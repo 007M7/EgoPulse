@@ -1,0 +1,16 @@
+[package]
+name = "egopulse-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+crossterm.workspace = true
+egopulse-local-api.workspace = true
+ratatui.workspace = true
+
+[[bin]]
+name = "egopulse-tui"
+path = "src/main.rs"

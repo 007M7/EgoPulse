@@ -1,0 +1,6 @@
+packages:
+  - apps/desktop
+  - packages/*
+
+allowBuilds:
+  "@bufbuild/buf": true

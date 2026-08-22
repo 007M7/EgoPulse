@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package egopulse.foundation.v1;
+
+message HealthRequest {}
+
+message HealthResponse {
+  string architecture_version = 1;
+  string service = 2;
+  HealthState state = 3;
+}
+
+enum HealthState {
+  HEALTH_STATE_UNSPECIFIED = 0;
+  HEALTH_STATE_FOUNDATION_ONLY = 1;
+  HEALTH_STATE_SERVING = 2;
+  HEALTH_STATE_DEGRADED = 3;
+}

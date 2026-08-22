@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://egopulse.local/schemas/foundation-health.schema.json",
+  "title": "EgoPulse Foundation Health",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["architectureVersion", "service", "state"],
+  "properties": {
+    "architectureVersion": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "service": {
+      "type": "string",
+      "minLength": 1
+    },
+    "state": {
+      "type": "string",
+      "enum": ["foundation-only", "serving", "degraded"]
+    }
+  }
+}

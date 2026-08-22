@@ -1,0 +1,14 @@
+[package]
+name = "egopulse-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+egopulse-local-api.workspace = true
+
+[[bin]]
+name = "egopulse"
+path = "src/main.rs"

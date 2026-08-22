@@ -1,0 +1,17 @@
+[package]
+name = "egopulse-agentosd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+egopulse-cognition-runtime.workspace = true
+egopulse-local-ide-control.workspace = true
+egopulse-process-supervision.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[[bin]]
+name = "agentosd"
+path = "src/main.rs"

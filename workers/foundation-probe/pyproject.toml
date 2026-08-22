@@ -1,0 +1,19 @@
+[project]
+name = "egopulse-foundation-probe"
+version = "0.0.0"
+description = "Packaging probe for EgoPulse Python worker boundaries"
+requires-python = ">=3.14,<3.15"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest==9.0.2",
+]
+
+[tool.pytest.ini_options]
+addopts = ["-p", "no:cacheprovider"]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.uv]
+package = false

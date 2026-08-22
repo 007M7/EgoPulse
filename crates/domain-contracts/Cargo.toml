@@ -1,0 +1,9 @@
+[package]
+name = "egopulse-domain-contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
