@@ -204,6 +204,7 @@ pub(super) struct CollaborationCommit {
     pub result: Vec<u8>,
     pub outboxes: Vec<OutboxWrite>,
     pub hold_dispatch_for_attempt: Option<String>,
+    pub deliver_dispatch_for_attempt: Option<String>,
     pub committed_at_seconds: i64,
 }
 
@@ -519,6 +520,21 @@ impl CollaborationStore {
                    AND delivery_state = 'pending'",
                 [attempt_id],
             )?;
+        }
+
+        if let Some(attempt_id) = &commit.deliver_dispatch_for_attempt {
+            let changed = transaction.execute(
+                "UPDATE collaboration_outbox
+                 SET delivery_state = 'delivered'
+                 WHERE attempt_id = ?1
+                   AND destination_domain = 'harness-adapter'
+                   AND payload_kind = 'dispatch-envelope'
+                   AND delivery_state = 'pending'",
+                [attempt_id],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::CasConflict("dispatch-outbox"));
+            }
         }
 
         for outbox in &commit.outboxes {

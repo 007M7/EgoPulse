@@ -5,8 +5,9 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     CollaborationCommand, CollaborationCommandResult, CollaborationError, CollaborationErrorCode,
     CollaborationEvent, CollaborationEventKind, CollaborationSnapshot, CreateAttemptCommand,
     CreateRunCommand, GetCollaborationResponse, Lease, MarkAttemptOutcomeUnknownCommand,
-    RecordDispatchIntentCommand, RecoveryClass, RunSnapshot, RunStatus, StepSnapshot, StepStatus,
-    collaboration_command, collaboration_command_result, get_collaboration_response,
+    RecordDeliveryReceiptCommand, RecordDispatchIntentCommand, RecordHarnessAckCommand,
+    RecordRunningObservationCommand, RecoveryClass, RunSnapshot, RunStatus, StepSnapshot,
+    StepStatus, collaboration_command, collaboration_command_result, get_collaboration_response,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
@@ -101,6 +102,34 @@ pub struct DispatchMaterial {
     pub evidence_refs: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedHarnessEvidence {
+    pub harness_session_ref: Option<String>,
+    pub evidence_refs: Vec<String>,
+}
+
+/// Provider-neutral read port for immutable evidence owned by a Harness Adapter.
+/// Collaboration never reads an Adapter database and never receives provider-private types.
+pub trait HarnessEvidenceResolver {
+    fn resolve_delivery_receipt(
+        &self,
+        command: &RecordDeliveryReceiptCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection>;
+
+    fn resolve_harness_ack(
+        &self,
+        command: &RecordHarnessAckCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection>;
+
+    fn validate_running_observation(
+        &self,
+        command: &RecordRunningObservationCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection>;
+}
+
 pub trait CollaborationReferenceGuard {
     fn validate_create_run(
         &self,
@@ -190,7 +219,7 @@ pub struct CollaborationControl<G, C> {
 
 impl<G, C> CollaborationControl<G, C>
 where
-    G: CollaborationReferenceGuard,
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
     C: AuthorityClock,
 {
     pub fn open(
@@ -301,6 +330,15 @@ where
             }
             collaboration_command::Command::RecordDispatchIntent(value) => {
                 self.record_dispatch_intent(value, command, principal)
+            }
+            collaboration_command::Command::RecordDeliveryReceipt(value) => {
+                self.record_delivery_receipt(value, command, principal)
+            }
+            collaboration_command::Command::RecordHarnessAck(value) => {
+                self.record_harness_ack(value, command, principal)
+            }
+            collaboration_command::Command::RecordRunningObservation(value) => {
+                self.record_running_observation(value, command, principal)
             }
             collaboration_command::Command::MarkAttemptOutcomeUnknown(value) => {
                 self.mark_outcome_unknown(value, command, principal)
@@ -800,6 +838,269 @@ where
         )
     }
 
+    fn record_delivery_receipt(
+        &mut self,
+        value: &RecordDeliveryReceiptCommand,
+        command: &CollaborationCommand,
+        principal: &AuthenticatedCollaborationPrincipal,
+    ) -> Result<CollaborationCommandResult, CollaborationControlError> {
+        let Some(base) = value.base.as_ref() else {
+            return Ok(invalid("DELIVERY_RECEIPT_BASE_REQUIRED"));
+        };
+        let Some(mut snapshot) = self.load_snapshot(&base.run_id)? else {
+            return Ok(not_found("COLLABORATION_RUN_NOT_FOUND"));
+        };
+        let (step_index, attempt_index) = match validate_attempt_preconditions(&snapshot, base) {
+            Ok(indexes) => indexes,
+            Err(result) => return Ok(*result),
+        };
+        let attempt = &snapshot.attempts[attempt_index];
+        if attempt.status != AttemptStatus::DispatchPending as i32 {
+            return Ok(state_conflict("ATTEMPT_MUST_BE_DISPATCH_PENDING"));
+        }
+        if attempt.dispatch_id.as_deref() != Some(value.dispatch_id.as_str()) {
+            return Ok(error_result(
+                CollaborationErrorCode::ContractMismatch,
+                "DISPATCH_ID_MISMATCH",
+                Some(snapshot.run.as_ref().expect("stored run").revision),
+                Some(attempt.revision),
+            ));
+        }
+        if !current_fence_matches(attempt, value.fencing_token) {
+            return Ok(fencing_rejected(
+                snapshot.run.as_ref().expect("stored run").revision,
+                attempt.revision,
+            ));
+        }
+        if value.delivery_receipt_id.trim().is_empty()
+            || !sha256_is_complete(&value.receipt_digest_sha256)
+        {
+            return Ok(invalid("DELIVERY_RECEIPT_IDENTITY_INVALID"));
+        }
+        let resolved = match self.guard.resolve_delivery_receipt(value, &snapshot) {
+            Ok(value) => value,
+            Err(rejection) => return Ok(guard_error(rejection)),
+        };
+        if resolved
+            .harness_session_ref
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Ok(guard_error(ReferenceGuardRejection::ContractMismatch));
+        }
+
+        let now = self.clock.now();
+        let run_previous = snapshot.run.as_ref().expect("stored run").revision;
+        let step_previous = snapshot.steps[step_index].revision;
+        let attempt_previous = attempt.revision;
+        let run = snapshot.run.as_mut().expect("stored run");
+        run.revision += 1;
+        run.updated_at = Some(now);
+        let step = &mut snapshot.steps[step_index];
+        step.revision += 1;
+        step.updated_at = Some(now);
+        let attempt = &mut snapshot.attempts[attempt_index];
+        attempt.revision += 1;
+        attempt.status = AttemptStatus::Dispatched as i32;
+        if resolved.harness_session_ref.is_some() {
+            attempt.harness_session_ref = resolved.harness_session_ref;
+        }
+        attempt.updated_at = Some(now);
+        let mut evidence = resolved.evidence_refs;
+        evidence.push(format!("delivery-receipt:{}", value.delivery_receipt_id));
+        self.persist(
+            command,
+            principal,
+            snapshot,
+            Some(run_previous),
+            Some(step_previous),
+            Some(attempt_previous),
+            CollaborationEventKind::DeliveryRecorded,
+            evidence,
+            None,
+            now,
+        )
+    }
+
+    fn record_harness_ack(
+        &mut self,
+        value: &RecordHarnessAckCommand,
+        command: &CollaborationCommand,
+        principal: &AuthenticatedCollaborationPrincipal,
+    ) -> Result<CollaborationCommandResult, CollaborationControlError> {
+        let Some(base) = value.base.as_ref() else {
+            return Ok(invalid("HARNESS_ACK_BASE_REQUIRED"));
+        };
+        let Some(mut snapshot) = self.load_snapshot(&base.run_id)? else {
+            return Ok(not_found("COLLABORATION_RUN_NOT_FOUND"));
+        };
+        let (step_index, attempt_index) = match validate_attempt_preconditions(&snapshot, base) {
+            Ok(indexes) => indexes,
+            Err(result) => return Ok(*result),
+        };
+        let attempt = &snapshot.attempts[attempt_index];
+        if attempt.status == AttemptStatus::DispatchPending as i32 {
+            return Ok(state_conflict("DELIVERY_RECEIPT_REQUIRED"));
+        }
+        if attempt.status != AttemptStatus::Dispatched as i32 {
+            return Ok(state_conflict("ATTEMPT_MUST_BE_DISPATCHED"));
+        }
+        if attempt.dispatch_id.as_deref() != Some(value.dispatch_id.as_str()) {
+            return Ok(error_result(
+                CollaborationErrorCode::ContractMismatch,
+                "DISPATCH_ID_MISMATCH",
+                Some(snapshot.run.as_ref().expect("stored run").revision),
+                Some(attempt.revision),
+            ));
+        }
+        if !current_fence_matches(attempt, value.fencing_token) {
+            return Ok(fencing_rejected(
+                snapshot.run.as_ref().expect("stored run").revision,
+                attempt.revision,
+            ));
+        }
+        if value.harness_sequence <= attempt.last_harness_sequence {
+            return Ok(sequence_conflict(
+                snapshot.run.as_ref().expect("stored run").revision,
+                attempt.revision,
+            ));
+        }
+        if value.ack_receipt_id.trim().is_empty()
+            || !sha256_is_complete(&value.receipt_digest_sha256)
+        {
+            return Ok(invalid("HARNESS_ACK_IDENTITY_INVALID"));
+        }
+        let resolved = match self.guard.resolve_harness_ack(value, &snapshot) {
+            Ok(value) => value,
+            Err(rejection) => return Ok(guard_error(rejection)),
+        };
+        if let (Some(existing), Some(resolved)) = (
+            attempt.harness_session_ref.as_ref(),
+            resolved.harness_session_ref.as_ref(),
+        ) && existing != resolved
+        {
+            return Ok(error_result(
+                CollaborationErrorCode::ContractMismatch,
+                "HARNESS_SESSION_REF_MISMATCH",
+                Some(snapshot.run.as_ref().expect("stored run").revision),
+                Some(attempt.revision),
+            ));
+        }
+        if resolved
+            .harness_session_ref
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Ok(guard_error(ReferenceGuardRejection::ContractMismatch));
+        }
+
+        let now = self.clock.now();
+        let run_previous = snapshot.run.as_ref().expect("stored run").revision;
+        let step_previous = snapshot.steps[step_index].revision;
+        let attempt_previous = attempt.revision;
+        let run = snapshot.run.as_mut().expect("stored run");
+        run.revision += 1;
+        run.updated_at = Some(now);
+        let step = &mut snapshot.steps[step_index];
+        step.revision += 1;
+        step.updated_at = Some(now);
+        let attempt = &mut snapshot.attempts[attempt_index];
+        attempt.revision += 1;
+        attempt.status = AttemptStatus::Acknowledged as i32;
+        attempt.last_harness_sequence = value.harness_sequence;
+        if resolved.harness_session_ref.is_some() {
+            attempt.harness_session_ref = resolved.harness_session_ref;
+        }
+        attempt.updated_at = Some(now);
+        let mut evidence = resolved.evidence_refs;
+        evidence.push(format!("ack-receipt:{}", value.ack_receipt_id));
+        self.persist(
+            command,
+            principal,
+            snapshot,
+            Some(run_previous),
+            Some(step_previous),
+            Some(attempt_previous),
+            CollaborationEventKind::AckRecorded,
+            evidence,
+            None,
+            now,
+        )
+    }
+
+    fn record_running_observation(
+        &mut self,
+        value: &RecordRunningObservationCommand,
+        command: &CollaborationCommand,
+        principal: &AuthenticatedCollaborationPrincipal,
+    ) -> Result<CollaborationCommandResult, CollaborationControlError> {
+        let Some(base) = value.base.as_ref() else {
+            return Ok(invalid("RUNNING_OBSERVATION_BASE_REQUIRED"));
+        };
+        let Some(mut snapshot) = self.load_snapshot(&base.run_id)? else {
+            return Ok(not_found("COLLABORATION_RUN_NOT_FOUND"));
+        };
+        let (step_index, attempt_index) = match validate_attempt_preconditions(&snapshot, base) {
+            Ok(indexes) => indexes,
+            Err(result) => return Ok(*result),
+        };
+        let attempt = &snapshot.attempts[attempt_index];
+        if attempt.status != AttemptStatus::Acknowledged as i32 {
+            return Ok(state_conflict("HARNESS_ACK_REQUIRED"));
+        }
+        if !current_fence_matches(attempt, value.fencing_token) {
+            return Ok(fencing_rejected(
+                snapshot.run.as_ref().expect("stored run").revision,
+                attempt.revision,
+            ));
+        }
+        if value.harness_sequence <= attempt.last_harness_sequence {
+            return Ok(sequence_conflict(
+                snapshot.run.as_ref().expect("stored run").revision,
+                attempt.revision,
+            ));
+        }
+        if value.lifecycle_event_id.trim().is_empty()
+            || !sha256_is_complete(&value.event_digest_sha256)
+        {
+            return Ok(invalid("RUNNING_OBSERVATION_IDENTITY_INVALID"));
+        }
+        let authorization = match self.guard.validate_running_observation(value, &snapshot) {
+            Ok(value) => value,
+            Err(rejection) => return Ok(guard_error(rejection)),
+        };
+
+        let now = self.clock.now();
+        let run_previous = snapshot.run.as_ref().expect("stored run").revision;
+        let step_previous = snapshot.steps[step_index].revision;
+        let attempt_previous = attempt.revision;
+        let run = snapshot.run.as_mut().expect("stored run");
+        run.revision += 1;
+        run.updated_at = Some(now);
+        let step = &mut snapshot.steps[step_index];
+        step.revision += 1;
+        step.updated_at = Some(now);
+        let attempt = &mut snapshot.attempts[attempt_index];
+        attempt.revision += 1;
+        attempt.status = AttemptStatus::Running as i32;
+        attempt.last_harness_sequence = value.harness_sequence;
+        attempt.updated_at = Some(now);
+        let mut evidence = authorization.evidence_refs;
+        evidence.push(format!("lifecycle-event:{}", value.lifecycle_event_id));
+        self.persist(
+            command,
+            principal,
+            snapshot,
+            Some(run_previous),
+            Some(step_previous),
+            Some(attempt_previous),
+            CollaborationEventKind::RunningObserved,
+            evidence,
+            None,
+            now,
+        )
+    }
+
     fn mark_outcome_unknown(
         &mut self,
         value: &MarkAttemptOutcomeUnknownCommand,
@@ -957,54 +1258,62 @@ where
             });
         }
 
-        let commit = CollaborationCommit {
-            run: RunWrite {
-                run_id: run.run_id.clone(),
-                task_id: run.task_id.clone(),
-                work_revision: run.work_revision,
-                revision: run.revision,
-                status: run.status,
-                snapshot: run.encode_to_vec(),
-                expected_revision: previous_run_revision,
-            },
-            step: changed_step.map(|(step, previous)| StepWrite {
-                step_id: step.step_id.clone(),
-                run_id: step.run_id.clone(),
-                revision: step.revision,
-                status: step.status,
-                snapshot: step.encode_to_vec(),
-                expected_revision: (previous != 0).then_some(previous),
-            }),
-            attempt: changed_attempt.map(|(attempt, previous)| AttemptWrite {
-                attempt_id: attempt.attempt_id.clone(),
-                run_id: attempt.run_id.clone(),
-                step_id: attempt.step_id.clone(),
-                revision: attempt.revision,
-                status: attempt.status,
-                snapshot: attempt.encode_to_vec(),
-                expected_revision: (previous != 0).then_some(previous),
-            }),
-            event_id,
-            command_id: meta.command_id.clone(),
-            request_digest_sha256: meta.request_digest_sha256.clone(),
-            event: event_bytes,
-            authenticated_principal_id: principal.principal_id.clone(),
-            operation: operation.to_owned(),
-            idempotency_scope: meta.idempotency_scope.clone(),
-            idempotency_key: meta.idempotency_key.clone(),
-            result: result.encode_to_vec(),
-            outboxes,
-            hold_dispatch_for_attempt: (kind == CollaborationEventKind::OutcomeMarkedUnknown).then(
-                || {
-                    changed_attempt
-                        .expect("unknown outcome changes attempt")
-                        .0
-                        .attempt_id
-                        .clone()
+        let commit =
+            CollaborationCommit {
+                run: RunWrite {
+                    run_id: run.run_id.clone(),
+                    task_id: run.task_id.clone(),
+                    work_revision: run.work_revision,
+                    revision: run.revision,
+                    status: run.status,
+                    snapshot: run.encode_to_vec(),
+                    expected_revision: previous_run_revision,
                 },
-            ),
-            committed_at_seconds: now.seconds,
-        };
+                step: changed_step.map(|(step, previous)| StepWrite {
+                    step_id: step.step_id.clone(),
+                    run_id: step.run_id.clone(),
+                    revision: step.revision,
+                    status: step.status,
+                    snapshot: step.encode_to_vec(),
+                    expected_revision: (previous != 0).then_some(previous),
+                }),
+                attempt: changed_attempt.map(|(attempt, previous)| AttemptWrite {
+                    attempt_id: attempt.attempt_id.clone(),
+                    run_id: attempt.run_id.clone(),
+                    step_id: attempt.step_id.clone(),
+                    revision: attempt.revision,
+                    status: attempt.status,
+                    snapshot: attempt.encode_to_vec(),
+                    expected_revision: (previous != 0).then_some(previous),
+                }),
+                event_id,
+                command_id: meta.command_id.clone(),
+                request_digest_sha256: meta.request_digest_sha256.clone(),
+                event: event_bytes,
+                authenticated_principal_id: principal.principal_id.clone(),
+                operation: operation.to_owned(),
+                idempotency_scope: meta.idempotency_scope.clone(),
+                idempotency_key: meta.idempotency_key.clone(),
+                result: result.encode_to_vec(),
+                outboxes,
+                hold_dispatch_for_attempt: (kind == CollaborationEventKind::OutcomeMarkedUnknown)
+                    .then(|| {
+                        changed_attempt
+                            .expect("unknown outcome changes attempt")
+                            .0
+                            .attempt_id
+                            .clone()
+                    }),
+                deliver_dispatch_for_attempt: (kind == CollaborationEventKind::DeliveryRecorded)
+                    .then(|| {
+                        changed_attempt
+                            .expect("delivery receipt changes attempt")
+                            .0
+                            .attempt_id
+                            .clone()
+                    }),
+                committed_at_seconds: now.seconds,
+            };
         self.store.commit(&commit)?;
         Ok(result)
     }
@@ -1435,6 +1744,15 @@ fn changed_step_id(command: &CollaborationCommand) -> Option<&str> {
         collaboration_command::Command::RecordDispatchIntent(value) => {
             Some(&value.base.as_ref()?.step_id)
         }
+        collaboration_command::Command::RecordDeliveryReceipt(value) => {
+            Some(&value.base.as_ref()?.step_id)
+        }
+        collaboration_command::Command::RecordHarnessAck(value) => {
+            Some(&value.base.as_ref()?.step_id)
+        }
+        collaboration_command::Command::RecordRunningObservation(value) => {
+            Some(&value.base.as_ref()?.step_id)
+        }
         collaboration_command::Command::MarkAttemptOutcomeUnknown(value) => {
             Some(&value.base.as_ref()?.step_id)
         }
@@ -1449,6 +1767,15 @@ fn changed_attempt_id(command: &CollaborationCommand) -> Option<&str> {
             Some(&value.base.as_ref()?.attempt_id)
         }
         collaboration_command::Command::RecordDispatchIntent(value) => {
+            Some(&value.base.as_ref()?.attempt_id)
+        }
+        collaboration_command::Command::RecordDeliveryReceipt(value) => {
+            Some(&value.base.as_ref()?.attempt_id)
+        }
+        collaboration_command::Command::RecordHarnessAck(value) => {
+            Some(&value.base.as_ref()?.attempt_id)
+        }
+        collaboration_command::Command::RecordRunningObservation(value) => {
             Some(&value.base.as_ref()?.attempt_id)
         }
         collaboration_command::Command::MarkAttemptOutcomeUnknown(value) => {
@@ -1519,6 +1846,22 @@ fn fencing_rejected(run: u64, attempt: u64) -> CollaborationCommandResult {
         Some(run),
         Some(attempt),
     )
+}
+
+fn sequence_conflict(run: u64, attempt: u64) -> CollaborationCommandResult {
+    error_result(
+        CollaborationErrorCode::SequenceConflict,
+        "HARNESS_OBSERVATION_SEQUENCE_CONFLICT",
+        Some(run),
+        Some(attempt),
+    )
+}
+
+fn current_fence_matches(attempt: &AttemptSnapshot, fencing_token: u64) -> bool {
+    attempt
+        .lease
+        .as_ref()
+        .is_some_and(|lease| lease.fencing_token == fencing_token)
 }
 
 fn error_result(

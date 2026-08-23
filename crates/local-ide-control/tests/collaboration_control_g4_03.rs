@@ -2,8 +2,9 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCommandBase, AttemptSnapshot,
     AttemptStatus, CollaborationCommand, CollaborationCommandResult, CollaborationErrorCode,
     CollaborationSnapshot, CreateAttemptCommand, CreateRunCommand,
-    MarkAttemptOutcomeUnknownCommand, RecordDispatchIntentCommand, RunCommandBase, RunPlan,
-    RunStatus, StepPlan, StepStatus, collaboration_command, collaboration_command_result,
+    MarkAttemptOutcomeUnknownCommand, RecordDeliveryReceiptCommand, RecordDispatchIntentCommand,
+    RecordHarnessAckCommand, RecordRunningObservationCommand, RunCommandBase, RunPlan, RunStatus,
+    StepPlan, StepStatus, collaboration_command, collaboration_command_result,
     get_collaboration_response,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
@@ -13,9 +14,9 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
 use egopulse_local_ide_control::collaboration_control::{
     AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
     CollaborationControlConfig, CollaborationControlError, CollaborationPrincipalKind,
-    CollaborationReferenceGuard, CollaborationSqlCipherKey, DispatchMaterial, LeaseAuthorization,
-    ReferenceAuthorization, ReferenceGuardRejection, canonical_dispatch_fingerprint,
-    canonical_request_digest,
+    CollaborationReferenceGuard, CollaborationSqlCipherKey, DispatchMaterial,
+    HarnessEvidenceResolver, LeaseAuthorization, ReferenceAuthorization, ReferenceGuardRejection,
+    ResolvedHarnessEvidence, canonical_dispatch_fingerprint, canonical_request_digest,
 };
 use prost_types::Timestamp;
 use std::fs;
@@ -126,6 +127,49 @@ impl CollaborationReferenceGuard for FixtureGuard {
         }
         Ok(ReferenceAuthorization {
             evidence_refs: vec!["lease-expired:external-stop-not-proven".to_owned()],
+        })
+    }
+}
+
+impl HarnessEvidenceResolver for FixtureGuard {
+    fn resolve_delivery_receipt(
+        &self,
+        command: &RecordDeliveryReceiptCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+        if command.delivery_receipt_id != "delivery-001" {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ResolvedHarnessEvidence {
+            harness_session_ref: Some("codex-thread-001".to_owned()),
+            evidence_refs: vec!["adapter-receipt:delivery-001@durable".to_owned()],
+        })
+    }
+
+    fn resolve_harness_ack(
+        &self,
+        command: &RecordHarnessAckCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+        if command.ack_receipt_id != "ack-001" {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ResolvedHarnessEvidence {
+            harness_session_ref: Some("codex-thread-001".to_owned()),
+            evidence_refs: vec!["adapter-observation:ack-001@durable".to_owned()],
+        })
+    }
+
+    fn validate_running_observation(
+        &self,
+        command: &RecordRunningObservationCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        if command.lifecycle_event_id != "running-001" {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ReferenceAuthorization {
+            evidence_refs: vec!["adapter-observation:running-001@durable".to_owned()],
         })
     }
 }
@@ -301,6 +345,36 @@ fn set_digest(command: &mut CollaborationCommand) {
                 .request_digest_sha256 = digest;
         }
         collaboration_command::Command::RecordDispatchIntent(value) => {
+            value
+                .base
+                .as_mut()
+                .expect("base")
+                .meta
+                .as_mut()
+                .expect("metadata")
+                .request_digest_sha256 = digest;
+        }
+        collaboration_command::Command::RecordDeliveryReceipt(value) => {
+            value
+                .base
+                .as_mut()
+                .expect("base")
+                .meta
+                .as_mut()
+                .expect("metadata")
+                .request_digest_sha256 = digest;
+        }
+        collaboration_command::Command::RecordHarnessAck(value) => {
+            value
+                .base
+                .as_mut()
+                .expect("base")
+                .meta
+                .as_mut()
+                .expect("metadata")
+                .request_digest_sha256 = digest;
+        }
+        collaboration_command::Command::RecordRunningObservation(value) => {
             value
                 .base
                 .as_mut()
@@ -546,6 +620,78 @@ fn unknown_command(snapshot: &CollaborationSnapshot) -> CollaborationCommand {
     command
 }
 
+fn attempt_base(snapshot: &CollaborationSnapshot, command_id: &str) -> AttemptCommandBase {
+    let run = snapshot.run.as_ref().expect("run");
+    let step = snapshot.steps.first().expect("step");
+    let attempt = snapshot.attempts.first().expect("attempt");
+    AttemptCommandBase {
+        meta: Some(metadata(command_id, command_id, &attempt.attempt_id)),
+        run_id: run.run_id.clone(),
+        expected_run_revision: run.revision,
+        step_id: step.step_id.clone(),
+        expected_step_revision: step.revision,
+        attempt_id: attempt.attempt_id.clone(),
+        expected_attempt_revision: attempt.revision,
+    }
+}
+
+fn delivery_command(snapshot: &CollaborationSnapshot, fencing_token: u64) -> CollaborationCommand {
+    let mut command = CollaborationCommand {
+        command: Some(collaboration_command::Command::RecordDeliveryReceipt(
+            RecordDeliveryReceiptCommand {
+                base: Some(attempt_base(snapshot, "cmd-delivery-001")),
+                dispatch_id: "dispatch-001".to_owned(),
+                fencing_token,
+                delivery_receipt_id: "delivery-001".to_owned(),
+                receipt_digest_sha256: "d".repeat(64),
+            },
+        )),
+    };
+    set_digest(&mut command);
+    command
+}
+
+fn ack_command(
+    snapshot: &CollaborationSnapshot,
+    fencing_token: u64,
+    harness_sequence: u64,
+) -> CollaborationCommand {
+    let mut command = CollaborationCommand {
+        command: Some(collaboration_command::Command::RecordHarnessAck(
+            RecordHarnessAckCommand {
+                base: Some(attempt_base(snapshot, "cmd-ack-001")),
+                dispatch_id: "dispatch-001".to_owned(),
+                fencing_token,
+                harness_sequence,
+                ack_receipt_id: "ack-001".to_owned(),
+                receipt_digest_sha256: "e".repeat(64),
+            },
+        )),
+    };
+    set_digest(&mut command);
+    command
+}
+
+fn running_command(
+    snapshot: &CollaborationSnapshot,
+    fencing_token: u64,
+    harness_sequence: u64,
+) -> CollaborationCommand {
+    let mut command = CollaborationCommand {
+        command: Some(collaboration_command::Command::RecordRunningObservation(
+            RecordRunningObservationCommand {
+                base: Some(attempt_base(snapshot, "cmd-running-001")),
+                fencing_token,
+                harness_sequence,
+                lifecycle_event_id: "running-001".to_owned(),
+                event_digest_sha256: "f".repeat(64),
+            },
+        )),
+    };
+    set_digest(&mut command);
+    command
+}
+
 fn committed_snapshot(result: &CollaborationCommandResult) -> CollaborationSnapshot {
     match result.outcome.clone().expect("result outcome") {
         collaboration_command_result::Outcome::Snapshot(snapshot) => snapshot,
@@ -610,6 +756,140 @@ fn advance_through_dispatch(
         .execute(&command, &attempt_supervisor())
         .expect("record dispatch intent");
     (committed_snapshot(&dispatched), command)
+}
+
+#[test]
+fn delivery_ack_and_running_are_separate_durable_monotonic_facts() {
+    let isolated = IsolatedStore::new("collaboration-harness-facts");
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut control = open_control(&isolated.database_path(), clock);
+    let (dispatch_pending, _) = advance_through_dispatch(&mut control);
+    let fence = dispatch_pending.attempts[0]
+        .lease
+        .as_ref()
+        .expect("lease")
+        .fencing_token;
+    assert_eq!(
+        control
+            .inspect_store()
+            .expect("inspect")
+            .pending_dispatch_count,
+        1
+    );
+
+    let delivery_command = delivery_command(&dispatch_pending, fence);
+    let delivered_result = control
+        .execute(&delivery_command, &harness_adapter())
+        .expect("record delivery");
+    let delivered = committed_snapshot(&delivered_result);
+    assert_eq!(
+        delivered.attempts[0].status,
+        AttemptStatus::Dispatched as i32
+    );
+    assert_eq!(
+        delivered.attempts[0].harness_session_ref.as_deref(),
+        Some("codex-thread-001")
+    );
+    assert_eq!(
+        control
+            .inspect_store()
+            .expect("inspect")
+            .pending_dispatch_count,
+        0
+    );
+    let event_count = control.inspect_store().expect("inspect").event_count;
+    let replay = control
+        .execute(&delivery_command, &harness_adapter())
+        .expect("replay delivery");
+    assert!(replay.replayed);
+    assert_eq!(
+        control.inspect_store().expect("inspect").event_count,
+        event_count
+    );
+
+    let acknowledged = committed_snapshot(
+        &control
+            .execute(&ack_command(&delivered, fence, 1), &harness_adapter())
+            .expect("record ACK"),
+    );
+    assert_eq!(
+        acknowledged.attempts[0].status,
+        AttemptStatus::Acknowledged as i32
+    );
+    assert_eq!(acknowledged.attempts[0].last_harness_sequence, 1);
+
+    let running = committed_snapshot(
+        &control
+            .execute(
+                &running_command(&acknowledged, fence, 2),
+                &harness_adapter(),
+            )
+            .expect("record running"),
+    );
+    assert_eq!(running.attempts[0].status, AttemptStatus::Running as i32);
+    assert_eq!(running.attempts[0].last_harness_sequence, 2);
+    assert!(control.integrity_is_ok().expect("integrity"));
+}
+
+#[test]
+fn ack_before_delivery_stale_fence_and_out_of_order_sequence_are_zero_write_failures() {
+    let isolated = IsolatedStore::new("collaboration-harness-rejections");
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut control = open_control(&isolated.database_path(), clock);
+    let (dispatch_pending, _) = advance_through_dispatch(&mut control);
+    let fence = dispatch_pending.attempts[0]
+        .lease
+        .as_ref()
+        .expect("lease")
+        .fencing_token;
+    let before = control.inspect_store().expect("inspect");
+    let early_ack = control
+        .execute(
+            &ack_command(&dispatch_pending, fence, 1),
+            &harness_adapter(),
+        )
+        .expect("reject early ACK");
+    assert_eq!(
+        error_code(&early_ack),
+        CollaborationErrorCode::StateConflict
+    );
+    assert_eq!(control.inspect_store().expect("inspect"), before);
+
+    let delivered = committed_snapshot(
+        &control
+            .execute(
+                &delivery_command(&dispatch_pending, fence),
+                &harness_adapter(),
+            )
+            .expect("record delivery"),
+    );
+    let before_stale = control.inspect_store().expect("inspect");
+    let stale_ack = control
+        .execute(&ack_command(&delivered, fence + 1, 1), &harness_adapter())
+        .expect("reject stale ACK");
+    assert_eq!(
+        error_code(&stale_ack),
+        CollaborationErrorCode::FencingRejected
+    );
+    assert_eq!(control.inspect_store().expect("inspect"), before_stale);
+
+    let acknowledged = committed_snapshot(
+        &control
+            .execute(&ack_command(&delivered, fence, 1), &harness_adapter())
+            .expect("record ACK"),
+    );
+    let before_sequence = control.inspect_store().expect("inspect");
+    let out_of_order = control
+        .execute(
+            &running_command(&acknowledged, fence, 1),
+            &harness_adapter(),
+        )
+        .expect("reject out-of-order running");
+    assert_eq!(
+        error_code(&out_of_order),
+        CollaborationErrorCode::SequenceConflict
+    );
+    assert_eq!(control.inspect_store().expect("inspect"), before_sequence);
 }
 
 #[test]
