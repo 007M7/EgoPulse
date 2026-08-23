@@ -11,7 +11,8 @@ members = [
   "crates/local-api",
   "crates/process-supervision",
   "crates/harness-adapter",
-  "crates/codex-adapter"
+  "crates/codex-adapter",
+  "crates/artifact-authority"
 ]
 
 [workspace.package]
@@ -47,6 +48,7 @@ egopulse-local-api = { path = "crates/local-api" }
 egopulse-process-supervision = { path = "crates/process-supervision" }
 egopulse-harness-adapter = { path = "crates/harness-adapter" }
 egopulse-codex-adapter = { path = "crates/codex-adapter" }
+egopulse-artifact-authority = { path = "crates/artifact-authority" }
 
 [profile.release]
 codegen-units = 1

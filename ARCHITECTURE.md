@@ -25,6 +25,7 @@ Named Pipe / UDS (not implemented in the foundation scaffold)
 agentosd deployment host
   +-- cognition-runtime authorities
   +-- local-ide collaboration control
+  +-- artifact authority + content-addressed blob data plane
   +-- process supervision
         |
         v
@@ -32,6 +33,12 @@ Harness / Worker / Sego adapters (not implemented yet)
 ```
 
 `agentosd` is a deployment host, not a shared fact owner. Authority and control modules must retain separate APIs, single-writer storage ownership and audit streams.
+
+Artifact metadata and content-addressed bytes form an independent fact domain. The Rust
+`artifact-authority` module owns metadata, immutable sets and technical return receipts; the blob
+data plane stores bytes by verified digest. Harnesses and collectors may submit candidates, but
+neither receives the Authority database handle nor may a terminal Harness event decide Artifact,
+verification or Task completion.
 
 ## Language boundaries
 
