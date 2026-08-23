@@ -1,3 +1,4 @@
+use egopulse_codex_adapter::{FakeCodexDriver, codex_protocol_fingerprint};
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCancellationDisposition,
     AttemptCommandBase, AttemptSnapshot, AttemptStatus, BeginAttemptReconciliationCommand,
@@ -14,7 +15,11 @@ use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, Cont
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     AckDisposition, DeliveryDisposition, DispatchEnvelope, DispatchReceipt, HarnessAckObservation,
     HarnessObservation, LifecycleKind, LifecycleObservation, NativeSessionStrategy,
-    ObservationCriticality, SideEffectCertainty, harness_observation,
+    ObservationCriticality, SideEffectCertainty, dispatch_result, harness_observation,
+};
+use egopulse_harness_adapter::{
+    AdapterClock, AdapterEdge, AdapterEdgeConfig, AdapterEdgeKey, DispatchMaterialResolver,
+    GovernedHarnessAdapter, ReconciliationFinding, ResolvedDispatchMaterial,
 };
 use egopulse_local_ide_control::collaboration_control::{
     AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
@@ -25,6 +30,7 @@ use egopulse_local_ide_control::collaboration_control::{
     canonical_dispatch_fingerprint, canonical_request_digest,
 };
 use prost_types::Timestamp;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,6 +39,7 @@ use uuid::Uuid;
 
 const STORE_EPOCH: &str = "collaboration-store-g4-03-test";
 const TEST_KEY: [u8; 32] = [0x63; 32];
+const ADAPTER_TEST_KEY: [u8; 32] = [0x64; 32];
 const FIXED_TIME: i64 = 1_777_073_600;
 
 #[derive(Clone)]
@@ -49,6 +56,12 @@ impl FixedClock {
 }
 
 impl AuthorityClock for FixedClock {
+    fn now(&self) -> Timestamp {
+        *self.0.lock().expect("clock mutex")
+    }
+}
+
+impl AdapterClock for FixedClock {
     fn now(&self) -> Timestamp {
         *self.0.lock().expect("clock mutex")
     }
@@ -225,6 +238,255 @@ impl HarnessEvidenceResolver for FixtureGuard {
     }
 }
 
+struct AdapterBackedFixtureGuard {
+    edge: AdapterEdge,
+    input_bundle_sha256: String,
+}
+
+impl CollaborationReferenceGuard for AdapterBackedFixtureGuard {
+    fn validate_create_run(
+        &self,
+        command: &CreateRunCommand,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        FixtureGuard.validate_create_run(command)
+    }
+
+    fn validate_activate_run(
+        &self,
+        command: &ActivateRunCommand,
+        run: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::RunSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        FixtureGuard.validate_activate_run(command, run)
+    }
+
+    fn validate_create_attempt(
+        &self,
+        command: &CreateAttemptCommand,
+        run: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::RunSnapshot,
+        step: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::StepSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        FixtureGuard.validate_create_attempt(command, run, step)
+    }
+
+    fn authorize_lease(
+        &self,
+        command: &AcquireAttemptLeaseCommand,
+        attempt: &AttemptSnapshot,
+    ) -> Result<LeaseAuthorization, ReferenceGuardRejection> {
+        FixtureGuard.authorize_lease(command, attempt)
+    }
+
+    fn resolve_dispatch_material(
+        &self,
+        _command: &RecordDispatchIntentCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<DispatchMaterial, ReferenceGuardRejection> {
+        let mut material = dispatch_material();
+        material.input_bundle_sha256 = self.input_bundle_sha256.clone();
+        Ok(material)
+    }
+
+    fn validate_unknown_outcome(
+        &self,
+        command: &MarkAttemptOutcomeUnknownCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        FixtureGuard.validate_unknown_outcome(command, snapshot)
+    }
+
+    fn validate_cancellation_request(
+        &self,
+        command: &RequestAttemptCancellationCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        FixtureGuard.validate_cancellation_request(command, snapshot)
+    }
+}
+
+impl HarnessEvidenceResolver for AdapterBackedFixtureGuard {
+    fn resolve_delivery_receipt(
+        &self,
+        command: &RecordDeliveryReceiptCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+        let receipt = self
+            .edge
+            .dispatch_receipt(&command.dispatch_id)
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let attempt_id = command
+            .base
+            .as_ref()
+            .map(|value| value.attempt_id.as_str())
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        if receipt.receipt_id != command.delivery_receipt_id
+            || receipt.receipt_digest_sha256 != command.receipt_digest_sha256
+            || receipt.attempt_id != attempt_id
+            || receipt.fencing_token != command.fencing_token
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ResolvedHarnessEvidence {
+            harness_session_ref: receipt.native_session_ref,
+            evidence_refs: vec![format!(
+                "adapter-receipt:{}@durable",
+                command.delivery_receipt_id
+            )],
+        })
+    }
+
+    fn resolve_harness_ack(
+        &self,
+        command: &RecordHarnessAckCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+        let evidence = self
+            .edge
+            .observation_evidence_by_sequence(&command.dispatch_id, command.harness_sequence)
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let ack = match evidence.observation.payload.as_ref() {
+            Some(harness_observation::Payload::Ack(value)) => value,
+            _ => return Err(ReferenceGuardRejection::UnverifiedReference),
+        };
+        if evidence.observation.native_event_digest_sha256 != command.receipt_digest_sha256
+            || evidence.observation.fencing_token != command.fencing_token
+            || ack.ack_receipt_id != command.ack_receipt_id
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ResolvedHarnessEvidence {
+            harness_session_ref: ack.native_session_ref.clone(),
+            evidence_refs: vec![format!(
+                "adapter-observation:{}@durable",
+                evidence.observation.observation_id
+            )],
+        })
+    }
+
+    fn validate_running_observation(
+        &self,
+        command: &RecordRunningObservationCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        let evidence = self
+            .edge
+            .observation_evidence(&command.lifecycle_event_id)
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let attempt = snapshot
+            .attempts
+            .iter()
+            .find(|value| {
+                Some(value.attempt_id.as_str())
+                    == command.base.as_ref().map(|base| base.attempt_id.as_str())
+            })
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        if evidence.observation.dispatch_id != attempt.dispatch_id.clone().unwrap_or_default()
+            || evidence.observation.observation_sequence != command.harness_sequence
+            || evidence.observation.fencing_token != command.fencing_token
+            || evidence.observation.native_event_digest_sha256 != command.event_digest_sha256
+            || !matches!(
+                evidence.observation.payload,
+                Some(harness_observation::Payload::Lifecycle(ref value))
+                    if value.kind == LifecycleKind::ExecutionStarted as i32
+            )
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ReferenceAuthorization {
+            evidence_refs: vec![format!(
+                "adapter-observation:{}@durable",
+                command.lifecycle_event_id
+            )],
+        })
+    }
+
+    fn validate_cancellation_outcome(
+        &self,
+        command: &RecordAttemptCancellationOutcomeCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        let evidence = self
+            .edge
+            .observation_evidence(&command.cancellation_receipt_id)
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        if !matches!(
+            evidence.observation.payload,
+            Some(harness_observation::Payload::Lifecycle(ref value))
+                if value.kind == LifecycleKind::ExecutionInterrupted as i32
+        ) {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ReferenceAuthorization {
+            evidence_refs: vec![format!(
+                "adapter-cancellation-observation:{}@durable",
+                command.cancellation_receipt_id
+            )],
+        })
+    }
+
+    fn validate_reconciliation(
+        &self,
+        command: &RecordAttemptReconciliationCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        let evidence = self
+            .edge
+            .observation_evidence(&command.evidence_id)
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let diagnostic = match evidence.observation.payload {
+            Some(harness_observation::Payload::Diagnostic(value)) => value,
+            _ => return Err(ReferenceGuardRejection::UnverifiedReference),
+        };
+        let disposition = ReconciliationDisposition::try_from(command.disposition)
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?;
+        if evidence.observation.native_event_id.as_deref()
+            != Some(command.reconciliation_id.as_str())
+            || !matches!(
+                (diagnostic.safe_diagnostic_code.as_str(), disposition),
+                (
+                    "ADAPTER_RECONCILIATION_NO_EFFECT_PROVEN",
+                    ReconciliationDisposition::NoEffectProven
+                )
+            )
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ReferenceAuthorization {
+            evidence_refs: vec![format!(
+                "adapter-reconciliation:{}@durable",
+                command.evidence_id
+            )],
+        })
+    }
+}
+
+#[derive(Clone)]
+struct LoopMaterialResolver {
+    bundle: Vec<u8>,
+    workspace_root: PathBuf,
+}
+
+impl DispatchMaterialResolver for LoopMaterialResolver {
+    fn resolve(
+        &self,
+        _envelope: &DispatchEnvelope,
+    ) -> Result<
+        ResolvedDispatchMaterial,
+        egopulse_domain_contracts::v01::egopulse::harness::v1::HarnessError,
+    > {
+        Ok(ResolvedDispatchMaterial {
+            canonical_input_bundle: self.bundle.clone(),
+            prompt: "provider-neutral collaboration loop fixture".to_owned(),
+            workspace_root: self.workspace_root.clone(),
+            model: None,
+        })
+    }
+}
+
 struct IsolatedStore {
     root: PathBuf,
 }
@@ -252,13 +514,34 @@ impl Drop for IsolatedStore {
 }
 
 fn open_control(path: &Path, clock: FixedClock) -> CollaborationControl<FixtureGuard, FixedClock> {
+    open_control_with_guard(path, clock, FixtureGuard)
+}
+
+fn open_loop_adapter_edge(path: &Path) -> AdapterEdge {
+    AdapterEdge::open(AdapterEdgeConfig {
+        database_path: path.to_owned(),
+        adapter_id: "adapter:codex".to_owned(),
+        store_epoch: "collaboration-loop-adapter-edge-v1".to_owned(),
+        key: AdapterEdgeKey::new(ADAPTER_TEST_KEY),
+    })
+    .expect("open Collaboration loop Adapter edge")
+}
+
+fn open_control_with_guard<G>(
+    path: &Path,
+    clock: FixedClock,
+    guard: G,
+) -> CollaborationControl<G, FixedClock>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+{
     CollaborationControl::open(
         CollaborationControlConfig {
             database_path: path.to_owned(),
             store_epoch: STORE_EPOCH.to_owned(),
             key: CollaborationSqlCipherKey::new(TEST_KEY),
         },
-        FixtureGuard,
+        guard,
         clock,
     )
     .expect("open encrypted Collaboration Control")
@@ -588,6 +871,13 @@ fn acquire_lease_command(
 }
 
 fn dispatch_command(snapshot: &CollaborationSnapshot) -> CollaborationCommand {
+    dispatch_command_with_bundle(snapshot, &"5".repeat(64))
+}
+
+fn dispatch_command_with_bundle(
+    snapshot: &CollaborationSnapshot,
+    input_bundle_sha256: &str,
+) -> CollaborationCommand {
     let run = snapshot.run.as_ref().expect("run");
     let step = snapshot.steps.first().expect("step");
     let attempt = snapshot.attempts.first().expect("attempt");
@@ -617,7 +907,7 @@ fn dispatch_command(snapshot: &CollaborationSnapshot) -> CollaborationCommand {
         fencing_token: lease.fencing_token,
         capability_profile_ref: attempt.capability_profile_ref.clone(),
         input_bundle_ref: "input-001".to_owned(),
-        input_bundle_sha256: "5".repeat(64),
+        input_bundle_sha256: input_bundle_sha256.to_owned(),
         workspace_ref: attempt.workspace_ref.clone(),
         budget_profile_ref: run.plan.as_ref().expect("plan").budget_profile_ref.clone(),
         sandbox_profile_ref: Some(contract_ref("sandbox-policy", '6')),
@@ -826,13 +1116,27 @@ fn begin_reconciliation(snapshot: &CollaborationSnapshot, id: &str) -> Collabora
 }
 
 fn reconciliation_result(snapshot: &CollaborationSnapshot, id: &str) -> CollaborationCommand {
+    reconciliation_result_with_evidence(
+        snapshot,
+        id,
+        "reconcile-evidence-001",
+        ReconciliationDisposition::RetryIdempotent,
+    )
+}
+
+fn reconciliation_result_with_evidence(
+    snapshot: &CollaborationSnapshot,
+    id: &str,
+    evidence_id: &str,
+    disposition: ReconciliationDisposition,
+) -> CollaborationCommand {
     let mut command = CollaborationCommand {
         command: Some(collaboration_command::Command::RecordAttemptReconciliation(
             RecordAttemptReconciliationCommand {
                 base: Some(attempt_base(snapshot, "cmd-reconcile-result-001")),
                 reconciliation_id: id.to_owned(),
-                disposition: ReconciliationDisposition::RetryIdempotent as i32,
-                evidence_id: "reconcile-evidence-001".to_owned(),
+                disposition: disposition as i32,
+                evidence_id: evidence_id.to_owned(),
             },
         )),
     };
@@ -858,9 +1162,10 @@ fn error_code(result: &CollaborationCommandResult) -> CollaborationErrorCode {
     }
 }
 
-fn load_snapshot(
-    control: &CollaborationControl<FixtureGuard, FixedClock>,
-) -> CollaborationSnapshot {
+fn load_snapshot<G>(control: &CollaborationControl<G, FixedClock>) -> CollaborationSnapshot
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+{
     match control
         .get_collaboration("run-001")
         .expect("get collaboration")
@@ -874,9 +1179,12 @@ fn load_snapshot(
     }
 }
 
-fn advance_through_lease(
-    control: &mut CollaborationControl<FixtureGuard, FixedClock>,
-) -> CollaborationSnapshot {
+fn advance_through_lease<G>(
+    control: &mut CollaborationControl<G, FixedClock>,
+) -> CollaborationSnapshot
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+{
     control
         .execute(&create_run_command(), &task_authority())
         .expect("create Run");
@@ -895,9 +1203,12 @@ fn advance_through_lease(
     committed_snapshot(&leased)
 }
 
-fn advance_through_dispatch(
-    control: &mut CollaborationControl<FixtureGuard, FixedClock>,
-) -> (CollaborationSnapshot, CollaborationCommand) {
+fn advance_through_dispatch<G>(
+    control: &mut CollaborationControl<G, FixedClock>,
+) -> (CollaborationSnapshot, CollaborationCommand)
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+{
     let leased = advance_through_lease(control);
     let command = dispatch_command(&leased);
     let dispatched = control
@@ -933,6 +1244,322 @@ fn advance_through_running(
             )
             .expect("running"),
     )
+}
+
+#[tokio::test]
+async fn fake_adapter_consumes_collaboration_outbox_and_settles_durable_candidates() {
+    let collaboration_store = IsolatedStore::new("collaboration-adapter-loop-authority");
+    let adapter_store = IsolatedStore::new("collaboration-adapter-loop-edge");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let bundle = br#"{"input":"governed-loop"}"#.to_vec();
+    let bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+    let writer_edge = open_loop_adapter_edge(&adapter_database);
+    let reader_edge = open_loop_adapter_edge(&adapter_database);
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: reader_edge,
+        input_bundle_sha256: bundle_sha256,
+    };
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let leased = advance_through_lease(&mut control);
+    let dispatch = dispatch_command_with_bundle(&leased, &hex::encode(Sha256::digest(&bundle)));
+    control
+        .execute(&dispatch, &attempt_supervisor())
+        .expect("commit Adapter loop dispatch intent");
+    let outbox = control
+        .pending_dispatches(&harness_adapter())
+        .expect("poll committed Collaboration dispatch outbox");
+    assert_eq!(outbox.len(), 1);
+    let envelope = outbox[0].envelope.clone();
+    let resolver = LoopMaterialResolver {
+        bundle,
+        workspace_root: adapter_store.root.clone(),
+    };
+    let mut adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        writer_edge,
+        resolver,
+        FakeCodexDriver::default(),
+        clock,
+    );
+
+    let dispatched = adapter
+        .dispatch(&envelope)
+        .await
+        .expect("dispatch committed envelope to fake Adapter");
+    let receipt = match dispatched.outcome.expect("dispatch outcome") {
+        dispatch_result::Outcome::Receipt(value) => value,
+        dispatch_result::Outcome::Error(error) => panic!("unexpected dispatch error: {error:?}"),
+    };
+    let delivered = control
+        .ingest_dispatch_receipt(&receipt, &harness_adapter())
+        .expect("commit Adapter delivery candidate");
+    assert_eq!(
+        delivered.disposition,
+        HarnessFactIngestionDisposition::Consumed
+    );
+
+    let ack = adapter
+        .pump_one(&envelope)
+        .await
+        .expect("pump ACK")
+        .expect("ACK observation");
+    let acknowledged = control
+        .ingest_harness_observation(&ack, &harness_adapter())
+        .expect("commit ACK candidate");
+    assert_eq!(
+        acknowledged.disposition,
+        HarnessFactIngestionDisposition::Consumed
+    );
+    adapter
+        .mark_observation_consumed(&ack.observation_id)
+        .expect("settle committed ACK candidate");
+
+    let running = adapter
+        .pump_one(&envelope)
+        .await
+        .expect("pump running")
+        .expect("running observation");
+    let started = control
+        .ingest_harness_observation(&running, &harness_adapter())
+        .expect("commit running candidate");
+    assert_eq!(
+        started.disposition,
+        HarnessFactIngestionDisposition::Consumed
+    );
+    adapter
+        .mark_observation_consumed(&running.observation_id)
+        .expect("settle committed running candidate");
+
+    let snapshot = load_snapshot(&control);
+    assert_eq!(
+        snapshot.run.as_ref().expect("run").status,
+        RunStatus::Active as i32
+    );
+    assert_eq!(snapshot.steps[0].status, StepStatus::Active as i32);
+    assert_eq!(snapshot.attempts[0].status, AttemptStatus::Running as i32);
+    assert_eq!(
+        snapshot.attempts[0].harness_session_ref.as_deref(),
+        Some("fake-thread-dispatch-001")
+    );
+    let cancellation_pending = committed_snapshot(
+        &control
+            .execute(&cancellation_request(&snapshot), &attempt_supervisor())
+            .expect("commit governed cancellation request"),
+    );
+    assert_eq!(
+        cancellation_pending.attempts[0].status,
+        AttemptStatus::CancellationPending as i32
+    );
+    adapter
+        .cancel_dispatch(
+            "task-cancel-001",
+            &envelope.dispatch_id,
+            Timestamp {
+                seconds: FIXED_TIME + 30,
+                nanos: 0,
+            },
+        )
+        .await
+        .expect("deliver cancellation by dispatch ID");
+    let interrupted = loop {
+        let observation = adapter
+            .pump_one(&envelope)
+            .await
+            .expect("pump cancellation candidate")
+            .expect("cancellation candidate");
+        if matches!(
+            observation.payload,
+            Some(harness_observation::Payload::Lifecycle(ref lifecycle))
+                if lifecycle.kind == LifecycleKind::ExecutionInterrupted as i32
+        ) {
+            break observation;
+        }
+        let routed = control
+            .ingest_harness_observation(&observation, &harness_adapter())
+            .expect("route pre-existing terminal candidate");
+        assert_eq!(
+            routed.disposition,
+            HarnessFactIngestionDisposition::DeferredToArtifactAuthority
+        );
+        adapter
+            .mark_observation_consumed(&observation.observation_id)
+            .expect("settle deferred terminal candidate");
+    };
+    let cancelled = control
+        .ingest_harness_observation(&interrupted, &harness_adapter())
+        .expect("confirm cancellation from durable Adapter interruption");
+    assert_eq!(
+        cancelled.disposition,
+        HarnessFactIngestionDisposition::Consumed
+    );
+    adapter
+        .mark_observation_consumed(&interrupted.observation_id)
+        .expect("settle committed interruption candidate");
+    let cancelled_snapshot = committed_snapshot(
+        cancelled
+            .authority_result
+            .as_ref()
+            .expect("cancel authority result"),
+    );
+    assert_eq!(
+        cancelled_snapshot.attempts[0].status,
+        AttemptStatus::Cancelled as i32
+    );
+    assert!(
+        adapter
+            .pending_observations()
+            .expect("pending observations")
+            .is_empty()
+    );
+    assert_eq!(adapter.driver().dispatch_count(), 1);
+    assert_eq!(adapter.driver().cancel_count(), 1);
+}
+
+#[tokio::test]
+async fn durable_adapter_reconciliation_evidence_recovers_outcome_unknown_authority() {
+    let collaboration_store = IsolatedStore::new("collaboration-adapter-reconciliation");
+    let adapter_store = IsolatedStore::new("collaboration-adapter-reconciliation-edge");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let bundle = br#"{"input":"reconcile-governed-loop"}"#.to_vec();
+    let bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+    let writer_edge = open_loop_adapter_edge(&adapter_database);
+    let reader_edge = open_loop_adapter_edge(&adapter_database);
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: reader_edge,
+        input_bundle_sha256: bundle_sha256.clone(),
+    };
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let leased = advance_through_lease(&mut control);
+    let dispatch = dispatch_command_with_bundle(&leased, &bundle_sha256);
+    control
+        .execute(&dispatch, &attempt_supervisor())
+        .expect("commit reconciliation dispatch intent");
+    let envelope = control
+        .pending_dispatches(&harness_adapter())
+        .expect("poll reconciliation dispatch")
+        .into_iter()
+        .next()
+        .expect("pending reconciliation envelope")
+        .envelope;
+    let resolver = LoopMaterialResolver {
+        bundle,
+        workspace_root: adapter_store.root.clone(),
+    };
+    let mut adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        writer_edge,
+        resolver,
+        FakeCodexDriver::default().with_reconciliation_finding(
+            ReconciliationFinding::NoEffectProven {
+                evidence_ref: "fixture://codex/fake/no-effect-proven".to_owned(),
+            },
+        ),
+        clock,
+    );
+    let dispatched = adapter.dispatch(&envelope).await.expect("dispatch fixture");
+    let receipt = match dispatched.outcome.expect("dispatch outcome") {
+        dispatch_result::Outcome::Receipt(value) => value,
+        dispatch_result::Outcome::Error(error) => panic!("unexpected dispatch error: {error:?}"),
+    };
+    control
+        .ingest_dispatch_receipt(&receipt, &harness_adapter())
+        .expect("ingest reconciliation delivery");
+    for expected in ["ACK", "running"] {
+        let observation = adapter
+            .pump_one(&envelope)
+            .await
+            .expect("pump fixture event")
+            .unwrap_or_else(|| panic!("missing {expected} observation"));
+        let ingested = control
+            .ingest_harness_observation(&observation, &harness_adapter())
+            .unwrap_or_else(|error| panic!("ingest {expected}: {error}"));
+        assert_eq!(
+            ingested.disposition,
+            HarnessFactIngestionDisposition::Consumed
+        );
+        adapter
+            .mark_observation_consumed(&observation.observation_id)
+            .expect("settle fixture observation");
+    }
+
+    let running = load_snapshot(&control);
+    let unknown = committed_snapshot(
+        &control
+            .execute(&unknown_command(&running), &recovery_worker())
+            .expect("mark external outcome unknown"),
+    );
+    let reconciling = committed_snapshot(
+        &control
+            .execute(
+                &begin_reconciliation(&unknown, "reconcile-adapter-001"),
+                &recovery_worker(),
+            )
+            .expect("begin Adapter reconciliation"),
+    );
+    let evidence = adapter
+        .reconcile_dispatch("reconcile-adapter-001", &envelope.dispatch_id)
+        .await
+        .expect("persist Adapter reconciliation evidence");
+    let unsafe_retry = reconciliation_result_with_evidence(
+        &reconciling,
+        "reconcile-adapter-001",
+        &evidence.evidence_id,
+        ReconciliationDisposition::RetryIdempotent,
+    );
+    let unsafe_retry = match unsafe_retry.command.as_ref().expect("unsafe retry command") {
+        collaboration_command::Command::RecordAttemptReconciliation(value) => value,
+        _ => panic!("expected reconciliation command"),
+    };
+    let audit_guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: bundle_sha256,
+    };
+    assert_eq!(
+        audit_guard.validate_reconciliation(unsafe_retry, &reconciling),
+        Err(ReferenceGuardRejection::UnverifiedReference),
+        "no-effect evidence must not authorize a caller-selected retry disposition"
+    );
+    let recovered = committed_snapshot(
+        &control
+            .execute(
+                &reconciliation_result_with_evidence(
+                    &reconciling,
+                    "reconcile-adapter-001",
+                    &evidence.evidence_id,
+                    ReconciliationDisposition::NoEffectProven,
+                ),
+                &recovery_worker(),
+            )
+            .expect("commit verified reconciliation result"),
+    );
+    assert_eq!(
+        recovered.run.as_ref().expect("run").status,
+        RunStatus::Active as i32
+    );
+    assert_eq!(
+        recovered.attempts[0].status,
+        AttemptStatus::Interrupted as i32
+    );
+    assert_eq!(
+        recovered.attempts[0].recovery_class,
+        RecoveryClass::RetryIdempotent as i32
+    );
+    assert_eq!(adapter.driver().reconcile_count(), 1);
+    let replayed = adapter
+        .reconcile_dispatch("reconcile-adapter-001", &envelope.dispatch_id)
+        .await
+        .expect("replay durable reconciliation evidence");
+    assert!(replayed.replayed);
+    assert_eq!(replayed.evidence_id, evidence.evidence_id);
+    assert_eq!(adapter.driver().reconcile_count(), 1);
 }
 
 #[test]

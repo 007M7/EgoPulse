@@ -1,12 +1,15 @@
-use crate::{AdapterEdge, AdapterEdgeError, DispatchPreparation, DurableWritePreparation};
+use crate::{
+    AdapterEdge, AdapterEdgeError, AdapterObservationEvidence, DispatchPreparation,
+    DurableWritePreparation,
+};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ApprovalDecisionEnvelope, ApprovalDecisionReceipt, ApprovalDecisionResult,
     CancelExecutionEnvelope, CancelExecutionReceipt, CancelExecutionResult,
-    CancellationDeliveryDisposition, DeliveryDisposition, DispatchEnvelope, DispatchReceipt,
-    DispatchResult, HarnessError, HarnessErrorCode, HarnessObservation, NativeProtocolFingerprint,
-    ObservationCriticality, ProbeHarnessRequest, ProbeHarnessResult, ResumeExecutionEnvelope,
-    ResumeExecutionResult, approval_decision_result, cancel_execution_result, dispatch_result,
-    harness_observation, resume_execution_result,
+    CancellationDeliveryDisposition, DeliveryDisposition, DiagnosticObservation, DispatchEnvelope,
+    DispatchReceipt, DispatchResult, HarnessError, HarnessErrorCode, HarnessObservation,
+    NativeProtocolFingerprint, ObservationCriticality, ProbeHarnessRequest, ProbeHarnessResult,
+    ResumeExecutionEnvelope, ResumeExecutionResult, approval_decision_result,
+    cancel_execution_result, dispatch_result, harness_observation, resume_execution_result,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -93,6 +96,16 @@ pub enum ReconciliationFinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdapterReconciliationEvidence {
+    pub reconciliation_id: String,
+    pub dispatch_id: String,
+    pub evidence_id: String,
+    pub raw_evidence_ref: String,
+    pub finding: ReconciliationFinding,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReconciliationContext {
     pub envelope: DispatchEnvelope,
     pub delivery_receipt: Option<DispatchReceipt>,
@@ -135,6 +148,12 @@ pub enum GovernedAdapterError {
     Decode(#[from] prost::DecodeError),
     #[error("adapter durable edge failed")]
     Edge(#[from] AdapterEdgeError),
+    #[error("reconciliation reference is invalid")]
+    InvalidReconciliationReference,
+    #[error("the durable dispatch could not be found")]
+    DispatchNotFound,
+    #[error("durable reconciliation evidence is invalid")]
+    InvalidReconciliationEvidence,
 }
 
 pub struct GovernedHarnessAdapter<R, D, C> {
@@ -517,27 +536,124 @@ where
         .await
     }
 
-    pub async fn reconcile(
+    pub async fn reconcile_dispatch(
         &mut self,
-        envelope: &DispatchEnvelope,
-    ) -> Result<ReconciliationFinding, DriverError> {
-        let material = self
-            .resolver
-            .resolve(envelope)
-            .map_err(resolver_driver_error)?;
-        let delivery_receipt =
-            self.edge
-                .dispatch_receipt(&envelope.dispatch_id)
-                .map_err(|error| {
-                    driver_error_from_edge("ADAPTER_EDGE_RECONCILE_READ_FAILED", &error)
-                })?;
-        self.driver
-            .reconcile(&ReconciliationContext {
-                envelope: envelope.clone(),
-                delivery_receipt,
-                material,
+        reconciliation_id: &str,
+        dispatch_id: &str,
+    ) -> Result<AdapterReconciliationEvidence, GovernedAdapterError> {
+        if reconciliation_id.trim().is_empty() || dispatch_id.trim().is_empty() {
+            return Err(GovernedAdapterError::InvalidReconciliationReference);
+        }
+        let native_key = reconciliation_native_key(reconciliation_id);
+        if let Some(evidence) = self
+            .edge
+            .observation_evidence_by_native_key(dispatch_id, &native_key)?
+        {
+            return decode_reconciliation_evidence(reconciliation_id, dispatch_id, evidence, true);
+        }
+        let envelope = self
+            .edge
+            .dispatch_envelope(dispatch_id)?
+            .ok_or(GovernedAdapterError::DispatchNotFound)?;
+        let delivery_receipt = self.edge.dispatch_receipt(dispatch_id)?;
+        let now = self.clock.now();
+        let (finding, supplemental_raw_evidence) = match self.resolver.resolve(&envelope) {
+            Ok(material) => match self
+                .driver
+                .reconcile(&ReconciliationContext {
+                    envelope: envelope.clone(),
+                    delivery_receipt,
+                    material,
+                })
+                .await
+            {
+                Ok(finding) => (finding, Vec::new()),
+                Err(error) => {
+                    let evidence_ref = error
+                        .error_fingerprint
+                        .as_ref()
+                        .map(|value| format!("error-fingerprint:{value}"))
+                        .unwrap_or_else(|| {
+                            format!("adapter-reconciliation-error:{}", error.safe_detail_code)
+                        });
+                    (
+                        ReconciliationFinding::OutcomeUnknown { evidence_ref },
+                        error.raw_evidence,
+                    )
+                }
+            },
+            Err(error) => {
+                let evidence_ref = error
+                    .error_fingerprint
+                    .as_ref()
+                    .map(|value| format!("error-fingerprint:{value}"))
+                    .unwrap_or_else(|| {
+                        format!("adapter-reconciliation-error:{}", error.safe_detail_code)
+                    });
+                (
+                    ReconciliationFinding::OutcomeUnknown { evidence_ref },
+                    error.encode_to_vec(),
+                )
+            }
+        };
+        let raw_event = encode_reconciliation_evidence(&finding, &supplemental_raw_evidence);
+        let observation = HarnessObservation {
+            observation_id: String::new(),
+            adapter_id: self.adapter_id.clone(),
+            attempt_id: envelope.attempt_id,
+            dispatch_id: envelope.dispatch_id.clone(),
+            fencing_token: envelope.fencing_token,
+            observation_sequence: 0,
+            native_event_id: Some(reconciliation_id.to_owned()),
+            native_sequence: None,
+            native_event_digest_sha256: String::new(),
+            capability_profile_id: self.capability_profile_id.clone(),
+            criticality: ObservationCriticality::Informational as i32,
+            raw_evidence_ref: String::new(),
+            native_observed_at: Some(now),
+            adapter_received_at: Some(now),
+            payload: Some(harness_observation::Payload::Diagnostic(
+                DiagnosticObservation {
+                    safe_diagnostic_code: reconciliation_diagnostic_code(&finding).to_owned(),
+                    error_fingerprint: None,
+                    recovery_required: false,
+                },
+            )),
+        };
+        let appended = self.edge.append_observation(
+            dispatch_id,
+            &native_key,
+            &raw_event,
+            observation,
+            now.seconds,
+        )?;
+        let (observation, replayed) = match appended {
+            crate::ObservationAppend::Committed(value) => (value, false),
+            crate::ObservationAppend::Replay(value) => (value, true),
+        };
+        decode_reconciliation_evidence(
+            reconciliation_id,
+            dispatch_id,
+            AdapterObservationEvidence {
+                observation,
+                raw_event,
+            },
+            replayed,
+        )
+    }
+
+    pub fn reconciliation_evidence(
+        &self,
+        reconciliation_id: &str,
+        dispatch_id: &str,
+    ) -> Result<Option<AdapterReconciliationEvidence>, GovernedAdapterError> {
+        let native_key = reconciliation_native_key(reconciliation_id);
+        self.edge
+            .observation_evidence_by_native_key(dispatch_id, &native_key)?
+            .map(|evidence| {
+                decode_reconciliation_evidence(reconciliation_id, dispatch_id, evidence, true)
             })
-            .await
+            .transpose()
     }
 
     pub fn observations_after(
@@ -748,6 +864,126 @@ fn cancellation_delivery_receipt(
     receipt
 }
 
+const RECONCILIATION_EVIDENCE_MAGIC: &[u8] = b"EGOPULSE_RECONCILIATION_EVIDENCE_V1\0";
+
+fn reconciliation_native_key(reconciliation_id: &str) -> String {
+    format!("reconciliation:{reconciliation_id}")
+}
+
+fn reconciliation_diagnostic_code(finding: &ReconciliationFinding) -> &'static str {
+    match finding {
+        ReconciliationFinding::NoEffectProven { .. } => "ADAPTER_RECONCILIATION_NO_EFFECT_PROVEN",
+        ReconciliationFinding::NativeExecutionActive { .. } => {
+            "ADAPTER_RECONCILIATION_NATIVE_EXECUTION_ACTIVE"
+        }
+        ReconciliationFinding::TerminalObservationRecovered { .. } => {
+            "ADAPTER_RECONCILIATION_TERMINAL_OBSERVATION_RECOVERED"
+        }
+        ReconciliationFinding::OutcomeUnknown { .. } => "ADAPTER_RECONCILIATION_OUTCOME_UNKNOWN",
+    }
+}
+
+fn reconciliation_kind(finding: &ReconciliationFinding) -> u8 {
+    match finding {
+        ReconciliationFinding::NoEffectProven { .. } => 1,
+        ReconciliationFinding::NativeExecutionActive { .. } => 2,
+        ReconciliationFinding::TerminalObservationRecovered { .. } => 3,
+        ReconciliationFinding::OutcomeUnknown { .. } => 4,
+    }
+}
+
+fn reconciliation_evidence_ref(finding: &ReconciliationFinding) -> &str {
+    match finding {
+        ReconciliationFinding::NoEffectProven { evidence_ref }
+        | ReconciliationFinding::NativeExecutionActive { evidence_ref }
+        | ReconciliationFinding::TerminalObservationRecovered { evidence_ref }
+        | ReconciliationFinding::OutcomeUnknown { evidence_ref } => evidence_ref,
+    }
+}
+
+fn encode_reconciliation_evidence(
+    finding: &ReconciliationFinding,
+    supplemental_raw_evidence: &[u8],
+) -> Vec<u8> {
+    let evidence_ref = reconciliation_evidence_ref(finding).as_bytes();
+    let length = u32::try_from(evidence_ref.len()).unwrap_or(u32::MAX);
+    let mut encoded = Vec::with_capacity(
+        RECONCILIATION_EVIDENCE_MAGIC.len()
+            + 1
+            + size_of::<u32>()
+            + evidence_ref.len()
+            + supplemental_raw_evidence.len(),
+    );
+    encoded.extend_from_slice(RECONCILIATION_EVIDENCE_MAGIC);
+    encoded.push(reconciliation_kind(finding));
+    encoded.extend_from_slice(&length.to_be_bytes());
+    encoded.extend_from_slice(evidence_ref);
+    encoded.extend_from_slice(supplemental_raw_evidence);
+    encoded
+}
+
+fn decode_reconciliation_finding(
+    raw_evidence: &[u8],
+) -> Result<ReconciliationFinding, GovernedAdapterError> {
+    let header_length = RECONCILIATION_EVIDENCE_MAGIC.len() + 1 + size_of::<u32>();
+    if raw_evidence.len() < header_length
+        || !raw_evidence.starts_with(RECONCILIATION_EVIDENCE_MAGIC)
+    {
+        return Err(GovernedAdapterError::InvalidReconciliationEvidence);
+    }
+    let kind = raw_evidence[RECONCILIATION_EVIDENCE_MAGIC.len()];
+    let length_start = RECONCILIATION_EVIDENCE_MAGIC.len() + 1;
+    let length = u32::from_be_bytes(
+        raw_evidence[length_start..length_start + size_of::<u32>()]
+            .try_into()
+            .map_err(|_| GovernedAdapterError::InvalidReconciliationEvidence)?,
+    ) as usize;
+    let evidence_start = header_length;
+    let evidence_end = evidence_start
+        .checked_add(length)
+        .filter(|value| *value <= raw_evidence.len())
+        .ok_or(GovernedAdapterError::InvalidReconciliationEvidence)?;
+    let evidence_ref = std::str::from_utf8(&raw_evidence[evidence_start..evidence_end])
+        .map_err(|_| GovernedAdapterError::InvalidReconciliationEvidence)?
+        .to_owned();
+    if evidence_ref.trim().is_empty() {
+        return Err(GovernedAdapterError::InvalidReconciliationEvidence);
+    }
+    match kind {
+        1 => Ok(ReconciliationFinding::NoEffectProven { evidence_ref }),
+        2 => Ok(ReconciliationFinding::NativeExecutionActive { evidence_ref }),
+        3 => Ok(ReconciliationFinding::TerminalObservationRecovered { evidence_ref }),
+        4 => Ok(ReconciliationFinding::OutcomeUnknown { evidence_ref }),
+        _ => Err(GovernedAdapterError::InvalidReconciliationEvidence),
+    }
+}
+
+fn decode_reconciliation_evidence(
+    reconciliation_id: &str,
+    dispatch_id: &str,
+    evidence: AdapterObservationEvidence,
+    replayed: bool,
+) -> Result<AdapterReconciliationEvidence, GovernedAdapterError> {
+    if evidence.observation.dispatch_id != dispatch_id
+        || evidence.observation.native_event_id.as_deref() != Some(reconciliation_id)
+        || !matches!(
+            evidence.observation.payload,
+            Some(harness_observation::Payload::Diagnostic(_))
+        )
+    {
+        return Err(GovernedAdapterError::InvalidReconciliationEvidence);
+    }
+    let finding = decode_reconciliation_finding(&evidence.raw_event)?;
+    Ok(AdapterReconciliationEvidence {
+        reconciliation_id: reconciliation_id.to_owned(),
+        dispatch_id: dispatch_id.to_owned(),
+        evidence_id: evidence.observation.observation_id,
+        raw_evidence_ref: evidence.observation.raw_evidence_ref,
+        finding,
+        replayed,
+    })
+}
+
 fn driver_error_event(error: DriverError, now: Timestamp) -> DriverEvent {
     let fingerprint = error.error_fingerprint.clone();
     let criticality = if error.code == HarnessErrorCode::UnknownCriticalEvent {
@@ -778,26 +1014,6 @@ fn driver_error_event(error: DriverError, now: Timestamp) -> DriverEvent {
             },
         ),
         raw_event: error.raw_evidence,
-    }
-}
-
-fn resolver_driver_error(error: HarnessError) -> DriverError {
-    DriverError {
-        certainty: DriverErrorCertainty::ProvenNotSent,
-        code: HarnessErrorCode::try_from(error.code).unwrap_or(HarnessErrorCode::Internal),
-        safe_detail_code: error.safe_detail_code,
-        error_fingerprint: error.error_fingerprint,
-        raw_evidence: Vec::new(),
-    }
-}
-
-fn driver_error_from_edge(detail: &str, error: &AdapterEdgeError) -> DriverError {
-    DriverError {
-        certainty: DriverErrorCertainty::DeliveryUnknown,
-        code: HarnessErrorCode::DependencyUnavailable,
-        safe_detail_code: detail.to_owned(),
-        error_fingerprint: Some(sha256(format!("{error:?}").as_bytes())),
-        raw_evidence: Vec::new(),
     }
 }
 

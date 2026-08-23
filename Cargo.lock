@@ -1081,7 +1081,9 @@ dependencies = [
 name = "egopulse-local-ide-control"
 version = "0.1.0"
 dependencies = [
+ "egopulse-codex-adapter",
  "egopulse-domain-contracts",
+ "egopulse-harness-adapter",
  "hex",
  "prost",
  "prost-types",
@@ -1089,6 +1091,7 @@ dependencies = [
  "rusqlite_migration",
  "sha2",
  "thiserror 2.0.20",
+ "tokio",
  "uuid",
  "zeroize",
 ]

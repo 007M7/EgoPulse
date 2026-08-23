@@ -1,5 +1,6 @@
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    DeliveryDisposition, DispatchEnvelope, DispatchReceipt, HarnessObservation, harness_observation,
+    CancelExecutionReceipt, DeliveryDisposition, DispatchEnvelope, DispatchReceipt,
+    HarnessObservation, harness_observation,
 };
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -165,6 +166,12 @@ pub struct NativeExecutionBinding {
     pub fencing_token: u64,
     pub native_session_ref: String,
     pub native_execution_ref: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdapterObservationEvidence {
+    pub observation: HarnessObservation,
+    pub raw_event: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -541,6 +548,109 @@ impl AdapterEdge {
             .flatten();
         bytes
             .map(|value| DispatchReceipt::decode(value.as_slice()).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn dispatch_envelope(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<DispatchEnvelope>, AdapterEdgeError> {
+        let bytes: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT envelope FROM adapter_dispatches WHERE dispatch_id = ?1",
+                [dispatch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        bytes
+            .map(|value| DispatchEnvelope::decode(value.as_slice()).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn observation_evidence(
+        &self,
+        observation_id: &str,
+    ) -> Result<Option<AdapterObservationEvidence>, AdapterEdgeError> {
+        self.connection
+            .query_row(
+                "SELECT observation, raw_event FROM adapter_observations
+                 WHERE observation_id = ?1",
+                [observation_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?
+            .map(|(observation, raw_event)| {
+                Ok(AdapterObservationEvidence {
+                    observation: HarnessObservation::decode(observation.as_slice())?,
+                    raw_event,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn observation_evidence_by_native_key(
+        &self,
+        dispatch_id: &str,
+        native_key: &str,
+    ) -> Result<Option<AdapterObservationEvidence>, AdapterEdgeError> {
+        self.connection
+            .query_row(
+                "SELECT observation, raw_event FROM adapter_observations
+                 WHERE dispatch_id = ?1 AND native_key = ?2",
+                params![dispatch_id, native_key],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?
+            .map(|(observation, raw_event)| {
+                Ok(AdapterObservationEvidence {
+                    observation: HarnessObservation::decode(observation.as_slice())?,
+                    raw_event,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn observation_evidence_by_sequence(
+        &self,
+        dispatch_id: &str,
+        observation_sequence: u64,
+    ) -> Result<Option<AdapterObservationEvidence>, AdapterEdgeError> {
+        let observation_sequence =
+            i64::try_from(observation_sequence).map_err(|_| AdapterEdgeError::SequenceConflict)?;
+        self.connection
+            .query_row(
+                "SELECT observation, raw_event FROM adapter_observations
+                 WHERE dispatch_id = ?1 AND observation_sequence = ?2",
+                params![dispatch_id, observation_sequence],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?
+            .map(|(observation, raw_event)| {
+                Ok(AdapterObservationEvidence {
+                    observation: HarnessObservation::decode(observation.as_slice())?,
+                    raw_event,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn cancellation_receipt(
+        &self,
+        cancellation_request_id: &str,
+    ) -> Result<Option<CancelExecutionReceipt>, AdapterEdgeError> {
+        let bytes: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT receipt FROM adapter_cancellations
+                 WHERE cancellation_request_id = ?1",
+                [cancellation_request_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        bytes
+            .map(|value| CancelExecutionReceipt::decode(value.as_slice()).map_err(Into::into))
             .transpose()
     }
 

@@ -132,7 +132,7 @@ async fn fake_codex_consumes_the_same_provider_neutral_contract_and_replays_dura
         CODEX_CAPABILITY_PROFILE_ID,
         codex_protocol_fingerprint(),
         open_edge(&root.0),
-        resolver,
+        resolver.clone(),
         FakeCodexDriver::default(),
         FixedClock,
     );
@@ -236,21 +236,61 @@ async fn fake_codex_consumes_the_same_provider_neutral_contract_and_replays_dura
             if value.kind == LifecycleKind::ExecutionInterrupted as i32
     ));
 
+    let reconciliation = adapter
+        .reconcile_dispatch("reconcile-001", &dispatch.dispatch_id)
+        .await
+        .expect("reconcile fixture");
     assert!(matches!(
-        adapter
-            .reconcile(&dispatch)
-            .await
-            .expect("reconcile fixture"),
+        reconciliation.finding,
         ReconciliationFinding::TerminalObservationRecovered { .. }
     ));
+    assert!(!reconciliation.replayed);
+    assert_eq!(adapter.driver().reconcile_count(), 1);
+    let replayed_reconciliation = adapter
+        .reconcile_dispatch("reconcile-001", &dispatch.dispatch_id)
+        .await
+        .expect("replay reconciliation fixture");
+    assert!(replayed_reconciliation.replayed);
+    assert_eq!(
+        replayed_reconciliation.evidence_id,
+        reconciliation.evidence_id
+    );
+    assert_eq!(adapter.driver().reconcile_count(), 1);
+    assert_eq!(
+        adapter
+            .reconciliation_evidence("reconcile-001", &dispatch.dispatch_id)
+            .expect("resolve reconciliation evidence")
+            .expect("durable reconciliation evidence")
+            .evidence_id,
+        reconciliation.evidence_id
+    );
     assert_eq!(
         adapter
             .observations_after(0)
             .expect("read durable events")
             .len(),
-        4
+        5
     );
     assert!(adapter.edge().integrity_is_ok().expect("edge integrity"));
+
+    let durable_evidence_id = reconciliation.evidence_id;
+    drop(adapter);
+    let mut recovered = GovernedHarnessAdapter::new(
+        "codex-adapter:test",
+        CODEX_CAPABILITY_PROFILE_ID,
+        codex_protocol_fingerprint(),
+        open_edge(&root.0),
+        resolver,
+        FakeCodexDriver::default(),
+        FixedClock,
+    );
+    let recovered_reconciliation = recovered
+        .reconcile_dispatch("reconcile-001", &dispatch.dispatch_id)
+        .await
+        .expect("recover durable reconciliation evidence");
+    assert!(recovered_reconciliation.replayed);
+    assert_eq!(recovered_reconciliation.evidence_id, durable_evidence_id);
+    assert_eq!(recovered.driver().reconcile_count(), 0);
 }
 
 #[tokio::test]

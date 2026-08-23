@@ -19,6 +19,8 @@ pub struct FakeCodexDriver {
     events: VecDeque<DriverEvent>,
     dispatch_count: u64,
     cancel_count: u64,
+    reconcile_count: u64,
+    reconciliation_finding: Option<ReconciliationFinding>,
 }
 
 impl FakeCodexDriver {
@@ -30,6 +32,17 @@ impl FakeCodexDriver {
     #[must_use]
     pub const fn cancel_count(&self) -> u64 {
         self.cancel_count
+    }
+
+    #[must_use]
+    pub const fn reconcile_count(&self) -> u64 {
+        self.reconcile_count
+    }
+
+    #[must_use]
+    pub fn with_reconciliation_finding(mut self, finding: ReconciliationFinding) -> Self {
+        self.reconciliation_finding = Some(finding);
+        self
     }
 }
 
@@ -133,9 +146,12 @@ impl NativeHarnessDriver for FakeCodexDriver {
         &mut self,
         _context: &ReconciliationContext,
     ) -> Result<ReconciliationFinding, DriverError> {
-        Ok(ReconciliationFinding::TerminalObservationRecovered {
-            evidence_ref: "fixture://codex/fake/reconciled".to_owned(),
-        })
+        self.reconcile_count += 1;
+        Ok(self.reconciliation_finding.clone().unwrap_or_else(|| {
+            ReconciliationFinding::TerminalObservationRecovered {
+                evidence_ref: "fixture://codex/fake/reconciled".to_owned(),
+            }
+        }))
     }
 }
 

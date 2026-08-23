@@ -17,5 +17,10 @@ thiserror.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+egopulse-codex-adapter.workspace = true
+egopulse-harness-adapter.workspace = true
+tokio.workspace = true
+
 [lib]
 path = "src/lib.rs"

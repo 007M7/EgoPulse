@@ -6,10 +6,11 @@ mod runtime;
 
 pub use edge::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeInspection, AdapterEdgeKey,
-    DispatchPreparation, DurableWritePreparation, NativeExecutionBinding, ObservationAppend,
+    AdapterObservationEvidence, DispatchPreparation, DurableWritePreparation,
+    NativeExecutionBinding, ObservationAppend,
 };
 pub use runtime::{
-    AdapterClock, DispatchMaterialResolver, DriverDelivery, DriverError, DriverErrorCertainty,
-    DriverEvent, GovernedHarnessAdapter, NativeHarnessDriver, ReconciliationContext,
-    ReconciliationFinding, ResolvedDispatchMaterial, SystemAdapterClock,
+    AdapterClock, AdapterReconciliationEvidence, DispatchMaterialResolver, DriverDelivery,
+    DriverError, DriverErrorCertainty, DriverEvent, GovernedHarnessAdapter, NativeHarnessDriver,
+    ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial, SystemAdapterClock,
 };

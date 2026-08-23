@@ -78,6 +78,22 @@ dispatch by itself.
   require Adapter quarantine;
 - cancellation is confirmed only by a structured interruption observation while cancellation is
   pending; cancellation delivery is not treated as execution termination.
+- reconciliation probes restore the immutable dispatch and native execution binding by
+  `dispatch_id`, then persist a provider-neutral diagnostic observation and encrypted raw evidence;
+- `(dispatch_id, reconciliation_id)` is idempotent across process restart: replay resolves the same
+  evidence ID without another native reconcile call;
+- the Adapter-backed evidence resolver verifies delivery, ACK, running, structured interruption and
+  reconciliation evidence from the independent Adapter SQLCipher edge before Collaboration writes;
+- the integrated fake-Harness path now proves committed outbox consumption, delivery, ACK, running,
+  terminal-candidate deferral, cancellation confirmation and `outcome_unknown -> reconciling ->
+  interrupted/retry-idempotent` recovery from a matching `no_effect_proven` finding without leaking
+  native execution references into Collaboration;
+- Adapter evidence identity alone cannot authorize a caller-selected recovery disposition. The
+  resolver currently permits only `no_effect_proven -> no_effect_proven`; recovered terminal,
+  active-execution and outcome-unknown findings require the appropriate Artifact, checkpoint,
+  side-effect or human authority before C-02 may advance.
 
-G4-04 remains open until durable reconciliation evidence, Adapter-backed evidence resolution and
-the complete fake/real contract audit are closed.
+The concrete resolver composition currently lives in the G4-04 integration harness. The production
+daemon composition root is deliberately deferred to G4-08; the production ports and durable Adapter
+read APIs are already present. G4-04 remains open only until the complete fake/real contract and
+provider-boundary audit is closed.
