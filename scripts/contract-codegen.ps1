@@ -47,6 +47,24 @@ function Invoke-Checked {
     }
 }
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [IO.File]::OpenRead($LiteralPath)
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+        }
+        finally {
+            $sha256.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 function Get-RelativeFiles {
     param([string]$Root)
     if (-not (Test-Path -LiteralPath $Root)) { return @() }
@@ -81,8 +99,8 @@ function Compare-GeneratedTree {
     foreach ($relativePath in $expectedFiles) {
         $expectedPath = Join-Path $ExpectedRoot ($relativePath.Replace('/', '\'))
         $actualPath = Join-Path $ActualRoot ($relativePath.Replace('/', '\'))
-        $expectedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $expectedPath).Hash
-        $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $actualPath).Hash
+        $expectedHash = Get-Sha256Hex -LiteralPath $expectedPath
+        $actualHash = Get-Sha256Hex -LiteralPath $actualPath
         if ($expectedHash -ne $actualHash) {
             throw "$Label generated file digest drift: $relativePath"
         }
@@ -114,7 +132,7 @@ function Get-ManifestEntries {
         $sourcePath = Join-Path $SourceRoot ($relativePath.Replace('/', '\'))
         $entries += [ordered]@{
             path = "$DestinationPrefix/$relativePath"
-            sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourcePath).Hash.ToLowerInvariant()
+            sha256 = Get-Sha256Hex -LiteralPath $sourcePath
         }
     }
     return $entries
@@ -125,7 +143,7 @@ Assert-UnderRepository -Path $typescriptDestination
 Assert-UnderRepository -Path $rustDestination
 Assert-UnderRepository -Path $pythonDestination
 
-$contractManifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $contractManifestPath).Hash.ToLowerInvariant()
+$contractManifestHash = Get-Sha256Hex -LiteralPath $contractManifestPath
 if ($contractManifestHash -ne $expectedContractManifestSha256) {
     throw "contract manifest digest mismatch: $contractManifestHash"
 }
@@ -150,11 +168,11 @@ if (-not (Test-Path -LiteralPath $prostExecutable)) {
     if (-not ($IsWindows -or $env:OS -eq 'Windows_NT')) {
         throw 'G4-01 protoc-gen-prost bootstrap currently supports only the accepted Windows x86_64 CI baseline'
     }
-    $actualVendorHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $vendoredProstArchive).Hash.ToLowerInvariant()
+    $actualVendorHash = Get-Sha256Hex -LiteralPath $vendoredProstArchive
     if ($actualVendorHash -ne $vendoredProstSha256) {
         throw "vendored protoc-gen-prost archive digest mismatch: $actualVendorHash"
     }
-    $actualBinaryHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $vendoredProstWindowsBinary).Hash.ToLowerInvariant()
+    $actualBinaryHash = Get-Sha256Hex -LiteralPath $vendoredProstWindowsBinary
     if ($actualBinaryHash -ne $vendoredProstWindowsBinarySha256) {
         throw "vendored protoc-gen-prost binary digest mismatch: $actualBinaryHash"
     }

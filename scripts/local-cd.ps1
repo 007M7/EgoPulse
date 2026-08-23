@@ -45,6 +45,24 @@ function Invoke-External {
     }
 }
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [IO.File]::OpenRead($LiteralPath)
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+        }
+        finally {
+            $sha256.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 if (-not $SkipCi) {
     & (Join-Path $PSScriptRoot 'local-ci.ps1')
     if ($LASTEXITCODE -ne 0) { throw "Local CI failed with exit code $LASTEXITCODE" }
@@ -114,14 +132,14 @@ $hashLines = Get-ChildItem -LiteralPath $candidateRoot -Recurse -File |
     Sort-Object FullName |
     ForEach-Object {
         $relative = $_.FullName.Substring($candidateRoot.Length + 1).Replace('\', '/')
-        $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $hash = Get-Sha256Hex -LiteralPath $_.FullName
         "$hash  $relative"
     }
 $hashLines | Set-Content -LiteralPath (Join-Path $candidateRoot 'SHA256SUMS') -Encoding ascii
 
 $zipPath = "$candidateRoot.zip"
 Compress-Archive -LiteralPath $candidateRoot -DestinationPath $zipPath -CompressionLevel Optimal
-$zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$zipHash = Get-Sha256Hex -LiteralPath $zipPath
 Set-Content -LiteralPath "$zipPath.sha256" -Value "$zipHash  $([IO.Path]::GetFileName($zipPath))" -Encoding ascii
 
 Write-Output "local_cd=passed classification=unsigned-release-candidate commit=$head"
