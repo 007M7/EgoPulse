@@ -45,25 +45,70 @@ for (const file of filesUnder("crates/domain-contracts")) {
 const nonAuthorityRoots = [
   "apps",
   "crates/local-api",
-  "crates/local-ide-control",
   "crates/process-supervision",
   "packages",
   "workers"
 ];
-const authorityStorageTerms = [
+const directDatabaseTerms = [
   "rusqlite",
   "libsqlite3_sys",
-  "bundled-sqlcipher",
-  "task-authority.sqlcipher",
-  "task_authority::store"
+  "bundled-sqlcipher"
 ];
 for (const root of nonAuthorityRoots) {
   for (const file of filesUnder(root)) {
     if (!/\.(rs|toml|ts|tsx|js|mjs|py|json)$/.test(file)) continue;
     const text = readFileSync(file, "utf8").toLowerCase();
-    for (const term of authorityStorageTerms) {
+    for (const term of directDatabaseTerms) {
+      if (text.includes(term)) {
+        throw new Error(`${relative(".", file)} attempts to own an Authority database: ${term}`);
+      }
+    }
+  }
+}
+
+const taskNonOwnerRoots = [
+  "apps",
+  "crates/local-api",
+  "crates/local-ide-control",
+  "crates/process-supervision",
+  "packages",
+  "workers"
+];
+const taskAuthorityStorageTerms = [
+  "task-authority.sqlcipher",
+  "task_authority::store"
+];
+for (const root of taskNonOwnerRoots) {
+  for (const file of filesUnder(root)) {
+    if (!/\.(rs|toml|ts|tsx|js|mjs|py|json)$/.test(file)) continue;
+    const text = readFileSync(file, "utf8").toLowerCase();
+    for (const term of taskAuthorityStorageTerms) {
       if (text.includes(term)) {
         throw new Error(`${relative(".", file)} attempts to depend on Task Authority storage: ${term}`);
+      }
+    }
+  }
+}
+
+const collaborationNonOwnerRoots = [
+  "apps",
+  "crates/cognition-runtime",
+  "crates/local-api",
+  "crates/process-supervision",
+  "packages",
+  "workers"
+];
+const collaborationStorageTerms = [
+  "collaboration-control.sqlcipher",
+  "collaboration_control::store"
+];
+for (const root of collaborationNonOwnerRoots) {
+  for (const file of filesUnder(root)) {
+    if (!/\.(rs|toml|ts|tsx|js|mjs|py|json)$/.test(file)) continue;
+    const text = readFileSync(file, "utf8").toLowerCase();
+    for (const term of collaborationStorageTerms) {
+      if (text.includes(term)) {
+        throw new Error(`${relative(".", file)} attempts to depend on Collaboration storage: ${term}`);
       }
     }
   }

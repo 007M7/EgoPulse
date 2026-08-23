@@ -1048,6 +1048,15 @@ name = "egopulse-local-ide-control"
 version = "0.1.0"
 dependencies = [
  "egopulse-domain-contracts",
+ "hex",
+ "prost",
+ "prost-types",
+ "rusqlite",
+ "rusqlite_migration",
+ "sha2",
+ "thiserror 2.0.20",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
