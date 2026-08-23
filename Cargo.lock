@@ -1004,6 +1004,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "egopulse-codex-adapter"
+version = "0.1.0"
+dependencies = [
+ "egopulse-domain-contracts",
+ "egopulse-harness-adapter",
+ "egopulse-process-supervision",
+ "hex",
+ "prost",
+ "prost-types",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "egopulse-cognition-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1037,6 +1054,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "egopulse-harness-adapter"
+version = "0.1.0"
+dependencies = [
+ "egopulse-domain-contracts",
+ "hex",
+ "prost",
+ "prost-types",
+ "rusqlite",
+ "rusqlite_migration",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "egopulse-local-api"
 version = "0.1.0"
 dependencies = [
@@ -1064,6 +1098,7 @@ name = "egopulse-process-supervision"
 version = "0.1.0"
 dependencies = [
  "egopulse-domain-contracts",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]

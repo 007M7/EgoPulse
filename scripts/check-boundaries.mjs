@@ -9,6 +9,8 @@ const required = [
   "apps/desktop/package.json",
   "crates/domain-contracts/Cargo.toml",
   "crates/cognition-runtime/Cargo.toml",
+  "crates/harness-adapter/Cargo.toml",
+  "crates/codex-adapter/Cargo.toml",
   "crates/local-ide-control/Cargo.toml",
   "packages/native-harness/package.json",
   "workers/foundation-probe/pyproject.toml",
@@ -109,6 +111,28 @@ for (const root of collaborationNonOwnerRoots) {
     for (const term of collaborationStorageTerms) {
       if (text.includes(term)) {
         throw new Error(`${relative(".", file)} attempts to depend on Collaboration storage: ${term}`);
+      }
+    }
+  }
+}
+
+const providerPrivateProtocolTerms = [
+  "codex-app-server",
+  "thread/start",
+  "thread/read",
+  "turn/start",
+  "turn/interrupt"
+];
+const providerNeutralRoots = ["apps", "crates", "packages", "workers"];
+for (const root of providerNeutralRoots) {
+  for (const file of filesUnder(root)) {
+    const normalized = relative(".", file).replaceAll("\\", "/");
+    if (normalized.startsWith("crates/codex-adapter/")) continue;
+    if (!/\.(rs|toml|ts|tsx|js|mjs|py|json)$/.test(file)) continue;
+    const text = readFileSync(file, "utf8").toLowerCase();
+    for (const term of providerPrivateProtocolTerms) {
+      if (text.includes(term)) {
+        throw new Error(`${normalized} leaks Codex-private protocol term: ${term}`);
       }
     }
   }
