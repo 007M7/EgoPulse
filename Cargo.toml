@@ -13,7 +13,8 @@ members = [
   "crates/harness-adapter",
   "crates/codex-adapter",
   "crates/artifact-authority",
-  "crates/verification-authority"
+  "crates/verification-authority",
+  "crates/founder-verdict-authority"
 ]
 
 [workspace.package]
@@ -51,6 +52,7 @@ egopulse-harness-adapter = { path = "crates/harness-adapter" }
 egopulse-codex-adapter = { path = "crates/codex-adapter" }
 egopulse-artifact-authority = { path = "crates/artifact-authority" }
 egopulse-verification-authority = { path = "crates/verification-authority" }
+egopulse-founder-verdict-authority = { path = "crates/founder-verdict-authority" }
 
 [profile.release]
 codegen-units = 1
