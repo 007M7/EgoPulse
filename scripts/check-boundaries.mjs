@@ -24,6 +24,7 @@ function filesUnder(root) {
   const result = [];
   for (const entry of readdirSync(root)) {
     const path = join(root, entry);
+    if (["node_modules", "target", ".venv", "generated"].includes(entry)) continue;
     if (statSync(path).isDirectory()) result.push(...filesUnder(path));
     else result.push(path);
   }
@@ -37,6 +38,33 @@ for (const file of filesUnder("crates/domain-contracts")) {
   for (const term of forbiddenFrameworkTerms) {
     if (text.includes(term)) {
       throw new Error(`${relative(".", file)} leaks framework term: ${term}`);
+    }
+  }
+}
+
+const nonAuthorityRoots = [
+  "apps",
+  "crates/local-api",
+  "crates/local-ide-control",
+  "crates/process-supervision",
+  "packages",
+  "workers"
+];
+const authorityStorageTerms = [
+  "rusqlite",
+  "libsqlite3_sys",
+  "bundled-sqlcipher",
+  "task-authority.sqlcipher",
+  "task_authority::store"
+];
+for (const root of nonAuthorityRoots) {
+  for (const file of filesUnder(root)) {
+    if (!/\.(rs|toml|ts|tsx|js|mjs|py|json)$/.test(file)) continue;
+    const text = readFileSync(file, "utf8").toLowerCase();
+    for (const term of authorityStorageTerms) {
+      if (text.includes(term)) {
+        throw new Error(`${relative(".", file)} attempts to depend on Task Authority storage: ${term}`);
+      }
     }
   }
 }

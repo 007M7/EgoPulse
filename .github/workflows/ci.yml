@@ -16,9 +16,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-rust.ps1
 
   typescript-and-contracts:
     runs-on: windows-latest
