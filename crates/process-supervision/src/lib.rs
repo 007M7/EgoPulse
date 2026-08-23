@@ -4,7 +4,7 @@ use egopulse_domain_contracts::FoundationHealth;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use thiserror::Error;
-use tokio::io::BufReader;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,6 +60,38 @@ pub enum ProcessSupervisionError {
     Spawn(#[source] std::io::Error),
     #[error("supervised process did not expose the required stdio handles")]
     MissingStdio,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GovernedProcessBudget {
+    pub timeout: std::time::Duration,
+    pub output_limit_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedProcessReceipt {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: i32,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum GovernedProcessError {
+    #[error("governed process specification is invalid")]
+    InvalidSpecification,
+    #[error("governed process could not be started")]
+    Spawn,
+    #[error("governed process input could not be delivered")]
+    InputDelivery,
+    #[error("governed process exceeded its timeout")]
+    Timeout,
+    #[error("governed process exited unsuccessfully")]
+    Crashed,
+    #[error("governed process output exceeded its byte limit")]
+    OutputLimit,
+    #[error("governed process I/O failed")]
+    Io,
 }
 
 pub struct SupervisedProcess {
@@ -139,6 +171,71 @@ impl SupervisedProcess {
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus, std::io::Error> {
         self.child.wait().await
     }
+}
+
+pub async fn run_governed_process(
+    spec: &SupervisedProcessSpec,
+    request: &[u8],
+    budget: GovernedProcessBudget,
+) -> Result<GovernedProcessReceipt, GovernedProcessError> {
+    if budget.timeout.is_zero() || budget.output_limit_bytes == 0 {
+        return Err(GovernedProcessError::InvalidSpecification);
+    }
+    let started = std::time::Instant::now();
+    let process = SupervisedProcess::spawn(spec)
+        .await
+        .map_err(|_| GovernedProcessError::Spawn)?;
+    let SupervisedProcess {
+        mut child,
+        mut stdin,
+        mut stdout,
+        stderr,
+    } = process;
+    let mut stderr = stderr.ok_or(GovernedProcessError::Spawn)?;
+    if stdin.write_all(request).await.is_err() || stdin.shutdown().await.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(GovernedProcessError::InputDelivery);
+    }
+    drop(stdin);
+
+    let operation = async {
+        let (stdout, stderr, status) = tokio::try_join!(
+            read_bounded(&mut stdout, budget.output_limit_bytes),
+            read_bounded(&mut stderr, budget.output_limit_bytes),
+            child.wait(),
+        )
+        .map_err(|_| GovernedProcessError::Io)?;
+        if stdout.len() as u64 > budget.output_limit_bytes
+            || stderr.len() as u64 > budget.output_limit_bytes
+        {
+            return Err(GovernedProcessError::OutputLimit);
+        }
+        if !status.success() {
+            return Err(GovernedProcessError::Crashed);
+        }
+        Ok(GovernedProcessReceipt {
+            stdout,
+            stderr,
+            exit_code: status.code().unwrap_or_default(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        })
+    };
+    tokio::time::timeout(budget.timeout, operation)
+        .await
+        .map_err(|_| GovernedProcessError::Timeout)?
+}
+
+async fn read_bounded(
+    reader: &mut (impl AsyncRead + Unpin),
+    output_limit_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(output_limit_bytes + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(bytes)
 }
 
 fn absolute_file_candidate(path: &Path) -> bool {

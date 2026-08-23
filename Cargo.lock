@@ -1133,6 +1133,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "egopulse-verification-authority"
+version = "0.1.0"
+dependencies = [
+ "egopulse-domain-contracts",
+ "egopulse-process-supervision",
+ "hex",
+ "prost",
+ "prost-types",
+ "rusqlite",
+ "rusqlite_migration",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

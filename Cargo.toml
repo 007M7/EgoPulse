@@ -12,7 +12,8 @@ members = [
   "crates/process-supervision",
   "crates/harness-adapter",
   "crates/codex-adapter",
-  "crates/artifact-authority"
+  "crates/artifact-authority",
+  "crates/verification-authority"
 ]
 
 [workspace.package]
@@ -49,6 +50,7 @@ egopulse-process-supervision = { path = "crates/process-supervision" }
 egopulse-harness-adapter = { path = "crates/harness-adapter" }
 egopulse-codex-adapter = { path = "crates/codex-adapter" }
 egopulse-artifact-authority = { path = "crates/artifact-authority" }
+egopulse-verification-authority = { path = "crates/verification-authority" }
 
 [profile.release]
 codegen-units = 1
