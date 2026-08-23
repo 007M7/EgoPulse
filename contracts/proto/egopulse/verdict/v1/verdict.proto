@@ -1,0 +1,224 @@
+syntax = "proto3";
+
+package egopulse.verdict.v1;
+
+import "egopulse/artifact/v1/artifact.proto";
+import "egopulse/common/v1/common.proto";
+import "egopulse/verification/v1/verification.proto";
+import "google/protobuf/timestamp.proto";
+
+enum FounderVerdictDecision {
+  FOUNDER_VERDICT_DECISION_UNSPECIFIED = 0;
+  FOUNDER_VERDICT_DECISION_ACCEPT = 1;
+  FOUNDER_VERDICT_DECISION_REWORK = 2;
+  FOUNDER_VERDICT_DECISION_REJECT = 3;
+}
+
+enum FounderVerdictStateKind {
+  FOUNDER_VERDICT_STATE_KIND_UNSPECIFIED = 0;
+  FOUNDER_VERDICT_STATE_KIND_ISSUED = 1;
+  FOUNDER_VERDICT_STATE_KIND_CONSUMED = 2;
+  FOUNDER_VERDICT_STATE_KIND_REVOKED = 3;
+  FOUNDER_VERDICT_STATE_KIND_EXPIRED = 4;
+  FOUNDER_VERDICT_STATE_KIND_SUPERSEDED = 5;
+}
+
+enum ConfirmationClass {
+  CONFIRMATION_CLASS_UNSPECIFIED = 0;
+  CONFIRMATION_CLASS_EXPLICIT = 1;
+  CONFIRMATION_CLASS_ELEVATED_RISK_ACCEPTANCE = 2;
+}
+
+enum RiskCategory {
+  RISK_CATEGORY_UNSPECIFIED = 0;
+  RISK_CATEGORY_QUALITY_RESIDUAL = 1;
+  RISK_CATEGORY_BUSINESS_RESIDUAL = 2;
+  RISK_CATEGORY_OPERATIONAL_RESIDUAL = 3;
+}
+
+enum VerdictEventKind {
+  VERDICT_EVENT_KIND_UNSPECIFIED = 0;
+  VERDICT_EVENT_KIND_ISSUED = 1;
+  VERDICT_EVENT_KIND_CONSUMED = 2;
+  VERDICT_EVENT_KIND_REVOKED = 3;
+  VERDICT_EVENT_KIND_EXPIRED = 4;
+  VERDICT_EVENT_KIND_SUPERSEDED = 5;
+}
+
+enum VerdictErrorCode {
+  VERDICT_ERROR_CODE_UNSPECIFIED = 0;
+  VERDICT_ERROR_CODE_INVALID_ARGUMENT = 1;
+  VERDICT_ERROR_CODE_UNAUTHENTICATED = 2;
+  VERDICT_ERROR_CODE_PERMISSION_DENIED = 3;
+  VERDICT_ERROR_CODE_NOT_FOUND = 4;
+  VERDICT_ERROR_CODE_REVISION_CONFLICT = 5;
+  VERDICT_ERROR_CODE_IDEMPOTENCY_CONFLICT = 6;
+  VERDICT_ERROR_CODE_TASK_NOT_VERDICT_PENDING = 7;
+  VERDICT_ERROR_CODE_SCOPE_STALE = 8;
+  VERDICT_ERROR_CODE_VERIFICATION_MISMATCH = 9;
+  VERDICT_ERROR_CODE_CONFIRMATION_REQUIRED = 10;
+  VERDICT_ERROR_CODE_RISK_ACCEPTANCE_REQUIRED = 11;
+  VERDICT_ERROR_CODE_RISK_COVERAGE_INCOMPLETE = 12;
+  VERDICT_ERROR_CODE_NON_OVERRIDABLE_GATE = 13;
+  VERDICT_ERROR_CODE_REWORK_DIRECTIVE_REQUIRED = 14;
+  VERDICT_ERROR_CODE_ALREADY_ACTIVE = 15;
+  VERDICT_ERROR_CODE_ALREADY_CONSUMED = 16;
+  VERDICT_ERROR_CODE_EXPIRED = 17;
+  VERDICT_ERROR_CODE_REVOKED = 18;
+  VERDICT_ERROR_CODE_TASK_COMMIT_RECEIPT_INVALID = 19;
+  VERDICT_ERROR_CODE_INTEGRITY_FAILURE = 20;
+}
+
+message VerdictScope {
+  string task_id = 1;
+  uint64 task_revision = 2;
+  uint64 work_revision = 3;
+  string artifact_set_id = 4;
+  egopulse.artifact.v1.ContentAddress artifact_set_manifest = 5;
+  string verification_artifact_id = 6;
+  egopulse.artifact.v1.ContentAddress verification_payload = 7;
+  egopulse.common.v1.ContractReference acceptance_contract_ref = 8;
+}
+
+message FounderAuthorityProof {
+  string authenticated_founder_principal_id = 1;
+  string authority_ref = 2;
+  ConfirmationClass confirmation_class = 3;
+  string confirmation_proof_ref = 4;
+  google.protobuf.Timestamp verified_at = 5;
+  google.protobuf.Timestamp valid_until = 6;
+  egopulse.common.v1.ContractReference authority_policy_ref = 7;
+}
+
+message RiskAcceptance {
+  string risk_acceptance_id = 1;
+  RiskCategory category = 2;
+  repeated string discrepancy_ids = 3;
+  repeated string unverified_item_ids = 4;
+  string rationale_artifact_id = 5;
+  repeated string compensating_control_artifact_ids = 6;
+  optional string review_trigger_code = 7;
+}
+
+message ReworkDirective {
+  string directive_id = 1;
+  string reason_code = 2;
+  string required_changes_artifact_id = 3;
+  repeated string target_discrepancy_ids = 4;
+  repeated string target_unverified_item_ids = 5;
+}
+
+message FounderVerdict {
+  string founder_verdict_id = 1;
+  uint64 version = 2;
+  FounderVerdictDecision decision = 3;
+  VerdictScope scope = 4;
+  egopulse.verification.v1.VerificationConclusion observed_verification_conclusion = 5;
+  FounderAuthorityProof authority_proof = 6;
+  repeated RiskAcceptance risk_acceptances = 7;
+  ReworkDirective rework_directive = 8;
+  string reason_code = 9;
+  optional string rationale_artifact_id = 10;
+  google.protobuf.Timestamp valid_from = 11;
+  google.protobuf.Timestamp expires_at = 12;
+  google.protobuf.Timestamp issued_at = 13;
+  egopulse.artifact.v1.ContentAddress canonical_payload = 14;
+  optional string supersedes_founder_verdict_id = 15;
+}
+
+message FounderVerdictState {
+  string founder_verdict_id = 1;
+  uint64 revision = 2;
+  FounderVerdictStateKind state = 3;
+  optional string consumption_receipt_id = 4;
+  optional string superseded_by_verdict_id = 5;
+  optional string terminal_reason_code = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message VerdictConsumptionReceipt {
+  string consumption_receipt_id = 1;
+  string founder_verdict_id = 2;
+  string task_id = 3;
+  uint64 consumed_task_revision = 4;
+  uint64 resulting_task_revision = 5;
+  string task_event_id = 6;
+  string resulting_task_status = 7;
+  google.protobuf.Timestamp consumed_at = 8;
+}
+
+message IssueFounderVerdictCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  VerdictScope scope = 2;
+  FounderVerdictDecision decision = 3;
+  egopulse.verification.v1.VerificationConclusion observed_verification_conclusion = 4;
+  repeated RiskAcceptance risk_acceptances = 5;
+  ReworkDirective rework_directive = 6;
+  string reason_code = 7;
+  optional string rationale_artifact_id = 8;
+  ConfirmationClass required_confirmation_class = 9;
+  string confirmation_proof_ref = 10;
+  google.protobuf.Timestamp expires_at = 11;
+  optional string supersedes_founder_verdict_id = 12;
+}
+
+message ConsumeFounderVerdictCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string founder_verdict_id = 2;
+  uint64 expected_state_revision = 3;
+  string task_event_id = 4;
+  uint64 consumed_task_revision = 5;
+  uint64 resulting_task_revision = 6;
+  string resulting_task_status = 7;
+  string task_commit_receipt_ref = 8;
+}
+
+message RevokeFounderVerdictCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string founder_verdict_id = 2;
+  uint64 expected_state_revision = 3;
+  string reason_code = 4;
+  string confirmation_proof_ref = 5;
+}
+
+message ExpireFounderVerdictCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string founder_verdict_id = 2;
+  uint64 expected_state_revision = 3;
+  string policy_decision_ref = 4;
+}
+
+message VerdictCommand {
+  oneof command {
+    IssueFounderVerdictCommand issue_founder_verdict = 1;
+    ConsumeFounderVerdictCommand consume_founder_verdict = 2;
+    RevokeFounderVerdictCommand revoke_founder_verdict = 3;
+    ExpireFounderVerdictCommand expire_founder_verdict = 4;
+  }
+}
+
+message VerdictEvent {
+  string event_id = 1;
+  VerdictEventKind kind = 2;
+  string founder_verdict_id = 3;
+  uint64 resulting_state_revision = 4;
+  string authenticated_principal_id = 5;
+  string command_id = 6;
+  repeated string evidence_artifact_ids = 7;
+  google.protobuf.Timestamp committed_at = 8;
+}
+
+message VerdictCommandResult {
+  bool committed = 1;
+  bool replayed = 2;
+  FounderVerdict verdict = 3;
+  FounderVerdictState state = 4;
+  VerdictConsumptionReceipt consumption_receipt = 5;
+  VerdictEvent event = 6;
+  VerdictErrorCode error_code = 7;
+  optional string safe_error_fingerprint = 8;
+}
+
+service FounderVerdictAuthorityService {
+  rpc Execute(VerdictCommand) returns (VerdictCommandResult);
+}

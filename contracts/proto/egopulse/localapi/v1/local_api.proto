@@ -1,0 +1,304 @@
+syntax = "proto3";
+
+package egopulse.localapi.v1;
+
+import "egopulse/artifact/v1/artifact.proto";
+import "egopulse/collaboration/v1/collaboration.proto";
+import "egopulse/common/v1/common.proto";
+import "egopulse/harness/v1/harness.proto";
+import "egopulse/task/v1/task.proto";
+import "egopulse/verdict/v1/verdict.proto";
+import "egopulse/verification/v1/verification.proto";
+import "google/protobuf/timestamp.proto";
+
+// Presentation/audit metadata only. It MUST NOT select capabilities or authorization.
+enum ClientSurface {
+  CLIENT_SURFACE_UNSPECIFIED = 0;
+  CLIENT_SURFACE_DESKTOP = 1;
+  CLIENT_SURFACE_CLI = 2;
+  CLIENT_SURFACE_TUI = 3;
+}
+
+enum ProjectionHealth {
+  PROJECTION_HEALTH_UNSPECIFIED = 0;
+  PROJECTION_HEALTH_READY = 1;
+  PROJECTION_HEALTH_CATCHING_UP = 2;
+  PROJECTION_HEALTH_REBUILDING = 3;
+  PROJECTION_HEALTH_HELD = 4;
+  PROJECTION_HEALTH_INTEGRITY_FAILED = 5;
+}
+
+enum SourceDomain {
+  SOURCE_DOMAIN_UNSPECIFIED = 0;
+  SOURCE_DOMAIN_TASK = 1;
+  SOURCE_DOMAIN_COLLABORATION = 2;
+  SOURCE_DOMAIN_ARTIFACT = 3;
+  SOURCE_DOMAIN_VERIFICATION = 4;
+  SOURCE_DOMAIN_FOUNDER_VERDICT = 5;
+}
+
+enum StreamFrameKind {
+  STREAM_FRAME_KIND_UNSPECIFIED = 0;
+  STREAM_FRAME_KIND_SNAPSHOT = 1;
+  STREAM_FRAME_KIND_HEARTBEAT = 2;
+  STREAM_FRAME_KIND_RESET_REQUIRED = 3;
+}
+
+enum AvailableActionKind {
+  AVAILABLE_ACTION_KIND_UNSPECIFIED = 0;
+  AVAILABLE_ACTION_KIND_CREATE_TASK = 1;
+  AVAILABLE_ACTION_KIND_REQUEST_CANCELLATION = 2;
+  AVAILABLE_ACTION_KIND_RESUME_TASK = 3;
+  AVAILABLE_ACTION_KIND_REVISE_TASK = 4;
+  AVAILABLE_ACTION_KIND_DECIDE_HARNESS_APPROVAL = 5;
+  AVAILABLE_ACTION_KIND_SUBMIT_FOUNDER_VERDICT = 6;
+}
+
+enum LocalApiErrorCode {
+  LOCAL_API_ERROR_CODE_UNSPECIFIED = 0;
+  LOCAL_API_ERROR_CODE_INVALID_ARGUMENT = 1;
+  LOCAL_API_ERROR_CODE_UNAUTHENTICATED = 2;
+  LOCAL_API_ERROR_CODE_PERMISSION_DENIED = 3;
+  LOCAL_API_ERROR_CODE_NOT_FOUND = 4;
+  LOCAL_API_ERROR_CODE_CONTRACT_INCOMPATIBLE = 5;
+  LOCAL_API_ERROR_CODE_SESSION_EXPIRED = 6;
+  LOCAL_API_ERROR_CODE_CURSOR_INVALID = 7;
+  LOCAL_API_ERROR_CODE_CURSOR_EXPIRED = 8;
+  LOCAL_API_ERROR_CODE_PROJECTION_BEHIND = 9;
+  LOCAL_API_ERROR_CODE_PROJECTION_RESET_REQUIRED = 10;
+  LOCAL_API_ERROR_CODE_PROJECTION_HELD = 11;
+  LOCAL_API_ERROR_CODE_INTEGRITY_FAILURE = 12;
+  LOCAL_API_ERROR_CODE_DEADLINE_EXCEEDED = 13;
+  LOCAL_API_ERROR_CODE_AUTHORITY_UNAVAILABLE = 14;
+  LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS = 15;
+}
+
+message ClientRequestMetadata {
+  string request_id = 1;
+  string client_instance_id = 2;
+  ClientSurface surface = 3;
+  string session_id = 4;
+  egopulse.common.v1.ContractReference api_contract_ref = 5;
+  optional string correlation_id = 6;
+}
+
+message ProjectionPosition {
+  string epoch = 1;
+  uint64 sequence = 2;
+  google.protobuf.Timestamp projected_at = 3;
+}
+
+message SourceRevision {
+  SourceDomain domain = 1;
+  string aggregate_id = 2;
+  uint64 revision = 3;
+  string last_event_id = 4;
+}
+
+message ProjectionMetadata {
+  egopulse.common.v1.ContractReference schema_ref = 1;
+  ProjectionPosition position = 2;
+  repeated SourceRevision source_revisions = 3;
+  ProjectionHealth health = 4;
+  bool stale = 5;
+  optional string safe_health_reason_code = 6;
+}
+
+message RedactedField {
+  string field_path = 1;
+  string reason_code = 2;
+}
+
+message AvailableAction {
+  AvailableActionKind kind = 1;
+  string owning_authority = 2;
+  string derivation_rule_ref = 3;
+  bool explicit_confirmation_required = 4;
+  optional string reason_code = 5;
+}
+
+message TaskView {
+  ProjectionMetadata metadata = 1;
+  egopulse.task.v1.TaskSnapshot task = 2;
+  egopulse.collaboration.v1.CollaborationSnapshot collaboration = 3;
+  egopulse.artifact.v1.ArtifactSet artifact_set = 4;
+  egopulse.verification.v1.VerificationArtifact verification = 5;
+  egopulse.verdict.v1.FounderVerdict founder_verdict = 6;
+  egopulse.verdict.v1.FounderVerdictState founder_verdict_state = 7;
+  repeated AvailableAction available_actions = 8;
+  repeated RedactedField redactions = 9;
+}
+
+message EvidenceGraphView {
+  ProjectionMetadata metadata = 1;
+  string task_id = 2;
+  string artifact_set_id = 3;
+  repeated egopulse.artifact.v1.ArtifactDescriptor artifacts = 4;
+  repeated egopulse.artifact.v1.Claim claims = 5;
+  repeated egopulse.artifact.v1.Evidence evidence = 6;
+  repeated RedactedField redactions = 7;
+}
+
+message LocalApiError {
+  LocalApiErrorCode code = 1;
+  string safe_fingerprint = 2;
+  bool retryable = 3;
+  optional string required_action_code = 4;
+  ProjectionPosition current_position = 5;
+  string correlation_id = 6;
+}
+
+message OpenSessionRequest {
+  string request_id = 1;
+  string client_instance_id = 2;
+  ClientSurface surface = 3;
+  repeated egopulse.common.v1.ContractReference supported_contracts = 4;
+}
+
+message OpenSessionResponse {
+  string session_id = 1;
+  string authenticated_principal_id = 2;
+  egopulse.common.v1.ContractReference negotiated_contract_ref = 3;
+  repeated string granted_permission_codes = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  ProjectionPosition current_position = 6;
+  LocalApiError error = 7;
+  egopulse.common.v1.ContractReference client_kernel_contract_ref = 8;
+  egopulse.common.v1.ContractReference authorization_policy_ref = 9;
+}
+
+message GetTaskViewRequest {
+  ClientRequestMetadata client = 1;
+  string task_id = 2;
+  ProjectionPosition minimum_position = 3;
+}
+
+message GetTaskViewResponse {
+  oneof outcome {
+    TaskView view = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message ListTaskViewsRequest {
+  ClientRequestMetadata client = 1;
+  repeated egopulse.task.v1.TaskStatus status_filter = 2;
+  uint32 page_size = 3;
+  optional string page_cursor = 4;
+  ProjectionPosition minimum_position = 5;
+}
+
+message ListTaskViewsResponse {
+  repeated TaskView views = 1;
+  optional string next_page_cursor = 2;
+  ProjectionPosition snapshot_position = 3;
+  LocalApiError error = 4;
+}
+
+message GetEvidenceGraphRequest {
+  ClientRequestMetadata client = 1;
+  string task_id = 2;
+  string artifact_set_id = 3;
+  ProjectionPosition minimum_position = 4;
+}
+
+message GetEvidenceGraphResponse {
+  oneof outcome {
+    EvidenceGraphView graph = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message GetProjectionStatusRequest {
+  ClientRequestMetadata client = 1;
+}
+
+message GetProjectionStatusResponse {
+  ProjectionMetadata metadata = 1;
+  LocalApiError error = 2;
+}
+
+message WatchTaskViewsRequest {
+  ClientRequestMetadata client = 1;
+  ProjectionPosition resume_after = 2;
+  repeated string task_ids = 3;
+  repeated egopulse.task.v1.TaskStatus status_filter = 4;
+}
+
+message TaskViewStreamFrame {
+  StreamFrameKind kind = 1;
+  ProjectionPosition position = 2;
+  TaskView snapshot = 3;
+  optional string reset_reason_code = 4;
+}
+
+message ProjectionAwaitToken {
+  string token = 1;
+  SourceRevision required_source_revision = 2;
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+message ExecuteTaskCommandRequest {
+  ClientRequestMetadata client = 1;
+  egopulse.task.v1.TaskCommand command = 2;
+}
+
+message ExecuteTaskCommandResponse {
+  egopulse.task.v1.TaskCommandResult authority_result = 1;
+  ProjectionAwaitToken await_token = 2;
+  LocalApiError gateway_error = 3;
+}
+
+message DecideHarnessApprovalRequest {
+  ClientRequestMetadata client = 1;
+  egopulse.harness.v1.ApprovalDecisionEnvelope decision = 2;
+}
+
+message DecideHarnessApprovalResponse {
+  egopulse.harness.v1.ApprovalDecisionResult authority_result = 1;
+  ProjectionAwaitToken await_token = 2;
+  LocalApiError gateway_error = 3;
+}
+
+message ExecuteFounderVerdictRequest {
+  ClientRequestMetadata client = 1;
+  egopulse.verdict.v1.VerdictCommand command = 2;
+}
+
+message ExecuteFounderVerdictResponse {
+  egopulse.verdict.v1.VerdictCommandResult authority_result = 1;
+  ProjectionAwaitToken await_token = 2;
+  LocalApiError gateway_error = 3;
+}
+
+message AwaitProjectionRequest {
+  ClientRequestMetadata client = 1;
+  ProjectionAwaitToken await_token = 2;
+  uint32 timeout_milliseconds = 3;
+}
+
+message AwaitProjectionResponse {
+  oneof outcome {
+    TaskView view = 1;
+    LocalApiError error = 2;
+  }
+}
+
+service LocalSessionService {
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+}
+
+service LocalReadModelService {
+  rpc GetTaskView(GetTaskViewRequest) returns (GetTaskViewResponse);
+  rpc ListTaskViews(ListTaskViewsRequest) returns (ListTaskViewsResponse);
+  rpc GetEvidenceGraph(GetEvidenceGraphRequest) returns (GetEvidenceGraphResponse);
+  rpc GetProjectionStatus(GetProjectionStatusRequest) returns (GetProjectionStatusResponse);
+  rpc WatchTaskViews(WatchTaskViewsRequest) returns (stream TaskViewStreamFrame);
+  rpc AwaitProjection(AwaitProjectionRequest) returns (AwaitProjectionResponse);
+}
+
+service LocalCommandGatewayService {
+  rpc ExecuteTaskCommand(ExecuteTaskCommandRequest) returns (ExecuteTaskCommandResponse);
+  rpc DecideHarnessApproval(DecideHarnessApprovalRequest) returns (DecideHarnessApprovalResponse);
+  rpc ExecuteFounderVerdict(ExecuteFounderVerdictRequest) returns (ExecuteFounderVerdictResponse);
+}

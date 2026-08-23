@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-valid-record-independent-command-evidence",
+  "category": "valid",
+  "requirementRefs": ["C04-EVID-01", "D02-EVID-05"],
+  "principal": { "kind": "SUPERVISED_RUNNER", "principalId": "agentosd:supervised-runner", "authenticated": true },
+  "startingState": { "claimId": "claim_change_01", "claimProposerPrincipalId": "adapter:codex", "sealedArtifactIds": ["art_command_receipt_01"] },
+  "command": { "recordEvidence": {
+    "evidenceId": "evidence_command_01", "claimId": "claim_change_01", "relation": "EVIDENCE_RELATION_SUPPORTS", "artifactIds": ["art_command_receipt_01"],
+    "evidenceProfileRef": "supervised_command_receipt/v1@sha256:evidence01", "producerClass": "EVIDENCE_PRODUCER_CLASS_SUPERVISED_RUNNER", "independentOfClaimProposer": true,
+    "integrityStatus": "INTEGRITY_STATUS_DIGEST_VERIFIED", "lineage": { "taskId": "task_01", "workRevision": 2, "runId": "run_01", "stepId": "step_01", "attemptId": "attempt_01", "fencingToken": 1 }
+  }},
+  "expected": { "outcome": "committed", "businessWriteCount": 1, "resultingStatus": "EVIDENCE_STATUS_RECORDED", "resultingRevision": 1, "independenceAccepted": true, "verificationPerformed": false }
+}

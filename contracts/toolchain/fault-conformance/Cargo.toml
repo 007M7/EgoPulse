@@ -1,0 +1,11 @@
+[package]
+name = "egopulse-v01-fault-conformance"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[dependencies]
+hex = "=0.4.3"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+sha2 = "=0.10.9"

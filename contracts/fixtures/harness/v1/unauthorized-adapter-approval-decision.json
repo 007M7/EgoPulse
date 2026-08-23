@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-unauthorized-adapter-approval-decision", "category": "unauthorized",
+  "requirementRefs": ["C03-APPROVAL-02", "QA-04"], "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "approvalRequestId": "approval-001", "decision": null, "fencingToken": 3 }, "resolvedReferences": { "authorityDecision": null },
+  "command": { "decideApproval": { "meta": { "commandId": "cmd-self-approve-001", "idempotencyKey": "self-approve-001", "idempotencyScope": "approval-001", "requestDigestSha256": "f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5", "issuedAt": "2026-08-23T04:12:00Z", "correlationId": "corr-harness-012" }, "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 3, "approvalRequestId": "approval-001", "actionDigestSha256": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3", "decision": "APPROVAL_DECISION_ALLOW_ONCE", "authorityDecisionRef": "", "nativeRoutingRef": "native-approval-route-001" } },
+  "expected": { "outcome": "error", "errorCode": "HARNESS_ERROR_CODE_PERMISSION_DENIED", "nativeDecisionCount": 0, "businessWriteCount": 0 }
+}

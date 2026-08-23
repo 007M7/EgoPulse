@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-invalid-unknown-claim-profile",
+  "category": "invalid",
+  "requirementRefs": ["C04-COMPAT-01"],
+  "principal": { "kind": "HARNESS", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "sealedArtifactIds": ["art_patch_01"], "knownClaimProfiles": ["repository_change_acceptance/v1"] },
+  "command": { "proposeClaim": { "claimId": "claim_unknown_01", "sourceType": "CLAIM_SOURCE_TYPE_TYPED_EXTENSION", "semanticProfileRef": "unregistered_claim/v9@sha256:unknown", "subjectArtifactIds": ["art_patch_01"], "acceptanceContractRef": "acceptance_contract_01/v3@sha256:accept01", "statement": { "algorithm": "HASH_ALGORITHM_SHA256", "digest": "2222222222222222222222222222222222222222222222222222222222222222", "byteLength": 50 } } },
+  "expected": { "outcome": "error", "businessWriteCount": 0, "errorCode": "ARTIFACT_ERROR_CODE_SCHEMA_INVALID", "claimVisible": false }
+}

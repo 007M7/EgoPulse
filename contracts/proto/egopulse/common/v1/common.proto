@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package egopulse.common.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message CommandMetadata {
+  string command_id = 1;
+  string idempotency_key = 2;
+  string idempotency_scope = 3;
+  string request_digest_sha256 = 4;
+  google.protobuf.Timestamp issued_at = 5;
+  string correlation_id = 6;
+  optional string causation_id = 7;
+}
+
+message ContractReference {
+  string contract_id = 1;
+  string version = 2;
+  string sha256 = 3;
+}
+

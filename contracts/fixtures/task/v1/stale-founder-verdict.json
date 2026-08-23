@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "v01-task-fixture/v0.1",
+  "fixtureId": "task-stale-founder-verdict",
+  "category": "stale",
+  "requirementRefs": ["AC-06", "QA-01", "BDD-stale-verdict"],
+  "principal": { "kind": "FOUNDER_AUTHORITY", "principalId": "founder-authority:test", "authenticated": true },
+  "startingSnapshot": { "taskId": "task-001", "revision": 6, "workRevision": 2, "status": "TASK_STATUS_VERDICT_PENDING", "verificationArtifactId": "verification-work2" },
+  "resolvedReferences": { "founderVerdict": { "valid": true, "verdictId": "verdict-stale", "taskId": "task-001", "taskRevision": 4, "workRevision": 1, "verificationArtifactId": "verification-work1", "decision": "FOUNDER_DECISION_ACCEPT", "consumed": false } },
+  "command": {
+    "applyFounderVerdict": {
+      "meta": { "commandId": "cmd-verdict-stale", "idempotencyKey": "verdict-stale", "idempotencyScope": "task-001", "requestDigestSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "issuedAt": "2026-08-23T00:05:00Z", "correlationId": "corr-003" },
+      "taskId": "task-001", "expectedRevision": 4, "workRevision": 1, "founderVerdictId": "verdict-stale"
+    }
+  },
+  "expected": { "outcome": "error", "errorCode": "TASK_ERROR_CODE_REVISION_CONFLICT", "currentRevision": 6, "businessWriteCount": 0 }
+}
+

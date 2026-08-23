@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "v01-collaboration-fixture/v0.1",
+  "fixtureId": "collaboration-valid-attempt-return-is-not-task-completion",
+  "category": "valid",
+  "requirementRefs": ["V01-D04", "C02-RETURN-01", "C01-BOUNDARY-01"],
+  "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingSnapshot": { "run": { "runId": "run-001", "revision": 7, "status": "RUN_STATUS_ACTIVE", "taskId": "task-001" }, "step": { "stepId": "step-001", "revision": 5, "status": "STEP_STATUS_ACTIVE" }, "attempt": { "attemptId": "attempt-001", "revision": 6, "status": "ATTEMPT_STATUS_RUNNING", "lastHarnessSequence": 2, "lease": { "leaseId": "lease-001", "fencingToken": 3 } } },
+  "resolvedReferences": { "artifactReturnReceipt": { "receiptId": "return-receipt-001", "durable": true }, "task": { "taskId": "task-001", "status": "TASK_STATUS_ACTIVE", "revision": 2 } },
+  "command": { "recordAttemptReturn": { "base": { "meta": { "commandId": "cmd-return-001", "idempotencyKey": "return-001", "idempotencyScope": "attempt-001", "requestDigestSha256": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0", "issuedAt": "2026-08-23T03:09:00Z", "correlationId": "corr-run-010" }, "runId": "run-001", "expectedRunRevision": 7, "stepId": "step-001", "expectedStepRevision": 5, "attemptId": "attempt-001", "expectedAttemptRevision": 6 }, "fencingToken": 3, "harnessSequence": 3, "artifactReturnReceiptId": "return-receipt-001", "receiptDigestSha256": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1" } },
+  "expected": { "outcome": "committed", "eventKind": "COLLABORATION_EVENT_KIND_RETURN_RECORDED", "resultingRunStatus": "RUN_STATUS_RETURN_PENDING", "resultingRunRevision": 8, "resultingStepStatus": "STEP_STATUS_RETURN_PENDING", "resultingStepRevision": 6, "resultingAttemptStatus": "ATTEMPT_STATUS_RETURNED", "resultingAttemptRevision": 7, "taskStatusUnchanged": "TASK_STATUS_ACTIVE", "taskBusinessWriteCount": 0, "businessWriteCount": 1 }
+}

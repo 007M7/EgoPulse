@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "v01-collaboration-fixture/v0.1",
+  "fixtureId": "collaboration-invalid-overlapping-attempt-capacity",
+  "category": "invalid",
+  "requirementRefs": ["V01-D03", "C02-CAPACITY-01"],
+  "principal": { "kind": "COLLABORATION_CONTROL", "principalId": "collaboration-control:test", "authenticated": true },
+  "startingSnapshot": { "run": { "runId": "run-001", "revision": 5, "status": "RUN_STATUS_ACTIVE", "maxActiveAttempts": 1, "activeAttemptCount": 1 }, "step": { "stepId": "step-001", "revision": 3, "status": "STEP_STATUS_ACTIVE", "attemptIds": ["attempt-001"], "currentAttemptId": "attempt-001" }, "attempt": { "attemptId": "attempt-001", "revision": 3, "status": "ATTEMPT_STATUS_RUNNING" } },
+  "resolvedReferences": { "priorAttempt": { "terminalOrReconciled": false } },
+  "command": { "createAttempt": { "base": { "meta": { "commandId": "cmd-overlap-001", "idempotencyKey": "overlap-001", "idempotencyScope": "run-001/step-001", "requestDigestSha256": "9090909090909090909090909090909090909090909090909090909090909090", "issuedAt": "2026-08-23T03:08:00Z", "correlationId": "corr-run-009" }, "runId": "run-001", "expectedRunRevision": 5 }, "stepId": "step-001", "expectedStepRevision": 3, "attemptId": "attempt-002", "harnessId": "codex", "capabilityProfileRef": { "contractId": "single-harness-capability", "version": "0.1", "sha256": "9191919191919191919191919191919191919191919191919191919191919191" }, "workspaceRef": "workspace-001" } },
+  "expected": { "outcome": "error", "errorCode": "COLLABORATION_ERROR_CODE_CAPACITY_EXHAUSTED", "businessWriteCount": 0 }
+}

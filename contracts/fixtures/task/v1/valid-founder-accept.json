@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "v01-task-fixture/v0.1",
+  "fixtureId": "task-valid-founder-accept",
+  "category": "valid",
+  "requirementRefs": ["AC-06", "QH-01"],
+  "principal": { "kind": "FOUNDER_AUTHORITY", "principalId": "founder-authority:test", "authenticated": true },
+  "startingSnapshot": { "taskId": "task-001", "revision": 4, "workRevision": 1, "status": "TASK_STATUS_VERDICT_PENDING", "verificationArtifactId": "verification-001" },
+  "resolvedReferences": { "verificationArtifact": { "outcome": "PASSED" }, "founderVerdict": { "valid": true, "verdictId": "verdict-001", "taskId": "task-001", "taskRevision": 4, "workRevision": 1, "verificationArtifactId": "verification-001", "decision": "FOUNDER_DECISION_ACCEPT", "consumed": false } },
+  "command": {
+    "applyFounderVerdict": {
+      "meta": { "commandId": "cmd-verdict-001", "idempotencyKey": "verdict-001", "idempotencyScope": "task-001", "requestDigestSha256": "3333333333333333333333333333333333333333333333333333333333333333", "issuedAt": "2026-08-23T00:09:00Z", "correlationId": "corr-007" },
+      "taskId": "task-001", "expectedRevision": 4, "workRevision": 1, "founderVerdictId": "verdict-001"
+    }
+  },
+  "expected": { "outcome": "committed", "eventKind": "TASK_EVENT_KIND_VERDICT_APPLIED", "resultingStatus": "TASK_STATUS_COMPLETED", "resultingRevision": 5, "resultingWorkRevision": 1, "businessWriteCount": 1, "verdictConsumedOnce": true }
+}
+

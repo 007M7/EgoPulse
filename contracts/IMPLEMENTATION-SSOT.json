@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "egopulse-contract-import-provenance/v0.1",
+  "featureId": "v01-governed-single-harness-work-loop",
+  "status": "imported_verified_implementation_ssot",
+  "importedOn": "2026-08-23",
+  "source": "founder-agent-os/planning/v01-governed-single-harness-work-loop/contracts-candidate/v0.1",
+  "acceptedCandidateVersion": "0.1.0-draft.11",
+  "acceptedManifestSha256": "adbcba96ee023f886ba6ea8de0083d7f09c2f5db67b60ddd6db6b231932fbe66",
+  "gate3AuthorityRef": "conversation:2026-08-23:founder-v01-gate3-pass",
+  "gate4DriAuthorityRef": "conversation:2026-08-23:founder-v01-gate4-dri-confirmation",
+  "implementationSsotAfterVerifiedImport": true,
+  "note": "The imported README.md is an immutable Gate 3 artifact and retains its candidate-time wording. This provenance record carries the post-acceptance implementation status."
+}

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "v01-collaboration-fixture/v0.1",
+  "fixtureId": "collaboration-invalid-ack-before-delivery",
+  "category": "invalid",
+  "requirementRefs": ["C02-ORDER-01", "QA-01"],
+  "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingSnapshot": { "run": { "runId": "run-001", "revision": 5, "status": "RUN_STATUS_ACTIVE" }, "step": { "stepId": "step-001", "revision": 3, "status": "STEP_STATUS_ACTIVE" }, "attempt": { "attemptId": "attempt-001", "revision": 3, "status": "ATTEMPT_STATUS_DISPATCH_PENDING", "lastHarnessSequence": 0, "lease": { "leaseId": "lease-001", "fencingToken": 3 } } },
+  "resolvedReferences": { "deliveryReceipt": null },
+  "command": { "recordHarnessAck": { "base": { "meta": { "commandId": "cmd-ack-early-001", "idempotencyKey": "ack-early-001", "idempotencyScope": "attempt-001", "requestDigestSha256": "5050505050505050505050505050505050505050505050505050505050505050", "issuedAt": "2026-08-23T03:04:00Z", "correlationId": "corr-run-005" }, "runId": "run-001", "expectedRunRevision": 5, "stepId": "step-001", "expectedStepRevision": 3, "attemptId": "attempt-001", "expectedAttemptRevision": 3 }, "dispatchId": "dispatch-001", "fencingToken": 3, "harnessSequence": 1, "ackReceiptId": "ack-early-001", "receiptDigestSha256": "5151515151515151515151515151515151515151515151515151515151515151" } },
+  "expected": { "outcome": "error", "errorCode": "COLLABORATION_ERROR_CODE_STATE_CONFLICT", "safeDetailCode": "DELIVERY_RECEIPT_REQUIRED", "businessWriteCount": 0 }
+}

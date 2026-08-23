@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-valid-session-continue-resume", "category": "valid",
+  "requirementRefs": ["C03-RESUME-01", "QA-02"], "principal": { "kind": "COLLABORATION_CONTROL", "principalId": "collaboration-control:test", "authenticated": true },
+  "startingState": { "attemptStatus": "ATTEMPT_STATUS_INTERRUPTED", "fencingToken": 4, "nativeResumeCount": 0 },
+  "resolvedReferences": { "capabilityProfile": { "resume": ["RESUME_SEMANTICS_SESSION_CONTINUE"] }, "checkpoint": { "checkpointRef": "checkpoint-001", "recoveryClass": "RECOVERY_CLASS_RESUME_SAFE", "sameAttempt": true }, "recoveryEvidence": { "valid": true } },
+  "command": { "resume": { "meta": { "commandId": "cmd-resume-session-001", "idempotencyKey": "resume-session-001", "idempotencyScope": "attempt-001", "requestDigestSha256": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3", "issuedAt": "2026-08-23T04:14:30Z", "correlationId": "corr-harness-014a" }, "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 4, "resumeRequestId": "resume-session-001", "requiredSemantics": "RESUME_SEMANTICS_SESSION_CONTINUE", "nativeSessionRef": "thread-opaque-001", "checkpointRef": "checkpoint-001", "recoveryEvidenceRef": "recovery-001" } },
+  "expected": { "outcome": "committed", "deliveryDisposition": "RESUME_DELIVERY_DISPOSITION_DELIVERED", "deliveredSemantics": "RESUME_SEMANTICS_SESSION_CONTINUE", "partialExecutionResumeClaimed": false, "sameAttempt": true, "nativeResumeCount": 1, "businessWriteCount": 1 }
+}

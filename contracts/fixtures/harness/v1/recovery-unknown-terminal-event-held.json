@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-recovery-unknown-terminal-event-held", "category": "recovery",
+  "requirementRefs": ["C03-EVENT-02", "QA-02", "QA-09"], "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "attemptStatus": "ATTEMPT_STATUS_RUNNING", "fencingToken": 3, "lastObservationSequence": 9 },
+  "resolvedReferences": { "nativeEvent": { "type": "future_terminal_variant", "knownToProfile": false, "rawEvidenceDurable": true } },
+  "command": { "ingestObservation": { "observationId": "obs-unknown-terminal-001", "adapterId": "codex-adapter", "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 3, "observationSequence": 10, "nativeEventDigestSha256": "f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9", "capabilityProfileId": "codex-app-server-v2-0.148.0-alpha.15", "criticality": "OBSERVATION_CRITICALITY_TERMINAL", "rawEvidenceRef": "raw-unknown-terminal-001", "diagnostic": { "safeDiagnosticCode": "UNKNOWN_NATIVE_TERMINAL_VARIANT", "recoveryRequired": true } } },
+  "expected": { "outcome": "error", "errorCode": "HARNESS_ERROR_CODE_UNKNOWN_CRITICAL_EVENT", "quarantineEvidence": true, "collaborationAction": "ATTEMPT_STATUS_HELD", "automaticRetryAllowed": false, "businessWriteCount": 0 }
+}

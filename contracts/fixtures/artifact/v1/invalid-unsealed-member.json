@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-invalid-unsealed-member",
+  "category": "invalid",
+  "requirementRefs": ["C04-SET-02"],
+  "principal": { "kind": "ARTIFACT_AUTHORITY", "principalId": "agentosd:artifact-authority", "authenticated": true },
+  "startingState": { "artifactSetId": "artifact_set_02", "revision": 1, "status": "ARTIFACT_SET_STATUS_DRAFT", "unsealedMemberIds": ["art_command_receipt_02"] },
+  "command": { "sealArtifactSet": { "artifactSetId": "artifact_set_02", "expectedRevision": 1, "observedManifest": { "algorithm": "HASH_ALGORITHM_SHA256", "digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "byteLength": 980 } } },
+  "expected": { "outcome": "error", "businessWriteCount": 0, "errorCode": "ARTIFACT_ERROR_CODE_MEMBER_NOT_SEALED", "resultingStatus": "ARTIFACT_SET_STATUS_DRAFT" }
+}

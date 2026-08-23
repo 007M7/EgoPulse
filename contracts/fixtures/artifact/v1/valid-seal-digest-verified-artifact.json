@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-valid-seal-digest-verified-artifact",
+  "category": "valid",
+  "requirementRefs": ["C04-INT-02", "C04-LIFE-01"],
+  "principal": { "kind": "ARTIFACT_AUTHORITY", "principalId": "agentosd:artifact-authority", "authenticated": true },
+  "startingState": { "artifactId": "art_patch_01", "revision": 1, "status": "ARTIFACT_STATUS_STAGED", "declaredDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "declaredByteLength": 842 },
+  "command": { "sealArtifact": { "artifactId": "art_patch_01", "expectedRevision": 1, "observedContent": { "algorithm": "HASH_ALGORITHM_SHA256", "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "byteLength": 842 } } },
+  "expected": { "outcome": "committed", "businessWriteCount": 1, "resultingStatus": "ARTIFACT_STATUS_SEALED", "resultingRevision": 2, "integrityStatus": "INTEGRITY_STATUS_DIGEST_VERIFIED", "contentImmutable": true }
+}

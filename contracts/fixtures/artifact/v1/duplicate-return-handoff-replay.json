@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-duplicate-return-handoff-replay",
+  "category": "duplicate",
+  "requirementRefs": ["C04-IDEMP-01", "C04-RETURN-02"],
+  "principal": { "kind": "ARTIFACT_AUTHORITY", "principalId": "agentosd:artifact-authority", "authenticated": true },
+  "startingState": { "returnHandoffId": "return_01", "receiptId": "receipt_01", "commandId": "cmd_return_01", "requestDigest": "4444444444444444444444444444444444444444444444444444444444444444", "status": "RETURN_HANDOFF_STATUS_RECEIPTED" },
+  "command": { "submitReturnHandoff": { "commandId": "cmd_return_01", "requestDigest": "4444444444444444444444444444444444444444444444444444444444444444", "returnHandoffId": "return_01", "expectedArtifactSetRevision": 2, "artifactSetId": "artifact_set_01" } },
+  "expected": { "outcome": "replayed", "businessWriteCount": 0, "replayed": true, "sameReturnHandoffId": "return_01", "sameReceiptId": "receipt_01", "verificationPerformed": false, "taskCompletionDecided": false }
+}

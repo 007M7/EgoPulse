@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "v01-task-fixture/v0.1",
+  "fixtureId": "task-invalid-risk-acceptance-missing",
+  "category": "invalid",
+  "requirementRefs": ["AC-05", "AC-06", "QH-04"],
+  "principal": { "kind": "FOUNDER_AUTHORITY", "principalId": "founder-authority:test", "authenticated": true },
+  "startingSnapshot": { "taskId": "task-001", "revision": 4, "workRevision": 1, "status": "TASK_STATUS_VERDICT_PENDING", "verificationArtifactId": "verification-failed" },
+  "resolvedReferences": { "verificationArtifact": { "outcome": "FAILED", "discrepancyRefs": ["discrepancy-001"] }, "founderVerdict": { "valid": true, "verdictId": "verdict-no-risk", "taskId": "task-001", "taskRevision": 4, "workRevision": 1, "verificationArtifactId": "verification-failed", "decision": "FOUNDER_DECISION_ACCEPT", "riskAcceptanceRef": null, "consumed": false } },
+  "command": {
+    "applyFounderVerdict": {
+      "meta": { "commandId": "cmd-verdict-no-risk", "idempotencyKey": "verdict-no-risk", "idempotencyScope": "task-001", "requestDigestSha256": "4444444444444444444444444444444444444444444444444444444444444444", "issuedAt": "2026-08-23T00:10:00Z", "correlationId": "corr-008" },
+      "taskId": "task-001", "expectedRevision": 4, "workRevision": 1, "founderVerdictId": "verdict-no-risk"
+    }
+  },
+  "expected": { "outcome": "error", "errorCode": "TASK_ERROR_CODE_TERMINAL_GATE_UNSATISFIED", "currentRevision": 4, "businessWriteCount": 0, "discrepancyRemainsVisible": true }
+}
+

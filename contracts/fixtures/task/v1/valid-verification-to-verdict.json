@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "v01-task-fixture/v0.1",
+  "fixtureId": "task-valid-verification-to-verdict",
+  "category": "valid",
+  "requirementRefs": ["AC-05", "AC-06", "QA-06"],
+  "principal": { "kind": "SEGO_SVA", "principalId": "sego-sva:test", "authenticated": true },
+  "startingSnapshot": { "taskId": "task-001", "revision": 3, "workRevision": 1, "status": "TASK_STATUS_VERIFICATION_PENDING", "artifactSetId": "artifact-set-001" },
+  "resolvedReferences": { "verificationArtifact": { "valid": true, "verificationArtifactId": "verification-001", "taskId": "task-001", "workRevision": 1, "artifactSetId": "artifact-set-001", "acceptanceContractDigestMatches": true, "outcome": "PASSED" } },
+  "command": {
+    "recordTaskVerification": {
+      "meta": { "commandId": "cmd-verification-001", "idempotencyKey": "verification-001", "idempotencyScope": "task-001", "requestDigestSha256": "2222222222222222222222222222222222222222222222222222222222222222", "issuedAt": "2026-08-23T00:08:00Z", "correlationId": "corr-006" },
+      "taskId": "task-001", "expectedRevision": 3, "workRevision": 1, "verificationArtifactId": "verification-001"
+    }
+  },
+  "expected": { "outcome": "committed", "eventKind": "TASK_EVENT_KIND_VERIFICATION_RECORDED", "resultingStatus": "TASK_STATUS_VERDICT_PENDING", "resultingRevision": 4, "resultingWorkRevision": 1, "businessWriteCount": 1 }
+}
+

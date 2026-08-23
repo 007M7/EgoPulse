@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-valid-stage-repository-patch",
+  "category": "valid",
+  "requirementRefs": ["C04-OWN-01", "C04-INT-01", "BDD-ARTIFACT-01"],
+  "principal": { "kind": "GOVERNED_COLLECTOR", "principalId": "collector:repository-change", "authenticated": true },
+  "startingState": null,
+  "command": { "stageArtifact": {
+    "artifactId": "art_patch_01", "semanticClass": "ARTIFACT_SEMANTIC_CLASS_REPOSITORY_PATCH",
+    "typeContractRef": "canonical-git-patch/v1@sha256:profile01", "content": { "algorithm": "HASH_ALGORITHM_SHA256", "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "byteLength": 842 },
+    "lineage": { "taskId": "task_01", "taskRevision": 3, "workRevision": 2, "runId": "run_01", "stepId": "step_01", "attemptId": "attempt_01", "fencingToken": 1 },
+    "workspaceRef": "workspace:ws_01", "relativePaths": ["src/lib.rs"], "secretScan": "passed"
+  }},
+  "expected": { "outcome": "committed", "businessWriteCount": 1, "resultingStatus": "ARTIFACT_STATUS_STAGED", "resultingRevision": 1, "integrityStatus": "INTEGRITY_STATUS_UNVERIFIED", "taskStatusUnchanged": "TASK_STATUS_ACTIVE" }
+}

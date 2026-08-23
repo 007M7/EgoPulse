@@ -1,0 +1,262 @@
+syntax = "proto3";
+
+package egopulse.task.v1;
+
+import "egopulse/common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_READY = 1;
+  TASK_STATUS_ACTIVE = 2;
+  TASK_STATUS_VERIFICATION_PENDING = 3;
+  TASK_STATUS_VERDICT_PENDING = 4;
+  TASK_STATUS_REWORK = 5;
+  TASK_STATUS_CANCELLATION_PENDING = 6;
+  TASK_STATUS_INTERRUPTED = 7;
+  TASK_STATUS_HELD = 8;
+  TASK_STATUS_COMPLETED = 9;
+  TASK_STATUS_REJECTED = 10;
+  TASK_STATUS_CANCELLED = 11;
+  TASK_STATUS_SUPERSEDED = 12;
+  TASK_STATUS_EXPIRED = 13;
+}
+
+enum FounderDecision {
+  FOUNDER_DECISION_UNSPECIFIED = 0;
+  FOUNDER_DECISION_ACCEPT = 1;
+  FOUNDER_DECISION_REWORK = 2;
+  FOUNDER_DECISION_REJECT = 3;
+}
+
+enum TaskEventKind {
+  TASK_EVENT_KIND_UNSPECIFIED = 0;
+  TASK_EVENT_KIND_CREATED = 1;
+  TASK_EVENT_KIND_ACTIVATED = 2;
+  TASK_EVENT_KIND_EVIDENCE_SUBMITTED = 3;
+  TASK_EVENT_KIND_VERIFICATION_RECORDED = 4;
+  TASK_EVENT_KIND_VERDICT_APPLIED = 5;
+  TASK_EVENT_KIND_REVISED = 6;
+  TASK_EVENT_KIND_INTERRUPTED = 7;
+  TASK_EVENT_KIND_HELD = 8;
+  TASK_EVENT_KIND_RESUMED = 9;
+  TASK_EVENT_KIND_CANCELLATION_REQUESTED = 10;
+  TASK_EVENT_KIND_CANCELLATION_RECORDED = 11;
+  TASK_EVENT_KIND_SUPERSEDED = 12;
+  TASK_EVENT_KIND_EXPIRED = 13;
+}
+
+enum TaskErrorCode {
+  TASK_ERROR_CODE_UNSPECIFIED = 0;
+  TASK_ERROR_CODE_INVALID_ARGUMENT = 1;
+  TASK_ERROR_CODE_UNAUTHENTICATED = 2;
+  TASK_ERROR_CODE_PERMISSION_DENIED = 3;
+  TASK_ERROR_CODE_NOT_FOUND = 4;
+  TASK_ERROR_CODE_REVISION_CONFLICT = 5;
+  TASK_ERROR_CODE_STATE_CONFLICT = 6;
+  TASK_ERROR_CODE_IDEMPOTENCY_CONFLICT = 7;
+  TASK_ERROR_CODE_CONTRACT_MISMATCH = 8;
+  TASK_ERROR_CODE_STALE_REFERENCE = 9;
+  TASK_ERROR_CODE_UNVERIFIED_REFERENCE = 10;
+  TASK_ERROR_CODE_TERMINAL_GATE_UNSATISFIED = 11;
+  TASK_ERROR_CODE_INTEGRITY_FAILURE = 12;
+  TASK_ERROR_CODE_RESOURCE_EXHAUSTED = 13;
+  TASK_ERROR_CODE_RECOVERY_REQUIRED = 14;
+  TASK_ERROR_CODE_INTERNAL = 15;
+}
+
+message TaskSnapshot {
+  string task_id = 1;
+  uint64 revision = 2;
+  uint64 work_revision = 3;
+  TaskStatus status = 4;
+  TaskStatus resume_status = 5;
+  string work_type = 6;
+  string input_snapshot_id = 7;
+  string target_scope_ref = 8;
+  egopulse.common.v1.ContractReference acceptance_contract_ref = 9;
+  egopulse.common.v1.ContractReference budget_profile_ref = 10;
+  optional string current_run_id = 11;
+  optional string artifact_set_id = 12;
+  optional string verification_artifact_id = 13;
+  optional string founder_verdict_id = 14;
+  optional string hold_reason_code = 15;
+  google.protobuf.Timestamp created_at = 16;
+  google.protobuf.Timestamp updated_at = 17;
+}
+
+message CreateTaskCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string work_type = 2;
+  string input_snapshot_id = 3;
+  string target_scope_ref = 4;
+  egopulse.common.v1.ContractReference acceptance_contract_ref = 5;
+  egopulse.common.v1.ContractReference budget_profile_ref = 6;
+}
+
+message ActivateTaskCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  uint64 work_revision = 4;
+  string run_id = 5;
+}
+
+message SubmitTaskEvidenceCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  uint64 work_revision = 4;
+  string return_handoff_id = 5;
+  string artifact_set_id = 6;
+}
+
+message RecordTaskVerificationCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  uint64 work_revision = 4;
+  string verification_artifact_id = 5;
+}
+
+message ApplyFounderVerdictCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  uint64 work_revision = 4;
+  string founder_verdict_id = 5;
+}
+
+message ReviseTaskCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  uint64 expected_work_revision = 4;
+  string new_input_snapshot_id = 5;
+  string new_target_scope_ref = 6;
+  egopulse.common.v1.ContractReference new_acceptance_contract_ref = 7;
+}
+
+message InterruptTaskCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  string interruption_evidence_id = 4;
+}
+
+message HoldTaskCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  string hold_reason_code = 4;
+  string recovery_evidence_id = 5;
+}
+
+message ResumeTaskCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  TaskStatus expected_resume_status = 4;
+  string recovery_evidence_id = 5;
+}
+
+message RequestTaskCancellationCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  string reason_code = 4;
+}
+
+message RecordTaskCancellationOutcomeCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  TaskStatus outcome = 4;
+  string cancellation_receipt_id = 5;
+}
+
+message SupersedeTaskCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  string replacement_task_id = 4;
+  string reason_code = 5;
+}
+
+message ExpireTaskCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  string policy_decision_id = 4;
+}
+
+message TaskCommand {
+  oneof command {
+    CreateTaskCommand create_task = 1;
+    ActivateTaskCommand activate_task = 2;
+    SubmitTaskEvidenceCommand submit_task_evidence = 3;
+    RecordTaskVerificationCommand record_task_verification = 4;
+    ApplyFounderVerdictCommand apply_founder_verdict = 5;
+    ReviseTaskCommand revise_task = 6;
+    InterruptTaskCommand interrupt_task = 7;
+    HoldTaskCommand hold_task = 8;
+    ResumeTaskCommand resume_task = 9;
+    RequestTaskCancellationCommand request_task_cancellation = 10;
+    RecordTaskCancellationOutcomeCommand record_task_cancellation_outcome = 11;
+    SupersedeTaskCommand supersede_task = 12;
+    ExpireTaskCommand expire_task = 13;
+  }
+}
+
+message TaskEvent {
+  string event_id = 1;
+  string command_id = 2;
+  TaskEventKind kind = 3;
+  string task_id = 4;
+  uint64 expected_revision = 5;
+  uint64 resulting_revision = 6;
+  uint64 work_revision = 7;
+  string authenticated_principal_id = 8;
+  string authority_ref = 9;
+  string idempotency_key = 10;
+  string request_digest_sha256 = 11;
+  string correlation_id = 12;
+  optional string causation_id = 13;
+  repeated string evidence_refs = 14;
+  google.protobuf.Timestamp occurred_at = 15;
+  TaskSnapshot snapshot = 16;
+}
+
+message TaskError {
+  TaskErrorCode code = 1;
+  string safe_detail_code = 2;
+  bool retryable = 3;
+  bool recovery_required = 4;
+  optional uint64 current_revision = 5;
+  optional string audit_ref = 6;
+}
+
+message TaskCommandResult {
+  bool replayed = 1;
+  oneof outcome {
+    TaskSnapshot task = 2;
+    TaskError error = 3;
+  }
+  TaskEvent committed_event = 4;
+}
+
+message GetTaskRequest {
+  string task_id = 1;
+}
+
+message GetTaskResponse {
+  oneof outcome {
+    TaskSnapshot task = 1;
+    TaskError error = 2;
+  }
+}
+
+service TaskAuthorityService {
+  rpc Execute(TaskCommand) returns (TaskCommandResult);
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+}

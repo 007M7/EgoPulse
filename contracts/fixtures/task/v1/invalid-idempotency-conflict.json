@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "v01-task-fixture/v0.1",
+  "fixtureId": "task-invalid-idempotency-conflict",
+  "category": "invalid",
+  "requirementRefs": ["AC-01", "QA-01"],
+  "principal": { "kind": "FOUNDER", "principalId": "founder:test", "authenticated": true },
+  "startingSnapshot": { "taskId": "task-001", "revision": 1, "workRevision": 1, "status": "TASK_STATUS_READY" },
+  "resolvedReferences": { "priorRequestDigestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "sameCanonicalRequestDigest": false },
+  "command": {
+    "createTask": {
+      "meta": { "commandId": "cmd-create-conflict-001", "idempotencyKey": "create-001", "idempotencyScope": "founder:test/v01", "requestDigestSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "issuedAt": "2026-08-23T00:00:02Z", "correlationId": "corr-002" },
+      "workType": "governed_repository_change",
+      "inputSnapshotId": "input-different",
+      "targetScopeRef": "repo-scope-001",
+      "acceptanceContractRef": { "contractId": "repository_change_acceptance", "version": "1", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      "budgetProfileRef": { "contractId": "v01-quality-budget", "version": "0.1", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+    }
+  },
+  "expected": { "outcome": "error", "errorCode": "TASK_ERROR_CODE_IDEMPOTENCY_CONFLICT", "currentRevision": 1, "businessWriteCount": 0 }
+}

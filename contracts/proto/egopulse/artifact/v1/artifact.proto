@@ -1,0 +1,383 @@
+syntax = "proto3";
+
+package egopulse.artifact.v1;
+
+import "egopulse/common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+enum HashAlgorithm {
+  HASH_ALGORITHM_UNSPECIFIED = 0;
+  HASH_ALGORITHM_SHA256 = 1;
+}
+
+enum ArtifactStatus {
+  ARTIFACT_STATUS_UNSPECIFIED = 0;
+  ARTIFACT_STATUS_STAGED = 1;
+  ARTIFACT_STATUS_SEALED = 2;
+  ARTIFACT_STATUS_QUARANTINED = 3;
+  ARTIFACT_STATUS_TOMBSTONED = 4;
+  ARTIFACT_STATUS_SUPERSEDED = 5;
+}
+
+enum ArtifactSemanticClass {
+  ARTIFACT_SEMANTIC_CLASS_UNSPECIFIED = 0;
+  ARTIFACT_SEMANTIC_CLASS_HARNESS_OUTPUT = 1;
+  ARTIFACT_SEMANTIC_CLASS_REPOSITORY_BASELINE = 2;
+  ARTIFACT_SEMANTIC_CLASS_REPOSITORY_PATCH = 3;
+  ARTIFACT_SEMANTIC_CLASS_WORKSPACE_MANIFEST = 4;
+  ARTIFACT_SEMANTIC_CLASS_COMMAND_RECEIPT = 5;
+  ARTIFACT_SEMANTIC_CLASS_TOOL_RECEIPT = 6;
+  ARTIFACT_SEMANTIC_CLASS_SIDE_EFFECT_LEDGER = 7;
+  ARTIFACT_SEMANTIC_CLASS_USAGE_RECEIPT = 8;
+  ARTIFACT_SEMANTIC_CLASS_LOG_BUNDLE = 9;
+  ARTIFACT_SEMANTIC_CLASS_FINAL_MESSAGE = 10;
+  ARTIFACT_SEMANTIC_CLASS_TYPED_EXTENSION = 11;
+}
+
+enum IntegrityStatus {
+  INTEGRITY_STATUS_UNSPECIFIED = 0;
+  INTEGRITY_STATUS_UNVERIFIED = 1;
+  INTEGRITY_STATUS_DIGEST_VERIFIED = 2;
+  INTEGRITY_STATUS_FAILED = 3;
+}
+
+enum ClaimSourceType {
+  CLAIM_SOURCE_TYPE_UNSPECIFIED = 0;
+  CLAIM_SOURCE_TYPE_CODE_CHANGE = 1;
+  CLAIM_SOURCE_TYPE_HARNESS_REPORT = 2;
+  CLAIM_SOURCE_TYPE_GOVERNED_COLLECTOR = 3;
+  CLAIM_SOURCE_TYPE_TYPED_EXTENSION = 4;
+}
+
+enum ClaimStatus {
+  CLAIM_STATUS_UNSPECIFIED = 0;
+  CLAIM_STATUS_PROPOSED = 1;
+  CLAIM_STATUS_WITHDRAWN = 2;
+  CLAIM_STATUS_SUPERSEDED = 3;
+}
+
+enum EvidenceRelation {
+  EVIDENCE_RELATION_UNSPECIFIED = 0;
+  EVIDENCE_RELATION_SUPPORTS = 1;
+  EVIDENCE_RELATION_REFUTES = 2;
+  EVIDENCE_RELATION_QUALIFIES = 3;
+  EVIDENCE_RELATION_CONTEXT = 4;
+}
+
+enum EvidenceProducerClass {
+  EVIDENCE_PRODUCER_CLASS_UNSPECIFIED = 0;
+  EVIDENCE_PRODUCER_CLASS_HARNESS = 1;
+  EVIDENCE_PRODUCER_CLASS_ATTEMPT_SUPERVISOR = 2;
+  EVIDENCE_PRODUCER_CLASS_GOVERNED_COLLECTOR = 3;
+  EVIDENCE_PRODUCER_CLASS_DETERMINISTIC_CHECKER = 4;
+  EVIDENCE_PRODUCER_CLASS_SUPERVISED_RUNNER = 5;
+  EVIDENCE_PRODUCER_CLASS_EXTERNAL_VERIFIER = 6;
+  EVIDENCE_PRODUCER_CLASS_TYPED_EXTENSION = 7;
+}
+
+enum EvidenceStatus {
+  EVIDENCE_STATUS_UNSPECIFIED = 0;
+  EVIDENCE_STATUS_RECORDED = 1;
+  EVIDENCE_STATUS_QUARANTINED = 2;
+  EVIDENCE_STATUS_TOMBSTONED = 3;
+  EVIDENCE_STATUS_SUPERSEDED = 4;
+}
+
+enum ArtifactSetStatus {
+  ARTIFACT_SET_STATUS_UNSPECIFIED = 0;
+  ARTIFACT_SET_STATUS_DRAFT = 1;
+  ARTIFACT_SET_STATUS_SEALED = 2;
+  ARTIFACT_SET_STATUS_QUARANTINED = 3;
+  ARTIFACT_SET_STATUS_TOMBSTONED = 4;
+  ARTIFACT_SET_STATUS_SUPERSEDED = 5;
+}
+
+enum ReturnHandoffStatus {
+  RETURN_HANDOFF_STATUS_UNSPECIFIED = 0;
+  RETURN_HANDOFF_STATUS_SUBMITTED = 1;
+  RETURN_HANDOFF_STATUS_RECEIPTED = 2;
+  RETURN_HANDOFF_STATUS_QUARANTINED = 3;
+  RETURN_HANDOFF_STATUS_SUPERSEDED = 4;
+}
+
+enum ArtifactEventKind {
+  ARTIFACT_EVENT_KIND_UNSPECIFIED = 0;
+  ARTIFACT_EVENT_KIND_ARTIFACT_STAGED = 1;
+  ARTIFACT_EVENT_KIND_ARTIFACT_SEALED = 2;
+  ARTIFACT_EVENT_KIND_OBJECT_QUARANTINED = 3;
+  ARTIFACT_EVENT_KIND_CLAIM_PROPOSED = 4;
+  ARTIFACT_EVENT_KIND_CLAIM_WITHDRAWN = 5;
+  ARTIFACT_EVENT_KIND_EVIDENCE_RECORDED = 6;
+  ARTIFACT_EVENT_KIND_SET_CREATED = 7;
+  ARTIFACT_EVENT_KIND_SET_SEALED = 8;
+  ARTIFACT_EVENT_KIND_RETURN_SUBMITTED = 9;
+  ARTIFACT_EVENT_KIND_RETURN_RECEIPTED = 10;
+  ARTIFACT_EVENT_KIND_OBJECT_SUPERSEDED = 11;
+  ARTIFACT_EVENT_KIND_OBJECT_TOMBSTONED = 12;
+}
+
+enum ArtifactErrorCode {
+  ARTIFACT_ERROR_CODE_UNSPECIFIED = 0;
+  ARTIFACT_ERROR_CODE_INVALID_ARGUMENT = 1;
+  ARTIFACT_ERROR_CODE_UNAUTHENTICATED = 2;
+  ARTIFACT_ERROR_CODE_PERMISSION_DENIED = 3;
+  ARTIFACT_ERROR_CODE_NOT_FOUND = 4;
+  ARTIFACT_ERROR_CODE_REVISION_CONFLICT = 5;
+  ARTIFACT_ERROR_CODE_IDEMPOTENCY_CONFLICT = 6;
+  ARTIFACT_ERROR_CODE_DIGEST_MISMATCH = 7;
+  ARTIFACT_ERROR_CODE_LENGTH_MISMATCH = 8;
+  ARTIFACT_ERROR_CODE_SCHEMA_INVALID = 9;
+  ARTIFACT_ERROR_CODE_LINEAGE_MISMATCH = 10;
+  ARTIFACT_ERROR_CODE_SCOPE_VIOLATION = 11;
+  ARTIFACT_ERROR_CODE_SECRET_DETECTED = 12;
+  ARTIFACT_ERROR_CODE_MEMBER_NOT_SEALED = 13;
+  ARTIFACT_ERROR_CODE_INDEPENDENCE_VIOLATION = 14;
+  ARTIFACT_ERROR_CODE_QUARANTINED = 15;
+  ARTIFACT_ERROR_CODE_RETENTION_CONFLICT = 16;
+  ARTIFACT_ERROR_CODE_INTEGRITY_FAILURE = 17;
+}
+
+message ContentAddress {
+  HashAlgorithm algorithm = 1;
+  string digest = 2;
+  uint64 byte_length = 3;
+}
+
+message LineageBinding {
+  string task_id = 1;
+  uint64 task_revision = 2;
+  uint64 work_revision = 3;
+  string run_id = 4;
+  uint64 run_revision = 5;
+  string step_id = 6;
+  uint64 step_revision = 7;
+  string attempt_id = 8;
+  uint64 attempt_revision = 9;
+  string dispatch_id = 10;
+  uint64 fencing_token = 11;
+}
+
+message ProducerIdentity {
+  string principal_kind = 1;
+  string principal_id = 2;
+  string component_name = 3;
+  string component_version = 4;
+  optional string capability_profile_id = 5;
+  optional string native_execution_ref = 6;
+}
+
+message Provenance {
+  LineageBinding lineage = 1;
+  ProducerIdentity producer = 2;
+  repeated string input_artifact_ids = 3;
+  egopulse.common.v1.ContractReference transformation_contract_ref = 4;
+  string workspace_ref = 5;
+  google.protobuf.Timestamp observed_at = 6;
+  google.protobuf.Timestamp captured_at = 7;
+  optional string raw_source_ref = 8;
+}
+
+message ArtifactDescriptor {
+  string artifact_id = 1;
+  uint64 revision = 2;
+  ArtifactStatus status = 3;
+  ArtifactSemanticClass semantic_class = 4;
+  egopulse.common.v1.ContractReference type_contract_ref = 5;
+  string media_type = 6;
+  ContentAddress content = 7;
+  IntegrityStatus integrity_status = 8;
+  Provenance provenance = 9;
+  string sensitivity_class = 10;
+  egopulse.common.v1.ContractReference retention_profile_ref = 11;
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp sealed_at = 13;
+  optional string supersedes_artifact_id = 14;
+  optional string quarantine_reason_code = 15;
+}
+
+message Claim {
+  string claim_id = 1;
+  uint64 revision = 2;
+  ClaimStatus status = 3;
+  ClaimSourceType source_type = 4;
+  egopulse.common.v1.ContractReference semantic_profile_ref = 5;
+  LineageBinding lineage = 6;
+  repeated string subject_artifact_ids = 7;
+  egopulse.common.v1.ContractReference acceptance_contract_ref = 8;
+  ContentAddress statement = 9;
+  ProducerIdentity proposer = 10;
+  google.protobuf.Timestamp proposed_at = 11;
+  optional string supersedes_claim_id = 12;
+}
+
+message Evidence {
+  string evidence_id = 1;
+  uint64 revision = 2;
+  EvidenceStatus status = 3;
+  EvidenceRelation relation = 4;
+  string claim_id = 5;
+  repeated string artifact_ids = 6;
+  egopulse.common.v1.ContractReference evidence_profile_ref = 7;
+  LineageBinding lineage = 8;
+  ProducerIdentity producer = 9;
+  EvidenceProducerClass producer_class = 10;
+  bool independent_of_claim_proposer = 11;
+  IntegrityStatus integrity_status = 12;
+  ContentAddress coverage_descriptor = 13;
+  repeated string limitation_codes = 14;
+  google.protobuf.Timestamp recorded_at = 15;
+  optional string supersedes_evidence_id = 16;
+}
+
+message ArtifactSet {
+  string artifact_set_id = 1;
+  uint64 revision = 2;
+  ArtifactSetStatus status = 3;
+  LineageBinding lineage = 4;
+  repeated string artifact_ids = 5;
+  repeated string claim_ids = 6;
+  repeated string evidence_ids = 7;
+  ContentAddress canonical_manifest = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp sealed_at = 10;
+  optional string supersedes_artifact_set_id = 11;
+}
+
+message ReturnHandoff {
+  string return_handoff_id = 1;
+  uint64 revision = 2;
+  ReturnHandoffStatus status = 3;
+  LineageBinding lineage = 4;
+  string artifact_set_id = 5;
+  ContentAddress artifact_set_manifest = 6;
+  repeated string primary_claim_ids = 7;
+  repeated string evidence_ids = 8;
+  repeated string limitation_artifact_ids = 9;
+  repeated string unknown_artifact_ids = 10;
+  optional string final_message_artifact_id = 11;
+  ProducerIdentity submitted_by = 12;
+  google.protobuf.Timestamp submitted_at = 13;
+  optional string supersedes_return_handoff_id = 14;
+}
+
+message ReturnReceipt {
+  string receipt_id = 1;
+  string return_handoff_id = 2;
+  ContentAddress return_handoff_digest = 3;
+  string artifact_set_id = 4;
+  ContentAddress artifact_set_manifest = 5;
+  LineageBinding lineage = 6;
+  bool accepted_for_evidence_intake = 7;
+  bool verification_performed = 8;
+  bool task_completion_decided = 9;
+  google.protobuf.Timestamp committed_at = 10;
+}
+
+message StageArtifactCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  ArtifactDescriptor candidate = 2;
+}
+
+message SealArtifactCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string artifact_id = 2;
+  uint64 expected_revision = 3;
+  ContentAddress observed_content = 4;
+}
+
+message QuarantineObjectCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string object_type = 2;
+  string object_id = 3;
+  uint64 expected_revision = 4;
+  string reason_code = 5;
+}
+
+message ProposeClaimCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  Claim claim = 2;
+}
+
+message WithdrawClaimCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string claim_id = 2;
+  uint64 expected_revision = 3;
+  string reason_code = 4;
+}
+
+message RecordEvidenceCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  Evidence evidence = 2;
+}
+
+message CreateArtifactSetCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  ArtifactSet artifact_set = 2;
+}
+
+message SealArtifactSetCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string artifact_set_id = 2;
+  uint64 expected_revision = 3;
+  ContentAddress observed_manifest = 4;
+}
+
+message SubmitReturnHandoffCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  ReturnHandoff return_handoff = 2;
+  uint64 expected_artifact_set_revision = 3;
+}
+
+message TombstoneObjectCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string object_type = 2;
+  string object_id = 3;
+  uint64 expected_revision = 4;
+  string retention_authority_ref = 5;
+}
+
+message ArtifactCommand {
+  oneof command {
+    StageArtifactCommand stage_artifact = 1;
+    SealArtifactCommand seal_artifact = 2;
+    QuarantineObjectCommand quarantine_object = 3;
+    ProposeClaimCommand propose_claim = 4;
+    WithdrawClaimCommand withdraw_claim = 5;
+    RecordEvidenceCommand record_evidence = 6;
+    CreateArtifactSetCommand create_artifact_set = 7;
+    SealArtifactSetCommand seal_artifact_set = 8;
+    SubmitReturnHandoffCommand submit_return_handoff = 9;
+    TombstoneObjectCommand tombstone_object = 10;
+  }
+}
+
+message ArtifactEvent {
+  string event_id = 1;
+  ArtifactEventKind kind = 2;
+  string aggregate_type = 3;
+  string aggregate_id = 4;
+  uint64 aggregate_revision = 5;
+  LineageBinding lineage = 6;
+  google.protobuf.Timestamp committed_at = 7;
+  string authenticated_principal_id = 8;
+  string command_id = 9;
+  ContentAddress payload = 10;
+}
+
+message ArtifactCommandResult {
+  bool committed = 1;
+  bool replayed = 2;
+  ArtifactDescriptor artifact = 3;
+  Claim claim = 4;
+  Evidence evidence = 5;
+  ArtifactSet artifact_set = 6;
+  ReturnHandoff return_handoff = 7;
+  ReturnReceipt return_receipt = 8;
+  ArtifactEvent event = 9;
+  ArtifactErrorCode error_code = 10;
+  optional string safe_error_fingerprint = 11;
+}
+
+service ArtifactAuthorityService {
+  rpc Execute(ArtifactCommand) returns (ArtifactCommandResult);
+}

@@ -8,9 +8,10 @@
     "pnpm": "11.x"
   },
   "scripts": {
-    "check": "pnpm run check:boundaries && pnpm run check:contracts && node scripts/check-typescript.mjs",
+    "check": "pnpm run check:boundaries && pnpm run check:contracts && pnpm run check:v01-contract-import && node scripts/check-typescript.mjs",
     "check:boundaries": "node scripts/check-boundaries.mjs",
     "check:contracts": "node scripts/check-proto.mjs && node scripts/check-json-schema.mjs",
+    "check:v01-contract-import": "node scripts/verify-v01-contract-import.mjs",
     "check:typescript": "node scripts/check-typescript.mjs",
     "desktop:dev": "pnpm --filter @egopulse/desktop tauri dev",
     "desktop:build": "pnpm --filter @egopulse/desktop tauri build"

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-invalid-digest-mismatch",
+  "category": "invalid",
+  "requirementRefs": ["C04-INT-02"],
+  "principal": { "kind": "ARTIFACT_AUTHORITY", "principalId": "agentosd:artifact-authority", "authenticated": true },
+  "startingState": { "artifactId": "art_patch_02", "revision": 1, "status": "ARTIFACT_STATUS_STAGED", "declaredDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  "command": { "sealArtifact": { "artifactId": "art_patch_02", "expectedRevision": 1, "observedContent": { "algorithm": "HASH_ALGORITHM_SHA256", "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "byteLength": 842 } } },
+  "expected": { "outcome": "error", "businessWriteCount": 0, "errorCode": "ARTIFACT_ERROR_CODE_DIGEST_MISMATCH", "resultingStatus": "ARTIFACT_STATUS_STAGED", "quarantineRequired": true }
+}

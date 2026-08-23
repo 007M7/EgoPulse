@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-valid-propose-code-change-claim",
+  "category": "valid",
+  "requirementRefs": ["C04-CLAIM-01", "D02-CLAIM-01"],
+  "principal": { "kind": "HARNESS", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "sealedArtifactIds": ["art_baseline_01", "art_patch_01", "art_workspace_01"] },
+  "command": { "proposeClaim": {
+    "claimId": "claim_change_01", "sourceType": "CLAIM_SOURCE_TYPE_CODE_CHANGE", "semanticProfileRef": "repository_change_acceptance/v1@sha256:claimprofile01",
+    "subjectArtifactIds": ["art_baseline_01", "art_patch_01", "art_workspace_01"], "acceptanceContractRef": "acceptance_contract_01/v3@sha256:accept01",
+    "statement": { "algorithm": "HASH_ALGORITHM_SHA256", "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "byteLength": 194 },
+    "lineage": { "taskId": "task_01", "taskRevision": 3, "workRevision": 2, "runId": "run_01", "stepId": "step_01", "attemptId": "attempt_01", "fencingToken": 1 }
+  }},
+  "expected": { "outcome": "committed", "businessWriteCount": 1, "resultingStatus": "CLAIM_STATUS_PROPOSED", "resultingRevision": 1, "verificationPerformed": false, "taskCompletionDecided": false }
+}

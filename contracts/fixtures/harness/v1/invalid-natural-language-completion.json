@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-invalid-natural-language-completion", "category": "invalid",
+  "requirementRefs": ["AC-03", "C03-RETURN-02"], "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "attemptStatus": "ATTEMPT_STATUS_RUNNING", "taskStatus": "TASK_STATUS_ACTIVE", "lastObservationSequence": 8 },
+  "resolvedReferences": { "finalMessage": { "text": "done", "outputManifest": null, "sideEffectLedger": null } },
+  "command": { "ingestObservation": { "observationId": "obs-fake-return-001", "adapterId": "codex-adapter", "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 3, "observationSequence": 9, "nativeEventDigestSha256": "f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4", "capabilityProfileId": "codex-app-server-v2-0.148.0-alpha.15", "criticality": "OBSERVATION_CRITICALITY_ARTIFACT", "rawEvidenceRef": "raw-message-001", "artifactReturn": { "returnReceiptId": "fake-return-001", "finalMessageRef": "message-001" } } },
+  "expected": { "outcome": "error", "errorCode": "HARNESS_ERROR_CODE_SCHEMA_INVALID", "attemptStatusUnchanged": "ATTEMPT_STATUS_RUNNING", "taskStatusUnchanged": "TASK_STATUS_ACTIVE", "businessWriteCount": 0 }
+}
