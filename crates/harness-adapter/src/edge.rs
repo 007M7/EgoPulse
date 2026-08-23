@@ -464,6 +464,21 @@ impl AdapterEdge {
             .collect()
     }
 
+    pub fn pending_observations(&self) -> Result<Vec<HarnessObservation>, AdapterEdgeError> {
+        let mut statement = self.connection.prepare(
+            "SELECT observation FROM adapter_observations
+             WHERE ingestion_state = 'pending'
+             ORDER BY observation_sequence",
+        )?;
+        let records = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        records
+            .into_iter()
+            .map(|record| HarnessObservation::decode(record.as_slice()).map_err(Into::into))
+            .collect()
+    }
+
     pub fn resolve_native_execution_binding(
         &self,
         dispatch_id: &str,
@@ -541,6 +556,61 @@ impl AdapterEdge {
         if changed != 1 {
             return Err(AdapterEdgeError::SequenceConflict);
         }
+        Ok(())
+    }
+
+    pub fn quarantine_observation(
+        &mut self,
+        observation_id: &str,
+        reason_code: &str,
+        now_seconds: i64,
+    ) -> Result<(), AdapterEdgeError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record: Option<(String, String, String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT dispatch_id, native_key, native_event_digest_sha256, raw_event
+                 FROM adapter_observations WHERE observation_id = ?1",
+                [observation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((dispatch_id, native_key, digest, raw_event)) = record else {
+            return Err(AdapterEdgeError::SequenceConflict);
+        };
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM adapter_quarantine
+               WHERE dispatch_id = ?1 AND native_key = ?2
+                 AND conflicting_digest_sha256 = ?3 AND reason_code = ?4
+             )",
+            params![dispatch_id, native_key, digest, reason_code],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            transaction.execute(
+                "INSERT INTO adapter_quarantine(
+                   quarantine_id, dispatch_id, native_key, prior_digest_sha256,
+                   conflicting_digest_sha256, raw_event, reason_code, created_at_seconds
+                 ) VALUES(?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
+                params![
+                    Uuid::now_v7().to_string(),
+                    dispatch_id,
+                    native_key,
+                    digest,
+                    raw_event,
+                    reason_code,
+                    now_seconds
+                ],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE adapter_observations SET ingestion_state = 'consumed'
+             WHERE observation_id = ?1",
+            [observation_id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -946,6 +1016,13 @@ mod tests {
         let inspection = edge.inspect().expect("inspect edge");
         assert_eq!(inspection.observation_count, 1);
         assert_eq!(inspection.quarantine_count, 1);
+        assert_eq!(edge.pending_observations().expect("pending").len(), 1);
+        edge.quarantine_observation(&first.observation_id, "STALE_FENCING_TOKEN", 16)
+            .expect("quarantine stale observation");
+        edge.quarantine_observation(&first.observation_id, "STALE_FENCING_TOKEN", 17)
+            .expect("replay quarantine");
+        assert!(edge.pending_observations().expect("pending").is_empty());
+        assert_eq!(edge.inspect().expect("inspect").quarantine_count, 2);
         assert_eq!(inspection.approval_count, 1);
         assert_eq!(inspection.cancellation_count, 1);
         assert_eq!(inspection.next_observation_sequence, 2);

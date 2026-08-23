@@ -141,6 +141,7 @@ pub(super) enum StoreError {
 pub(super) struct IdempotencyRecord {
     pub request_digest_sha256: String,
     pub run_revision: u64,
+    pub event_id: String,
     pub result: Vec<u8>,
 }
 
@@ -299,7 +300,7 @@ impl CollaborationStore {
     ) -> Result<Option<IdempotencyRecord>, StoreError> {
         self.connection
             .query_row(
-                "SELECT request_digest_sha256, run_revision, result
+                "SELECT request_digest_sha256, run_revision, event_id, result
                  FROM collaboration_idempotency_results
                  WHERE authenticated_principal_id = ?1
                    AND operation = ?2
@@ -311,7 +312,8 @@ impl CollaborationStore {
                     Ok(IdempotencyRecord {
                         request_digest_sha256: row.get(0)?,
                         run_revision: revision as u64,
-                        result: row.get(2)?,
+                        event_id: row.get(2)?,
+                        result: row.get(3)?,
                     })
                 },
             )
@@ -350,6 +352,28 @@ impl CollaborationStore {
             steps,
             attempts,
         }))
+    }
+
+    pub fn run_id_for_attempt(&self, attempt_id: &str) -> Result<Option<String>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT run_id FROM collaboration_attempts WHERE attempt_id = ?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn event_blob(&self, event_id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT event FROM collaboration_events WHERE event_id = ?1",
+                [event_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     pub fn latest_event_blob(&self, run_id: &str) -> Result<Option<Vec<u8>>, StoreError> {

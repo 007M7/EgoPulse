@@ -547,12 +547,26 @@ where
         self.edge.observations_after(sequence).map_err(Into::into)
     }
 
+    pub fn pending_observations(&self) -> Result<Vec<HarnessObservation>, GovernedAdapterError> {
+        self.edge.pending_observations().map_err(Into::into)
+    }
+
     pub fn mark_observation_consumed(
         &mut self,
         observation_id: &str,
     ) -> Result<(), GovernedAdapterError> {
         self.edge
             .mark_observation_consumed(observation_id)
+            .map_err(Into::into)
+    }
+
+    pub fn quarantine_observation(
+        &mut self,
+        observation_id: &str,
+        reason_code: &str,
+    ) -> Result<(), GovernedAdapterError> {
+        self.edge
+            .quarantine_observation(observation_id, reason_code, self.clock.now().seconds)
             .map_err(Into::into)
     }
 
@@ -736,6 +750,16 @@ fn cancellation_delivery_receipt(
 
 fn driver_error_event(error: DriverError, now: Timestamp) -> DriverEvent {
     let fingerprint = error.error_fingerprint.clone();
+    let criticality = if error.code == HarnessErrorCode::UnknownCriticalEvent {
+        ObservationCriticality::Terminal
+    } else if matches!(
+        error.code,
+        HarnessErrorCode::Unauthenticated | HarnessErrorCode::PermissionDenied
+    ) {
+        ObservationCriticality::Security
+    } else {
+        ObservationCriticality::Control
+    };
     DriverEvent {
         native_key: format!(
             "driver-error:{}:{}",
@@ -745,7 +769,7 @@ fn driver_error_event(error: DriverError, now: Timestamp) -> DriverEvent {
         native_event_id: None,
         native_sequence: None,
         native_observed_at: now,
-        criticality: ObservationCriticality::Control,
+        criticality,
         payload: harness_observation::Payload::Diagnostic(
             egopulse_domain_contracts::v01::egopulse::harness::v1::DiagnosticObservation {
                 safe_diagnostic_code: error.safe_detail_code,

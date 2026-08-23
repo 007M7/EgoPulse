@@ -69,6 +69,15 @@ dispatch by itself.
   result are distinct durable Collaboration facts;
 - cancellation by `dispatch_id` resolves native routing only inside the Adapter;
 - duplicate dispatch/native observation/cancellation operations replay without a second native call.
+- Adapter candidate facts are delivered at least once and remain pending until Collaboration commits,
+  explicitly defers them, or requests Adapter quarantine;
+- source replay is bound to durable source evidence, so a crash after authority commit cannot create a
+  second fact and reuse of a source ID with another digest is quarantined with zero authority writes;
+- stale dispatch/fence candidates are quarantined before authority writes;
+- unknown control/security/terminal/artifact candidates hold the Attempt as `outcome_unknown` and
+  require Adapter quarantine;
+- cancellation is confirmed only by a structured interruption observation while cancellation is
+  pending; cancellation delivery is not treated as execution termination.
 
-G4-04 remains open until candidate-fact ingestion, stale/critical observation quarantine and the
-complete fake/real contract audit are closed.
+G4-04 remains open until durable reconciliation evidence, Adapter-backed evidence resolution and
+the complete fake/real contract audit are closed.

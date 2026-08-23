@@ -12,14 +12,17 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    DispatchEnvelope, NativeSessionStrategy,
+    AckDisposition, DeliveryDisposition, DispatchEnvelope, DispatchReceipt, HarnessAckObservation,
+    HarnessObservation, LifecycleKind, LifecycleObservation, NativeSessionStrategy,
+    ObservationCriticality, SideEffectCertainty, harness_observation,
 };
 use egopulse_local_ide_control::collaboration_control::{
     AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
     CollaborationControlConfig, CollaborationControlError, CollaborationPrincipalKind,
     CollaborationReferenceGuard, CollaborationSqlCipherKey, DispatchMaterial,
-    HarnessEvidenceResolver, LeaseAuthorization, ReferenceAuthorization, ReferenceGuardRejection,
-    ResolvedHarnessEvidence, canonical_dispatch_fingerprint, canonical_request_digest,
+    HarnessEvidenceResolver, HarnessFactIngestionDisposition, LeaseAuthorization,
+    ReferenceAuthorization, ReferenceGuardRejection, ResolvedHarnessEvidence,
+    canonical_dispatch_fingerprint, canonical_request_digest,
 };
 use prost_types::Timestamp;
 use std::fs;
@@ -125,7 +128,10 @@ impl CollaborationReferenceGuard for FixtureGuard {
         command: &MarkAttemptOutcomeUnknownCommand,
         _snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
-        if command.uncertainty_evidence_id != "uncertainty-001" {
+        if !matches!(
+            command.uncertainty_evidence_id.as_str(),
+            "uncertainty-001" | "unknown-terminal-001"
+        ) {
             return Err(ReferenceGuardRejection::UnverifiedReference);
         }
         Ok(ReferenceAuthorization {
@@ -194,7 +200,10 @@ impl HarnessEvidenceResolver for FixtureGuard {
         command: &RecordAttemptCancellationOutcomeCommand,
         _snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
-        if command.cancellation_receipt_id != "cancel-receipt-001" {
+        if !matches!(
+            command.cancellation_receipt_id.as_str(),
+            "cancel-receipt-001" | "interrupted-001"
+        ) {
             return Err(ReferenceGuardRejection::UnverifiedReference);
         }
         Ok(ReferenceAuthorization {
@@ -924,6 +933,248 @@ fn advance_through_running(
             )
             .expect("running"),
     )
+}
+
+#[test]
+fn adapter_candidate_facts_ingest_at_least_once_and_stale_facts_require_quarantine() {
+    let isolated = IsolatedStore::new("collaboration-harness-ingestion");
+    let mut control = open_control(&isolated.database_path(), FixedClock::new(FIXED_TIME));
+    let (pending, _) = advance_through_dispatch(&mut control);
+    let fence = pending.attempts[0]
+        .lease
+        .as_ref()
+        .expect("lease")
+        .fencing_token;
+    let delivery = DispatchReceipt {
+        receipt_id: "delivery-001".to_owned(),
+        disposition: DeliveryDisposition::Delivered as i32,
+        attempt_id: "attempt-001".to_owned(),
+        dispatch_id: "dispatch-001".to_owned(),
+        fencing_token: fence,
+        adapter_id: "adapter:codex".to_owned(),
+        capability_profile_id: "codex-profile".to_owned(),
+        native_session_ref: Some("codex-thread-001".to_owned()),
+        native_execution_ref: Some("codex-turn-001".to_owned()),
+        receipt_digest_sha256: "d".repeat(64),
+        delivered_at: Some(Timestamp {
+            seconds: FIXED_TIME,
+            nanos: 0,
+        }),
+        ..DispatchReceipt::default()
+    };
+    let delivered = control
+        .ingest_dispatch_receipt(&delivery, &harness_adapter())
+        .expect("ingest delivery");
+    assert_eq!(
+        delivered.disposition,
+        HarnessFactIngestionDisposition::Consumed
+    );
+
+    let ack = HarnessObservation {
+        observation_id: "ack-observation-001".to_owned(),
+        adapter_id: "adapter:codex".to_owned(),
+        attempt_id: "attempt-001".to_owned(),
+        dispatch_id: "dispatch-001".to_owned(),
+        fencing_token: fence,
+        observation_sequence: 1,
+        native_event_digest_sha256: "e".repeat(64),
+        capability_profile_id: "codex-profile".to_owned(),
+        criticality: ObservationCriticality::Control as i32,
+        raw_evidence_ref: "adapter-edge://ack-observation-001".to_owned(),
+        payload: Some(harness_observation::Payload::Ack(HarnessAckObservation {
+            disposition: AckDisposition::Accepted as i32,
+            ack_receipt_id: "ack-001".to_owned(),
+            native_session_ref: Some("codex-thread-001".to_owned()),
+            native_execution_ref: Some("codex-turn-001".to_owned()),
+        })),
+        ..HarnessObservation::default()
+    };
+    let before_stale = control.inspect_store().expect("inspect");
+    let stale = HarnessObservation {
+        observation_id: "stale-ack-001".to_owned(),
+        fencing_token: fence + 1,
+        ..ack.clone()
+    };
+    let rejected = control
+        .ingest_harness_observation(&stale, &harness_adapter())
+        .expect("reject stale observation");
+    assert!(matches!(
+        rejected.disposition,
+        HarnessFactIngestionDisposition::QuarantineRequired { .. }
+    ));
+    assert_eq!(control.inspect_store().expect("inspect"), before_stale);
+
+    let acknowledged = control
+        .ingest_harness_observation(&ack, &harness_adapter())
+        .expect("ingest ack");
+    assert_eq!(
+        acknowledged.disposition,
+        HarnessFactIngestionDisposition::Consumed
+    );
+
+    let running = HarnessObservation {
+        observation_id: "running-001".to_owned(),
+        observation_sequence: 2,
+        native_event_digest_sha256: "f".repeat(64),
+        payload: Some(harness_observation::Payload::Lifecycle(
+            LifecycleObservation {
+                kind: LifecycleKind::ExecutionStarted as i32,
+                side_effect_certainty: SideEffectCertainty::Unknown as i32,
+                ..LifecycleObservation::default()
+            },
+        )),
+        ..ack.clone()
+    };
+    let started = control
+        .ingest_harness_observation(&running, &harness_adapter())
+        .expect("ingest running");
+    assert_eq!(
+        started.disposition,
+        HarnessFactIngestionDisposition::Consumed
+    );
+    let replayed = control
+        .ingest_harness_observation(&ack, &harness_adapter())
+        .expect("replay ack after later revision");
+    assert!(
+        replayed
+            .authority_result
+            .as_ref()
+            .expect("replayed result")
+            .replayed
+    );
+
+    let before_conflict = control.inspect_store().expect("inspect before conflict");
+    let conflicting_ack = HarnessObservation {
+        native_event_digest_sha256: "a".repeat(64),
+        ..ack
+    };
+    let conflict = control
+        .ingest_harness_observation(&conflicting_ack, &harness_adapter())
+        .expect("classify source identity conflict");
+    assert!(matches!(
+        conflict.disposition,
+        HarnessFactIngestionDisposition::QuarantineRequired { .. }
+    ));
+    assert_eq!(
+        control.inspect_store().expect("inspect after conflict"),
+        before_conflict
+    );
+}
+
+#[test]
+fn unknown_critical_harness_fact_holds_authority_and_requires_quarantine() {
+    let isolated = IsolatedStore::new("collaboration-unknown-critical-ingestion");
+    let mut control = open_control(&isolated.database_path(), FixedClock::new(FIXED_TIME));
+    let running = advance_through_running(&mut control);
+    let fence = running.attempts[0]
+        .lease
+        .as_ref()
+        .expect("lease")
+        .fencing_token;
+    let observation = HarnessObservation {
+        observation_id: "unknown-terminal-001".to_owned(),
+        adapter_id: "adapter:codex".to_owned(),
+        attempt_id: "attempt-001".to_owned(),
+        dispatch_id: "dispatch-001".to_owned(),
+        fencing_token: fence,
+        observation_sequence: 3,
+        native_event_digest_sha256: "7".repeat(64),
+        capability_profile_id: "codex-profile".to_owned(),
+        criticality: ObservationCriticality::Terminal as i32,
+        raw_evidence_ref: "adapter-edge://unknown-terminal-001".to_owned(),
+        payload: None,
+        ..HarnessObservation::default()
+    };
+
+    let held = control
+        .ingest_harness_observation(&observation, &harness_adapter())
+        .expect("hold unknown critical observation");
+    assert!(matches!(
+        held.disposition,
+        HarnessFactIngestionDisposition::QuarantineRequired { .. }
+    ));
+    let snapshot = committed_snapshot(held.authority_result.as_ref().expect("authority result"));
+    assert_eq!(
+        snapshot.run.as_ref().expect("run").status,
+        RunStatus::Held as i32
+    );
+    assert_eq!(snapshot.steps[0].status, StepStatus::Held as i32);
+    assert_eq!(
+        snapshot.attempts[0].status,
+        AttemptStatus::OutcomeUnknown as i32
+    );
+
+    let replayed = control
+        .ingest_harness_observation(&observation, &harness_adapter())
+        .expect("replay unknown critical observation");
+    assert!(matches!(
+        replayed.disposition,
+        HarnessFactIngestionDisposition::QuarantineRequired { .. }
+    ));
+    assert!(
+        replayed
+            .authority_result
+            .as_ref()
+            .expect("replayed authority result")
+            .replayed
+    );
+}
+
+#[test]
+fn cancellation_is_confirmed_only_by_structured_interruption_observation() {
+    let isolated = IsolatedStore::new("collaboration-interrupted-ingestion");
+    let mut control = open_control(&isolated.database_path(), FixedClock::new(FIXED_TIME));
+    let running = advance_through_running(&mut control);
+    let pending = committed_snapshot(
+        &control
+            .execute(&cancellation_request(&running), &attempt_supervisor())
+            .expect("request cancellation"),
+    );
+    let fence = pending.attempts[0]
+        .lease
+        .as_ref()
+        .expect("lease")
+        .fencing_token;
+    let interrupted = HarnessObservation {
+        observation_id: "interrupted-001".to_owned(),
+        adapter_id: "adapter:codex".to_owned(),
+        attempt_id: "attempt-001".to_owned(),
+        dispatch_id: "dispatch-001".to_owned(),
+        fencing_token: fence,
+        observation_sequence: 3,
+        native_event_digest_sha256: "8".repeat(64),
+        capability_profile_id: "codex-profile".to_owned(),
+        criticality: ObservationCriticality::Terminal as i32,
+        raw_evidence_ref: "adapter-edge://interrupted-001".to_owned(),
+        payload: Some(harness_observation::Payload::Lifecycle(
+            LifecycleObservation {
+                kind: LifecycleKind::ExecutionInterrupted as i32,
+                side_effect_certainty: SideEffectCertainty::NoneProven as i32,
+                ..LifecycleObservation::default()
+            },
+        )),
+        ..HarnessObservation::default()
+    };
+
+    let confirmed = control
+        .ingest_harness_observation(&interrupted, &harness_adapter())
+        .expect("confirm cancellation from interruption");
+    assert_eq!(
+        confirmed.disposition,
+        HarnessFactIngestionDisposition::Consumed
+    );
+    let snapshot = committed_snapshot(
+        confirmed
+            .authority_result
+            .as_ref()
+            .expect("authority result"),
+    );
+    assert_eq!(
+        snapshot.run.as_ref().expect("run").status,
+        RunStatus::Cancelled as i32
+    );
+    assert_eq!(snapshot.steps[0].status, StepStatus::Cancelled as i32);
+    assert_eq!(snapshot.attempts[0].status, AttemptStatus::Cancelled as i32);
 }
 
 #[test]

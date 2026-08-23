@@ -1,4 +1,7 @@
+mod ingestion;
 mod store;
+
+pub use ingestion::{HarnessFactIngestionDisposition, HarnessFactIngestionResult};
 
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCancellationDisposition,
@@ -941,6 +944,10 @@ where
         attempt.updated_at = Some(now);
         let mut evidence = resolved.evidence_refs;
         evidence.push(format!("delivery-receipt:{}", value.delivery_receipt_id));
+        evidence.push(format!(
+            "delivery-receipt-digest:{}",
+            value.receipt_digest_sha256
+        ));
         self.persist(
             command,
             principal,
@@ -1047,6 +1054,10 @@ where
         attempt.updated_at = Some(now);
         let mut evidence = resolved.evidence_refs;
         evidence.push(format!("ack-receipt:{}", value.ack_receipt_id));
+        evidence.push(format!(
+            "harness-observation-digest:{}",
+            value.receipt_digest_sha256
+        ));
         self.persist(
             command,
             principal,
@@ -1120,6 +1131,10 @@ where
         attempt.updated_at = Some(now);
         let mut evidence = authorization.evidence_refs;
         evidence.push(format!("lifecycle-event:{}", value.lifecycle_event_id));
+        evidence.push(format!(
+            "harness-observation-digest:{}",
+            value.event_digest_sha256
+        ));
         self.persist(
             command,
             principal,
