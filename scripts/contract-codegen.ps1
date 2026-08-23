@@ -53,6 +53,10 @@ function Get-RelativeFiles {
     $normalizedRoot = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
     return @(
         Get-ChildItem -LiteralPath $normalizedRoot -Recurse -File |
+            Where-Object {
+                $_.Extension -ne '.pyc' -and
+                $_.FullName -notmatch '[\\/]__pycache__[\\/]'
+            } |
             ForEach-Object { $_.FullName.Substring($normalizedRoot.Length + 1).Replace('\', '/') } |
             Sort-Object
     )
