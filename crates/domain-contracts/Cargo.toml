@@ -5,5 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+
 [lib]
 path = "src/lib.rs"

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "egopulse-buf-breaking-baseline/v0.1",
+  "featureId": "v01-governed-single-harness-work-loop",
+  "candidateVersion": "0.1.0-draft.11",
+  "descriptor": "v01-gate3-draft11.binpb",
+  "sha256": "77f07275c43b21f53de000d06c18728e0fe617c585b73ab1756f29650cf31b70",
+  "sourceManifestSha256": "adbcba96ee023f886ba6ea8de0083d7f09c2f5db67b60ddd6db6b231932fbe66",
+  "authorityRef": "conversation:2026-08-23:founder-v01-gate3-pass",
+  "note": "Initial accepted V-01 Buf image; all later contract revisions must run buf breaking against this baseline or an explicitly superseding accepted baseline."
+}
