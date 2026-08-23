@@ -1,13 +1,16 @@
 mod store;
 
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
-    AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptSnapshot, AttemptStatus,
-    CollaborationCommand, CollaborationCommandResult, CollaborationError, CollaborationErrorCode,
-    CollaborationEvent, CollaborationEventKind, CollaborationSnapshot, CreateAttemptCommand,
-    CreateRunCommand, GetCollaborationResponse, Lease, MarkAttemptOutcomeUnknownCommand,
+    AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCancellationDisposition,
+    AttemptSnapshot, AttemptStatus, BeginAttemptReconciliationCommand, CollaborationCommand,
+    CollaborationCommandResult, CollaborationError, CollaborationErrorCode, CollaborationEvent,
+    CollaborationEventKind, CollaborationSnapshot, CreateAttemptCommand, CreateRunCommand,
+    GetCollaborationResponse, Lease, MarkAttemptOutcomeUnknownCommand, ReconciliationDisposition,
+    RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
     RecordDeliveryReceiptCommand, RecordDispatchIntentCommand, RecordHarnessAckCommand,
-    RecordRunningObservationCommand, RecoveryClass, RunSnapshot, RunStatus, StepSnapshot,
-    StepStatus, collaboration_command, collaboration_command_result, get_collaboration_response,
+    RecordRunningObservationCommand, RecoveryClass, RequestAttemptCancellationCommand, RunSnapshot,
+    RunStatus, StepSnapshot, StepStatus, collaboration_command, collaboration_command_result,
+    get_collaboration_response,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
@@ -128,6 +131,18 @@ pub trait HarnessEvidenceResolver {
         command: &RecordRunningObservationCommand,
         snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection>;
+
+    fn validate_cancellation_outcome(
+        &self,
+        command: &RecordAttemptCancellationOutcomeCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection>;
+
+    fn validate_reconciliation(
+        &self,
+        command: &RecordAttemptReconciliationCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection>;
 }
 
 pub trait CollaborationReferenceGuard {
@@ -164,6 +179,12 @@ pub trait CollaborationReferenceGuard {
     fn validate_unknown_outcome(
         &self,
         command: &MarkAttemptOutcomeUnknownCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection>;
+
+    fn validate_cancellation_request(
+        &self,
+        command: &RequestAttemptCancellationCommand,
         snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection>;
 }
@@ -339,6 +360,18 @@ where
             }
             collaboration_command::Command::RecordRunningObservation(value) => {
                 self.record_running_observation(value, command, principal)
+            }
+            collaboration_command::Command::RequestAttemptCancellation(value) => {
+                self.request_attempt_cancellation(value, command, principal)
+            }
+            collaboration_command::Command::RecordAttemptCancellationOutcome(value) => {
+                self.record_attempt_cancellation_outcome(value, command, principal)
+            }
+            collaboration_command::Command::BeginAttemptReconciliation(value) => {
+                self.begin_attempt_reconciliation(value, command, principal)
+            }
+            collaboration_command::Command::RecordAttemptReconciliation(value) => {
+                self.record_attempt_reconciliation(value, command, principal)
             }
             collaboration_command::Command::MarkAttemptOutcomeUnknown(value) => {
                 self.mark_outcome_unknown(value, command, principal)
@@ -1101,6 +1134,349 @@ where
         )
     }
 
+    fn request_attempt_cancellation(
+        &mut self,
+        value: &RequestAttemptCancellationCommand,
+        command: &CollaborationCommand,
+        principal: &AuthenticatedCollaborationPrincipal,
+    ) -> Result<CollaborationCommandResult, CollaborationControlError> {
+        let Some(base) = value.base.as_ref() else {
+            return Ok(invalid("CANCELLATION_BASE_REQUIRED"));
+        };
+        let Some(mut snapshot) = self.load_snapshot(&base.run_id)? else {
+            return Ok(not_found("COLLABORATION_RUN_NOT_FOUND"));
+        };
+        let (step_index, attempt_index) = match validate_attempt_preconditions(&snapshot, base) {
+            Ok(value) => value,
+            Err(value) => return Ok(*value),
+        };
+        let attempt = &snapshot.attempts[attempt_index];
+        if !matches!(
+            AttemptStatus::try_from(attempt.status),
+            Ok(AttemptStatus::DispatchPending
+                | AttemptStatus::Dispatched
+                | AttemptStatus::Acknowledged
+                | AttemptStatus::Running)
+        ) {
+            return Ok(state_conflict("ATTEMPT_NOT_CANCELLABLE"));
+        }
+        if value.task_cancellation_request_id.trim().is_empty() {
+            return Ok(invalid("TASK_CANCELLATION_REQUEST_REQUIRED"));
+        }
+        let authorization = match self.guard.validate_cancellation_request(value, &snapshot) {
+            Ok(value) => value,
+            Err(value) => return Ok(guard_error(value)),
+        };
+        let now = self.clock.now();
+        let run_previous = snapshot.run.as_ref().expect("run").revision;
+        let step_previous = snapshot.steps[step_index].revision;
+        let attempt_previous = attempt.revision;
+        let run = snapshot.run.as_mut().expect("run");
+        run.revision += 1;
+        run.status = RunStatus::CancellationPending as i32;
+        run.updated_at = Some(now);
+        let step = &mut snapshot.steps[step_index];
+        step.revision += 1;
+        step.updated_at = Some(now);
+        let attempt = &mut snapshot.attempts[attempt_index];
+        attempt.revision += 1;
+        attempt.status = AttemptStatus::CancellationPending as i32;
+        attempt.updated_at = Some(now);
+        let mut evidence = authorization.evidence_refs;
+        evidence.push(format!(
+            "task-cancellation:{}",
+            value.task_cancellation_request_id
+        ));
+        self.persist(
+            command,
+            principal,
+            snapshot,
+            Some(run_previous),
+            Some(step_previous),
+            Some(attempt_previous),
+            CollaborationEventKind::CancellationRequested,
+            evidence,
+            None,
+            now,
+        )
+    }
+
+    fn record_attempt_cancellation_outcome(
+        &mut self,
+        value: &RecordAttemptCancellationOutcomeCommand,
+        command: &CollaborationCommand,
+        principal: &AuthenticatedCollaborationPrincipal,
+    ) -> Result<CollaborationCommandResult, CollaborationControlError> {
+        let Some(base) = value.base.as_ref() else {
+            return Ok(invalid("CANCELLATION_OUTCOME_BASE_REQUIRED"));
+        };
+        let Some(mut snapshot) = self.load_snapshot(&base.run_id)? else {
+            return Ok(not_found("COLLABORATION_RUN_NOT_FOUND"));
+        };
+        let (step_index, attempt_index) = match validate_attempt_preconditions(&snapshot, base) {
+            Ok(value) => value,
+            Err(value) => return Ok(*value),
+        };
+        let attempt = &snapshot.attempts[attempt_index];
+        if attempt.status != AttemptStatus::CancellationPending as i32 {
+            return Ok(state_conflict("CANCELLATION_MUST_BE_PENDING"));
+        }
+        if value.cancellation_receipt_id.trim().is_empty() {
+            return Ok(invalid("CANCELLATION_RECEIPT_REQUIRED"));
+        }
+        let disposition = match AttemptCancellationDisposition::try_from(value.disposition) {
+            Ok(AttemptCancellationDisposition::Unspecified) | Err(_) => {
+                return Ok(invalid("CANCELLATION_DISPOSITION_INVALID"));
+            }
+            Ok(value) => value,
+        };
+        let authorization = match self.guard.validate_cancellation_outcome(value, &snapshot) {
+            Ok(value) => value,
+            Err(value) => return Ok(guard_error(value)),
+        };
+        let now = self.clock.now();
+        let run_previous = snapshot.run.as_ref().expect("run").revision;
+        let step_previous = snapshot.steps[step_index].revision;
+        let attempt_previous = attempt.revision;
+        let (run_status, step_status, attempt_status, recovery, hold) = match disposition {
+            AttemptCancellationDisposition::CancelledConfirmed => (
+                RunStatus::Cancelled,
+                StepStatus::Cancelled,
+                AttemptStatus::Cancelled,
+                RecoveryClass::ReconcileBeforeRetry,
+                None,
+            ),
+            AttemptCancellationDisposition::ReturnFound => (
+                RunStatus::ReturnPending,
+                StepStatus::ReturnPending,
+                AttemptStatus::Returned,
+                RecoveryClass::ReconcileBeforeRetry,
+                None,
+            ),
+            AttemptCancellationDisposition::OutcomeUnknown => (
+                RunStatus::Held,
+                StepStatus::Held,
+                AttemptStatus::OutcomeUnknown,
+                RecoveryClass::ReconcileBeforeRetry,
+                Some("CANCELLATION_OUTCOME_UNKNOWN".to_owned()),
+            ),
+            AttemptCancellationDisposition::Unspecified => unreachable!(),
+        };
+        let run = snapshot.run.as_mut().expect("run");
+        run.revision += 1;
+        run.status = run_status as i32;
+        run.hold_reason_code = hold.clone();
+        run.updated_at = Some(now);
+        let step = &mut snapshot.steps[step_index];
+        step.revision += 1;
+        step.status = step_status as i32;
+        step.hold_reason_code = hold.clone();
+        step.updated_at = Some(now);
+        let attempt = &mut snapshot.attempts[attempt_index];
+        attempt.revision += 1;
+        attempt.status = attempt_status as i32;
+        attempt.recovery_class = recovery as i32;
+        attempt.hold_reason_code = hold;
+        attempt.updated_at = Some(now);
+        let mut evidence = authorization.evidence_refs;
+        evidence.push(format!(
+            "cancellation-receipt:{}",
+            value.cancellation_receipt_id
+        ));
+        self.persist(
+            command,
+            principal,
+            snapshot,
+            Some(run_previous),
+            Some(step_previous),
+            Some(attempt_previous),
+            CollaborationEventKind::CancellationRecorded,
+            evidence,
+            None,
+            now,
+        )
+    }
+
+    fn begin_attempt_reconciliation(
+        &mut self,
+        value: &BeginAttemptReconciliationCommand,
+        command: &CollaborationCommand,
+        principal: &AuthenticatedCollaborationPrincipal,
+    ) -> Result<CollaborationCommandResult, CollaborationControlError> {
+        let Some(base) = value.base.as_ref() else {
+            return Ok(invalid("RECONCILIATION_BASE_REQUIRED"));
+        };
+        let Some(mut snapshot) = self.load_snapshot(&base.run_id)? else {
+            return Ok(not_found("COLLABORATION_RUN_NOT_FOUND"));
+        };
+        let (step_index, attempt_index) = match validate_attempt_preconditions(&snapshot, base) {
+            Ok(value) => value,
+            Err(value) => return Ok(*value),
+        };
+        let attempt = &snapshot.attempts[attempt_index];
+        if attempt.status != AttemptStatus::OutcomeUnknown as i32 {
+            return Ok(state_conflict("OUTCOME_UNKNOWN_REQUIRED"));
+        }
+        if value.reconciliation_id.trim().is_empty() {
+            return Ok(invalid("RECONCILIATION_ID_REQUIRED"));
+        }
+        let now = self.clock.now();
+        let run_previous = snapshot.run.as_ref().expect("run").revision;
+        let step_previous = snapshot.steps[step_index].revision;
+        let attempt_previous = attempt.revision;
+        let run = snapshot.run.as_mut().expect("run");
+        run.revision += 1;
+        run.updated_at = Some(now);
+        let step = &mut snapshot.steps[step_index];
+        step.revision += 1;
+        step.updated_at = Some(now);
+        let attempt = &mut snapshot.attempts[attempt_index];
+        attempt.revision += 1;
+        attempt.status = AttemptStatus::Reconciling as i32;
+        attempt.updated_at = Some(now);
+        self.persist(
+            command,
+            principal,
+            snapshot,
+            Some(run_previous),
+            Some(step_previous),
+            Some(attempt_previous),
+            CollaborationEventKind::ReconciliationStarted,
+            vec![format!("reconciliation:{}", value.reconciliation_id)],
+            None,
+            now,
+        )
+    }
+
+    fn record_attempt_reconciliation(
+        &mut self,
+        value: &RecordAttemptReconciliationCommand,
+        command: &CollaborationCommand,
+        principal: &AuthenticatedCollaborationPrincipal,
+    ) -> Result<CollaborationCommandResult, CollaborationControlError> {
+        let Some(base) = value.base.as_ref() else {
+            return Ok(invalid("RECONCILIATION_RESULT_BASE_REQUIRED"));
+        };
+        let Some(mut snapshot) = self.load_snapshot(&base.run_id)? else {
+            return Ok(not_found("COLLABORATION_RUN_NOT_FOUND"));
+        };
+        let (step_index, attempt_index) = match validate_attempt_preconditions(&snapshot, base) {
+            Ok(value) => value,
+            Err(value) => return Ok(*value),
+        };
+        let attempt = &snapshot.attempts[attempt_index];
+        if attempt.status != AttemptStatus::Reconciling as i32 {
+            return Ok(state_conflict("RECONCILIATION_NOT_ACTIVE"));
+        }
+        if value.reconciliation_id.trim().is_empty() || value.evidence_id.trim().is_empty() {
+            return Ok(invalid("RECONCILIATION_EVIDENCE_REQUIRED"));
+        }
+        let latest = self
+            .store
+            .latest_event_blob(&base.run_id)?
+            .ok_or(CollaborationControlError::Persistence)?;
+        let latest = CollaborationEvent::decode(latest.as_slice())?;
+        if latest.kind != CollaborationEventKind::ReconciliationStarted as i32
+            || latest.attempt_id.as_deref() != Some(base.attempt_id.as_str())
+            || !latest
+                .evidence_refs
+                .iter()
+                .any(|item| item == &format!("reconciliation:{}", value.reconciliation_id))
+        {
+            return Ok(state_conflict("RECONCILIATION_ID_MISMATCH"));
+        }
+        let disposition = match ReconciliationDisposition::try_from(value.disposition) {
+            Ok(ReconciliationDisposition::Unspecified) | Err(_) => {
+                return Ok(invalid("RECONCILIATION_DISPOSITION_INVALID"));
+            }
+            Ok(value) => value,
+        };
+        let authorization = match self.guard.validate_reconciliation(value, &snapshot) {
+            Ok(value) => value,
+            Err(value) => return Ok(guard_error(value)),
+        };
+        let now = self.clock.now();
+        let run_previous = snapshot.run.as_ref().expect("run").revision;
+        let step_previous = snapshot.steps[step_index].revision;
+        let attempt_previous = attempt.revision;
+        let (run_status, step_status, attempt_status, recovery, hold) = match disposition {
+            ReconciliationDisposition::ReturnFound => (
+                RunStatus::ReturnPending,
+                StepStatus::ReturnPending,
+                AttemptStatus::Returned,
+                RecoveryClass::ReconcileBeforeRetry,
+                None,
+            ),
+            ReconciliationDisposition::NoEffectProven
+            | ReconciliationDisposition::RetryIdempotent => (
+                RunStatus::Active,
+                StepStatus::Active,
+                AttemptStatus::Interrupted,
+                RecoveryClass::RetryIdempotent,
+                None,
+            ),
+            ReconciliationDisposition::ResumeSafe => (
+                RunStatus::Active,
+                StepStatus::Active,
+                AttemptStatus::Interrupted,
+                RecoveryClass::ResumeSafe,
+                None,
+            ),
+            ReconciliationDisposition::Compensate => (
+                RunStatus::Held,
+                StepStatus::Held,
+                AttemptStatus::Held,
+                RecoveryClass::Compensatable,
+                Some("COMPENSATION_REQUIRED".to_owned()),
+            ),
+            ReconciliationDisposition::ManualOnly => (
+                RunStatus::Held,
+                StepStatus::Held,
+                AttemptStatus::Held,
+                RecoveryClass::ManualOnly,
+                Some("MANUAL_RECOVERY_REQUIRED".to_owned()),
+            ),
+            ReconciliationDisposition::IrreversibleUnknown => (
+                RunStatus::Held,
+                StepStatus::Held,
+                AttemptStatus::Held,
+                RecoveryClass::Irreversible,
+                Some("IRREVERSIBLE_OUTCOME_UNKNOWN".to_owned()),
+            ),
+            ReconciliationDisposition::Unspecified => unreachable!(),
+        };
+        let run = snapshot.run.as_mut().expect("run");
+        run.revision += 1;
+        run.status = run_status as i32;
+        run.hold_reason_code = hold.clone();
+        run.updated_at = Some(now);
+        let step = &mut snapshot.steps[step_index];
+        step.revision += 1;
+        step.status = step_status as i32;
+        step.hold_reason_code = hold.clone();
+        step.updated_at = Some(now);
+        let attempt = &mut snapshot.attempts[attempt_index];
+        attempt.revision += 1;
+        attempt.status = attempt_status as i32;
+        attempt.recovery_class = recovery as i32;
+        attempt.hold_reason_code = hold;
+        attempt.updated_at = Some(now);
+        let mut evidence = authorization.evidence_refs;
+        evidence.push(format!("reconciliation-evidence:{}", value.evidence_id));
+        self.persist(
+            command,
+            principal,
+            snapshot,
+            Some(run_previous),
+            Some(step_previous),
+            Some(attempt_previous),
+            CollaborationEventKind::ReconciliationRecorded,
+            evidence,
+            None,
+            now,
+        )
+    }
+
     fn mark_outcome_unknown(
         &mut self,
         value: &MarkAttemptOutcomeUnknownCommand,
@@ -1258,62 +1634,66 @@ where
             });
         }
 
-        let commit =
-            CollaborationCommit {
-                run: RunWrite {
-                    run_id: run.run_id.clone(),
-                    task_id: run.task_id.clone(),
-                    work_revision: run.work_revision,
-                    revision: run.revision,
-                    status: run.status,
-                    snapshot: run.encode_to_vec(),
-                    expected_revision: previous_run_revision,
+        let commit = CollaborationCommit {
+            run: RunWrite {
+                run_id: run.run_id.clone(),
+                task_id: run.task_id.clone(),
+                work_revision: run.work_revision,
+                revision: run.revision,
+                status: run.status,
+                snapshot: run.encode_to_vec(),
+                expected_revision: previous_run_revision,
+            },
+            step: changed_step.map(|(step, previous)| StepWrite {
+                step_id: step.step_id.clone(),
+                run_id: step.run_id.clone(),
+                revision: step.revision,
+                status: step.status,
+                snapshot: step.encode_to_vec(),
+                expected_revision: (previous != 0).then_some(previous),
+            }),
+            attempt: changed_attempt.map(|(attempt, previous)| AttemptWrite {
+                attempt_id: attempt.attempt_id.clone(),
+                run_id: attempt.run_id.clone(),
+                step_id: attempt.step_id.clone(),
+                revision: attempt.revision,
+                status: attempt.status,
+                snapshot: attempt.encode_to_vec(),
+                expected_revision: (previous != 0).then_some(previous),
+            }),
+            event_id,
+            command_id: meta.command_id.clone(),
+            request_digest_sha256: meta.request_digest_sha256.clone(),
+            event: event_bytes,
+            authenticated_principal_id: principal.principal_id.clone(),
+            operation: operation.to_owned(),
+            idempotency_scope: meta.idempotency_scope.clone(),
+            idempotency_key: meta.idempotency_key.clone(),
+            result: result.encode_to_vec(),
+            outboxes,
+            hold_dispatch_for_attempt: matches!(
+                kind,
+                CollaborationEventKind::OutcomeMarkedUnknown
+                    | CollaborationEventKind::CancellationRequested
+            )
+            .then(|| {
+                changed_attempt
+                    .expect("unknown outcome changes attempt")
+                    .0
+                    .attempt_id
+                    .clone()
+            }),
+            deliver_dispatch_for_attempt: (kind == CollaborationEventKind::DeliveryRecorded).then(
+                || {
+                    changed_attempt
+                        .expect("delivery receipt changes attempt")
+                        .0
+                        .attempt_id
+                        .clone()
                 },
-                step: changed_step.map(|(step, previous)| StepWrite {
-                    step_id: step.step_id.clone(),
-                    run_id: step.run_id.clone(),
-                    revision: step.revision,
-                    status: step.status,
-                    snapshot: step.encode_to_vec(),
-                    expected_revision: (previous != 0).then_some(previous),
-                }),
-                attempt: changed_attempt.map(|(attempt, previous)| AttemptWrite {
-                    attempt_id: attempt.attempt_id.clone(),
-                    run_id: attempt.run_id.clone(),
-                    step_id: attempt.step_id.clone(),
-                    revision: attempt.revision,
-                    status: attempt.status,
-                    snapshot: attempt.encode_to_vec(),
-                    expected_revision: (previous != 0).then_some(previous),
-                }),
-                event_id,
-                command_id: meta.command_id.clone(),
-                request_digest_sha256: meta.request_digest_sha256.clone(),
-                event: event_bytes,
-                authenticated_principal_id: principal.principal_id.clone(),
-                operation: operation.to_owned(),
-                idempotency_scope: meta.idempotency_scope.clone(),
-                idempotency_key: meta.idempotency_key.clone(),
-                result: result.encode_to_vec(),
-                outboxes,
-                hold_dispatch_for_attempt: (kind == CollaborationEventKind::OutcomeMarkedUnknown)
-                    .then(|| {
-                        changed_attempt
-                            .expect("unknown outcome changes attempt")
-                            .0
-                            .attempt_id
-                            .clone()
-                    }),
-                deliver_dispatch_for_attempt: (kind == CollaborationEventKind::DeliveryRecorded)
-                    .then(|| {
-                        changed_attempt
-                            .expect("delivery receipt changes attempt")
-                            .0
-                            .attempt_id
-                            .clone()
-                    }),
-                committed_at_seconds: now.seconds,
-            };
+            ),
+            committed_at_seconds: now.seconds,
+        };
         self.store.commit(&commit)?;
         Ok(result)
     }
@@ -1753,6 +2133,18 @@ fn changed_step_id(command: &CollaborationCommand) -> Option<&str> {
         collaboration_command::Command::RecordRunningObservation(value) => {
             Some(&value.base.as_ref()?.step_id)
         }
+        collaboration_command::Command::RequestAttemptCancellation(value) => {
+            Some(&value.base.as_ref()?.step_id)
+        }
+        collaboration_command::Command::RecordAttemptCancellationOutcome(value) => {
+            Some(&value.base.as_ref()?.step_id)
+        }
+        collaboration_command::Command::BeginAttemptReconciliation(value) => {
+            Some(&value.base.as_ref()?.step_id)
+        }
+        collaboration_command::Command::RecordAttemptReconciliation(value) => {
+            Some(&value.base.as_ref()?.step_id)
+        }
         collaboration_command::Command::MarkAttemptOutcomeUnknown(value) => {
             Some(&value.base.as_ref()?.step_id)
         }
@@ -1776,6 +2168,18 @@ fn changed_attempt_id(command: &CollaborationCommand) -> Option<&str> {
             Some(&value.base.as_ref()?.attempt_id)
         }
         collaboration_command::Command::RecordRunningObservation(value) => {
+            Some(&value.base.as_ref()?.attempt_id)
+        }
+        collaboration_command::Command::RequestAttemptCancellation(value) => {
+            Some(&value.base.as_ref()?.attempt_id)
+        }
+        collaboration_command::Command::RecordAttemptCancellationOutcome(value) => {
+            Some(&value.base.as_ref()?.attempt_id)
+        }
+        collaboration_command::Command::BeginAttemptReconciliation(value) => {
+            Some(&value.base.as_ref()?.attempt_id)
+        }
+        collaboration_command::Command::RecordAttemptReconciliation(value) => {
             Some(&value.base.as_ref()?.attempt_id)
         }
         collaboration_command::Command::MarkAttemptOutcomeUnknown(value) => {

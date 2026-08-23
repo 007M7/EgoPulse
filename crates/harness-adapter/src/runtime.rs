@@ -476,6 +476,47 @@ where
         Ok(cancel_receipt(receipt))
     }
 
+    pub async fn cancel_dispatch(
+        &mut self,
+        cancellation_request_id: &str,
+        dispatch_id: &str,
+        confirmation_deadline: Timestamp,
+    ) -> Result<CancelExecutionResult, GovernedAdapterError> {
+        if cancellation_request_id.trim().is_empty() || dispatch_id.trim().is_empty() {
+            return Ok(CancelExecutionResult {
+                outcome: Some(cancel_execution_result::Outcome::Error(harness_error(
+                    HarnessErrorCode::InvalidArgument,
+                    "CANCELLATION_REFERENCE_INVALID",
+                    false,
+                    false,
+                    None,
+                ))),
+            });
+        }
+        let Some(binding) = self.edge.resolve_native_execution_binding(dispatch_id)? else {
+            return Ok(CancelExecutionResult {
+                outcome: Some(cancel_execution_result::Outcome::Error(harness_error(
+                    HarnessErrorCode::NotFound,
+                    "NATIVE_EXECUTION_BINDING_NOT_FOUND",
+                    false,
+                    false,
+                    None,
+                ))),
+            });
+        };
+        self.cancel(&CancelExecutionEnvelope {
+            attempt_id: binding.attempt_id,
+            dispatch_id: binding.dispatch_id,
+            fencing_token: binding.fencing_token,
+            cancellation_request_id: cancellation_request_id.to_owned(),
+            native_session_ref: binding.native_session_ref,
+            native_execution_ref: binding.native_execution_ref,
+            confirmation_deadline: Some(confirmation_deadline),
+            ..CancelExecutionEnvelope::default()
+        })
+        .await
+    }
+
     pub async fn reconcile(
         &mut self,
         envelope: &DispatchEnvelope,

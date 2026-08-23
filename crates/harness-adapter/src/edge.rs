@@ -1,5 +1,5 @@
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    DeliveryDisposition, DispatchEnvelope, DispatchReceipt, HarnessObservation,
+    DeliveryDisposition, DispatchEnvelope, DispatchReceipt, HarnessObservation, harness_observation,
 };
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -156,6 +156,15 @@ pub enum DurableWritePreparation {
 pub enum ObservationAppend {
     Committed(HarnessObservation),
     Replay(HarnessObservation),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeExecutionBinding {
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub fencing_token: u64,
+    pub native_session_ref: String,
+    pub native_execution_ref: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -453,6 +462,53 @@ impl AdapterEdge {
             .into_iter()
             .map(|record| HarnessObservation::decode(record.as_slice()).map_err(Into::into))
             .collect()
+    }
+
+    pub fn resolve_native_execution_binding(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<NativeExecutionBinding>, AdapterEdgeError> {
+        let receipt: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT receipt FROM adapter_dispatches WHERE dispatch_id = ?1",
+                [dispatch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(receipt) = receipt else {
+            return Ok(None);
+        };
+        let receipt = DispatchReceipt::decode(receipt.as_slice())?;
+        let mut session_ref = receipt.native_session_ref;
+        let mut execution_ref = receipt.native_execution_ref;
+        let mut statement = self.connection.prepare(
+            "SELECT observation FROM adapter_observations
+             WHERE dispatch_id = ?1 ORDER BY observation_sequence DESC",
+        )?;
+        let rows = statement.query_map([dispatch_id], |row| row.get::<_, Vec<u8>>(0))?;
+        for row in rows {
+            let observation = HarnessObservation::decode(row?.as_slice())?;
+            if let Some(harness_observation::Payload::Ack(ack)) = observation.payload {
+                session_ref = ack.native_session_ref.or(session_ref);
+                execution_ref = ack.native_execution_ref.or(execution_ref);
+                if session_ref.is_some() && execution_ref.is_some() {
+                    break;
+                }
+            }
+        }
+        Ok(match (session_ref, execution_ref) {
+            (Some(native_session_ref), Some(native_execution_ref)) => {
+                Some(NativeExecutionBinding {
+                    attempt_id: receipt.attempt_id,
+                    dispatch_id: receipt.dispatch_id,
+                    fencing_token: receipt.fencing_token,
+                    native_session_ref,
+                    native_execution_ref,
+                })
+            }
+            _ => None,
+        })
     }
 
     pub fn dispatch_receipt(

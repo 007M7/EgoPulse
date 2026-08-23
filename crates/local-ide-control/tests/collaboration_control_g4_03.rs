@@ -1,11 +1,14 @@
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
-    AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCommandBase, AttemptSnapshot,
-    AttemptStatus, CollaborationCommand, CollaborationCommandResult, CollaborationErrorCode,
+    AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCancellationDisposition,
+    AttemptCommandBase, AttemptSnapshot, AttemptStatus, BeginAttemptReconciliationCommand,
+    CollaborationCommand, CollaborationCommandResult, CollaborationErrorCode,
     CollaborationSnapshot, CreateAttemptCommand, CreateRunCommand,
-    MarkAttemptOutcomeUnknownCommand, RecordDeliveryReceiptCommand, RecordDispatchIntentCommand,
-    RecordHarnessAckCommand, RecordRunningObservationCommand, RunCommandBase, RunPlan, RunStatus,
-    StepPlan, StepStatus, collaboration_command, collaboration_command_result,
-    get_collaboration_response,
+    MarkAttemptOutcomeUnknownCommand, ReconciliationDisposition,
+    RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
+    RecordDeliveryReceiptCommand, RecordDispatchIntentCommand, RecordHarnessAckCommand,
+    RecordRunningObservationCommand, RecoveryClass, RequestAttemptCancellationCommand,
+    RunCommandBase, RunPlan, RunStatus, StepPlan, StepStatus, collaboration_command,
+    collaboration_command_result, get_collaboration_response,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
@@ -129,6 +132,19 @@ impl CollaborationReferenceGuard for FixtureGuard {
             evidence_refs: vec!["lease-expired:external-stop-not-proven".to_owned()],
         })
     }
+
+    fn validate_cancellation_request(
+        &self,
+        command: &RequestAttemptCancellationCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        if command.task_cancellation_request_id != "task-cancel-001" {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ReferenceAuthorization {
+            evidence_refs: vec!["task-cancellation:verified".to_owned()],
+        })
+    }
 }
 
 impl HarnessEvidenceResolver for FixtureGuard {
@@ -170,6 +186,32 @@ impl HarnessEvidenceResolver for FixtureGuard {
         }
         Ok(ReferenceAuthorization {
             evidence_refs: vec!["adapter-observation:running-001@durable".to_owned()],
+        })
+    }
+
+    fn validate_cancellation_outcome(
+        &self,
+        command: &RecordAttemptCancellationOutcomeCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        if command.cancellation_receipt_id != "cancel-receipt-001" {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ReferenceAuthorization {
+            evidence_refs: vec!["adapter-cancellation:durable".to_owned()],
+        })
+    }
+
+    fn validate_reconciliation(
+        &self,
+        command: &RecordAttemptReconciliationCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        if command.evidence_id != "reconcile-evidence-001" {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ReferenceAuthorization {
+            evidence_refs: vec!["adapter-reconciliation:durable".to_owned()],
         })
     }
 }
@@ -375,6 +417,46 @@ fn set_digest(command: &mut CollaborationCommand) {
                 .request_digest_sha256 = digest;
         }
         collaboration_command::Command::RecordRunningObservation(value) => {
+            value
+                .base
+                .as_mut()
+                .expect("base")
+                .meta
+                .as_mut()
+                .expect("metadata")
+                .request_digest_sha256 = digest;
+        }
+        collaboration_command::Command::RequestAttemptCancellation(value) => {
+            value
+                .base
+                .as_mut()
+                .expect("base")
+                .meta
+                .as_mut()
+                .expect("metadata")
+                .request_digest_sha256 = digest;
+        }
+        collaboration_command::Command::RecordAttemptCancellationOutcome(value) => {
+            value
+                .base
+                .as_mut()
+                .expect("base")
+                .meta
+                .as_mut()
+                .expect("metadata")
+                .request_digest_sha256 = digest;
+        }
+        collaboration_command::Command::BeginAttemptReconciliation(value) => {
+            value
+                .base
+                .as_mut()
+                .expect("base")
+                .meta
+                .as_mut()
+                .expect("metadata")
+                .request_digest_sha256 = digest;
+        }
+        collaboration_command::Command::RecordAttemptReconciliation(value) => {
             value
                 .base
                 .as_mut()
@@ -692,6 +774,63 @@ fn running_command(
     command
 }
 
+fn cancellation_request(snapshot: &CollaborationSnapshot) -> CollaborationCommand {
+    let mut command = CollaborationCommand {
+        command: Some(collaboration_command::Command::RequestAttemptCancellation(
+            RequestAttemptCancellationCommand {
+                base: Some(attempt_base(snapshot, "cmd-cancel-request-001")),
+                task_cancellation_request_id: "task-cancel-001".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut command);
+    command
+}
+
+fn cancellation_unknown(snapshot: &CollaborationSnapshot) -> CollaborationCommand {
+    let mut command = CollaborationCommand {
+        command: Some(
+            collaboration_command::Command::RecordAttemptCancellationOutcome(
+                RecordAttemptCancellationOutcomeCommand {
+                    base: Some(attempt_base(snapshot, "cmd-cancel-outcome-001")),
+                    disposition: AttemptCancellationDisposition::OutcomeUnknown as i32,
+                    cancellation_receipt_id: "cancel-receipt-001".to_owned(),
+                },
+            ),
+        ),
+    };
+    set_digest(&mut command);
+    command
+}
+
+fn begin_reconciliation(snapshot: &CollaborationSnapshot, id: &str) -> CollaborationCommand {
+    let mut command = CollaborationCommand {
+        command: Some(collaboration_command::Command::BeginAttemptReconciliation(
+            BeginAttemptReconciliationCommand {
+                base: Some(attempt_base(snapshot, "cmd-reconcile-begin-001")),
+                reconciliation_id: id.to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut command);
+    command
+}
+
+fn reconciliation_result(snapshot: &CollaborationSnapshot, id: &str) -> CollaborationCommand {
+    let mut command = CollaborationCommand {
+        command: Some(collaboration_command::Command::RecordAttemptReconciliation(
+            RecordAttemptReconciliationCommand {
+                base: Some(attempt_base(snapshot, "cmd-reconcile-result-001")),
+                reconciliation_id: id.to_owned(),
+                disposition: ReconciliationDisposition::RetryIdempotent as i32,
+                evidence_id: "reconcile-evidence-001".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut command);
+    command
+}
+
 fn committed_snapshot(result: &CollaborationCommandResult) -> CollaborationSnapshot {
     match result.outcome.clone().expect("result outcome") {
         collaboration_command_result::Outcome::Snapshot(snapshot) => snapshot,
@@ -756,6 +895,112 @@ fn advance_through_dispatch(
         .execute(&command, &attempt_supervisor())
         .expect("record dispatch intent");
     (committed_snapshot(&dispatched), command)
+}
+
+fn advance_through_running(
+    control: &mut CollaborationControl<FixtureGuard, FixedClock>,
+) -> CollaborationSnapshot {
+    let (pending, _) = advance_through_dispatch(control);
+    let fence = pending.attempts[0]
+        .lease
+        .as_ref()
+        .expect("lease")
+        .fencing_token;
+    let delivered = committed_snapshot(
+        &control
+            .execute(&delivery_command(&pending, fence), &harness_adapter())
+            .expect("delivery"),
+    );
+    let acknowledged = committed_snapshot(
+        &control
+            .execute(&ack_command(&delivered, fence, 1), &harness_adapter())
+            .expect("ack"),
+    );
+    committed_snapshot(
+        &control
+            .execute(
+                &running_command(&acknowledged, fence, 2),
+                &harness_adapter(),
+            )
+            .expect("running"),
+    )
+}
+
+#[test]
+fn cancellation_delivery_unknown_reconciliation_and_retry_are_distinct_facts() {
+    let isolated = IsolatedStore::new("collaboration-cancel-reconcile");
+    let mut control = open_control(&isolated.database_path(), FixedClock::new(FIXED_TIME));
+    let running = advance_through_running(&mut control);
+    let pending = committed_snapshot(
+        &control
+            .execute(&cancellation_request(&running), &attempt_supervisor())
+            .expect("request cancellation"),
+    );
+    assert_eq!(
+        pending.run.as_ref().expect("run").status,
+        RunStatus::CancellationPending as i32
+    );
+    assert_eq!(
+        pending.attempts[0].status,
+        AttemptStatus::CancellationPending as i32
+    );
+
+    let unknown = committed_snapshot(
+        &control
+            .execute(&cancellation_unknown(&pending), &recovery_worker())
+            .expect("unknown cancellation"),
+    );
+    assert_eq!(
+        unknown.run.as_ref().expect("run").status,
+        RunStatus::Held as i32
+    );
+    assert_eq!(
+        unknown.attempts[0].status,
+        AttemptStatus::OutcomeUnknown as i32
+    );
+
+    let reconciling = committed_snapshot(
+        &control
+            .execute(
+                &begin_reconciliation(&unknown, "reconcile-001"),
+                &recovery_worker(),
+            )
+            .expect("begin reconciliation"),
+    );
+    assert_eq!(
+        reconciling.attempts[0].status,
+        AttemptStatus::Reconciling as i32
+    );
+    let before = control.inspect_store().expect("inspect");
+    let wrong = control
+        .execute(
+            &reconciliation_result(&reconciling, "reconcile-wrong"),
+            &recovery_worker(),
+        )
+        .expect("reject wrong reconciliation");
+    assert_eq!(error_code(&wrong), CollaborationErrorCode::StateConflict);
+    assert_eq!(control.inspect_store().expect("inspect"), before);
+
+    let recovered = committed_snapshot(
+        &control
+            .execute(
+                &reconciliation_result(&reconciling, "reconcile-001"),
+                &recovery_worker(),
+            )
+            .expect("record reconciliation"),
+    );
+    assert_eq!(
+        recovered.run.as_ref().expect("run").status,
+        RunStatus::Active as i32
+    );
+    assert_eq!(
+        recovered.attempts[0].status,
+        AttemptStatus::Interrupted as i32
+    );
+    assert_eq!(
+        recovered.attempts[0].recovery_class,
+        RecoveryClass::RetryIdempotent as i32
+    );
 }
 
 #[test]

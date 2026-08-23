@@ -209,25 +209,14 @@ async fn fake_codex_consumes_the_same_provider_neutral_contract_and_replays_dura
     ));
 
     let cancellation = adapter
-        .cancel(&CancelExecutionEnvelope {
-            attempt_id: dispatch.attempt_id.clone(),
-            dispatch_id: dispatch.dispatch_id.clone(),
-            fencing_token: dispatch.fencing_token,
-            cancellation_request_id: "cancel-001".to_owned(),
-            native_session_ref: first_receipt
-                .native_session_ref
-                .clone()
-                .expect("native session ref"),
-            native_execution_ref: first_receipt
-                .native_execution_ref
-                .clone()
-                .expect("native execution ref"),
-            confirmation_deadline: Some(Timestamp {
+        .cancel_dispatch(
+            "cancel-001",
+            &dispatch.dispatch_id,
+            Timestamp {
                 seconds: 1_787_488_010,
                 nanos: 0,
-            }),
-            ..CancelExecutionEnvelope::default()
-        })
+            },
+        )
         .await
         .expect("deliver cancellation");
     assert!(matches!(

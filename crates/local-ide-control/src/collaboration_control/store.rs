@@ -352,6 +352,18 @@ impl CollaborationStore {
         }))
     }
 
+    pub fn latest_event_blob(&self, run_id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT event FROM collaboration_events
+                 WHERE run_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn commit(&mut self, commit: &CollaborationCommit) -> Result<(), StoreError> {
         let transaction = self
             .connection
