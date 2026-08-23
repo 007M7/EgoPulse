@@ -2,7 +2,8 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
-$cargo = (Get-Command cargo -ErrorAction SilentlyContinue).Source
+$cargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
+$cargo = if ($cargoCommand) { $cargoCommand.Path } else { $null }
 if (-not $cargo) {
     $rustupCargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
     if (Test-Path -LiteralPath $rustupCargo) {
@@ -23,7 +24,8 @@ if (-not $perl) {
     }
 }
 
-Write-Output "rust_prerequisite=perl path=$($perl.Source)"
+$perlPath = if ($perl.Path) { $perl.Path } else { $perl.Source }
+Write-Output "rust_prerequisite=perl path=$perlPath"
 
 & $cargo fmt --all -- --check
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -26,3 +26,9 @@ The SQLCipher build uses vendored OpenSSL and therefore requires Perl plus the V
 - Keep commits scoped and reviewable.
 - Do not mix generated files, unrelated refactors and behavior changes without a reason.
 - Never commit credentials, runtime state, model weights or personal data.
+- Install `.githooks/pre-push` with `scripts/install-git-hooks.ps1`; every push must pass the local CI gate.
+- Keep Founder governance, Gate evidence, methodology and research in `founder-agent-os`, not in this product repository.
+
+## Local delivery gates
+
+Run `pnpm run ci:local` for the full local CI gate. Run `pnpm run cd:local` only when a commit-bound Windows release candidate is needed. See [Local CI/CD and repository classification](docs/engineering/local-ci-cd.md).

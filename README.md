@@ -15,7 +15,7 @@ Available now:
 - TypeScript packages for generated clients, Agent SDK and the bounded native Harness;
 - isolated CPython 3.14 Worker project managed by uv;
 - Protobuf/Buf and JSON Schema contract roots;
-- CI, repository-boundary checks and minimal smoke tests.
+- local CI, repository-boundary checks and commit-bound release-candidate packaging.
 
 Not implemented yet:
 
@@ -73,4 +73,7 @@ uv sync --project workers/foundation-probe --frozen
 uv run --project workers/foundation-probe --frozen pytest workers/foundation-probe --rootdir workers/foundation-probe
 ```
 
-See [Foundation Gate](docs/foundation-gate.md) and [Architecture](ARCHITECTURE.md).
+For the current delivery controls, install the tracked pre-push hook with
+`scripts/install-git-hooks.ps1`, then use `pnpm run ci:local` and
+`pnpm run cd:local`. See [Local CI/CD](docs/engineering/local-ci-cd.md),
+[Foundation Gate](docs/foundation-gate.md) and [Architecture](ARCHITECTURE.md).
