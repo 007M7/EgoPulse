@@ -3,6 +3,8 @@
 use egopulse_domain_contracts::FoundationHealth;
 pub use egopulse_local_ipc_platform::LocalTransport;
 
+pub mod read_gateway_policy;
+pub mod read_tokens;
 pub mod session;
 
 #[derive(Clone, Copy, Debug)]

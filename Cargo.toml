@@ -29,6 +29,7 @@ rust-version = "1.98"
 repository = "https://github.com/007M7/EgoPulse"
 
 [workspace.dependencies]
+base64 = "=0.22.1"
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.29.0"
 ratatui = "0.30.2"
@@ -43,6 +44,7 @@ tonic = "=0.14.6"
 tonic-prost = "=0.14.6"
 tonic-prost-build = "=0.14.6"
 hex = "=0.4.3"
+hmac = "=0.12.1"
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 rusqlite_migration = { version = "=2.6.0", default-features = false }
 sha2 = "=0.10.9"

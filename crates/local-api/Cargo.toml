@@ -6,12 +6,18 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 egopulse-domain-contracts.workspace = true
 egopulse-local-ipc-platform.workspace = true
+hmac.workspace = true
 prost-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tonic.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 hyper-util.workspace = true
