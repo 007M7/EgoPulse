@@ -16,7 +16,11 @@ No runtime code is copied automatically from the historical workspace. Reuse req
 Desktop / CLI / TUI
         |
         v
-local-api client boundary
+shared Rust client kernel
+  +-- exact contract/profile negotiation
+  +-- session/request binding
+  +-- typed authorization preflight
+  +-- stream dedupe + reset/refetch state
         |
         v
 Named Pipe / UDS account-authenticated local transport
@@ -25,7 +29,7 @@ Named Pipe / UDS account-authenticated local transport
 local session service (ephemeral, policy-resolved)
         |
         v
-local API gateway / shared client kernel (G4-08C)
+local read/command API gateway (G4-08C C2/C3)
         |
         v
 agentosd deployment host
@@ -60,7 +64,8 @@ verification or Task completion.
 - Artifact and tool boundaries: JSON Schema 2020-12.
 - Local client transport: HTTP/2 gRPC over Windows Named Pipe or Unix Domain Socket. The platform crate owns peer-account extraction, owner-only access control and all required platform `unsafe`.
 - Local session boundary: account-level peer identity is resolved by a trusted policy adapter into a logical principal and permissions; sessions are process-ephemeral, connection/account-bound, expiring and revocable. An OS SID/UID never implies Founder identity.
-- Local API gateway and shared three-surface client kernel: planned for G4-08C; the G4-08B session service is exercised over the real transport but is not yet the complete product client path.
+- Shared three-surface client kernel: G4-08C C1 provides the independent Rust `client-kernel` crate with digest-bound profiles, surface-neutral session/request state, typed authorization preflight and complete-snapshot replay/reset handling. It does not own facts or final authorization.
+- Local API gateway: remains G4-08C C2/C3. The G4-08B session service is exercised over the real transport, but the full query/watch/await/command product path is not yet complete.
 - Supervised Worker/Harness transport: framed stdio or an official native protocol adapter; not implemented in this scaffold.
 
 ## Repository rules

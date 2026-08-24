@@ -1074,6 +1074,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "egopulse-client-kernel"
+version = "0.1.0"
+dependencies = [
+ "egopulse-domain-contracts",
+ "hex",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "egopulse-codex-adapter"
 version = "0.1.0"
 dependencies = [
