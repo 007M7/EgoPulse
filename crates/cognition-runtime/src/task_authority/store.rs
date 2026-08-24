@@ -202,6 +202,15 @@ pub struct PendingTaskOutbox {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTaskProjectionOutbox {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub payload_digest_sha256: String,
+    pub payload: Vec<u8>,
+}
+
 pub(super) struct TaskStore {
     connection: Connection,
     store_epoch: String,
@@ -501,6 +510,69 @@ impl TaskStore {
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn pending_projection_outbox(
+        &self,
+    ) -> Result<Vec<PendingTaskProjectionOutbox>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT message_id,source_event_id,source_revision,canonical_payload_digest_sha256,payload
+             FROM task_outbox
+             WHERE destination_domain='local-read-model' AND delivery_state='pending'
+             ORDER BY created_at_seconds,message_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let revision: i64 = row.get(2)?;
+            Ok(PendingTaskProjectionOutbox {
+                message_id: row.get(0)?,
+                source_event_id: row.get(1)?,
+                source_revision: revision as u64,
+                payload_digest_sha256: row.get(3)?,
+                payload: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn projection_baselines(&self) -> Result<Vec<PendingTaskProjectionOutbox>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT o.message_id,o.source_event_id,o.source_revision,
+                    o.canonical_payload_digest_sha256,o.payload
+             FROM task_outbox o
+             JOIN tasks t ON t.task_id=(
+               SELECT e.task_id FROM task_events e WHERE e.event_id=o.source_event_id
+             )
+             WHERE o.destination_domain='local-read-model'
+               AND o.source_revision=t.revision
+             ORDER BY t.task_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let revision: i64 = row.get(2)?;
+            Ok(PendingTaskProjectionOutbox {
+                message_id: format!("bootstrap:{}", row.get::<_, String>(0)?),
+                source_event_id: row.get(1)?,
+                source_revision: revision as u64,
+                payload_digest_sha256: row.get(3)?,
+                payload: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn acknowledge_projection_outbox(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE task_outbox SET delivery_state='consumed'
+             WHERE message_id=?1 AND destination_domain='local-read-model'
+               AND canonical_payload_digest_sha256=?2 AND delivery_state='pending'",
+            params![message_id, expected_payload_digest_sha256],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn inspect(&self) -> Result<TaskStoreInspection, StoreError> {

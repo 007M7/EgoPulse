@@ -164,6 +164,15 @@ pub struct ArtifactAuthorityConfig {
     pub key: ArtifactSqlCipherKey,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArtifactProjectionMessage {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub payload_digest_sha256: String,
+    pub result: ArtifactCommandResult,
+}
+
 #[derive(Debug, Error)]
 pub enum ArtifactAuthorityFailure {
     #[error("artifact authority storage failed")]
@@ -1097,6 +1106,59 @@ where
 
     pub fn integrity_is_ok(&self) -> Result<bool, ArtifactAuthorityFailure> {
         Ok(self.store.integrity_is_ok()?)
+    }
+
+    pub fn drain_projection_outbox(
+        &self,
+    ) -> Result<Vec<ArtifactProjectionMessage>, ArtifactAuthorityFailure> {
+        self.decode_projection_messages(self.store.pending_projection_outbox()?)
+    }
+
+    pub fn projection_baselines(
+        &self,
+    ) -> Result<Vec<ArtifactProjectionMessage>, ArtifactAuthorityFailure> {
+        self.decode_projection_messages(self.store.projection_baselines()?)
+    }
+
+    fn decode_projection_messages(
+        &self,
+        pending_messages: Vec<store::PendingProjectionOutbox>,
+    ) -> Result<Vec<ArtifactProjectionMessage>, ArtifactAuthorityFailure> {
+        pending_messages
+            .into_iter()
+            .map(|pending| {
+                let actual_digest = hex::encode(Sha256::digest(&pending.payload));
+                let result = ArtifactCommandResult::decode(pending.payload.as_slice())?;
+                let event = result
+                    .event
+                    .as_ref()
+                    .ok_or(ArtifactAuthorityFailure::Storage)?;
+                if actual_digest != pending.payload_digest_sha256
+                    || !result.committed
+                    || event.event_id != pending.source_event_id
+                    || event.aggregate_revision != pending.source_revision
+                {
+                    return Err(ArtifactAuthorityFailure::Storage);
+                }
+                Ok(ArtifactProjectionMessage {
+                    message_id: pending.message_id,
+                    source_event_id: pending.source_event_id,
+                    source_revision: pending.source_revision,
+                    payload_digest_sha256: pending.payload_digest_sha256,
+                    result,
+                })
+            })
+            .collect()
+    }
+
+    pub fn acknowledge_projection(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, ArtifactAuthorityFailure> {
+        self.store
+            .acknowledge_projection_outbox(message_id, expected_payload_digest_sha256)
+            .map_err(ArtifactAuthorityFailure::from)
     }
 }
 

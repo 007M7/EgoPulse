@@ -357,6 +357,43 @@ fn encrypted_store_reopens_with_the_same_authority_facts() {
 }
 
 #[test]
+fn task_projection_feed_is_typed_digest_bound_and_acknowledged_explicitly() {
+    let isolated = IsolatedStore::new("task-projection-feed");
+    let mut authority = open_authority(&isolated.database_path());
+    let created = authority
+        .execute(&valid_create_command(), &founder())
+        .expect("create projected Task");
+    let task = committed_task(&created);
+
+    let pending = authority
+        .drain_projection_outbox()
+        .expect("drain Task projection outbox");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].event.snapshot.as_ref(), Some(&task));
+    assert!(
+        !authority
+            .acknowledge_projection(&pending[0].message_id, &"0".repeat(64))
+            .expect("reject digest-mismatched ACK")
+    );
+    assert!(
+        authority
+            .acknowledge_projection(&pending[0].message_id, &pending[0].payload_digest_sha256)
+            .expect("ack committed projection")
+    );
+    assert!(
+        authority
+            .drain_projection_outbox()
+            .expect("projection outbox after ACK")
+            .is_empty()
+    );
+    let baselines = authority
+        .projection_baselines()
+        .expect("Task projection baseline");
+    assert_eq!(baselines.len(), 1);
+    assert_eq!(baselines[0].event.snapshot.as_ref(), Some(&task));
+}
+
+#[test]
 fn committed_create_survives_process_abort_before_response_delivery() {
     let isolated = IsolatedStore::new("task-abort");
     let path = isolated.database_path();

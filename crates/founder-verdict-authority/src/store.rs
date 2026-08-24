@@ -82,6 +82,19 @@ CREATE TABLE verdict_commit_receipts (
 ) STRICT;
 "#;
 
+const SCHEMA_V2: &str = r#"
+CREATE TABLE verdict_projection_outbox (
+  message_id TEXT PRIMARY KEY,
+  source_event_id TEXT NOT NULL UNIQUE,
+  source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+  payload_digest_sha256 TEXT NOT NULL,
+  payload BLOB NOT NULL,
+  delivery_state TEXT NOT NULL CHECK (delivery_state IN ('pending','consumed','held')),
+  created_at_seconds INTEGER NOT NULL,
+  FOREIGN KEY (source_event_id) REFERENCES verdict_events(event_id)
+) STRICT;
+"#;
+
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
     #[error("founder verdict storage operation failed")]
@@ -127,6 +140,9 @@ pub(crate) struct IssueCommit<'a> {
     pub read_outbox_id: &'a str,
     pub task_outbox_id: &'a str,
     pub outbox_digest: &'a str,
+    pub projection_outbox_id: &'a str,
+    pub projection_payload_digest: &'a str,
+    pub projection_payload: &'a [u8],
     pub committed_at: i64,
     pub supersede: Option<SupersedeCommit<'a>>,
 }
@@ -141,6 +157,9 @@ pub(crate) struct SupersedeCommit<'a> {
     pub event: &'a [u8],
     pub outbox_id: &'a str,
     pub outbox_digest: &'a str,
+    pub projection_outbox_id: &'a str,
+    pub projection_payload_digest: &'a str,
+    pub projection_payload: &'a [u8],
 }
 
 pub(crate) struct ConsumeCommit<'a> {
@@ -162,6 +181,9 @@ pub(crate) struct ConsumeCommit<'a> {
     pub result: &'a [u8],
     pub outbox_id: &'a str,
     pub outbox_digest: &'a str,
+    pub projection_outbox_id: &'a str,
+    pub projection_payload_digest: &'a str,
+    pub projection_payload: &'a [u8],
     pub committed_at: i64,
 }
 
@@ -181,6 +203,9 @@ pub(crate) struct StateCommit<'a> {
     pub result: &'a [u8],
     pub outbox_id: &'a str,
     pub outbox_digest: &'a str,
+    pub projection_outbox_id: &'a str,
+    pub projection_payload_digest: &'a str,
+    pub projection_payload: &'a [u8],
     pub committed_at: i64,
 }
 
@@ -218,6 +243,22 @@ pub struct VerdictStoreInspection {
     pub commit_receipt_count: u64,
 }
 
+pub(crate) struct PendingProjectionOutbox {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub payload_digest_sha256: String,
+    pub payload: Vec<u8>,
+}
+
+pub(crate) struct VerdictProjectionBaseline {
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub verdict: Vec<u8>,
+    pub state: Vec<u8>,
+    pub event: Vec<u8>,
+}
+
 pub(crate) struct VerdictStore {
     connection: Connection,
     store_epoch: String,
@@ -240,8 +281,11 @@ impl VerdictStore {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "secure_delete", "ON")?;
-        Migrations::new(vec![M::up(SCHEMA_V1)]).to_latest(&mut connection)?;
-        let digest = hex::encode(Sha256::digest(SCHEMA_V1.as_bytes()));
+        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)]).to_latest(&mut connection)?;
+        let legacy_digest = hex::encode(Sha256::digest(SCHEMA_V1.as_bytes()));
+        let digest = hex::encode(Sha256::digest(
+            format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes(),
+        ));
         connection.execute(
             "INSERT OR IGNORE INTO verdict_store_metadata(singleton,store_epoch,schema_profile_id,schema_profile_sha256) VALUES(1,?1,?2,?3)",
             params![store_epoch, SCHEMA_PROFILE_ID, digest],
@@ -251,7 +295,16 @@ impl VerdictStore {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        if actual != (store_epoch.to_owned(), SCHEMA_PROFILE_ID.to_owned(), digest) {
+        if actual.0 != store_epoch || actual.1 != SCHEMA_PROFILE_ID {
+            return Err(StoreError::StoreGenerationMismatch);
+        }
+        if actual.2 == legacy_digest {
+            connection.execute(
+                "UPDATE verdict_store_metadata SET schema_profile_sha256=?1
+                 WHERE singleton=1 AND schema_profile_sha256=?2",
+                params![digest, legacy_digest],
+            )?;
+        } else if actual.2 != digest {
             return Err(StoreError::StoreGenerationMismatch);
         }
         let integrity: String =
@@ -338,6 +391,15 @@ impl VerdictStore {
                     c.committed_at
                 ],
             )?;
+            insert_projection_outbox(
+                &tx,
+                supersede.projection_outbox_id,
+                supersede.event_id,
+                supersede.expected_revision + 1,
+                supersede.projection_payload_digest,
+                supersede.projection_payload,
+                c.committed_at,
+            )?;
             insert_commit_receipt(
                 &tx,
                 &ReceiptInsert {
@@ -401,6 +463,15 @@ impl VerdictStore {
                 ],
             )?;
         }
+        insert_projection_outbox(
+            &tx,
+            c.projection_outbox_id,
+            c.event_id,
+            1,
+            c.projection_payload_digest,
+            c.projection_payload,
+            c.committed_at,
+        )?;
         insert_commit_receipt(
             &tx,
             &ReceiptInsert {
@@ -468,6 +539,15 @@ impl VerdictStore {
                 c.committed_at
             ],
         )?;
+        insert_projection_outbox(
+            &tx,
+            c.projection_outbox_id,
+            c.event_id,
+            c.expected_revision + 1,
+            c.projection_payload_digest,
+            c.projection_payload,
+            c.committed_at,
+        )?;
         insert_commit_receipt(
             &tx,
             &ReceiptInsert {
@@ -533,6 +613,15 @@ impl VerdictStore {
                 c.committed_at
             ],
         )?;
+        insert_projection_outbox(
+            &tx,
+            c.projection_outbox_id,
+            c.event_id,
+            c.expected_revision + 1,
+            c.projection_payload_digest,
+            c.projection_payload,
+            c.committed_at,
+        )?;
         insert_commit_receipt(
             &tx,
             &ReceiptInsert {
@@ -566,6 +655,91 @@ impl VerdictStore {
             commit_receipt_count: count("SELECT count(*) FROM verdict_commit_receipts")?,
         })
     }
+
+    pub fn pending_projection_outbox(&self) -> Result<Vec<PendingProjectionOutbox>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT message_id,source_event_id,source_revision,payload_digest_sha256,payload
+             FROM verdict_projection_outbox WHERE delivery_state='pending'
+             ORDER BY created_at_seconds,message_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let revision: i64 = row.get(2)?;
+            Ok(PendingProjectionOutbox {
+                message_id: row.get(0)?,
+                source_event_id: row.get(1)?,
+                source_revision: revision as u64,
+                payload_digest_sha256: row.get(3)?,
+                payload: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn acknowledge_projection_outbox(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE verdict_projection_outbox SET delivery_state='consumed'
+             WHERE message_id=?1 AND payload_digest_sha256=?2 AND delivery_state='pending'",
+            params![message_id, expected_payload_digest_sha256],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn projection_baselines(&self) -> Result<Vec<VerdictProjectionBaseline>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT e.event_id,e.resulting_state_revision,v.verdict,s.state_blob,e.event
+             FROM founder_verdicts v
+             JOIN founder_verdict_states s USING(founder_verdict_id)
+             JOIN verdict_events e ON e.founder_verdict_id=v.founder_verdict_id
+             WHERE e.sequence=(
+               SELECT max(latest.sequence) FROM verdict_events latest
+               WHERE latest.founder_verdict_id=v.founder_verdict_id
+             )
+             ORDER BY v.founder_verdict_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let revision: i64 = row.get(1)?;
+            Ok(VerdictProjectionBaseline {
+                source_event_id: row.get(0)?,
+                source_revision: revision as u64,
+                verdict: row.get(2)?,
+                state: row.get(3)?,
+                event: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+}
+
+fn insert_projection_outbox(
+    tx: &rusqlite::Transaction<'_>,
+    message_id: &str,
+    source_event_id: &str,
+    source_revision: u64,
+    payload_digest_sha256: &str,
+    payload: &[u8],
+    created_at_seconds: i64,
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "INSERT INTO verdict_projection_outbox(
+           message_id,source_event_id,source_revision,payload_digest_sha256,payload,
+           delivery_state,created_at_seconds
+         ) VALUES(?1,?2,?3,?4,?5,'pending',?6)",
+        params![
+            message_id,
+            source_event_id,
+            source_revision as i64,
+            payload_digest_sha256,
+            payload,
+            created_at_seconds
+        ],
+    )?;
+    Ok(())
 }
 
 fn insert_event_and_idempotency(

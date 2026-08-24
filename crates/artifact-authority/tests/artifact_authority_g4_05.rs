@@ -987,6 +987,58 @@ fn committed_return_survives_process_abort_before_response_delivery() {
 }
 
 #[test]
+fn artifact_projection_feed_exposes_committed_result_and_requires_digest_bound_ack() {
+    let isolated = IsolatedStore::new("artifact-projection-feed");
+    let mut authority = open_authority(&isolated.database_path(), &isolated.blob_root());
+    let bytes = b"projection artifact";
+    let address = content_address(bytes);
+    authority
+        .put_blob(bytes, &address)
+        .expect("put projection blob");
+    let result = authority
+        .execute(
+            &stage_command(
+                artifact_candidate(
+                    "artifact-projection-001",
+                    ArtifactSemanticClass::CommandReceipt,
+                    address,
+                    ArtifactPrincipalKind::Harness,
+                    "harness:codex",
+                ),
+                "projection-stage",
+            ),
+            &harness(),
+        )
+        .expect("stage projection artifact");
+    let pending = authority
+        .drain_projection_outbox()
+        .expect("drain Artifact projection outbox");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].result, result);
+    assert!(
+        !authority
+            .acknowledge_projection(&pending[0].message_id, &"0".repeat(64))
+            .expect("reject mismatched Artifact ACK")
+    );
+    assert!(
+        authority
+            .acknowledge_projection(&pending[0].message_id, &pending[0].payload_digest_sha256)
+            .expect("ack Artifact projection")
+    );
+    assert!(
+        authority
+            .drain_projection_outbox()
+            .expect("Artifact projection after ACK")
+            .is_empty()
+    );
+    let baselines = authority
+        .projection_baselines()
+        .expect("Artifact projection baseline");
+    assert_eq!(baselines.len(), 1);
+    assert_eq!(baselines[0].result.artifact, result.artifact);
+}
+
+#[test]
 fn crash_probe_child() {
     if std::env::var("EGOPULSE_G4_05_CRASH_PROBE").as_deref() != Ok("1") {
         return;

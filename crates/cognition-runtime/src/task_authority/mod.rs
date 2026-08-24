@@ -157,6 +157,15 @@ pub struct TaskAuthority {
     transition_guard: Box<dyn TaskTransitionGuard>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskProjectionMessage {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub payload_digest_sha256: String,
+    pub event: TaskEvent,
+}
+
 impl TaskAuthority {
     pub fn open(
         config: TaskAuthorityConfig,
@@ -366,6 +375,56 @@ impl TaskAuthority {
     ) -> Result<Vec<PendingTaskOutbox>, TaskAuthorityFailure> {
         self.store
             .pending_cross_authority_outbox()
+            .map_err(TaskAuthorityFailure::from)
+    }
+
+    pub fn drain_projection_outbox(
+        &self,
+    ) -> Result<Vec<TaskProjectionMessage>, TaskAuthorityFailure> {
+        self.decode_projection_messages(self.store.pending_projection_outbox()?)
+    }
+
+    pub fn projection_baselines(&self) -> Result<Vec<TaskProjectionMessage>, TaskAuthorityFailure> {
+        self.decode_projection_messages(self.store.projection_baselines()?)
+    }
+
+    fn decode_projection_messages(
+        &self,
+        pending_messages: Vec<store::PendingTaskProjectionOutbox>,
+    ) -> Result<Vec<TaskProjectionMessage>, TaskAuthorityFailure> {
+        pending_messages
+            .into_iter()
+            .map(|pending| {
+                let actual_digest = hex::encode(Sha256::digest(&pending.payload));
+                let event = TaskEvent::decode(pending.payload.as_slice())?;
+                if actual_digest != pending.payload_digest_sha256
+                    || event.event_id != pending.source_event_id
+                    || event.resulting_revision != pending.source_revision
+                    || event.snapshot.as_ref().is_none_or(|snapshot| {
+                        snapshot.task_id != event.task_id
+                            || snapshot.revision != pending.source_revision
+                    })
+                {
+                    return Err(TaskAuthorityFailure::Storage);
+                }
+                Ok(TaskProjectionMessage {
+                    message_id: pending.message_id,
+                    source_event_id: pending.source_event_id,
+                    source_revision: pending.source_revision,
+                    payload_digest_sha256: pending.payload_digest_sha256,
+                    event,
+                })
+            })
+            .collect()
+    }
+
+    pub fn acknowledge_projection(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, TaskAuthorityFailure> {
+        self.store
+            .acknowledge_projection_outbox(message_id, expected_payload_digest_sha256)
             .map_err(TaskAuthorityFailure::from)
     }
 

@@ -215,6 +215,14 @@ pub(super) struct OutboxWrite {
     pub payload: Vec<u8>,
 }
 
+pub(super) struct PendingProjectionOutbox {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub payload_digest_sha256: String,
+    pub payload: Vec<u8>,
+}
+
 pub(super) struct AuthorityCommit {
     pub mutation: Mutation,
     pub event_id: String,
@@ -441,6 +449,68 @@ impl VerificationStore {
         self.connection
             .pragma_update(None, "wal_checkpoint", "FULL")?;
         Ok(())
+    }
+
+    pub fn pending_projection_outbox(&self) -> Result<Vec<PendingProjectionOutbox>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT message_id,source_event_id,source_revision,canonical_payload_digest_sha256,payload
+             FROM verification_outbox
+             WHERE destination_domain='local-read-model' AND delivery_state='pending'
+             ORDER BY created_at_seconds,message_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let revision: i64 = row.get(2)?;
+            Ok(PendingProjectionOutbox {
+                message_id: row.get(0)?,
+                source_event_id: row.get(1)?,
+                source_revision: revision as u64,
+                payload_digest_sha256: row.get(3)?,
+                payload: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn projection_baselines(&self) -> Result<Vec<PendingProjectionOutbox>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT o.message_id,o.source_event_id,o.source_revision,
+                    o.canonical_payload_digest_sha256,o.payload
+             FROM verification_outbox o
+             JOIN verification_events e ON e.event_id=o.source_event_id
+             WHERE o.destination_domain='local-read-model'
+               AND e.sequence=(
+                 SELECT max(latest.sequence) FROM verification_events latest
+                 WHERE latest.aggregate_id=e.aggregate_id
+               )
+             ORDER BY e.aggregate_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let revision: i64 = row.get(2)?;
+            Ok(PendingProjectionOutbox {
+                message_id: format!("bootstrap:{}", row.get::<_, String>(0)?),
+                source_event_id: row.get(1)?,
+                source_revision: revision as u64,
+                payload_digest_sha256: row.get(3)?,
+                payload: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn acknowledge_projection_outbox(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE verification_outbox SET delivery_state='consumed'
+             WHERE message_id=?1 AND destination_domain='local-read-model'
+               AND canonical_payload_digest_sha256=?2 AND delivery_state='pending'",
+            params![message_id, expected_payload_digest_sha256],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn inspect(&self) -> Result<VerificationStoreInspection, StoreError> {

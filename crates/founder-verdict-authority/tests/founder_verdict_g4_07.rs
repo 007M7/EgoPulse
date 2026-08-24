@@ -278,6 +278,56 @@ fn nonpassed_accept_requires_elevated_exact_risk_coverage_and_redlines_fail_clos
 }
 
 #[test]
+fn verdict_projection_feed_carries_verdict_and_state_and_acks_by_digest() {
+    let (_root, mut authority, founder, _) = authority_fixture(
+        "projection-feed",
+        VerificationConclusion::Passed,
+        vec![],
+        vec![],
+        vec![],
+        true,
+    );
+    let mut command = issue_command(
+        FounderVerdictDecision::Accept,
+        VerificationConclusion::Passed,
+        vec![],
+    );
+    sign(&mut command);
+    let committed = authority
+        .execute(&command, &founder)
+        .expect("issue verdict");
+    let pending = authority
+        .drain_projection_outbox()
+        .expect("drain Verdict projection outbox");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].result, committed);
+    assert!(pending[0].result.verdict.is_some());
+    assert!(pending[0].result.state.is_some());
+    assert!(
+        !authority
+            .acknowledge_projection(&pending[0].message_id, &"0".repeat(64))
+            .expect("reject mismatched Verdict ACK")
+    );
+    assert!(
+        authority
+            .acknowledge_projection(&pending[0].message_id, &pending[0].payload_digest_sha256)
+            .expect("ack Verdict projection")
+    );
+    assert!(
+        authority
+            .drain_projection_outbox()
+            .expect("Verdict projection after ACK")
+            .is_empty()
+    );
+    let baselines = authority
+        .projection_baselines()
+        .expect("Verdict projection baseline");
+    assert_eq!(baselines.len(), 1);
+    assert_eq!(baselines[0].result.verdict, committed.verdict);
+    assert_eq!(baselines[0].result.state, committed.state);
+}
+
+#[test]
 fn task_commit_consumes_once_and_invalid_receipt_cannot_mutate_state() {
     let (_root, mut authority, founder, task) = authority_fixture(
         "consume",

@@ -301,6 +301,44 @@ fn immutable_verification_artifact_commit_is_atomic_and_duplicate_safe() {
 }
 
 #[test]
+fn verification_projection_feed_is_typed_and_ack_is_commit_ordered() {
+    let mut fixture = running_fixture("projection-feed", CheckerAssuranceClass::Deterministic);
+    let pending = fixture
+        .authority
+        .drain_projection_outbox()
+        .expect("drain Verification projection outbox");
+    assert!(!pending.is_empty());
+    assert!(pending.iter().all(|message| message.result.committed));
+    let first = &pending[0];
+    assert!(
+        !fixture
+            .authority
+            .acknowledge_projection(&first.message_id, &"0".repeat(64))
+            .expect("reject mismatched Verification ACK")
+    );
+    assert!(
+        fixture
+            .authority
+            .acknowledge_projection(&first.message_id, &first.payload_digest_sha256)
+            .expect("ack Verification projection")
+    );
+    assert_eq!(
+        fixture
+            .authority
+            .drain_projection_outbox()
+            .expect("Verification projection after ACK")
+            .len(),
+        pending.len() - 1
+    );
+    let baselines = fixture
+        .authority
+        .projection_baselines()
+        .expect("Verification projection baselines");
+    assert_eq!(baselines.len(), 3);
+    assert!(baselines.iter().all(|message| message.result.committed));
+}
+
+#[test]
 fn deterministic_complete_evidence_can_produce_strict_passed() {
     let mut fixture = running_fixture("passed", CheckerAssuranceClass::Deterministic);
     let result = CriterionResult {

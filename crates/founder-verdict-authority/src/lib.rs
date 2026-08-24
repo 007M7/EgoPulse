@@ -158,6 +158,15 @@ pub struct VerdictAuthorityConfig {
     pub key: VerdictSqlCipherKey,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerdictProjectionMessage {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub payload_digest_sha256: String,
+    pub result: VerdictCommandResult,
+}
+
 #[derive(Debug, Error)]
 pub enum VerdictAuthorityFailure {
     #[error("founder verdict storage is unavailable")]
@@ -189,6 +198,9 @@ struct PreparedSupersedeCommit {
     event: Vec<u8>,
     outbox_id: String,
     outbox_digest: String,
+    projection_outbox_id: String,
+    projection_payload_digest: String,
+    projection_payload: Vec<u8>,
 }
 
 impl PreparedSupersedeCommit {
@@ -203,6 +215,9 @@ impl PreparedSupersedeCommit {
             event: &self.event,
             outbox_id: &self.outbox_id,
             outbox_digest: &self.outbox_digest,
+            projection_outbox_id: &self.projection_outbox_id,
+            projection_payload_digest: &self.projection_payload_digest,
+            projection_payload: &self.projection_payload,
         }
     }
 }
@@ -333,6 +348,94 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
         self.store.inspect().map_err(VerdictAuthorityFailure::from)
     }
 
+    pub fn drain_projection_outbox(
+        &self,
+    ) -> Result<Vec<VerdictProjectionMessage>, VerdictAuthorityFailure> {
+        self.store
+            .pending_projection_outbox()?
+            .into_iter()
+            .map(|pending| {
+                let actual_digest = hex::encode(Sha256::digest(&pending.payload));
+                let result = VerdictCommandResult::decode(pending.payload.as_slice())?;
+                let event = result
+                    .event
+                    .as_ref()
+                    .ok_or(VerdictAuthorityFailure::Storage)?;
+                let state = result
+                    .state
+                    .as_ref()
+                    .ok_or(VerdictAuthorityFailure::Storage)?;
+                if actual_digest != pending.payload_digest_sha256
+                    || !result.committed
+                    || result.verdict.is_none()
+                    || event.event_id != pending.source_event_id
+                    || event.resulting_state_revision != pending.source_revision
+                    || state.revision != pending.source_revision
+                    || state.founder_verdict_id != event.founder_verdict_id
+                {
+                    return Err(VerdictAuthorityFailure::Storage);
+                }
+                Ok(VerdictProjectionMessage {
+                    message_id: pending.message_id,
+                    source_event_id: pending.source_event_id,
+                    source_revision: pending.source_revision,
+                    payload_digest_sha256: pending.payload_digest_sha256,
+                    result,
+                })
+            })
+            .collect()
+    }
+
+    pub fn projection_baselines(
+        &self,
+    ) -> Result<Vec<VerdictProjectionMessage>, VerdictAuthorityFailure> {
+        self.store
+            .projection_baselines()?
+            .into_iter()
+            .map(|baseline| {
+                let verdict = FounderVerdict::decode(baseline.verdict.as_slice())?;
+                let state = FounderVerdictState::decode(baseline.state.as_slice())?;
+                let event = VerdictEvent::decode(baseline.event.as_slice())?;
+                if verdict.founder_verdict_id != state.founder_verdict_id
+                    || state.founder_verdict_id != event.founder_verdict_id
+                    || state.revision != baseline.source_revision
+                    || event.resulting_state_revision != baseline.source_revision
+                    || event.event_id != baseline.source_event_id
+                {
+                    return Err(VerdictAuthorityFailure::Storage);
+                }
+                let result = VerdictCommandResult {
+                    committed: true,
+                    replayed: false,
+                    verdict: Some(verdict),
+                    state: Some(state),
+                    consumption_receipt: None,
+                    event: Some(event),
+                    error_code: VerdictErrorCode::Unspecified as i32,
+                    safe_error_fingerprint: None,
+                };
+                let payload = result.encode_to_vec();
+                Ok(VerdictProjectionMessage {
+                    message_id: format!("bootstrap:{}", baseline.source_event_id),
+                    source_event_id: baseline.source_event_id,
+                    source_revision: baseline.source_revision,
+                    payload_digest_sha256: hex::encode(Sha256::digest(payload)),
+                    result,
+                })
+            })
+            .collect()
+    }
+
+    pub fn acknowledge_projection(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, VerdictAuthorityFailure> {
+        self.store
+            .acknowledge_projection_outbox(message_id, expected_payload_digest_sha256)
+            .map_err(VerdictAuthorityFailure::from)
+    }
+
     fn issue(
         &mut self,
         command: &IssueFounderVerdictCommand,
@@ -451,7 +554,7 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
             }
             evidence.extend(authorization.evidence_refs.iter().cloned());
             normalize_evidence(&mut evidence);
-            Some((old_state, evidence))
+            Some((old_verdict, old_state, evidence))
         } else {
             None
         };
@@ -525,7 +628,7 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
         let event_bytes = event.encode_to_vec();
         let scope_digest = hex::encode(Sha256::digest(scope.encode_to_vec()));
         let outbox_digest = hex::encode(Sha256::digest(&event_bytes));
-        let prepared_supersede = superseded.map(|(old_state, evidence)| {
+        let prepared_supersede = superseded.map(|(old_verdict, old_state, evidence)| {
             let event_id = format!("verdict-event-{}", Uuid::now_v7());
             let command_id = format!("{}:supersede", meta.command_id);
             let state = FounderVerdictState {
@@ -548,6 +651,17 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
                 committed_at: Some(now),
             };
             let event = supersede_event.encode_to_vec();
+            let projection_result = VerdictCommandResult {
+                committed: true,
+                replayed: false,
+                verdict: Some(old_verdict),
+                state: Some(state.clone()),
+                consumption_receipt: None,
+                event: Some(supersede_event),
+                error_code: VerdictErrorCode::Unspecified as i32,
+                safe_error_fingerprint: None,
+            }
+            .encode_to_vec();
             PreparedSupersedeCommit {
                 verdict_id: state.founder_verdict_id.clone(),
                 expected_revision: old_state.revision,
@@ -557,11 +671,16 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
                 outbox_id: format!("verdict-outbox-read-{}", Uuid::now_v7()),
                 outbox_digest: hex::encode(Sha256::digest(&event)),
                 event,
+                projection_outbox_id: format!("verdict-projection-outbox-{}", Uuid::now_v7()),
+                projection_payload_digest: hex::encode(Sha256::digest(&projection_result)),
+                projection_payload: projection_result,
             }
         });
         let supersede_commit = prepared_supersede
             .as_ref()
             .map(PreparedSupersedeCommit::as_store_commit);
+        let result_bytes = result.encode_to_vec();
+        let projection_digest = hex::encode(Sha256::digest(&result_bytes));
         let changed = self.store.issue(&IssueCommit {
             verdict_id: &verdict_id,
             scope_digest: &scope_digest,
@@ -577,10 +696,13 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
             operation: ISSUE_OPERATION,
             idempotency_scope: &meta.idempotency_scope,
             idempotency_key: &meta.idempotency_key,
-            result: &result.encode_to_vec(),
+            result: &result_bytes,
             read_outbox_id: &format!("verdict-outbox-read-{}", Uuid::now_v7()),
             task_outbox_id: &format!("verdict-outbox-task-{}", Uuid::now_v7()),
             outbox_digest: &outbox_digest,
+            projection_outbox_id: &format!("verdict-projection-outbox-{}", Uuid::now_v7()),
+            projection_payload_digest: &projection_digest,
+            projection_payload: &result_bytes,
             committed_at: now.seconds,
             supersede: supersede_commit,
         })?;
@@ -694,6 +816,8 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
         };
         let event_bytes = event.encode_to_vec();
         let outbox_digest = hex::encode(Sha256::digest(&event_bytes));
+        let result_bytes = result.encode_to_vec();
+        let projection_digest = hex::encode(Sha256::digest(&result_bytes));
         let changed = self.store.consume(&ConsumeCommit {
             verdict_id: &command.founder_verdict_id,
             expected_revision: command.expected_state_revision,
@@ -710,9 +834,12 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
             operation: CONSUME_OPERATION,
             idempotency_scope: &meta.idempotency_scope,
             idempotency_key: &meta.idempotency_key,
-            result: &result.encode_to_vec(),
+            result: &result_bytes,
             outbox_id: &format!("verdict-outbox-read-{}", Uuid::now_v7()),
             outbox_digest: &outbox_digest,
+            projection_outbox_id: &format!("verdict-projection-outbox-{}", Uuid::now_v7()),
+            projection_payload_digest: &projection_digest,
+            projection_payload: &result_bytes,
             committed_at: now.seconds,
         })?;
         if !changed {
@@ -881,6 +1008,8 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
         };
         let event_bytes = event.encode_to_vec();
         let outbox_digest = hex::encode(Sha256::digest(&event_bytes));
+        let result_bytes = result.encode_to_vec();
+        let projection_digest = hex::encode(Sha256::digest(&result_bytes));
         let changed = self.store.transition(&StateCommit {
             verdict_id: &state.founder_verdict_id,
             expected_revision: current.revision,
@@ -894,9 +1023,12 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
             operation,
             idempotency_scope: &metadata.idempotency_scope,
             idempotency_key: &metadata.idempotency_key,
-            result: &result.encode_to_vec(),
+            result: &result_bytes,
             outbox_id: &format!("verdict-outbox-read-{}", Uuid::now_v7()),
             outbox_digest: &outbox_digest,
+            projection_outbox_id: &format!("verdict-projection-outbox-{}", Uuid::now_v7()),
+            projection_payload_digest: &projection_digest,
+            projection_payload: &result_bytes,
             committed_at: now.seconds,
         })?;
         if !changed {
