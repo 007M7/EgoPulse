@@ -4,6 +4,13 @@
 //! This crate owns derived state only. It accepts typed, owner-produced
 //! projection messages and never receives an Authority database handle.
 
+mod task_evidence;
+
+pub use task_evidence::{
+    ArtifactProjectionInput, EvidenceGraphAccess, TaskListFilter, TaskProjectionApply,
+    TaskProjectionInput, TaskViewAccess, VerdictProjectionInput, VerificationProjectionInput,
+};
+
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     CollaborationCommandResult, CollaborationSnapshot, collaboration_command_result,
 };
@@ -91,6 +98,66 @@ CREATE TABLE harness_approval_frames (
   approval_request_id TEXT NOT NULL,
   frame BLOB NOT NULL,
   PRIMARY KEY (sequence, approval_request_id)
+) STRICT;
+"#;
+
+const SCHEMA_V2: &str = r#"
+CREATE TABLE task_domain_projections (
+  task_id TEXT PRIMARY KEY,
+  source_event_id TEXT NOT NULL,
+  source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+  payload_digest_sha256 TEXT NOT NULL,
+  snapshot BLOB NOT NULL
+) STRICT;
+CREATE TABLE artifact_object_projections (
+  object_kind TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  source_event_id TEXT NOT NULL,
+  source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+  payload_digest_sha256 TEXT NOT NULL,
+  snapshot BLOB NOT NULL,
+  PRIMARY KEY(object_kind,object_id)
+) STRICT;
+CREATE INDEX artifact_projection_task_idx
+  ON artifact_object_projections(task_id,object_kind,object_id);
+CREATE TABLE verification_result_projections (
+  aggregate_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  verification_artifact_id TEXT,
+  source_event_id TEXT NOT NULL,
+  source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+  payload_digest_sha256 TEXT NOT NULL,
+  result BLOB NOT NULL
+) STRICT;
+CREATE UNIQUE INDEX verification_artifact_projection_idx
+  ON verification_result_projections(verification_artifact_id)
+  WHERE verification_artifact_id IS NOT NULL;
+CREATE TABLE verdict_result_projections (
+  founder_verdict_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  source_event_id TEXT NOT NULL,
+  source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+  payload_digest_sha256 TEXT NOT NULL,
+  result BLOB NOT NULL
+) STRICT;
+CREATE TABLE task_views (
+  task_id TEXT PRIMARY KEY,
+  updated_sequence INTEGER NOT NULL CHECK (updated_sequence >= 1),
+  view BLOB NOT NULL
+) STRICT;
+CREATE TABLE task_view_frames (
+  sequence INTEGER NOT NULL,
+  task_id TEXT NOT NULL,
+  frame BLOB NOT NULL,
+  PRIMARY KEY(sequence,task_id)
+) STRICT;
+CREATE TABLE evidence_graph_views (
+  task_id TEXT NOT NULL,
+  artifact_set_id TEXT NOT NULL,
+  updated_sequence INTEGER NOT NULL CHECK (updated_sequence >= 1),
+  view BLOB NOT NULL,
+  PRIMARY KEY(task_id,artifact_set_id)
 ) STRICT;
 "#;
 
@@ -232,8 +299,9 @@ impl LocalReadModel {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "secure_delete", "ON")?;
-        Migrations::new(vec![M::up(SCHEMA_V1)]).to_latest(&mut connection)?;
-        let digest = sha256(SCHEMA_V1.as_bytes());
+        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)]).to_latest(&mut connection)?;
+        let legacy_digest = sha256(SCHEMA_V1.as_bytes());
+        let digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes());
         connection.execute(
             "INSERT OR IGNORE INTO projection_metadata(
                singleton,epoch,schema_profile_id,schema_profile_sha256,current_sequence,health
@@ -251,7 +319,16 @@ impl LocalReadModel {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        if actual != (config.epoch, SCHEMA_PROFILE_ID.to_owned(), digest) {
+        if actual.0 != config.epoch || actual.1 != SCHEMA_PROFILE_ID {
+            return Err(ProjectionFailure::StoreGenerationMismatch);
+        }
+        if actual.2 == legacy_digest {
+            connection.execute(
+                "UPDATE projection_metadata SET schema_profile_sha256=?1
+                 WHERE singleton=1 AND schema_profile_sha256=?2",
+                params![digest, legacy_digest],
+            )?;
+        } else if actual.2 != digest {
             return Err(ProjectionFailure::StoreGenerationMismatch);
         }
         let integrity: String =
@@ -300,6 +377,12 @@ impl LocalReadModel {
             for id in &ids {
                 recompute_approval_view(tx, id, sequence, &input.metadata.projected_at)?;
             }
+            task_evidence::recompute_task_for_run(
+                tx,
+                &run.run_id,
+                sequence,
+                &input.metadata.projected_at,
+            )?;
             bind_inbox_sequence(tx, SourceDomain::Collaboration, &input.metadata, sequence)?;
             Ok(Some((sequence, ids)))
         });
@@ -539,6 +622,13 @@ impl LocalReadModel {
             "policy_decision_projections",
             "harness_approval_views",
             "harness_approval_frames",
+            "task_domain_projections",
+            "artifact_object_projections",
+            "verification_result_projections",
+            "verdict_result_projections",
+            "task_views",
+            "task_view_frames",
+            "evidence_graph_views",
         ] {
             transaction.execute(&format!("DELETE FROM {table}"), [])?;
         }

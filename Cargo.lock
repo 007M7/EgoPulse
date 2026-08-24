@@ -1219,6 +1219,7 @@ dependencies = [
 name = "egopulse-local-read-model"
 version = "0.1.0"
 dependencies = [
+ "egopulse-cognition-runtime",
  "egopulse-domain-contracts",
  "hex",
  "prost",

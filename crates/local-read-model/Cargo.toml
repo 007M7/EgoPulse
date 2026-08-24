@@ -20,4 +20,5 @@ zeroize.workspace = true
 path = "src/lib.rs"
 
 [dev-dependencies]
+egopulse-cognition-runtime.workspace = true
 uuid.workspace = true
