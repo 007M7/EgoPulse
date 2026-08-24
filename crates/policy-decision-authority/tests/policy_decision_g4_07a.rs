@@ -17,6 +17,7 @@ use egopulse_policy_decision_authority::{
 };
 use prost::Message;
 use prost_types::Timestamp;
+use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,6 +28,8 @@ const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const CRASH_PROBE: &str = "EGOPULSE_G4_07A_CRASH_PROBE";
 const CRASH_DB: &str = "EGOPULSE_G4_07A_CRASH_DB";
+const MIGRATION_CRASH_PROBE: &str = "EGOPULSE_G4_08A_POLICY_MIGRATION_CRASH_PROBE";
+const MIGRATION_CRASH_DB: &str = "EGOPULSE_G4_08A_POLICY_MIGRATION_CRASH_DB";
 
 #[derive(Clone, Copy)]
 struct FixedClock(i64);
@@ -194,6 +197,59 @@ fn issue_is_authoritative_immutable_idempotent_and_exactly_routed() {
     assert_eq!(envelope.native_routing_ref, "native-route:approval-01");
     assert_eq!(envelope.fencing_token, 9);
     assert_eq!(envelope.action_digest_sha256, SHA_A);
+    let projection = authority
+        .pending_projection_messages()
+        .expect("pending read-model projection");
+    assert_eq!(projection.len(), 1);
+    let projected_result = &projection[0].result;
+    assert!(
+        projected_result
+            .decision_record
+            .as_ref()
+            .and_then(|record| record.request.as_ref())
+            .is_some_and(|request| request.native_routing_ref.is_empty())
+    );
+    assert_eq!(
+        projected_result
+            .decision_record
+            .as_ref()
+            .map(|value| value.authority_decision_ref.as_str()),
+        Some(record.authority_decision_ref.as_str())
+    );
+    assert!(
+        authority
+            .acknowledge_projection_message(
+                &projection[0].message_id,
+                &projection[0].payload_digest_sha256,
+            )
+            .expect("ack projection after projector commit")
+    );
+    assert!(
+        authority
+            .acknowledge_projection_message(
+                &projection[0].message_id,
+                &projection[0].payload_digest_sha256,
+            )
+            .expect("idempotent projection ack replay")
+    );
+    assert!(
+        authority
+            .pending_projection_messages()
+            .expect("projection drained")
+            .is_empty()
+    );
+    let retained = authority
+        .retained_projection_messages_for_rebuild()
+        .expect("acknowledged projection remains rebuildable");
+    assert_eq!(retained.len(), 1);
+    let retained_result = &retained[0].result;
+    assert!(
+        retained_result
+            .decision_record
+            .as_ref()
+            .and_then(|record| record.request.as_ref())
+            .is_some_and(|request| request.native_routing_ref.is_empty())
+    );
 
     let replay = authority.execute(&command, &local_user()).expect("replay");
     assert!(replay.replayed);
@@ -438,6 +494,88 @@ fn adapter_receipt_is_bound_final_and_consumed_once() {
 }
 
 #[test]
+fn existing_authority_facts_generate_one_deterministic_rebuild_bootstrap() {
+    let root = TempRoot::new("projection-bootstrap");
+    let mut authority = open_authority(&root.database(), NOW, NOW + 300);
+    let mut issue = issue_command();
+    sign(&mut issue);
+    let issued = authority.execute(&issue, &local_user()).expect("issue");
+    let decision_ref = issued
+        .decision_record
+        .as_ref()
+        .expect("record")
+        .authority_decision_ref
+        .clone();
+    let mut consume = consume_command(&decision_ref, DeliveryDisposition::Delivered);
+    sign(&mut consume);
+    authority.execute(&consume, &adapter()).expect("consume");
+    let before = authority.inspect_store().expect("before migration");
+    drop(authority);
+
+    let connection = Connection::open(root.database()).expect("open encrypted store");
+    connection
+        .pragma_update(None, "key", format!("x'{}'", hex::encode([107; 32])))
+        .expect("apply SQLCipher key");
+    connection
+        .execute(
+            "UPDATE policy_projection_migrations
+             SET state='pending',completed_at_seconds=NULL
+             WHERE migration_id='g4-08a-bootstrap-v1'",
+            [],
+        )
+        .expect("simulate pre-bootstrap migrated store");
+    drop(connection);
+
+    let status = Command::new(std::env::current_exe().expect("current test executable"))
+        .arg("--exact")
+        .arg("projection_migration_crash_probe_child")
+        .arg("--nocapture")
+        .env(MIGRATION_CRASH_PROBE, "1")
+        .env(MIGRATION_CRASH_DB, root.database())
+        .status()
+        .expect("launch migration crash probe");
+    assert!(!status.success(), "migration probe must terminate by abort");
+
+    let authority = open_authority(&root.database(), NOW, NOW + 300);
+    let after = authority.inspect_store().expect("after migration");
+    assert_eq!(after.decision_count, before.decision_count);
+    assert_eq!(after.event_count, before.event_count);
+    assert_eq!(after.commit_receipt_count, before.commit_receipt_count);
+    assert_eq!(after.outbox_count, before.outbox_count + 1);
+    let retained = authority
+        .retained_projection_messages_for_rebuild()
+        .expect("canonical rebuild feed");
+    assert_eq!(retained.len(), 1);
+    assert!(retained[0].rebuild_baseline);
+    assert_eq!(retained[0].source_revision, 2);
+    let baseline = &retained[0].result;
+    assert!(baseline.consumption_receipt.is_some());
+    assert!(
+        baseline
+            .decision_record
+            .as_ref()
+            .and_then(|record| record.request.as_ref())
+            .is_some_and(|request| request.native_routing_ref.is_empty())
+    );
+    let message_id = retained[0].message_id.clone();
+    drop(authority);
+
+    let authority = open_authority(&root.database(), NOW, NOW + 300);
+    let reopened = authority
+        .retained_projection_messages_for_rebuild()
+        .expect("idempotent reopen");
+    assert_eq!(reopened.len(), 1);
+    assert_eq!(reopened[0].message_id, message_id);
+    assert_eq!(
+        authority
+            .inspect_store()
+            .expect("reopen counts")
+            .outbox_count,
+        after.outbox_count
+    );
+}
+
+#[test]
 fn revoke_and_authority_clock_expiry_use_revision_cas() {
     let revoke_root = TempRoot::new("revoke");
     let mut authority = open_authority(&revoke_root.database(), NOW, NOW + 300);
@@ -581,6 +719,22 @@ fn crash_probe_child() {
             .expect("commit before abort")
             .committed
     );
+    std::process::abort();
+}
+
+#[test]
+fn projection_migration_crash_probe_child() {
+    if std::env::var(MIGRATION_CRASH_PROBE).as_deref() != Ok("1") {
+        return;
+    }
+    let database =
+        PathBuf::from(std::env::var_os(MIGRATION_CRASH_DB).expect("migration crash database"));
+    let authority = open_authority(&database, NOW, NOW + 300);
+    let retained = authority
+        .retained_projection_messages_for_rebuild()
+        .expect("bootstrap committed before abort");
+    assert_eq!(retained.len(), 1);
+    assert!(retained[0].rebuild_baseline);
     std::process::abort();
 }
 

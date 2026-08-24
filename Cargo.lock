@@ -1195,6 +1195,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "egopulse-local-read-model"
+version = "0.1.0"
+dependencies = [
+ "egopulse-domain-contracts",
+ "hex",
+ "prost",
+ "prost-types",
+ "rusqlite",
+ "rusqlite_migration",
+ "sha2",
+ "thiserror 2.0.20",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "egopulse-policy-decision-authority"
 version = "0.1.0"
 dependencies = [

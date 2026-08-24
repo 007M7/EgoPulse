@@ -82,6 +82,37 @@ CREATE TABLE policy_commit_receipts (
 ) STRICT;
 "#;
 
+const SCHEMA_V2: &str = r#"
+ALTER TABLE policy_outbox RENAME TO policy_outbox_v1;
+CREATE TABLE policy_outbox (
+  message_id TEXT PRIMARY KEY,
+  source_event_id TEXT NOT NULL,
+  destination_domain TEXT NOT NULL,
+  payload_kind TEXT NOT NULL,
+  payload_digest_sha256 TEXT NOT NULL,
+  payload BLOB NOT NULL,
+  delivery_state TEXT NOT NULL CHECK (delivery_state IN ('pending','delivered','consumed','held')),
+  created_at_seconds INTEGER NOT NULL,
+  UNIQUE(source_event_id, destination_domain, payload_kind),
+  FOREIGN KEY (source_event_id) REFERENCES policy_decision_events(event_id)
+) STRICT;
+INSERT INTO policy_outbox(
+  message_id,source_event_id,destination_domain,payload_kind,
+  payload_digest_sha256,payload,delivery_state,created_at_seconds
+)
+SELECT message_id,source_event_id,destination_domain,'policy-event-v1',
+       payload_digest_sha256,payload,delivery_state,created_at_seconds
+FROM policy_outbox_v1;
+DROP TABLE policy_outbox_v1;
+CREATE TABLE policy_projection_migrations (
+  migration_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK (state IN ('pending','completed')),
+  completed_at_seconds INTEGER
+) STRICT;
+INSERT INTO policy_projection_migrations(migration_id,state)
+VALUES('g4-08a-bootstrap-v1','pending');
+"#;
+
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
     #[error("policy decision storage operation failed")]
@@ -113,8 +144,32 @@ pub struct PendingPolicyOutbox {
     pub message_id: String,
     pub source_event_id: String,
     pub destination_domain: String,
+    pub payload_kind: String,
+    pub source_revision: u64,
     pub payload_digest_sha256: String,
     pub payload: Vec<u8>,
+    pub rebuild_baseline: bool,
+}
+
+pub(crate) struct ProjectionBootstrapCandidate {
+    pub decision_ref: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub decision_record: Vec<u8>,
+    pub state: Vec<u8>,
+    pub event: Vec<u8>,
+    pub consumption_receipt: Option<Vec<u8>>,
+    pub created_at_seconds: i64,
+}
+
+pub(crate) struct ProjectionBootstrapWrite {
+    pub decision_ref: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub message_id: String,
+    pub payload_digest_sha256: String,
+    pub payload: Vec<u8>,
+    pub created_at_seconds: i64,
 }
 
 pub(crate) struct IssueCommit<'a> {
@@ -138,6 +193,7 @@ pub(crate) struct IssueCommit<'a> {
     pub adapter_payload: &'a [u8],
     pub read_outbox_id: &'a str,
     pub read_payload_digest: &'a str,
+    pub read_payload: &'a [u8],
     pub committed_at: i64,
 }
 
@@ -160,6 +216,7 @@ pub(crate) struct ConsumeCommit<'a> {
     pub result: &'a [u8],
     pub outbox_id: &'a str,
     pub outbox_digest: &'a str,
+    pub outbox_payload: &'a [u8],
     pub committed_at: i64,
 }
 
@@ -179,6 +236,7 @@ pub(crate) struct StateCommit<'a> {
     pub result: &'a [u8],
     pub outbox_id: &'a str,
     pub outbox_digest: &'a str,
+    pub outbox_payload: &'a [u8],
     pub committed_at: i64,
 }
 
@@ -224,14 +282,35 @@ impl PolicyStore {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "secure_delete", "ON")?;
-        Migrations::new(vec![M::up(SCHEMA_V1)]).to_latest(&mut connection)?;
-        let digest = hex::encode(Sha256::digest(SCHEMA_V1.as_bytes()));
+        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)]).to_latest(&mut connection)?;
+        let digest = hex::encode(Sha256::digest(
+            format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes(),
+        ));
+        let prior_digest = hex::encode(Sha256::digest(SCHEMA_V1.as_bytes()));
         connection.execute(
             "INSERT OR IGNORE INTO policy_store_metadata(singleton,store_epoch,schema_profile_id,schema_profile_sha256) VALUES(1,?1,?2,?3)",
             params![store_epoch, SCHEMA_PROFILE_ID, digest],
         )?;
         let actual: (String, String, String) = connection.query_row(
             "SELECT store_epoch,schema_profile_id,schema_profile_sha256 FROM policy_store_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if actual
+            == (
+                store_epoch.to_owned(),
+                SCHEMA_PROFILE_ID.to_owned(),
+                prior_digest,
+            )
+        {
+            connection.execute(
+                "UPDATE policy_store_metadata SET schema_profile_sha256=?1 WHERE singleton=1",
+                [&digest],
+            )?;
+        }
+        let actual: (String, String, String) = connection.query_row(
+            "SELECT store_epoch,schema_profile_id,schema_profile_sha256
+             FROM policy_store_metadata WHERE singleton=1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
@@ -247,6 +326,140 @@ impl PolicyStore {
             connection,
             store_epoch: store_epoch.to_owned(),
         })
+    }
+
+    pub fn projection_bootstrap_candidates(
+        &self,
+    ) -> Result<Vec<ProjectionBootstrapCandidate>, StoreError> {
+        let state: String = self.connection.query_row(
+            "SELECT state FROM policy_projection_migrations
+             WHERE migration_id='g4-08a-bootstrap-v1'",
+            [],
+            |row| row.get(0),
+        )?;
+        if state == "completed" {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT d.authority_decision_ref,e.event_id,s.revision,d.decision_record,
+                    s.state_blob,e.event,r.receipt,s.updated_at_seconds
+             FROM policy_decisions d
+             JOIN policy_decision_states s USING(authority_decision_ref)
+             JOIN policy_decision_events e
+               ON e.authority_decision_ref=d.authority_decision_ref
+              AND e.resulting_state_revision=s.revision
+             LEFT JOIN policy_consumption_receipts r
+               ON r.authority_decision_ref=d.authority_decision_ref
+             ORDER BY d.authority_decision_ref",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ProjectionBootstrapCandidate {
+                decision_ref: row.get(0)?,
+                source_event_id: row.get(1)?,
+                source_revision: row.get::<_, i64>(2)? as u64,
+                decision_record: row.get(3)?,
+                state: row.get(4)?,
+                event: row.get(5)?,
+                consumption_receipt: row.get(6)?,
+                created_at_seconds: row.get(7)?,
+            })
+        })?;
+        let candidates = rows.collect::<Result<Vec<_>, _>>()?;
+        let decision_count: i64 =
+            self.connection
+                .query_row("SELECT count(*) FROM policy_decisions", [], |row| {
+                    row.get(0)
+                })?;
+        if candidates.len() != decision_count as usize {
+            return Err(StoreError::IntegrityFailure);
+        }
+        Ok(candidates)
+    }
+
+    pub fn complete_projection_bootstrap(
+        &mut self,
+        writes: &[ProjectionBootstrapWrite],
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: String = tx.query_row(
+            "SELECT state FROM policy_projection_migrations
+             WHERE migration_id='g4-08a-bootstrap-v1'",
+            [],
+            |row| row.get(0),
+        )?;
+        if state == "completed" {
+            tx.commit()?;
+            return Ok(());
+        }
+        let decision_count: i64 =
+            tx.query_row("SELECT count(*) FROM policy_decisions", [], |row| {
+                row.get(0)
+            })?;
+        if writes.len() != decision_count as usize {
+            return Err(StoreError::IntegrityFailure);
+        }
+        for write in writes {
+            let current: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT e.event_id,s.revision
+                     FROM policy_decision_states s
+                     JOIN policy_decision_events e
+                       ON e.authority_decision_ref=s.authority_decision_ref
+                      AND e.resulting_state_revision=s.revision
+                     WHERE s.authority_decision_ref=?1",
+                    [&write.decision_ref],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if current != Some((write.source_event_id.clone(), write.source_revision as i64)) {
+                return Err(StoreError::IntegrityFailure);
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO policy_outbox(
+                   message_id,source_event_id,destination_domain,payload_kind,
+                   payload_digest_sha256,payload,delivery_state,created_at_seconds
+                 ) VALUES(?1,?2,'local-read-model','policy-decision-bootstrap-v1',
+                          ?3,?4,'consumed',?5)",
+                params![
+                    write.message_id,
+                    write.source_event_id,
+                    write.payload_digest_sha256,
+                    write.payload,
+                    write.created_at_seconds
+                ],
+            )?;
+            let persisted: Option<(String, String, Vec<u8>, String)> = tx
+                .query_row(
+                    "SELECT message_id,payload_digest_sha256,payload,delivery_state
+                     FROM policy_outbox
+                     WHERE source_event_id=?1
+                       AND destination_domain='local-read-model'
+                       AND payload_kind='policy-decision-bootstrap-v1'",
+                    [&write.source_event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            if persisted
+                != Some((
+                    write.message_id.clone(),
+                    write.payload_digest_sha256.clone(),
+                    write.payload.clone(),
+                    "consumed".to_owned(),
+                ))
+            {
+                return Err(StoreError::IntegrityFailure);
+            }
+        }
+        tx.execute(
+            "UPDATE policy_projection_migrations
+             SET state='completed',completed_at_seconds=(unixepoch())
+             WHERE migration_id='g4-08a-bootstrap-v1' AND state='pending'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn idempotency_record(
@@ -329,12 +542,28 @@ impl PolicyStore {
                 c.read_outbox_id,
                 "local-read-model",
                 c.read_payload_digest,
-                c.event,
+                c.read_payload,
             ),
         ] {
+            let payload_kind = if destination == "harness-adapter" {
+                "approval-decision-envelope-v1"
+            } else {
+                "policy-decision-snapshot-v1"
+            };
             tx.execute(
-                "INSERT INTO policy_outbox VALUES(?1,?2,?3,?4,?5,'pending',?6)",
-                params![id, c.event_id, destination, digest, payload, c.committed_at],
+                "INSERT INTO policy_outbox(
+                   message_id,source_event_id,destination_domain,payload_kind,
+                   payload_digest_sha256,payload,delivery_state,created_at_seconds
+                 ) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7)",
+                params![
+                    id,
+                    c.event_id,
+                    destination,
+                    payload_kind,
+                    digest,
+                    payload,
+                    c.committed_at
+                ],
             )?;
         }
         insert_commit_receipt(
@@ -395,12 +624,16 @@ impl PolicyStore {
             },
         )?;
         tx.execute(
-            "INSERT INTO policy_outbox VALUES(?1,?2,'local-read-model',?3,?4,'pending',?5)",
+            "INSERT INTO policy_outbox(
+               message_id,source_event_id,destination_domain,payload_kind,
+               payload_digest_sha256,payload,delivery_state,created_at_seconds
+             ) VALUES(?1,?2,'local-read-model','policy-decision-snapshot-v1',
+                      ?3,?4,'pending',?5)",
             params![
                 c.outbox_id,
                 c.event_id,
                 c.outbox_digest,
-                c.event,
+                c.outbox_payload,
                 c.committed_at
             ],
         )?;
@@ -452,12 +685,16 @@ impl PolicyStore {
             },
         )?;
         tx.execute(
-            "INSERT INTO policy_outbox VALUES(?1,?2,'local-read-model',?3,?4,'pending',?5)",
+            "INSERT INTO policy_outbox(
+               message_id,source_event_id,destination_domain,payload_kind,
+               payload_digest_sha256,payload,delivery_state,created_at_seconds
+             ) VALUES(?1,?2,'local-read-model','policy-decision-snapshot-v1',
+                      ?3,?4,'pending',?5)",
             params![
                 c.outbox_id,
                 c.event_id,
                 c.outbox_digest,
-                c.event,
+                c.outbox_payload,
                 c.committed_at
             ],
         )?;
@@ -482,18 +719,101 @@ impl PolicyStore {
     }
 
     pub fn pending_outbox(&self) -> Result<Vec<PendingPolicyOutbox>, StoreError> {
-        let mut statement = self.connection.prepare("SELECT message_id,source_event_id,destination_domain,payload_digest_sha256,payload FROM policy_outbox WHERE delivery_state='pending' ORDER BY rowid")?;
+        let mut statement = self.connection.prepare(
+            "SELECT o.message_id,o.source_event_id,o.destination_domain,o.payload_kind,
+                    e.resulting_state_revision,o.payload_digest_sha256,o.payload
+             FROM policy_outbox o JOIN policy_decision_events e ON e.event_id=o.source_event_id
+             WHERE o.delivery_state='pending' ORDER BY o.rowid",
+        )?;
         let rows = statement.query_map([], |row| {
             Ok(PendingPolicyOutbox {
                 message_id: row.get(0)?,
                 source_event_id: row.get(1)?,
                 destination_domain: row.get(2)?,
-                payload_digest_sha256: row.get(3)?,
-                payload: row.get(4)?,
+                payload_kind: row.get(3)?,
+                source_revision: row.get::<_, i64>(4)? as u64,
+                payload_digest_sha256: row.get(5)?,
+                payload: row.get(6)?,
+                rebuild_baseline: false,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn pending_projection_outbox(&self) -> Result<Vec<PendingPolicyOutbox>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT o.message_id,o.source_event_id,o.destination_domain,o.payload_kind,
+                    e.resulting_state_revision,o.payload_digest_sha256,o.payload
+             FROM policy_outbox o JOIN policy_decision_events e ON e.event_id=o.source_event_id
+             WHERE o.delivery_state='pending'
+               AND o.destination_domain='local-read-model'
+               AND o.payload_kind='policy-decision-snapshot-v1'
+             ORDER BY o.rowid",
+        )?;
+        let rows = statement.query_map([], pending_policy_outbox_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn retained_projection_outbox(&self) -> Result<Vec<PendingPolicyOutbox>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT o.message_id,o.source_event_id,o.destination_domain,o.payload_kind,
+                    e.resulting_state_revision,o.payload_digest_sha256,o.payload
+             FROM policy_outbox o
+             JOIN policy_decision_events e ON e.event_id=o.source_event_id
+             LEFT JOIN (
+               SELECT be.authority_decision_ref,MAX(bse.resulting_state_revision) baseline_revision
+               FROM policy_outbox b
+               JOIN policy_decision_events bse ON bse.event_id=b.source_event_id
+               JOIN policy_decision_events be ON be.event_id=b.source_event_id
+               WHERE b.destination_domain='local-read-model'
+                 AND b.payload_kind='policy-decision-bootstrap-v1'
+               GROUP BY be.authority_decision_ref
+             ) baseline ON baseline.authority_decision_ref=e.authority_decision_ref
+             WHERE o.destination_domain='local-read-model'
+               AND o.delivery_state IN ('pending','consumed')
+               AND (
+                 o.payload_kind='policy-decision-bootstrap-v1'
+                 OR (
+                   o.payload_kind='policy-decision-snapshot-v1'
+                   AND (baseline.baseline_revision IS NULL
+                        OR e.resulting_state_revision>baseline.baseline_revision)
+                 )
+               )
+             ORDER BY e.authority_decision_ref,e.resulting_state_revision,o.rowid",
+        )?;
+        let rows = statement.query_map([], pending_policy_outbox_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn acknowledge_projection_outbox(
+        &mut self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE policy_outbox SET delivery_state='consumed'
+             WHERE message_id=?1 AND destination_domain='local-read-model'
+               AND payload_kind='policy-decision-snapshot-v1'
+               AND payload_digest_sha256=?2 AND delivery_state='pending'",
+            params![message_id, payload_digest_sha256],
+        )?;
+        if changed == 1 {
+            return Ok(true);
+        }
+        let replay: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT payload_digest_sha256,delivery_state FROM policy_outbox
+                 WHERE message_id=?1 AND destination_domain='local-read-model'
+                   AND payload_kind='policy-decision-snapshot-v1'",
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(
+            matches!(replay, Some((digest, state)) if digest == payload_digest_sha256 && state == "consumed"),
+        )
     }
 
     pub fn inspect(&self) -> Result<PolicyStoreInspection, StoreError> {
@@ -511,6 +831,22 @@ impl PolicyStore {
             commit_receipt_count: count("SELECT count(*) FROM policy_commit_receipts")?,
         })
     }
+}
+
+fn pending_policy_outbox_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<PendingPolicyOutbox, rusqlite::Error> {
+    let payload_kind: String = row.get(3)?;
+    Ok(PendingPolicyOutbox {
+        message_id: row.get(0)?,
+        source_event_id: row.get(1)?,
+        destination_domain: row.get(2)?,
+        rebuild_baseline: payload_kind == "policy-decision-bootstrap-v1",
+        payload_kind,
+        source_revision: row.get::<_, i64>(4)? as u64,
+        payload_digest_sha256: row.get(5)?,
+        payload: row.get(6)?,
+    })
 }
 
 struct EventInsert<'a> {
@@ -566,4 +902,125 @@ fn insert_commit_receipt(
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn legacy_v1_store_migrates_without_losing_authority_facts_or_old_outbox() {
+        let root =
+            std::env::temp_dir().join(format!("egopulse-policy-v1-migration-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create migration root");
+        let path = root.join("policy.db");
+        let key = [92_u8; 32];
+        let epoch = "policy-v1-epoch";
+        {
+            let mut connection = Connection::open(&path).expect("open legacy store");
+            connection
+                .pragma_update(None, "key", format!("x'{}'", hex::encode(key)))
+                .expect("configure SQLCipher key");
+            Migrations::new(vec![M::up(SCHEMA_V1)])
+                .to_latest(&mut connection)
+                .expect("create v1 schema");
+            let digest = hex::encode(Sha256::digest(SCHEMA_V1.as_bytes()));
+            connection
+                .execute(
+                    "INSERT INTO policy_store_metadata(
+                       singleton,store_epoch,schema_profile_id,schema_profile_sha256,
+                       last_event_sequence
+                     ) VALUES(1,?1,?2,?3,1)",
+                    params![epoch, SCHEMA_PROFILE_ID, digest],
+                )
+                .expect("insert metadata");
+            connection
+                .execute(
+                    "INSERT INTO policy_decisions VALUES(
+                       'decision-v1','approval-v1','payload-digest-v1',x'01',10
+                     )",
+                    [],
+                )
+                .expect("insert decision fact");
+            connection
+                .execute(
+                    "INSERT INTO policy_decision_states VALUES(
+                       'decision-v1',2,2,x'02',20
+                     )",
+                    [],
+                )
+                .expect("insert state fact");
+            connection
+                .execute(
+                    "INSERT INTO policy_decision_events(
+                       event_id,command_id,authority_decision_ref,resulting_state_revision,
+                       request_digest_sha256,event
+                     ) VALUES('event-v1','command-v1','decision-v1',2,'request-digest-v1',x'03')",
+                    [],
+                )
+                .expect("insert event fact");
+            connection
+                .execute(
+                    "INSERT INTO policy_outbox VALUES(
+                       'read-v1','event-v1','local-read-model','read-digest-v1',
+                       x'04','pending',20
+                     )",
+                    [],
+                )
+                .expect("insert legacy read outbox");
+            connection
+                .execute(
+                    "INSERT INTO policy_commit_receipts VALUES(
+                       'event-v1','decision-v1',2,'key-v1','request-digest-v1',?1,1,20
+                     )",
+                    [epoch],
+                )
+                .expect("insert receipt");
+        }
+
+        let mut store = PolicyStore::open(&path, &key, epoch).expect("migrate v1 store");
+        let inspection = store.inspect().expect("inspect migrated store");
+        assert_eq!(inspection.decision_count, 1);
+        assert_eq!(inspection.event_count, 1);
+        assert_eq!(inspection.outbox_count, 1);
+        assert_eq!(inspection.commit_receipt_count, 1);
+        let old_kind: String = store
+            .connection
+            .query_row(
+                "SELECT payload_kind FROM policy_outbox WHERE message_id='read-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy outbox preserved");
+        assert_eq!(old_kind, "policy-event-v1");
+        let candidates = store
+            .projection_bootstrap_candidates()
+            .expect("bootstrap candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_revision, 2);
+        store
+            .complete_projection_bootstrap(&[ProjectionBootstrapWrite {
+                decision_ref: "decision-v1".to_owned(),
+                source_event_id: "event-v1".to_owned(),
+                source_revision: 2,
+                message_id: "bootstrap-v1".to_owned(),
+                payload_digest_sha256: "bootstrap-digest-v1".to_owned(),
+                payload: vec![5],
+                created_at_seconds: 20,
+            }])
+            .expect("complete bootstrap atomically");
+        assert_eq!(store.inspect().expect("post bootstrap").outbox_count, 2);
+        drop(store);
+        let store = PolicyStore::open(&path, &key, epoch).expect("idempotent reopen");
+        assert!(
+            store
+                .projection_bootstrap_candidates()
+                .expect("completed migration")
+                .is_empty()
+        );
+        assert_eq!(store.inspect().expect("reopen inspection").outbox_count, 2);
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
 }

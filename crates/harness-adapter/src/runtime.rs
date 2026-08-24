@@ -1,6 +1,6 @@
 use crate::{
     AdapterEdge, AdapterEdgeError, AdapterObservationEvidence, DispatchPreparation,
-    DurableWritePreparation,
+    DurableWritePreparation, PendingAdapterApprovalProjection,
 };
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ApprovalDecisionEnvelope, ApprovalDecisionReceipt, ApprovalDecisionResult,
@@ -665,6 +665,32 @@ where
 
     pub fn pending_observations(&self) -> Result<Vec<HarnessObservation>, GovernedAdapterError> {
         self.edge.pending_observations().map_err(Into::into)
+    }
+
+    pub fn pending_approval_projection_messages(
+        &self,
+    ) -> Result<Vec<PendingAdapterApprovalProjection>, GovernedAdapterError> {
+        self.edge
+            .pending_approval_projection_messages()
+            .map_err(Into::into)
+    }
+
+    pub fn retained_approval_projection_messages_for_rebuild(
+        &self,
+    ) -> Result<Vec<PendingAdapterApprovalProjection>, GovernedAdapterError> {
+        self.edge
+            .retained_approval_projection_messages_for_rebuild()
+            .map_err(Into::into)
+    }
+
+    pub fn acknowledge_approval_projection_message(
+        &mut self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, GovernedAdapterError> {
+        self.edge
+            .acknowledge_approval_projection_message(message_id, payload_digest_sha256)
+            .map_err(Into::into)
     }
 
     pub fn mark_observation_consumed(

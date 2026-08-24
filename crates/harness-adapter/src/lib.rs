@@ -7,7 +7,7 @@ mod runtime;
 pub use edge::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeInspection, AdapterEdgeKey,
     AdapterObservationEvidence, DispatchPreparation, DurableWritePreparation,
-    NativeExecutionBinding, ObservationAppend,
+    NativeExecutionBinding, ObservationAppend, PendingAdapterApprovalProjection,
 };
 pub use runtime::{
     AdapterClock, AdapterReconciliationEvidence, DispatchMaterialResolver, DriverDelivery,

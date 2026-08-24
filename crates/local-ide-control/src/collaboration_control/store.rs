@@ -119,6 +119,16 @@ CREATE TABLE collaboration_commit_outboxes (
 ) STRICT;
 "#;
 
+const SCHEMA_V2: &str = r#"
+CREATE TABLE collaboration_projection_migrations (
+  migration_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+  completed_at_seconds INTEGER
+) STRICT;
+INSERT INTO collaboration_projection_migrations(migration_id,state)
+VALUES('g4-08a-bootstrap-v1','pending');
+"#;
+
 #[derive(Debug, Error)]
 pub(super) enum StoreError {
     #[error("collaboration control storage operation failed")]
@@ -231,6 +241,35 @@ pub(super) struct PendingDispatchRecord {
     pub payload: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PendingProjectionRecord {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub canonical_payload_digest_sha256: String,
+    pub payload: Vec<u8>,
+    pub rebuild_baseline: bool,
+}
+
+pub(super) struct ProjectionBootstrapCandidate {
+    pub run_id: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub event: Vec<u8>,
+    pub snapshots: SnapshotBlobs,
+    pub created_at_seconds: i64,
+}
+
+pub(super) struct ProjectionBootstrapWrite {
+    pub run_id: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub message_id: String,
+    pub canonical_payload_digest_sha256: String,
+    pub payload: Vec<u8>,
+    pub created_at_seconds: i64,
+}
+
 pub(super) struct CollaborationStore {
     connection: Connection,
     store_epoch: String,
@@ -257,15 +296,34 @@ impl CollaborationStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "secure_delete", "ON")?;
 
-        Migrations::new(vec![M::up(SCHEMA_V1)]).to_latest(&mut connection)?;
+        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)]).to_latest(&mut connection)?;
 
-        let schema_digest = hex::encode(Sha256::digest(SCHEMA_V1.as_bytes()));
+        let schema_digest = hex::encode(Sha256::digest(
+            format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes(),
+        ));
+        let prior_schema_digest = hex::encode(Sha256::digest(SCHEMA_V1.as_bytes()));
         connection.execute(
             "INSERT OR IGNORE INTO collaboration_store_metadata(
                singleton, store_epoch, schema_profile_id, schema_profile_sha256
              ) VALUES(1, ?1, ?2, ?3)",
             params![store_epoch, SCHEMA_PROFILE_ID, schema_digest],
         )?;
+        let metadata: (String, String, String) = connection.query_row(
+            "SELECT store_epoch, schema_profile_id, schema_profile_sha256
+             FROM collaboration_store_metadata WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if metadata.0 == store_epoch
+            && metadata.1 == SCHEMA_PROFILE_ID
+            && metadata.2 == prior_schema_digest
+        {
+            connection.execute(
+                "UPDATE collaboration_store_metadata
+                 SET schema_profile_sha256=?1 WHERE singleton=1",
+                [&schema_digest],
+            )?;
+        }
         let metadata: (String, String, String) = connection.query_row(
             "SELECT store_epoch, schema_profile_id, schema_profile_sha256
              FROM collaboration_store_metadata WHERE singleton = 1",
@@ -289,6 +347,158 @@ impl CollaborationStore {
             connection,
             store_epoch: store_epoch.to_owned(),
         })
+    }
+
+    pub fn projection_bootstrap_candidates(
+        &self,
+    ) -> Result<Vec<ProjectionBootstrapCandidate>, StoreError> {
+        let state: String = self.connection.query_row(
+            "SELECT state FROM collaboration_projection_migrations
+             WHERE migration_id='g4-08a-bootstrap-v1'",
+            [],
+            |row| row.get(0),
+        )?;
+        if state == "completed" {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT r.run_id,r.revision,r.updated_at_seconds,e.event_id,e.event
+             FROM collaboration_runs r
+             JOIN collaboration_events e
+               ON e.run_id=r.run_id AND e.resulting_run_revision=r.revision
+             ORDER BY r.run_id",
+        )?;
+        let heads = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let run_count: i64 =
+            self.connection
+                .query_row("SELECT count(*) FROM collaboration_runs", [], |row| {
+                    row.get(0)
+                })?;
+        if heads.len() != run_count as usize {
+            return Err(StoreError::IntegrityFailure);
+        }
+        let mut candidates = Vec::with_capacity(heads.len());
+        for (run_id, revision, created_at_seconds, source_event_id, event) in heads {
+            let snapshots = self
+                .snapshot_blobs(&run_id)?
+                .ok_or(StoreError::IntegrityFailure)?;
+            candidates.push(ProjectionBootstrapCandidate {
+                run_id,
+                source_event_id,
+                source_revision: revision,
+                event,
+                snapshots,
+                created_at_seconds,
+            });
+        }
+        Ok(candidates)
+    }
+
+    pub fn complete_projection_bootstrap(
+        &mut self,
+        writes: &[ProjectionBootstrapWrite],
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: String = transaction.query_row(
+            "SELECT state FROM collaboration_projection_migrations
+             WHERE migration_id='g4-08a-bootstrap-v1'",
+            [],
+            |row| row.get(0),
+        )?;
+        if state == "completed" {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let run_count: i64 =
+            transaction.query_row("SELECT count(*) FROM collaboration_runs", [], |row| {
+                row.get(0)
+            })?;
+        if writes.len() != run_count as usize {
+            return Err(StoreError::IntegrityFailure);
+        }
+        for write in writes {
+            let current: Option<(String, i64)> = transaction
+                .query_row(
+                    "SELECT e.event_id,r.revision
+                     FROM collaboration_runs r
+                     JOIN collaboration_events e
+                       ON e.run_id=r.run_id AND e.resulting_run_revision=r.revision
+                     WHERE r.run_id=?1",
+                    [&write.run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if current != Some((write.source_event_id.clone(), write.source_revision as i64)) {
+                return Err(StoreError::IntegrityFailure);
+            }
+            transaction.execute(
+                "INSERT OR IGNORE INTO collaboration_outbox(
+                   message_id,source_event_id,source_revision,attempt_id,destination_domain,
+                   payload_kind,canonical_payload_digest_sha256,payload,delivery_state,
+                   created_at_seconds
+                 ) VALUES(?1,?2,?3,NULL,'local-read-model',
+                          'collaboration-bootstrap-snapshot-v1',?4,?5,'consumed',?6)",
+                params![
+                    write.message_id,
+                    write.source_event_id,
+                    write.source_revision as i64,
+                    write.canonical_payload_digest_sha256,
+                    write.payload,
+                    write.created_at_seconds
+                ],
+            )?;
+            let persisted: Option<(String, i64, String, Vec<u8>, String)> = transaction
+                .query_row(
+                    "SELECT message_id,source_revision,canonical_payload_digest_sha256,
+                            payload,delivery_state
+                     FROM collaboration_outbox
+                     WHERE source_event_id=?1
+                       AND destination_domain='local-read-model'
+                       AND payload_kind='collaboration-bootstrap-snapshot-v1'",
+                    [&write.source_event_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if persisted
+                != Some((
+                    write.message_id.clone(),
+                    write.source_revision as i64,
+                    write.canonical_payload_digest_sha256.clone(),
+                    write.payload.clone(),
+                    "consumed".to_owned(),
+                ))
+            {
+                return Err(StoreError::IntegrityFailure);
+            }
+        }
+        transaction.execute(
+            "UPDATE collaboration_projection_migrations
+             SET state='completed',completed_at_seconds=(unixepoch())
+             WHERE migration_id='g4-08a-bootstrap-v1' AND state='pending'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn idempotency_record(
@@ -649,6 +859,104 @@ impl CollaborationStore {
             .map_err(StoreError::from)
     }
 
+    pub fn pending_projection_messages(&self) -> Result<Vec<PendingProjectionRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT message_id,source_event_id,source_revision,
+                    canonical_payload_digest_sha256,payload
+             FROM collaboration_outbox
+             WHERE destination_domain='local-read-model'
+               AND payload_kind='collaboration-snapshot-v1'
+               AND delivery_state='pending'
+             ORDER BY rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(PendingProjectionRecord {
+                message_id: row.get(0)?,
+                source_event_id: row.get(1)?,
+                source_revision: row.get::<_, i64>(2)? as u64,
+                canonical_payload_digest_sha256: row.get(3)?,
+                payload: row.get(4)?,
+                rebuild_baseline: false,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn retained_projection_messages(&self) -> Result<Vec<PendingProjectionRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT o.message_id,o.source_event_id,o.source_revision,
+                    o.canonical_payload_digest_sha256,o.payload,o.payload_kind
+             FROM collaboration_outbox o
+             JOIN collaboration_events oe ON oe.event_id=o.source_event_id
+             LEFT JOIN (
+               SELECT be.run_id,MAX(b.source_revision) AS baseline_revision
+               FROM collaboration_outbox b
+               JOIN collaboration_events be ON be.event_id=b.source_event_id
+               WHERE b.destination_domain='local-read-model'
+                 AND b.payload_kind='collaboration-bootstrap-snapshot-v1'
+               GROUP BY be.run_id
+             ) baseline ON baseline.run_id=oe.run_id
+             WHERE o.destination_domain='local-read-model'
+               AND o.delivery_state IN ('pending','consumed')
+               AND (
+                 o.payload_kind='collaboration-bootstrap-snapshot-v1'
+                 OR (
+                   o.payload_kind='collaboration-snapshot-v1'
+                   AND (baseline.baseline_revision IS NULL
+                        OR o.source_revision>baseline.baseline_revision)
+                 )
+               )
+             ORDER BY oe.run_id,o.source_revision,o.rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let payload_kind: String = row.get(5)?;
+            Ok(PendingProjectionRecord {
+                message_id: row.get(0)?,
+                source_event_id: row.get(1)?,
+                source_revision: row.get::<_, i64>(2)? as u64,
+                canonical_payload_digest_sha256: row.get(3)?,
+                payload: row.get(4)?,
+                rebuild_baseline: payload_kind == "collaboration-bootstrap-snapshot-v1",
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn acknowledge_projection_message(
+        &mut self,
+        message_id: &str,
+        canonical_payload_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE collaboration_outbox
+             SET delivery_state = 'consumed'
+             WHERE message_id = ?1
+               AND destination_domain = 'local-read-model'
+               AND payload_kind = 'collaboration-snapshot-v1'
+               AND canonical_payload_digest_sha256 = ?2
+               AND delivery_state = 'pending'",
+            params![message_id, canonical_payload_digest_sha256],
+        )?;
+        if changed == 1 {
+            return Ok(true);
+        }
+        let replay: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT canonical_payload_digest_sha256, delivery_state
+                 FROM collaboration_outbox
+                 WHERE message_id = ?1
+                   AND destination_domain = 'local-read-model'
+                   AND payload_kind = 'collaboration-snapshot-v1'",
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(
+            matches!(replay, Some((digest, state)) if digest == canonical_payload_digest_sha256 && state == "consumed"),
+        )
+    }
+
     pub fn inspect(&self) -> Result<CollaborationStoreInspection, StoreError> {
         let scalar = |sql: &str| -> Result<u64, StoreError> {
             let value: i64 = self.connection.query_row(sql, [], |row| row.get(0))?;
@@ -684,5 +992,125 @@ impl CollaborationStore {
             .connection
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         Ok(integrity == "ok")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn legacy_v1_store_migrates_without_losing_authority_facts_or_old_outbox() {
+        let root = std::env::temp_dir().join(format!(
+            "egopulse-collaboration-v1-migration-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).expect("create migration root");
+        let path = root.join("collaboration.db");
+        let key = [91_u8; 32];
+        let epoch = "collaboration-v1-epoch";
+        {
+            let mut connection = Connection::open(&path).expect("open legacy store");
+            connection
+                .pragma_update(None, "key", format!("x'{}'", hex::encode(key)))
+                .expect("configure SQLCipher key");
+            Migrations::new(vec![M::up(SCHEMA_V1)])
+                .to_latest(&mut connection)
+                .expect("create v1 schema");
+            let digest = hex::encode(Sha256::digest(SCHEMA_V1.as_bytes()));
+            connection
+                .execute(
+                    "INSERT INTO collaboration_store_metadata(
+                       singleton,store_epoch,schema_profile_id,schema_profile_sha256,
+                       last_committed_revision,last_event_sequence
+                     ) VALUES(1,?1,?2,?3,1,1)",
+                    params![epoch, SCHEMA_PROFILE_ID, digest],
+                )
+                .expect("insert metadata");
+            connection
+                .execute(
+                    "INSERT INTO collaboration_runs(
+                       run_id,revision,task_id,work_revision,status,snapshot,
+                       created_at_seconds,updated_at_seconds
+                     ) VALUES('run-v1',2,'task-v1',1,1,x'01',10,20)",
+                    [],
+                )
+                .expect("insert run fact");
+            connection
+                .execute(
+                    "INSERT INTO collaboration_events(
+                       event_id,command_id,run_id,resulting_run_revision,
+                       request_digest_sha256,event
+                     ) VALUES('event-v1','command-v1','run-v1',2,'digest-v1',x'02')",
+                    [],
+                )
+                .expect("insert event fact");
+            connection
+                .execute(
+                    "INSERT INTO collaboration_outbox(
+                       message_id,source_event_id,source_revision,attempt_id,
+                       destination_domain,payload_kind,canonical_payload_digest_sha256,
+                       payload,delivery_state,created_at_seconds
+                     ) VALUES('outbox-v1','event-v1',2,NULL,'local-read-model',
+                              'collaboration-event','outbox-digest-v1',x'03','pending',20)",
+                    [],
+                )
+                .expect("insert legacy outbox");
+            connection
+                .execute(
+                    "INSERT INTO collaboration_commit_receipts(
+                       event_id,aggregate_id,aggregate_revision,idempotency_key,
+                       request_digest_sha256,store_epoch,
+                       acknowledged_after_durability_barrier,committed_at_seconds
+                     ) VALUES('event-v1','run-v1',2,'key-v1','digest-v1',?1,1,20)",
+                    [epoch],
+                )
+                .expect("insert receipt");
+        }
+
+        let mut store = CollaborationStore::open(&path, &key, epoch).expect("migrate v1 store");
+        let inspection = store.inspect().expect("inspect migrated store");
+        assert_eq!(inspection.run_count, 1);
+        assert_eq!(inspection.event_count, 1);
+        assert_eq!(inspection.outbox_count, 1);
+        assert_eq!(inspection.commit_receipt_count, 1);
+        let old_kind: String = store
+            .connection
+            .query_row(
+                "SELECT payload_kind FROM collaboration_outbox WHERE message_id='outbox-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy outbox preserved");
+        assert_eq!(old_kind, "collaboration-event");
+        let candidates = store
+            .projection_bootstrap_candidates()
+            .expect("bootstrap candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_revision, 2);
+        store
+            .complete_projection_bootstrap(&[ProjectionBootstrapWrite {
+                run_id: "run-v1".to_owned(),
+                source_event_id: "event-v1".to_owned(),
+                source_revision: 2,
+                message_id: "bootstrap-v1".to_owned(),
+                canonical_payload_digest_sha256: "bootstrap-digest-v1".to_owned(),
+                payload: vec![4],
+                created_at_seconds: 20,
+            }])
+            .expect("complete bootstrap atomically");
+        assert_eq!(store.inspect().expect("post bootstrap").outbox_count, 2);
+        drop(store);
+        let store = CollaborationStore::open(&path, &key, epoch).expect("idempotent reopen");
+        assert!(
+            store
+                .projection_bootstrap_candidates()
+                .expect("completed migration")
+                .is_empty()
+        );
+        assert_eq!(store.inspect().expect("reopen inspection").outbox_count, 2);
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 }

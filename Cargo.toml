@@ -9,6 +9,7 @@ members = [
   "crates/cognition-runtime",
   "crates/local-ide-control",
   "crates/local-api",
+  "crates/local-read-model",
   "crates/process-supervision",
   "crates/harness-adapter",
   "crates/codex-adapter",
@@ -52,6 +53,7 @@ egopulse-domain-contracts = { path = "crates/domain-contracts" }
 egopulse-cognition-runtime = { path = "crates/cognition-runtime" }
 egopulse-local-ide-control = { path = "crates/local-ide-control" }
 egopulse-local-api = { path = "crates/local-api" }
+egopulse-local-read-model = { path = "crates/local-read-model" }
 egopulse-process-supervision = { path = "crates/process-supervision" }
 egopulse-harness-adapter = { path = "crates/harness-adapter" }
 egopulse-codex-adapter = { path = "crates/codex-adapter" }

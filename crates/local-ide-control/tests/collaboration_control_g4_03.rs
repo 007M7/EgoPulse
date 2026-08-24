@@ -30,6 +30,7 @@ use egopulse_local_ide_control::collaboration_control::{
     canonical_dispatch_fingerprint, canonical_request_digest,
 };
 use prost_types::Timestamp;
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,8 @@ const STORE_EPOCH: &str = "collaboration-store-g4-03-test";
 const TEST_KEY: [u8; 32] = [0x63; 32];
 const ADAPTER_TEST_KEY: [u8; 32] = [0x64; 32];
 const FIXED_TIME: i64 = 1_777_073_600;
+const MIGRATION_CRASH_PROBE: &str = "EGOPULSE_G4_08A_COLLABORATION_MIGRATION_CRASH_PROBE";
+const MIGRATION_CRASH_DB: &str = "EGOPULSE_G4_08A_COLLABORATION_MIGRATION_CRASH_DB";
 
 #[derive(Clone)]
 struct FixedClock(Arc<Mutex<Timestamp>>);
@@ -2040,6 +2043,47 @@ fn hierarchy_lease_dispatch_and_duplicate_are_one_durable_sequence() {
     assert_eq!(pending[0].envelope.run_revision, 5);
     assert_eq!(pending[0].envelope.step_revision, 4);
     assert_eq!(pending[0].envelope.attempt_revision, 3);
+    let projections = control
+        .pending_projection_messages()
+        .expect("pending typed Collaboration projections");
+    assert_eq!(projections.len(), 5);
+    assert_eq!(
+        projections
+            .last()
+            .and_then(|value| value.snapshot.run.as_ref())
+            .map(|value| value.revision),
+        Some(5)
+    );
+    assert!(
+        control
+            .acknowledge_projection_message(
+                &projections[0].message_id,
+                &projections[0].canonical_payload_digest_sha256,
+            )
+            .expect("ack projection after projector commit")
+    );
+    assert!(
+        control
+            .acknowledge_projection_message(
+                &projections[0].message_id,
+                &projections[0].canonical_payload_digest_sha256,
+            )
+            .expect("idempotent projection ack replay")
+    );
+    assert_eq!(
+        control
+            .pending_projection_messages()
+            .expect("remaining projections")
+            .len(),
+        4
+    );
+    assert_eq!(
+        control
+            .retained_projection_messages_for_rebuild()
+            .expect("acknowledged projections remain rebuildable")
+            .len(),
+        5
+    );
     assert!(matches!(
         control.pending_dispatches(&recovery_worker()),
         Err(CollaborationControlError::DispatchPollNotAuthorized)
@@ -2094,6 +2138,72 @@ fn hierarchy_lease_dispatch_and_duplicate_are_one_durable_sequence() {
         CollaborationErrorCode::IdempotencyConflict
     );
     assert_eq!(control.inspect_store().expect("inspect conflict"), baseline);
+}
+
+#[test]
+fn existing_collaboration_facts_generate_one_deterministic_rebuild_bootstrap() {
+    let isolated = IsolatedStore::new("collaboration-projection-bootstrap");
+    let path = isolated.database_path();
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut control = open_control(&path, clock.clone());
+    let (snapshot, _) = advance_through_dispatch(&mut control);
+    let revision = snapshot.run.as_ref().expect("run").revision;
+    let before = control.inspect_store().expect("before migration");
+    drop(control);
+
+    let connection = Connection::open(&path).expect("open encrypted store");
+    connection
+        .pragma_update(None, "key", format!("x'{}'", hex::encode(TEST_KEY)))
+        .expect("apply SQLCipher key");
+    connection
+        .execute(
+            "UPDATE collaboration_projection_migrations
+             SET state='pending',completed_at_seconds=NULL
+             WHERE migration_id='g4-08a-bootstrap-v1'",
+            [],
+        )
+        .expect("simulate pre-bootstrap migrated store");
+    drop(connection);
+
+    let status = Command::new(std::env::current_exe().expect("current test executable"))
+        .arg("--exact")
+        .arg("projection_migration_crash_probe_child")
+        .arg("--nocapture")
+        .env(MIGRATION_CRASH_PROBE, "1")
+        .env(MIGRATION_CRASH_DB, &path)
+        .status()
+        .expect("launch migration crash probe");
+    assert!(!status.success(), "migration probe must terminate by abort");
+
+    let control = open_control(&path, clock.clone());
+    let after = control.inspect_store().expect("after migration");
+    assert_eq!(after.run_count, before.run_count);
+    assert_eq!(after.event_count, before.event_count);
+    assert_eq!(after.commit_receipt_count, before.commit_receipt_count);
+    assert_eq!(after.outbox_count, before.outbox_count + 1);
+    let retained = control
+        .retained_projection_messages_for_rebuild()
+        .expect("canonical rebuild feed");
+    assert_eq!(retained.len(), 1);
+    assert!(retained[0].rebuild_baseline);
+    assert_eq!(retained[0].source_revision, revision);
+    assert_eq!(
+        retained[0].snapshot.run.as_ref().map(|run| run.revision),
+        Some(revision)
+    );
+    let message_id = retained[0].message_id.clone();
+    drop(control);
+
+    let control = open_control(&path, clock);
+    let reopened = control
+        .retained_projection_messages_for_rebuild()
+        .expect("idempotent reopen");
+    assert_eq!(reopened.len(), 1);
+    assert_eq!(reopened[0].message_id, message_id);
+    assert_eq!(
+        control.inspect_store().expect("reopen counts").outbox_count,
+        after.outbox_count
+    );
 }
 
 #[test]
@@ -2341,5 +2451,21 @@ fn crash_probe_child() {
     let clock = FixedClock::new(FIXED_TIME);
     let mut control = open_control(&path, clock);
     let (_, _) = advance_through_dispatch(&mut control);
+    std::process::abort();
+}
+
+#[test]
+fn projection_migration_crash_probe_child() {
+    if std::env::var(MIGRATION_CRASH_PROBE).as_deref() != Ok("1") {
+        return;
+    }
+    let path =
+        PathBuf::from(std::env::var_os(MIGRATION_CRASH_DB).expect("migration crash database path"));
+    let control = open_control(&path, FixedClock::new(FIXED_TIME));
+    let retained = control
+        .retained_projection_messages_for_rebuild()
+        .expect("bootstrap committed before abort");
+    assert_eq!(retained.len(), 1);
+    assert!(retained[0].rebuild_baseline);
     std::process::abort();
 }

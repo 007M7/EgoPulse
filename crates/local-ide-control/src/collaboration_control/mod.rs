@@ -30,8 +30,8 @@ use zeroize::Zeroize;
 
 pub use store::CollaborationStoreInspection;
 use store::{
-    AttemptWrite, CollaborationCommit, CollaborationStore, OutboxWrite, RunWrite, StepWrite,
-    StoreError,
+    AttemptWrite, CollaborationCommit, CollaborationStore, OutboxWrite, PendingProjectionRecord,
+    ProjectionBootstrapCandidate, ProjectionBootstrapWrite, RunWrite, StepWrite, StoreError,
 };
 
 const AUTHORITY_REF: &str = "agentosd:collaboration-control/v1";
@@ -219,6 +219,17 @@ pub struct PendingDispatch {
     pub envelope: DispatchEnvelope,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingCollaborationProjection {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub canonical_payload_digest_sha256: String,
+    pub rebuild_baseline: bool,
+    pub snapshot: CollaborationSnapshot,
+    pub event: CollaborationEvent,
+}
+
 #[derive(Debug, Error)]
 pub enum CollaborationControlError {
     #[error("collaboration control persistence failed")]
@@ -251,8 +262,14 @@ where
         guard: G,
         clock: C,
     ) -> Result<Self, CollaborationControlError> {
-        let store =
+        let mut store =
             CollaborationStore::open(&config.database_path, &config.key.0, &config.store_epoch)?;
+        let bootstrap_writes = store
+            .projection_bootstrap_candidates()?
+            .into_iter()
+            .map(encode_projection_bootstrap)
+            .collect::<Result<Vec<_>, _>>()?;
+        store.complete_projection_bootstrap(&bootstrap_writes)?;
         Ok(Self {
             store,
             guard,
@@ -431,6 +448,36 @@ where
                 })
             })
             .collect()
+    }
+
+    pub fn pending_projection_messages(
+        &self,
+    ) -> Result<Vec<PendingCollaborationProjection>, CollaborationControlError> {
+        self.store
+            .pending_projection_messages()?
+            .into_iter()
+            .map(decode_projection_record)
+            .collect()
+    }
+
+    pub fn retained_projection_messages_for_rebuild(
+        &self,
+    ) -> Result<Vec<PendingCollaborationProjection>, CollaborationControlError> {
+        self.store
+            .retained_projection_messages()?
+            .into_iter()
+            .map(decode_projection_record)
+            .collect()
+    }
+
+    pub fn acknowledge_projection_message(
+        &mut self,
+        message_id: &str,
+        canonical_payload_digest_sha256: &str,
+    ) -> Result<bool, CollaborationControlError> {
+        self.store
+            .acknowledge_projection_message(message_id, canonical_payload_digest_sha256)
+            .map_err(Into::into)
     }
 
     pub fn inspect_store(&self) -> Result<CollaborationStoreInspection, CollaborationControlError> {
@@ -1629,13 +1676,14 @@ where
             committed_event: Some(event.clone()),
         };
         let event_bytes = event.encode_to_vec();
+        let projection_bytes = result.encode_to_vec();
         let mut outboxes = vec![OutboxWrite {
             message_id: Uuid::now_v7().to_string(),
             attempt_id: None,
             destination_domain: "local-read-model".to_owned(),
-            payload_kind: "collaboration-event".to_owned(),
-            canonical_payload_digest_sha256: sha256_bytes(&event_bytes),
-            payload: event_bytes.clone(),
+            payload_kind: "collaboration-snapshot-v1".to_owned(),
+            canonical_payload_digest_sha256: sha256_bytes(&projection_bytes),
+            payload: projection_bytes,
         }];
         if let Some(envelope) = dispatch_envelope {
             let payload = envelope.encode_to_vec();
@@ -1734,6 +1782,91 @@ where
                 .collect::<Result<Vec<_>, _>>()?,
         }))
     }
+}
+
+fn decode_projection_record(
+    record: PendingProjectionRecord,
+) -> Result<PendingCollaborationProjection, CollaborationControlError> {
+    let result = CollaborationCommandResult::decode(record.payload.as_slice())?;
+    let snapshot = match result.outcome {
+        Some(collaboration_command_result::Outcome::Snapshot(snapshot)) => snapshot,
+        _ => return Err(CollaborationControlError::Persistence),
+    };
+    let event = result
+        .committed_event
+        .ok_or(CollaborationControlError::Persistence)?;
+    if event.event_id != record.source_event_id
+        || event.resulting_run_revision != record.source_revision
+    {
+        return Err(CollaborationControlError::Persistence);
+    }
+    Ok(PendingCollaborationProjection {
+        message_id: record.message_id,
+        source_event_id: record.source_event_id,
+        source_revision: record.source_revision,
+        canonical_payload_digest_sha256: record.canonical_payload_digest_sha256,
+        rebuild_baseline: record.rebuild_baseline,
+        snapshot,
+        event,
+    })
+}
+
+fn encode_projection_bootstrap(
+    candidate: ProjectionBootstrapCandidate,
+) -> Result<ProjectionBootstrapWrite, CollaborationControlError> {
+    let run = RunSnapshot::decode(candidate.snapshots.run.as_slice())?;
+    let steps = candidate
+        .snapshots
+        .steps
+        .iter()
+        .map(|value| StepSnapshot::decode(value.as_slice()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let attempts = candidate
+        .snapshots
+        .attempts
+        .iter()
+        .map(|value| AttemptSnapshot::decode(value.as_slice()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let event = CollaborationEvent::decode(candidate.event.as_slice())?;
+    if run.run_id != candidate.run_id
+        || run.revision != candidate.source_revision
+        || event.event_id != candidate.source_event_id
+        || event.resulting_run_revision != candidate.source_revision
+        || steps.iter().any(|step| step.run_id != candidate.run_id)
+        || attempts
+            .iter()
+            .any(|attempt| attempt.run_id != candidate.run_id)
+    {
+        return Err(CollaborationControlError::Persistence);
+    }
+    let result = CollaborationCommandResult {
+        replayed: false,
+        outcome: Some(collaboration_command_result::Outcome::Snapshot(
+            CollaborationSnapshot {
+                run: Some(run),
+                steps,
+                attempts,
+            },
+        )),
+        committed_event: Some(event),
+    };
+    let payload = result.encode_to_vec();
+    let identity = sha256_bytes(
+        format!(
+            "g4-08a|collaboration|{}|{}|{}",
+            candidate.run_id, candidate.source_revision, candidate.source_event_id
+        )
+        .as_bytes(),
+    );
+    Ok(ProjectionBootstrapWrite {
+        run_id: candidate.run_id,
+        source_event_id: candidate.source_event_id,
+        source_revision: candidate.source_revision,
+        message_id: format!("collaboration-bootstrap-v1-{identity}"),
+        canonical_payload_digest_sha256: sha256_bytes(&payload),
+        payload,
+        created_at_seconds: candidate.created_at_seconds,
+    })
 }
 
 #[must_use]

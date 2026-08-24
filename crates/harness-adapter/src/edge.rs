@@ -93,6 +93,19 @@ CREATE TABLE adapter_approvals (
 ) STRICT;
 "#;
 
+const SCHEMA_V2: &str = r#"
+CREATE TABLE adapter_projection_outbox (
+  message_id TEXT PRIMARY KEY,
+  source_observation_id TEXT NOT NULL UNIQUE,
+  source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+  payload_digest_sha256 TEXT NOT NULL,
+  payload BLOB NOT NULL,
+  delivery_state TEXT NOT NULL CHECK (delivery_state IN ('pending', 'consumed', 'held')),
+  created_at_seconds INTEGER NOT NULL,
+  FOREIGN KEY (source_observation_id) REFERENCES adapter_observations(observation_id)
+) STRICT;
+"#;
+
 pub struct AdapterEdgeKey([u8; 32]);
 
 impl AdapterEdgeKey {
@@ -174,6 +187,20 @@ pub struct AdapterObservationEvidence {
     pub raw_event: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdapterApprovalProjection {
+    pub message_id: String,
+    pub source_observation_id: String,
+    pub source_revision: u64,
+    pub payload_digest_sha256: String,
+    pub run_id: String,
+    pub step_id: String,
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub fencing_token: u64,
+    pub observation: HarnessObservation,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdapterEdgeInspection {
     pub dispatch_count: u64,
@@ -183,6 +210,8 @@ pub struct AdapterEdgeInspection {
     pub quarantine_count: u64,
     pub cancellation_count: u64,
     pub approval_count: u64,
+    pub projection_outbox_count: u64,
+    pub pending_projection_count: u64,
     pub next_observation_sequence: u64,
 }
 
@@ -211,9 +240,16 @@ impl AdapterEdge {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "secure_delete", "ON")?;
-        Migrations::new(vec![M::up(SCHEMA_V1)]).to_latest(&mut connection)?;
+        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)]).to_latest(&mut connection)?;
 
-        let schema_digest = sha256(SCHEMA_V1.as_bytes());
+        backfill_approval_projection_outbox(&mut connection)?;
+        let schema_digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes());
+        let prior_schema_digest = sha256(SCHEMA_V1.as_bytes());
+        connection.execute(
+            "UPDATE adapter_edge_metadata SET schema_profile_sha256 = ?1
+             WHERE singleton = 1 AND schema_profile_id = ?2 AND schema_profile_sha256 = ?3",
+            params![schema_digest, SCHEMA_PROFILE_ID, prior_schema_digest],
+        )?;
         connection.execute(
             "INSERT OR IGNORE INTO adapter_edge_metadata(
                singleton, adapter_id, store_epoch, schema_profile_id,
@@ -428,6 +464,13 @@ impl AdapterEdge {
         observation.native_event_digest_sha256 = digest.clone();
         observation.raw_evidence_ref = raw_evidence_ref.clone();
         let encoded = observation.encode_to_vec();
+        let is_approval = matches!(
+            observation.payload.as_ref(),
+            Some(harness_observation::Payload::ApprovalRequest(_))
+        );
+        let approval_projection = is_approval
+            .then(|| sanitized_approval_projection(&observation))
+            .transpose()?;
         transaction.execute(
             "INSERT INTO adapter_observations(
                observation_id, dispatch_id, attempt_id, fencing_token,
@@ -449,6 +492,25 @@ impl AdapterEdge {
                 now_seconds
             ],
         )?;
+        if is_approval {
+            let projection_payload = approval_projection
+                .as_ref()
+                .expect("approval projection created after typed match");
+            transaction.execute(
+                "INSERT INTO adapter_projection_outbox(
+                   message_id, source_observation_id, source_revision,
+                   payload_digest_sha256, payload, delivery_state, created_at_seconds
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+                params![
+                    format!("adapter-projection-{observation_id}"),
+                    observation_id,
+                    sequence,
+                    sha256(projection_payload),
+                    projection_payload,
+                    now_seconds
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(ObservationAppend::Committed(observation))
     }
@@ -484,6 +546,120 @@ impl AdapterEdge {
             .into_iter()
             .map(|record| HarnessObservation::decode(record.as_slice()).map_err(Into::into))
             .collect()
+    }
+
+    pub fn pending_approval_projection_messages(
+        &self,
+    ) -> Result<Vec<PendingAdapterApprovalProjection>, AdapterEdgeError> {
+        self.approval_projection_messages(false)
+    }
+
+    pub fn retained_approval_projection_messages_for_rebuild(
+        &self,
+    ) -> Result<Vec<PendingAdapterApprovalProjection>, AdapterEdgeError> {
+        self.approval_projection_messages(true)
+    }
+
+    fn approval_projection_messages(
+        &self,
+        include_consumed: bool,
+    ) -> Result<Vec<PendingAdapterApprovalProjection>, AdapterEdgeError> {
+        let state_filter = if include_consumed {
+            "o.delivery_state IN ('pending','consumed')"
+        } else {
+            "o.delivery_state = 'pending'"
+        };
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT o.message_id, o.source_observation_id, o.source_revision,
+                    o.payload_digest_sha256, o.payload, d.envelope
+             FROM adapter_projection_outbox o
+             JOIN adapter_observations a ON a.observation_id = o.source_observation_id
+             JOIN adapter_dispatches d ON d.dispatch_id = a.dispatch_id
+             WHERE {state_filter}
+             ORDER BY o.source_revision"
+        ))?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                message_id,
+                source_observation_id,
+                source_revision,
+                digest,
+                payload,
+                envelope_payload,
+            ) = row?;
+            let observation = HarnessObservation::decode(payload.as_slice())?;
+            let envelope = DispatchEnvelope::decode(envelope_payload.as_slice())?;
+            if observation.observation_id != source_observation_id
+                || observation.observation_sequence != source_revision as u64
+                || observation.attempt_id != envelope.attempt_id
+                || observation.dispatch_id != envelope.dispatch_id
+                || observation.fencing_token != envelope.fencing_token
+                || !matches!(
+                    observation.payload.as_ref(),
+                    Some(harness_observation::Payload::ApprovalRequest(_))
+                )
+                || observation.payload.as_ref().is_some_and(|payload| {
+                    matches!(
+                        payload,
+                        harness_observation::Payload::ApprovalRequest(request)
+                            if !request.native_routing_ref.is_empty()
+                    )
+                })
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+            Ok(PendingAdapterApprovalProjection {
+                message_id,
+                source_observation_id,
+                source_revision: source_revision as u64,
+                payload_digest_sha256: digest,
+                run_id: envelope.run_id,
+                step_id: envelope.step_id,
+                attempt_id: envelope.attempt_id,
+                dispatch_id: envelope.dispatch_id,
+                fencing_token: envelope.fencing_token,
+                observation,
+            })
+        })
+        .collect()
+    }
+
+    pub fn acknowledge_approval_projection_message(
+        &mut self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, AdapterEdgeError> {
+        let changed = self.connection.execute(
+            "UPDATE adapter_projection_outbox SET delivery_state = 'consumed'
+             WHERE message_id = ?1 AND payload_digest_sha256 = ?2
+               AND delivery_state = 'pending'",
+            params![message_id, payload_digest_sha256],
+        )?;
+        if changed == 1 {
+            return Ok(true);
+        }
+        let replay: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT payload_digest_sha256, delivery_state
+                 FROM adapter_projection_outbox WHERE message_id = ?1",
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(
+            matches!(replay, Some((digest, state)) if digest == payload_digest_sha256 && state == "consumed"),
+        )
     }
 
     pub fn resolve_native_execution_binding(
@@ -852,6 +1028,10 @@ impl AdapterEdge {
             quarantine_count: scalar("SELECT count(*) FROM adapter_quarantine")?,
             cancellation_count: scalar("SELECT count(*) FROM adapter_cancellations")?,
             approval_count: scalar("SELECT count(*) FROM adapter_approvals")?,
+            projection_outbox_count: scalar("SELECT count(*) FROM adapter_projection_outbox")?,
+            pending_projection_count: scalar(
+                "SELECT count(*) FROM adapter_projection_outbox WHERE delivery_state = 'pending'",
+            )?,
             next_observation_sequence: next as u64,
         })
     }
@@ -862,6 +1042,65 @@ impl AdapterEdge {
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         Ok(integrity == "ok")
     }
+}
+
+fn backfill_approval_projection_outbox(
+    connection: &mut Connection,
+) -> Result<(), AdapterEdgeError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let records = {
+        let mut statement = transaction.prepare(
+            "SELECT observation_id, observation_sequence, observation, created_at_seconds
+             FROM adapter_observations ORDER BY observation_sequence",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (observation_id, sequence, payload, created_at) in records {
+        let observation = HarnessObservation::decode(payload.as_slice())?;
+        if matches!(
+            observation.payload.as_ref(),
+            Some(harness_observation::Payload::ApprovalRequest(_))
+        ) {
+            let projection_payload = sanitized_approval_projection(&observation)?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO adapter_projection_outbox(
+                   message_id, source_observation_id, source_revision,
+                   payload_digest_sha256, payload, delivery_state, created_at_seconds
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+                params![
+                    format!("adapter-projection-{observation_id}"),
+                    observation_id,
+                    sequence,
+                    sha256(&projection_payload),
+                    projection_payload,
+                    created_at
+                ],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn sanitized_approval_projection(
+    observation: &HarnessObservation,
+) -> Result<Vec<u8>, AdapterEdgeError> {
+    let mut projection = observation.clone();
+    let request = match projection.payload.as_mut() {
+        Some(harness_observation::Payload::ApprovalRequest(request)) => request,
+        _ => return Err(AdapterEdgeError::IntegrityFailure),
+    };
+    request.native_routing_ref.clear();
+    Ok(projection.encode_to_vec())
 }
 
 fn prepare_durable_write(
@@ -965,6 +1204,7 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use egopulse_domain_contracts::v01::egopulse::harness::v1::{
+        ApprovalKind, ApprovalRequestLifecycleKind, ApprovalRequestObservation,
         DiagnosticObservation, HarnessObservation, ObservationCriticality, harness_observation,
     };
     use std::path::Path;
@@ -1043,6 +1283,28 @@ mod tests {
                     safe_diagnostic_code: "TEST_EVENT".to_owned(),
                     error_fingerprint: None,
                     recovery_required: false,
+                },
+            )),
+            ..HarnessObservation::default()
+        }
+    }
+
+    fn approval_observation() -> HarnessObservation {
+        HarnessObservation {
+            attempt_id: "attempt-001".to_owned(),
+            dispatch_id: "dispatch-001".to_owned(),
+            fencing_token: 1,
+            criticality: ObservationCriticality::Control as i32,
+            payload: Some(harness_observation::Payload::ApprovalRequest(
+                ApprovalRequestObservation {
+                    approval_request_id: "approval-request-001".to_owned(),
+                    kind: ApprovalKind::Command as i32,
+                    action_digest_sha256: "8".repeat(64),
+                    requested_scope_ref: "safe://scope/001".to_owned(),
+                    display_summary_ref: "safe://summary/001".to_owned(),
+                    native_routing_ref: "adapter-private://route/001".to_owned(),
+                    lifecycle: ApprovalRequestLifecycleKind::Open as i32,
+                    request_revision: 1,
                 },
             )),
             ..HarnessObservation::default()
@@ -1185,6 +1447,86 @@ mod tests {
                 .inspect()
                 .expect("inspect recovered edge")
                 .dispatch_count,
+            1
+        );
+    }
+
+    #[test]
+    fn approval_projection_outbox_is_typed_durable_and_acknowledged_idempotently() {
+        let isolated = IsolatedEdge::new("adapter-approval-projection");
+        let mut envelope = dispatch();
+        envelope.run_id = "run-001".to_owned();
+        envelope.step_id = "step-001".to_owned();
+        let mut edge = open_edge(&isolated.path());
+        edge.prepare_dispatch(&envelope, 10)
+            .expect("prepare projection dispatch");
+        let appended = edge
+            .append_observation(
+                "dispatch-001",
+                "native-approval-001",
+                b"approval-raw",
+                approval_observation(),
+                11,
+            )
+            .expect("append approval observation");
+        let ObservationAppend::Committed(observation) = appended else {
+            panic!("expected committed approval observation");
+        };
+        let pending = edge
+            .pending_approval_projection_messages()
+            .expect("pending approval projection");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source_observation_id, observation.observation_id);
+        assert_eq!(pending[0].run_id, "run-001");
+        assert_eq!(pending[0].step_id, "step-001");
+        assert_eq!(pending[0].attempt_id, "attempt-001");
+        assert_eq!(pending[0].dispatch_id, "dispatch-001");
+        assert_eq!(pending[0].fencing_token, 1);
+        let projected_request = match pending[0].observation.payload.as_ref() {
+            Some(harness_observation::Payload::ApprovalRequest(request)) => request,
+            _ => panic!("typed approval projection"),
+        };
+        assert!(projected_request.native_routing_ref.is_empty());
+        assert_eq!(edge.inspect().expect("inspect").projection_outbox_count, 1);
+        assert!(
+            edge.acknowledge_approval_projection_message(
+                &pending[0].message_id,
+                &pending[0].payload_digest_sha256,
+            )
+            .expect("ack projection")
+        );
+        assert!(
+            edge.acknowledge_approval_projection_message(
+                &pending[0].message_id,
+                &pending[0].payload_digest_sha256,
+            )
+            .expect("idempotent projection ack")
+        );
+        assert!(
+            edge.pending_approval_projection_messages()
+                .expect("projection drained")
+                .is_empty()
+        );
+        assert_eq!(
+            edge.retained_approval_projection_messages_for_rebuild()
+                .expect("acknowledged projection remains rebuildable")
+                .len(),
+            1
+        );
+        drop(edge);
+        let recovered = open_edge(&isolated.path());
+        assert_eq!(
+            recovered
+                .inspect()
+                .expect("inspect recovered projection")
+                .pending_projection_count,
+            0
+        );
+        assert_eq!(
+            recovered
+                .retained_approval_projection_messages_for_rebuild()
+                .expect("recovered retained projection")
+                .len(),
             1
         );
     }

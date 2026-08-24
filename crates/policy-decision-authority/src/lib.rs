@@ -29,13 +29,26 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use store::{ConsumeCommit, IssueCommit, PolicyStore, StateCommit, StoreError};
+use store::{
+    ConsumeCommit, IssueCommit, PolicyStore, ProjectionBootstrapCandidate,
+    ProjectionBootstrapWrite, StateCommit, StoreError,
+};
 pub use store::{PendingPolicyOutbox, PolicyStoreInspection};
 
 const ISSUE_OPERATION: &str = "issue_harness_approval_decision";
 const CONSUME_OPERATION: &str = "consume_harness_approval_decision";
 const REVOKE_OPERATION: &str = "revoke_harness_approval_decision";
 const EXPIRE_OPERATION: &str = "expire_harness_approval_decision";
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingPolicyProjection {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub source_revision: u64,
+    pub payload_digest_sha256: String,
+    pub rebuild_baseline: bool,
+    pub result: PolicyDecisionCommandResult,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyPrincipalKind {
@@ -183,12 +196,19 @@ impl<C: PolicyClock> PolicyDecisionAuthority<C> {
         if config.store_epoch.trim().is_empty() {
             return Err(PolicyAuthorityFailure::Storage);
         }
+        let mut store = PolicyStore::open(
+            &config.database_path,
+            config.key.expose(),
+            &config.store_epoch,
+        )?;
+        let bootstrap_writes = store
+            .projection_bootstrap_candidates()?
+            .into_iter()
+            .map(encode_projection_bootstrap)
+            .collect::<Result<Vec<_>, _>>()?;
+        store.complete_projection_bootstrap(&bootstrap_writes)?;
         Ok(Self {
-            store: PolicyStore::open(
-                &config.database_path,
-                config.key.expose(),
-                &config.store_epoch,
-            )?,
+            store,
             resolver: Box::new(resolver),
             clock,
         })
@@ -297,6 +317,36 @@ impl<C: PolicyClock> PolicyDecisionAuthority<C> {
     pub fn pending_outbox(&self) -> Result<Vec<PendingPolicyOutbox>, PolicyAuthorityFailure> {
         self.store
             .pending_outbox()
+            .map_err(PolicyAuthorityFailure::from)
+    }
+
+    pub fn pending_projection_messages(
+        &self,
+    ) -> Result<Vec<PendingPolicyProjection>, PolicyAuthorityFailure> {
+        self.store
+            .pending_projection_outbox()?
+            .into_iter()
+            .map(decode_projection_outbox)
+            .collect()
+    }
+
+    pub fn retained_projection_messages_for_rebuild(
+        &self,
+    ) -> Result<Vec<PendingPolicyProjection>, PolicyAuthorityFailure> {
+        self.store
+            .retained_projection_outbox()?
+            .into_iter()
+            .map(decode_projection_outbox)
+            .collect()
+    }
+
+    pub fn acknowledge_projection_message(
+        &mut self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, PolicyAuthorityFailure> {
+        self.store
+            .acknowledge_projection_outbox(message_id, payload_digest_sha256)
             .map_err(PolicyAuthorityFailure::from)
     }
 
@@ -412,6 +462,8 @@ impl<C: PolicyClock> PolicyDecisionAuthority<C> {
         let envelope = approval_envelope(&record, meta, now);
         let event_bytes = event.encode_to_vec();
         let envelope_bytes = envelope.encode_to_vec();
+        let result_bytes = result.encode_to_vec();
+        let projection_bytes = sanitized_read_model_projection(&result).encode_to_vec();
         let changed = self.store.issue(&IssueCommit {
             decision_ref: &decision_ref,
             approval_request_id: &command.approval_request_id,
@@ -427,12 +479,13 @@ impl<C: PolicyClock> PolicyDecisionAuthority<C> {
             operation: ISSUE_OPERATION,
             idempotency_scope: &meta.idempotency_scope,
             idempotency_key: &meta.idempotency_key,
-            result: &result.encode_to_vec(),
+            result: &result_bytes,
             adapter_outbox_id: &format!("policy-outbox-adapter-{}", Uuid::now_v7()),
             adapter_payload_digest: &sha256(&envelope_bytes),
             adapter_payload: &envelope_bytes,
             read_outbox_id: &format!("policy-outbox-read-{}", Uuid::now_v7()),
-            read_payload_digest: &sha256(&event_bytes),
+            read_payload_digest: &sha256(&projection_bytes),
+            read_payload: &projection_bytes,
             committed_at: now.seconds,
         })?;
         if !changed {
@@ -548,6 +601,8 @@ impl<C: PolicyClock> PolicyDecisionAuthority<C> {
             safe_error_fingerprint: None,
         };
         let event_bytes = event.encode_to_vec();
+        let result_bytes = result.encode_to_vec();
+        let projection_bytes = sanitized_read_model_projection(&result).encode_to_vec();
         let changed = self.store.consume(&ConsumeCommit {
             decision_ref: &command.authority_decision_ref,
             expected_revision: current.revision,
@@ -564,9 +619,10 @@ impl<C: PolicyClock> PolicyDecisionAuthority<C> {
             operation: CONSUME_OPERATION,
             idempotency_scope: &meta.idempotency_scope,
             idempotency_key: &meta.idempotency_key,
-            result: &result.encode_to_vec(),
+            result: &result_bytes,
             outbox_id: &format!("policy-outbox-read-{}", Uuid::now_v7()),
-            outbox_digest: &sha256(&event_bytes),
+            outbox_digest: &sha256(&projection_bytes),
+            outbox_payload: &projection_bytes,
             committed_at: now.seconds,
         })?;
         if !changed {
@@ -725,6 +781,8 @@ impl<C: PolicyClock> PolicyDecisionAuthority<C> {
             safe_error_fingerprint: None,
         };
         let event_bytes = event.encode_to_vec();
+        let result_bytes = result.encode_to_vec();
+        let projection_bytes = sanitized_read_model_projection(&result).encode_to_vec();
         let changed = self.store.transition(&StateCommit {
             decision_ref,
             expected_revision: current.revision,
@@ -738,9 +796,10 @@ impl<C: PolicyClock> PolicyDecisionAuthority<C> {
             operation,
             idempotency_scope: &meta.idempotency_scope,
             idempotency_key: &meta.idempotency_key,
-            result: &result.encode_to_vec(),
+            result: &result_bytes,
             outbox_id: &format!("policy-outbox-read-{}", Uuid::now_v7()),
-            outbox_digest: &sha256(&event_bytes),
+            outbox_digest: &sha256(&projection_bytes),
+            outbox_payload: &projection_bytes,
             committed_at: now.seconds,
         })?;
         if !changed {
@@ -999,6 +1058,115 @@ fn normalize_evidence(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values.dedup();
     values
+}
+
+fn sanitized_read_model_projection(
+    result: &PolicyDecisionCommandResult,
+) -> PolicyDecisionCommandResult {
+    let mut projection = result.clone();
+    if let Some(request) = projection
+        .decision_record
+        .as_mut()
+        .and_then(|record| record.request.as_mut())
+    {
+        request.native_routing_ref.clear();
+    }
+    projection
+}
+
+fn decode_projection_outbox(
+    outbox: PendingPolicyOutbox,
+) -> Result<PendingPolicyProjection, PolicyAuthorityFailure> {
+    if outbox.payload_digest_sha256 != sha256(&outbox.payload) {
+        return Err(PolicyAuthorityFailure::Storage);
+    }
+    let result = PolicyDecisionCommandResult::decode(outbox.payload.as_slice())?;
+    let record = result
+        .decision_record
+        .as_ref()
+        .ok_or(PolicyAuthorityFailure::Storage)?;
+    let state = result
+        .state
+        .as_ref()
+        .ok_or(PolicyAuthorityFailure::Storage)?;
+    let event = result
+        .event
+        .as_ref()
+        .ok_or(PolicyAuthorityFailure::Storage)?;
+    let request = record
+        .request
+        .as_ref()
+        .ok_or(PolicyAuthorityFailure::Storage)?;
+    if !result.committed
+        || event.event_id != outbox.source_event_id
+        || event.resulting_state_revision != outbox.source_revision
+        || state.revision != outbox.source_revision
+        || state.authority_decision_ref != record.authority_decision_ref
+        || event.authority_decision_ref != record.authority_decision_ref
+        || !request.native_routing_ref.is_empty()
+    {
+        return Err(PolicyAuthorityFailure::Storage);
+    }
+    Ok(PendingPolicyProjection {
+        message_id: outbox.message_id,
+        source_event_id: outbox.source_event_id,
+        source_revision: outbox.source_revision,
+        payload_digest_sha256: outbox.payload_digest_sha256,
+        rebuild_baseline: outbox.rebuild_baseline,
+        result,
+    })
+}
+
+fn encode_projection_bootstrap(
+    candidate: ProjectionBootstrapCandidate,
+) -> Result<ProjectionBootstrapWrite, PolicyAuthorityFailure> {
+    let record = HarnessApprovalDecisionRecord::decode(candidate.decision_record.as_slice())?;
+    let state = HarnessApprovalDecisionState::decode(candidate.state.as_slice())?;
+    let event = PolicyDecisionEvent::decode(candidate.event.as_slice())?;
+    let consumption_receipt = candidate
+        .consumption_receipt
+        .as_deref()
+        .map(HarnessApprovalConsumptionReceipt::decode)
+        .transpose()?;
+    if record.authority_decision_ref != candidate.decision_ref
+        || state.authority_decision_ref != candidate.decision_ref
+        || state.revision != candidate.source_revision
+        || event.authority_decision_ref != candidate.decision_ref
+        || event.event_id != candidate.source_event_id
+        || event.resulting_state_revision != candidate.source_revision
+        || consumption_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.authority_decision_ref != candidate.decision_ref)
+    {
+        return Err(PolicyAuthorityFailure::Storage);
+    }
+    let result = sanitized_read_model_projection(&PolicyDecisionCommandResult {
+        committed: true,
+        replayed: false,
+        decision_record: Some(record),
+        state: Some(state),
+        consumption_receipt,
+        event: Some(event),
+        error_code: PolicyDecisionErrorCode::Unspecified as i32,
+        safe_error_fingerprint: None,
+    });
+    let payload = result.encode_to_vec();
+    let identity = sha256(
+        format!(
+            "g4-08a|policy|{}|{}|{}",
+            candidate.decision_ref, candidate.source_revision, candidate.source_event_id
+        )
+        .as_bytes(),
+    );
+    Ok(ProjectionBootstrapWrite {
+        decision_ref: candidate.decision_ref,
+        source_event_id: candidate.source_event_id,
+        source_revision: candidate.source_revision,
+        message_id: format!("policy-bootstrap-v1-{identity}"),
+        payload_digest_sha256: sha256(&payload),
+        payload,
+        created_at_seconds: candidate.created_at_seconds,
+    })
 }
 
 fn sha256(bytes: &[u8]) -> String {
