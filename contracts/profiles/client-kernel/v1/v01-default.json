@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "egopulse.client-kernel-profile/v0.1",
+  "contractId": "egopulse.client-kernel.v1",
+  "contractVersion": "0.1.0",
+  "authorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
+  "localApiCompatibility": {
+    "contractId": "egopulse.localapi.v1",
+    "minimumVersion": "0.1.0-draft.13",
+    "maximumVersionExclusive": "0.2.0",
+    "runtimeReferenceRequired": true
+  },
+  "implementationBoundary": {
+    "sharedKernelLanguage": "rust",
+    "surfaces": ["cli", "tui", "desktop_tauri_backend"],
+    "typescriptBusinessKernelAllowed": false,
+    "transport": "tonic_grpc_http2_semantics_over_named_pipe_or_uds_no_tcp"
+  },
+  "capabilities": [
+    "session_negotiation",
+    "query",
+    "list",
+    "watch_complete_snapshots",
+    "await_projection",
+    "typed_command",
+    "stable_cursor",
+    "reset_and_refetch",
+    "read_your_write",
+    "typed_error",
+    "frame_deduplication"
+  ],
+  "invariants": {
+    "surfaceNeutral": true,
+    "completeSnapshotStreams": true,
+    "orderedWithinEpoch": true,
+    "atLeastOnceDelivery": true,
+    "unknownFrameFailClosed": true,
+    "gapRequiresReset": true,
+    "authorityResultPreserved": true,
+    "clientNeverBecomesAuthority": true
+  }
+}

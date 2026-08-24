@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://egopulse.local/contracts/authorization-capability-profile/v0.1",
+  "title": "EgoPulse Local API Authorization Capability Profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "contractId", "contractVersion", "authorityRef", "localApiContractId", "defaults", "permissions", "rpcRules", "commandRules"],
+  "properties": {
+    "schemaVersion": { "const": "egopulse.authorization-capability-profile/v0.1" },
+    "contractId": { "const": "egopulse.authorization.v1" },
+    "contractVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "authorityRef": { "type": "string", "minLength": 1 },
+    "localApiContractId": { "const": "egopulse.localapi.v1" },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unknownPermission", "unknownRpc", "unknownCommandOneof", "surfaceNeutral", "sessionGrantIsFinalAuthorization", "owningAuthorityRevalidationRequired"],
+      "properties": {
+        "unknownPermission": { "const": "fail_closed" },
+        "unknownRpc": { "const": "fail_closed" },
+        "unknownCommandOneof": { "const": "fail_closed" },
+        "surfaceNeutral": { "const": true },
+        "sessionGrantIsFinalAuthorization": { "const": false },
+        "owningAuthorityRevalidationRequired": { "const": true }
+      }
+    },
+    "permissions": {
+      "type": "array",
+      "minItems": 9,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "kind", "description"],
+        "properties": {
+          "code": { "type": "string", "pattern": "^local\\.[a-z0-9.-]+$" },
+          "kind": { "enum": ["read", "write"] },
+          "description": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "rpcRules": {
+      "type": "array",
+      "minItems": 13,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rpc", "access", "requiredPermissionCodes"],
+        "properties": {
+          "rpc": { "type": "string", "minLength": 1 },
+          "access": { "enum": ["authenticated_peer_bootstrap", "granted_permission", "per_command_oneof"] },
+          "requiredPermissionCodes": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+          "tokenScopeEnforced": { "type": "boolean" }
+        }
+      }
+    },
+    "commandRules": {
+      "type": "array",
+      "minItems": 18,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rpc", "oneof", "access", "requiredPermissionCodes", "confirmationClass", "writeOwner", "requiredAuthorityPrincipalKinds"],
+        "properties": {
+          "rpc": { "type": "string", "minLength": 1 },
+          "oneof": { "type": "string", "minLength": 1 },
+          "access": { "enum": ["user", "system_only"] },
+          "requiredPermissionCodes": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+          "confirmationClass": { "enum": ["none", "authority_contract"] },
+          "writeOwner": { "enum": ["TaskAuthority", "PolicyDecisionAuthority", "FounderVerdictAuthority"] },
+          "requiredAuthorityPrincipalKinds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+        }
+      }
+    }
+  }
+}

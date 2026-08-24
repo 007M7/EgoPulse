@@ -9,9 +9,10 @@
   "gate3AuthorityRef": "conversation:2026-08-23:founder-v01-gate3-pass",
   "gate4DriAuthorityRef": "conversation:2026-08-23:founder-v01-gate4-dri-confirmation",
   "implementationSsotAfterVerifiedImport": true,
-  "currentContractVersion": "0.1.0-draft.13",
+  "currentContractVersion": "0.1.0-draft.14",
   "targetedRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3",
   "approvalReadModelRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a",
-  "targetedRevisionScope": ["C-03", "C-07", "C-08", "G4-07A", "G4-08A"],
-  "note": "Draft.11 remains the immutable accepted Gate 3 import. Draft.12 inserted Policy Decision Authority. Draft.13 is the Founder-authorized implementation-SSOT revision for an independently rebuildable Harness Approval Read Model with Adapter request lifecycle, Policy-owned decision state, typed Local API read/watch/await operations, and strict native-routing redaction."
+  "g408cSupportProfilesAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
+  "targetedRevisionScope": ["C-03", "C-07", "C-08", "G4-07A", "G4-08A", "G4-08C-A1", "G4-08C-A3"],
+  "note": "Draft.11 remains the immutable accepted Gate 3 import. Draft.12 inserted Policy Decision Authority. Draft.13 added the independently rebuildable Harness Approval Read Model. Draft.14 adds versioned, digest-addressed client-kernel conformance and authorization capability profiles without changing the Protobuf wire descriptor."
 }

@@ -7,9 +7,11 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
 const contractsRoot = join(repositoryRoot, "contracts");
 const manifestPath = join(contractsRoot, "manifest.json");
-const expectedManifestSha256 = "64da25010ce5284679e386864721ed54c364f8fa2811cd9d38b386ba8b8aea6e";
-const expectedArtifactCount = 231;
-const expectedFixtureCount = 179;
+const expectedManifestSha256 = "8eadb3686c8dfe76bf8b56fa48d8a76bd7fa57c177804b132eac793d33b7379e";
+const expectedArtifactCount = 238;
+const expectedFixtureCount = 182;
+const expectedClientKernelProfileSha256 = "367ad4210c499d7501acd060f5b544255521cefefca86b8d69a2cea022166c11";
+const expectedAuthorizationProfileSha256 = "5ae8cff8552910c780cdde9e29f1a5a3a95e40803ebcbb1de26544de5f6ac29f";
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -35,9 +37,10 @@ const manifestSha256 = sha256(manifestBytes);
 assert(manifestSha256 === expectedManifestSha256, `manifest digest mismatch: ${manifestSha256}`);
 
 const manifest = JSON.parse(manifestBytes.toString("utf8"));
-assert(manifest.candidateVersion === "0.1.0-draft.13", "unexpected V-01 implementation contract version");
+assert(manifest.candidateVersion === "0.1.0-draft.14", "unexpected V-01 implementation contract version");
 assert(manifest.targetedRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3", "missing Founder authority for targeted revision");
 assert(manifest.approvalReadModelRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a", "missing Founder authority for approval read model revision");
+assert(manifest.g408cSupportProfilesAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3", "missing Founder authority for G4-08C support profiles");
 assert(manifest.artifacts.length === expectedArtifactCount, "unexpected V-01 artifact count");
 
 let fixtureCount = 0;
@@ -50,6 +53,8 @@ for (const artifact of manifest.artifacts) {
 }
 
 assert(fixtureCount === expectedFixtureCount, `unexpected fixture count: ${fixtureCount}`);
+assert(sha256(readFileSync(join(contractsRoot, "profiles", "client-kernel", "v1", "v01-default.json"))) === expectedClientKernelProfileSha256, "client-kernel profile digest mismatch");
+assert(sha256(readFileSync(join(contractsRoot, "profiles", "authorization", "v1", "v01-default.json"))) === expectedAuthorizationProfileSha256, "authorization capability profile digest mismatch");
 assert(existsSync(join(contractsRoot, "proto", "egopulse", "foundation", "v1", "health.proto")), "Foundation health contract was lost during V-01 import");
 
 console.log(

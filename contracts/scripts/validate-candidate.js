@@ -15,6 +15,10 @@ const verdictFixtureRoot = path.join(root, 'fixtures', 'verdict', 'v1');
 const policyFixtureRoot = path.join(root, 'fixtures', 'policy', 'v1');
 const localApiFixtureRoot = path.join(root, 'fixtures', 'localapi', 'v1');
 const persistenceFixtureRoot = path.join(root, 'fixtures', 'persistence', 'v1');
+const clientKernelProfileRelative = 'profiles/client-kernel/v1/v01-default.json';
+const clientKernelSchemaRelative = 'client-kernel-profile.schema.json';
+const authorizationProfileRelative = 'profiles/authorization/v1/v01-default.json';
+const authorizationSchemaRelative = 'authorization-capability-profile.schema.json';
 const requiredCategories = new Set(['valid', 'invalid', 'duplicate', 'stale', 'unauthorized', 'recovery']);
 const taskCommandNames = new Set([
   'createTask', 'activateTask', 'submitTaskEvidence', 'recordTaskVerification',
@@ -503,6 +507,7 @@ function validateLocalApiFixture(file) {
   if (value.transport.kind === 'LOOPBACK_TCP' && (expected.outcome !== 'error' || expected.listenerCreated !== false)) fail(prefix + 'V-01 must not expose loopback TCP');
   if (operationName === 'openSession' && expected.outcome === 'ok') {
     if (value.transport.peerCredentialVerified !== true || expected.authenticatedPrincipalFromTransport !== true || expected.surfaceUsedAsAuthorization !== false) fail(prefix + 'session identity must come from trusted IPC peer credentials');
+    if (value.fixtureId.includes('open-desktop-session') && (expected.clientKernelDigestMatchesProfile !== true || expected.authorizationPolicyDigestMatchesProfile !== true || expected.grantedPermissionCodesKnownToProfile !== true)) fail(prefix + 'successful session must return exact governed profile references and known permission codes');
   }
   if (operationName === 'getTaskView' && expected.outcome === 'ok') {
     if (expected.sourceRevisionVectorPreserved === false || expected.unifiedStatusInvented === true) fail(prefix + 'Task view must preserve source revisions without inventing unified status');
@@ -555,6 +560,8 @@ function validateLocalApiFixture(file) {
     ['client-supplied-authority-ref', 'LOCAL_API_ERROR_CODE_INVALID_ARGUMENT'],
     ['approval-source-binding-mismatch', 'LOCAL_API_ERROR_CODE_INTEGRITY_FAILURE'],
     ['approval-native-routing-exposure', 'LOCAL_API_ERROR_CODE_INTEGRITY_FAILURE'],
+    ['client-kernel-profile-digest-mismatch', 'LOCAL_API_ERROR_CODE_CONTRACT_INCOMPATIBLE'],
+    ['unknown-permission-code', 'LOCAL_API_ERROR_CODE_PERMISSION_DENIED'],
   ];
   for (const [needle, errorCode] of expectedErrors) if (value.fixtureId.includes(needle) && expected.errorCode !== errorCode) fail(prefix + needle + ' must fail with ' + errorCode);
   if (value.category === 'unauthorized' && (expected.errorCode !== 'LOCAL_API_ERROR_CODE_PERMISSION_DENIED' || expected.businessWriteCount !== 0)) fail(prefix + 'unauthorized Local API operation must fail before authority write');
@@ -568,6 +575,9 @@ function validateLocalApiFixture(file) {
   if (value.fixtureId.includes('approval-source-binding-mismatch') && expected.viewReturned !== false) fail(prefix + 'source binding mismatch must suppress the projection');
   if (value.fixtureId.includes('approval-native-routing-exposure') && expected.nativeRoutingReturned !== false) fail(prefix + 'native routing must never leave the Local API boundary');
   if (value.fixtureId.includes('harness-approval-stream-gap') && (expected.frameKind !== 'STREAM_FRAME_KIND_RESET_REQUIRED' || expected.clientMustRefetch !== true)) fail(prefix + 'approval stream retention gap must require full refetch');
+  if (value.fixtureId.includes('client-kernel-profile-digest-mismatch') && (expected.profileDigestMismatchRejected !== true || expected.sessionCreated !== false)) fail(prefix + 'client-kernel profile digest mismatch must reject session creation');
+  if (value.fixtureId.includes('unknown-permission-code') && (expected.unknownPermissionFailClosed !== true || expected.sessionCreated !== false)) fail(prefix + 'unknown permission code must fail closed before session creation');
+  if (value.fixtureId.includes('system-only-task-command') && (expected.systemOnlyOneofFailClosed !== true || expected.gatewayRejectedBeforeAuthorityCall !== true || expected.authorityCallCount !== 0)) fail(prefix + 'system-only task oneof must fail before Authority invocation');
   return value.category;
 }
 
@@ -678,13 +688,14 @@ function main() {
   const machineRoots = [
     path.join(root, 'fixtures'),
     path.join(root, 'proto'),
+    path.join(root, 'profiles'),
   ];
   const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     const absolute = path.join(dir, entry.name);
     return entry.isDirectory() ? walk(absolute) : [absolute];
   });
   const requiredManifestFiles = machineRoots.flatMap(walk)
-    .concat(fs.readdirSync(root).filter((name) => name.endsWith('-fixture-envelope.schema.json')).map((name) => path.join(root, name)));
+    .concat(fs.readdirSync(root).filter((name) => name.endsWith('-fixture-envelope.schema.json') || name.endsWith('-profile.schema.json')).map((name) => path.join(root, name)));
   for (const file of requiredManifestFiles) {
     const relative = path.relative(root, file).replace(/\\/g, '/');
     if (!manifestPaths.has(relative)) fail('machine candidate missing from manifest: ' + relative);
@@ -758,8 +769,62 @@ function main() {
   if (limit('QR-01', 'hardBytes') !== 536870912 || limit('QR-03', 'hardBytes') !== 2147483648 || limit('QR-09', 'minimumSecondsAfterTaskTerminal') !== 2592000) fail('resource budget values drifted');
   if (limit('QM-01', 'hardTokens') !== 500000 || limit('QM-02', 'hardTokens') !== 50000 || limit('QM-03', 'unknownMayRenderAsZero') !== false) fail('model usage budget values drifted');
   if (budgetProfile.measurementPolicy?.crashInjectionsPerBoundary !== 10 || budgetProfile.measurementPolicy?.crashBoundaryCount !== 8 || budgetProfile.measurementPolicy?.failedSamplesIncluded !== true) fail('measurement policy drifted');
+  for (const relative of [clientKernelProfileRelative, clientKernelSchemaRelative, authorizationProfileRelative, authorizationSchemaRelative]) {
+    if (!manifestPaths.has(relative)) fail('G4-08C support profile contract missing from manifest: ' + relative);
+  }
+  const clientKernelProfile = readJson(path.join(root, clientKernelProfileRelative));
+  if (clientKernelProfile.schemaVersion !== 'egopulse.client-kernel-profile/v0.1' || clientKernelProfile.contractId !== 'egopulse.client-kernel.v1' || clientKernelProfile.contractVersion !== '0.1.0') fail('client-kernel profile identity drifted');
+  if (clientKernelProfile.authorityRef !== 'conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3') fail('client-kernel profile missing Founder authority');
+  if (clientKernelProfile.localApiCompatibility?.contractId !== 'egopulse.localapi.v1' || clientKernelProfile.localApiCompatibility?.runtimeReferenceRequired !== true) fail('client-kernel Local API compatibility binding invalid');
+  const kernelBoundary = clientKernelProfile.implementationBoundary || {};
+  const expectedSurfaces = new Set(['cli', 'tui', 'desktop_tauri_backend']);
+  if (kernelBoundary.sharedKernelLanguage !== 'rust' || kernelBoundary.typescriptBusinessKernelAllowed !== false || kernelBoundary.transport !== 'tonic_grpc_http2_semantics_over_named_pipe_or_uds_no_tcp' || new Set(kernelBoundary.surfaces || []).size !== expectedSurfaces.size || [...expectedSurfaces].some((surface) => !(kernelBoundary.surfaces || []).includes(surface))) fail('client-kernel implementation boundary drifted');
+  const requiredKernelCapabilities = ['session_negotiation', 'query', 'list', 'watch_complete_snapshots', 'await_projection', 'typed_command', 'stable_cursor', 'reset_and_refetch', 'read_your_write', 'typed_error', 'frame_deduplication'];
+  if (requiredKernelCapabilities.some((capability) => !(clientKernelProfile.capabilities || []).includes(capability))) fail('client-kernel conformance capability missing');
+  const kernelInvariants = clientKernelProfile.invariants || {};
+  for (const field of ['surfaceNeutral', 'completeSnapshotStreams', 'orderedWithinEpoch', 'atLeastOnceDelivery', 'unknownFrameFailClosed', 'gapRequiresReset', 'authorityResultPreserved', 'clientNeverBecomesAuthority']) if (kernelInvariants[field] !== true) fail('client-kernel invariant drifted: ' + field);
+
+  const authorizationProfile = readJson(path.join(root, authorizationProfileRelative));
+  if (authorizationProfile.schemaVersion !== 'egopulse.authorization-capability-profile/v0.1' || authorizationProfile.contractId !== 'egopulse.authorization.v1' || authorizationProfile.contractVersion !== '0.1.0' || authorizationProfile.localApiContractId !== 'egopulse.localapi.v1') fail('authorization profile identity drifted');
+  if (authorizationProfile.authorityRef !== 'conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3') fail('authorization profile missing Founder authority');
+  const authorizationDefaults = authorizationProfile.defaults || {};
+  if (authorizationDefaults.unknownPermission !== 'fail_closed' || authorizationDefaults.unknownRpc !== 'fail_closed' || authorizationDefaults.unknownCommandOneof !== 'fail_closed' || authorizationDefaults.surfaceNeutral !== true || authorizationDefaults.sessionGrantIsFinalAuthorization !== false || authorizationDefaults.owningAuthorityRevalidationRequired !== true) fail('authorization fail-closed defaults drifted');
+  const expectedPermissionCodes = new Set(['local.task.read', 'local.evidence.read', 'local.approval.read', 'local.projection.status.read', 'local.projection.await', 'local.task.create', 'local.task.cancellation.request', 'local.approval.decide', 'local.founder-verdict.issue', 'local.founder-verdict.revoke']);
+  const permissionCodes = new Set((authorizationProfile.permissions || []).map((permission) => permission.code));
+  if (permissionCodes.size !== expectedPermissionCodes.size || [...expectedPermissionCodes].some((code) => !permissionCodes.has(code))) fail('authorization permission catalog must contain the exact V-01 code set');
+  const expectedRpcs = new Set(['LocalSessionService/OpenSession', 'LocalReadModelService/GetTaskView', 'LocalReadModelService/ListTaskViews', 'LocalReadModelService/GetEvidenceGraph', 'LocalReadModelService/GetHarnessApprovalView', 'LocalReadModelService/ListHarnessApprovalViews', 'LocalReadModelService/GetProjectionStatus', 'LocalReadModelService/WatchTaskViews', 'LocalReadModelService/WatchHarnessApprovalViews', 'LocalReadModelService/AwaitProjection', 'LocalCommandGatewayService/ExecuteTaskCommand', 'LocalCommandGatewayService/DecideHarnessApproval', 'LocalCommandGatewayService/ExecuteFounderVerdict']);
+  const rpcRules = new Map((authorizationProfile.rpcRules || []).map((rule) => [rule.rpc, rule]));
+  if (rpcRules.size !== expectedRpcs.size || [...expectedRpcs].some((rpc) => !rpcRules.has(rpc))) fail('authorization RPC catalog must cover the exact Local API service set');
+  for (const rule of rpcRules.values()) for (const code of rule.requiredPermissionCodes || []) if (!permissionCodes.has(code)) fail('RPC rule references unknown permission: ' + code);
+  const expectedCommandRules = new Map([
+    ['LocalCommandGatewayService/ExecuteTaskCommand#create_task', ['user', 'local.task.create', 'TaskAuthority', ['TaskAuthority.Founder']]],
+    ['LocalCommandGatewayService/ExecuteTaskCommand#request_task_cancellation', ['user', 'local.task.cancellation.request', 'TaskAuthority', ['TaskAuthority.Founder']]],
+    ...['activate_task', 'submit_task_evidence', 'interrupt_task', 'hold_task', 'resume_task', 'record_task_cancellation_outcome'].map((oneof) => [`LocalCommandGatewayService/ExecuteTaskCommand#${oneof}`, ['system_only', null, 'TaskAuthority', ['TaskAuthority.CollaborationControl']]]),
+    ['LocalCommandGatewayService/ExecuteTaskCommand#record_task_verification', ['system_only', null, 'TaskAuthority', ['TaskAuthority.SegoVerification']]],
+    ...['apply_founder_verdict', 'revise_task', 'supersede_task', 'expire_task'].map((oneof) => [`LocalCommandGatewayService/ExecuteTaskCommand#${oneof}`, ['system_only', null, 'TaskAuthority', ['TaskAuthority.FounderAuthority']]]),
+    ['LocalCommandGatewayService/DecideHarnessApproval#issue_harness_approval_decision', ['user', 'local.approval.decide', 'PolicyDecisionAuthority', ['PolicyDecisionAuthority.FounderPolicy', 'PolicyDecisionAuthority.LocalUser']]],
+    ['LocalCommandGatewayService/ExecuteFounderVerdict#issue_founder_verdict', ['user', 'local.founder-verdict.issue', 'FounderVerdictAuthority', ['FounderVerdictAuthority.FounderAuthority']]],
+    ['LocalCommandGatewayService/ExecuteFounderVerdict#revoke_founder_verdict', ['user', 'local.founder-verdict.revoke', 'FounderVerdictAuthority', ['FounderVerdictAuthority.FounderAuthority']]],
+    ['LocalCommandGatewayService/ExecuteFounderVerdict#consume_founder_verdict', ['system_only', null, 'FounderVerdictAuthority', ['FounderVerdictAuthority.TaskAuthority']]],
+    ['LocalCommandGatewayService/ExecuteFounderVerdict#expire_founder_verdict', ['system_only', null, 'FounderVerdictAuthority', ['FounderVerdictAuthority.PolicyAuthority']]],
+  ]);
+  const commandRules = new Map((authorizationProfile.commandRules || []).map((rule) => [`${rule.rpc}#${rule.oneof}`, rule]));
+  if (commandRules.size !== expectedCommandRules.size || [...expectedCommandRules.keys()].some((key) => !commandRules.has(key))) fail('authorization command catalog must cover every exposed command oneof exactly once');
+  for (const [key, expected] of expectedCommandRules) {
+    const rule = commandRules.get(key);
+    if (rule.access !== expected[0] || rule.writeOwner !== expected[2]) fail('authorization command ownership/access drifted: ' + key);
+    const requiredCodes = rule.requiredPermissionCodes || [];
+    if (expected[1] === null ? requiredCodes.length !== 0 : requiredCodes.length !== 1 || requiredCodes[0] !== expected[1]) fail('authorization command permission drifted: ' + key);
+    if (requiredCodes.some((code) => !permissionCodes.has(code))) fail('command rule references unknown permission: ' + key);
+    const actualPrincipalKinds = [...(rule.requiredAuthorityPrincipalKinds || [])].sort();
+    const expectedPrincipalKinds = [...expected[3]].sort();
+    if (actualPrincipalKinds.length !== expectedPrincipalKinds.length || expectedPrincipalKinds.some((kind, index) => actualPrincipalKinds[index] !== kind)) fail('authorization command principal-kind mapping drifted: ' + key);
+  }
+  const openSessionFixture = readJson(path.join(localApiFixtureRoot, 'valid-open-desktop-session.json'));
+  const grantedCodes = openSessionFixture.expected?.grantedWriteCapabilities || [];
+  if (grantedCodes.some((code) => !permissionCodes.has(code))) fail('open-session fixture grants permission outside authorization profile');
   const validation = manifest.validation || {};
-  for (const field of ['bufLint', 'bufBuild', 'protocCompile', 'crossLanguageGeneration', 'faultConformance', 'qualityBudgetProfile']) {
+  for (const field of ['bufLint', 'bufBuild', 'protocCompile', 'crossLanguageGeneration', 'faultConformance', 'qualityBudgetProfile', 'clientKernelProfile', 'authorizationCapabilityProfile']) {
     if (typeof validation[field] !== 'string' || !validation[field].startsWith('passed_')) fail('toolchain evidence is not passed: ' + field);
   }
   if (typeof validation.bufBreaking !== 'string' || (!validation.bufBreaking.startsWith('passed_') && !validation.bufBreaking.startsWith('not_applicable_initial_contract_'))) {
@@ -771,9 +836,11 @@ function main() {
   if (!policy || policy.status !== 'founder_confirmed_toolchain_reverified') fail('G4-07A Policy Decision Authority must carry explicit Founder acceptance and technical reverification');
   const approvalReadModel = manifest.groups.find((group) => group.id === 'G4-08A');
   if (!approvalReadModel || approvalReadModel.status !== 'founder_confirmed_toolchain_reverified') fail('G4-08A Harness Approval Read Model must carry explicit Founder acceptance and technical reverification');
+  const g408cProfiles = manifest.groups.find((group) => group.id === 'G4-08C-A1+A3');
+  if (!g408cProfiles || g408cProfiles.status !== 'founder_confirmed_targeted_gate3_reverified') fail('G4-08C A1/A3 support profiles must carry Founder acceptance and targeted Gate 3 reverification');
   console.log(`candidate validation passed: ${taskFixtureFiles.length} task fixtures, ${collaborationFixtureFiles.length} collaboration fixtures, ${harnessFixtureFiles.length} harness fixtures, ${artifactFixtureFiles.length} artifact fixtures, ${verificationFixtureFiles.length} verification fixtures, ${verdictFixtureFiles.length} verdict fixtures, ${policyFixtureFiles.length} policy fixtures, ${localApiFixtureFiles.length} localapi fixtures, ${persistenceFixtureFiles.length} persistence fixtures, ${manifest.artifacts.length} digests`);
   console.log('proto_toolchain_status=passed; Buf/protoc, Rust/TypeScript/Python generation, and SQLCipher process-crash conformance are verified');
-  console.log('gate3_status=targeted_revision_reverified; G4-08A approval read model contract is authorized for implementation');
+  console.log('gate3_status=targeted_revision_reverified; G4-08C A1/A3 support profiles are closed and G4-08A2 is authorized for implementation');
 }
 
 main();

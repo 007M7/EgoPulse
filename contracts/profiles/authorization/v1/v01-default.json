@@ -1,0 +1,62 @@
+{
+  "schemaVersion": "egopulse.authorization-capability-profile/v0.1",
+  "contractId": "egopulse.authorization.v1",
+  "contractVersion": "0.1.0",
+  "authorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
+  "localApiContractId": "egopulse.localapi.v1",
+  "defaults": {
+    "unknownPermission": "fail_closed",
+    "unknownRpc": "fail_closed",
+    "unknownCommandOneof": "fail_closed",
+    "surfaceNeutral": true,
+    "sessionGrantIsFinalAuthorization": false,
+    "owningAuthorityRevalidationRequired": true
+  },
+  "permissions": [
+    { "code": "local.task.read", "kind": "read", "description": "Read and watch Task projections." },
+    { "code": "local.evidence.read", "kind": "read", "description": "Read redacted Evidence Graph projections." },
+    { "code": "local.approval.read", "kind": "read", "description": "Read and watch Harness approval projections." },
+    { "code": "local.projection.status.read", "kind": "read", "description": "Read projection health and position." },
+    { "code": "local.projection.await", "kind": "read", "description": "Await a principal- and scope-bound projection token." },
+    { "code": "local.task.create", "kind": "write", "description": "Submit the user-owned create_task command branch." },
+    { "code": "local.task.cancellation.request", "kind": "write", "description": "Submit the user-owned request_task_cancellation branch." },
+    { "code": "local.approval.decide", "kind": "write", "description": "Submit an issue_harness_approval_decision intent." },
+    { "code": "local.founder-verdict.issue", "kind": "write", "description": "Submit an issue_founder_verdict command as a trusted Founder principal." },
+    { "code": "local.founder-verdict.revoke", "kind": "write", "description": "Submit a revoke_founder_verdict command as a trusted Founder principal." }
+  ],
+  "rpcRules": [
+    { "rpc": "LocalSessionService/OpenSession", "access": "authenticated_peer_bootstrap", "requiredPermissionCodes": [] },
+    { "rpc": "LocalReadModelService/GetTaskView", "access": "granted_permission", "requiredPermissionCodes": ["local.task.read"] },
+    { "rpc": "LocalReadModelService/ListTaskViews", "access": "granted_permission", "requiredPermissionCodes": ["local.task.read"] },
+    { "rpc": "LocalReadModelService/GetEvidenceGraph", "access": "granted_permission", "requiredPermissionCodes": ["local.evidence.read"] },
+    { "rpc": "LocalReadModelService/GetHarnessApprovalView", "access": "granted_permission", "requiredPermissionCodes": ["local.approval.read"] },
+    { "rpc": "LocalReadModelService/ListHarnessApprovalViews", "access": "granted_permission", "requiredPermissionCodes": ["local.approval.read"] },
+    { "rpc": "LocalReadModelService/GetProjectionStatus", "access": "granted_permission", "requiredPermissionCodes": ["local.projection.status.read"] },
+    { "rpc": "LocalReadModelService/WatchTaskViews", "access": "granted_permission", "requiredPermissionCodes": ["local.task.read"] },
+    { "rpc": "LocalReadModelService/WatchHarnessApprovalViews", "access": "granted_permission", "requiredPermissionCodes": ["local.approval.read"] },
+    { "rpc": "LocalReadModelService/AwaitProjection", "access": "granted_permission", "requiredPermissionCodes": ["local.projection.await"], "tokenScopeEnforced": true },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "access": "per_command_oneof", "requiredPermissionCodes": [] },
+    { "rpc": "LocalCommandGatewayService/DecideHarnessApproval", "access": "per_command_oneof", "requiredPermissionCodes": [] },
+    { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "access": "per_command_oneof", "requiredPermissionCodes": [] }
+  ],
+  "commandRules": [
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "create_task", "access": "user", "requiredPermissionCodes": ["local.task.create"], "confirmationClass": "none", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.Founder"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "request_task_cancellation", "access": "user", "requiredPermissionCodes": ["local.task.cancellation.request"], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.Founder"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "activate_task", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.CollaborationControl"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "submit_task_evidence", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.CollaborationControl"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "record_task_verification", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.SegoVerification"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "apply_founder_verdict", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.FounderAuthority"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "revise_task", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.FounderAuthority"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "interrupt_task", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.CollaborationControl"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "hold_task", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.CollaborationControl"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "resume_task", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.CollaborationControl"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "record_task_cancellation_outcome", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.CollaborationControl"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "supersede_task", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.FounderAuthority"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "expire_task", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.FounderAuthority"] },
+    { "rpc": "LocalCommandGatewayService/DecideHarnessApproval", "oneof": "issue_harness_approval_decision", "access": "user", "requiredPermissionCodes": ["local.approval.decide"], "confirmationClass": "authority_contract", "writeOwner": "PolicyDecisionAuthority", "requiredAuthorityPrincipalKinds": ["PolicyDecisionAuthority.LocalUser", "PolicyDecisionAuthority.FounderPolicy"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "oneof": "issue_founder_verdict", "access": "user", "requiredPermissionCodes": ["local.founder-verdict.issue"], "confirmationClass": "authority_contract", "writeOwner": "FounderVerdictAuthority", "requiredAuthorityPrincipalKinds": ["FounderVerdictAuthority.FounderAuthority"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "oneof": "revoke_founder_verdict", "access": "user", "requiredPermissionCodes": ["local.founder-verdict.revoke"], "confirmationClass": "authority_contract", "writeOwner": "FounderVerdictAuthority", "requiredAuthorityPrincipalKinds": ["FounderVerdictAuthority.FounderAuthority"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "oneof": "consume_founder_verdict", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "FounderVerdictAuthority", "requiredAuthorityPrincipalKinds": ["FounderVerdictAuthority.TaskAuthority"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "oneof": "expire_founder_verdict", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "FounderVerdictAuthority", "requiredAuthorityPrincipalKinds": ["FounderVerdictAuthority.PolicyAuthority"] }
+  ]
+}

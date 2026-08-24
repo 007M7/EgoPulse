@@ -30,9 +30,9 @@ use tonic::{Request, transport::Endpoint};
 use tower::service_fn;
 use uuid::Uuid;
 
-const CONTRACT_DIGEST: &str = "64da25010ce5284679e386864721ed54c364f8fa2811cd9d38b386ba8b8aea6e";
-const KERNEL_DIGEST: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-const POLICY_DIGEST: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const CONTRACT_DIGEST: &str = "8eadb3686c8dfe76bf8b56fa48d8a76bd7fa57c177804b132eac793d33b7379e";
+const KERNEL_DIGEST: &str = "367ad4210c499d7501acd060f5b544255521cefefca86b8d69a2cea022166c11";
+const POLICY_DIGEST: &str = "5ae8cff8552910c780cdde9e29f1a5a3a95e40803ebcbb1de26544de5f6ac29f";
 
 #[derive(Clone)]
 struct MutableClock(Arc<Mutex<SystemTime>>);
@@ -103,7 +103,7 @@ fn contract_ref(id: &str, version: &str, digest: &str) -> ContractReference {
 }
 
 fn api_contract() -> ContractReference {
-    contract_ref("egopulse.localapi.v1", "0.1.0-draft.13", CONTRACT_DIGEST)
+    contract_ref("egopulse.localapi.v1", "0.1.0-draft.14", CONTRACT_DIGEST)
 }
 
 fn kernel_contract() -> ContractReference {
@@ -118,9 +118,16 @@ fn founder_grant() -> PrincipalGrant {
     PrincipalGrant {
         authenticated_principal_id: "os-user:founder".to_owned(),
         permission_codes: BTreeSet::from([
-            "approval.decide".to_owned(),
-            "founder-verdict.execute".to_owned(),
-            "task.execute".to_owned(),
+            "local.approval.decide".to_owned(),
+            "local.approval.read".to_owned(),
+            "local.evidence.read".to_owned(),
+            "local.founder-verdict.issue".to_owned(),
+            "local.founder-verdict.revoke".to_owned(),
+            "local.projection.await".to_owned(),
+            "local.projection.status.read".to_owned(),
+            "local.task.cancellation.request".to_owned(),
+            "local.task.create".to_owned(),
+            "local.task.read".to_owned(),
         ]),
         authorization_policy_ref: policy_contract(),
     }
@@ -385,7 +392,9 @@ async fn session_authentication_rechecks_binding_expiry_revoke_and_policy_drift(
     );
 
     let mut changed_grant = founder_grant();
-    changed_grant.permission_codes.remove("approval.decide");
+    changed_grant
+        .permission_codes
+        .remove("local.approval.decide");
     resolver.set(Ok(changed_grant));
     assert_eq!(
         registry.authenticate(Some(&valid_metadata), &peer),
