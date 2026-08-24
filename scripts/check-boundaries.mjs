@@ -11,6 +11,7 @@ const required = [
   "crates/cognition-runtime/Cargo.toml",
   "crates/harness-adapter/Cargo.toml",
   "crates/codex-adapter/Cargo.toml",
+  "crates/policy-decision-authority/Cargo.toml",
   "crates/local-ide-control/Cargo.toml",
   "packages/native-harness/package.json",
   "workers/foundation-probe/pyproject.toml",
@@ -87,6 +88,24 @@ for (const root of taskNonOwnerRoots) {
     for (const term of taskAuthorityStorageTerms) {
       if (text.includes(term)) {
         throw new Error(`${relative(".", file)} attempts to depend on Task Authority storage: ${term}`);
+      }
+    }
+  }
+}
+
+const policyAuthorityStorageTerms = [
+  "policy-decision-authority.sqlcipher",
+  "policy_decision_authority::store"
+];
+for (const root of ["apps", "crates", "packages", "workers"]) {
+  for (const file of filesUnder(root)) {
+    const normalized = relative(".", file).replaceAll("\\", "/");
+    if (normalized.startsWith("crates/policy-decision-authority/")) continue;
+    if (!/\.(rs|toml|ts|tsx|js|mjs|py|json)$/.test(file)) continue;
+    const text = readFileSync(file, "utf8").toLowerCase();
+    for (const term of policyAuthorityStorageTerms) {
+      if (text.includes(term)) {
+        throw new Error(`${normalized} attempts to depend on Policy Decision Authority storage: ${term}`);
       }
     }
   }

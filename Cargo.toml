@@ -15,6 +15,7 @@ members = [
   "crates/artifact-authority",
   "crates/verification-authority",
   "crates/founder-verdict-authority",
+  "crates/policy-decision-authority",
   "tools/contract-rust-codegen"
 ]
 
@@ -57,6 +58,7 @@ egopulse-codex-adapter = { path = "crates/codex-adapter" }
 egopulse-artifact-authority = { path = "crates/artifact-authority" }
 egopulse-verification-authority = { path = "crates/verification-authority" }
 egopulse-founder-verdict-authority = { path = "crates/founder-verdict-authority" }
+egopulse-policy-decision-authority = { path = "crates/policy-decision-authority" }
 
 [profile.release]
 codegen-units = 1
