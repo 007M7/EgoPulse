@@ -1,249 +1,55 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
+    ops::Deref,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use egopulse_domain_contracts::v01::egopulse::{
-    common::v1::ContractReference,
-    localapi::v1::{
-        ClientRequestMetadata, ClientSurface, HarnessApprovalView, HarnessApprovalViewStreamFrame,
-        LocalApiError, LocalApiErrorCode, OpenSessionRequest, OpenSessionResponse,
-        ProjectionMetadata, ProjectionPosition, SourceDomain, StreamFrameKind, TaskView,
-        TaskViewStreamFrame,
+use egopulse_domain_contracts::{
+    profiles::{ContractProfileError, ContractProfiles as SharedContractProfiles},
+    v01::egopulse::{
+        common::v1::ContractReference,
+        localapi::v1::{
+            ClientRequestMetadata, ClientSurface, HarnessApprovalView,
+            HarnessApprovalViewStreamFrame, LocalApiError, LocalApiErrorCode, OpenSessionRequest,
+            OpenSessionResponse, ProjectionMetadata, ProjectionPosition, SourceDomain,
+            StreamFrameKind, TaskView, TaskViewStreamFrame,
+        },
     },
 };
 use prost::Message;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const API_CONTRACT_ID: &str = "egopulse.localapi.v1";
-pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.14";
-pub const API_CONTRACT_DIGEST_SHA256: &str =
-    "8eadb3686c8dfe76bf8b56fa48d8a76bd7fa57c177804b132eac793d33b7379e";
-pub const CLIENT_KERNEL_CONTRACT_ID: &str = "egopulse.client-kernel.v1";
-pub const CLIENT_KERNEL_CONTRACT_VERSION: &str = "0.1.0";
-pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =
-    "367ad4210c499d7501acd060f5b544255521cefefca86b8d69a2cea022166c11";
-pub const AUTHORIZATION_CONTRACT_ID: &str = "egopulse.authorization.v1";
-pub const AUTHORIZATION_CONTRACT_VERSION: &str = "0.1.0";
-pub const AUTHORIZATION_PROFILE_DIGEST_SHA256: &str =
-    "5ae8cff8552910c780cdde9e29f1a5a3a95e40803ebcbb1de26544de5f6ac29f";
-
-const CLIENT_KERNEL_PROFILE_BYTES: &[u8] =
-    include_bytes!("../../../contracts/profiles/client-kernel/v1/v01-default.json");
-const AUTHORIZATION_PROFILE_BYTES: &[u8] =
-    include_bytes!("../../../contracts/profiles/authorization/v1/v01-default.json");
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ClientKernelProfile {
-    pub schema_version: String,
-    pub contract_id: String,
-    pub contract_version: String,
-    pub authority_ref: String,
-    pub local_api_compatibility: LocalApiCompatibility,
-    pub implementation_boundary: ImplementationBoundary,
-    pub capabilities: BTreeSet<String>,
-    pub invariants: ClientKernelInvariants,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LocalApiCompatibility {
-    pub contract_id: String,
-    pub minimum_version: String,
-    pub maximum_version_exclusive: String,
-    pub runtime_reference_required: bool,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ImplementationBoundary {
-    pub shared_kernel_language: String,
-    pub surfaces: BTreeSet<String>,
-    pub typescript_business_kernel_allowed: bool,
-    pub transport: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ClientKernelInvariants {
-    pub surface_neutral: bool,
-    pub complete_snapshot_streams: bool,
-    pub ordered_within_epoch: bool,
-    pub at_least_once_delivery: bool,
-    pub unknown_frame_fail_closed: bool,
-    pub gap_requires_reset: bool,
-    pub authority_result_preserved: bool,
-    pub client_never_becomes_authority: bool,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AuthorizationProfile {
-    pub schema_version: String,
-    pub contract_id: String,
-    pub contract_version: String,
-    pub authority_ref: String,
-    pub local_api_contract_id: String,
-    pub defaults: AuthorizationDefaults,
-    pub permissions: Vec<PermissionDefinition>,
-    pub rpc_rules: Vec<RpcRule>,
-    pub command_rules: Vec<CommandRule>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AuthorizationDefaults {
-    pub unknown_permission: String,
-    pub unknown_rpc: String,
-    pub unknown_command_oneof: String,
-    pub surface_neutral: bool,
-    pub session_grant_is_final_authorization: bool,
-    pub owning_authority_revalidation_required: bool,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PermissionDefinition {
-    pub code: String,
-    pub kind: String,
-    pub description: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum RpcAccess {
-    AuthenticatedPeerBootstrap,
-    GrantedPermission,
-    PerCommandOneof,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RpcRule {
-    pub rpc: String,
-    pub access: RpcAccess,
-    pub required_permission_codes: Vec<String>,
-    #[serde(default)]
-    pub token_scope_enforced: bool,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum CommandAccess {
-    User,
-    SystemOnly,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ConfirmationClass {
-    None,
-    AuthorityContract,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CommandRule {
-    pub rpc: String,
-    pub oneof: String,
-    pub access: CommandAccess,
-    pub required_permission_codes: Vec<String>,
-    pub confirmation_class: ConfirmationClass,
-    pub write_owner: String,
-    pub required_authority_principal_kinds: Vec<String>,
-}
+pub use egopulse_domain_contracts::profiles::{
+    API_CONTRACT_DIGEST_SHA256, API_CONTRACT_ID, API_CONTRACT_VERSION, AUTHORIZATION_CONTRACT_ID,
+    AUTHORIZATION_CONTRACT_VERSION, AUTHORIZATION_PROFILE_DIGEST_SHA256, AuthorizationDefaults,
+    AuthorizationProfile, AuthorizedCommand, CLIENT_KERNEL_CONTRACT_ID,
+    CLIENT_KERNEL_CONTRACT_VERSION, CLIENT_KERNEL_PROFILE_DIGEST_SHA256, ClientKernelInvariants,
+    ClientKernelProfile, CommandAccess, CommandRule, ConfirmationClass, ImplementationBoundary,
+    LocalApiCompatibility, PermissionDefinition, RpcAccess, RpcRule,
+};
 
 #[derive(Clone, Debug)]
-pub struct ContractProfiles {
-    pub client_kernel: ClientKernelProfile,
-    pub authorization: AuthorizationProfile,
-    permission_codes: BTreeSet<String>,
-    rpc_rules: BTreeMap<String, RpcRule>,
-    command_rules: BTreeMap<(String, String), CommandRule>,
-}
+pub struct ContractProfiles(SharedContractProfiles);
 
 impl ContractProfiles {
     pub fn embedded() -> Result<Self, KernelError> {
-        verify_digest(
-            CLIENT_KERNEL_PROFILE_BYTES,
-            CLIENT_KERNEL_PROFILE_DIGEST_SHA256,
-        )?;
-        verify_digest(
-            AUTHORIZATION_PROFILE_BYTES,
-            AUTHORIZATION_PROFILE_DIGEST_SHA256,
-        )?;
-        let client_kernel: ClientKernelProfile =
-            serde_json::from_slice(CLIENT_KERNEL_PROFILE_BYTES)
-                .map_err(|_| KernelError::ProfileInvalid("client_kernel"))?;
-        let authorization: AuthorizationProfile =
-            serde_json::from_slice(AUTHORIZATION_PROFILE_BYTES)
-                .map_err(|_| KernelError::ProfileInvalid("authorization"))?;
-        validate_client_kernel_profile(&client_kernel)?;
-        validate_authorization_profile(client_kernel.contract_id.as_str(), &authorization)?;
-
-        let mut permission_codes = BTreeSet::new();
-        for permission in &authorization.permissions {
-            if permission.code.is_empty()
-                || !permission_codes.insert(permission.code.clone())
-                || !matches!(permission.kind.as_str(), "read" | "write")
-                || permission.description.is_empty()
-            {
-                return Err(KernelError::ProfileInvalid("authorization_permissions"));
-            }
-        }
-
-        let mut rpc_rules = BTreeMap::new();
-        for rule in &authorization.rpc_rules {
-            validate_permission_references(&permission_codes, &rule.required_permission_codes)?;
-            if rule.rpc.is_empty() || rpc_rules.insert(rule.rpc.clone(), rule.clone()).is_some() {
-                return Err(KernelError::ProfileInvalid("authorization_rpc_rules"));
-            }
-        }
-
-        let mut command_rules = BTreeMap::new();
-        for rule in &authorization.command_rules {
-            validate_permission_references(&permission_codes, &rule.required_permission_codes)?;
-            if rule.rpc.is_empty()
-                || rule.oneof.is_empty()
-                || rule.write_owner.is_empty()
-                || rule.required_authority_principal_kinds.is_empty()
-                || command_rules
-                    .insert((rule.rpc.clone(), rule.oneof.clone()), rule.clone())
-                    .is_some()
-            {
-                return Err(KernelError::ProfileInvalid("authorization_command_rules"));
-            }
-        }
-
-        Ok(Self {
-            client_kernel,
-            authorization,
-            permission_codes,
-            rpc_rules,
-            command_rules,
-        })
+        SharedContractProfiles::embedded()
+            .map(Self)
+            .map_err(map_profile_error)
     }
 
     #[must_use]
     pub fn permission_codes(&self) -> &BTreeSet<String> {
-        &self.permission_codes
+        self.0.permission_codes()
     }
 
     pub fn authorize_rpc(&self, rpc: &str, granted: &BTreeSet<String>) -> Result<(), KernelError> {
-        self.validate_grants(granted)?;
-        let rule = self
-            .rpc_rules
-            .get(rpc)
-            .ok_or_else(|| KernelError::UnknownRpc(rpc.to_owned()))?;
-        if rule.access != RpcAccess::GrantedPermission {
-            return Err(KernelError::WrongAuthorizationPath(rpc.to_owned()));
-        }
-        require_permissions(granted, &rule.required_permission_codes)
+        self.0
+            .authorize_rpc(rpc, granted)
+            .map_err(map_profile_error)
     }
 
     pub fn authorize_command(
@@ -252,50 +58,18 @@ impl ContractProfiles {
         oneof: &str,
         granted: &BTreeSet<String>,
     ) -> Result<AuthorizedCommand, KernelError> {
-        self.validate_grants(granted)?;
-        let rpc_rule = self
-            .rpc_rules
-            .get(rpc)
-            .ok_or_else(|| KernelError::UnknownRpc(rpc.to_owned()))?;
-        if rpc_rule.access != RpcAccess::PerCommandOneof {
-            return Err(KernelError::WrongAuthorizationPath(rpc.to_owned()));
-        }
-        let rule = self
-            .command_rules
-            .get(&(rpc.to_owned(), oneof.to_owned()))
-            .ok_or_else(|| KernelError::UnknownCommandOneof {
-                rpc: rpc.to_owned(),
-                oneof: oneof.to_owned(),
-            })?;
-        if rule.access == CommandAccess::SystemOnly {
-            return Err(KernelError::SystemOnlyCommand {
-                rpc: rpc.to_owned(),
-                oneof: oneof.to_owned(),
-            });
-        }
-        require_permissions(granted, &rule.required_permission_codes)?;
-        Ok(AuthorizedCommand {
-            write_owner: rule.write_owner.clone(),
-            confirmation_class: rule.confirmation_class,
-            required_authority_principal_kinds: rule.required_authority_principal_kinds.clone(),
-        })
-    }
-
-    fn validate_grants(&self, granted: &BTreeSet<String>) -> Result<(), KernelError> {
-        for permission in granted {
-            if !self.permission_codes.contains(permission) {
-                return Err(KernelError::UnknownPermission(permission.clone()));
-            }
-        }
-        Ok(())
+        self.0
+            .authorize_command(rpc, oneof, granted)
+            .map_err(map_profile_error)
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthorizedCommand {
-    pub write_owner: String,
-    pub confirmation_class: ConfirmationClass,
-    pub required_authority_principal_kinds: Vec<String>,
+impl Deref for ContractProfiles {
+    type Target = SharedContractProfiles;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -402,7 +176,7 @@ impl ClientKernel {
         }
         let mut granted = BTreeSet::new();
         for permission in response.granted_permission_codes {
-            if !self.profiles.permission_codes.contains(&permission) {
+            if !self.profiles.permission_codes().contains(&permission) {
                 return Err(KernelError::UnknownPermission(permission));
             }
             if !granted.insert(permission.clone()) {
@@ -690,114 +464,31 @@ fn contract_ref(id: &str, version: &str, sha256: &str) -> ContractReference {
     }
 }
 
-fn verify_digest(payload: &[u8], expected: &str) -> Result<(), KernelError> {
-    if sha256_hex(payload) == expected {
-        Ok(())
-    } else {
-        Err(KernelError::ProfileDigestMismatch)
-    }
-}
-
 fn sha256_hex(payload: &[u8]) -> String {
     hex::encode(Sha256::digest(payload))
 }
 
-fn validate_client_kernel_profile(profile: &ClientKernelProfile) -> Result<(), KernelError> {
-    let required_capabilities = [
-        "session_negotiation",
-        "query",
-        "list",
-        "watch_complete_snapshots",
-        "await_projection",
-        "typed_command",
-        "stable_cursor",
-        "reset_and_refetch",
-        "read_your_write",
-        "typed_error",
-        "frame_deduplication",
-    ];
-    let required_surfaces = ["cli", "tui", "desktop_tauri_backend"];
-    if profile.schema_version != "egopulse.client-kernel-profile/v0.1"
-        || profile.contract_id != CLIENT_KERNEL_CONTRACT_ID
-        || profile.contract_version != CLIENT_KERNEL_CONTRACT_VERSION
-        || profile.authority_ref.is_empty()
-        || profile.local_api_compatibility.contract_id != API_CONTRACT_ID
-        || !profile.local_api_compatibility.runtime_reference_required
-        || profile.local_api_compatibility.minimum_version.is_empty()
-        || profile
-            .local_api_compatibility
-            .maximum_version_exclusive
-            .is_empty()
-        || profile.implementation_boundary.shared_kernel_language != "rust"
-        || profile
-            .implementation_boundary
-            .typescript_business_kernel_allowed
-        || profile.implementation_boundary.transport
-            != "tonic_grpc_http2_semantics_over_named_pipe_or_uds_no_tcp"
-        || required_surfaces
-            .iter()
-            .any(|value| !profile.implementation_boundary.surfaces.contains(*value))
-        || required_capabilities
-            .iter()
-            .any(|value| !profile.capabilities.contains(*value))
-        || !profile.invariants.surface_neutral
-        || !profile.invariants.complete_snapshot_streams
-        || !profile.invariants.ordered_within_epoch
-        || !profile.invariants.at_least_once_delivery
-        || !profile.invariants.unknown_frame_fail_closed
-        || !profile.invariants.gap_requires_reset
-        || !profile.invariants.authority_result_preserved
-        || !profile.invariants.client_never_becomes_authority
-    {
-        return Err(KernelError::ProfileInvalid("client_kernel_invariants"));
-    }
-    Ok(())
-}
-
-fn validate_authorization_profile(
-    client_kernel_contract_id: &str,
-    profile: &AuthorizationProfile,
-) -> Result<(), KernelError> {
-    let defaults = &profile.defaults;
-    if client_kernel_contract_id != CLIENT_KERNEL_CONTRACT_ID
-        || profile.schema_version != "egopulse.authorization-capability-profile/v0.1"
-        || profile.contract_id != AUTHORIZATION_CONTRACT_ID
-        || profile.contract_version != AUTHORIZATION_CONTRACT_VERSION
-        || profile.authority_ref.is_empty()
-        || profile.local_api_contract_id != API_CONTRACT_ID
-        || defaults.unknown_permission != "fail_closed"
-        || defaults.unknown_rpc != "fail_closed"
-        || defaults.unknown_command_oneof != "fail_closed"
-        || !defaults.surface_neutral
-        || defaults.session_grant_is_final_authorization
-        || !defaults.owning_authority_revalidation_required
-    {
-        return Err(KernelError::ProfileInvalid("authorization_defaults"));
-    }
-    Ok(())
-}
-
-fn validate_permission_references(
-    known: &BTreeSet<String>,
-    required: &[String],
-) -> Result<(), KernelError> {
-    let mut unique = BTreeSet::new();
-    if required
-        .iter()
-        .any(|value| !known.contains(value) || !unique.insert(value))
-    {
-        return Err(KernelError::ProfileInvalid("permission_reference"));
-    }
-    Ok(())
-}
-
-fn require_permissions(granted: &BTreeSet<String>, required: &[String]) -> Result<(), KernelError> {
-    for permission in required {
-        if !granted.contains(permission) {
-            return Err(KernelError::PermissionDenied(permission.clone()));
+fn map_profile_error(error: ContractProfileError) -> KernelError {
+    match error {
+        ContractProfileError::Invalid(section) => KernelError::ProfileInvalid(section),
+        ContractProfileError::DigestMismatch => KernelError::ProfileDigestMismatch,
+        ContractProfileError::UnknownPermission(permission) => {
+            KernelError::UnknownPermission(permission)
+        }
+        ContractProfileError::PermissionDenied(permission) => {
+            KernelError::PermissionDenied(permission)
+        }
+        ContractProfileError::UnknownRpc(rpc) => KernelError::UnknownRpc(rpc),
+        ContractProfileError::WrongAuthorizationPath(rpc) => {
+            KernelError::WrongAuthorizationPath(rpc)
+        }
+        ContractProfileError::UnknownCommandOneof { rpc, oneof } => {
+            KernelError::UnknownCommandOneof { rpc, oneof }
+        }
+        ContractProfileError::SystemOnlyCommand { rpc, oneof } => {
+            KernelError::SystemOnlyCommand { rpc, oneof }
         }
     }
-    Ok(())
 }
 
 fn exact_contract(

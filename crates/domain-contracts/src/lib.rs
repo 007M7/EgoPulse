@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod profiles;
+
 pub const ARCHITECTURE_VERSION: &str = "1.0";
 
 /// Machine-generated V-01 wire contracts. Authority behavior remains in its

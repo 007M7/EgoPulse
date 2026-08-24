@@ -65,6 +65,7 @@ verification or Task completion.
 - Local client transport: HTTP/2 gRPC over Windows Named Pipe or Unix Domain Socket. The platform crate owns peer-account extraction, owner-only access control and all required platform `unsafe`.
 - Local session boundary: account-level peer identity is resolved by a trusted policy adapter into a logical principal and permissions; sessions are process-ephemeral, connection/account-bound, expiring and revocable. An OS SID/UID never implies Founder identity.
 - Shared three-surface client kernel: G4-08C C1 provides the independent Rust `client-kernel` crate with digest-bound profiles, surface-neutral session/request state, typed authorization preflight and complete-snapshot replay/reset handling. It does not own facts or final authorization.
+- Shared profile interpretation: G4-08C C2 moves digest verification, profile parsing and fail-closed RPC/oneof authorization lookup into the framework-neutral `domain-contracts::profiles` boundary. Client and server consume that one interpreter; framework types still cannot enter `domain-contracts`.
 - Local API gateway: remains G4-08C C2/C3. The G4-08B session service is exercised over the real transport, but the full query/watch/await/command product path is not yet complete.
 - Supervised Worker/Harness transport: framed stdio or an official native protocol adapter; not implemented in this scaffold.
 

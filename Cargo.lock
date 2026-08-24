@@ -1081,8 +1081,6 @@ dependencies = [
  "hex",
  "prost",
  "prost-types",
- "serde",
- "serde_json",
  "sha2",
  "thiserror 2.0.20",
 ]
@@ -1142,8 +1140,13 @@ dependencies = [
 name = "egopulse-domain-contracts"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "prost",
  "prost-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
  "tonic",
  "tonic-prost",
 ]
