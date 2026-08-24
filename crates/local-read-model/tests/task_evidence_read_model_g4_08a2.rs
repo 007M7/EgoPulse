@@ -231,6 +231,42 @@ fn task_input(
     }
 }
 
+fn ordered_task_input(
+    task_id: &str,
+    revision: u64,
+    status: TaskStatus,
+    updated_at_seconds: i64,
+) -> TaskProjectionInput {
+    let event_id = format!("{task_id}-event-{revision:02}");
+    let snapshot = TaskSnapshot {
+        task_id: task_id.to_owned(),
+        revision,
+        work_revision: 1,
+        status: status as i32,
+        created_at: Some(Timestamp {
+            seconds: NOW,
+            nanos: 0,
+        }),
+        updated_at: Some(Timestamp {
+            seconds: updated_at_seconds,
+            nanos: 0,
+        }),
+        ..Default::default()
+    };
+    let event = TaskEvent {
+        event_id: event_id.clone(),
+        task_id: task_id.to_owned(),
+        resulting_revision: revision,
+        work_revision: 1,
+        snapshot: Some(snapshot),
+        ..Default::default()
+    };
+    TaskProjectionInput {
+        metadata: metadata(&event_id, revision, &event),
+        event,
+    }
+}
+
 fn collaboration_input() -> CollaborationProjectionInput {
     let event_id = "collaboration-event-01";
     let snapshot = CollaborationSnapshot {
@@ -685,6 +721,82 @@ fn permissions_source_wait_and_epoch_reset_are_enforced() {
         .expect("watch reset");
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].kind, StreamFrameKind::ResetRequired as i32);
+}
+
+#[test]
+fn historical_task_snapshot_is_stable_until_retention_floor_advances() {
+    let root = TempRoot::new("historical-task-page");
+    let mut model = open(&root, "epoch-01");
+    let first = model
+        .apply_task(&ordered_task_input("task-01", 1, TaskStatus::Ready, NOW))
+        .expect("project first Task revision");
+    let first_position = match first {
+        TaskProjectionApply::Committed { position, .. } => position,
+        TaskProjectionApply::Replay { .. } => panic!("first Task revision must commit"),
+    };
+    model
+        .apply_task(&ordered_task_input(
+            "task-01",
+            2,
+            TaskStatus::Active,
+            NOW + 20,
+        ))
+        .expect("project second Task revision");
+    model
+        .apply_task(&ordered_task_input(
+            "task-02",
+            1,
+            TaskStatus::Ready,
+            NOW + 10,
+        ))
+        .expect("project unrelated Task after the snapshot");
+
+    let historical = model
+        .list_task_views_at(&first_position, &TaskListFilter::default(), access())
+        .expect("read stable historical Task snapshot");
+    assert_eq!(historical.snapshot_position, first_position);
+    assert_eq!(historical.retention_floor.sequence, 0);
+    assert_eq!(historical.items.len(), 1);
+    assert_eq!(historical.items[0].task.as_ref().expect("task").revision, 1);
+    let current_items = model
+        .list_task_views(&TaskListFilter::default(), access())
+        .expect("read current Task snapshot");
+    assert_eq!(current_items.len(), 2);
+    assert_eq!(
+        current_items[0].task.as_ref().expect("task").task_id,
+        "task-01"
+    );
+    assert_eq!(current_items[0].task.as_ref().expect("task").revision, 2);
+
+    let current = model.position().expect("current position");
+    let floor = model
+        .compact_history(current.sequence)
+        .expect("compact with caller-selected floor");
+    assert_eq!(floor.sequence, current.sequence);
+    let retained = model
+        .list_task_views_at(&current, &TaskListFilter::default(), access())
+        .expect("baseline at retention floor remains readable");
+    assert_eq!(retained.items.len(), 2);
+    assert_eq!(
+        retained.items[0].task.as_ref().expect("task").task_id,
+        "task-01"
+    );
+    assert_eq!(retained.items[0].task.as_ref().expect("task").revision, 2);
+    assert!(matches!(
+        model
+            .list_task_views_at(&first_position, &TaskListFilter::default(), access())
+            .expect_err("snapshot below floor must reset"),
+        ProjectionFailure::SnapshotBeforeRetention { .. }
+    ));
+    let frames = model
+        .task_frames_after(&first_position, &TaskListFilter::default(), &[], access())
+        .expect("watch below floor receives reset");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].kind, StreamFrameKind::ResetRequired as i32);
+    assert_eq!(
+        frames[0].reset_reason_code.as_deref(),
+        Some("PROJECTION_RETENTION_GAP")
+    );
 }
 
 #[test]

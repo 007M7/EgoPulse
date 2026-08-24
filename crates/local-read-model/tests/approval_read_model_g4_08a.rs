@@ -13,11 +13,12 @@ use egopulse_domain_contracts::v01::egopulse::policy::v1::{
     HarnessApprovalDecisionRecord, HarnessApprovalDecisionState, HarnessApprovalDecisionStateKind,
     HarnessApprovalRequestBinding, PolicyDecisionCommandResult, PolicyDecisionEvent,
 };
+use egopulse_domain_contracts::v01::egopulse::task::v1::{TaskEvent, TaskSnapshot, TaskStatus};
 use egopulse_local_read_model::{
     AdapterApprovalProjectionInput, ApprovalListFilter, ApprovalViewAccess,
     CollaborationProjectionInput, LocalReadModel, LocalReadModelConfig, LocalReadModelKey,
     PolicyApprovalProjectionInput, ProjectionApply, ProjectionFailure, ProjectionMessageMetadata,
-    ProjectionMessageMode,
+    ProjectionMessageMode, TaskProjectionInput,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -155,6 +156,29 @@ fn adapter_input(
         dispatch_id: "dispatch-01".to_owned(),
         fencing_token: 9,
         observation,
+    }
+}
+
+fn unrelated_task_input() -> TaskProjectionInput {
+    let event = TaskEvent {
+        event_id: "unrelated-task-event-01".to_owned(),
+        task_id: "task-unrelated".to_owned(),
+        resulting_revision: 1,
+        work_revision: 1,
+        snapshot: Some(TaskSnapshot {
+            task_id: "task-unrelated".to_owned(),
+            revision: 1,
+            work_revision: 1,
+            status: TaskStatus::Ready as i32,
+            created_at: Some(timestamp()),
+            updated_at: Some(timestamp()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    TaskProjectionInput {
+        metadata: metadata("unrelated-task-event-01", 1, &event),
+        event,
     }
 }
 
@@ -515,6 +539,82 @@ fn unauthorized_reader_cannot_observe_approval_projection() {
         ),
         Err(ProjectionFailure::PermissionDenied)
     ));
+}
+
+#[test]
+fn historical_approval_snapshot_and_watch_share_the_retention_floor() {
+    let root = TempRoot::new("historical-approval-page");
+    let mut model = open(&root, "epoch-01");
+    let first = model
+        .apply_adapter_approval(&adapter_input(ApprovalRequestLifecycleKind::Open, 1, 11))
+        .expect("project open approval request");
+    let first_position = match first {
+        ProjectionApply::Committed { position, .. } => position,
+        ProjectionApply::Replay { .. } => panic!("first approval request must commit"),
+    };
+    model
+        .apply_adapter_approval(&adapter_input(
+            ApprovalRequestLifecycleKind::Resolved,
+            2,
+            12,
+        ))
+        .expect("project responded approval request");
+    model
+        .apply_task(&unrelated_task_input())
+        .expect("advance projection without changing the approval");
+
+    let historical = model
+        .list_harness_approval_views_at(
+            &first_position,
+            &ApprovalListFilter::default(),
+            founder_access(),
+        )
+        .expect("read stable historical approval snapshot");
+    assert_eq!(historical.items.len(), 1);
+    assert_eq!(
+        historical.items[0].request_lifecycle,
+        ApprovalRequestLifecycleKind::Open as i32
+    );
+    assert_eq!(
+        model
+            .get_harness_approval_view("approval-01", founder_access())
+            .expect("read current approval")
+            .expect("approval")
+            .request_lifecycle,
+        ApprovalRequestLifecycleKind::Resolved as i32
+    );
+
+    let current = model.position().expect("current position");
+    model
+        .compact_history(current.sequence)
+        .expect("advance retention floor");
+    let retained = model
+        .list_harness_approval_views_at(&current, &ApprovalListFilter::default(), founder_access())
+        .expect("approval baseline below the floor remains readable");
+    assert_eq!(retained.items.len(), 1);
+    assert_eq!(
+        retained.items[0].request_lifecycle,
+        ApprovalRequestLifecycleKind::Resolved as i32
+    );
+    assert!(matches!(
+        model
+            .list_harness_approval_views_at(
+                &first_position,
+                &ApprovalListFilter::default(),
+                founder_access(),
+            )
+            .expect_err("approval snapshot below floor must reset"),
+        ProjectionFailure::SnapshotBeforeRetention { .. }
+    ));
+    let frames = model
+        .approval_frames_after(&first_position, founder_access())
+        .expect("approval watch below floor receives reset");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].kind, StreamFrameKind::ResetRequired as i32);
+    assert_eq!(
+        frames[0].reset_reason_code.as_deref(),
+        Some("PROJECTION_RETENTION_GAP")
+    );
 }
 
 #[test]

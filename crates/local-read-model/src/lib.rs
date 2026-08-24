@@ -161,6 +161,16 @@ CREATE TABLE evidence_graph_views (
 ) STRICT;
 "#;
 
+const SCHEMA_V3: &str = r#"
+ALTER TABLE projection_metadata
+  ADD COLUMN retention_floor_sequence INTEGER NOT NULL DEFAULT 0
+  CHECK (retention_floor_sequence >= 0 AND retention_floor_sequence <= current_sequence);
+CREATE INDEX task_view_frames_entity_sequence_idx
+  ON task_view_frames(task_id,sequence);
+CREATE INDEX approval_view_frames_entity_sequence_idx
+  ON harness_approval_frames(approval_request_id,sequence);
+"#;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ProjectionMessageMode {
     #[default]
@@ -213,6 +223,13 @@ pub struct ApprovalListFilter {
     pub decision_states: Vec<i32>,
     pub task_ids: Vec<String>,
     pub actionable_only: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoricalPage<T> {
+    pub snapshot_position: ProjectionPosition,
+    pub retention_floor: ProjectionPosition,
+    pub items: Vec<T>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -269,6 +286,14 @@ pub enum ProjectionFailure {
     IntegrityFailure,
     #[error("projection read is not authorized")]
     PermissionDenied,
+    #[error("requested projection snapshot belongs to a different epoch")]
+    SnapshotEpochMismatch,
+    #[error("requested projection snapshot is ahead of the current position")]
+    SnapshotAhead,
+    #[error("requested projection snapshot is below the retention floor")]
+    SnapshotBeforeRetention { requested: u64, floor: u64 },
+    #[error("projection retention floor is invalid or would move backwards")]
+    InvalidRetentionFloor,
 }
 
 pub struct LocalReadModel {
@@ -299,9 +324,11 @@ impl LocalReadModel {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "secure_delete", "ON")?;
-        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)]).to_latest(&mut connection)?;
-        let legacy_digest = sha256(SCHEMA_V1.as_bytes());
-        let digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes());
+        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2), M::up(SCHEMA_V3)])
+            .to_latest(&mut connection)?;
+        let legacy_v1_digest = sha256(SCHEMA_V1.as_bytes());
+        let legacy_v2_digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes());
+        let digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}\n{SCHEMA_V3}").as_bytes());
         connection.execute(
             "INSERT OR IGNORE INTO projection_metadata(
                singleton,epoch,schema_profile_id,schema_profile_sha256,current_sequence,health
@@ -322,11 +349,11 @@ impl LocalReadModel {
         if actual.0 != config.epoch || actual.1 != SCHEMA_PROFILE_ID {
             return Err(ProjectionFailure::StoreGenerationMismatch);
         }
-        if actual.2 == legacy_digest {
+        if actual.2 == legacy_v1_digest || actual.2 == legacy_v2_digest {
             connection.execute(
                 "UPDATE projection_metadata SET schema_profile_sha256=?1
-                 WHERE singleton=1 AND schema_profile_sha256=?2",
-                params![digest, legacy_digest],
+                 WHERE singleton=1 AND schema_profile_sha256 IN (?2,?3)",
+                params![digest, legacy_v1_digest, legacy_v2_digest],
             )?;
         } else if actual.2 != digest {
             return Err(ProjectionFailure::StoreGenerationMismatch);
@@ -527,19 +554,64 @@ impl LocalReadModel {
         for payload in payloads {
             let mut view = HarnessApprovalView::decode(payload.as_slice())?;
             apply_access(&mut view, access, health);
-            let decision_state = view.policy_decision.as_ref().map(|value| value.state);
-            if (!filter.request_lifecycles.is_empty()
-                && !filter.request_lifecycles.contains(&view.request_lifecycle))
-                || (!filter.decision_states.is_empty()
-                    && !decision_state.is_some_and(|value| filter.decision_states.contains(&value)))
-                || (!filter.task_ids.is_empty() && !filter.task_ids.contains(&view.task_id))
-                || (filter.actionable_only && view.available_actions.is_empty())
-            {
+            if !approval_matches_filter(&view, filter) {
                 continue;
             }
             views.push(view);
         }
         Ok(views)
+    }
+
+    pub fn list_harness_approval_views_at(
+        &self,
+        snapshot: &ProjectionPosition,
+        filter: &ApprovalListFilter,
+        access: ApprovalViewAccess,
+    ) -> Result<HistoricalPage<HarnessApprovalView>, ProjectionFailure> {
+        if !access.can_read {
+            return Err(ProjectionFailure::PermissionDenied);
+        }
+        let (snapshot_position, retention_floor, health) = self.historical_context(snapshot)?;
+        let mut statement = self.connection.prepare(
+            "SELECT current.frame
+             FROM harness_approval_frames current
+             WHERE current.sequence<=?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM harness_approval_frames newer
+                 WHERE newer.approval_request_id=current.approval_request_id
+                   AND newer.sequence<=?1 AND newer.sequence>current.sequence
+               )",
+        )?;
+        let payloads = statement
+            .query_map([snapshot.sequence as i64], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut items = Vec::new();
+        for payload in payloads {
+            let frame = HarnessApprovalViewStreamFrame::decode(payload.as_slice())?;
+            if StreamFrameKind::try_from(frame.kind) != Ok(StreamFrameKind::Snapshot)
+                || frame
+                    .position
+                    .as_ref()
+                    .is_none_or(|position| position.sequence > snapshot.sequence)
+            {
+                return Err(ProjectionFailure::IntegrityFailure);
+            }
+            let mut view = frame.snapshot.ok_or(ProjectionFailure::IntegrityFailure)?;
+            apply_access(&mut view, access, health);
+            if approval_matches_filter(&view, filter) {
+                items.push(view);
+            }
+        }
+        items.sort_by(|left, right| {
+            approval_updated_sequence(right)
+                .cmp(&approval_updated_sequence(left))
+                .then_with(|| left.approval_request_id.cmp(&right.approval_request_id))
+        });
+        Ok(HistoricalPage {
+            snapshot_position,
+            retention_floor,
+            items,
+        })
     }
 
     pub fn approval_frames_after(
@@ -552,18 +624,22 @@ impl LocalReadModel {
         }
         let current = self.position()?;
         let health = self.health()?;
+        let floor = self.retention_floor()?;
         if after.epoch != current.epoch
             || after.sequence > current.sequence
+            || after.sequence < floor.sequence
             || health != ProjectionHealth::Ready
         {
             return Ok(vec![HarnessApprovalViewStreamFrame {
                 kind: StreamFrameKind::ResetRequired as i32,
-                position: Some(current),
+                position: Some(current.clone()),
                 snapshot: None,
-                reset_reason_code: Some(if health == ProjectionHealth::Ready {
-                    "PROJECTION_EPOCH_OR_POSITION_INVALID".to_owned()
-                } else {
+                reset_reason_code: Some(if health != ProjectionHealth::Ready {
                     "PROJECTION_NOT_READY".to_owned()
+                } else if after.epoch == current.epoch && after.sequence < floor.sequence {
+                    "PROJECTION_RETENTION_GAP".to_owned()
+                } else {
+                    "PROJECTION_EPOCH_OR_POSITION_INVALID".to_owned()
                 }),
             }]);
         }
@@ -597,6 +673,57 @@ impl LocalReadModel {
             sequence: sequence as u64,
             projected_at: None,
         })
+    }
+
+    pub fn retention_floor(&self) -> Result<ProjectionPosition, ProjectionFailure> {
+        let (epoch, sequence): (String, i64) = self.connection.query_row(
+            "SELECT epoch,retention_floor_sequence FROM projection_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(ProjectionPosition {
+            epoch,
+            sequence: sequence as u64,
+            projected_at: None,
+        })
+    }
+
+    pub fn compact_history(
+        &mut self,
+        retain_from_sequence: u64,
+    ) -> Result<ProjectionPosition, ProjectionFailure> {
+        let current = self.position()?;
+        let floor = self.retention_floor()?;
+        if retain_from_sequence < floor.sequence || retain_from_sequence > current.sequence {
+            return Err(ProjectionFailure::InvalidRetentionFloor);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM task_view_frames AS old
+             WHERE old.sequence<?1 AND EXISTS (
+               SELECT 1 FROM task_view_frames AS baseline
+               WHERE baseline.task_id=old.task_id
+                 AND baseline.sequence<=?1 AND baseline.sequence>old.sequence
+             )",
+            [retain_from_sequence as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM harness_approval_frames AS old
+             WHERE old.sequence<?1 AND EXISTS (
+               SELECT 1 FROM harness_approval_frames AS baseline
+               WHERE baseline.approval_request_id=old.approval_request_id
+                 AND baseline.sequence<=?1 AND baseline.sequence>old.sequence
+             )",
+            [retain_from_sequence as i64],
+        )?;
+        transaction.execute(
+            "UPDATE projection_metadata SET retention_floor_sequence=?1 WHERE singleton=1",
+            [retain_from_sequence as i64],
+        )?;
+        transaction.commit()?;
+        self.retention_floor()
     }
 
     pub fn health(&self) -> Result<ProjectionHealth, ProjectionFailure> {
@@ -633,7 +760,8 @@ impl LocalReadModel {
             transaction.execute(&format!("DELETE FROM {table}"), [])?;
         }
         transaction.execute(
-            "UPDATE projection_metadata SET epoch=?1,current_sequence=0,health=?2
+            "UPDATE projection_metadata
+             SET epoch=?1,current_sequence=0,retention_floor_sequence=0,health=?2
              WHERE singleton=1",
             params![new_epoch, ProjectionHealth::Rebuilding as i32],
         )?;
@@ -715,6 +843,27 @@ impl LocalReadModel {
             sequence,
             projected_at: Some(*projected_at),
         }
+    }
+
+    fn historical_context(
+        &self,
+        snapshot: &ProjectionPosition,
+    ) -> Result<(ProjectionPosition, ProjectionPosition, ProjectionHealth), ProjectionFailure> {
+        let current = self.position()?;
+        if snapshot.epoch != current.epoch {
+            return Err(ProjectionFailure::SnapshotEpochMismatch);
+        }
+        if snapshot.sequence > current.sequence {
+            return Err(ProjectionFailure::SnapshotAhead);
+        }
+        let floor = self.retention_floor()?;
+        if snapshot.sequence < floor.sequence {
+            return Err(ProjectionFailure::SnapshotBeforeRetention {
+                requested: snapshot.sequence,
+                floor: floor.sequence,
+            });
+        }
+        Ok((snapshot.clone(), floor, self.health()?))
     }
 }
 
@@ -1318,7 +1467,86 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn approval_matches_filter(view: &HarnessApprovalView, filter: &ApprovalListFilter) -> bool {
+    let decision_state = view.policy_decision.as_ref().map(|value| value.state);
+    (filter.request_lifecycles.is_empty()
+        || filter.request_lifecycles.contains(&view.request_lifecycle))
+        && (filter.decision_states.is_empty()
+            || decision_state.is_some_and(|value| filter.decision_states.contains(&value)))
+        && (filter.task_ids.is_empty() || filter.task_ids.contains(&view.task_id))
+        && (!filter.actionable_only || !view.available_actions.is_empty())
+}
+
+fn approval_updated_sequence(view: &HarnessApprovalView) -> u64 {
+    view.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.position.as_ref())
+        .map_or(0, |position| position.sequence)
+}
+
 #[allow(dead_code)]
 fn _assert_path_is_scoped(path: &Path) -> bool {
     !path.as_os_str().is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn v2_store_migrates_to_retention_floor_without_losing_position() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "egopulse-read-model-v2-migration-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create migration root");
+        let database_path = root.join("read-model.db");
+        let key = [0x19; 32];
+        {
+            let connection = Connection::open(&database_path).expect("create legacy store");
+            connection
+                .pragma_update(None, "key", format!("x'{}'", hex::encode(key)))
+                .expect("set legacy SQLCipher key");
+            connection
+                .execute_batch(SCHEMA_V1)
+                .expect("create v1 schema");
+            connection
+                .execute_batch(SCHEMA_V2)
+                .expect("create v2 schema");
+            connection
+                .pragma_update(None, "user_version", 2)
+                .expect("mark v2 migration level");
+            let legacy_digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes());
+            connection
+                .execute(
+                    "INSERT INTO projection_metadata(
+                       singleton,epoch,schema_profile_id,schema_profile_sha256,current_sequence,health
+                     ) VALUES(1,?1,?2,?3,7,?4)",
+                    params![
+                        "epoch-v2",
+                        SCHEMA_PROFILE_ID,
+                        legacy_digest,
+                        ProjectionHealth::Ready as i32
+                    ],
+                )
+                .expect("seed v2 metadata");
+        }
+
+        let model = LocalReadModel::open(LocalReadModelConfig {
+            database_path,
+            epoch: "epoch-v2".to_owned(),
+            key: LocalReadModelKey::new(key),
+        })
+        .expect("migrate v2 store");
+        assert_eq!(model.position().expect("position").sequence, 7);
+        assert_eq!(model.retention_floor().expect("floor").sequence, 0);
+        assert!(model.integrity_is_ok().expect("integrity"));
+        drop(model);
+        fs::remove_dir_all(root).expect("remove migration root");
+    }
 }

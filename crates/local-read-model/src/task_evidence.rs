@@ -282,18 +282,63 @@ impl LocalReadModel {
         let mut views = Vec::new();
         for payload in payloads {
             let mut view = TaskView::decode(payload.as_slice())?;
-            if !filter.statuses.is_empty()
-                && view
-                    .task
-                    .as_ref()
-                    .is_none_or(|task| !filter.statuses.contains(&task.status))
-            {
+            if !task_matches_filter(&view, filter) {
                 continue;
             }
             apply_task_access(&mut view, access, health);
             views.push(view);
         }
+        views.sort_by(compare_task_views);
         Ok(views)
+    }
+
+    pub fn list_task_views_at(
+        &self,
+        snapshot: &ProjectionPosition,
+        filter: &TaskListFilter,
+        access: TaskViewAccess,
+    ) -> Result<HistoricalPage<TaskView>, ProjectionFailure> {
+        if !access.can_read {
+            return Err(ProjectionFailure::PermissionDenied);
+        }
+        let (snapshot_position, retention_floor, health) = self.historical_context(snapshot)?;
+        let mut statement = self.connection.prepare(
+            "SELECT current.frame
+             FROM task_view_frames current
+             WHERE current.sequence<=?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM task_view_frames newer
+                 WHERE newer.task_id=current.task_id
+                   AND newer.sequence<=?1 AND newer.sequence>current.sequence
+               )",
+        )?;
+        let payloads = statement
+            .query_map([snapshot.sequence as i64], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut items = Vec::new();
+        for payload in payloads {
+            let frame = TaskViewStreamFrame::decode(payload.as_slice())?;
+            if StreamFrameKind::try_from(frame.kind) != Ok(StreamFrameKind::Snapshot)
+                || frame
+                    .position
+                    .as_ref()
+                    .is_none_or(|position| position.sequence > snapshot.sequence)
+            {
+                return Err(ProjectionFailure::IntegrityFailure);
+            }
+            let mut view = frame.snapshot.ok_or(ProjectionFailure::IntegrityFailure)?;
+            if !task_matches_filter(&view, filter) {
+                continue;
+            }
+            apply_task_access(&mut view, access, health);
+            items.push(view);
+        }
+        items.sort_by(compare_task_views);
+        Ok(HistoricalPage {
+            snapshot_position,
+            retention_floor,
+            items,
+        })
     }
 
     pub fn task_frames_after(
@@ -308,18 +353,22 @@ impl LocalReadModel {
         }
         let current = self.position()?;
         let health = self.health()?;
+        let floor = self.retention_floor()?;
         if after.epoch != current.epoch
             || after.sequence > current.sequence
+            || after.sequence < floor.sequence
             || health != ProjectionHealth::Ready
         {
             return Ok(vec![TaskViewStreamFrame {
                 kind: StreamFrameKind::ResetRequired as i32,
-                position: Some(current),
+                position: Some(current.clone()),
                 snapshot: None,
-                reset_reason_code: Some(if health == ProjectionHealth::Ready {
-                    "PROJECTION_EPOCH_OR_POSITION_INVALID".to_owned()
-                } else {
+                reset_reason_code: Some(if health != ProjectionHealth::Ready {
                     "PROJECTION_NOT_READY".to_owned()
+                } else if after.epoch == current.epoch && after.sequence < floor.sequence {
+                    "PROJECTION_RETENTION_GAP".to_owned()
+                } else {
+                    "PROJECTION_EPOCH_OR_POSITION_INVALID".to_owned()
                 }),
             }]);
         }
@@ -1334,6 +1383,31 @@ fn load_artifact_member(
         Ok((revision, event, payload))
     })
     .transpose()
+}
+
+fn task_matches_filter(view: &TaskView, filter: &TaskListFilter) -> bool {
+    filter.statuses.is_empty()
+        || view
+            .task
+            .as_ref()
+            .is_some_and(|task| filter.statuses.contains(&task.status))
+}
+
+fn compare_task_views(left: &TaskView, right: &TaskView) -> std::cmp::Ordering {
+    task_updated_at(right)
+        .cmp(&task_updated_at(left))
+        .then_with(|| task_id(left).cmp(task_id(right)))
+}
+
+fn task_updated_at(view: &TaskView) -> Option<(i64, i32)> {
+    view.task
+        .as_ref()
+        .and_then(|task| task.updated_at.as_ref())
+        .map(|value| (value.seconds, value.nanos))
+}
+
+fn task_id(view: &TaskView) -> &str {
+    view.task.as_ref().map_or("", |task| task.task_id.as_str())
 }
 
 fn apply_task_access(view: &mut TaskView, access: TaskViewAccess, health: ProjectionHealth) {
