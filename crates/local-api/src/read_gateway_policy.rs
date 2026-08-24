@@ -9,6 +9,7 @@ pub struct ReadGatewayPolicy {
     version: String,
     default_page_size: u32,
     max_page_size: u32,
+    minimum_position_wait_timeout: Duration,
     cursor_ttl: Duration,
     await_token_ttl: Duration,
     default_await_timeout: Duration,
@@ -29,6 +30,7 @@ impl ReadGatewayPolicy {
         version: impl Into<String>,
         default_page_size: u32,
         max_page_size: u32,
+        minimum_position_wait_timeout: Duration,
         cursor_ttl: Duration,
         await_token_ttl: Duration,
         default_await_timeout: Duration,
@@ -40,6 +42,7 @@ impl ReadGatewayPolicy {
             version: version.into(),
             default_page_size,
             max_page_size,
+            minimum_position_wait_timeout,
             cursor_ttl,
             await_token_ttl,
             default_await_timeout,
@@ -57,6 +60,7 @@ impl ReadGatewayPolicy {
             READ_GATEWAY_POLICY_V01,
             50,
             200,
+            Duration::from_secs(5),
             Duration::from_secs(30 * 60),
             Duration::from_secs(5 * 60),
             Duration::from_secs(5),
@@ -73,6 +77,7 @@ impl ReadGatewayPolicy {
             || self.version.chars().any(char::is_control)
             || self.default_page_size == 0
             || self.max_page_size < self.default_page_size
+            || self.minimum_position_wait_timeout.is_zero()
             || self.cursor_ttl.is_zero()
             || self.await_token_ttl.is_zero()
             || self.default_await_timeout.is_zero()
@@ -100,6 +105,11 @@ impl ReadGatewayPolicy {
     #[must_use]
     pub const fn max_page_size(&self) -> u32 {
         self.max_page_size
+    }
+
+    #[must_use]
+    pub const fn minimum_position_wait_timeout(&self) -> Duration {
+        self.minimum_position_wait_timeout
     }
 
     #[must_use]
@@ -188,6 +198,10 @@ mod tests {
         assert_eq!(policy.effective_page_size(1), 1);
         assert_eq!(policy.effective_page_size(200), 200);
         assert_eq!(policy.effective_page_size(201), 200);
+        assert_eq!(
+            policy.minimum_position_wait_timeout(),
+            Duration::from_secs(5)
+        );
         assert_eq!(policy.cursor_ttl(), Duration::from_secs(1_800));
         assert_eq!(policy.await_token_ttl(), Duration::from_secs(300));
         assert_eq!(policy.effective_await_timeout(0), Duration::from_secs(5));
@@ -210,6 +224,7 @@ mod tests {
                 "test/v1",
                 50,
                 49,
+                Duration::from_secs(1),
                 Duration::from_secs(1),
                 Duration::from_secs(1),
                 Duration::from_secs(2),

@@ -1193,6 +1193,7 @@ dependencies = [
  "base64 0.22.1",
  "egopulse-domain-contracts",
  "egopulse-local-ipc-platform",
+ "egopulse-local-read-model",
  "hmac",
  "hyper-util",
  "prost-types",
