@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "v01-policy-fixture/v0.1",
+  "fixtureId": "policy-stale-request-observation-rejected",
+  "category": "stale",
+  "requirementRefs": ["G4-07A-BIND-02", "QH-02"],
+  "principal": { "kind": "FOUNDER", "principalId": "os-user:founder", "authenticated": true },
+  "startingState": null,
+  "resolvedReferences": { "approvalRequest": { "approvalRequestId": "approval-001", "requestObservationId": "observation-approval-002", "requestObservationSequence": 13, "durable": true } },
+  "command": {
+    "issueHarnessApprovalDecision": {
+      "metadata": { "commandId": "cmd-policy-stale-001", "idempotencyKey": "policy-stale-001", "idempotencyScope": "approval-001", "requestDigestSha256": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1", "issuedAt": "2026-08-24T01:12:00Z", "correlationId": "corr-policy-003" },
+      "approvalRequestId": "approval-001",
+      "expectedActionDigestSha256": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
+      "expectedRequestObservationId": "observation-approval-001",
+      "expectedRequestObservationSequence": 12,
+      "decision": "APPROVAL_DECISION_DENY",
+      "reasonCode": "STALE_VIEW"
+    }
+  },
+  "expected": { "outcome": "error", "businessWriteCount": 0, "errorCode": "POLICY_DECISION_ERROR_CODE_REVISION_CONFLICT", "adapterEnvelopeOutboxCount": 0 }
+}

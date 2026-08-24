@@ -48,7 +48,7 @@
     "releaseBuildRequired": true,
     "failedSamplesIncluded": true,
     "crashInjectionsPerBoundary": 10,
-    "crashBoundaryCount": 7,
+    "crashBoundaryCount": 8,
     "providerAndLocalLatencySeparated": true
   }
 }

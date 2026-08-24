@@ -7,9 +7,9 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
 const contractsRoot = join(repositoryRoot, "contracts");
 const manifestPath = join(contractsRoot, "manifest.json");
-const expectedManifestSha256 = "adbcba96ee023f886ba6ea8de0083d7f09c2f5db67b60ddd6db6b231932fbe66";
-const expectedArtifactCount = 198;
-const expectedFixtureCount = 157;
+const expectedManifestSha256 = "80f8742ec8df1926421dac88dc22e34fa8837a8cc19f35d7c75b4a4eee1fd2d5";
+const expectedArtifactCount = 217;
+const expectedFixtureCount = 167;
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -35,7 +35,8 @@ const manifestSha256 = sha256(manifestBytes);
 assert(manifestSha256 === expectedManifestSha256, `manifest digest mismatch: ${manifestSha256}`);
 
 const manifest = JSON.parse(manifestBytes.toString("utf8"));
-assert(manifest.candidateVersion === "0.1.0-draft.11", "unexpected V-01 contract candidate version");
+assert(manifest.candidateVersion === "0.1.0-draft.12", "unexpected V-01 implementation contract version");
+assert(manifest.targetedRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3", "missing Founder authority for targeted revision");
 assert(manifest.artifacts.length === expectedArtifactCount, "unexpected V-01 artifact count");
 
 let fixtureCount = 0;
@@ -51,5 +52,5 @@ assert(fixtureCount === expectedFixtureCount, `unexpected fixture count: ${fixtu
 assert(existsSync(join(contractsRoot, "proto", "egopulse", "foundation", "v1", "health.proto")), "Foundation health contract was lost during V-01 import");
 
 console.log(
-  `V-01 contract import verified: manifest=${manifestSha256}, artifacts=${manifest.artifacts.length}, fixtures=${fixtureCount}`,
+  `V-01 contract SSOT verified: version=${manifest.candidateVersion}, manifest=${manifestSha256}, artifacts=${manifest.artifacts.length}, fixtures=${fixtureCount}`,
 );

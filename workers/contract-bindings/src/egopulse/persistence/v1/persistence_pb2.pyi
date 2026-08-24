@@ -24,6 +24,7 @@ class PersistenceDomain(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     PERSISTENCE_DOMAIN_FOUNDER_VERDICT: _ClassVar[PersistenceDomain]
     PERSISTENCE_DOMAIN_LOCAL_READ_MODEL: _ClassVar[PersistenceDomain]
     PERSISTENCE_DOMAIN_RECOVERY_COORDINATOR: _ClassVar[PersistenceDomain]
+    PERSISTENCE_DOMAIN_POLICY_DECISION: _ClassVar[PersistenceDomain]
 
 class StoreRole(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -102,6 +103,7 @@ PERSISTENCE_DOMAIN_VERIFICATION: PersistenceDomain
 PERSISTENCE_DOMAIN_FOUNDER_VERDICT: PersistenceDomain
 PERSISTENCE_DOMAIN_LOCAL_READ_MODEL: PersistenceDomain
 PERSISTENCE_DOMAIN_RECOVERY_COORDINATOR: PersistenceDomain
+PERSISTENCE_DOMAIN_POLICY_DECISION: PersistenceDomain
 STORE_ROLE_UNSPECIFIED: StoreRole
 STORE_ROLE_AUTHORITY: StoreRole
 STORE_ROLE_ADAPTER_DURABLE_EDGE: StoreRole

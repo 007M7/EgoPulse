@@ -11,7 +11,7 @@
     "check": "pnpm run check:public-boundary && pnpm run check:boundaries && pnpm run check:contracts && pnpm run check:v01-contract-import && pnpm run check:contract-codegen && node scripts/check-typescript.mjs",
     "check:public-boundary": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-public-boundary.ps1",
     "check:boundaries": "node scripts/check-boundaries.mjs",
-    "check:contracts": "node scripts/check-proto.mjs && node scripts/check-contract-breaking.mjs && node scripts/check-json-schema.mjs",
+    "check:contracts": "node scripts/check-proto.mjs && node scripts/check-approved-contract-change.mjs && node scripts/check-contract-breaking.mjs && node scripts/check-json-schema.mjs",
     "check:v01-contract-import": "node scripts/verify-v01-contract-import.mjs",
     "check:contract-codegen": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/contract-codegen.ps1 -Mode Check",
     "generate:contracts": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/contract-codegen.ps1 -Mode Write",

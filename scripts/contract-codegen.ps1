@@ -17,14 +17,18 @@ $typescriptDestination = Join-Path $repositoryRoot 'packages\generated-client\sr
 $rustDestination = Join-Path $repositoryRoot 'crates\domain-contracts\src\generated'
 $pythonDestination = Join-Path $repositoryRoot 'workers\contract-bindings\src'
 $generatedManifestPath = Join-Path $repositoryRoot 'generated\contract-bindings-manifest.json'
-$toolRoot = Join-Path $cacheRoot 'tools'
-$vendoredProstArchive = Join-Path $repositoryRoot 'tools\vendor\protoc-gen-prost-0.5.0.crate'
-$vendoredProstSha256 = '4018e7b5e3a213d241d79a0ef43a442a17dc23dcdd5b81b0c42b2549197897fd'
-$vendoredProstWindowsBinary = Join-Path $repositoryRoot 'tools\vendor\protoc-gen-prost\windows-x86_64\protoc-gen-prost.exe'
-$vendoredProstWindowsBinarySha256 = 'cfd828f8d2b98854bd69869353d0f72f2bbcfd28c2ee599060cdb86e31a9c4a3'
-$prostExecutableName = if ($IsWindows -or $env:OS -eq 'Windows_NT') { 'protoc-gen-prost.exe' } else { 'protoc-gen-prost' }
-$prostExecutable = Join-Path $toolRoot "bin\$prostExecutableName"
-$expectedContractManifestSha256 = 'adbcba96ee023f886ba6ea8de0083d7f09c2f5db67b60ddd6db6b231932fbe66'
+$expectedContractManifestSha256 = '80f8742ec8df1926421dac88dc22e34fa8837a8cc19f35d7c75b4a4eee1fd2d5'
+$cargoCommand = Get-Command 'cargo' -ErrorAction SilentlyContinue
+$cargoExecutable = if ($null -ne $cargoCommand) {
+    $cargoCommand.Source
+} elseif ($IsWindows -or $env:OS -eq 'Windows_NT') {
+    Join-Path ([Environment]::GetFolderPath('UserProfile')) '.cargo\bin\cargo.exe'
+} else {
+    'cargo'
+}
+if (($IsWindows -or $env:OS -eq 'Windows_NT') -and -not (Test-Path -LiteralPath $cargoExecutable)) {
+    throw "Cargo is missing: $cargoExecutable"
+}
 
 function Assert-UnderRepository {
     param([string]$Path)
@@ -150,11 +154,14 @@ if ($contractManifestHash -ne $expectedContractManifestSha256) {
 $contractManifest = Get-Content -Raw -Encoding utf8 -LiteralPath $contractManifestPath | ConvertFrom-Json
 $protoArtifacts = @(
     $contractManifest.artifacts |
-        Where-Object { $_.path -like 'proto/*.proto' } |
+        Where-Object {
+            $_.path -like 'proto/*.proto' -and
+            $_.path -ne 'proto/egopulse/foundation/v1/health.proto'
+        } |
         Sort-Object path
 )
-if ($protoArtifacts.Count -ne 9) {
-    throw "expected 9 V-01 proto artifacts, found $($protoArtifacts.Count)"
+if ($protoArtifacts.Count -ne 10) {
+    throw "expected 10 V-01 proto artifacts, found $($protoArtifacts.Count)"
 }
 
 Invoke-Checked -Executable 'node' -Arguments @((Join-Path $repositoryRoot 'scripts\verify-v01-contract-import.mjs')) -Failure 'V-01 import verification failed'
@@ -164,26 +171,6 @@ $protocGenEsExecutable = Join-Path $repositoryRoot 'node_modules\.bin\protoc-gen
 if (-not (Test-Path -LiteralPath $bufExecutable)) { throw 'Buf is missing; run pnpm install --frozen-lockfile' }
 if (-not (Test-Path -LiteralPath $protocGenEsExecutable)) { throw 'protoc-gen-es is missing; run pnpm install --frozen-lockfile' }
 
-if (-not (Test-Path -LiteralPath $prostExecutable)) {
-    if (-not ($IsWindows -or $env:OS -eq 'Windows_NT')) {
-        throw 'G4-01 protoc-gen-prost bootstrap currently supports only the accepted Windows x86_64 CI baseline'
-    }
-    $actualVendorHash = Get-Sha256Hex -LiteralPath $vendoredProstArchive
-    if ($actualVendorHash -ne $vendoredProstSha256) {
-        throw "vendored protoc-gen-prost archive digest mismatch: $actualVendorHash"
-    }
-    $actualBinaryHash = Get-Sha256Hex -LiteralPath $vendoredProstWindowsBinary
-    if ($actualBinaryHash -ne $vendoredProstWindowsBinarySha256) {
-        throw "vendored protoc-gen-prost binary digest mismatch: $actualBinaryHash"
-    }
-    New-Item -ItemType Directory -Path (Split-Path -Parent $prostExecutable) -Force | Out-Null
-    Copy-Item -LiteralPath $vendoredProstWindowsBinary -Destination $prostExecutable
-}
-$prostVersion = (& $prostExecutable --version).Trim()
-if ($LASTEXITCODE -ne 0 -or $prostVersion -ne '0.5.0') {
-    throw "unexpected protoc-gen-prost version: $prostVersion"
-}
-
 if (Test-Path -LiteralPath $stagingRoot) {
     Remove-Item -LiteralPath $stagingRoot -Recurse -Force
 }
@@ -192,7 +179,7 @@ New-Item -ItemType Directory -Path $typescriptStage, $rustStage, $pythonStage -F
 $oldPath = $env:PATH
 $oldBufCache = $env:BUF_CACHE_DIR
 $oldUvCache = $env:UV_CACHE_DIR
-$env:PATH = "$(Join-Path $repositoryRoot 'node_modules\.bin');$(Join-Path $toolRoot 'bin');$oldPath"
+$env:PATH = "$(Join-Path $repositoryRoot 'node_modules\.bin');$oldPath"
 $env:BUF_CACHE_DIR = Join-Path $cacheRoot 'buf'
 $env:UV_CACHE_DIR = Join-Path $cacheRoot 'uv'
 try {
@@ -208,8 +195,6 @@ plugins:
     opt:
       - target=ts
       - import_extension=js
-  - local: protoc-gen-prost
-    out: $rustOutput
 "@
     $utf8NoBom = New-Object Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($templatePath, $template.Replace("`r`n", "`n") + "`n", $utf8NoBom)
@@ -218,7 +203,18 @@ plugins:
     foreach ($artifact in $protoArtifacts) {
         $bufArguments += @('--path', "contracts/$($artifact.path)")
     }
-    Invoke-Checked -Executable $bufExecutable -Arguments $bufArguments -Failure 'Buf TypeScript/Rust generation failed'
+    Invoke-Checked -Executable $bufExecutable -Arguments $bufArguments -Failure 'Buf TypeScript generation failed'
+
+    $rustDescriptor = Join-Path $stagingRoot 'v01-file-descriptor-set.binpb'
+    $descriptorArguments = @('build', '--as-file-descriptor-set', '-o', $rustDescriptor)
+    foreach ($artifact in $protoArtifacts) {
+        $descriptorArguments += @('--path', "contracts/$($artifact.path)")
+    }
+    Invoke-Checked -Executable $bufExecutable -Arguments $descriptorArguments -Failure 'Buf Rust descriptor-set build failed'
+    Invoke-Checked -Executable $cargoExecutable -Arguments @(
+        'run', '--locked', '--quiet', '-p', 'egopulse-contract-rust-codegen', '--',
+        $rustDescriptor, $rustStage
+    ) -Failure 'Tonic/Prost Rust service generation failed'
 
     $pythonProtoFiles = @($protoArtifacts | ForEach-Object { $_.path.Substring('proto/'.Length) })
     $pythonArguments = @(
@@ -249,7 +245,7 @@ $typescriptFiles = @(Get-ChildItem -LiteralPath $typescriptStage -Recurse -Filte
 $rustFiles = @(Get-ChildItem -LiteralPath $rustStage -Recurse -Filter '*.rs' -File)
 $pythonModules = @(Get-ChildItem -LiteralPath $pythonStage -Recurse -Filter '*_pb2.py' -File)
 $pythonStubs = @(Get-ChildItem -LiteralPath $pythonStage -Recurse -Filter '*_pb2.pyi' -File)
-if ($typescriptFiles.Count -ne 9 -or $rustFiles.Count -ne 9 -or $pythonModules.Count -ne 9 -or $pythonStubs.Count -ne 9) {
+if ($typescriptFiles.Count -ne 10 -or $rustFiles.Count -ne 10 -or $pythonModules.Count -ne 10 -or $pythonStubs.Count -ne 10) {
     throw "unexpected generated counts: ts=$($typescriptFiles.Count) rust=$($rustFiles.Count) python=$($pythonModules.Count) pyi=$($pythonStubs.Count)"
 }
 
@@ -264,7 +260,7 @@ $generatedManifest = [ordered]@{
     generators = [ordered]@{
         buf = '1.72.0'
         protocGenEs = '2.14.0'
-        protocGenProst = '0.5.0'
+        tonicProstBuild = '0.14.6'
         grpcioTools = '1.83.0'
         protobufPython = '7.35.1'
     }

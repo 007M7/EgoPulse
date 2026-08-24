@@ -5,7 +5,7 @@ package egopulse.localapi.v1;
 import "egopulse/artifact/v1/artifact.proto";
 import "egopulse/collaboration/v1/collaboration.proto";
 import "egopulse/common/v1/common.proto";
-import "egopulse/harness/v1/harness.proto";
+import "egopulse/policy/v1/policy.proto";
 import "egopulse/task/v1/task.proto";
 import "egopulse/verdict/v1/verdict.proto";
 import "egopulse/verification/v1/verification.proto";
@@ -35,6 +35,7 @@ enum SourceDomain {
   SOURCE_DOMAIN_ARTIFACT = 3;
   SOURCE_DOMAIN_VERIFICATION = 4;
   SOURCE_DOMAIN_FOUNDER_VERDICT = 5;
+  SOURCE_DOMAIN_POLICY_DECISION = 6;
 }
 
 enum StreamFrameKind {
@@ -251,13 +252,17 @@ message ExecuteTaskCommandResponse {
 
 message DecideHarnessApprovalRequest {
   ClientRequestMetadata client = 1;
-  egopulse.harness.v1.ApprovalDecisionEnvelope decision = 2;
+  reserved 2;
+  reserved "decision";
+  egopulse.policy.v1.IssueHarnessApprovalDecisionCommand command = 3;
 }
 
 message DecideHarnessApprovalResponse {
-  egopulse.harness.v1.ApprovalDecisionResult authority_result = 1;
+  reserved 1;
+  reserved "authority_result";
   ProjectionAwaitToken await_token = 2;
   LocalApiError gateway_error = 3;
+  egopulse.policy.v1.PolicyDecisionCommandResult policy_authority_result = 4;
 }
 
 message ExecuteFounderVerdictRequest {

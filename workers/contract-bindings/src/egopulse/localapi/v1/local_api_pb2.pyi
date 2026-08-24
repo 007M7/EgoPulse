@@ -3,7 +3,7 @@ import datetime
 from egopulse.artifact.v1 import artifact_pb2 as _artifact_pb2
 from egopulse.collaboration.v1 import collaboration_pb2 as _collaboration_pb2
 from egopulse.common.v1 import common_pb2 as _common_pb2
-from egopulse.harness.v1 import harness_pb2 as _harness_pb2
+from egopulse.policy.v1 import policy_pb2 as _policy_pb2
 from egopulse.task.v1 import task_pb2 as _task_pb2
 from egopulse.verdict.v1 import verdict_pb2 as _verdict_pb2
 from egopulse.verification.v1 import verification_pb2 as _verification_pb2
@@ -41,6 +41,7 @@ class SourceDomain(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     SOURCE_DOMAIN_ARTIFACT: _ClassVar[SourceDomain]
     SOURCE_DOMAIN_VERIFICATION: _ClassVar[SourceDomain]
     SOURCE_DOMAIN_FOUNDER_VERDICT: _ClassVar[SourceDomain]
+    SOURCE_DOMAIN_POLICY_DECISION: _ClassVar[SourceDomain]
 
 class StreamFrameKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -93,6 +94,7 @@ SOURCE_DOMAIN_COLLABORATION: SourceDomain
 SOURCE_DOMAIN_ARTIFACT: SourceDomain
 SOURCE_DOMAIN_VERIFICATION: SourceDomain
 SOURCE_DOMAIN_FOUNDER_VERDICT: SourceDomain
+SOURCE_DOMAIN_POLICY_DECISION: SourceDomain
 STREAM_FRAME_KIND_UNSPECIFIED: StreamFrameKind
 STREAM_FRAME_KIND_SNAPSHOT: StreamFrameKind
 STREAM_FRAME_KIND_HEARTBEAT: StreamFrameKind
@@ -418,22 +420,22 @@ class ExecuteTaskCommandResponse(_message.Message):
     def __init__(self, authority_result: _Optional[_Union[_task_pb2.TaskCommandResult, _Mapping]] = ..., await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ..., gateway_error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
 
 class DecideHarnessApprovalRequest(_message.Message):
-    __slots__ = ("client", "decision")
+    __slots__ = ("client", "command")
     CLIENT_FIELD_NUMBER: _ClassVar[int]
-    DECISION_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_FIELD_NUMBER: _ClassVar[int]
     client: ClientRequestMetadata
-    decision: _harness_pb2.ApprovalDecisionEnvelope
-    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., decision: _Optional[_Union[_harness_pb2.ApprovalDecisionEnvelope, _Mapping]] = ...) -> None: ...
+    command: _policy_pb2.IssueHarnessApprovalDecisionCommand
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., command: _Optional[_Union[_policy_pb2.IssueHarnessApprovalDecisionCommand, _Mapping]] = ...) -> None: ...
 
 class DecideHarnessApprovalResponse(_message.Message):
-    __slots__ = ("authority_result", "await_token", "gateway_error")
-    AUTHORITY_RESULT_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("await_token", "gateway_error", "policy_authority_result")
     AWAIT_TOKEN_FIELD_NUMBER: _ClassVar[int]
     GATEWAY_ERROR_FIELD_NUMBER: _ClassVar[int]
-    authority_result: _harness_pb2.ApprovalDecisionResult
+    POLICY_AUTHORITY_RESULT_FIELD_NUMBER: _ClassVar[int]
     await_token: ProjectionAwaitToken
     gateway_error: LocalApiError
-    def __init__(self, authority_result: _Optional[_Union[_harness_pb2.ApprovalDecisionResult, _Mapping]] = ..., await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ..., gateway_error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+    policy_authority_result: _policy_pb2.PolicyDecisionCommandResult
+    def __init__(self, await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ..., gateway_error: _Optional[_Union[LocalApiError, _Mapping]] = ..., policy_authority_result: _Optional[_Union[_policy_pb2.PolicyDecisionCommandResult, _Mapping]] = ...) -> None: ...
 
 class ExecuteFounderVerdictRequest(_message.Message):
     __slots__ = ("client", "command")

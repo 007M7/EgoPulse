@@ -1,9 +1,9 @@
 {
   "schemaVersion": "v01-gate3-contract-candidate-manifest/v0.1",
   "candidateId": "v01-gate3-contracts",
-  "candidateVersion": "0.1.0-draft.11",
-  "status": "all_contracts_founder_confirmed_toolchain_verified_awaiting_gate3_final_decision",
-  "ssotRole": "gate3_design_candidate",
+  "candidateVersion": "0.1.0-draft.12",
+  "status": "targeted_gate3_revision_founder_confirmed_toolchain_reverified_gate4_07a_authorized",
+  "ssotRole": "implementation_contract_ssot",
   "featureId": "v01-governed-single-harness-work-loop",
   "architectureAuthorityRef": "conversation:2026-08-23:founder-v01-feature-adr-a01",
   "c01AuthorityRef": "conversation:2026-08-23:founder-v01-c01-task-contract",
@@ -20,7 +20,8 @@
   "c08EntryRef": "conversation:2026-08-23:founder-v01-c08-entry",
   "c08ExplicitEntryRef": "conversation:2026-08-23:founder-v01-c08-entry-explicit",
   "c08AuthorityRef": "conversation:2026-08-23:founder-v01-c08-persistence-recovery-contract",
-  "implementationAuthorized": false,
+  "targetedRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3",
+  "implementationAuthorized": true,
   "handoffRule": {
     "gate": "Gate 4",
     "target": "EgoPulse/contracts/",
@@ -49,7 +50,7 @@
     {
       "id": "C-03",
       "name": "Harness Adapter",
-      "status": "founder_confirmed_toolchain_verified",
+      "status": "founder_confirmed_targeted_revision_toolchain_reverified",
       "founderDecisionRequired": true
     },
     {
@@ -73,25 +74,31 @@
     {
       "id": "C-07",
       "name": "Local API Read Model",
-      "status": "founder_confirmed_toolchain_verified",
+      "status": "founder_confirmed_targeted_revision_toolchain_reverified",
       "founderDecisionRequired": true
     },
     {
       "id": "C-08",
       "name": "Persistence Recovery",
-      "status": "founder_confirmed_toolchain_verified",
+      "status": "founder_confirmed_targeted_revision_toolchain_reverified",
+      "founderDecisionRequired": true
+    },
+    {
+      "id": "G4-07A",
+      "name": "Policy Decision Authority",
+      "status": "founder_confirmed_toolchain_reverified",
       "founderDecisionRequired": true
     }
   ],
   "validation": {
     "localCandidateValidator": "scripts/validate-candidate.js",
-    "localCandidateStatus": "passed_157_fixtures",
+    "localCandidateStatus": "passed_166_domain_fixtures_plus_1_foundation_fixture",
     "bufLint": "passed_buf_1.72.0_with_two_documented_rpc_naming_exceptions",
-    "bufBuild": "passed_image_sha256_77f07275c43b21f53de000d06c18728e0fe617c585b73ab1756f29650cf31b70",
-    "bufBreaking": "not_applicable_initial_contract_no_prior_accepted_baseline_current_digest_is_future_baseline",
-    "protocCompile": "passed_libprotoc_35.1_image_sha256_e3eef78580b2c3997108934082718a5280e007fce8b0f10b126117ff93762e75",
-    "crossLanguageGeneration": "passed_typescript_rust_python_nine_modules_each",
-    "faultConformance": "passed_70_real_process_aborts_bundled_sqlcipher_encrypted_header_integrity_ok",
+    "bufBuild": "passed_draft12_image_sha256_2854b4e74e20e85205140c2a39274c58c603e6ef0ec458f4c48d5fcf5371fc28",
+    "bufBreaking": "passed_exact_founder_authorized_two_field_breaks_against_draft11_and_no_breaks_against_draft12",
+    "protocCompile": "passed_libprotoc_35.1_draft12_ten_v01_modules",
+    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_ten_modules_each",
+    "faultConformance": "passed_80_real_process_aborts_bundled_sqlcipher_encrypted_header_integrity_ok_including_policy_decision_boundary",
     "qualityBudgetProfile": "passed_33_d03_rules_exactly_once_with_gate3_design_gate6_verification_binding"
   },
   "artifacts": [
@@ -100,8 +107,20 @@
       "sha256": "24dd1084a85b8728f764bbc89236a0b4dc3bfa1a8cc5bcdc65c86cbb8a246438"
     },
     {
+      "path": "baselines/v01-gate3-draft11.binpb",
+      "sha256": "77f07275c43b21f53de000d06c18728e0fe617c585b73ab1756f29650cf31b70"
+    },
+    {
+      "path": "baselines/v01-gate3-draft11.json",
+      "sha256": "4c08a6315adefb134bc8ea0744bdce26f1bbe5a189dfdb821098e87046efe8d0"
+    },
+    {
+      "path": "baselines/v01-gate3-draft12.binpb",
+      "sha256": "2854b4e74e20e85205140c2a39274c58c603e6ef0ec458f4c48d5fcf5371fc28"
+    },
+    {
       "path": "buf.gen.yaml",
-      "sha256": "96d4ab20863f64b39bc4bf00b6fd93b2eac3ddab8c50fac3b251ea27b583d685"
+      "sha256": "4bfec54584d52db188527df9b0dff56b138de34cf5e203dababc7f2840808930"
     },
     {
       "path": "buf.yaml",
@@ -240,6 +259,10 @@
       "sha256": "e7a8ae426a239f4aa3d0a9991ac50a6e2f1288a3c4002e5f5ebfbc1198775272"
     },
     {
+      "path": "fixtures/foundation-health.valid.json",
+      "sha256": "c1caa64426a501f28cb724ed84993a71fa3717ecab25fbec0125abb5bc4f3985"
+    },
+    {
       "path": "fixtures/harness/v1/duplicate-observation-replay.json",
       "sha256": "8f2b9145239228045fdb3d92b3aee2ad99ef81711cfeae9e2e8128474f509247"
     },
@@ -297,7 +320,7 @@
     },
     {
       "path": "fixtures/harness/v1/valid-governed-approval-decision.json",
-      "sha256": "09bbd50770b8f31a3cbe82134b0978f597db6ded1ac0a5d7b05768a882824714"
+      "sha256": "f58b9bdfd83841177f4076b1f5bb6f96af26ecfa92a944662faffc38da9557d4"
     },
     {
       "path": "fixtures/harness/v1/valid-running-observation.json",
@@ -318,6 +341,10 @@
     {
       "path": "fixtures/localapi/v1/invalid-authority-error-rewritten-as-success.json",
       "sha256": "f104ebc14d56a7487e500d9744b243c46e4bbb5f4f67a371e36a6b2e8100d5fd"
+    },
+    {
+      "path": "fixtures/localapi/v1/invalid-client-supplied-authority-ref.json",
+      "sha256": "b38dd8ffe5cb2d3a0a849043b57bcc19aa14c60a8955bb899b38d05bec09f3d1"
     },
     {
       "path": "fixtures/localapi/v1/invalid-cursor-filter-mismatch.json",
@@ -368,6 +395,10 @@
       "sha256": "c4908a6246e2dc4a8c226ff411f99d0a110a11b0452fdd03f772c6cd2b2e9cf2"
     },
     {
+      "path": "fixtures/localapi/v1/unauthorized-model-harness-approval.json",
+      "sha256": "5e4a34b0d40a4eb15c2ecdced494280cb6463295a9d973a00ac7cfc3557c6c56"
+    },
+    {
       "path": "fixtures/localapi/v1/unauthorized-other-os-user.json",
       "sha256": "07b24323304e984a8e25160e969052d4738cdf1d858a534f0e68e372d8ef5a1d"
     },
@@ -386,6 +417,10 @@
     {
       "path": "fixtures/localapi/v1/valid-evidence-redaction.json",
       "sha256": "8e80ac5574b5076ea3c4d367b00431f2c3bca863be07519f7cb2dbba58513669"
+    },
+    {
+      "path": "fixtures/localapi/v1/valid-founder-harness-approval-gateway.json",
+      "sha256": "8c64f8e6d17b79fd2f98f38fe1cf8255994f30acbe30515341a80e9fb03878f8"
     },
     {
       "path": "fixtures/localapi/v1/valid-get-coherent-task-view.json",
@@ -433,7 +468,7 @@
     },
     {
       "path": "fixtures/persistence/v1/invalid-backup-missing-required-domain.json",
-      "sha256": "d0dfa6b43a24fbccb0ae33af2fc8606a54732c03b06c1e5a1a78eef719738309"
+      "sha256": "92e7df827dfbe0bb377e4cad4d8fe56458255a6c17ef9deeced4ac7950225d09"
     },
     {
       "path": "fixtures/persistence/v1/invalid-derived-readmodel-as-restore-source.json",
@@ -533,7 +568,7 @@
     },
     {
       "path": "fixtures/persistence/v1/valid-coordinated-backup-manifest.json",
-      "sha256": "a1d06945ba3422111a2ca82403e9f61cfda03208d85f524e0684e4299cb53993"
+      "sha256": "09d85624ca934afdb919bcdff84eb2f7a36af7dad1084bff28e765a4e71cbcb0"
     },
     {
       "path": "fixtures/persistence/v1/valid-cross-authority-consumption.json",
@@ -546,6 +581,30 @@
     {
       "path": "fixtures/persistence/v1/valid-read-model-rebuild-new-epoch.json",
       "sha256": "6dcc4916247ac73ada77b3db5f33f7b15d7a209d2740d0b5c245dbaf33a39235"
+    },
+    {
+      "path": "fixtures/policy/v1/duplicate-issue-command-replay.json",
+      "sha256": "e736f9454d0c84d3d3f7b4430ca406ca25a16e300ebd4b74023450a6b2d5d785"
+    },
+    {
+      "path": "fixtures/policy/v1/invalid-request-binding-mismatch.json",
+      "sha256": "dd60ce23799522b009ad01ff45632fa9de850e759841f150903ab856225c1a4a"
+    },
+    {
+      "path": "fixtures/policy/v1/recovery-issued-decision-outbox-replay.json",
+      "sha256": "8c8ac9cec09d2d0ba44fd1fae5bd9610f01fc950ddc09f6108d47fdf9369a65e"
+    },
+    {
+      "path": "fixtures/policy/v1/stale-request-observation-rejected.json",
+      "sha256": "a02c7851decc28ea7712d9b556aea9a6ad4c9cc64682713c0cd08b2420a1eb87"
+    },
+    {
+      "path": "fixtures/policy/v1/unauthorized-model-approval-decision.json",
+      "sha256": "cebca5d5704a5f654f5e3331983c2e8a8f8c62c8d7ac70db0ec1bb9c3a279545"
+    },
+    {
+      "path": "fixtures/policy/v1/valid-issue-harness-approval-decision.json",
+      "sha256": "90821cdbfa3f9e731665bd0bc891b061be50ca8ca44033d42e84266b7c6432fe"
     },
     {
       "path": "fixtures/task/v1/duplicate-create-replay.json",
@@ -748,6 +807,18 @@
       "sha256": "fd55cd3eefa3b2610473dfafc8a73d163a8fa12c3b6412fec552fa8e9829d6e0"
     },
     {
+      "path": "IMPLEMENTATION-SSOT.json",
+      "sha256": "30ae5941e6b8c38d036d4628aa9e318c143211d84a26d69fa058d3ebe9267a7a"
+    },
+    {
+      "path": "IMPLEMENTATION-SSOT.md",
+      "sha256": "51f8f629f5a185036c25c1a67e61c3291f607040e094ea2ef4cdcb7908aebbba"
+    },
+    {
+      "path": "json-schema/foundation-health.schema.json",
+      "sha256": "b54b3fc093b92e1f356998c01981fbe57f742380068ef7e58ada91d6f25d3e12"
+    },
+    {
       "path": "localapi-fixture-envelope.schema.json",
       "sha256": "a64d571032b5fe09699dcb9d3e50a37a79594ad5dfe3e84e97d0d85f27c3012f"
     },
@@ -756,8 +827,12 @@
       "sha256": "f94687c97fd8be1c001be123026bf973dd6b6a3a4bf5926a675610df1a0f7e43"
     },
     {
+      "path": "policy-fixture-envelope.schema.json",
+      "sha256": "c8cb95faf42ec7f5fe4429380a9544b292bafc03bab012d26d9517aa64ac51c0"
+    },
+    {
       "path": "profiles/quality-budget/v1/v01-default.json",
-      "sha256": "2b43702432d85e5a06d7fd153552e0342856059362215df9493bce2c6fe62c2c"
+      "sha256": "20cd7a375cb545d7249105f73368cabe7c9b1c9ad428cd960d4ce1f66579277b"
     },
     {
       "path": "proto/egopulse/artifact/v1/artifact.proto",
@@ -772,16 +847,24 @@
       "sha256": "a91ccaf532db7591c20f5c5d42cf1dea75c051867b630d4633c248ad388935e3"
     },
     {
+      "path": "proto/egopulse/foundation/v1/health.proto",
+      "sha256": "7a6e6656ac433677cedd664a646f1e9e5cc4dc43b5c3381ff1e16075317cdf2e"
+    },
+    {
       "path": "proto/egopulse/harness/v1/harness.proto",
       "sha256": "3674b77583a5ee462f95470fee53464afbf4d88d032ba7718f75ba4168d7a80b"
     },
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
-      "sha256": "7652108d42b3f0c42589fecb67995ba475f5060c642d584db3ef623937bc7435"
+      "sha256": "372c93137227f70ccf0f2eecf07d3ea55d8c83ae7f97c1c71344750dc560c2ec"
     },
     {
       "path": "proto/egopulse/persistence/v1/persistence.proto",
-      "sha256": "ddf0dc863fe0476b2e7b17801d985ded3957e73aeeecc198637bfb870f90f03f"
+      "sha256": "cff36e50229af352881963d8c85e0b59f69e9bf70bb06f9d98dc9028dcf670cd"
+    },
+    {
+      "path": "proto/egopulse/policy/v1/policy.proto",
+      "sha256": "372fab795c916509336e2ed38bf550022d817bdf4ecbf5b66b6ae54e5f5ba8a6"
     },
     {
       "path": "proto/egopulse/task/v1/task.proto",
@@ -809,7 +892,7 @@
     },
     {
       "path": "scripts/validate-candidate.js",
-      "sha256": "24da237c3c65da9156f29318af12eb263496f1f890eb44f4137a1104d0ae9a54"
+      "sha256": "c503e77ef6c4c65b217c5c2de8b154224908dc9873daf6bd4802046a436d9cd0"
     },
     {
       "path": "scripts/verify-faults.ps1",
@@ -825,11 +908,11 @@
     },
     {
       "path": "toolchain/fault-conformance/Cargo.toml",
-      "sha256": "dd0d6983ef92ff6feb7d198c0914872233c2c9d504229cd1cc72a06c2c8e1cbd"
+      "sha256": "65d535ea0a69daae9384e2f6f9f8b17414947fa973e1f7ba122e8022d4fb864c"
     },
     {
       "path": "toolchain/fault-conformance/src/lib.rs",
-      "sha256": "f3f537c10fffa5223f4277ffd47191b7cf1de5c11552134038274066ecf873bb"
+      "sha256": "be00ff589d2380aac3948f1d52ed16ec0f3234ebf388432d9462ddee12ca4899"
     },
     {
       "path": "toolchain/fault-conformance/src/main.rs",
@@ -837,7 +920,7 @@
     },
     {
       "path": "toolchain/fault-conformance/tests/crash_recovery.rs",
-      "sha256": "4636bd13549001285a44b1bd2b09a965a29d6846594e1c68518ddb085fa79936"
+      "sha256": "2efffccc6200c2e60efa2975b36ad76e9005483e37f63faefff89091002ad9b5"
     },
     {
       "path": "toolchain/package.json",

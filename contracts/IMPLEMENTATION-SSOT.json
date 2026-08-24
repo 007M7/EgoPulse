@@ -1,7 +1,7 @@
 {
   "schemaVersion": "egopulse-contract-import-provenance/v0.1",
   "featureId": "v01-governed-single-harness-work-loop",
-  "status": "imported_verified_implementation_ssot",
+  "status": "targeted_revision_founder_confirmed_implementation_ssot",
   "importedOn": "2026-08-23",
   "source": "founder-agent-os/planning/v01-governed-single-harness-work-loop/contracts-candidate/v0.1",
   "acceptedCandidateVersion": "0.1.0-draft.11",
@@ -9,5 +9,8 @@
   "gate3AuthorityRef": "conversation:2026-08-23:founder-v01-gate3-pass",
   "gate4DriAuthorityRef": "conversation:2026-08-23:founder-v01-gate4-dri-confirmation",
   "implementationSsotAfterVerifiedImport": true,
-  "note": "The imported README.md is an immutable Gate 3 artifact and retains its candidate-time wording. This provenance record carries the post-acceptance implementation status."
+  "currentContractVersion": "0.1.0-draft.12",
+  "targetedRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3",
+  "targetedRevisionScope": ["C-03", "C-07", "C-08", "G4-07A"],
+  "note": "Draft.11 remains the immutable accepted Gate 3 import. Draft.12 is the Founder-authorized implementation-SSOT revision that inserts Policy Decision Authority before G4-08 and reserves the removed Local API field identities."
 }

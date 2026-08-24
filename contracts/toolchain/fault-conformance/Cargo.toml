@@ -9,3 +9,5 @@ publish = false
 hex = "=0.4.3"
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 sha2 = "=0.10.9"
+
+[workspace]

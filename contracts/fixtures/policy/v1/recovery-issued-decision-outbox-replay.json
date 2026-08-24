@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "v01-policy-fixture/v0.1",
+  "fixtureId": "policy-recovery-issued-decision-outbox-replay",
+  "category": "recovery",
+  "requirementRefs": ["G4-07A-RECOVERY-01", "QH-07"],
+  "principal": { "kind": "RECOVERY_COORDINATOR", "principalId": "recovery-coordinator", "authenticated": true },
+  "startingState": { "authorityDecisionRef": "policy-decision-001", "revision": 2, "state": "HARNESS_APPROVAL_DECISION_STATE_KIND_CONSUMED", "authorityCommitDurable": true, "adapterDeliveryCommitted": true, "consumeResponseLost": true },
+  "resolvedReferences": { "approvalRequest": { "approvalRequestId": "approval-001", "durable": true } },
+  "command": {
+    "consumeHarnessApprovalDecision": {
+      "metadata": { "commandId": "cmd-policy-recover-001", "idempotencyKey": "policy-recover-001", "idempotencyScope": "policy-decision-001", "requestDigestSha256": "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1", "issuedAt": "2026-08-24T01:14:00Z", "correlationId": "corr-policy-005" },
+      "authorityDecisionRef": "policy-decision-001",
+      "expectedStateRevision": 1,
+      "adapterReceipt": { "receiptId": "adapter-receipt-001", "approvalRequestId": "approval-001", "decision": "APPROVAL_DECISION_ALLOW_ONCE", "disposition": "DELIVERY_DISPOSITION_DELIVERED", "receiptDigestSha256": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1", "deliveredAt": "2026-08-24T01:14:00Z" }
+    }
+  },
+  "expected": { "outcome": "replayed", "businessWriteCount": 0, "sameAuthorityDecisionRefReplayed": true, "sameConsumptionReceiptReplayed": true, "duplicateNativeDecision": false, "automaticAllowOnRecovery": false }
+}

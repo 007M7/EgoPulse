@@ -5,5 +5,3 @@ plugins:
     out: toolchain/generated/typescript
     opt:
       - target=ts
-  - local: protoc-gen-prost
-    out: toolchain/generated/rust
