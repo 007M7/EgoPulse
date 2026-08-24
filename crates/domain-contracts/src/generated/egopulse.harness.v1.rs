@@ -346,6 +346,10 @@ pub struct ApprovalRequestObservation {
     pub display_summary_ref: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
     pub native_routing_ref: ::prost::alloc::string::String,
+    #[prost(enumeration = "ApprovalRequestLifecycleKind", tag = "7")]
+    pub lifecycle: i32,
+    #[prost(uint64, tag = "8")]
+    pub request_revision: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UsageObservation {
@@ -1229,6 +1233,40 @@ impl ApprovalDecision {
             "APPROVAL_DECISION_ALLOW_ONCE" => Some(Self::AllowOnce),
             "APPROVAL_DECISION_DENY" => Some(Self::Deny),
             "APPROVAL_DECISION_CANCEL_ATTEMPT" => Some(Self::CancelAttempt),
+            _ => None,
+        }
+    }
+}
+/// Adapter-owned lifecycle of one immutable native approval request. This is
+/// a candidate control fact, not a Policy Authority decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ApprovalRequestLifecycleKind {
+    Unspecified = 0,
+    Open = 1,
+    Withdrawn = 2,
+    Resolved = 3,
+}
+impl ApprovalRequestLifecycleKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "APPROVAL_REQUEST_LIFECYCLE_KIND_UNSPECIFIED",
+            Self::Open => "APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN",
+            Self::Withdrawn => "APPROVAL_REQUEST_LIFECYCLE_KIND_WITHDRAWN",
+            Self::Resolved => "APPROVAL_REQUEST_LIFECYCLE_KIND_RESOLVED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "APPROVAL_REQUEST_LIFECYCLE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN" => Some(Self::Open),
+            "APPROVAL_REQUEST_LIFECYCLE_KIND_WITHDRAWN" => Some(Self::Withdrawn),
+            "APPROVAL_REQUEST_LIFECYCLE_KIND_RESOLVED" => Some(Self::Resolved),
             _ => None,
         }
     }

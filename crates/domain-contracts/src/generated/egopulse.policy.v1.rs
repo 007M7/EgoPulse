@@ -25,6 +25,13 @@ pub struct HarnessApprovalRequestBinding {
     pub request_observation_id: ::prost::alloc::string::String,
     #[prost(uint64, tag = "11")]
     pub request_observation_sequence: u64,
+    #[prost(
+        enumeration = "super::super::harness::v1::ApprovalRequestLifecycleKind",
+        tag = "12"
+    )]
+    pub request_lifecycle: i32,
+    #[prost(uint64, tag = "13")]
+    pub request_revision: u64,
 }
 /// Created by the authority from trusted IPC identity and policy evaluation.
 /// It is never accepted as a client-authored assertion.
@@ -120,6 +127,8 @@ pub struct IssueHarnessApprovalDecisionCommand {
     pub reason_code: ::prost::alloc::string::String,
     #[prost(string, optional, tag = "8")]
     pub confirmation_proof_ref: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "9")]
+    pub expected_request_revision: u64,
 }
 /// System-only command emitted after the Adapter has durably committed its
 /// delivery receipt. It cannot repeat the native Harness decision.

@@ -116,9 +116,15 @@ const policyDecisionStates = new Set([
   'HARNESS_APPROVAL_DECISION_STATE_KIND_EXPIRED',
   'HARNESS_APPROVAL_DECISION_STATE_KIND_SUPERSEDED',
 ]);
+const approvalRequestLifecycles = new Set([
+  'APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN',
+  'APPROVAL_REQUEST_LIFECYCLE_KIND_WITHDRAWN',
+  'APPROVAL_REQUEST_LIFECYCLE_KIND_RESOLVED',
+]);
 const localApiOperationNames = new Set([
   'openSession', 'getTaskView', 'listTaskViews', 'getEvidenceGraph',
-  'getProjectionStatus', 'watchTaskViews', 'executeTaskCommand',
+  'getHarnessApprovalView', 'listHarnessApprovalViews', 'getProjectionStatus',
+  'watchTaskViews', 'watchHarnessApprovalViews', 'executeTaskCommand',
   'decideHarnessApproval', 'executeFounderVerdict', 'awaitProjection',
 ]);
 const persistenceOperationNames = new Set([
@@ -249,8 +255,16 @@ function validateHarnessFixture(file) {
     if (expected.attemptStatusUnchanged !== 'ATTEMPT_STATUS_RUNNING' || expected.taskStatusUnchanged !== 'TASK_STATUS_ACTIVE') fail(prefix + 'artifact return candidate cannot advance Attempt or Task');
   }
   if (commandName === 'ingestObservation' && command.approvalRequest && expected.outcome === 'committed') {
-    const allowed = new Set(expected.allowedDecisions || []);
-    for (const decision of ['APPROVAL_DECISION_ALLOW_ONCE', 'APPROVAL_DECISION_DENY', 'APPROVAL_DECISION_CANCEL_ATTEMPT']) if (!allowed.has(decision)) fail(prefix + 'V-01 approval decision set incomplete');
+    const request = command.approvalRequest;
+    if (!approvalRequestLifecycles.has(request.lifecycle)) fail(prefix + 'approval request lifecycle required');
+    if (!Number.isInteger(request.requestRevision) || request.requestRevision < 1) fail(prefix + 'approval request revision must be positive');
+    if (request.lifecycle === 'APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN' && request.requestRevision !== 1) fail(prefix + 'new approval request must start OPEN at revision one');
+    if (request.lifecycle === 'APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN') {
+      const allowed = new Set(expected.allowedDecisions || []);
+      for (const decision of ['APPROVAL_DECISION_ALLOW_ONCE', 'APPROVAL_DECISION_DENY', 'APPROVAL_DECISION_CANCEL_ATTEMPT']) if (!allowed.has(decision)) fail(prefix + 'V-01 approval decision set incomplete');
+    } else if (request.requestRevision < 2 || expected.actionable !== false || expected.policyDecisionWriteCount !== 0) {
+      fail(prefix + 'withdrawn/resolved approval request must be non-actionable and cannot write Policy facts');
+    }
     if (expected.automaticApproval !== false) fail(prefix + 'Harness approval cannot be automatic');
   }
   if (commandName === 'decideApproval' && expected.outcome === 'committed') {
@@ -451,7 +465,8 @@ function validatePolicyFixture(file) {
     const resolved = value.resolvedReferences && value.resolvedReferences.approvalRequest;
     if (expected.outcome === 'committed') {
       if (!resolved || resolved.durable !== true) fail(prefix + 'authority must resolve a durable Harness approval request');
-      if (resolved.approvalRequestId !== command.approvalRequestId || resolved.actionDigestSha256 !== command.expectedActionDigestSha256 || resolved.requestObservationId !== command.expectedRequestObservationId || resolved.requestObservationSequence !== command.expectedRequestObservationSequence) fail(prefix + 'issue command must exactly match the durable approval request observation');
+      if (resolved.approvalRequestId !== command.approvalRequestId || resolved.actionDigestSha256 !== command.expectedActionDigestSha256 || resolved.requestObservationId !== command.expectedRequestObservationId || resolved.requestObservationSequence !== command.expectedRequestObservationSequence || resolved.requestRevision !== command.expectedRequestRevision) fail(prefix + 'issue command must exactly match the durable approval request observation');
+      if (resolved.requestLifecycle !== 'APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN' || command.expectedRequestRevision !== 1) fail(prefix + 'authority may issue only against the current OPEN request revision');
       if (!['APPROVAL_DECISION_ALLOW_ONCE', 'APPROVAL_DECISION_DENY', 'APPROVAL_DECISION_CANCEL_ATTEMPT'].includes(command.decision)) fail(prefix + 'unsupported V-01 approval decision');
       if (expected.resultingState !== 'HARNESS_APPROVAL_DECISION_STATE_KIND_ISSUED' || expected.resultingStateRevision !== 1) fail(prefix + 'new authority decision must enter ISSUED revision one');
       if (expected.authorityDecisionRefGenerated !== true || expected.authorityProofDerivedFromTrustedContext !== true || expected.clientSuppliedAuthorityDecisionRef !== false || expected.clientSuppliedNativeRoutingRef !== false) fail(prefix + 'authority must generate trusted identity, proof and routing');
@@ -495,6 +510,12 @@ function validateLocalApiFixture(file) {
   if (operationName === 'listTaskViews' && expected.outcome === 'ok') {
     if (expected.cursorBindsFilterSortAndPosition !== true || expected.stableTieBreaker !== 'task_id') fail(prefix + 'list cursor must bind query and stable tie breaker');
   }
+  if (operationName === 'getHarnessApprovalView' && expected.outcome === 'ok') {
+    if (expected.adapterRequestSourcePreserved !== true || expected.policyDecisionSourcePreserved !== true || expected.unifiedAuthorityStateInvented !== false || expected.nativeRoutingExposed !== false) fail(prefix + 'approval view must preserve source ownership and redact native routing');
+  }
+  if (operationName === 'listHarnessApprovalViews' && expected.outcome === 'ok') {
+    if (expected.cursorBindsFilterSortAndPosition !== true || expected.stableTieBreaker !== 'approval_request_id' || expected.actionableDerivedFromSources !== true) fail(prefix + 'approval list must use a stable cursor and derive actionability from source facts');
+  }
   if (operationName === 'executeTaskCommand' && expected.outcome === 'ok') {
     if (expected.writeOwner !== 'TaskAuthority' || expected.projectionAwaitTokenCreated !== true || expected.projectedViewReturnedAsCurrent !== false || expected.localApiFactWritten !== false) fail(prefix + 'gateway must preserve Task authority and projection lag');
   }
@@ -515,6 +536,12 @@ function validateLocalApiFixture(file) {
   if (operationName === 'watchTaskViews' && expected.outcome === 'ok' && value.fixtureId.includes('complete-snapshots')) {
     if (expected.completeSnapshot !== true || expected.fieldPatch !== false || expected.delivery !== 'at_least_once' || expected.orderedWithinEpoch !== true) fail(prefix + 'stream must use ordered complete snapshots with at-least-once delivery');
   }
+  if (operationName === 'watchHarnessApprovalViews' && expected.outcome === 'ok' && value.fixtureId.includes('complete-snapshots')) {
+    if (expected.completeSnapshot !== true || expected.fieldPatch !== false || expected.delivery !== 'at_least_once' || expected.orderedWithinEpoch !== true) fail(prefix + 'approval stream must use ordered complete snapshots with at-least-once delivery');
+  }
+  if (operationName === 'awaitProjection' && value.fixtureId.includes('policy-projection') && expected.outcome === 'ok') {
+    if (expected.returnedViewKind !== 'HarnessApprovalView' || expected.minimumPolicyRevisionSatisfied !== true || expected.readYourWriteGuaranteed !== true) fail(prefix + 'policy await must return the approval projection at or after the required Authority revision');
+  }
   const expectedErrors = [
     ['incompatible-contract', 'LOCAL_API_ERROR_CODE_CONTRACT_INCOMPATIBLE'],
     ['loopback-tcp-transport', 'LOCAL_API_ERROR_CODE_UNAUTHENTICATED'],
@@ -526,6 +553,8 @@ function validateLocalApiFixture(file) {
     ['minimum-position-timeout', 'LOCAL_API_ERROR_CODE_PROJECTION_BEHIND'],
     ['cursor-old-epoch', 'LOCAL_API_ERROR_CODE_PROJECTION_RESET_REQUIRED'],
     ['client-supplied-authority-ref', 'LOCAL_API_ERROR_CODE_INVALID_ARGUMENT'],
+    ['approval-source-binding-mismatch', 'LOCAL_API_ERROR_CODE_INTEGRITY_FAILURE'],
+    ['approval-native-routing-exposure', 'LOCAL_API_ERROR_CODE_INTEGRITY_FAILURE'],
   ];
   for (const [needle, errorCode] of expectedErrors) if (value.fixtureId.includes(needle) && expected.errorCode !== errorCode) fail(prefix + needle + ' must fail with ' + errorCode);
   if (value.category === 'unauthorized' && (expected.errorCode !== 'LOCAL_API_ERROR_CODE_PERMISSION_DENIED' || expected.businessWriteCount !== 0)) fail(prefix + 'unauthorized Local API operation must fail before authority write');
@@ -535,6 +564,10 @@ function validateLocalApiFixture(file) {
   if (value.fixtureId.includes('stream-gap-reset-required') && (expected.frameKind !== 'STREAM_FRAME_KIND_RESET_REQUIRED' || expected.clientMustRefetch !== true)) fail(prefix + 'retention gap must require full refetch');
   if (value.fixtureId.includes('projector-rebuild-new-epoch') && (expected.newEpoch === value.startingState.oldEpoch || expected.authorityBusinessWriteCount !== 0)) fail(prefix + 'rebuild must change epoch without authority writes');
   if (value.fixtureId.includes('evidence-redaction') && (expected.absolutePathExposed !== false || expected.secretExposed !== false || expected.rawBlobEmbedded !== false)) fail(prefix + 'read model cannot expose paths, secrets or raw blobs');
+  if (value.fixtureId.includes('withdrawn-harness-approval') && (expected.actionable !== false || expected.availableActionsCount !== 0 || expected.policyAuthorityCallCount !== 0)) fail(prefix + 'withdrawn approval cannot remain actionable');
+  if (value.fixtureId.includes('approval-source-binding-mismatch') && expected.viewReturned !== false) fail(prefix + 'source binding mismatch must suppress the projection');
+  if (value.fixtureId.includes('approval-native-routing-exposure') && expected.nativeRoutingReturned !== false) fail(prefix + 'native routing must never leave the Local API boundary');
+  if (value.fixtureId.includes('harness-approval-stream-gap') && (expected.frameKind !== 'STREAM_FRAME_KIND_RESET_REQUIRED' || expected.clientMustRefetch !== true)) fail(prefix + 'approval stream retention gap must require full refetch');
   return value.category;
 }
 
@@ -675,7 +708,7 @@ function main() {
   for (const required of ['package egopulse.collaboration.v1', 'enum RunStatus', 'enum StepStatus', 'enum AttemptStatus', 'enum AttemptCancellationDisposition', 'message Lease', 'message CheckpointReference', 'string task_id = 14', 'uint64 work_revision = 15', 'message CollaborationSnapshot', 'message CollaborationCommand', 'message CollaborationEvent', 'service CollaborationControlService']) {
     if (!collaborationProto.includes(required)) fail('collaboration proto missing: ' + required);
   }
-  for (const required of ['package egopulse.harness.v1', 'enum SupportLevel', 'enum CancellationSemantics', 'enum ResumeSemantics', 'message CapabilityProfile', 'message DispatchEnvelope', 'message HarnessObservation', 'message ApprovalDecisionEnvelope', 'message CancelExecutionEnvelope', 'message ResumeExecutionEnvelope', 'message ArtifactReturnObservation', 'service HarnessAdapterService', 'service HarnessRegistryService']) {
+  for (const required of ['package egopulse.harness.v1', 'enum SupportLevel', 'enum CancellationSemantics', 'enum ResumeSemantics', 'enum ApprovalRequestLifecycleKind', 'message CapabilityProfile', 'message DispatchEnvelope', 'message HarnessObservation', 'message ApprovalDecisionEnvelope', 'message CancelExecutionEnvelope', 'message ResumeExecutionEnvelope', 'message ArtifactReturnObservation', 'service HarnessAdapterService', 'service HarnessRegistryService']) {
     if (!harnessProto.includes(required)) fail('harness proto missing: ' + required);
   }
   for (const required of ['package egopulse.artifact.v1', 'message ContentAddress', 'message LineageBinding', 'message Provenance', 'message ArtifactDescriptor', 'message Claim', 'message Evidence', 'message ArtifactSet', 'message ReturnHandoff', 'message ReturnReceipt', 'bool verification_performed = 8', 'bool task_completion_decided = 9', 'service ArtifactAuthorityService']) {
@@ -689,15 +722,17 @@ function main() {
     if (!verdictProto.includes(required)) fail('verdict proto missing: ' + required);
   }
   for (const forbidden of ['message ApprovalDecision', 'message ParentReceipt', 'user_verdict', 'USER_OVERRIDDEN']) if (verdictProto.includes(forbidden)) fail('verdict proto crosses authority boundary: ' + forbidden);
-  for (const required of ['package egopulse.policy.v1', 'message HarnessApprovalRequestBinding', 'message PolicyAuthorityProof', 'message HarnessApprovalDecisionRecord', 'message HarnessApprovalDecisionState', 'message HarnessApprovalConsumptionReceipt', 'message IssueHarnessApprovalDecisionCommand', 'message PolicyDecisionCommand', 'message PolicyDecisionEvent', 'service PolicyDecisionAuthorityService']) {
+  for (const required of ['package egopulse.policy.v1', 'message HarnessApprovalRequestBinding', 'request_lifecycle', 'request_revision', 'message PolicyAuthorityProof', 'message HarnessApprovalDecisionRecord', 'message HarnessApprovalDecisionState', 'message HarnessApprovalConsumptionReceipt', 'message IssueHarnessApprovalDecisionCommand', 'expected_request_revision', 'message PolicyDecisionCommand', 'message PolicyDecisionEvent', 'service PolicyDecisionAuthorityService']) {
     if (!policyProto.includes(required)) fail('policy proto missing: ' + required);
   }
   const issuePolicyCommand = policyProto.slice(policyProto.indexOf('message IssueHarnessApprovalDecisionCommand'), policyProto.indexOf('message ConsumeHarnessApprovalDecisionCommand'));
   for (const forbidden of ['authority_decision_ref', 'native_routing_ref', 'authenticated_principal_id', 'authorization_policy_ref']) if (issuePolicyCommand.includes(forbidden)) fail('client policy issue command asserts trusted field: ' + forbidden);
-  for (const required of ['package egopulse.localapi.v1', 'SOURCE_DOMAIN_POLICY_DECISION', 'message ProjectionPosition', 'message SourceRevision', 'message ProjectionMetadata', 'message TaskView', 'message EvidenceGraphView', 'message ProjectionAwaitToken', 'message TaskViewStreamFrame', 'client_kernel_contract_ref', 'authorization_policy_ref', 'reserved 2', 'reserved "decision"', 'IssueHarnessApprovalDecisionCommand command = 3', 'reserved 1', 'reserved "authority_result"', 'PolicyDecisionCommandResult policy_authority_result = 4', 'service LocalSessionService', 'service LocalReadModelService', 'service LocalCommandGatewayService']) {
+  for (const required of ['package egopulse.localapi.v1', 'SOURCE_DOMAIN_POLICY_DECISION', 'SOURCE_DOMAIN_HARNESS_ADAPTER', 'message ProjectionPosition', 'message SourceRevision', 'message ProjectionMetadata', 'message TaskView', 'message EvidenceGraphView', 'message HarnessApprovalAuthorityResult', 'message HarnessApprovalView', 'message GetHarnessApprovalViewRequest', 'message ListHarnessApprovalViewsRequest', 'message WatchHarnessApprovalViewsRequest', 'message ProjectionAwaitToken', 'message TaskViewStreamFrame', 'client_kernel_contract_ref', 'authorization_policy_ref', 'reserved 2', 'reserved "decision"', 'IssueHarnessApprovalDecisionCommand command = 3', 'reserved 1', 'reserved "authority_result"', 'PolicyDecisionCommandResult policy_authority_result = 4 [deprecated = true]', 'HarnessApprovalAuthorityResult sanitized_authority_result = 5', 'service LocalSessionService', 'service LocalReadModelService', 'service LocalCommandGatewayService']) {
     if (!localApiProto.includes(required)) fail('localapi proto missing: ' + required);
   }
   for (const forbidden of ['enum UnifiedTaskStatus', 'message LocalTaskFact', 'string actor_id', 'json_patch', 'surface_permission', 'tui_read_only', 'service ArtifactAuthorityService', 'ApprovalDecisionEnvelope decision = 2', 'ApprovalDecisionResult authority_result = 1']) if (localApiProto.includes(forbidden)) fail('localapi proto crosses projection/authority boundary: ' + forbidden);
+  const approvalView = localApiProto.slice(localApiProto.indexOf('message HarnessApprovalView'), localApiProto.indexOf('message LocalApiError'));
+  for (const forbidden of ['native_routing_ref', 'authority_proof', 'raw_command', 'credential', 'store_handle']) if (approvalView.includes(forbidden)) fail('approval read model exposes private Adapter/Authority field: ' + forbidden);
   for (const required of ['package egopulse.persistence.v1', 'enum PersistenceDomain', 'PERSISTENCE_DOMAIN_POLICY_DECISION = 10', 'enum StoreRole', 'enum StoreHealth', 'enum RecoveryPhase', 'message DomainWatermark', 'message DurableCommitReceipt', 'message OutboxEnvelope', 'message InboxConsumptionReceipt', 'message DomainSnapshotDescriptor', 'message BackupManifest', 'message RestoreVerificationReport', 'message RecoveryPlan', 'service PersistenceParticipantService', 'service BackupRecoveryCoordinatorService']) {
     if (!persistenceProto.includes(required)) fail('persistence proto missing: ' + required);
   }
@@ -734,9 +769,11 @@ function main() {
   if (!c08 || c08.status !== 'founder_confirmed_targeted_revision_toolchain_reverified') fail('C-08 must carry explicit Founder acceptance after targeted technical reverification');
   const policy = manifest.groups.find((group) => group.id === 'G4-07A');
   if (!policy || policy.status !== 'founder_confirmed_toolchain_reverified') fail('G4-07A Policy Decision Authority must carry explicit Founder acceptance and technical reverification');
+  const approvalReadModel = manifest.groups.find((group) => group.id === 'G4-08A');
+  if (!approvalReadModel || approvalReadModel.status !== 'founder_confirmed_toolchain_reverified') fail('G4-08A Harness Approval Read Model must carry explicit Founder acceptance and technical reverification');
   console.log(`candidate validation passed: ${taskFixtureFiles.length} task fixtures, ${collaborationFixtureFiles.length} collaboration fixtures, ${harnessFixtureFiles.length} harness fixtures, ${artifactFixtureFiles.length} artifact fixtures, ${verificationFixtureFiles.length} verification fixtures, ${verdictFixtureFiles.length} verdict fixtures, ${policyFixtureFiles.length} policy fixtures, ${localApiFixtureFiles.length} localapi fixtures, ${persistenceFixtureFiles.length} persistence fixtures, ${manifest.artifacts.length} digests`);
   console.log('proto_toolchain_status=passed; Buf/protoc, Rust/TypeScript/Python generation, and SQLCipher process-crash conformance are verified');
-  console.log('gate3_status=targeted_revision_reverified; G4-07A is authorized and G4-08 remains sequenced after it');
+  console.log('gate3_status=targeted_revision_reverified; G4-08A approval read model contract is authorized for implementation');
 }
 
 main();

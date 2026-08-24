@@ -144,6 +144,13 @@ class ApprovalDecision(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     APPROVAL_DECISION_DENY: _ClassVar[ApprovalDecision]
     APPROVAL_DECISION_CANCEL_ATTEMPT: _ClassVar[ApprovalDecision]
 
+class ApprovalRequestLifecycleKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    APPROVAL_REQUEST_LIFECYCLE_KIND_UNSPECIFIED: _ClassVar[ApprovalRequestLifecycleKind]
+    APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN: _ClassVar[ApprovalRequestLifecycleKind]
+    APPROVAL_REQUEST_LIFECYCLE_KIND_WITHDRAWN: _ClassVar[ApprovalRequestLifecycleKind]
+    APPROVAL_REQUEST_LIFECYCLE_KIND_RESOLVED: _ClassVar[ApprovalRequestLifecycleKind]
+
 class CancellationDeliveryDisposition(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     CANCELLATION_DELIVERY_DISPOSITION_UNSPECIFIED: _ClassVar[CancellationDeliveryDisposition]
@@ -273,6 +280,10 @@ APPROVAL_DECISION_UNSPECIFIED: ApprovalDecision
 APPROVAL_DECISION_ALLOW_ONCE: ApprovalDecision
 APPROVAL_DECISION_DENY: ApprovalDecision
 APPROVAL_DECISION_CANCEL_ATTEMPT: ApprovalDecision
+APPROVAL_REQUEST_LIFECYCLE_KIND_UNSPECIFIED: ApprovalRequestLifecycleKind
+APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN: ApprovalRequestLifecycleKind
+APPROVAL_REQUEST_LIFECYCLE_KIND_WITHDRAWN: ApprovalRequestLifecycleKind
+APPROVAL_REQUEST_LIFECYCLE_KIND_RESOLVED: ApprovalRequestLifecycleKind
 CANCELLATION_DELIVERY_DISPOSITION_UNSPECIFIED: CancellationDeliveryDisposition
 CANCELLATION_DELIVERY_DISPOSITION_DELIVERED: CancellationDeliveryDisposition
 CANCELLATION_DELIVERY_DISPOSITION_REJECTED: CancellationDeliveryDisposition
@@ -613,20 +624,24 @@ class LifecycleObservation(_message.Message):
     def __init__(self, kind: _Optional[_Union[LifecycleKind, str]] = ..., native_item_ref: _Optional[str] = ..., safe_status_code: _Optional[str] = ..., side_effect_certainty: _Optional[_Union[SideEffectCertainty, str]] = ..., native_will_retry: _Optional[bool] = ...) -> None: ...
 
 class ApprovalRequestObservation(_message.Message):
-    __slots__ = ("approval_request_id", "kind", "action_digest_sha256", "requested_scope_ref", "display_summary_ref", "native_routing_ref")
+    __slots__ = ("approval_request_id", "kind", "action_digest_sha256", "requested_scope_ref", "display_summary_ref", "native_routing_ref", "lifecycle", "request_revision")
     APPROVAL_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     ACTION_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
     REQUESTED_SCOPE_REF_FIELD_NUMBER: _ClassVar[int]
     DISPLAY_SUMMARY_REF_FIELD_NUMBER: _ClassVar[int]
     NATIVE_ROUTING_REF_FIELD_NUMBER: _ClassVar[int]
+    LIFECYCLE_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_REVISION_FIELD_NUMBER: _ClassVar[int]
     approval_request_id: str
     kind: ApprovalKind
     action_digest_sha256: str
     requested_scope_ref: str
     display_summary_ref: str
     native_routing_ref: str
-    def __init__(self, approval_request_id: _Optional[str] = ..., kind: _Optional[_Union[ApprovalKind, str]] = ..., action_digest_sha256: _Optional[str] = ..., requested_scope_ref: _Optional[str] = ..., display_summary_ref: _Optional[str] = ..., native_routing_ref: _Optional[str] = ...) -> None: ...
+    lifecycle: ApprovalRequestLifecycleKind
+    request_revision: int
+    def __init__(self, approval_request_id: _Optional[str] = ..., kind: _Optional[_Union[ApprovalKind, str]] = ..., action_digest_sha256: _Optional[str] = ..., requested_scope_ref: _Optional[str] = ..., display_summary_ref: _Optional[str] = ..., native_routing_ref: _Optional[str] = ..., lifecycle: _Optional[_Union[ApprovalRequestLifecycleKind, str]] = ..., request_revision: _Optional[int] = ...) -> None: ...
 
 class UsageObservation(_message.Message):
     __slots__ = ("usage_receipt_ref", "input_tokens", "output_tokens", "cached_input_tokens", "cost_receipt_ref")

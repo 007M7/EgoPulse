@@ -138,6 +138,15 @@ enum ApprovalDecision {
   APPROVAL_DECISION_CANCEL_ATTEMPT = 3;
 }
 
+// Adapter-owned lifecycle of one immutable native approval request. This is
+// a candidate control fact, not a Policy Authority decision.
+enum ApprovalRequestLifecycleKind {
+  APPROVAL_REQUEST_LIFECYCLE_KIND_UNSPECIFIED = 0;
+  APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN = 1;
+  APPROVAL_REQUEST_LIFECYCLE_KIND_WITHDRAWN = 2;
+  APPROVAL_REQUEST_LIFECYCLE_KIND_RESOLVED = 3;
+}
+
 enum CancellationDeliveryDisposition {
   CANCELLATION_DELIVERY_DISPOSITION_UNSPECIFIED = 0;
   CANCELLATION_DELIVERY_DISPOSITION_DELIVERED = 1;
@@ -360,6 +369,8 @@ message ApprovalRequestObservation {
   string requested_scope_ref = 4;
   string display_summary_ref = 5;
   string native_routing_ref = 6;
+  ApprovalRequestLifecycleKind lifecycle = 7;
+  uint64 request_revision = 8;
 }
 
 message UsageObservation {

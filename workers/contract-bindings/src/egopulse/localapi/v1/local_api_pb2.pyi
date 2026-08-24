@@ -3,6 +3,7 @@ import datetime
 from egopulse.artifact.v1 import artifact_pb2 as _artifact_pb2
 from egopulse.collaboration.v1 import collaboration_pb2 as _collaboration_pb2
 from egopulse.common.v1 import common_pb2 as _common_pb2
+from egopulse.harness.v1 import harness_pb2 as _harness_pb2
 from egopulse.policy.v1 import policy_pb2 as _policy_pb2
 from egopulse.task.v1 import task_pb2 as _task_pb2
 from egopulse.verdict.v1 import verdict_pb2 as _verdict_pb2
@@ -42,6 +43,7 @@ class SourceDomain(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     SOURCE_DOMAIN_VERIFICATION: _ClassVar[SourceDomain]
     SOURCE_DOMAIN_FOUNDER_VERDICT: _ClassVar[SourceDomain]
     SOURCE_DOMAIN_POLICY_DECISION: _ClassVar[SourceDomain]
+    SOURCE_DOMAIN_HARNESS_ADAPTER: _ClassVar[SourceDomain]
 
 class StreamFrameKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -95,6 +97,7 @@ SOURCE_DOMAIN_ARTIFACT: SourceDomain
 SOURCE_DOMAIN_VERIFICATION: SourceDomain
 SOURCE_DOMAIN_FOUNDER_VERDICT: SourceDomain
 SOURCE_DOMAIN_POLICY_DECISION: SourceDomain
+SOURCE_DOMAIN_HARNESS_ADAPTER: SourceDomain
 STREAM_FRAME_KIND_UNSPECIFIED: StreamFrameKind
 STREAM_FRAME_KIND_SNAPSHOT: StreamFrameKind
 STREAM_FRAME_KIND_HEARTBEAT: StreamFrameKind
@@ -239,6 +242,90 @@ class EvidenceGraphView(_message.Message):
     redactions: _containers.RepeatedCompositeFieldContainer[RedactedField]
     def __init__(self, metadata: _Optional[_Union[ProjectionMetadata, _Mapping]] = ..., task_id: _Optional[str] = ..., artifact_set_id: _Optional[str] = ..., artifacts: _Optional[_Iterable[_Union[_artifact_pb2.ArtifactDescriptor, _Mapping]]] = ..., claims: _Optional[_Iterable[_Union[_artifact_pb2.Claim, _Mapping]]] = ..., evidence: _Optional[_Iterable[_Union[_artifact_pb2.Evidence, _Mapping]]] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ...) -> None: ...
 
+class HarnessApprovalAuthorityResult(_message.Message):
+    __slots__ = ("committed", "replayed", "authority_decision_ref", "decision", "state", "state_revision", "expires_at", "error_code", "safe_error_fingerprint")
+    COMMITTED_FIELD_NUMBER: _ClassVar[int]
+    REPLAYED_FIELD_NUMBER: _ClassVar[int]
+    AUTHORITY_DECISION_REF_FIELD_NUMBER: _ClassVar[int]
+    DECISION_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    EXPIRES_AT_FIELD_NUMBER: _ClassVar[int]
+    ERROR_CODE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_ERROR_FINGERPRINT_FIELD_NUMBER: _ClassVar[int]
+    committed: bool
+    replayed: bool
+    authority_decision_ref: str
+    decision: _harness_pb2.ApprovalDecision
+    state: _policy_pb2.HarnessApprovalDecisionStateKind
+    state_revision: int
+    expires_at: _timestamp_pb2.Timestamp
+    error_code: _policy_pb2.PolicyDecisionErrorCode
+    safe_error_fingerprint: str
+    def __init__(self, committed: _Optional[bool] = ..., replayed: _Optional[bool] = ..., authority_decision_ref: _Optional[str] = ..., decision: _Optional[_Union[_harness_pb2.ApprovalDecision, str]] = ..., state: _Optional[_Union[_policy_pb2.HarnessApprovalDecisionStateKind, str]] = ..., state_revision: _Optional[int] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., error_code: _Optional[_Union[_policy_pb2.PolicyDecisionErrorCode, str]] = ..., safe_error_fingerprint: _Optional[str] = ...) -> None: ...
+
+class HarnessApprovalDecisionView(_message.Message):
+    __slots__ = ("authority_decision_ref", "decision", "reason_code", "state", "state_revision", "issued_at", "expires_at", "updated_at")
+    AUTHORITY_DECISION_REF_FIELD_NUMBER: _ClassVar[int]
+    DECISION_FIELD_NUMBER: _ClassVar[int]
+    REASON_CODE_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    ISSUED_AT_FIELD_NUMBER: _ClassVar[int]
+    EXPIRES_AT_FIELD_NUMBER: _ClassVar[int]
+    UPDATED_AT_FIELD_NUMBER: _ClassVar[int]
+    authority_decision_ref: str
+    decision: _harness_pb2.ApprovalDecision
+    reason_code: str
+    state: _policy_pb2.HarnessApprovalDecisionStateKind
+    state_revision: int
+    issued_at: _timestamp_pb2.Timestamp
+    expires_at: _timestamp_pb2.Timestamp
+    updated_at: _timestamp_pb2.Timestamp
+    def __init__(self, authority_decision_ref: _Optional[str] = ..., decision: _Optional[_Union[_harness_pb2.ApprovalDecision, str]] = ..., reason_code: _Optional[str] = ..., state: _Optional[_Union[_policy_pb2.HarnessApprovalDecisionStateKind, str]] = ..., state_revision: _Optional[int] = ..., issued_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class HarnessApprovalView(_message.Message):
+    __slots__ = ("metadata", "approval_request_id", "task_id", "run_id", "step_id", "attempt_id", "dispatch_id", "fencing_token", "kind", "action_digest_sha256", "requested_scope_ref", "display_summary_ref", "request_observation_id", "request_observation_sequence", "request_lifecycle", "request_revision", "policy_decision", "available_actions", "redactions")
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    APPROVAL_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    STEP_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    DISPATCH_ID_FIELD_NUMBER: _ClassVar[int]
+    FENCING_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    ACTION_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    REQUESTED_SCOPE_REF_FIELD_NUMBER: _ClassVar[int]
+    DISPLAY_SUMMARY_REF_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_OBSERVATION_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_OBSERVATION_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_LIFECYCLE_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_REVISION_FIELD_NUMBER: _ClassVar[int]
+    POLICY_DECISION_FIELD_NUMBER: _ClassVar[int]
+    AVAILABLE_ACTIONS_FIELD_NUMBER: _ClassVar[int]
+    REDACTIONS_FIELD_NUMBER: _ClassVar[int]
+    metadata: ProjectionMetadata
+    approval_request_id: str
+    task_id: str
+    run_id: str
+    step_id: str
+    attempt_id: str
+    dispatch_id: str
+    fencing_token: int
+    kind: _harness_pb2.ApprovalKind
+    action_digest_sha256: str
+    requested_scope_ref: str
+    display_summary_ref: str
+    request_observation_id: str
+    request_observation_sequence: int
+    request_lifecycle: _harness_pb2.ApprovalRequestLifecycleKind
+    request_revision: int
+    policy_decision: HarnessApprovalDecisionView
+    available_actions: _containers.RepeatedCompositeFieldContainer[AvailableAction]
+    redactions: _containers.RepeatedCompositeFieldContainer[RedactedField]
+    def __init__(self, metadata: _Optional[_Union[ProjectionMetadata, _Mapping]] = ..., approval_request_id: _Optional[str] = ..., task_id: _Optional[str] = ..., run_id: _Optional[str] = ..., step_id: _Optional[str] = ..., attempt_id: _Optional[str] = ..., dispatch_id: _Optional[str] = ..., fencing_token: _Optional[int] = ..., kind: _Optional[_Union[_harness_pb2.ApprovalKind, str]] = ..., action_digest_sha256: _Optional[str] = ..., requested_scope_ref: _Optional[str] = ..., display_summary_ref: _Optional[str] = ..., request_observation_id: _Optional[str] = ..., request_observation_sequence: _Optional[int] = ..., request_lifecycle: _Optional[_Union[_harness_pb2.ApprovalRequestLifecycleKind, str]] = ..., request_revision: _Optional[int] = ..., policy_decision: _Optional[_Union[HarnessApprovalDecisionView, _Mapping]] = ..., available_actions: _Optional[_Iterable[_Union[AvailableAction, _Mapping]]] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ...) -> None: ...
+
 class LocalApiError(_message.Message):
     __slots__ = ("code", "safe_fingerprint", "retryable", "required_action_code", "current_position", "correlation_id")
     CODE_FIELD_NUMBER: _ClassVar[int]
@@ -353,6 +440,56 @@ class GetEvidenceGraphResponse(_message.Message):
     error: LocalApiError
     def __init__(self, graph: _Optional[_Union[EvidenceGraphView, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
 
+class GetHarnessApprovalViewRequest(_message.Message):
+    __slots__ = ("client", "approval_request_id", "minimum_position")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    APPROVAL_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    MINIMUM_POSITION_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    approval_request_id: str
+    minimum_position: ProjectionPosition
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., approval_request_id: _Optional[str] = ..., minimum_position: _Optional[_Union[ProjectionPosition, _Mapping]] = ...) -> None: ...
+
+class GetHarnessApprovalViewResponse(_message.Message):
+    __slots__ = ("view", "error")
+    VIEW_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    view: HarnessApprovalView
+    error: LocalApiError
+    def __init__(self, view: _Optional[_Union[HarnessApprovalView, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class ListHarnessApprovalViewsRequest(_message.Message):
+    __slots__ = ("client", "request_lifecycle_filter", "decision_state_filter", "task_ids", "actionable_only", "page_size", "page_cursor", "minimum_position")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_LIFECYCLE_FILTER_FIELD_NUMBER: _ClassVar[int]
+    DECISION_STATE_FILTER_FIELD_NUMBER: _ClassVar[int]
+    TASK_IDS_FIELD_NUMBER: _ClassVar[int]
+    ACTIONABLE_ONLY_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    PAGE_CURSOR_FIELD_NUMBER: _ClassVar[int]
+    MINIMUM_POSITION_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    request_lifecycle_filter: _containers.RepeatedScalarFieldContainer[_harness_pb2.ApprovalRequestLifecycleKind]
+    decision_state_filter: _containers.RepeatedScalarFieldContainer[_policy_pb2.HarnessApprovalDecisionStateKind]
+    task_ids: _containers.RepeatedScalarFieldContainer[str]
+    actionable_only: bool
+    page_size: int
+    page_cursor: str
+    minimum_position: ProjectionPosition
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., request_lifecycle_filter: _Optional[_Iterable[_Union[_harness_pb2.ApprovalRequestLifecycleKind, str]]] = ..., decision_state_filter: _Optional[_Iterable[_Union[_policy_pb2.HarnessApprovalDecisionStateKind, str]]] = ..., task_ids: _Optional[_Iterable[str]] = ..., actionable_only: _Optional[bool] = ..., page_size: _Optional[int] = ..., page_cursor: _Optional[str] = ..., minimum_position: _Optional[_Union[ProjectionPosition, _Mapping]] = ...) -> None: ...
+
+class ListHarnessApprovalViewsResponse(_message.Message):
+    __slots__ = ("views", "next_page_cursor", "snapshot_position", "error")
+    VIEWS_FIELD_NUMBER: _ClassVar[int]
+    NEXT_PAGE_CURSOR_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_POSITION_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    views: _containers.RepeatedCompositeFieldContainer[HarnessApprovalView]
+    next_page_cursor: str
+    snapshot_position: ProjectionPosition
+    error: LocalApiError
+    def __init__(self, views: _Optional[_Iterable[_Union[HarnessApprovalView, _Mapping]]] = ..., next_page_cursor: _Optional[str] = ..., snapshot_position: _Optional[_Union[ProjectionPosition, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
 class GetProjectionStatusRequest(_message.Message):
     __slots__ = ("client",)
     CLIENT_FIELD_NUMBER: _ClassVar[int]
@@ -391,6 +528,36 @@ class TaskViewStreamFrame(_message.Message):
     reset_reason_code: str
     def __init__(self, kind: _Optional[_Union[StreamFrameKind, str]] = ..., position: _Optional[_Union[ProjectionPosition, _Mapping]] = ..., snapshot: _Optional[_Union[TaskView, _Mapping]] = ..., reset_reason_code: _Optional[str] = ...) -> None: ...
 
+class WatchHarnessApprovalViewsRequest(_message.Message):
+    __slots__ = ("client", "resume_after", "approval_request_ids", "task_ids", "request_lifecycle_filter", "decision_state_filter", "actionable_only")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    RESUME_AFTER_FIELD_NUMBER: _ClassVar[int]
+    APPROVAL_REQUEST_IDS_FIELD_NUMBER: _ClassVar[int]
+    TASK_IDS_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_LIFECYCLE_FILTER_FIELD_NUMBER: _ClassVar[int]
+    DECISION_STATE_FILTER_FIELD_NUMBER: _ClassVar[int]
+    ACTIONABLE_ONLY_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    resume_after: ProjectionPosition
+    approval_request_ids: _containers.RepeatedScalarFieldContainer[str]
+    task_ids: _containers.RepeatedScalarFieldContainer[str]
+    request_lifecycle_filter: _containers.RepeatedScalarFieldContainer[_harness_pb2.ApprovalRequestLifecycleKind]
+    decision_state_filter: _containers.RepeatedScalarFieldContainer[_policy_pb2.HarnessApprovalDecisionStateKind]
+    actionable_only: bool
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., resume_after: _Optional[_Union[ProjectionPosition, _Mapping]] = ..., approval_request_ids: _Optional[_Iterable[str]] = ..., task_ids: _Optional[_Iterable[str]] = ..., request_lifecycle_filter: _Optional[_Iterable[_Union[_harness_pb2.ApprovalRequestLifecycleKind, str]]] = ..., decision_state_filter: _Optional[_Iterable[_Union[_policy_pb2.HarnessApprovalDecisionStateKind, str]]] = ..., actionable_only: _Optional[bool] = ...) -> None: ...
+
+class HarnessApprovalViewStreamFrame(_message.Message):
+    __slots__ = ("kind", "position", "snapshot", "reset_reason_code")
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    POSITION_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
+    RESET_REASON_CODE_FIELD_NUMBER: _ClassVar[int]
+    kind: StreamFrameKind
+    position: ProjectionPosition
+    snapshot: HarnessApprovalView
+    reset_reason_code: str
+    def __init__(self, kind: _Optional[_Union[StreamFrameKind, str]] = ..., position: _Optional[_Union[ProjectionPosition, _Mapping]] = ..., snapshot: _Optional[_Union[HarnessApprovalView, _Mapping]] = ..., reset_reason_code: _Optional[str] = ...) -> None: ...
+
 class ProjectionAwaitToken(_message.Message):
     __slots__ = ("token", "required_source_revision", "expires_at")
     TOKEN_FIELD_NUMBER: _ClassVar[int]
@@ -428,14 +595,16 @@ class DecideHarnessApprovalRequest(_message.Message):
     def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., command: _Optional[_Union[_policy_pb2.IssueHarnessApprovalDecisionCommand, _Mapping]] = ...) -> None: ...
 
 class DecideHarnessApprovalResponse(_message.Message):
-    __slots__ = ("await_token", "gateway_error", "policy_authority_result")
+    __slots__ = ("await_token", "gateway_error", "policy_authority_result", "sanitized_authority_result")
     AWAIT_TOKEN_FIELD_NUMBER: _ClassVar[int]
     GATEWAY_ERROR_FIELD_NUMBER: _ClassVar[int]
     POLICY_AUTHORITY_RESULT_FIELD_NUMBER: _ClassVar[int]
+    SANITIZED_AUTHORITY_RESULT_FIELD_NUMBER: _ClassVar[int]
     await_token: ProjectionAwaitToken
     gateway_error: LocalApiError
     policy_authority_result: _policy_pb2.PolicyDecisionCommandResult
-    def __init__(self, await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ..., gateway_error: _Optional[_Union[LocalApiError, _Mapping]] = ..., policy_authority_result: _Optional[_Union[_policy_pb2.PolicyDecisionCommandResult, _Mapping]] = ...) -> None: ...
+    sanitized_authority_result: HarnessApprovalAuthorityResult
+    def __init__(self, await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ..., gateway_error: _Optional[_Union[LocalApiError, _Mapping]] = ..., policy_authority_result: _Optional[_Union[_policy_pb2.PolicyDecisionCommandResult, _Mapping]] = ..., sanitized_authority_result: _Optional[_Union[HarnessApprovalAuthorityResult, _Mapping]] = ...) -> None: ...
 
 class ExecuteFounderVerdictRequest(_message.Message):
     __slots__ = ("client", "command")
@@ -466,9 +635,11 @@ class AwaitProjectionRequest(_message.Message):
     def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ..., timeout_milliseconds: _Optional[int] = ...) -> None: ...
 
 class AwaitProjectionResponse(_message.Message):
-    __slots__ = ("view", "error")
+    __slots__ = ("view", "error", "approval_view")
     VIEW_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
+    APPROVAL_VIEW_FIELD_NUMBER: _ClassVar[int]
     view: TaskView
     error: LocalApiError
-    def __init__(self, view: _Optional[_Union[TaskView, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+    approval_view: HarnessApprovalView
+    def __init__(self, view: _Optional[_Union[TaskView, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ..., approval_view: _Optional[_Union[HarnessApprovalView, _Mapping]] = ...) -> None: ...

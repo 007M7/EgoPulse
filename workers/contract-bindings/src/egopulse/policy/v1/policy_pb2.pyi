@@ -76,7 +76,7 @@ POLICY_DECISION_ERROR_CODE_INTEGRITY_FAILURE: PolicyDecisionErrorCode
 POLICY_DECISION_ERROR_CODE_DELIVERY_RECEIPT_INVALID: PolicyDecisionErrorCode
 
 class HarnessApprovalRequestBinding(_message.Message):
-    __slots__ = ("adapter_id", "attempt_id", "dispatch_id", "fencing_token", "approval_request_id", "kind", "action_digest_sha256", "requested_scope_ref", "native_routing_ref", "request_observation_id", "request_observation_sequence")
+    __slots__ = ("adapter_id", "attempt_id", "dispatch_id", "fencing_token", "approval_request_id", "kind", "action_digest_sha256", "requested_scope_ref", "native_routing_ref", "request_observation_id", "request_observation_sequence", "request_lifecycle", "request_revision")
     ADAPTER_ID_FIELD_NUMBER: _ClassVar[int]
     ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
     DISPATCH_ID_FIELD_NUMBER: _ClassVar[int]
@@ -88,6 +88,8 @@ class HarnessApprovalRequestBinding(_message.Message):
     NATIVE_ROUTING_REF_FIELD_NUMBER: _ClassVar[int]
     REQUEST_OBSERVATION_ID_FIELD_NUMBER: _ClassVar[int]
     REQUEST_OBSERVATION_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_LIFECYCLE_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_REVISION_FIELD_NUMBER: _ClassVar[int]
     adapter_id: str
     attempt_id: str
     dispatch_id: str
@@ -99,7 +101,9 @@ class HarnessApprovalRequestBinding(_message.Message):
     native_routing_ref: str
     request_observation_id: str
     request_observation_sequence: int
-    def __init__(self, adapter_id: _Optional[str] = ..., attempt_id: _Optional[str] = ..., dispatch_id: _Optional[str] = ..., fencing_token: _Optional[int] = ..., approval_request_id: _Optional[str] = ..., kind: _Optional[_Union[_harness_pb2.ApprovalKind, str]] = ..., action_digest_sha256: _Optional[str] = ..., requested_scope_ref: _Optional[str] = ..., native_routing_ref: _Optional[str] = ..., request_observation_id: _Optional[str] = ..., request_observation_sequence: _Optional[int] = ...) -> None: ...
+    request_lifecycle: _harness_pb2.ApprovalRequestLifecycleKind
+    request_revision: int
+    def __init__(self, adapter_id: _Optional[str] = ..., attempt_id: _Optional[str] = ..., dispatch_id: _Optional[str] = ..., fencing_token: _Optional[int] = ..., approval_request_id: _Optional[str] = ..., kind: _Optional[_Union[_harness_pb2.ApprovalKind, str]] = ..., action_digest_sha256: _Optional[str] = ..., requested_scope_ref: _Optional[str] = ..., native_routing_ref: _Optional[str] = ..., request_observation_id: _Optional[str] = ..., request_observation_sequence: _Optional[int] = ..., request_lifecycle: _Optional[_Union[_harness_pb2.ApprovalRequestLifecycleKind, str]] = ..., request_revision: _Optional[int] = ...) -> None: ...
 
 class PolicyAuthorityProof(_message.Message):
     __slots__ = ("authenticated_principal_id", "authentication_context_ref", "authorization_policy_ref", "authorization_decision_id", "verified_at")
@@ -170,7 +174,7 @@ class HarnessApprovalConsumptionReceipt(_message.Message):
     def __init__(self, consumption_receipt_id: _Optional[str] = ..., authority_decision_ref: _Optional[str] = ..., adapter_receipt: _Optional[_Union[_harness_pb2.ApprovalDecisionReceipt, _Mapping]] = ..., consumed_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
 
 class IssueHarnessApprovalDecisionCommand(_message.Message):
-    __slots__ = ("metadata", "approval_request_id", "expected_action_digest_sha256", "expected_request_observation_id", "expected_request_observation_sequence", "decision", "reason_code", "confirmation_proof_ref")
+    __slots__ = ("metadata", "approval_request_id", "expected_action_digest_sha256", "expected_request_observation_id", "expected_request_observation_sequence", "decision", "reason_code", "confirmation_proof_ref", "expected_request_revision")
     METADATA_FIELD_NUMBER: _ClassVar[int]
     APPROVAL_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     EXPECTED_ACTION_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
@@ -179,6 +183,7 @@ class IssueHarnessApprovalDecisionCommand(_message.Message):
     DECISION_FIELD_NUMBER: _ClassVar[int]
     REASON_CODE_FIELD_NUMBER: _ClassVar[int]
     CONFIRMATION_PROOF_REF_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_REQUEST_REVISION_FIELD_NUMBER: _ClassVar[int]
     metadata: _common_pb2.CommandMetadata
     approval_request_id: str
     expected_action_digest_sha256: str
@@ -187,7 +192,8 @@ class IssueHarnessApprovalDecisionCommand(_message.Message):
     decision: _harness_pb2.ApprovalDecision
     reason_code: str
     confirmation_proof_ref: str
-    def __init__(self, metadata: _Optional[_Union[_common_pb2.CommandMetadata, _Mapping]] = ..., approval_request_id: _Optional[str] = ..., expected_action_digest_sha256: _Optional[str] = ..., expected_request_observation_id: _Optional[str] = ..., expected_request_observation_sequence: _Optional[int] = ..., decision: _Optional[_Union[_harness_pb2.ApprovalDecision, str]] = ..., reason_code: _Optional[str] = ..., confirmation_proof_ref: _Optional[str] = ...) -> None: ...
+    expected_request_revision: int
+    def __init__(self, metadata: _Optional[_Union[_common_pb2.CommandMetadata, _Mapping]] = ..., approval_request_id: _Optional[str] = ..., expected_action_digest_sha256: _Optional[str] = ..., expected_request_observation_id: _Optional[str] = ..., expected_request_observation_sequence: _Optional[int] = ..., decision: _Optional[_Union[_harness_pb2.ApprovalDecision, str]] = ..., reason_code: _Optional[str] = ..., confirmation_proof_ref: _Optional[str] = ..., expected_request_revision: _Optional[int] = ...) -> None: ...
 
 class ConsumeHarnessApprovalDecisionCommand(_message.Message):
     __slots__ = ("metadata", "authority_decision_ref", "expected_state_revision", "adapter_receipt")

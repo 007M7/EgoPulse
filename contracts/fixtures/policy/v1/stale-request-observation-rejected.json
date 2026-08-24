@@ -5,7 +5,7 @@
   "requirementRefs": ["G4-07A-BIND-02", "QH-02"],
   "principal": { "kind": "FOUNDER", "principalId": "os-user:founder", "authenticated": true },
   "startingState": null,
-  "resolvedReferences": { "approvalRequest": { "approvalRequestId": "approval-001", "requestObservationId": "observation-approval-002", "requestObservationSequence": 13, "durable": true } },
+  "resolvedReferences": { "approvalRequest": { "approvalRequestId": "approval-001", "requestObservationId": "observation-approval-002", "requestObservationSequence": 13, "requestLifecycle": "APPROVAL_REQUEST_LIFECYCLE_KIND_WITHDRAWN", "requestRevision": 2, "durable": true } },
   "command": {
     "issueHarnessApprovalDecision": {
       "metadata": { "commandId": "cmd-policy-stale-001", "idempotencyKey": "policy-stale-001", "idempotencyScope": "approval-001", "requestDigestSha256": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1", "issuedAt": "2026-08-24T01:12:00Z", "correlationId": "corr-policy-003" },
@@ -13,6 +13,7 @@
       "expectedActionDigestSha256": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
       "expectedRequestObservationId": "observation-approval-001",
       "expectedRequestObservationSequence": 12,
+      "expectedRequestRevision": 1,
       "decision": "APPROVAL_DECISION_DENY",
       "reasonCode": "STALE_VIEW"
     }

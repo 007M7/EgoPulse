@@ -1,8 +1,8 @@
 {
   "schemaVersion": "v01-gate3-contract-candidate-manifest/v0.1",
   "candidateId": "v01-gate3-contracts",
-  "candidateVersion": "0.1.0-draft.12",
-  "status": "targeted_gate3_revision_founder_confirmed_toolchain_reverified_gate4_07a_authorized",
+  "candidateVersion": "0.1.0-draft.13",
+  "status": "targeted_gate3_revision_founder_confirmed_toolchain_reverified_g4_08a_authorized",
   "ssotRole": "implementation_contract_ssot",
   "featureId": "v01-governed-single-harness-work-loop",
   "architectureAuthorityRef": "conversation:2026-08-23:founder-v01-feature-adr-a01",
@@ -21,6 +21,7 @@
   "c08ExplicitEntryRef": "conversation:2026-08-23:founder-v01-c08-entry-explicit",
   "c08AuthorityRef": "conversation:2026-08-23:founder-v01-c08-persistence-recovery-contract",
   "targetedRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3",
+  "approvalReadModelRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a",
   "implementationAuthorized": true,
   "handoffRule": {
     "gate": "Gate 4",
@@ -88,16 +89,22 @@
       "name": "Policy Decision Authority",
       "status": "founder_confirmed_toolchain_reverified",
       "founderDecisionRequired": true
+    },
+    {
+      "id": "G4-08A",
+      "name": "Harness Approval Read Model",
+      "status": "founder_confirmed_toolchain_reverified",
+      "founderDecisionRequired": true
     }
   ],
   "validation": {
     "localCandidateValidator": "scripts/validate-candidate.js",
-    "localCandidateStatus": "passed_166_domain_fixtures_plus_1_foundation_fixture",
+    "localCandidateStatus": "passed_178_domain_fixtures_plus_1_foundation_fixture",
     "bufLint": "passed_buf_1.72.0_with_two_documented_rpc_naming_exceptions",
-    "bufBuild": "passed_draft12_image_sha256_2854b4e74e20e85205140c2a39274c58c603e6ef0ec458f4c48d5fcf5371fc28",
-    "bufBreaking": "passed_exact_founder_authorized_two_field_breaks_against_draft11_and_no_breaks_against_draft12",
-    "protocCompile": "passed_libprotoc_35.1_draft12_ten_v01_modules",
-    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_ten_modules_each",
+    "bufBuild": "passed_draft13_baseline_sha256_fe13c937feb38a4df8f880739f4f8582d12b66f282c2f5dada7dd5886b0a0fa7_and_independent_toolchain_descriptor_sha256_b911c0c8b245314b5d71e2f0235ab2189622e581ac8c929d122eca5ae5390b7a",
+    "bufBreaking": "passed_exact_founder_authorized_two_field_breaks_against_draft11_and_no_breaks_against_draft12_then_baselined_draft13",
+    "protocCompile": "passed_libprotoc_35.1_draft13_ten_v01_modules_plus_foundation",
+    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_ten_v01_modules_plus_foundation",
     "faultConformance": "passed_80_real_process_aborts_bundled_sqlcipher_encrypted_header_integrity_ok_including_policy_decision_boundary",
     "qualityBudgetProfile": "passed_33_d03_rules_exactly_once_with_gate3_design_gate6_verification_binding"
   },
@@ -117,6 +124,14 @@
     {
       "path": "baselines/v01-gate3-draft12.binpb",
       "sha256": "2854b4e74e20e85205140c2a39274c58c603e6ef0ec458f4c48d5fcf5371fc28"
+    },
+    {
+      "path": "baselines/v01-gate3-draft13.binpb",
+      "sha256": "fe13c937feb38a4df8f880739f4f8582d12b66f282c2f5dada7dd5886b0a0fa7"
+    },
+    {
+      "path": "baselines/v01-gate3-draft13.json",
+      "sha256": "13b7d3695ec6d58d165330f2365a01cf950d9d066cbecf3d938825e2a1d278d0"
     },
     {
       "path": "buf.gen.yaml",
@@ -303,8 +318,12 @@
       "sha256": "d55796544e718822066214cc1a681afb2eb7236aaece24e6742dbaede5a207ef"
     },
     {
+      "path": "fixtures/harness/v1/valid-approval-request-withdrawn.json",
+      "sha256": "2affe2282f6ec2b0d20ecc14d0d4e529c1657013a86ca944061624049f4cce41"
+    },
+    {
       "path": "fixtures/harness/v1/valid-approval-request.json",
-      "sha256": "5199d5ba1fa4036442c6a8c666c386f3440cd18b2f4c3fa03d3a777fe8152ba0"
+      "sha256": "86c46795a1388a4ce8fb44df33c96ea44ae58ed3c623bb8f66494fbafed531c1"
     },
     {
       "path": "fixtures/harness/v1/valid-artifact-return-candidate.json",
@@ -331,6 +350,10 @@
       "sha256": "9dd6db604530eb2d4fb13c09d0f2318a8ce14265ae7d7d8a7d1a5aa39441605d"
     },
     {
+      "path": "fixtures/localapi/v1/duplicate-harness-approval-observation-projection.json",
+      "sha256": "1cf47dc00a86ca7af3bee1056fc6538fc60f981bac1ce7f0eaa9136a1a87f139"
+    },
+    {
       "path": "fixtures/localapi/v1/duplicate-stream-frame-deduped.json",
       "sha256": "83b072bd408db393258c27dc8bdd9185274c7cf3e142acfa632208b7a1df76f6"
     },
@@ -349,6 +372,14 @@
     {
       "path": "fixtures/localapi/v1/invalid-cursor-filter-mismatch.json",
       "sha256": "eac339788b0fc89c6975b866f8d2349fe6a43e8bc52bac2bec2b691a54915c33"
+    },
+    {
+      "path": "fixtures/localapi/v1/invalid-harness-approval-native-routing-exposure.json",
+      "sha256": "030cf7e69054708e422aac79a545a529b2d260f98537e4365a6fccbbaabac6cc"
+    },
+    {
+      "path": "fixtures/localapi/v1/invalid-harness-approval-source-binding-mismatch.json",
+      "sha256": "c5a6fdf5004cb4ee0b8237752a0780735248bf8b930c81d06b59dd8c4632aaf2"
     },
     {
       "path": "fixtures/localapi/v1/invalid-incoherent-source-vector.json",
@@ -375,6 +406,10 @@
       "sha256": "cb434cba36f150287f0fab76a3919a5a1d9a6d077a187682bffb174f0ff9c440"
     },
     {
+      "path": "fixtures/localapi/v1/recovery-harness-approval-stream-gap-reset.json",
+      "sha256": "b89a0f9a2750197ce2f8283f64eb6ee90b04654fa269d4c5c3ad15cb0f202d62"
+    },
+    {
       "path": "fixtures/localapi/v1/recovery-projector-rebuild-new-epoch.json",
       "sha256": "5483c4239b4737b747b5e5568114765d1e1bbd05ca69da22993d8b54e645e63e"
     },
@@ -396,11 +431,19 @@
     },
     {
       "path": "fixtures/localapi/v1/unauthorized-model-harness-approval.json",
-      "sha256": "5e4a34b0d40a4eb15c2ecdced494280cb6463295a9d973a00ac7cfc3557c6c56"
+      "sha256": "78e851d99a548e75f36433c0c4f1010dad015f2f3252f0d5ca68bda3bb630b58"
+    },
+    {
+      "path": "fixtures/localapi/v1/unauthorized-other-os-user-harness-approval-list.json",
+      "sha256": "fdd40c49e3e755896e2eec18c6c6e9adae7ccd635580842521e0bdc98bf539c6"
     },
     {
       "path": "fixtures/localapi/v1/unauthorized-other-os-user.json",
       "sha256": "07b24323304e984a8e25160e969052d4738cdf1d858a534f0e68e372d8ef5a1d"
+    },
+    {
+      "path": "fixtures/localapi/v1/valid-await-policy-projection-approval-view.json",
+      "sha256": "04621d8f103c52e2a1b65900545354b58d4cb0a620496248097ae4026a9a5b50"
     },
     {
       "path": "fixtures/localapi/v1/valid-await-projection-read-your-write.json",
@@ -420,11 +463,19 @@
     },
     {
       "path": "fixtures/localapi/v1/valid-founder-harness-approval-gateway.json",
-      "sha256": "8c64f8e6d17b79fd2f98f38fe1cf8255994f30acbe30515341a80e9fb03878f8"
+      "sha256": "10874e0f5d751b6d9e9a4e614bddc10cf506524e6203c05e8e2d02654c57acbb"
     },
     {
       "path": "fixtures/localapi/v1/valid-get-coherent-task-view.json",
       "sha256": "494e52e14c59afba0795341a47895bcbc2c4173bfc7ee809222a999a13082a40"
+    },
+    {
+      "path": "fixtures/localapi/v1/valid-get-harness-approval-policy-state.json",
+      "sha256": "23a82d5c33aec4acc6c753ba42da6a3230206fc0870241dc667e80caa64f8bc7"
+    },
+    {
+      "path": "fixtures/localapi/v1/valid-list-actionable-harness-approvals.json",
+      "sha256": "75d9ecaaa8d04f4dcb2ef87f65fea3c7f1e25ae88ac850f6adc407d57ab7a364"
     },
     {
       "path": "fixtures/localapi/v1/valid-list-stable-cursor.json",
@@ -445,6 +496,14 @@
     {
       "path": "fixtures/localapi/v1/valid-watch-complete-snapshots.json",
       "sha256": "073f8cb2d9046e0dcb611ad3aa8c46c5021cdaf2585cf0700defda7dabc72b7f"
+    },
+    {
+      "path": "fixtures/localapi/v1/valid-watch-harness-approval-complete-snapshots.json",
+      "sha256": "ddf05c9b04401487a3e36cb378943a9aaf0f02b45557a4153f42af44b1925d28"
+    },
+    {
+      "path": "fixtures/localapi/v1/valid-withdrawn-harness-approval-not-actionable.json",
+      "sha256": "8da48f832c01086b3e7ccd345197afba76b136b86397409e5a3f3a7649ffc8fc"
     },
     {
       "path": "fixtures/persistence/v1/duplicate-command-after-commit-before-response.json",
@@ -513,6 +572,10 @@
     {
       "path": "fixtures/persistence/v1/recovery-corrupt-authority-store-held.json",
       "sha256": "49e696716175b93e8461685b3ab7f062ebe32f9d1401b88c76e153ed59a8b993"
+    },
+    {
+      "path": "fixtures/persistence/v1/recovery-harness-approval-projection-outbox-replay.json",
+      "sha256": "377a13cce279d2f9e512da469924859f7f6be4cb989d8644e2b5bef99af3db9d"
     },
     {
       "path": "fixtures/persistence/v1/recovery-outbox-commit-before-delivery.json",
@@ -584,11 +647,11 @@
     },
     {
       "path": "fixtures/policy/v1/duplicate-issue-command-replay.json",
-      "sha256": "e736f9454d0c84d3d3f7b4430ca406ca25a16e300ebd4b74023450a6b2d5d785"
+      "sha256": "52c4ad70a6ef0bb367feeb2bdc7de5be8f496393a2c497a014899a33a64b59ad"
     },
     {
       "path": "fixtures/policy/v1/invalid-request-binding-mismatch.json",
-      "sha256": "dd60ce23799522b009ad01ff45632fa9de850e759841f150903ab856225c1a4a"
+      "sha256": "6330b32853d80d37668e2936262e58ff003cb3ceba3dd4a377e1478a8149bbea"
     },
     {
       "path": "fixtures/policy/v1/recovery-issued-decision-outbox-replay.json",
@@ -596,15 +659,15 @@
     },
     {
       "path": "fixtures/policy/v1/stale-request-observation-rejected.json",
-      "sha256": "a02c7851decc28ea7712d9b556aea9a6ad4c9cc64682713c0cd08b2420a1eb87"
+      "sha256": "dabfd0ea277d3d484983a38a11f08d1f3dbdd6ccb4b5dd7911c5046ebdb373cd"
     },
     {
       "path": "fixtures/policy/v1/unauthorized-model-approval-decision.json",
-      "sha256": "cebca5d5704a5f654f5e3331983c2e8a8f8c62c8d7ac70db0ec1bb9c3a279545"
+      "sha256": "ac34ab2ff2eaf71663149121c3b754caa5d05952d2b427fdf173d6f342eec3ec"
     },
     {
       "path": "fixtures/policy/v1/valid-issue-harness-approval-decision.json",
-      "sha256": "90821cdbfa3f9e731665bd0bc891b061be50ca8ca44033d42e84266b7c6432fe"
+      "sha256": "390769a6f752528f0e42940f0fbc81f336d742b82a82e45b7c3d00a52e37846d"
     },
     {
       "path": "fixtures/task/v1/duplicate-create-replay.json",
@@ -808,11 +871,11 @@
     },
     {
       "path": "IMPLEMENTATION-SSOT.json",
-      "sha256": "30ae5941e6b8c38d036d4628aa9e318c143211d84a26d69fa058d3ebe9267a7a"
+      "sha256": "32fed184d10b3bb9304928843486d2faeffc2f7c31413dcd4050c349c8c75d46"
     },
     {
       "path": "IMPLEMENTATION-SSOT.md",
-      "sha256": "51f8f629f5a185036c25c1a67e61c3291f607040e094ea2ef4cdcb7908aebbba"
+      "sha256": "477dfad04fa1f5002ce63dce520b312f74e91fd050d36bfb8773272ea5a90cd1"
     },
     {
       "path": "json-schema/foundation-health.schema.json",
@@ -852,11 +915,11 @@
     },
     {
       "path": "proto/egopulse/harness/v1/harness.proto",
-      "sha256": "3674b77583a5ee462f95470fee53464afbf4d88d032ba7718f75ba4168d7a80b"
+      "sha256": "fc3d69093fd8e4eb93daa427ba217f5142d2c10f6c7938f9a4a2751b552462d8"
     },
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
-      "sha256": "372c93137227f70ccf0f2eecf07d3ea55d8c83ae7f97c1c71344750dc560c2ec"
+      "sha256": "943bcbe3bc09734fcd9a81d1a0df2094690173b368e062ab566cc088cdecb6ce"
     },
     {
       "path": "proto/egopulse/persistence/v1/persistence.proto",
@@ -864,7 +927,7 @@
     },
     {
       "path": "proto/egopulse/policy/v1/policy.proto",
-      "sha256": "372fab795c916509336e2ed38bf550022d817bdf4ecbf5b66b6ae54e5f5ba8a6"
+      "sha256": "2ee5f15683d52d51255ef78dd3f4a1cb8ddfde860142319283499c6e3d28b0bd"
     },
     {
       "path": "proto/egopulse/task/v1/task.proto",
@@ -892,7 +955,7 @@
     },
     {
       "path": "scripts/validate-candidate.js",
-      "sha256": "c503e77ef6c4c65b217c5c2de8b154224908dc9873daf6bd4802046a436d9cd0"
+      "sha256": "57105a67e887c67db08c04c8c1d8cb694645527ebe9620766071589681bad8e1"
     },
     {
       "path": "scripts/verify-faults.ps1",
@@ -900,7 +963,7 @@
     },
     {
       "path": "scripts/verify-toolchain.ps1",
-      "sha256": "165a5a9352b36f287d95a6b98ad8fad4cbf230c037535fee34816beae025d8fd"
+      "sha256": "3e81b47d5019fcc4392334c53de93ab0a2e6ccc06881df2668a11099053e3299"
     },
     {
       "path": "toolchain/fault-conformance/Cargo.lock",
@@ -944,19 +1007,19 @@
     },
     {
       "path": "toolchain/python/verify_generated.py",
-      "sha256": "61847bab1c6b4e3d9e9ed4a322b6b674598b0d3c28ddba415341c2119ab75051"
+      "sha256": "73a62ff018f6fecfd3c459a3cca6b56491a87e1a678bbaea38b52bbd7b6d5b6c"
     },
     {
       "path": "toolchain/rust-generated-check/Cargo.lock",
-      "sha256": "9a1704a83e4ca9e4b854e36d35ace8494c3be9bc42160de3ac0f5a1b9122ba72"
+      "sha256": "12ef9ba5dba4441f3f5b4e073ca1c075d2a69667fd8f789fa015bcb527a9f90f"
     },
     {
       "path": "toolchain/rust-generated-check/Cargo.toml",
-      "sha256": "5231b905f62e4c71230e237af44aa10f75cc65993298ddf12058ee6d4301386b"
+      "sha256": "155676451ad3a0fb8c8397e7c4dac050cf6fddea2f914d7eb867b9675c7b2d07"
     },
     {
       "path": "toolchain/rust-generated-check/src/lib.rs",
-      "sha256": "515b4e037b7dea5dcc490a09f6306cd0cad75f761810ae2be2cbcf31edefc05c"
+      "sha256": "1f29e82692cc82f3e17bf70ffed962fd3a671bbf4d880f323bedbbb17c6be28b"
     },
     {
       "path": "toolchain/tsconfig.json",

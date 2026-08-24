@@ -119,6 +119,105 @@ pub struct EvidenceGraphView {
     #[prost(message, repeated, tag = "7")]
     pub redactions: ::prost::alloc::vec::Vec<RedactedField>,
 }
+/// Sanitized Authority result safe for Local API clients. The owning Policy
+/// Authority remains the source of this result; native routing and proof
+/// internals are deliberately absent.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessApprovalAuthorityResult {
+    #[prost(bool, tag = "1")]
+    pub committed: bool,
+    #[prost(bool, tag = "2")]
+    pub replayed: bool,
+    #[prost(string, tag = "3")]
+    pub authority_decision_ref: ::prost::alloc::string::String,
+    #[prost(enumeration = "super::super::harness::v1::ApprovalDecision", tag = "4")]
+    pub decision: i32,
+    #[prost(
+        enumeration = "super::super::policy::v1::HarnessApprovalDecisionStateKind",
+        tag = "5"
+    )]
+    pub state: i32,
+    #[prost(uint64, tag = "6")]
+    pub state_revision: u64,
+    #[prost(message, optional, tag = "7")]
+    pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(
+        enumeration = "super::super::policy::v1::PolicyDecisionErrorCode",
+        tag = "8"
+    )]
+    pub error_code: i32,
+    #[prost(string, optional, tag = "9")]
+    pub safe_error_fingerprint: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessApprovalDecisionView {
+    #[prost(string, tag = "1")]
+    pub authority_decision_ref: ::prost::alloc::string::String,
+    #[prost(enumeration = "super::super::harness::v1::ApprovalDecision", tag = "2")]
+    pub decision: i32,
+    #[prost(string, tag = "3")]
+    pub reason_code: ::prost::alloc::string::String,
+    #[prost(
+        enumeration = "super::super::policy::v1::HarnessApprovalDecisionStateKind",
+        tag = "4"
+    )]
+    pub state: i32,
+    #[prost(uint64, tag = "5")]
+    pub state_revision: u64,
+    #[prost(message, optional, tag = "6")]
+    pub issued_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(message, optional, tag = "7")]
+    pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(message, optional, tag = "8")]
+    pub updated_at: ::core::option::Option<::prost_types::Timestamp>,
+}
+/// Rebuildable projection joining an Adapter-owned request with an optional
+/// Policy-owned decision. Native routing, raw prompt/command, credentials and
+/// store handles are never part of this view.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HarnessApprovalView {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<ProjectionMetadata>,
+    #[prost(string, tag = "2")]
+    pub approval_request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub run_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub step_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub attempt_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub dispatch_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "8")]
+    pub fencing_token: u64,
+    #[prost(enumeration = "super::super::harness::v1::ApprovalKind", tag = "9")]
+    pub kind: i32,
+    #[prost(string, tag = "10")]
+    pub action_digest_sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "11")]
+    pub requested_scope_ref: ::prost::alloc::string::String,
+    #[prost(string, tag = "12")]
+    pub display_summary_ref: ::prost::alloc::string::String,
+    #[prost(string, tag = "13")]
+    pub request_observation_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "14")]
+    pub request_observation_sequence: u64,
+    #[prost(
+        enumeration = "super::super::harness::v1::ApprovalRequestLifecycleKind",
+        tag = "15"
+    )]
+    pub request_lifecycle: i32,
+    #[prost(uint64, tag = "16")]
+    pub request_revision: u64,
+    #[prost(message, optional, tag = "17")]
+    pub policy_decision: ::core::option::Option<HarnessApprovalDecisionView>,
+    #[prost(message, repeated, tag = "18")]
+    pub available_actions: ::prost::alloc::vec::Vec<AvailableAction>,
+    #[prost(message, repeated, tag = "19")]
+    pub redactions: ::prost::alloc::vec::Vec<RedactedField>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LocalApiError {
     #[prost(enumeration = "LocalApiErrorCode", tag = "1")]
@@ -251,6 +350,68 @@ pub mod get_evidence_graph_response {
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetHarnessApprovalViewRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub approval_request_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub minimum_position: ::core::option::Option<ProjectionPosition>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetHarnessApprovalViewResponse {
+    #[prost(oneof = "get_harness_approval_view_response::Outcome", tags = "1, 2")]
+    pub outcome: ::core::option::Option<get_harness_approval_view_response::Outcome>,
+}
+/// Nested message and enum types in `GetHarnessApprovalViewResponse`.
+pub mod get_harness_approval_view_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Outcome {
+        #[prost(message, tag = "1")]
+        View(super::HarnessApprovalView),
+        #[prost(message, tag = "2")]
+        Error(super::LocalApiError),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListHarnessApprovalViewsRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(
+        enumeration = "super::super::harness::v1::ApprovalRequestLifecycleKind",
+        repeated,
+        tag = "2"
+    )]
+    pub request_lifecycle_filter: ::prost::alloc::vec::Vec<i32>,
+    #[prost(
+        enumeration = "super::super::policy::v1::HarnessApprovalDecisionStateKind",
+        repeated,
+        tag = "3"
+    )]
+    pub decision_state_filter: ::prost::alloc::vec::Vec<i32>,
+    #[prost(string, repeated, tag = "4")]
+    pub task_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, tag = "5")]
+    pub actionable_only: bool,
+    #[prost(uint32, tag = "6")]
+    pub page_size: u32,
+    #[prost(string, optional, tag = "7")]
+    pub page_cursor: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "8")]
+    pub minimum_position: ::core::option::Option<ProjectionPosition>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListHarnessApprovalViewsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub views: ::prost::alloc::vec::Vec<HarnessApprovalView>,
+    #[prost(string, optional, tag = "2")]
+    pub next_page_cursor: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "3")]
+    pub snapshot_position: ::core::option::Option<ProjectionPosition>,
+    #[prost(message, optional, tag = "4")]
+    pub error: ::core::option::Option<LocalApiError>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetProjectionStatusRequest {
     #[prost(message, optional, tag = "1")]
     pub client: ::core::option::Option<ClientRequestMetadata>,
@@ -281,6 +442,42 @@ pub struct TaskViewStreamFrame {
     pub position: ::core::option::Option<ProjectionPosition>,
     #[prost(message, optional, tag = "3")]
     pub snapshot: ::core::option::Option<TaskView>,
+    #[prost(string, optional, tag = "4")]
+    pub reset_reason_code: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchHarnessApprovalViewsRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(message, optional, tag = "2")]
+    pub resume_after: ::core::option::Option<ProjectionPosition>,
+    #[prost(string, repeated, tag = "3")]
+    pub approval_request_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "4")]
+    pub task_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(
+        enumeration = "super::super::harness::v1::ApprovalRequestLifecycleKind",
+        repeated,
+        tag = "5"
+    )]
+    pub request_lifecycle_filter: ::prost::alloc::vec::Vec<i32>,
+    #[prost(
+        enumeration = "super::super::policy::v1::HarnessApprovalDecisionStateKind",
+        repeated,
+        tag = "6"
+    )]
+    pub decision_state_filter: ::prost::alloc::vec::Vec<i32>,
+    #[prost(bool, tag = "7")]
+    pub actionable_only: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HarnessApprovalViewStreamFrame {
+    #[prost(enumeration = "StreamFrameKind", tag = "1")]
+    pub kind: i32,
+    #[prost(message, optional, tag = "2")]
+    pub position: ::core::option::Option<ProjectionPosition>,
+    #[prost(message, optional, tag = "3")]
+    pub snapshot: ::core::option::Option<HarnessApprovalView>,
     #[prost(string, optional, tag = "4")]
     pub reset_reason_code: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -326,9 +523,16 @@ pub struct DecideHarnessApprovalResponse {
     pub await_token: ::core::option::Option<ProjectionAwaitToken>,
     #[prost(message, optional, tag = "3")]
     pub gateway_error: ::core::option::Option<LocalApiError>,
+    /// Kept for draft.12 wire compatibility but MUST remain unset because the
+    /// full Authority result contains Adapter-native routing/proof internals.
+    #[deprecated]
     #[prost(message, optional, tag = "4")]
     pub policy_authority_result: ::core::option::Option<
         super::super::policy::v1::PolicyDecisionCommandResult,
+    >,
+    #[prost(message, optional, tag = "5")]
+    pub sanitized_authority_result: ::core::option::Option<
+        HarnessApprovalAuthorityResult,
     >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -360,7 +564,7 @@ pub struct AwaitProjectionRequest {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AwaitProjectionResponse {
-    #[prost(oneof = "await_projection_response::Outcome", tags = "1, 2")]
+    #[prost(oneof = "await_projection_response::Outcome", tags = "1, 2, 3")]
     pub outcome: ::core::option::Option<await_projection_response::Outcome>,
 }
 /// Nested message and enum types in `AwaitProjectionResponse`.
@@ -371,6 +575,8 @@ pub mod await_projection_response {
         View(super::TaskView),
         #[prost(message, tag = "2")]
         Error(super::LocalApiError),
+        #[prost(message, tag = "3")]
+        ApprovalView(super::HarnessApprovalView),
     }
 }
 /// Presentation/audit metadata only. It MUST NOT select capabilities or authorization.
@@ -454,6 +660,9 @@ pub enum SourceDomain {
     Verification = 4,
     FounderVerdict = 5,
     PolicyDecision = 6,
+    /// Candidate facts from the Adapter durable edge; this does not grant
+    /// Authority ownership to the Adapter.
+    HarnessAdapter = 7,
 }
 impl SourceDomain {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -469,6 +678,7 @@ impl SourceDomain {
             Self::Verification => "SOURCE_DOMAIN_VERIFICATION",
             Self::FounderVerdict => "SOURCE_DOMAIN_FOUNDER_VERDICT",
             Self::PolicyDecision => "SOURCE_DOMAIN_POLICY_DECISION",
+            Self::HarnessAdapter => "SOURCE_DOMAIN_HARNESS_ADAPTER",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -481,6 +691,7 @@ impl SourceDomain {
             "SOURCE_DOMAIN_VERIFICATION" => Some(Self::Verification),
             "SOURCE_DOMAIN_FOUNDER_VERDICT" => Some(Self::FounderVerdict),
             "SOURCE_DOMAIN_POLICY_DECISION" => Some(Self::PolicyDecision),
+            "SOURCE_DOMAIN_HARNESS_ADAPTER" => Some(Self::HarnessAdapter),
             _ => None,
         }
     }
@@ -1129,6 +1340,64 @@ pub mod local_read_model_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_harness_approval_view(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetHarnessApprovalViewRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetHarnessApprovalViewResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalReadModelService/GetHarnessApprovalView",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalReadModelService",
+                        "GetHarnessApprovalView",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_harness_approval_views(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListHarnessApprovalViewsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListHarnessApprovalViewsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalReadModelService/ListHarnessApprovalViews",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalReadModelService",
+                        "ListHarnessApprovalViews",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn get_projection_status(
             &mut self,
             request: impl tonic::IntoRequest<super::GetProjectionStatusRequest>,
@@ -1183,6 +1452,37 @@ pub mod local_read_model_service_client {
                     GrpcMethod::new(
                         "egopulse.localapi.v1.LocalReadModelService",
                         "WatchTaskViews",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn watch_harness_approval_views(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WatchHarnessApprovalViewsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<
+                tonic::codec::Streaming<super::HarnessApprovalViewStreamFrame>,
+            >,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalReadModelService/WatchHarnessApprovalViews",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalReadModelService",
+                        "WatchHarnessApprovalViews",
                     ),
                 );
             self.inner.server_streaming(req, path, codec).await
@@ -1252,6 +1552,20 @@ pub mod local_read_model_service_server {
             tonic::Response<super::GetEvidenceGraphResponse>,
             tonic::Status,
         >;
+        async fn get_harness_approval_view(
+            &self,
+            request: tonic::Request<super::GetHarnessApprovalViewRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetHarnessApprovalViewResponse>,
+            tonic::Status,
+        >;
+        async fn list_harness_approval_views(
+            &self,
+            request: tonic::Request<super::ListHarnessApprovalViewsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListHarnessApprovalViewsResponse>,
+            tonic::Status,
+        >;
         async fn get_projection_status(
             &self,
             request: tonic::Request<super::GetProjectionStatusRequest>,
@@ -1270,6 +1584,22 @@ pub mod local_read_model_service_server {
             request: tonic::Request<super::WatchTaskViewsRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::WatchTaskViewsStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the WatchHarnessApprovalViews method.
+        type WatchHarnessApprovalViewsStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<
+                    super::HarnessApprovalViewStreamFrame,
+                    tonic::Status,
+                >,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn watch_harness_approval_views(
+            &self,
+            request: tonic::Request<super::WatchHarnessApprovalViewsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::WatchHarnessApprovalViewsStream>,
             tonic::Status,
         >;
         async fn await_projection(
@@ -1501,6 +1831,110 @@ pub mod local_read_model_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/egopulse.localapi.v1.LocalReadModelService/GetHarnessApprovalView" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetHarnessApprovalViewSvc<T: LocalReadModelService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: LocalReadModelService,
+                    > tonic::server::UnaryService<super::GetHarnessApprovalViewRequest>
+                    for GetHarnessApprovalViewSvc<T> {
+                        type Response = super::GetHarnessApprovalViewResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetHarnessApprovalViewRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalReadModelService>::get_harness_approval_view(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetHarnessApprovalViewSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/egopulse.localapi.v1.LocalReadModelService/ListHarnessApprovalViews" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListHarnessApprovalViewsSvc<T: LocalReadModelService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: LocalReadModelService,
+                    > tonic::server::UnaryService<super::ListHarnessApprovalViewsRequest>
+                    for ListHarnessApprovalViewsSvc<T> {
+                        type Response = super::ListHarnessApprovalViewsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::ListHarnessApprovalViewsRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalReadModelService>::list_harness_approval_views(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListHarnessApprovalViewsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/egopulse.localapi.v1.LocalReadModelService/GetProjectionStatus" => {
                     #[allow(non_camel_case_types)]
                     struct GetProjectionStatusSvc<T: LocalReadModelService>(pub Arc<T>);
@@ -1585,6 +2019,61 @@ pub mod local_read_model_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = WatchTaskViewsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/egopulse.localapi.v1.LocalReadModelService/WatchHarnessApprovalViews" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchHarnessApprovalViewsSvc<T: LocalReadModelService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: LocalReadModelService,
+                    > tonic::server::ServerStreamingService<
+                        super::WatchHarnessApprovalViewsRequest,
+                    > for WatchHarnessApprovalViewsSvc<T> {
+                        type Response = super::HarnessApprovalViewStreamFrame;
+                        type ResponseStream = T::WatchHarnessApprovalViewsStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::WatchHarnessApprovalViewsRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalReadModelService>::watch_harness_approval_views(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchHarnessApprovalViewsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

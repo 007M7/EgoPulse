@@ -34,7 +34,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'buf version failed' }
     & buf lint
     if ($LASTEXITCODE -ne 0) { throw 'buf lint failed' }
-    & buf build --exclude-source-info -o (Join-Path $evidenceRoot 'buf-image.binpb')
+    $bufImage = Join-Path $evidenceRoot 'buf-image.binpb'
+    & buf build --as-file-descriptor-set --exclude-source-info -o $bufImage
     if ($LASTEXITCODE -ne 0) { throw 'buf build failed' }
 
     $protoFiles = Get-ChildItem -LiteralPath (Join-Path $candidateRoot 'proto') -Recurse -Filter '*.proto' -File |
@@ -57,6 +58,12 @@ try {
 
     & buf generate --template (Join-Path $candidateRoot 'buf.gen.yaml')
     if ($LASTEXITCODE -ne 0) { throw 'buf cross-language generation failed' }
+    $repositoryRoot = (& git -C $candidateRoot rev-parse --show-toplevel).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repositoryRoot)) { throw 'repository root resolution failed' }
+    $rustOut = Join-Path $generatedRoot 'rust'
+    New-Item -ItemType Directory -Force -Path $rustOut | Out-Null
+    & $cargoExe run --manifest-path (Join-Path $repositoryRoot 'Cargo.toml') --locked --quiet -p egopulse-contract-rust-codegen -- $bufImage $rustOut
+    if ($LASTEXITCODE -ne 0) { throw 'Rust/Tonic generation failed' }
     & pnpm --dir $toolchainRoot run typecheck
     if ($LASTEXITCODE -ne 0) { throw 'TypeScript generated code typecheck failed' }
     & $cargoExe test --manifest-path (Join-Path $toolchainRoot 'rust-generated-check\Cargo.toml') --locked

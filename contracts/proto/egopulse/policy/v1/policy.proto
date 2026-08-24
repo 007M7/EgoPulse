@@ -56,6 +56,8 @@ message HarnessApprovalRequestBinding {
   string native_routing_ref = 9;
   string request_observation_id = 10;
   uint64 request_observation_sequence = 11;
+  egopulse.harness.v1.ApprovalRequestLifecycleKind request_lifecycle = 12;
+  uint64 request_revision = 13;
 }
 
 // Created by the authority from trusted IPC identity and policy evaluation.
@@ -109,6 +111,7 @@ message IssueHarnessApprovalDecisionCommand {
   egopulse.harness.v1.ApprovalDecision decision = 6;
   string reason_code = 7;
   optional string confirmation_proof_ref = 8;
+  uint64 expected_request_revision = 9;
 }
 
 // System-only command emitted after the Adapter has durably committed its

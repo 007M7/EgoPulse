@@ -1,7 +1,7 @@
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ApprovalDecision, ApprovalDecisionEnvelope, ApprovalDecisionReceipt, ApprovalKind,
-    DeliveryDisposition,
+    ApprovalRequestLifecycleKind, DeliveryDisposition,
 };
 use egopulse_domain_contracts::v01::egopulse::policy::v1::{
     ConsumeHarnessApprovalDecisionCommand, ExpireHarnessApprovalDecisionCommand,
@@ -42,6 +42,7 @@ struct StaticResolver {
     expires_at: i64,
     receipt_valid: bool,
     issue_rejection: Option<PolicyReferenceRejection>,
+    request_override: Option<HarnessApprovalRequestBinding>,
 }
 
 impl PolicyReferenceResolver for StaticResolver {
@@ -54,7 +55,10 @@ impl PolicyReferenceResolver for StaticResolver {
             return Err(rejection);
         }
         Ok(ResolvedApprovalAuthorization {
-            request: request_binding(),
+            request: self
+                .request_override
+                .clone()
+                .unwrap_or_else(request_binding),
             authority_proof: PolicyAuthorityProof {
                 authenticated_principal_id: principal.principal_id.clone(),
                 authentication_context_ref: "ipc-session:trusted-local-user".to_owned(),
@@ -255,6 +259,7 @@ fn request_mismatch_and_identity_forgery_fail_with_zero_writes() {
             expires_at: NOW + 300,
             receipt_valid: true,
             issue_rejection: Some(PolicyReferenceRejection::FencingRejected),
+            request_override: None,
         },
     );
     let rejected = fenced.execute(&valid, &local_user()).expect("fence denial");
@@ -280,6 +285,38 @@ fn request_mismatch_and_identity_forgery_fail_with_zero_writes() {
         authority.inspect_store().expect("inspect").decision_count,
         0
     );
+}
+
+#[test]
+fn withdrawn_or_stale_request_revision_cannot_be_decided() {
+    let root = TempRoot::new("withdrawn-request");
+    let mut withdrawn = request_binding();
+    withdrawn.request_lifecycle = ApprovalRequestLifecycleKind::Withdrawn as i32;
+    withdrawn.request_revision = 2;
+    let mut authority = open_authority_with_resolver(
+        &root.database(),
+        NOW,
+        StaticResolver {
+            expires_at: NOW + 300,
+            receipt_valid: true,
+            issue_rejection: None,
+            request_override: Some(withdrawn),
+        },
+    );
+    let mut command = issue_command();
+    sign(&mut command);
+    let rejected = authority
+        .execute(&command, &local_user())
+        .expect("withdrawn request denial");
+    assert_eq!(
+        rejected.error_code,
+        PolicyDecisionErrorCode::RevisionConflict as i32
+    );
+    assert_eq!(
+        authority.inspect_store().expect("inspect").decision_count,
+        0
+    );
+    assert!(authority.pending_outbox().expect("outbox").is_empty());
 }
 
 #[test]
@@ -559,6 +596,7 @@ fn open_authority(
             expires_at,
             receipt_valid: true,
             issue_rejection: None,
+            request_override: None,
         },
     )
 }
@@ -590,6 +628,7 @@ fn issue_command() -> PolicyDecisionCommand {
                     expected_action_digest_sha256: SHA_A.to_owned(),
                     expected_request_observation_id: "observation-approval-01".to_owned(),
                     expected_request_observation_sequence: 17,
+                    expected_request_revision: 1,
                     decision: ApprovalDecision::AllowOnce as i32,
                     reason_code: "FOUNDER_ALLOW_ONCE".to_owned(),
                     confirmation_proof_ref: Some("founder-confirmation:approval-01".to_owned()),
@@ -636,6 +675,8 @@ fn request_binding() -> HarnessApprovalRequestBinding {
         native_routing_ref: "native-route:approval-01".to_owned(),
         request_observation_id: "observation-approval-01".to_owned(),
         request_observation_sequence: 17,
+        request_lifecycle: ApprovalRequestLifecycleKind::Open as i32,
+        request_revision: 1,
     }
 }
 

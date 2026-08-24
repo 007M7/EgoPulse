@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-persistence-fixture/v0.1",
+  "fixtureId": "persistence-recovery-harness-approval-projection-outbox-replay",
+  "category": "recovery",
+  "requirementRefs": ["G4-08A-REC-03", "C08-OUTBOX-02"],
+  "principal": { "kind": "SYSTEM_PROJECTOR", "principalId": "projector:approval-read-model", "authenticated": true },
+  "startingState": { "sourceDomain": "PERSISTENCE_DOMAIN_HARNESS_ADAPTER", "outboxMessageId": "outbox-approval-observation-001", "deliveryAttempt": 2, "projectorInboxReceiptPresent": true },
+  "operation": { "consumeOutboxMessage": { "outboxMessageId": "outbox-approval-observation-001", "consumerId": "approval-read-model", "sourceEntityId": "approval-001", "sourceRevision": 1 } },
+  "expected": { "outcome": "replayed", "businessWriteCount": 0, "sameOutboxMessageIdReplayed": true, "projectorInboxDeduplicated": true, "authorityDecisionWriteCount": 0, "nativeHarnessCallCount": 0 }
+}

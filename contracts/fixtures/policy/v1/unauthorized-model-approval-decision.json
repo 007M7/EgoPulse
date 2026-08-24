@@ -13,6 +13,7 @@
       "expectedActionDigestSha256": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
       "expectedRequestObservationId": "observation-approval-001",
       "expectedRequestObservationSequence": 12,
+      "expectedRequestRevision": 1,
       "decision": "APPROVAL_DECISION_ALLOW_ONCE",
       "reasonCode": "MODEL_SELF_APPROVAL"
     }

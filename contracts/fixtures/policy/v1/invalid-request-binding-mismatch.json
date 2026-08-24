@@ -21,6 +21,7 @@
       "expectedActionDigestSha256": "f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4",
       "expectedRequestObservationId": "observation-approval-001",
       "expectedRequestObservationSequence": 12,
+      "expectedRequestRevision": 1,
       "decision": "APPROVAL_DECISION_ALLOW_ONCE",
       "reasonCode": "FOUNDER_CONFIRMED"
     }

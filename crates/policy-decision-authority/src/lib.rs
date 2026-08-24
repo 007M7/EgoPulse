@@ -10,7 +10,7 @@ mod store;
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ApprovalDecision, ApprovalDecisionEnvelope, ApprovalDecisionReceipt, ApprovalKind,
-    DeliveryDisposition,
+    ApprovalRequestLifecycleKind, DeliveryDisposition,
 };
 use egopulse_domain_contracts::v01::egopulse::policy::v1::{
     ConsumeHarnessApprovalDecisionCommand, ExpireHarnessApprovalDecisionCommand,
@@ -310,6 +310,7 @@ impl<C: PolicyClock> PolicyDecisionAuthority<C> {
             || !sha256_is_valid(&command.expected_action_digest_sha256)
             || command.expected_request_observation_id.trim().is_empty()
             || command.expected_request_observation_sequence == 0
+            || command.expected_request_revision == 0
             || command.reason_code.trim().is_empty()
             || ApprovalDecision::try_from(command.decision).unwrap_or(ApprovalDecision::Unspecified)
                 == ApprovalDecision::Unspecified
@@ -323,8 +324,23 @@ impl<C: PolicyClock> PolicyDecisionAuthority<C> {
             Ok(value) => value,
             Err(rejection) => return Ok(reference_error(rejection)),
         };
-        if !binding_complete(&resolved.request)
-            || resolved.request.approval_request_id != command.approval_request_id
+        if !binding_complete(&resolved.request) {
+            return Ok(error_result(
+                PolicyDecisionErrorCode::RequestMismatch,
+                "TRUSTED_APPROVAL_REQUEST_INVALID",
+            ));
+        }
+        if resolved.request.request_revision != command.expected_request_revision
+            || ApprovalRequestLifecycleKind::try_from(resolved.request.request_lifecycle)
+                .unwrap_or(ApprovalRequestLifecycleKind::Unspecified)
+                != ApprovalRequestLifecycleKind::Open
+        {
+            return Ok(error_result(
+                PolicyDecisionErrorCode::RevisionConflict,
+                "TRUSTED_APPROVAL_REQUEST_NOT_CURRENT_OPEN_REVISION",
+            ));
+        }
+        if resolved.request.approval_request_id != command.approval_request_id
             || resolved.request.action_digest_sha256 != command.expected_action_digest_sha256
             || resolved.request.request_observation_id != command.expected_request_observation_id
             || resolved.request.request_observation_sequence
@@ -892,6 +908,10 @@ fn binding_complete(binding: &HarnessApprovalRequestBinding) -> bool {
         && !binding.native_routing_ref.trim().is_empty()
         && !binding.request_observation_id.trim().is_empty()
         && binding.request_observation_sequence > 0
+        && ApprovalRequestLifecycleKind::try_from(binding.request_lifecycle)
+            .unwrap_or(ApprovalRequestLifecycleKind::Unspecified)
+            != ApprovalRequestLifecycleKind::Unspecified
+        && binding.request_revision > 0
 }
 
 fn proof_complete(proof: &PolicyAuthorityProof) -> bool {

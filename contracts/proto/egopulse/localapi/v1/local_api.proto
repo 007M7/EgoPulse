@@ -5,6 +5,7 @@ package egopulse.localapi.v1;
 import "egopulse/artifact/v1/artifact.proto";
 import "egopulse/collaboration/v1/collaboration.proto";
 import "egopulse/common/v1/common.proto";
+import "egopulse/harness/v1/harness.proto";
 import "egopulse/policy/v1/policy.proto";
 import "egopulse/task/v1/task.proto";
 import "egopulse/verdict/v1/verdict.proto";
@@ -36,6 +37,9 @@ enum SourceDomain {
   SOURCE_DOMAIN_VERIFICATION = 4;
   SOURCE_DOMAIN_FOUNDER_VERDICT = 5;
   SOURCE_DOMAIN_POLICY_DECISION = 6;
+  // Candidate facts from the Adapter durable edge; this does not grant
+  // Authority ownership to the Adapter.
+  SOURCE_DOMAIN_HARNESS_ADAPTER = 7;
 }
 
 enum StreamFrameKind {
@@ -140,6 +144,57 @@ message EvidenceGraphView {
   repeated RedactedField redactions = 7;
 }
 
+// Sanitized Authority result safe for Local API clients. The owning Policy
+// Authority remains the source of this result; native routing and proof
+// internals are deliberately absent.
+message HarnessApprovalAuthorityResult {
+  bool committed = 1;
+  bool replayed = 2;
+  string authority_decision_ref = 3;
+  egopulse.harness.v1.ApprovalDecision decision = 4;
+  egopulse.policy.v1.HarnessApprovalDecisionStateKind state = 5;
+  uint64 state_revision = 6;
+  google.protobuf.Timestamp expires_at = 7;
+  egopulse.policy.v1.PolicyDecisionErrorCode error_code = 8;
+  optional string safe_error_fingerprint = 9;
+}
+
+message HarnessApprovalDecisionView {
+  string authority_decision_ref = 1;
+  egopulse.harness.v1.ApprovalDecision decision = 2;
+  string reason_code = 3;
+  egopulse.policy.v1.HarnessApprovalDecisionStateKind state = 4;
+  uint64 state_revision = 5;
+  google.protobuf.Timestamp issued_at = 6;
+  google.protobuf.Timestamp expires_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+// Rebuildable projection joining an Adapter-owned request with an optional
+// Policy-owned decision. Native routing, raw prompt/command, credentials and
+// store handles are never part of this view.
+message HarnessApprovalView {
+  ProjectionMetadata metadata = 1;
+  string approval_request_id = 2;
+  string task_id = 3;
+  string run_id = 4;
+  string step_id = 5;
+  string attempt_id = 6;
+  string dispatch_id = 7;
+  uint64 fencing_token = 8;
+  egopulse.harness.v1.ApprovalKind kind = 9;
+  string action_digest_sha256 = 10;
+  string requested_scope_ref = 11;
+  string display_summary_ref = 12;
+  string request_observation_id = 13;
+  uint64 request_observation_sequence = 14;
+  egopulse.harness.v1.ApprovalRequestLifecycleKind request_lifecycle = 15;
+  uint64 request_revision = 16;
+  HarnessApprovalDecisionView policy_decision = 17;
+  repeated AvailableAction available_actions = 18;
+  repeated RedactedField redactions = 19;
+}
+
 message LocalApiError {
   LocalApiErrorCode code = 1;
   string safe_fingerprint = 2;
@@ -210,6 +265,37 @@ message GetEvidenceGraphResponse {
   }
 }
 
+message GetHarnessApprovalViewRequest {
+  ClientRequestMetadata client = 1;
+  string approval_request_id = 2;
+  ProjectionPosition minimum_position = 3;
+}
+
+message GetHarnessApprovalViewResponse {
+  oneof outcome {
+    HarnessApprovalView view = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message ListHarnessApprovalViewsRequest {
+  ClientRequestMetadata client = 1;
+  repeated egopulse.harness.v1.ApprovalRequestLifecycleKind request_lifecycle_filter = 2;
+  repeated egopulse.policy.v1.HarnessApprovalDecisionStateKind decision_state_filter = 3;
+  repeated string task_ids = 4;
+  bool actionable_only = 5;
+  uint32 page_size = 6;
+  optional string page_cursor = 7;
+  ProjectionPosition minimum_position = 8;
+}
+
+message ListHarnessApprovalViewsResponse {
+  repeated HarnessApprovalView views = 1;
+  optional string next_page_cursor = 2;
+  ProjectionPosition snapshot_position = 3;
+  LocalApiError error = 4;
+}
+
 message GetProjectionStatusRequest {
   ClientRequestMetadata client = 1;
 }
@@ -230,6 +316,23 @@ message TaskViewStreamFrame {
   StreamFrameKind kind = 1;
   ProjectionPosition position = 2;
   TaskView snapshot = 3;
+  optional string reset_reason_code = 4;
+}
+
+message WatchHarnessApprovalViewsRequest {
+  ClientRequestMetadata client = 1;
+  ProjectionPosition resume_after = 2;
+  repeated string approval_request_ids = 3;
+  repeated string task_ids = 4;
+  repeated egopulse.harness.v1.ApprovalRequestLifecycleKind request_lifecycle_filter = 5;
+  repeated egopulse.policy.v1.HarnessApprovalDecisionStateKind decision_state_filter = 6;
+  bool actionable_only = 7;
+}
+
+message HarnessApprovalViewStreamFrame {
+  StreamFrameKind kind = 1;
+  ProjectionPosition position = 2;
+  HarnessApprovalView snapshot = 3;
   optional string reset_reason_code = 4;
 }
 
@@ -262,7 +365,10 @@ message DecideHarnessApprovalResponse {
   reserved "authority_result";
   ProjectionAwaitToken await_token = 2;
   LocalApiError gateway_error = 3;
-  egopulse.policy.v1.PolicyDecisionCommandResult policy_authority_result = 4;
+  // Kept for draft.12 wire compatibility but MUST remain unset because the
+  // full Authority result contains Adapter-native routing/proof internals.
+  egopulse.policy.v1.PolicyDecisionCommandResult policy_authority_result = 4 [deprecated = true];
+  HarnessApprovalAuthorityResult sanitized_authority_result = 5;
 }
 
 message ExecuteFounderVerdictRequest {
@@ -286,6 +392,7 @@ message AwaitProjectionResponse {
   oneof outcome {
     TaskView view = 1;
     LocalApiError error = 2;
+    HarnessApprovalView approval_view = 3;
   }
 }
 
@@ -297,8 +404,11 @@ service LocalReadModelService {
   rpc GetTaskView(GetTaskViewRequest) returns (GetTaskViewResponse);
   rpc ListTaskViews(ListTaskViewsRequest) returns (ListTaskViewsResponse);
   rpc GetEvidenceGraph(GetEvidenceGraphRequest) returns (GetEvidenceGraphResponse);
+  rpc GetHarnessApprovalView(GetHarnessApprovalViewRequest) returns (GetHarnessApprovalViewResponse);
+  rpc ListHarnessApprovalViews(ListHarnessApprovalViewsRequest) returns (ListHarnessApprovalViewsResponse);
   rpc GetProjectionStatus(GetProjectionStatusRequest) returns (GetProjectionStatusResponse);
   rpc WatchTaskViews(WatchTaskViewsRequest) returns (stream TaskViewStreamFrame);
+  rpc WatchHarnessApprovalViews(WatchHarnessApprovalViewsRequest) returns (stream HarnessApprovalViewStreamFrame);
   rpc AwaitProjection(AwaitProjectionRequest) returns (AwaitProjectionResponse);
 }
 

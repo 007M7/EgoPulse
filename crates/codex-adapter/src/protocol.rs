@@ -1,9 +1,9 @@
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     AckDisposition, ApprovalDecision, ApprovalDecisionEnvelope, ApprovalKind,
-    ApprovalRequestObservation, CancelExecutionEnvelope, DispatchEnvelope, HarnessAckObservation,
-    HarnessErrorCode, HarnessReadiness, LifecycleKind, LifecycleObservation,
-    NativeProtocolFingerprint, ObservationCriticality, ProbeHarnessRequest, ProbeHarnessResult,
-    SideEffectCertainty, UsageObservation, harness_observation,
+    ApprovalRequestLifecycleKind, ApprovalRequestObservation, CancelExecutionEnvelope,
+    DispatchEnvelope, HarnessAckObservation, HarnessErrorCode, HarnessReadiness, LifecycleKind,
+    LifecycleObservation, NativeProtocolFingerprint, ObservationCriticality, ProbeHarnessRequest,
+    ProbeHarnessResult, SideEffectCertainty, UsageObservation, harness_observation,
 };
 use egopulse_harness_adapter::{
     DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, NativeHarnessDriver,
@@ -13,7 +13,7 @@ use egopulse_process_supervision::{SupervisedProcess, SupervisedProcessSpec};
 use prost_types::Timestamp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -67,6 +67,7 @@ struct PendingApproval {
     request_id: Value,
     method: String,
     params: Value,
+    observation: ApprovalRequestObservation,
 }
 
 struct CodexSession {
@@ -80,7 +81,7 @@ pub struct CodexAppServerDriver {
     session: Option<CodexSession>,
     active: Option<ActiveDispatch>,
     pending_approvals: HashMap<String, PendingApproval>,
-    responded_request_ids: HashSet<String>,
+    responded_approvals: HashMap<String, ApprovalRequestObservation>,
     queued_events: VecDeque<DriverEvent>,
     pending_control_requests: HashMap<u64, &'static str>,
     last_protocol_diagnostic: Option<String>,
@@ -94,7 +95,7 @@ impl CodexAppServerDriver {
             session: None,
             active: None,
             pending_approvals: HashMap::new(),
-            responded_request_ids: HashSet::new(),
+            responded_approvals: HashMap::new(),
             queued_events: VecDeque::new(),
             pending_control_requests: HashMap::new(),
             last_protocol_diagnostic: None,
@@ -359,12 +360,23 @@ impl CodexAppServerDriver {
             )
         })?;
         let params = value.get("params").cloned().unwrap_or(Value::Null);
+        let observation = ApprovalRequestObservation {
+            approval_request_id: Uuid::now_v7().to_string(),
+            kind: kind as i32,
+            action_digest_sha256: sha256(params.to_string().as_bytes()),
+            requested_scope_ref: "adapter-edge://codex/approval/scope".to_owned(),
+            display_summary_ref: "adapter-edge://codex/approval/summary".to_owned(),
+            native_routing_ref: routing_ref.clone(),
+            lifecycle: ApprovalRequestLifecycleKind::Open as i32,
+            request_revision: 1,
+        };
         self.pending_approvals.insert(
             routing_ref.clone(),
             PendingApproval {
                 request_id,
                 method: method.to_owned(),
                 params: params.clone(),
+                observation: observation.clone(),
             },
         );
         Ok(Some(DriverEvent {
@@ -373,14 +385,7 @@ impl CodexAppServerDriver {
             native_sequence: None,
             native_observed_at: now(),
             criticality: ObservationCriticality::Security,
-            payload: harness_observation::Payload::ApprovalRequest(ApprovalRequestObservation {
-                approval_request_id: Uuid::now_v7().to_string(),
-                kind: kind as i32,
-                action_digest_sha256: sha256(params.to_string().as_bytes()),
-                requested_scope_ref: "adapter-edge://codex/approval/scope".to_owned(),
-                display_summary_ref: "adapter-edge://codex/approval/summary".to_owned(),
-                native_routing_ref: routing_ref,
-            }),
+            payload: harness_observation::Payload::ApprovalRequest(observation),
             raw_event: raw,
         }))
     }
@@ -693,42 +698,45 @@ impl CodexAppServerDriver {
                     )
                 })?;
                 let request_key = request_id.to_string();
-                let responded = self.responded_request_ids.remove(&request_key);
-                let pending_routing_ref = self.pending_approvals.iter().find_map(|(key, value)| {
-                    (value.request_id == *request_id).then(|| key.clone())
-                });
-                let withdrawn = pending_routing_ref
-                    .as_ref()
-                    .and_then(|key| self.pending_approvals.remove(key))
-                    .is_some();
-                if !responded && !withdrawn {
-                    self.last_protocol_diagnostic =
-                        Some("server-request-resolution-without-request".to_owned());
-                    return Err(driver_error(
-                        DriverErrorCertainty::DeliveryUnknown,
-                        HarnessErrorCode::UnknownCriticalEvent,
-                        "CODEX_UNKNOWN_SERVER_REQUEST_RESOLUTION",
-                        &raw,
-                    ));
+                let (mut observation, lifecycle) =
+                    if let Some(observation) = self.responded_approvals.remove(&request_key) {
+                        (observation, ApprovalRequestLifecycleKind::Resolved)
+                    } else {
+                        let pending_routing_ref =
+                            self.pending_approvals.iter().find_map(|(key, value)| {
+                                (value.request_id == *request_id).then(|| key.clone())
+                            });
+                        match pending_routing_ref
+                            .as_ref()
+                            .and_then(|key| self.pending_approvals.remove(key))
+                        {
+                            Some(pending) => {
+                                (pending.observation, ApprovalRequestLifecycleKind::Withdrawn)
+                            }
+                            None => {
+                                self.last_protocol_diagnostic =
+                                    Some("server-request-resolution-without-request".to_owned());
+                                return Err(driver_error(
+                                    DriverErrorCertainty::DeliveryUnknown,
+                                    HarnessErrorCode::UnknownCriticalEvent,
+                                    "CODEX_UNKNOWN_SERVER_REQUEST_RESOLUTION",
+                                    &raw,
+                                ));
+                            }
+                        }
+                    };
+                observation.lifecycle = lifecycle as i32;
+                observation.request_revision = observation.request_revision.saturating_add(1);
+                if observation.request_revision < 2 {
+                    observation.request_revision = 2;
                 }
                 DriverEvent {
                     native_key: native_key(method, &raw),
                     native_event_id: None,
                     native_sequence: None,
                     native_observed_at: now(),
-                    criticality: ObservationCriticality::Control,
-                    payload: harness_observation::Payload::Diagnostic(
-                        egopulse_domain_contracts::v01::egopulse::harness::v1::DiagnosticObservation {
-                            safe_diagnostic_code: if withdrawn {
-                                "HARNESS_APPROVAL_REQUEST_WITHDRAWN"
-                            } else {
-                                "HARNESS_APPROVAL_RESPONSE_RESOLVED"
-                            }
-                            .to_owned(),
-                            error_fingerprint: None,
-                            recovery_required: false,
-                        },
-                    ),
+                    criticality: ObservationCriticality::Security,
+                    payload: harness_observation::Payload::ApprovalRequest(observation),
                     raw_event: raw,
                 }
             }
@@ -817,8 +825,8 @@ impl CodexAppServerDriver {
             .ok_or_else(|| dependency_error("CODEX_SESSION_NOT_RUNNING"))?
             .write_value(&response)
             .await?;
-        self.responded_request_ids
-            .insert(pending.request_id.to_string());
+        self.responded_approvals
+            .insert(pending.request_id.to_string(), pending.observation);
         Ok(raw)
     }
 }
@@ -1283,4 +1291,102 @@ fn dependency_error(detail: &str) -> DriverError {
 
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approval_request(id: u64) -> Value {
+        json!({
+            "id": id,
+            "method": "item/commandExecution/requestApproval",
+            "params": { "command": "cargo test" }
+        })
+    }
+
+    fn approval_payload(event: DriverEvent) -> ApprovalRequestObservation {
+        match event.payload {
+            harness_observation::Payload::ApprovalRequest(value) => value,
+            _ => panic!("expected approval request lifecycle observation"),
+        }
+    }
+
+    #[test]
+    fn native_resolution_preserves_request_identity_and_advances_lifecycle_revision() {
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let request = approval_request(7);
+        let raw = serde_json::to_vec(&request).expect("request bytes");
+        let opened = driver
+            .map_server_request("item/commandExecution/requestApproval", request, raw)
+            .expect("map request")
+            .map(approval_payload)
+            .expect("request event");
+        assert_eq!(opened.lifecycle, ApprovalRequestLifecycleKind::Open as i32);
+        assert_eq!(opened.request_revision, 1);
+
+        let resolved = json!({
+            "method": "serverRequest/resolved",
+            "params": { "requestId": 7 }
+        });
+        let raw = serde_json::to_vec(&resolved).expect("resolved bytes");
+        let withdrawn = driver
+            .map_notification(
+                &DispatchEnvelope::default(),
+                "serverRequest/resolved",
+                resolved,
+                raw,
+            )
+            .expect("map withdrawal")
+            .map(approval_payload)
+            .expect("withdrawal event");
+        assert_eq!(withdrawn.approval_request_id, opened.approval_request_id);
+        assert_eq!(
+            withdrawn.lifecycle,
+            ApprovalRequestLifecycleKind::Withdrawn as i32
+        );
+        assert_eq!(withdrawn.request_revision, 2);
+    }
+
+    #[test]
+    fn responded_request_resolves_without_losing_canonical_request_identity() {
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let request = approval_request(8);
+        let raw = serde_json::to_vec(&request).expect("request bytes");
+        let opened = driver
+            .map_server_request("item/commandExecution/requestApproval", request, raw)
+            .expect("map request")
+            .map(approval_payload)
+            .expect("request event");
+        let routing = opened.native_routing_ref.clone();
+        let pending = driver
+            .pending_approvals
+            .remove(&routing)
+            .expect("pending approval");
+        driver
+            .responded_approvals
+            .insert(pending.request_id.to_string(), pending.observation);
+
+        let resolved = json!({
+            "method": "serverRequest/resolved",
+            "params": { "requestId": 8 }
+        });
+        let raw = serde_json::to_vec(&resolved).expect("resolved bytes");
+        let completed = driver
+            .map_notification(
+                &DispatchEnvelope::default(),
+                "serverRequest/resolved",
+                resolved,
+                raw,
+            )
+            .expect("map resolution")
+            .map(approval_payload)
+            .expect("resolution event");
+        assert_eq!(completed.approval_request_id, opened.approval_request_id);
+        assert_eq!(
+            completed.lifecycle,
+            ApprovalRequestLifecycleKind::Resolved as i32
+        );
+        assert_eq!(completed.request_revision, 2);
+    }
 }

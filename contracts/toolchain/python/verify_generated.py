@@ -14,8 +14,23 @@ def main() -> int:
         module_name = ".".join(relative.parts)
         importlib.import_module(module_name)
         modules.append(module_name)
-    if len(modules) != 9:
-        raise RuntimeError(f"expected 9 generated Python modules, found {len(modules)}: {modules}")
+    expected_modules = {
+        "egopulse.artifact.v1.artifact_pb2",
+        "egopulse.collaboration.v1.collaboration_pb2",
+        "egopulse.common.v1.common_pb2",
+        "egopulse.foundation.v1.health_pb2",
+        "egopulse.harness.v1.harness_pb2",
+        "egopulse.localapi.v1.local_api_pb2",
+        "egopulse.persistence.v1.persistence_pb2",
+        "egopulse.policy.v1.policy_pb2",
+        "egopulse.task.v1.task_pb2",
+        "egopulse.verdict.v1.verdict_pb2",
+        "egopulse.verification.v1.verification_pb2",
+    }
+    if set(modules) != expected_modules:
+        raise RuntimeError(
+            f"expected the 10 V-01 modules plus Foundation, found {len(modules)}: {modules}"
+        )
     print(f"python_generated_imports=passed modules={len(modules)}")
     return 0
 
