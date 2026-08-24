@@ -1,7 +1,7 @@
 # EgoPulse implementation architecture
 
-- Status: active foundation boundary
-- Date: 2026-08-22
+- Status: Gate 4 vertical implementation in progress
+- Date: 2026-08-24
 - Decision owner: Founder
 
 ## Source and responsibility
@@ -19,7 +19,13 @@ Desktop / CLI / TUI
 local-api client boundary
         |
         v
-Named Pipe / UDS (not implemented in the foundation scaffold)
+Named Pipe / UDS account-authenticated local transport
+        |
+        v
+local session service (ephemeral, policy-resolved)
+        |
+        v
+local API gateway / shared client kernel (G4-08C)
         |
         v
 agentosd deployment host
@@ -52,7 +58,9 @@ verification or Task completion.
 
 - Internal commands/events/API: Protobuf proto3, checked by Buf.
 - Artifact and tool boundaries: JSON Schema 2020-12.
-- Local client transport: Named Pipe on Windows and UDS on Unix; not implemented in this scaffold.
+- Local client transport: HTTP/2 gRPC over Windows Named Pipe or Unix Domain Socket. The platform crate owns peer-account extraction, owner-only access control and all required platform `unsafe`.
+- Local session boundary: account-level peer identity is resolved by a trusted policy adapter into a logical principal and permissions; sessions are process-ephemeral, connection/account-bound, expiring and revocable. An OS SID/UID never implies Founder identity.
+- Local API gateway and shared three-surface client kernel: planned for G4-08C; the G4-08B session service is exercised over the real transport but is not yet the complete product client path.
 - Supervised Worker/Harness transport: framed stdio or an official native protocol adapter; not implemented in this scaffold.
 
 ## Repository rules
@@ -63,3 +71,4 @@ verification or Task completion.
 4. Python projects remain isolated and cannot become an authority backend.
 5. `contracts/` is the only machine-contract source; generated output is never edited as truth.
 6. A vertical feature starts only after the Foundation Gate passes.
+7. Rust `unsafe` is allowed only inside `crates/local-ipc-platform`; repository boundary checks reject it elsewhere.

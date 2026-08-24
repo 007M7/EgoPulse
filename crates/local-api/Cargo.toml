@@ -7,6 +7,16 @@ repository.workspace = true
 
 [dependencies]
 egopulse-domain-contracts.workspace = true
+egopulse-local-ipc-platform.workspace = true
+prost-types.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+hyper-util.workspace = true
+tokio.workspace = true
+tower.workspace = true
 
 [lib]
 path = "src/lib.rs"

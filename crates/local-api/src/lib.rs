@@ -1,12 +1,9 @@
 #![forbid(unsafe_code)]
 
 use egopulse_domain_contracts::FoundationHealth;
+pub use egopulse_local_ipc_platform::LocalTransport;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LocalTransport {
-    WindowsNamedPipe,
-    UnixDomainSocket,
-}
+pub mod session;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LocalApiClient {

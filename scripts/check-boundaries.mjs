@@ -13,6 +13,7 @@ const required = [
   "crates/codex-adapter/Cargo.toml",
   "crates/policy-decision-authority/Cargo.toml",
   "crates/local-ide-control/Cargo.toml",
+  "crates/local-ipc-platform/Cargo.toml",
   "packages/native-harness/package.json",
   "workers/foundation-probe/pyproject.toml",
   "contracts/proto/egopulse/foundation/v1/health.proto"
@@ -48,6 +49,7 @@ for (const file of filesUnder("crates/domain-contracts")) {
 const nonAuthorityRoots = [
   "apps",
   "crates/local-api",
+  "crates/local-ipc-platform",
   "crates/process-supervision",
   "packages",
   "workers"
@@ -65,6 +67,18 @@ for (const root of nonAuthorityRoots) {
       if (text.includes(term)) {
         throw new Error(`${relative(".", file)} attempts to own an Authority database: ${term}`);
       }
+    }
+  }
+}
+
+const unsafeOwnerRoot = "crates/local-ipc-platform/";
+const unsafeSyntax = /\bunsafe\s*(?:\{|fn\b|impl\b|trait\b)/;
+for (const root of ["apps", "crates", "packages", "workers"]) {
+  for (const file of filesUnder(root)) {
+    const normalized = relative(".", file).replaceAll("\\", "/");
+    if (normalized.startsWith(unsafeOwnerRoot) || !file.endsWith(".rs")) continue;
+    if (unsafeSyntax.test(readFileSync(file, "utf8"))) {
+      throw new Error(`${normalized} contains unsafe Rust outside ${unsafeOwnerRoot}`);
     }
   }
 }

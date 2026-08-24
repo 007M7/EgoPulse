@@ -6,7 +6,7 @@ The repository starts from the frozen architecture and technology baseline, but 
 
 ## Foundation status
 
-Current maturity: **foundation scaffold**.
+Current maturity: **Gate 4 vertical implementation in progress**.
 
 Available now:
 
@@ -16,11 +16,12 @@ Available now:
 - isolated CPython 3.14 Worker project managed by uv;
 - Protobuf/Buf and JSON Schema contract roots;
 - local CI, repository-boundary checks and commit-bound release-candidate packaging.
+- account-authenticated Windows Named Pipe / Unix Domain Socket transport and an ephemeral, policy-resolved local session service.
 
 Not implemented yet:
 
 - Task, Memory, Policy, Verdict or Release authority behavior;
-- local IPC transport;
+- local API gateway and the shared Desktop/CLI/TUI client kernel;
 - SQLCipher persistence or Qdrant indexing;
 - Codex, Kimi or DeepSeek Harness adapters;
 - Sego verification integration;
@@ -39,6 +40,7 @@ crates/
   cognition-runtime/ authority boundary skeletons
   local-ide-control/ deterministic collaboration control skeletons
   local-api/          local API client boundary
+  local-ipc-platform/ OS peer identity and owner-only local transport
   process-supervision/process and Attempt supervision primitives
 packages/
   generated-client/  generated TypeScript contract target

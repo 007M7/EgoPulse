@@ -1173,6 +1173,14 @@ name = "egopulse-local-api"
 version = "0.1.0"
 dependencies = [
  "egopulse-domain-contracts",
+ "egopulse-local-ipc-platform",
+ "hyper-util",
+ "prost-types",
+ "thiserror 2.0.20",
+ "tokio",
+ "tonic",
+ "tower",
+ "uuid",
 ]
 
 [[package]]
@@ -1192,6 +1200,19 @@ dependencies = [
  "tokio",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "egopulse-local-ipc-platform"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
