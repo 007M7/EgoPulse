@@ -2,9 +2,10 @@
 
 ## Status
 
-Implemented as an internal cognition-runtime slice. This is not a new V-01
-Proto contract, does not add public API methods and does not claim that the
-Python Worker is wired to the daemon.
+Implemented as an internal cognition-runtime slice and opened by the
+production daemon composition root. This is not a new V-01 Proto contract,
+does not add public API methods and does not claim that the Python Worker is
+wired to the daemon.
 
 ## Governance boundary
 
@@ -72,7 +73,7 @@ Python Worker.
 
 - the public Memory API and cross-language Protobuf messages;
 - embedding model, vector index, reranker or LangChain/LangGraph dependency;
-- daemon wiring and CLI/TUI commands;
+- Memory commands and read projections for CLI/TUI;
 - compaction, retention and user-facing export/import policy.
 
 Each item requires its own contract/evaluation record rather than being

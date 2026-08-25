@@ -1,10 +1,15 @@
 {
-  "schema_version": "egopulse.production-bootstrap/v1",
+  "schema_version": "egopulse.production-bootstrap/v2",
   "stores": {
     "task": {
       "database_path": "egopulse-data/task.db",
       "store_epoch": "replace-task-epoch",
       "key_env": "EGOPULSE_TASK_KEY_HEX"
+    },
+    "memory": {
+      "database_path": "egopulse-data/memory.db",
+      "store_epoch": "replace-memory-epoch",
+      "key_env": "EGOPULSE_MEMORY_KEY_HEX"
     },
     "artifact": {
       "database_path": "egopulse-data/artifact.db",

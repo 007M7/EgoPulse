@@ -9,6 +9,9 @@ use std::{
 use egopulse_artifact_authority::{
     ArtifactAuthority, ArtifactAuthorityConfig, ArtifactAuthorityFailure, ArtifactSqlCipherKey,
 };
+use egopulse_cognition_runtime::memory_authority::{
+    MemoryAuthority, MemoryAuthorityConfig, MemoryAuthorityFailure,
+};
 use egopulse_cognition_runtime::task_authority::{
     PrincipalKind as TaskPrincipalKind, SqlCipherKey, TaskAuthority, TaskAuthorityConfig,
     TaskAuthorityFailure,
@@ -68,6 +71,7 @@ pub struct LocalUserPolicyBootstrapConfig {
 /// Inputs owned by the local installation, not inferred from a client request.
 pub struct ProductionBootstrapConfig {
     pub task: TaskAuthorityConfig,
+    pub memory: MemoryAuthorityConfig,
     pub task_guard: ConfiguredTaskCreationGuardConfig,
     pub artifact: ArtifactAuthorityConfig,
     pub artifact_guard: ConfiguredArtifactAdmissionGuardConfig,
@@ -128,6 +132,7 @@ impl ProductionBootstrapConfig {
     pub fn build(self) -> Result<DaemonProviders, ProductionBootstrapError> {
         let task_guard = ConfiguredTaskCreationGuard::new(self.task_guard)?;
         let task = Arc::new(Mutex::new(TaskAuthority::open(self.task, task_guard)?));
+        let memory = Arc::new(Mutex::new(MemoryAuthority::open(self.memory)?));
 
         let artifact_guard = ConfiguredArtifactAdmissionGuard::new(self.artifact_guard)?;
         let artifact = Arc::new(Mutex::new(ArtifactAuthority::open(
@@ -219,6 +224,7 @@ impl ProductionBootstrapConfig {
             .map_err(ProductionBootstrapError::VerificationWorker)?;
             providers = providers.with_verification_worker(Arc::new(worker));
         }
+        providers = providers.with_memory_authority(memory);
         providers = providers.with_codex_harness(self.codex)?;
         Ok(providers)
     }
@@ -245,6 +251,7 @@ struct UserOwnedBootstrapFile {
 #[serde(deny_unknown_fields)]
 struct StoreFiles {
     task: StoreFile,
+    memory: StoreFile,
     artifact: ArtifactStoreFile,
     verification: StoreFile,
     policy: StoreFile,
@@ -512,12 +519,13 @@ struct ReferenceFile {
 
 impl UserOwnedBootstrapFile {
     fn into_typed(self) -> Result<ProductionBootstrapConfig, ProductionBootstrapError> {
-        if self.schema_version != "egopulse.production-bootstrap/v1" {
+        if self.schema_version != "egopulse.production-bootstrap/v2" {
             return Err(ProductionBootstrapError::InvalidConfiguration(
                 "schema_version",
             ));
         }
         let task_store = typed_store(self.stores.task, "task authority")?;
+        let memory_store = typed_store(self.stores.memory, "memory authority")?;
         let artifact_store = typed_artifact_store(self.stores.artifact)?;
         let verification_store = typed_store(self.stores.verification, "verification authority")?;
         let policy_store = typed_store(self.stores.policy, "policy authority")?;
@@ -652,6 +660,11 @@ impl UserOwnedBootstrapFile {
                 database_path: task_store.database_path,
                 store_epoch: task_store.store_epoch,
                 key: SqlCipherKey::new(task_store.key),
+            },
+            memory: MemoryAuthorityConfig {
+                database_path: memory_store.database_path,
+                store_epoch: memory_store.store_epoch,
+                key: SqlCipherKey::new(memory_store.key),
             },
             task_guard,
             artifact: ArtifactAuthorityConfig {
@@ -1307,6 +1320,8 @@ pub enum ProductionBootstrapError {
     TaskGuard(#[from] crate::TaskCreationGuardConfigurationError),
     #[error("Task Authority could not be opened")]
     TaskAuthority(#[from] TaskAuthorityFailure),
+    #[error("Memory Authority could not be opened")]
+    MemoryAuthority(#[from] MemoryAuthorityFailure),
     #[error("Artifact admission guard configuration is invalid")]
     ArtifactGuard(#[from] crate::ArtifactAdmissionGuardConfigurationError),
     #[error("Artifact Authority could not be opened")]
@@ -1370,7 +1385,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("egopulse-bootstrap-{}.json", Uuid::now_v7()));
         fs::write(
             &path,
-            br#"{"schema_version": "egopulse.production-bootstrap/v1", "unknown": true}"#,
+            br#"{"schema_version": "egopulse.production-bootstrap/v2", "unknown": true}"#,
         )
         .expect("write malformed bootstrap fixture");
         assert!(matches!(

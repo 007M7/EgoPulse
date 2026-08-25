@@ -10,6 +10,7 @@ use egopulse_codex_adapter::{
     CODEX_ADAPTER_ID, CODEX_CAPABILITY_PROFILE_ID, CodexAppServerConfig, CodexAppServerDriver,
     FileDispatchMaterialResolver, codex_protocol_fingerprint,
 };
+use egopulse_cognition_runtime::memory_authority::MemoryAuthority;
 use egopulse_domain_contracts::v01::egopulse::{
     policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
     task::v1::{TaskCommand, TaskCommandResult},
@@ -263,6 +264,7 @@ pub struct DaemonProviders {
     pub harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
     pub verification_worker: Option<Arc<dyn VerificationWorker>>,
     pub task_activation_source: Option<Arc<dyn TaskActivationSource>>,
+    pub memory_authority: Option<Arc<Mutex<MemoryAuthority>>>,
 }
 
 /// Explicit workflow configuration boundary for the first vertical. It does
@@ -369,6 +371,7 @@ impl DaemonProviders {
             harness_dispatch_runner: None,
             verification_worker: None,
             task_activation_source: None,
+            memory_authority: None,
         }
     }
 
@@ -424,6 +427,7 @@ impl DaemonProviders {
             harness_dispatch_runner: None,
             verification_worker: None,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
+            memory_authority: None,
         }
     }
 
@@ -455,6 +459,7 @@ impl DaemonProviders {
             harness_dispatch_runner: None,
             verification_worker: None,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
+            memory_authority: None,
         }
     }
 
@@ -467,6 +472,12 @@ impl DaemonProviders {
     #[must_use]
     pub fn with_verification_worker(mut self, worker: Arc<dyn VerificationWorker>) -> Self {
         self.verification_worker = Some(worker);
+        self
+    }
+
+    #[must_use]
+    pub fn with_memory_authority(mut self, authority: Arc<Mutex<MemoryAuthority>>) -> Self {
+        self.memory_authority = Some(authority);
         self
     }
 
@@ -606,6 +617,7 @@ pub struct DaemonComposition {
     harness_dispatch_interval: Duration,
     verification_worker: Option<Arc<dyn VerificationWorker>>,
     verification_interval: Duration,
+    memory_authority: Option<Arc<Mutex<MemoryAuthority>>>,
 }
 
 impl DaemonComposition {
@@ -679,6 +691,7 @@ impl DaemonComposition {
             .map(|source| ProjectionPump::new(Arc::clone(&model), notifier, source));
         let harness_dispatch_runner = providers.harness_dispatch_runner;
         let verification_worker = providers.verification_worker;
+        let memory_authority = providers.memory_authority;
 
         Ok(Self {
             address,
@@ -691,6 +704,7 @@ impl DaemonComposition {
             harness_dispatch_interval: config.harness_dispatch_interval,
             verification_worker,
             verification_interval: config.verification_interval,
+            memory_authority,
         })
     }
 
@@ -713,6 +727,7 @@ impl DaemonComposition {
             harness_dispatch_interval,
             verification_worker,
             verification_interval,
+            memory_authority: _memory_authority,
             ..
         } = self;
         let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
