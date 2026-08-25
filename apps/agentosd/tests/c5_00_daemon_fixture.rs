@@ -34,23 +34,23 @@ use egopulse_founder_verdict_authority::{
     ResolvedVerdictContext, VerdictAuthorityConfig, VerdictPrincipalKind,
     VerdictReferenceRejection, VerdictSqlCipherKey,
 };
-use egopulse_local_api::command_gateway::{CommandPortFailure, CommandPrincipal};
 use egopulse_local_api::session::{
     NoopSessionAuditSink, PrincipalGrant, PrincipalResolutionFailure, TrustedPrincipalResolver,
 };
-use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcClient};
+use egopulse_local_api::{
+    LocalApiClient,
+    command_gateway::{CommandPortFailure, CommandPrincipal},
+};
+use egopulse_local_ipc_platform::LocalIpcAddress;
 use egopulse_policy_decision_authority::{
     AuthenticatedPolicyPrincipal, PolicyAuthorityConfig, PolicyDecisionAuthority,
     PolicyPrincipalKind, PolicyReferenceRejection, PolicySqlCipherKey,
     ResolvedApprovalAuthorization,
 };
-use hyper_util::rt::TokioIo;
 use tokio::{
     process::{Child, Command},
     time::sleep,
 };
-use tonic::transport::Endpoint;
-use tower::service_fn;
 use uuid::Uuid;
 
 const FIXTURE_ROOT_ENV: &str = "EGOPULSE_C5_FIXTURE_ROOT";
@@ -219,14 +219,14 @@ fn open_fixture_providers(root: &Path) -> DaemonProviders {
 
 async fn connect_session(
     address: LocalIpcAddress,
-) -> Result<LocalSessionServiceClient<tonic::transport::Channel>, tonic::transport::Error> {
-    let channel = Endpoint::try_from("http://egopulse.local")?
-        .connect_with_connector(service_fn(move |_| {
-            let address = address.clone();
-            async move { LocalIpcClient::connect(&address).await.map(TokioIo::new) }
-        }))
-        .await?;
-    Ok(LocalSessionServiceClient::new(channel))
+) -> Result<
+    LocalSessionServiceClient<tonic::transport::Channel>,
+    egopulse_local_api::LocalApiConnectError,
+> {
+    Ok(LocalApiClient::platform_default()
+        .connect(address)
+        .await?
+        .session_service())
 }
 
 async fn spawn_fixture(root: &Path, instance: &str) -> Child {

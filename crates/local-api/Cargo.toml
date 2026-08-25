@@ -11,6 +11,7 @@ egopulse-domain-contracts.workspace = true
 egopulse-local-ipc-platform.workspace = true
 egopulse-local-read-model.workspace = true
 futures-util.workspace = true
+hyper-util.workspace = true
 hmac.workspace = true
 prost-types.workspace = true
 serde.workspace = true
@@ -19,12 +20,9 @@ sha2.workspace = true
 thiserror.workspace = true
 tonic.workspace = true
 tokio.workspace = true
+tower.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
-
-[dev-dependencies]
-hyper-util.workspace = true
-tower.workspace = true
 
 [lib]
 path = "src/lib.rs"
