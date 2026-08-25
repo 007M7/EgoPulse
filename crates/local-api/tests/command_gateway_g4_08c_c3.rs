@@ -1,0 +1,452 @@
+#![cfg(windows)]
+
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use egopulse_domain_contracts::{
+    profiles::ContractProfiles,
+    v01::egopulse::{
+        common::v1::{CommandMetadata, ContractReference},
+        localapi::v1::{
+            ClientRequestMetadata, ClientSurface, ExecuteFounderVerdictRequest,
+            ExecuteTaskCommandRequest, LocalApiErrorCode, OpenSessionRequest, ProjectionPosition,
+            SourceDomain, SourceRevision, local_session_service_server::LocalSessionService,
+        },
+        policy::v1::{
+            HarnessApprovalDecisionRecord, HarnessApprovalDecisionState,
+            IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult,
+        },
+        task::v1::{CreateTaskCommand, TaskCommand, TaskCommandResult, task_command},
+        verdict::v1::{
+            IssueFounderVerdictCommand, VerdictCommand, VerdictCommandResult, verdict_command,
+        },
+    },
+};
+use egopulse_local_api::{
+    command_gateway::{
+        CommandGatewayApplication, CommandPortFailure, CommandPortResult, PolicyCommandPort,
+        TaskCommandPort, VerdictCommandPort,
+    },
+    read_gateway_policy::ReadGatewayPolicy,
+    read_tokens::{AwaitTarget, ReadTokenCodec, TokenMacKey},
+    session::{
+        FixedProjectionPosition, LocalSessionEndpoint, PrincipalGrant, PrincipalResolutionFailure,
+        ProjectionPositionProvider, SessionAuditEvent, SessionAuditSink, SessionClock,
+        SessionConfig, TrustedPrincipalResolver,
+    },
+};
+use egopulse_local_ipc_platform::{
+    LocalIpcAddress, LocalIpcClient, LocalIpcListener, OsPrincipal, PeerConnectionInfo,
+};
+use prost_types::Timestamp;
+use tonic::Request;
+use uuid::Uuid;
+
+const CONTRACT_DIGEST: &str = "8eadb3686c8dfe76bf8b56fa48d8a76bd7fa57c177804b132eac793d33b7379e";
+const KERNEL_DIGEST: &str = "367ad4210c499d7501acd060f5b544255521cefefca86b8d69a2cea022166c11";
+const POLICY_DIGEST: &str = "5ae8cff8552910c780cdde9e29f1a5a3a95e40803ebcbb1de26544de5f6ac29f";
+
+#[derive(Clone)]
+struct FixedClock(SystemTime);
+
+impl SessionClock for FixedClock {
+    fn now(&self) -> SystemTime {
+        self.0
+    }
+}
+
+#[derive(Clone)]
+struct Resolver {
+    peer: OsPrincipal,
+    grant: PrincipalGrant,
+}
+
+impl TrustedPrincipalResolver for Resolver {
+    fn resolve(
+        &self,
+        principal: &OsPrincipal,
+    ) -> Result<PrincipalGrant, PrincipalResolutionFailure> {
+        if principal == &self.peer {
+            Ok(self.grant.clone())
+        } else {
+            Err(PrincipalResolutionFailure::PermissionDenied)
+        }
+    }
+}
+
+#[derive(Default)]
+struct NoopSessionAudit;
+
+impl SessionAuditSink for NoopSessionAudit {
+    fn record(&self, _event: SessionAuditEvent) {}
+}
+
+#[derive(Clone)]
+struct RecordingTaskPort {
+    calls: Arc<AtomicUsize>,
+    outcome: Arc<Mutex<Result<CommandPortResult<TaskCommandResult>, CommandPortFailure>>>,
+}
+
+impl TaskCommandPort for RecordingTaskPort {
+    fn execute(
+        &self,
+        _command: &TaskCommand,
+        _principal: &egopulse_local_api::command_gateway::CommandPrincipal,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.outcome.lock().expect("task port lock").clone()
+    }
+}
+
+#[derive(Clone)]
+struct RecordingPolicyPort {
+    outcome: Arc<Mutex<Result<CommandPortResult<PolicyDecisionCommandResult>, CommandPortFailure>>>,
+}
+
+impl PolicyCommandPort for RecordingPolicyPort {
+    fn execute(
+        &self,
+        _command: &IssueHarnessApprovalDecisionCommand,
+        _principal: &egopulse_local_api::command_gateway::CommandPrincipal,
+    ) -> Result<CommandPortResult<PolicyDecisionCommandResult>, CommandPortFailure> {
+        self.outcome.lock().expect("policy port lock").clone()
+    }
+}
+
+#[derive(Clone)]
+struct RecordingVerdictPort {
+    outcome: Arc<Mutex<Result<CommandPortResult<VerdictCommandResult>, CommandPortFailure>>>,
+}
+
+impl VerdictCommandPort for RecordingVerdictPort {
+    fn execute(
+        &self,
+        _command: &VerdictCommand,
+        _principal: &egopulse_local_api::command_gateway::CommandPrincipal,
+    ) -> Result<CommandPortResult<VerdictCommandResult>, CommandPortFailure> {
+        self.outcome.lock().expect("verdict port lock").clone()
+    }
+}
+
+fn contract_ref(id: &str, version: &str, sha256: &str) -> ContractReference {
+    ContractReference {
+        contract_id: id.to_owned(),
+        version: version.to_owned(),
+        sha256: sha256.to_owned(),
+    }
+}
+
+fn api_contract() -> ContractReference {
+    contract_ref("egopulse.localapi.v1", "0.1.0-draft.14", CONTRACT_DIGEST)
+}
+
+fn kernel_contract() -> ContractReference {
+    contract_ref("egopulse.client-kernel.v1", "0.1.0", KERNEL_DIGEST)
+}
+
+fn founder_grant() -> PrincipalGrant {
+    PrincipalGrant {
+        authenticated_principal_id: "os-user:founder".to_owned(),
+        permission_codes: BTreeSet::from([
+            "local.approval.decide".to_owned(),
+            "local.founder-verdict.issue".to_owned(),
+            "local.founder-verdict.revoke".to_owned(),
+            "local.task.create".to_owned(),
+        ]),
+        authorization_policy_ref: contract_ref("egopulse.authorization.v1", "0.1.0", POLICY_DIGEST),
+    }
+}
+
+fn metadata(correlation_id: &str) -> CommandMetadata {
+    CommandMetadata {
+        command_id: Uuid::now_v7().to_string(),
+        idempotency_key: Uuid::now_v7().to_string(),
+        idempotency_scope: "local-api-test".to_owned(),
+        request_digest_sha256: "digest".to_owned(),
+        correlation_id: correlation_id.to_owned(),
+        ..CommandMetadata::default()
+    }
+}
+
+fn position() -> ProjectionPosition {
+    ProjectionPosition {
+        epoch: "epoch-command-gateway".to_owned(),
+        sequence: 10,
+        projected_at: None,
+    }
+}
+
+async fn real_peer() -> PeerConnectionInfo {
+    use tonic::transport::server::Connected;
+
+    let address = LocalIpcAddress::for_instance(&format!("command-gateway-{}", Uuid::now_v7()))
+        .expect("address");
+    let mut listener = LocalIpcListener::bind(address.clone()).expect("bind");
+    let client = LocalIpcClient::connect(&address).await.expect("connect");
+    let connection = listener.accept().await.expect("accept");
+    let peer = connection.connect_info();
+    drop(connection);
+    drop(client);
+    peer
+}
+
+async fn test_context(
+    task_outcome: Result<CommandPortResult<TaskCommandResult>, CommandPortFailure>,
+    policy_outcome: Result<CommandPortResult<PolicyDecisionCommandResult>, CommandPortFailure>,
+    verdict_outcome: Result<CommandPortResult<VerdictCommandResult>, CommandPortFailure>,
+) -> (
+    PeerConnectionInfo,
+    ClientRequestMetadata,
+    Arc<CommandGatewayApplication>,
+    Arc<AtomicUsize>,
+) {
+    let peer = real_peer().await;
+    let clock: Arc<dyn SessionClock> = Arc::new(FixedClock(UNIX_EPOCH + Duration::from_secs(100)));
+    let endpoint = LocalSessionEndpoint::new(
+        SessionConfig::new(
+            vec![api_contract()],
+            kernel_contract(),
+            Duration::from_secs(60),
+        )
+        .expect("session config"),
+        Arc::new(Resolver {
+            peer: peer.principal().clone(),
+            grant: founder_grant(),
+        }),
+        Arc::clone(&clock),
+        Arc::new(FixedProjectionPosition(position())) as Arc<dyn ProjectionPositionProvider>,
+        Arc::new(NoopSessionAudit),
+    );
+    let open = OpenSessionRequest {
+        request_id: Uuid::now_v7().to_string(),
+        client_instance_id: "command-gateway-test".to_owned(),
+        surface: ClientSurface::Cli as i32,
+        supported_contracts: vec![api_contract()],
+    };
+    let mut open_request = Request::new(open.clone());
+    open_request.extensions_mut().insert(peer.clone());
+    let opened = endpoint
+        .open_session(open_request)
+        .await
+        .expect("open session transport")
+        .into_inner();
+    assert!(opened.error.is_none());
+    let client = ClientRequestMetadata {
+        request_id: Uuid::now_v7().to_string(),
+        client_instance_id: open.client_instance_id,
+        surface: open.surface,
+        session_id: opened.session_id,
+        api_contract_ref: Some(api_contract()),
+        correlation_id: Some("c3-correlation".to_owned()),
+    };
+    let task_calls = Arc::new(AtomicUsize::new(0));
+    let app = Arc::new(CommandGatewayApplication::new(
+        endpoint.registry(),
+        Arc::new(ContractProfiles::embedded().expect("profiles")),
+        Arc::new(ReadTokenCodec::new(
+            TokenMacKey::new([9; 32]).expect("key"),
+            ReadGatewayPolicy::v01(),
+            clock,
+        )),
+        Arc::new(RecordingTaskPort {
+            calls: Arc::clone(&task_calls),
+            outcome: Arc::new(Mutex::new(task_outcome)),
+        }),
+        Arc::new(RecordingPolicyPort {
+            outcome: Arc::new(Mutex::new(policy_outcome)),
+        }),
+        Arc::new(RecordingVerdictPort {
+            outcome: Arc::new(Mutex::new(verdict_outcome)),
+        }),
+    ));
+    (peer, client, app, task_calls)
+}
+
+fn task_command(oneof: task_command::Command) -> TaskCommand {
+    TaskCommand {
+        command: Some(oneof),
+    }
+}
+
+fn create_task_command() -> TaskCommand {
+    task_command(task_command::Command::CreateTask(CreateTaskCommand {
+        meta: Some(metadata("c3-correlation")),
+        ..CreateTaskCommand::default()
+    }))
+}
+
+fn activate_task_command() -> TaskCommand {
+    task_command(task_command::Command::ActivateTask(
+        egopulse_domain_contracts::v01::egopulse::task::v1::ActivateTaskCommand {
+            meta: Some(metadata("c3-correlation")),
+            ..Default::default()
+        },
+    ))
+}
+
+fn task_result_with_await() -> CommandPortResult<TaskCommandResult> {
+    CommandPortResult {
+        result: TaskCommandResult::default(),
+        source_revision: Some(SourceRevision {
+            domain: SourceDomain::Task as i32,
+            aggregate_id: "task-1".to_owned(),
+            revision: 1,
+            last_event_id: "event-1".to_owned(),
+        }),
+        await_target: Some(AwaitTarget::Task {
+            task_id: "task-1".to_owned(),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn task_success_propagates_result_and_typed_await_token() {
+    let (peer, client, app, calls) = test_context(
+        Ok(task_result_with_await()),
+        Err(CommandPortFailure::Unavailable),
+        Err(CommandPortFailure::Unavailable),
+    )
+    .await;
+    let request = ExecuteTaskCommandRequest {
+        client: Some(client),
+        command: Some(create_task_command()),
+    };
+    let response = app.execute_task_command(Some(&peer), request);
+    assert!(response.gateway_error.is_none());
+    assert!(response.authority_result.is_some());
+    assert!(response.await_token.is_some());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn system_only_task_branch_is_denied_before_owner_port() {
+    let (peer, client, app, calls) = test_context(
+        Ok(task_result_with_await()),
+        Err(CommandPortFailure::Unavailable),
+        Err(CommandPortFailure::Unavailable),
+    )
+    .await;
+    let response = app.execute_task_command(
+        Some(&peer),
+        ExecuteTaskCommandRequest {
+            client: Some(client),
+            command: Some(activate_task_command()),
+        },
+    );
+    assert_eq!(
+        response.gateway_error.as_ref().map(|error| error.code),
+        Some(LocalApiErrorCode::PermissionDenied as i32)
+    );
+    assert!(response.authority_result.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn authority_unavailable_is_returned_without_fabricating_success() {
+    let (peer, client, app, calls) = test_context(
+        Err(CommandPortFailure::Unavailable),
+        Err(CommandPortFailure::Unavailable),
+        Err(CommandPortFailure::Unavailable),
+    )
+    .await;
+    let response = app.execute_task_command(
+        Some(&peer),
+        ExecuteTaskCommandRequest {
+            client: Some(client),
+            command: Some(create_task_command()),
+        },
+    );
+    assert_eq!(
+        response.gateway_error.as_ref().map(|error| error.code),
+        Some(LocalApiErrorCode::AuthorityUnavailable as i32)
+    );
+    assert!(response.authority_result.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn founder_verdict_returns_authority_result_without_unsupported_await_token() {
+    let (peer, client, app, _calls) = test_context(
+        Err(CommandPortFailure::Unavailable),
+        Err(CommandPortFailure::Unavailable),
+        Ok(CommandPortResult {
+            result: VerdictCommandResult::default(),
+            source_revision: None,
+            await_target: None,
+        }),
+    )
+    .await;
+    let response = app.execute_founder_verdict(
+        Some(&peer),
+        ExecuteFounderVerdictRequest {
+            client: Some(client),
+            command: Some(VerdictCommand {
+                command: Some(verdict_command::Command::IssueFounderVerdict(
+                    IssueFounderVerdictCommand {
+                        metadata: Some(metadata("c3-correlation")),
+                        ..Default::default()
+                    },
+                )),
+            }),
+        },
+    );
+    assert!(response.gateway_error.is_none());
+    assert!(response.authority_result.is_some());
+    assert!(response.await_token.is_none());
+}
+
+#[allow(deprecated)]
+#[tokio::test]
+async fn approval_success_returns_only_sanitized_authority_result() {
+    let (peer, client, app, _calls) = test_context(
+        Err(CommandPortFailure::Unavailable),
+        Ok(CommandPortResult {
+            result: PolicyDecisionCommandResult {
+                committed: true,
+                decision_record: Some(HarnessApprovalDecisionRecord {
+                    authority_decision_ref: "decision-1".to_owned(),
+                    decision: 1,
+                    expires_at: Some(Timestamp {
+                        seconds: 200,
+                        nanos: 0,
+                    }),
+                    ..Default::default()
+                }),
+                state: Some(HarnessApprovalDecisionState {
+                    authority_decision_ref: "decision-1".to_owned(),
+                    revision: 1,
+                    state: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            source_revision: None,
+            await_target: None,
+        }),
+        Err(CommandPortFailure::Unavailable),
+    )
+    .await;
+    let response = app.decide_harness_approval(
+        Some(&peer),
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::DecideHarnessApprovalRequest {
+            client: Some(client),
+            command: Some(IssueHarnessApprovalDecisionCommand {
+                metadata: Some(metadata("c3-correlation")),
+                ..Default::default()
+            }),
+        },
+    );
+    assert!(response.gateway_error.is_none());
+    assert!(response.policy_authority_result.is_none());
+    let sanitized = response
+        .sanitized_authority_result
+        .expect("sanitized result");
+    assert_eq!(sanitized.authority_decision_ref, "decision-1");
+    assert_eq!(sanitized.state_revision, 1);
+}
