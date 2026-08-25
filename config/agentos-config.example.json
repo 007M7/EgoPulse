@@ -118,6 +118,17 @@
       }
     ]
   },
+  "verification": {
+    "criteria": [
+      {
+        "criterion_id": "replace-criterion-id",
+        "requirement": 1,
+        "minimum_assurance": 1,
+        "not_applicable_allowed": false,
+        "checker_profile_ids": ["replace-checker-profile-id"]
+      }
+    ]
+  },
   "policy": {
     "authentication_context_ref": "local-ipc:windows-named-pipe",
     "authorization_policy_ref": {

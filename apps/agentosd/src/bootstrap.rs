@@ -31,23 +31,24 @@ use egopulse_policy_decision_authority::{
     PolicySqlCipherKey,
 };
 use egopulse_verification_authority::{
-    ReferenceRejection, ResolvedVerificationInput, VerificationAuthority,
-    VerificationAuthorityConfig, VerificationAuthorityFailure, VerificationReferenceResolver,
-    VerificationSqlCipherKey,
+    ArtifactBackedReferenceResolver, ReferenceRejection, ResolvedVerificationInput,
+    VerificationAuthority, VerificationAuthorityConfig, VerificationAuthorityFailure,
+    VerificationReferenceResolver, VerificationSqlCipherKey,
 };
 use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{AllowlistedPrincipal, AllowlistedPrincipalResolver, PrincipalPolicyError};
 use crate::{
-    ArtifactProjectionSource, AuthorityPrincipalBinding, CodexHarnessCompositionConfig,
-    ConfiguredArtifactAdmissionGuard, ConfiguredArtifactAdmissionGuardConfig,
-    ConfiguredAuthorityPrincipalResolver, ConfiguredFounderVerdictResolver,
-    ConfiguredFounderVerdictResolverConfig, ConfiguredTaskCreationGuard,
-    ConfiguredTaskCreationGuardConfig, DaemonCompositionError, DaemonProviders,
-    FounderVerdictConfigurationError, LocalUserPolicyResolver, LocalUserPolicyResolverConfig,
-    SharedAuthorityCompositionInputs, TaskAuthorityCommitReceiptSource,
-    VerificationAuthorityArtifactSource, VerificationProjectionSource,
+    ArtifactAuthorityReferenceSource, ArtifactProjectionSource, AuthorityPrincipalBinding,
+    CodexHarnessCompositionConfig, ConfiguredArtifactAdmissionGuard,
+    ConfiguredArtifactAdmissionGuardConfig, ConfiguredAuthorityPrincipalResolver,
+    ConfiguredFounderVerdictResolver, ConfiguredFounderVerdictResolverConfig,
+    ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, DaemonCompositionError,
+    DaemonProviders, FounderVerdictConfigurationError, LocalUserPolicyResolver,
+    LocalUserPolicyResolverConfig, SharedAuthorityCompositionInputs,
+    TaskAuthorityCommitReceiptSource, VerificationAuthorityArtifactSource,
+    VerificationProjectionSource,
 };
 
 /// Explicit scalar configuration for the local-user Policy resolver. The
@@ -68,6 +69,10 @@ pub struct ProductionBootstrapConfig {
     pub artifact: ArtifactAuthorityConfig,
     pub artifact_guard: ConfiguredArtifactAdmissionGuardConfig,
     pub verification: VerificationAuthorityConfig,
+    /// Optional reviewed Artifact-backed Verification reference policy. When
+    /// absent, production remains deny-by-default for external Verification
+    /// requests and checker profile attestation.
+    pub verification_references: Option<VerificationReferenceBootstrapConfig>,
     pub policy: PolicyAuthorityConfig,
     pub policy_resolver: LocalUserPolicyBootstrapConfig,
     pub verdict: VerdictAuthorityConfig,
@@ -123,13 +128,29 @@ impl ProductionBootstrapConfig {
             artifact_guard,
         )?));
 
-        // Verification is intentionally opened with a deny-by-default
-        // reference resolver until the reviewed Sego checker composition is
-        // supplied by the verification vertical. It can still persist and
-        // project only through its own Authority boundary.
+        let verification_resolver: Box<dyn VerificationReferenceResolver> =
+            match self.verification_references {
+                Some(config) => Box::new(
+                    ArtifactBackedReferenceResolver::new(
+                        ArtifactAuthorityReferenceSource::new_shared(Arc::clone(&artifact)),
+                        config.criteria,
+                    )
+                    .map_err(|_| {
+                        ProductionBootstrapError::InvalidConfiguration("verification.criteria")
+                    })?,
+                ),
+                None => Box::new(DenyVerificationReferences),
+            };
+
+        // Verification persists and projects only through its own Authority
+        // boundary. The optional resolver above is still only an
+        // Artifact-backed reference check; it does not attest a checker or
+        // start Sego execution.
         let verification = Arc::new(Mutex::new(VerificationAuthority::open(
             self.verification,
-            DenyVerificationReferences,
+            ComposedVerificationReferenceResolver {
+                inner: verification_resolver,
+            },
         )?));
 
         let policy_edge = AdapterEdge::open(self.policy_resolver.edge)?;
@@ -194,6 +215,8 @@ struct UserOwnedBootstrapFile {
     identity: IdentityFile,
     task_guard: TaskGuardFile,
     artifact: ArtifactPolicyFile,
+    #[serde(default)]
+    verification: Option<VerificationFile>,
     policy: PolicyFile,
     founder: FounderFile,
     codex: CodexFile,
@@ -260,6 +283,22 @@ struct ArtifactPolicyFile {
     allowed_claim_semantic_profile_refs: Vec<ReferenceFile>,
     allowed_claim_acceptance_contract_refs: Vec<ReferenceFile>,
     allowed_evidence_profile_refs: Vec<ReferenceFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerificationFile {
+    criteria: Vec<CriterionFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CriterionFile {
+    criterion_id: String,
+    requirement: i32,
+    minimum_assurance: i32,
+    not_applicable_allowed: bool,
+    checker_profile_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,6 +493,11 @@ impl UserOwnedBootstrapFile {
                 .collect(),
         };
 
+        let verification_references = self
+            .verification
+            .map(VerificationFile::into_typed)
+            .transpose()?;
+
         let workflow = self.codex.workflow.into_typed()?;
         let codex = CodexHarnessCompositionConfig {
             collaboration_database_path: collaboration_store.database_path,
@@ -497,6 +541,7 @@ impl UserOwnedBootstrapFile {
                 store_epoch: verification_store.store_epoch,
                 key: VerificationSqlCipherKey::new(verification_store.key),
             },
+            verification_references,
             policy: PolicyAuthorityConfig {
                 database_path: policy_store.database_path,
                 store_epoch: policy_store.store_epoch,
@@ -652,6 +697,52 @@ impl ReferenceFile {
             version: self.version,
             sha256: self.sha256,
         }
+    }
+}
+
+/// Reviewed criterion policy snapshots used by the owner-backed Verification
+/// resolver. This configuration names acceptance policy only; it does not
+/// make a checker profile active or attest any evidence.
+#[derive(Clone, Debug)]
+pub struct VerificationReferenceBootstrapConfig {
+    pub criteria: Vec<egopulse_verification_authority::CriterionPolicySnapshot>,
+}
+
+impl VerificationFile {
+    fn into_typed(self) -> Result<VerificationReferenceBootstrapConfig, ProductionBootstrapError> {
+        if self.criteria.is_empty() {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification.criteria",
+            ));
+        }
+        let criteria = self
+            .criteria
+            .into_iter()
+            .map(CriterionFile::into_typed)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(VerificationReferenceBootstrapConfig { criteria })
+    }
+}
+
+impl CriterionFile {
+    fn into_typed(
+        self,
+    ) -> Result<egopulse_verification_authority::CriterionPolicySnapshot, ProductionBootstrapError>
+    {
+        let criterion_id = required(self.criterion_id, "verification.criteria.criterion_id")?;
+        let checker_profile_ids = non_empty_set(
+            self.checker_profile_ids,
+            "verification.criteria.checker_profile_ids",
+        )?
+        .into_iter()
+        .collect();
+        Ok(egopulse_verification_authority::CriterionPolicySnapshot {
+            criterion_id,
+            requirement: self.requirement,
+            minimum_assurance: self.minimum_assurance,
+            not_applicable_allowed: self.not_applicable_allowed,
+            checker_profile_ids,
+        })
     }
 }
 
@@ -817,7 +908,9 @@ fn parse_verdict_principal(
 
 /// Production's temporary verification boundary. It prevents the daemon from
 /// accepting client-supplied verification references before the reviewed
-/// Sego/checker composition is installed in the next vertical.
+/// Sego/checker composition is installed in the next vertical. This resolver
+/// remains useful for tests and for the explicit deny branch of the
+/// production composition.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DenyVerificationReferences;
 
@@ -846,6 +939,49 @@ impl VerificationReferenceResolver for DenyVerificationReferences {
         _artifact_ids: &[String],
     ) -> Result<(), ReferenceRejection> {
         Err(ReferenceRejection::OutputUntrusted)
+    }
+}
+
+/// Small composition-root adapter allowing the optional concrete resolver to
+/// be selected without leaking its Artifact Authority generic parameters into
+/// `ProductionBootstrapConfig` or `VerificationAuthority`.
+struct ComposedVerificationReferenceResolver {
+    inner: Box<dyn VerificationReferenceResolver>,
+}
+
+impl VerificationReferenceResolver for ComposedVerificationReferenceResolver {
+    fn validate_checker_profile(&self, profile: &CheckerProfile) -> Result<(), ReferenceRejection> {
+        self.inner.validate_checker_profile(profile)
+    }
+
+    fn resolve_request(
+        &self,
+        request: &VerificationRequest,
+    ) -> Result<ResolvedVerificationInput, ReferenceRejection> {
+        self.inner.resolve_request(request)
+    }
+
+    fn revalidate_binding(&self, binding: &VerificationBinding) -> Result<(), ReferenceRejection> {
+        self.inner.revalidate_binding(binding)
+    }
+
+    fn validate_result_references(
+        &self,
+        evidence_ids: &[String],
+        artifact_ids: &[String],
+    ) -> Result<(), ReferenceRejection> {
+        self.inner
+            .validate_result_references(evidence_ids, artifact_ids)
+    }
+
+    fn validate_result_references_for_binding(
+        &self,
+        binding: &VerificationBinding,
+        evidence_ids: &[String],
+        artifact_ids: &[String],
+    ) -> Result<(), ReferenceRejection> {
+        self.inner
+            .validate_result_references_for_binding(binding, evidence_ids, artifact_ids)
     }
 }
 

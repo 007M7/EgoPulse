@@ -132,3 +132,12 @@ composition. `DenyVerificationReferences` still keeps Verification external
 requests held while allowing its own store and projection boundary to be
 composed; merely opening Artifact Authority must not turn that deny boundary
 into an implicit Sego authorization.
+
+The bootstrap now accepts an optional `verification.criteria` section. When it
+is present, the composition root constructs `ArtifactBackedReferenceResolver`
+over the same shared `ArtifactAuthorityReferenceSource` owner handle and
+binds the configured criterion policy snapshots to Verification. When it is
+absent, the deny resolver remains active. This section authorizes neither a
+checker profile nor a Sego process: checker profiles still require an explicit
+Verification Authority attestation command whose evidence artifacts pass the
+same owner-backed resolver.
