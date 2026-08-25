@@ -5,9 +5,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use egopulse_client_kernel::ClientKernel;
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
-    ClientSurface, GetProjectionStatusRequest, ProjectionHealth,
+    ClientSurface, GetProjectionStatusRequest, LocalApiError, LocalApiErrorCode, ProjectionHealth,
 };
 use egopulse_local_api::{LocalApiClient, LocalIpcAddress};
+use serde_json::json;
 use uuid::Uuid;
 
 const DEFAULT_INSTANCE: &str = "default";
@@ -34,6 +35,10 @@ struct CliFailure {
     exit_code: u8,
     reason_code: &'static str,
     message: String,
+    category: &'static str,
+    retryable: bool,
+    required_action_code: Option<String>,
+    safe_fingerprint: Option<String>,
 }
 
 impl CliFailure {
@@ -42,6 +47,10 @@ impl CliFailure {
             exit_code: 3,
             reason_code: "DAEMON_UNAVAILABLE",
             message: message.into(),
+            category: "unavailable",
+            retryable: true,
+            required_action_code: Some("attach_to_daemon".to_owned()),
+            safe_fingerprint: None,
         }
     }
 
@@ -50,20 +59,77 @@ impl CliFailure {
             exit_code: 70,
             reason_code: "LOCAL_API_PROTOCOL_ERROR",
             message: message.into(),
+            category: "internal",
+            retryable: false,
+            required_action_code: None,
+            safe_fingerprint: None,
         }
+    }
+
+    fn from_local_api_error(error: LocalApiError) -> Self {
+        let code = LocalApiErrorCode::try_from(error.code)
+            .map(|code| code.as_str_name())
+            .unwrap_or("LOCAL_API_ERROR_UNKNOWN");
+        let (exit_code, category) = match LocalApiErrorCode::try_from(error.code).ok() {
+            Some(LocalApiErrorCode::Unauthenticated | LocalApiErrorCode::PermissionDenied) => {
+                (4, "authentication")
+            }
+            Some(LocalApiErrorCode::ContractIncompatible | LocalApiErrorCode::SessionExpired) => {
+                (5, "contract")
+            }
+            Some(
+                LocalApiErrorCode::ProjectionBehind
+                | LocalApiErrorCode::ProjectionResetRequired
+                | LocalApiErrorCode::CursorExpired
+                | LocalApiErrorCode::CursorInvalid,
+            ) => (7, "projection"),
+            _ => (70, "internal"),
+        };
+        Self {
+            exit_code,
+            reason_code: "LOCAL_API_ERROR",
+            message: code.to_owned(),
+            category,
+            retryable: error.retryable,
+            required_action_code: error.required_action_code,
+            safe_fingerprint: (!error.safe_fingerprint.is_empty())
+                .then_some(error.safe_fingerprint),
+        }
+    }
+
+    fn json_envelope(&self) -> serde_json::Value {
+        json!({
+            "schemaVersion": "egopulse.cli-result/v0.1",
+            "ok": false,
+            "operation": "status",
+            "error": {
+                "category": self.category,
+                "code": self.reason_code,
+                "retryable": self.retryable,
+                "requiredActionCode": self.required_action_code,
+                "safeFingerprint": self.safe_fingerprint,
+            },
+            "projection": serde_json::Value::Null,
+            "correlationId": Uuid::now_v7().to_string(),
+        })
     }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let json_output = matches!(&cli.command, Command::Status { json: true });
     let result = match cli.command {
         Command::Status { json } => status(json).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{}: {}", error.reason_code, error.message);
+            if json_output {
+                println!("{}", serde_json::to_string(&error.json_envelope()).unwrap());
+            } else {
+                eprintln!("{}: {}", error.reason_code, error.message);
+            }
             ExitCode::from(error.exit_code)
         }
     }
@@ -106,11 +172,7 @@ async fn status(json: bool) -> Result<(), CliFailure> {
         .map_err(|error| CliFailure::daemon_unavailable(error.to_string()))?
         .into_inner();
     if let Some(error) = response.error {
-        return Err(CliFailure::protocol(format!(
-            "local_api_error_code={} required_action={}",
-            error.code,
-            error.required_action_code.as_deref().unwrap_or("none")
-        )));
+        return Err(CliFailure::from_local_api_error(error));
     }
     let metadata = response
         .metadata
@@ -122,13 +184,19 @@ async fn status(json: bool) -> Result<(), CliFailure> {
         .map_err(|_| CliFailure::protocol("projection health is unknown"))?;
 
     if json {
-        println!(
-            "{{\"state\":\"connected\",\"projectionHealth\":\"{}\",\"stale\":{},\"epoch\":\"{}\",\"sequence\":{}}}",
-            health.as_str_name(),
-            metadata.stale,
-            position.epoch,
-            position.sequence
-        );
+        let output = json!({
+            "schemaVersion": "egopulse.cli-result/v0.1",
+            "ok": true,
+            "operation": "status",
+            "data": { "state": "connected" },
+            "projection": {
+                "position": { "epoch": position.epoch, "sequence": position.sequence },
+                "health": health.as_str_name(),
+                "stale": metadata.stale,
+            },
+            "correlationId": Uuid::now_v7().to_string(),
+        });
+        println!("{}", serde_json::to_string(&output).unwrap());
     } else {
         println!("EgoPulse status: connected");
         println!("Projection: {}", health.as_str_name());
