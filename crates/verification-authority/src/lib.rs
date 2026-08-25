@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
+mod execution;
 mod reference_resolver;
 mod sego;
 mod sego_runner;
 mod store;
 mod supervisor;
 
+pub use execution::{
+    GovernedVerificationExecutionCoordinator, GovernedVerificationExecutionError,
+    GovernedVerificationExecutionOutcome, GovernedVerificationExecutionPlan,
+};
 pub use reference_resolver::{
     ArtifactBackedReferenceResolver, ArtifactContentSource, ArtifactReferenceSource,
     ArtifactReferenceSourceError, ReferenceResolverConfigurationError,

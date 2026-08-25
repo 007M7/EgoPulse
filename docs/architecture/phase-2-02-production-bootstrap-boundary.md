@@ -155,3 +155,11 @@ Verification Authority also exposes decoded request and run snapshots as
 read-only owner APIs. The execution coordinator uses these snapshots to resume
 from the last durable revision after a crash; it does not reconstruct
 revisions from a Task payload or a client-side cache.
+
+The next application boundary is `GovernedVerificationExecutionCoordinator`.
+It is intentionally limited to one reviewed criterion: it reads the durable
+request/run snapshots, invokes the existing governed Sego supervisor and mapper,
+records the criterion through the checker principal, and completes the artifact
+through the Verification Authority principal. A process-output failure is still
+recorded as an explicit non-passing result; a completed run is replayed from
+the immutable artifact instead of being executed again.

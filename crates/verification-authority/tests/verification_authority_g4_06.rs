@@ -12,9 +12,10 @@ use egopulse_domain_contracts::v01::egopulse::verification::v1::{
 };
 use egopulse_verification_authority::{
     AuthenticatedVerificationPrincipal, CheckerExecutionError, CheckerProcessFailure,
-    CriterionPolicySnapshot, GovernedCheckerSupervisor, GovernedSegoRunner, ReferenceRejection,
-    ResolvedVerificationInput, SegoFindingEvidenceBinding, SegoMapError, SegoMapperPolicy,
-    VerificationAuthority, VerificationAuthorityConfig, VerificationClock,
+    CriterionPolicySnapshot, GovernedCheckerSupervisor, GovernedSegoRunner,
+    GovernedVerificationExecutionCoordinator, GovernedVerificationExecutionPlan,
+    ReferenceRejection, ResolvedVerificationInput, SegoFindingEvidenceBinding, SegoMapError,
+    SegoMapperPolicy, VerificationAuthority, VerificationAuthorityConfig, VerificationClock,
     VerificationPrincipalKind, VerificationReferenceResolver, VerificationSqlCipherKey,
     canonical_checker_profile_digest, canonical_request_digest, checker_failure_result,
     map_sego_review,
@@ -24,6 +25,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -617,6 +619,101 @@ async fn governed_sego_runner_maps_untrusted_output_without_dropping_receipt() {
     assert_eq!(
         result.mapped.criterion_result.outcome,
         CriterionOutcome::Error as i32
+    );
+}
+
+#[tokio::test]
+async fn governed_execution_coordinator_records_completes_and_replays() {
+    let fixture = running_fixture(
+        "execution-coordinator",
+        CheckerAssuranceClass::ModelAssisted,
+    );
+    let mut authority = fixture.authority;
+    let mut request = fixture.request.clone();
+    request.verification_request_id = "verification-request-coordinator".to_owned();
+    let create = seal_command(
+        VerificationCommand {
+            command: Some(verification_command::Command::CreateVerificationRequest(
+                CreateVerificationRequestCommand {
+                    metadata: Some(metadata("coordinator-create")),
+                    request: Some(request.clone()),
+                },
+            )),
+        },
+        "coordinator-create",
+    );
+    assert!(
+        authority
+            .execute(
+                &create,
+                &principal(
+                    VerificationPrincipalKind::TaskAuthority,
+                    "agentosd:task-authority",
+                    None,
+                ),
+            )
+            .expect("create coordinator request")
+            .committed
+    );
+    let authority = Arc::new(Mutex::new(authority));
+    let runner = GovernedSegoRunner::new(
+        GovernedCheckerSupervisor::new(
+            std::env::current_exe().expect("test executable"),
+            vec![
+                "--exact".to_owned(),
+                "checker_invalid_output_probe".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            Duration::from_secs(2),
+            64 * 1024,
+        )
+        .expect("supervisor"),
+    );
+    let coordinator = GovernedVerificationExecutionCoordinator::new(Arc::clone(&authority), runner);
+    let plan = GovernedVerificationExecutionPlan {
+        verification_request_id: request.verification_request_id.clone(),
+        verification_run_id: "verification-run-coordinator".to_owned(),
+        execution_id: "execution-coordinator-01".to_owned(),
+        working_directory: fixture._root.path().to_owned(),
+        checker_request: b"{}".to_vec(),
+        mapper_policy: mapper_policy(),
+        verification_artifact_id: "verification-artifact-coordinator".to_owned(),
+        tool_receipt_artifact_ids: Vec::new(),
+        model_call_receipt_artifact_ids: vec!["model-call-receipt".to_owned()],
+        issued_at: Timestamp {
+            seconds: 1_782_000_000,
+            nanos: 0,
+        },
+    };
+    let completed = coordinator
+        .execute_one(plan.clone())
+        .await
+        .expect("coordinator completes verification");
+    assert!(!completed.replayed);
+    assert!(!completed.recovered_existing_result);
+    assert_eq!(
+        completed.verification_artifact.conclusion,
+        VerificationConclusion::Indeterminate as i32
+    );
+
+    let replay = coordinator
+        .execute_one(plan)
+        .await
+        .expect("completed execution is recoverable");
+    assert!(replay.replayed);
+    assert!(replay.recovered_existing_result);
+    assert_eq!(
+        replay.verification_artifact,
+        completed.verification_artifact
+    );
+    let authority = authority.lock().expect("authority lock");
+    assert_eq!(
+        authority
+            .verification_run("verification-run-coordinator")
+            .expect("run snapshot")
+            .expect("run")
+            .status,
+        VerificationStatus::Completed as i32
     );
 }
 
