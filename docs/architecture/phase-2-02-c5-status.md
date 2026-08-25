@@ -151,6 +151,17 @@ replays. It is not yet installed in `ProductionBootstrapConfig`: that remains
 deny-by-default until a real Artifact-backed resolver, reviewed plan source,
 checker profile and Sego runner are composed together.
 
+The G4-10 integration fixture in
+`apps/agentosd/tests/verification_intake_g4_10.rs` now proves this boundary with
+real local Authority stores: Task creation/activation/evidence submission emits
+the durable handoff; an Artifact owner projection supplies a sealed set whose
+claim, evidence, artifact digest and lineage are checked by
+`ArtifactBackedReferenceResolver`; Verification attests the checker profile and
+commits exactly one request; only then does Task ACK the original message. A
+second intake poll observes no pending handoff, proving the committed-then-ACKed
+path is idempotent. This fixture does not claim Sego execution, verification
+completion, or Task verification write-back.
+
 `with_codex_harness` and `ProductionBootstrapConfig::build` remain explicit
 production composition APIs and not implicit unsafe defaults. Verification
 remains deny-by-default for unreviewed external references until Sego/checker
