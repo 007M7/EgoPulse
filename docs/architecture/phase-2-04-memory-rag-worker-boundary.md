@@ -43,6 +43,28 @@ index ownership, rebuild/versioning, cost and rollback. A future embedding or
 reranker must remain behind this read-only boundary and must not become a
 Memory Authority.
 
+## Selection rationale and cost
+
+Python is used here because the cognition plane already reserves Python for
+parsing, model experiments and evaluation, and because an isolated `uv`
+project keeps those fast-changing dependencies out of the Rust authority and
+the TypeScript client. The immediate cost is one more runtime boundary and a
+future cross-language contract to maintain; that cost is accepted only for
+experimental cognition code, not for authoritative state.
+
+The lexical baseline is selected because it is dependency-free, reproducible,
+easy to inspect in a failing fixture and cheap to run on a local Windows
+installation. It gives up semantic recall, multilingual quality and large
+corpus performance compared with embeddings plus a vector index. Those are
+known product costs, not hidden architecture decisions. They must be measured
+against representative local data before an embedding model, vector store or
+framework is admitted.
+
+LangChain and LangGraph are therefore not dependencies of this worker. They
+remain possible cognition-plane implementation tools, but selecting either
+would introduce framework lifecycle, upgrade and observability coupling before
+the Memory Authority and retrieval contract are frozen.
+
 ## Acceptance evidence
 
 The local tests cover normal ranking, scope/state filtering, digest mismatch,
