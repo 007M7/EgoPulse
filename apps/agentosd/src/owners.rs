@@ -563,6 +563,7 @@ mod tests {
         fn validate_task_commit(
             &self,
             _command: &ConsumeFounderVerdictCommand,
+            _scope: &egopulse_domain_contracts::v01::egopulse::verdict::v1::VerdictScope,
         ) -> Result<(), VerdictReferenceRejection> {
             Err(VerdictReferenceRejection::PermissionDenied)
         }

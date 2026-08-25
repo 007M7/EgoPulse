@@ -94,6 +94,7 @@ pub trait VerdictReferenceResolver: Send + Sync + 'static {
     fn validate_task_commit(
         &self,
         command: &ConsumeFounderVerdictCommand,
+        scope: &VerdictScope,
     ) -> Result<(), VerdictReferenceRejection>;
 
     fn validate_revoke(
@@ -744,7 +745,13 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
         if timestamp_after_or_equal(&now, verdict.expires_at.as_ref()) {
             return Ok(error_result(VerdictErrorCode::Expired, "VERDICT_EXPIRED"));
         }
-        if let Err(rejection) = self.resolver.validate_task_commit(command) {
+        let Some(scope) = verdict.scope.as_ref() else {
+            return Ok(error_result(
+                VerdictErrorCode::IntegrityFailure,
+                "STORED_VERDICT_SCOPE_MISSING",
+            ));
+        };
+        if let Err(rejection) = self.resolver.validate_task_commit(command, scope) {
             return Ok(reference_error(rejection));
         }
         let expected_status = match FounderVerdictDecision::try_from(verdict.decision)

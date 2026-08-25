@@ -39,7 +39,10 @@ Verification Authority's read API, then binds the verdict scope and observed
 conclusion to that artifact. It also requires an explicitly allowlisted Founder
 confirmation proof and a bounded expiry. Task commit receipt validation remains
 a separate injected source and defaults to fail-closed until the Task Authority
-receipt source is composed.
+receipt source is composed. The Verdict resolver contract now receives the
+stored verdict scope during consumption, so the Task source can validate the
+receipt against the exact task ID and resulting revision rather than guessing
+from a receipt string.
 
 The normal `agentosd` entrypoint remains fail-closed until all three decisions,
 the encrypted Authority stores and the explicit Codex workflow configuration

@@ -183,6 +183,7 @@ impl egopulse_founder_verdict_authority::VerdictReferenceResolver for DenyVerdic
     fn validate_task_commit(
         &self,
         _command: &ConsumeFounderVerdictCommand,
+        _scope: &egopulse_domain_contracts::v01::egopulse::verdict::v1::VerdictScope,
     ) -> Result<(), VerdictReferenceRejection> {
         Err(VerdictReferenceRejection::PermissionDenied)
     }
@@ -225,6 +226,7 @@ impl egopulse_founder_verdict_authority::VerdictReferenceResolver for AllowVerdi
     fn validate_task_commit(
         &self,
         _command: &ConsumeFounderVerdictCommand,
+        _scope: &egopulse_domain_contracts::v01::egopulse::verdict::v1::VerdictScope,
     ) -> Result<(), VerdictReferenceRejection> {
         Ok(())
     }

@@ -84,7 +84,8 @@ pub use verdict::{
     ConfiguredFounderVerdictResolver, ConfiguredFounderVerdictResolverConfig,
     DenyFounderTaskCommitEvidence, FounderTaskCommitEvidenceSource,
     FounderVerdictConfigurationError, FounderVerificationEvidenceError,
-    FounderVerificationEvidenceSource, VerificationAuthorityArtifactSource,
+    FounderVerificationEvidenceSource, TaskAuthorityCommitReceiptSource,
+    VerificationAuthorityArtifactSource,
 };
 
 #[derive(Clone, Debug)]

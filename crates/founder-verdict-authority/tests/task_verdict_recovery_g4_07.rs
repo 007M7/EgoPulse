@@ -125,6 +125,7 @@ impl VerdictReferenceResolver for IntegratedGuard {
     fn validate_task_commit(
         &self,
         _: &egopulse_domain_contracts::v01::egopulse::verdict::v1::ConsumeFounderVerdictCommand,
+        _: &egopulse_domain_contracts::v01::egopulse::verdict::v1::VerdictScope,
     ) -> Result<(), VerdictReferenceRejection> {
         (*self.0.task_commit_valid.lock().expect("receipt lock"))
             .then_some(())

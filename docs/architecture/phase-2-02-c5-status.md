@@ -85,7 +85,8 @@ committed Verification artifact through an Authority-owned read boundary,
 checks scope/conclusion consistency, requires an allowlisted Founder
 confirmation proof, and bounds the verdict expiry. Task commit receipt
 consumption remains fail-closed until its Task Authority evidence source is
-composed.
+composed. The consumption resolver contract carries the stored verdict scope
+into receipt validation, binding the check to the exact task and revision.
 
 Until that bootstrap exists, `with_codex_harness` is an explicit production composition API and not
 an implicit unsafe default.

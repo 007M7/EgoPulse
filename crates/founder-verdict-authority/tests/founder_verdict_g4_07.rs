@@ -75,6 +75,7 @@ impl VerdictReferenceResolver for StaticResolver {
     fn validate_task_commit(
         &self,
         _command: &ConsumeFounderVerdictCommand,
+        _scope: &VerdictScope,
     ) -> Result<(), VerdictReferenceRejection> {
         self.task_commit_valid
             .then_some(())

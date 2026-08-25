@@ -1,6 +1,7 @@
+use egopulse_cognition_runtime::task_authority::{TaskAuthority, TaskAuthorityFailure};
 use std::{
     collections::BTreeSet,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -39,7 +40,63 @@ pub trait FounderTaskCommitEvidenceSource: Send + Sync + 'static {
         &self,
         command: &egopulse_domain_contracts::v01::egopulse::verdict::v1::
             ConsumeFounderVerdictCommand,
+        _scope: &VerdictScope,
     ) -> Result<(), VerdictReferenceRejection>;
+}
+
+/// Provider-neutral Task commit receipt reader backed by the owning Task
+/// Authority. The caller shares the Authority's single-writer handle; no
+/// second database connection or repair path is introduced.
+pub struct TaskAuthorityCommitReceiptSource {
+    authority: Arc<Mutex<TaskAuthority>>,
+}
+
+impl TaskAuthorityCommitReceiptSource {
+    #[must_use]
+    pub fn new(authority: Arc<Mutex<TaskAuthority>>) -> Self {
+        Self { authority }
+    }
+}
+
+impl FounderTaskCommitEvidenceSource for TaskAuthorityCommitReceiptSource {
+    fn validate_task_commit(
+        &self,
+        command: &egopulse_domain_contracts::v01::egopulse::verdict::v1::
+            ConsumeFounderVerdictCommand,
+        scope: &VerdictScope,
+    ) -> Result<(), VerdictReferenceRejection> {
+        if scope.task_id.trim().is_empty()
+            || scope.task_revision == 0
+            || command.task_event_id.trim().is_empty()
+            || command.task_commit_receipt_ref.trim().is_empty()
+            || command.consumed_task_revision != scope.task_revision
+            || command.resulting_task_revision != command.consumed_task_revision + 1
+        {
+            return Err(VerdictReferenceRejection::TaskCommitReceiptInvalid);
+        }
+        let event_id = command
+            .task_commit_receipt_ref
+            .strip_prefix("task-commit:")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(VerdictReferenceRejection::TaskCommitReceiptInvalid)?;
+        if event_id != command.task_event_id {
+            return Err(VerdictReferenceRejection::TaskCommitReceiptInvalid);
+        }
+        let committed = self
+            .authority
+            .lock()
+            .map_err(|_| VerdictReferenceRejection::IntegrityFailure)?
+            .commit_receipt_exists(event_id, &scope.task_id, command.resulting_task_revision)
+            .map_err(|error| match error {
+                TaskAuthorityFailure::Storage
+                | TaskAuthorityFailure::Decode(_)
+                | TaskAuthorityFailure::InvalidCrossAuthorityHandoff
+                | TaskAuthorityFailure::Clock => VerdictReferenceRejection::IntegrityFailure,
+            })?;
+        committed
+            .then_some(())
+            .ok_or(VerdictReferenceRejection::TaskCommitReceiptInvalid)
+    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -103,6 +160,7 @@ impl FounderTaskCommitEvidenceSource for DenyFounderTaskCommitEvidence {
         &self,
         _command: &egopulse_domain_contracts::v01::egopulse::verdict::v1::
             ConsumeFounderVerdictCommand,
+        _scope: &VerdictScope,
     ) -> Result<(), VerdictReferenceRejection> {
         Err(VerdictReferenceRejection::TaskCommitReceiptInvalid)
     }
@@ -289,8 +347,9 @@ impl VerdictReferenceResolver for ConfiguredFounderVerdictResolver {
         &self,
         command: &egopulse_domain_contracts::v01::egopulse::verdict::v1::
             ConsumeFounderVerdictCommand,
+        scope: &VerdictScope,
     ) -> Result<(), VerdictReferenceRejection> {
-        self.task_commit_source.validate_task_commit(command)
+        self.task_commit_source.validate_task_commit(command, scope)
     }
 }
 
@@ -549,7 +608,7 @@ mod tests {
     #[test]
     fn task_consumption_remains_fail_closed_without_task_receipt_source() {
         let error = resolver()
-            .validate_task_commit(&ConsumeFounderVerdictCommand::default())
+            .validate_task_commit(&ConsumeFounderVerdictCommand::default(), &scope())
             .expect_err("task receipt source is not configured");
         assert_eq!(error, VerdictReferenceRejection::TaskCommitReceiptInvalid);
     }
