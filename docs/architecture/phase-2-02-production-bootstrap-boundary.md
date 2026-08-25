@@ -38,17 +38,29 @@ Verification evidence source reads a committed artifact through the owning
 Verification Authority's read API, then binds the verdict scope and observed
 conclusion to that artifact. It also requires an explicitly allowlisted Founder
 confirmation proof and a bounded expiry. Task commit receipt validation remains
-a separate injected source and defaults to fail-closed until the Task Authority
-receipt source is composed. The Verdict resolver contract now receives the
+a separate injected source; the typed production composition now supplies the
+Task Authority receipt source. The Verdict resolver contract now receives the
 stored verdict scope during consumption, so the Task source can validate the
 receipt against the exact task ID and resulting revision rather than guessing
 from a receipt string.
 
-The normal `agentosd` entrypoint remains fail-closed until all three decisions,
-the encrypted Authority stores and the explicit Codex workflow configuration
-are assembled as one reviewed bootstrap. This is deliberate: a daemon that
-authenticates a user but silently uses test Allow guards would be a governance
-regression, not a usable production mode.
+`ProductionBootstrapConfig::build` is now the reusable typed composition root.
+It opens Task, Verification, Policy and Founder Verdict exactly once, shares
+the Task handle with command ports and receipt validation, shares the
+Verification handle with Verdict evidence reads and projection ACKs, then
+installs the explicit identity policy and Codex Harness composition. There is
+no test Allow resolver in this path.
+
+The normal `agentosd` entrypoint remains fail-closed until a user-owned
+configuration loader can supply the typed bootstrap, including the already
+structured single-Harness workflow. This is deliberate: a daemon that
+authenticates a user but silently guesses workflow facts or uses test guards
+would be a governance regression, not a usable production mode.
+
+Until the Sego/checker composition enters the Verification vertical, the
+production bootstrap uses `DenyVerificationReferences`: Verification storage
+and projection are available, but unreviewed external verification requests
+cannot be accepted.
 
 ## Owner boundary
 
@@ -86,8 +98,7 @@ The agentosd unit suite covers:
 - the existing real Windows Named Pipe C5 suite continues to pass in serial
   mode.
 
-The remaining bootstrap work is to provide reviewed configuration, compose the
-Task commit receipt source, and wire the explicit Codex composition plus all
-three Authority stores into the normal binary. No test fixture Allow
-implementation is reused for that step; the three guards remain separate from
-identity mapping and from the client surfaces.
+The remaining bootstrap work is the user-owned configuration loader and normal
+binary wiring. No test fixture Allow implementation is reused for that step;
+the three guards remain separate from identity mapping and from the client
+surfaces.

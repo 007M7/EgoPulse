@@ -54,6 +54,7 @@ use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
 use tonic::transport::Server;
 
+mod bootstrap;
 mod owners;
 mod policy;
 mod projections;
@@ -61,6 +62,10 @@ mod security;
 mod task;
 mod verdict;
 
+pub use bootstrap::{
+    DenyVerificationReferences, LocalUserPolicyBootstrapConfig, ProductionBootstrapConfig,
+    ProductionBootstrapError,
+};
 pub use owners::{
     AuthorityCommandPorts, AuthorityPrincipalResolver, DenyAllAuthorityPrincipalResolver,
 };

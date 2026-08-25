@@ -51,7 +51,8 @@ lifecycle timeout even though every test passes independently and in serial mode
 ## Remaining Phase 2-02 work
 
 The normal `agentosd` binary still uses `FailClosedProviderFactory`. This is intentional until the
-real local bootstrap supplies all of the following as reviewed configuration:
+user-owned configuration loader wires the reusable `ProductionBootstrapConfig` into the binary and
+supplies all of the following as reviewed configuration:
 
 - authority database paths, epochs and non-zero keys;
 - local OS-principal allowlist and authority-principal mapping;
@@ -65,9 +66,12 @@ platform-derived peer fingerprint against explicit grants, while
 owner kinds independently for Task, Policy and Verdict. Missing mappings fail
 closed; no OS identity or request field is promoted to Founder implicitly.
 
-This does not claim that Authority reference guards or the normal binary's full
-Codex bootstrap are complete. They remain separate obligations so that identity
-configuration cannot be mistaken for evidence validation or Harness configuration.
+`ProductionBootstrapConfig::build` now provides the typed full composition API:
+it opens all four Authority stores, shares Task and Verification owner handles,
+injects the concrete Task/Policy/Verdict guards, and installs the Codex
+composition. The normal binary wiring and user-owned configuration loader
+remain separate obligations so that identity configuration cannot be mistaken
+for evidence validation or Harness configuration.
 
 The first concrete production-side guard is now `LocalUserPolicyResolver`.
 It resolves approval requests from the Adapter Edge's durable projection,
@@ -84,12 +88,13 @@ Founder Verdict now has `ConfiguredFounderVerdictResolver`. It reads a
 committed Verification artifact through an Authority-owned read boundary,
 checks scope/conclusion consistency, requires an allowlisted Founder
 confirmation proof, and bounds the verdict expiry. Task commit receipt
-consumption remains fail-closed until its Task Authority evidence source is
-composed. The consumption resolver contract carries the stored verdict scope
+consumption is fail-closed by default, while the typed production composition
+supplies its Task Authority evidence source. The consumption resolver contract carries the stored verdict scope
 into receipt validation, binding the check to the exact task and revision.
 
-Until that bootstrap exists, `with_codex_harness` is an explicit production composition API and not
-an implicit unsafe default.
+Until the loader is wired, `with_codex_harness` and `ProductionBootstrapConfig::build` are explicit
+production composition APIs and not implicit unsafe defaults. Verification remains deny-by-default
+for unreviewed external references until Sego/checker composition is supplied.
 
 ## Next unit: Phase 2-03
 
