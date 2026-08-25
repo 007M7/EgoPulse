@@ -141,6 +141,8 @@ pub enum TaskAuthorityFailure {
     Storage,
     #[error("task authority stored protobuf could not be decoded")]
     Decode(#[from] prost::DecodeError),
+    #[error("task authority cross-authority handoff is invalid")]
+    InvalidCrossAuthorityHandoff,
     #[error("task authority clock is before the Unix epoch")]
     Clock,
 }
@@ -162,6 +164,13 @@ pub struct TaskProjectionMessage {
     pub message_id: String,
     pub source_event_id: String,
     pub source_revision: u64,
+    pub payload_digest_sha256: String,
+    pub event: TaskEvent,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingTaskActivation {
+    pub message_id: String,
     pub payload_digest_sha256: String,
     pub event: TaskEvent,
 }
@@ -376,6 +385,39 @@ impl TaskAuthority {
         self.store
             .pending_cross_authority_outbox()
             .map_err(TaskAuthorityFailure::from)
+    }
+
+    pub fn pending_task_activations(
+        &self,
+    ) -> Result<Vec<PendingTaskActivation>, TaskAuthorityFailure> {
+        self.store
+            .pending_cross_authority_outbox()?
+            .into_iter()
+            .filter(|message| message.destination_domain == "collaboration-control")
+            .map(|message| {
+                let actual_digest = hex::encode(Sha256::digest(&message.payload));
+                if actual_digest != message.payload_digest_sha256 {
+                    return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+                }
+                let event = TaskEvent::decode(message.payload.as_slice())?;
+                let Some(snapshot) = event.snapshot.as_ref() else {
+                    return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+                };
+                if event.kind != TaskEventKind::Activated as i32
+                    || event.task_id != snapshot.task_id
+                    || event.resulting_revision != snapshot.revision
+                    || event.work_revision != snapshot.work_revision
+                    || snapshot.current_run_id.is_none()
+                {
+                    return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+                }
+                Ok(PendingTaskActivation {
+                    message_id: message.message_id,
+                    payload_digest_sha256: message.payload_digest_sha256,
+                    event,
+                })
+            })
+            .collect()
     }
 
     pub fn drain_projection_outbox(

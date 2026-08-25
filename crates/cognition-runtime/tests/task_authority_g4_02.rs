@@ -485,6 +485,51 @@ fn activation_emits_task_event_to_collaboration_outbox_and_requires_digest_ack()
 }
 
 #[test]
+fn task_activation_reader_returns_only_validated_collaboration_handoffs() {
+    let isolated = IsolatedStore::new("task-activation-reader");
+    let mut authority = open_authority(&isolated.database_path());
+    let created = authority
+        .execute(&valid_create_command(), &founder())
+        .expect("create Task before activation");
+    let task = committed_task(&created);
+    let mut activate = TaskCommand {
+        command: Some(task_command::Command::ActivateTask(ActivateTaskCommand {
+            meta: Some(metadata(
+                "cmd-activate-reader",
+                "activate-reader",
+                "corr-reader",
+            )),
+            task_id: task.task_id,
+            expected_revision: task.revision,
+            work_revision: task.work_revision,
+            run_id: "run-reader-001".to_owned(),
+        })),
+    };
+    set_digest(&mut activate);
+    let collaboration = AuthenticatedPrincipal {
+        kind: PrincipalKind::CollaborationControl,
+        principal_id: "collaboration-control:reader".to_owned(),
+        authenticated: true,
+    };
+    authority
+        .execute(&activate, &collaboration)
+        .expect("activate Task");
+
+    let activations = authority
+        .pending_task_activations()
+        .expect("read validated Task activation handoff");
+    assert_eq!(activations.len(), 1);
+    assert_eq!(
+        activations[0]
+            .event
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.current_run_id.as_deref()),
+        Some("run-reader-001")
+    );
+}
+
+#[test]
 fn committed_create_survives_process_abort_before_response_delivery() {
     let isolated = IsolatedStore::new("task-abort");
     let path = isolated.database_path();
