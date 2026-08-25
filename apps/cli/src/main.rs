@@ -4,16 +4,13 @@
 // boundary; the process is short-lived and does not cross the kernel ABI.
 #![allow(clippy::result_large_err)]
 
-use std::{
-    process::ExitCode,
-    time::{Duration, SystemTime},
-};
+use std::{process::ExitCode, time::Duration};
 
 use clap::{Parser, Subcommand};
-use egopulse_client_kernel::{ClientKernel, SnapshotStreamTracker, StreamApply};
+use egopulse_client_kernel::{SnapshotStreamTracker, StreamApply};
 use egopulse_client_operations::{
-    AttachError, attach as attach_client, canonical_task_digest, command_metadata,
-    set_policy_digest, set_verdict_digest, timestamp_after,
+    AttachError, ClientAttachment, attach as attach_client, canonical_task_digest,
+    command_metadata, set_policy_digest, set_verdict_digest, timestamp_after,
 };
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
@@ -43,7 +40,6 @@ use egopulse_domain_contracts::v01::egopulse::{
     },
     verification::v1::VerificationConclusion,
 };
-use egopulse_local_api::LocalApiConnection;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -598,10 +594,7 @@ fn command_json(command: &Command) -> bool {
     }
 }
 
-struct AttachedClient {
-    connection: LocalApiConnection,
-    kernel: ClientKernel,
-}
+struct AttachedClient(ClientAttachment);
 
 impl AttachedClient {
     fn metadata(
@@ -611,22 +604,14 @@ impl AttachedClient {
         egopulse_domain_contracts::v01::egopulse::localapi::v1::ClientRequestMetadata,
         CliFailure,
     > {
-        self.kernel
-            .request_metadata(
-                Uuid::now_v7().to_string(),
-                correlation_id,
-                SystemTime::now(),
-            )
+        self.0
+            .metadata(correlation_id)
             .map_err(|error| CliFailure::protocol(error.to_string()))
     }
 
     fn require_rpc(&self, rpc: &str, operation: &'static str) -> Result<(), CliFailure> {
-        let session = self.kernel.session().ok_or_else(|| {
-            CliFailure::protocol("session binding missing").for_operation(operation)
-        })?;
-        self.kernel
-            .profiles()
-            .authorize_rpc(rpc, &session.granted_permission_codes)
+        self.0
+            .require_rpc(rpc)
             .map_err(|error| CliFailure::permission(operation, error.to_string()))
     }
 
@@ -636,13 +621,8 @@ impl AttachedClient {
         oneof: &str,
         operation: &'static str,
     ) -> Result<(), CliFailure> {
-        let session = self.kernel.session().ok_or_else(|| {
-            CliFailure::protocol("session binding missing").for_operation(operation)
-        })?;
-        self.kernel
-            .profiles()
-            .authorize_command(rpc, oneof, &session.granted_permission_codes)
-            .map(|_| ())
+        self.0
+            .require_command(rpc, oneof)
             .map_err(|error| CliFailure::permission(operation, error.to_string()))
     }
 }
@@ -660,10 +640,7 @@ async fn attach(operation: &'static str) -> Result<AttachedClient, CliFailure> {
                 }
                 AttachError::Kernel(error) => CliFailure::protocol(error.to_string()),
             })?;
-        Ok::<_, CliFailure>(AttachedClient {
-            connection: attached.connection,
-            kernel: attached.kernel,
-        })
+        Ok::<_, CliFailure>(AttachedClient(attached))
     }
     .await;
     result.map_err(|mut error| {
@@ -677,6 +654,7 @@ async fn status(json: bool) -> Result<(), CliFailure> {
     attached.require_rpc("LocalReadModelService/GetProjectionStatus", "status")?;
     let metadata = attached.metadata(None)?;
     let response = attached
+        .0
         .connection
         .read_model_service()
         .get_projection_status(GetProjectionStatusRequest {
@@ -722,6 +700,7 @@ async fn await_projection(
     attached.require_rpc("LocalReadModelService/AwaitProjection", "await")?;
     let metadata = attached.metadata(None)?;
     let response = attached
+        .0
         .connection
         .read_model_service()
         .await_projection(AwaitProjectionRequest {
@@ -842,6 +821,7 @@ async fn task_get(task_id: String, json: bool) -> Result<(), CliFailure> {
     attached.require_rpc("LocalReadModelService/GetTaskView", "task.get")?;
     let metadata = attached.metadata(None)?;
     let response = attached
+        .0
         .connection
         .read_model_service()
         .get_task_view(GetTaskViewRequest {
@@ -877,6 +857,7 @@ async fn task_list(page_size: u32, cursor: Option<String>, json: bool) -> Result
     attached.require_rpc("LocalReadModelService/ListTaskViews", "task.list")?;
     let metadata = attached.metadata(None)?;
     let response = attached
+        .0
         .connection
         .read_model_service()
         .list_task_views(ListTaskViewsRequest {
@@ -953,6 +934,7 @@ async fn task_watch(
     });
     let metadata = attached.metadata(None)?;
     let mut stream = attached
+        .0
         .connection
         .read_model_service()
         .watch_task_views(WatchTaskViewsRequest {
@@ -1054,6 +1036,7 @@ async fn evidence_get(
     attached.require_rpc("LocalReadModelService/GetEvidenceGraph", "evidence.get")?;
     let metadata = attached.metadata(None)?;
     let response = attached
+        .0
         .connection
         .read_model_service()
         .get_evidence_graph(GetEvidenceGraphRequest {
@@ -1164,6 +1147,7 @@ async fn approval_get(approval_request_id: String, json: bool) -> Result<(), Cli
     )?;
     let metadata = attached.metadata(None)?;
     let response = attached
+        .0
         .connection
         .read_model_service()
         .get_harness_approval_view(GetHarnessApprovalViewRequest {
@@ -1221,6 +1205,7 @@ async fn approval_list(
     )?;
     let metadata = attached.metadata(None)?;
     let response = attached
+        .0
         .connection
         .read_model_service()
         .list_harness_approval_views(ListHarnessApprovalViewsRequest {
@@ -1295,6 +1280,7 @@ async fn approval_watch(
     });
     let metadata = attached.metadata(None)?;
     let mut stream = attached
+        .0
         .connection
         .read_model_service()
         .watch_harness_approval_views(WatchHarnessApprovalViewsRequest {
@@ -1427,6 +1413,7 @@ async fn approval_decide(
     set_policy_digest(&mut command);
     let metadata = attached.metadata(Some(correlation_id.clone()))?;
     let response = attached
+        .0
         .connection
         .command_gateway_service()
         .decide_harness_approval(DecideHarnessApprovalRequest {
@@ -1622,6 +1609,7 @@ async fn verdict_issue(
     set_verdict_digest(&mut command);
     let metadata = attached.metadata(Some(correlation_id.clone()))?;
     let response = attached
+        .0
         .connection
         .command_gateway_service()
         .execute_founder_verdict(ExecuteFounderVerdictRequest {
@@ -1708,6 +1696,7 @@ async fn verdict_revoke(
     set_verdict_digest(&mut command);
     let metadata = attached.metadata(Some(correlation_id.clone()))?;
     let response = attached
+        .0
         .connection
         .command_gateway_service()
         .execute_founder_verdict(ExecuteFounderVerdictRequest {
@@ -1797,6 +1786,7 @@ async fn task_create(
     }
     let metadata = attached.metadata(Some(correlation_id.clone()))?;
     let response = attached
+        .0
         .connection
         .command_gateway_service()
         .execute_task_command(ExecuteTaskCommandRequest {

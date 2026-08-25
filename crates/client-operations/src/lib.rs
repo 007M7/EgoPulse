@@ -5,7 +5,11 @@ use std::time::SystemTime;
 use egopulse_client_kernel::{ClientKernel, KernelError};
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::CommandMetadata,
-    localapi::v1::ClientSurface,
+    localapi::v1::{
+        ClientRequestMetadata, ClientSurface, GetProjectionStatusRequest, HarnessApprovalView,
+        ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError, ProjectionMetadata,
+        TaskView,
+    },
     policy::v1::{PolicyDecisionCommand, policy_decision_command},
     task::v1::{TaskCommand, task_command},
     verdict::v1::{VerdictCommand, verdict_command},
@@ -24,6 +28,121 @@ use uuid::Uuid;
 pub struct ClientAttachment {
     pub connection: LocalApiConnection,
     pub kernel: ClientKernel,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectionSnapshot {
+    pub metadata: ProjectionMetadata,
+    pub tasks: Vec<TaskView>,
+    pub approvals: Vec<HarnessApprovalView>,
+}
+
+#[derive(Debug, Error)]
+pub enum ClientReadError {
+    #[error("client kernel rejected the read: {0}")]
+    Kernel(#[from] KernelError),
+    #[error("local API transport failed: {0}")]
+    Transport(String),
+    #[error("local API rejected the read: {0:?}")]
+    Api(Box<LocalApiError>),
+    #[error("local API returned an incomplete response: {0}")]
+    Protocol(&'static str),
+}
+
+impl ClientAttachment {
+    pub fn metadata(
+        &self,
+        correlation_id: Option<String>,
+    ) -> Result<ClientRequestMetadata, KernelError> {
+        self.kernel.request_metadata(
+            Uuid::now_v7().to_string(),
+            correlation_id,
+            SystemTime::now(),
+        )
+    }
+
+    pub fn require_rpc(&self, rpc: &str) -> Result<(), KernelError> {
+        let session = self
+            .kernel
+            .session()
+            .ok_or(KernelError::SessionUnavailable)?;
+        self.kernel
+            .profiles()
+            .authorize_rpc(rpc, &session.granted_permission_codes)
+            .map(|_| ())
+    }
+
+    pub fn require_command(&self, rpc: &str, oneof: &str) -> Result<(), KernelError> {
+        let session = self
+            .kernel
+            .session()
+            .ok_or(KernelError::SessionUnavailable)?;
+        self.kernel
+            .profiles()
+            .authorize_command(rpc, oneof, &session.granted_permission_codes)
+            .map(|_| ())
+    }
+
+    pub async fn read_projection_snapshot(&self) -> Result<ProjectionSnapshot, ClientReadError> {
+        let status = self
+            .connection
+            .read_model_service()
+            .get_projection_status(GetProjectionStatusRequest {
+                client: Some(self.metadata(None)?),
+            })
+            .await
+            .map_err(|error| ClientReadError::Transport(error.to_string()))?
+            .into_inner();
+        if let Some(error) = status.error {
+            return Err(ClientReadError::Api(Box::new(error)));
+        }
+        let metadata = status
+            .metadata
+            .ok_or(ClientReadError::Protocol("projection metadata missing"))?;
+
+        let tasks = self
+            .connection
+            .read_model_service()
+            .list_task_views(ListTaskViewsRequest {
+                client: Some(self.metadata(None)?),
+                status_filter: Vec::new(),
+                page_size: 100,
+                page_cursor: None,
+                minimum_position: None,
+            })
+            .await
+            .map_err(|error| ClientReadError::Transport(error.to_string()))?
+            .into_inner();
+        if let Some(error) = tasks.error {
+            return Err(ClientReadError::Api(Box::new(error)));
+        }
+
+        let approvals = self
+            .connection
+            .read_model_service()
+            .list_harness_approval_views(ListHarnessApprovalViewsRequest {
+                client: Some(self.metadata(None)?),
+                request_lifecycle_filter: Vec::new(),
+                decision_state_filter: Vec::new(),
+                task_ids: Vec::new(),
+                actionable_only: false,
+                page_size: 100,
+                page_cursor: None,
+                minimum_position: None,
+            })
+            .await
+            .map_err(|error| ClientReadError::Transport(error.to_string()))?
+            .into_inner();
+        if let Some(error) = approvals.error {
+            return Err(ClientReadError::Api(Box::new(error)));
+        }
+
+        Ok(ProjectionSnapshot {
+            metadata,
+            tasks: tasks.views,
+            approvals: approvals.views,
+        })
+    }
 }
 
 #[derive(Debug, Error)]

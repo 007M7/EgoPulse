@@ -3,7 +3,7 @@
 use std::{
     io::{self, stdout},
     process::ExitCode,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use clap::{Parser, Subcommand};
@@ -12,10 +12,9 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use egopulse_client_kernel::ClientKernel;
 use egopulse_client_operations::{
-    attach as attach_client, canonical_task_digest, command_metadata, set_policy_digest,
-    set_verdict_digest, timestamp_after,
+    ClientAttachment, ClientReadError, attach as attach_client, canonical_task_digest,
+    command_metadata, set_policy_digest, set_verdict_digest, timestamp_after,
 };
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
@@ -24,10 +23,8 @@ use egopulse_domain_contracts::v01::egopulse::{
     harness::v1::ApprovalRequestLifecycleKind,
     localapi::v1::{
         AwaitProjectionRequest, DecideHarnessApprovalRequest, ExecuteFounderVerdictRequest,
-        ExecuteTaskCommandRequest, GetProjectionStatusRequest, HarnessApprovalView,
-        ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiErrorCode,
-        ProjectionAwaitToken, ProjectionHealth, SourceRevision, TaskView,
-        await_projection_response,
+        ExecuteTaskCommandRequest, HarnessApprovalView, LocalApiErrorCode, ProjectionAwaitToken,
+        ProjectionHealth, SourceRevision, TaskView, await_projection_response,
     },
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
@@ -40,7 +37,7 @@ use egopulse_domain_contracts::v01::egopulse::{
     },
     verification::v1::VerificationConclusion,
 };
-use egopulse_local_api::{LocalApiClient, LocalApiConnection};
+use egopulse_local_api::LocalApiClient;
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -449,10 +446,7 @@ enum InteractiveMode {
     Form(CommandForm),
 }
 
-struct AttachedClient {
-    connection: LocalApiConnection,
-    kernel: ClientKernel,
-}
+struct AttachedClient(ClientAttachment);
 
 impl AttachedClient {
     async fn open(instance: &str) -> Result<Self, String> {
@@ -463,19 +457,14 @@ impl AttachedClient {
         )
         .await
         .map_err(|error| error.to_string())?;
-        Ok(Self {
-            connection: attached.connection,
-            kernel: attached.kernel,
-        })
+        Ok(Self(attached))
     }
 
     fn metadata(
         &self,
     ) -> Result<egopulse_domain_contracts::v01::egopulse::localapi::v1::ClientRequestMetadata, String>
     {
-        self.kernel
-            .request_metadata(Uuid::now_v7().to_string(), None, SystemTime::now())
-            .map_err(|error| error.to_string())
+        self.0.metadata(None).map_err(|error| error.to_string())
     }
 
     fn metadata_with_correlation(
@@ -483,92 +472,38 @@ impl AttachedClient {
         correlation_id: String,
     ) -> Result<egopulse_domain_contracts::v01::egopulse::localapi::v1::ClientRequestMetadata, String>
     {
-        self.kernel
-            .request_metadata(
-                Uuid::now_v7().to_string(),
-                Some(correlation_id),
-                SystemTime::now(),
-            )
+        self.0
+            .metadata(Some(correlation_id))
             .map_err(|error| error.to_string())
     }
 
     fn require_command(&self, rpc: &str, oneof: &str) -> Result<(), String> {
-        let session = self
-            .kernel
-            .session()
-            .ok_or_else(|| "session binding missing".to_owned())?;
-        self.kernel
-            .profiles()
-            .authorize_command(rpc, oneof, &session.granted_permission_codes)
-            .map(|_| ())
+        self.0
+            .require_command(rpc, oneof)
             .map_err(|error| error.to_string())
     }
 
     async fn snapshot(&self) -> Result<Snapshot, String> {
-        let status = self
-            .connection
-            .read_model_service()
-            .get_projection_status(GetProjectionStatusRequest {
-                client: Some(self.metadata()?),
-            })
+        let projection = self
+            .0
+            .read_projection_snapshot()
             .await
-            .map_err(|error| error.to_string())?
-            .into_inner();
-        if let Some(error) = status.error {
-            return Err(local_error_message(error));
-        }
-        let metadata = status
-            .metadata
-            .ok_or_else(|| "projection metadata missing".to_owned())?;
-
-        let tasks = self
-            .connection
-            .read_model_service()
-            .list_task_views(ListTaskViewsRequest {
-                client: Some(self.metadata()?),
-                status_filter: Vec::new(),
-                page_size: 100,
-                page_cursor: None,
-                minimum_position: None,
-            })
-            .await
-            .map_err(|error| error.to_string())?
-            .into_inner();
-        if let Some(error) = tasks.error {
-            return Err(local_error_message(error));
-        }
-
-        let approvals = self
-            .connection
-            .read_model_service()
-            .list_harness_approval_views(ListHarnessApprovalViewsRequest {
-                client: Some(self.metadata()?),
-                request_lifecycle_filter: Vec::new(),
-                decision_state_filter: Vec::new(),
-                task_ids: Vec::new(),
-                actionable_only: false,
-                page_size: 100,
-                page_cursor: None,
-                minimum_position: None,
-            })
-            .await
-            .map_err(|error| error.to_string())?
-            .into_inner();
-        if let Some(error) = approvals.error {
-            return Err(local_error_message(error));
-        }
-
+            .map_err(|error| match error {
+                ClientReadError::Api(error) => local_error_message(*error),
+                other => other.to_string(),
+            })?;
         Ok(Snapshot {
-            health: ProjectionHealth::try_from(metadata.health)
+            health: ProjectionHealth::try_from(projection.metadata.health)
                 .map(|value| value.as_str_name().to_owned())
                 .unwrap_or_else(|_| "PROJECTION_HEALTH_UNKNOWN".to_owned()),
-            stale: metadata.stale,
-            position: metadata
+            stale: projection.metadata.stale,
+            position: projection
+                .metadata
                 .position
                 .map(|value| format!("{}:{}", value.epoch, value.sequence))
                 .unwrap_or_else(|| "unknown".to_owned()),
-            tasks: tasks.views,
-            approvals: approvals.views,
+            tasks: projection.tasks,
+            approvals: projection.approvals,
         })
     }
 }
@@ -641,6 +576,7 @@ async fn run_command_with_output(
                     .request_digest_sha256 = digest;
             }
             let response = attached
+                .0
                 .connection
                 .command_gateway_service()
                 .execute_task_command(ExecuteTaskCommandRequest {
@@ -736,6 +672,7 @@ async fn run_command_with_output(
             };
             set_policy_digest(&mut command);
             let response = attached
+                .0
                 .connection
                 .command_gateway_service()
                 .decide_harness_approval(DecideHarnessApprovalRequest {
@@ -804,6 +741,7 @@ async fn run_command_with_output(
             let token = parse_await_token(&token_json)?;
             let attached = AttachedClient::open(instance).await?;
             let response = attached
+                .0
                 .connection
                 .read_model_service()
                 .await_projection(AwaitProjectionRequest {
@@ -938,6 +876,7 @@ async fn run_command_with_output(
             };
             set_verdict_digest(&mut command);
             let response = attached
+                .0
                 .connection
                 .command_gateway_service()
                 .execute_founder_verdict(ExecuteFounderVerdictRequest {
@@ -1016,6 +955,7 @@ async fn run_command_with_output(
             };
             set_verdict_digest(&mut command);
             let response = attached
+                .0
                 .connection
                 .command_gateway_service()
                 .execute_founder_verdict(ExecuteFounderVerdictRequest {

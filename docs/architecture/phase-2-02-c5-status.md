@@ -48,6 +48,13 @@ The `--test-threads=1` constraint is required because each test starts a child d
 separate Windows Named Pipe instance. Running this fixture group in parallel caused a test-process
 lifecycle timeout even though every test passes independently and in serial mode.
 
+The CLI and TUI now consume the same `client-operations::ClientAttachment`
+boundary for session metadata, permission revalidation, command authorization,
+and bounded Task/Approval projection snapshots. Their remaining differences
+are command-line parsing, terminal interaction, rendering, and user-facing
+error presentation. The shared client snapshot path and the real Windows IPC
+fixture both pass locally; no surface-specific write authority was introduced.
+
 ## Remaining Phase 2-02 work
 
 The normal `agentosd` binary now loads the reusable `ProductionBootstrapConfig`
