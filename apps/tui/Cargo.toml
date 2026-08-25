@@ -8,8 +8,12 @@ repository.workspace = true
 [dependencies]
 clap.workspace = true
 crossterm.workspace = true
+egopulse-client-kernel.workspace = true
+egopulse-domain-contracts.workspace = true
 egopulse-local-api.workspace = true
 ratatui.workspace = true
+tokio.workspace = true
+uuid.workspace = true
 
 [[bin]]
 name = "egopulse-tui"

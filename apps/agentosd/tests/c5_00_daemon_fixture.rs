@@ -554,6 +554,21 @@ fn cli_executable() -> PathBuf {
     executable
 }
 
+fn tui_executable() -> PathBuf {
+    let test_executable = std::env::current_exe().expect("TUI E2E test executable path");
+    let target_debug = test_executable
+        .parent()
+        .and_then(Path::parent)
+        .expect("TUI E2E test must run below target/debug");
+    let executable = target_debug.join("egopulse-tui.exe");
+    assert!(
+        executable.is_file(),
+        "TUI E2E requires the normal egopulse-tui binary at {}",
+        executable.display()
+    );
+    executable
+}
+
 async fn run_cli(instance: &str, arguments: &[&str]) -> std::process::Output {
     Command::new(cli_executable())
         .env("EGOPULSE_IPC_INSTANCE", instance)
@@ -561,6 +576,14 @@ async fn run_cli(instance: &str, arguments: &[&str]) -> std::process::Output {
         .output()
         .await
         .expect("run real egopulse CLI process")
+}
+
+async fn run_tui_once(instance: &str) -> std::process::Output {
+    Command::new(tui_executable())
+        .args(["--instance", instance, "--once"])
+        .output()
+        .await
+        .expect("run real egopulse TUI process")
 }
 
 async fn wait_for_cli_status(instance: &str) -> std::process::Output {
@@ -912,6 +935,16 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
         status_output.is_some(),
         "successful fixture daemon must become ready"
     );
+
+    let tui_output = run_tui_once(&instance).await;
+    assert!(
+        tui_output.status.success(),
+        "TUI must attach to the same daemon kernel: stdout={} stderr={}",
+        String::from_utf8_lossy(&tui_output.stdout),
+        String::from_utf8_lossy(&tui_output.stderr)
+    );
+    let tui_stdout = String::from_utf8_lossy(&tui_output.stdout);
+    assert!(tui_stdout.contains("EgoPulse TUI: connected"));
 
     let acceptance_sha = "11".repeat(32);
     let budget_sha = "22".repeat(32);

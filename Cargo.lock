@@ -1319,8 +1319,12 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "crossterm",
+ "egopulse-client-kernel",
+ "egopulse-domain-contracts",
  "egopulse-local-api",
  "ratatui",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
