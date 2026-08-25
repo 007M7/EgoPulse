@@ -83,7 +83,7 @@ impl AuthorityPrincipalResolver for DenyAllAuthorityPrincipalResolver {
 /// mutex is a process-local single-writer serialization point; it is not a
 /// second source of business facts.
 pub struct AuthorityCommandPorts {
-    task: Mutex<TaskAuthority>,
+    task: Arc<Mutex<TaskAuthority>>,
     policy: Mutex<PolicyDecisionAuthority>,
     verdict: Mutex<FounderVerdictAuthority>,
     principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
@@ -97,8 +97,26 @@ impl AuthorityCommandPorts {
         verdict: FounderVerdictAuthority,
         principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
     ) -> Self {
+        Self::new_shared(
+            Arc::new(Mutex::new(task)),
+            policy,
+            verdict,
+            principal_resolver,
+        )
+    }
+
+    /// Composes a shared Task Authority handle so the command port, activation
+    /// projector and cross-authority receipt reader all observe one serialized
+    /// owner. No second Task store or independent write path is created.
+    #[must_use]
+    pub fn new_shared(
+        task: Arc<Mutex<TaskAuthority>>,
+        policy: PolicyDecisionAuthority,
+        verdict: FounderVerdictAuthority,
+        principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
+    ) -> Self {
         Self {
-            task: Mutex::new(task),
+            task,
             policy: Mutex::new(policy),
             verdict: Mutex::new(verdict),
             principal_resolver,
