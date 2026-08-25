@@ -25,7 +25,8 @@ Available now:
 Not implemented yet:
 
 - second Harness adapter and multi-model collaboration path (Kimi CLI / DeepSeek Harness are next Phase 2-03 candidates);
-- governed Memory/RAG subsystem and its Python Worker boundary;
+- production Memory/RAG authority and its cross-language contract (a read-only
+  lexical retrieval candidate worker now exists under `workers/memory-rag`);
 - SQLCipher-backed Memory/RAG indexes and retrieval evaluation;
 - Sego verification integration;
 - production packaging or release.
@@ -51,6 +52,7 @@ packages/
   native-harness/     bounded Layer 4 LangGraph.js Harness
 workers/
   foundation-probe/  isolated Python Worker pattern
+  memory-rag/        read-only deterministic retrieval candidate
 contracts/
   proto/             internal Protobuf source
   json-schema/       Artifact and tool schemas

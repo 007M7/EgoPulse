@@ -68,6 +68,11 @@ verification or Task completion.
 - Shared profile interpretation: G4-08C C2 moves digest verification, profile parsing and fail-closed RPC/oneof authorization lookup into the framework-neutral `domain-contracts::profiles` boundary. Client and server consume that one interpreter; framework types still cannot enter `domain-contracts`.
 - Local API gateway: G4-08C C2/C3 is exercised by the real CLI/TUI C5 fixtures over Windows Named Pipe; the default production provider bootstrap remains open.
 - Supervised Worker/Harness transport: the Codex App Server official native protocol adapter and durable Adapter Edge are implemented for V-01; additional Harness protocols remain separate adapter units.
+- Memory/RAG candidate boundary: `workers/memory-rag` is a dependency-free,
+  read-only lexical retrieval candidate. Rust supplies verified, scoped,
+  already-accepted records; the worker returns ranked references and an
+  evidence digest. It has no authority database access and is not yet the
+  production Memory Authority or a frozen cross-language contract.
 
 ## Repository rules
 

@@ -1,0 +1,19 @@
+[project]
+name = "egopulse-memory-rag-worker"
+version = "0.1.0"
+description = "Read-only deterministic retrieval candidate worker for EgoPulse"
+requires-python = ">=3.14,<3.15"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest==9.0.2",
+]
+
+[tool.pytest.ini_options]
+addopts = ["-p", "no:cacheprovider"]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.uv]
+package = false
