@@ -17,9 +17,9 @@ use egopulse_domain_contracts::{
             ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiErrorCode,
             OpenSessionRequest, ProjectionHealth, ProjectionMetadata, ProjectionPosition,
             SourceDomain, SourceRevision, StreamFrameKind, TaskView, TaskViewStreamFrame,
-            WatchTaskViewsRequest, await_projection_response, get_evidence_graph_response,
-            get_harness_approval_view_response, get_task_view_response,
-            local_read_model_service_server::LocalReadModelService,
+            WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, await_projection_response,
+            get_evidence_graph_response, get_harness_approval_view_response,
+            get_task_view_response, local_read_model_service_server::LocalReadModelService,
             local_session_service_server::LocalSessionService,
         },
         task::v1::TaskSnapshot,
@@ -675,6 +675,90 @@ async fn tonic_task_watch_emits_initial_heartbeat_then_snapshots_and_terminates_
             .expect("task")
             .task_id,
         "task-a"
+    );
+
+    let reset = stream.next().await.expect("reset item").expect("reset");
+    assert_eq!(reset.kind, StreamFrameKind::ResetRequired as i32);
+    assert_eq!(
+        reset.reset_reason_code.as_deref(),
+        Some("retention_floor_advanced")
+    );
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn tonic_approval_watch_emits_initial_heartbeat_then_snapshots_and_terminates_on_reset() {
+    let model = Arc::new(FakeReadModel {
+        status: ReadModelStatus {
+            position: position(20),
+            retention_floor: position(0),
+            health: ProjectionHealth::Ready,
+        },
+        tasks: Vec::new(),
+        approvals: vec![approval("approval-a", 20)],
+        evidence: EvidenceGraphView::default(),
+        task_batches: Mutex::new(VecDeque::new()),
+        approval_batches: Mutex::new(VecDeque::from([
+            StreamBatch {
+                observed_position: position(21),
+                frames: vec![HarnessApprovalViewStreamFrame {
+                    kind: StreamFrameKind::Snapshot as i32,
+                    position: Some(position(21)),
+                    snapshot: Some(approval("approval-a", 21)),
+                    reset_reason_code: None,
+                }],
+            },
+            StreamBatch {
+                observed_position: position(21),
+                frames: vec![HarnessApprovalViewStreamFrame {
+                    kind: StreamFrameKind::ResetRequired as i32,
+                    position: Some(position(21)),
+                    snapshot: None,
+                    reset_reason_code: Some("retention_floor_advanced".to_owned()),
+                }],
+            },
+        ])),
+        projected_source: false,
+    });
+    let (peer, client, app) = read_gateway_context(model).await;
+    let endpoint = LocalReadModelEndpoint::new(app);
+    let mut request = Request::new(WatchHarnessApprovalViewsRequest {
+        client: Some(client),
+        resume_after: None,
+        approval_request_ids: vec!["approval-a".to_owned()],
+        task_ids: Vec::new(),
+        request_lifecycle_filter: Vec::new(),
+        decision_state_filter: Vec::new(),
+        actionable_only: false,
+    });
+    request.extensions_mut().insert(peer);
+    let response = endpoint
+        .watch_harness_approval_views(request)
+        .await
+        .expect("watch setup")
+        .into_inner();
+    let mut stream = response;
+
+    let heartbeat = stream
+        .next()
+        .await
+        .expect("heartbeat item")
+        .expect("heartbeat");
+    assert_eq!(heartbeat.kind, StreamFrameKind::Heartbeat as i32);
+    assert_eq!(heartbeat.position.expect("heartbeat position").sequence, 20);
+
+    let snapshot = stream
+        .next()
+        .await
+        .expect("snapshot item")
+        .expect("snapshot");
+    assert_eq!(snapshot.kind, StreamFrameKind::Snapshot as i32);
+    assert_eq!(
+        snapshot
+            .snapshot
+            .expect("snapshot view")
+            .approval_request_id,
+        "approval-a"
     );
 
     let reset = stream.next().await.expect("reset item").expect("reset");
