@@ -652,7 +652,21 @@ async fn run_background_workers(
                 .await
                 .map_err(DaemonServeError::Dispatch)
         }
-        (None, None) => std::future::pending().await,
+        (None, None) => {
+            // A fail-closed daemon has no projection or Harness worker, but
+            // it must still observe the server shutdown signal. Waiting
+            // forever here would make a clean IPC shutdown hang after the
+            // gRPC server has already stopped.
+            let mut stop = stop;
+            loop {
+                if *stop.borrow() {
+                    return Ok(());
+                }
+                if stop.changed().await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 

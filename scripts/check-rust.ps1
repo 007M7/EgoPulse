@@ -36,5 +36,14 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $cargo build -p egopulse-cli --bin egopulse --locked
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-& $cargo test --workspace --locked
+& $cargo test --workspace --exclude egopulse-agentosd --locked
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# The daemon's real-process fixture starts child daemons and owns Windows
+# Named Pipe instances. Keep its test binary serial so the local quality gate
+# validates the lifecycle deterministically instead of racing child teardown.
+& $cargo test -p egopulse-agentosd --lib --locked -- --test-threads=1
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+& $cargo test -p egopulse-agentosd --test c5_00_daemon_fixture --locked -- --test-threads=1
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

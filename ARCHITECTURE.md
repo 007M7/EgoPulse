@@ -39,7 +39,7 @@ agentosd deployment host
   +-- process supervision
         |
         v
-Harness / Worker / Sego adapters (not implemented yet)
+Harness / Worker / Sego adapters
 ```
 
 `agentosd` is a deployment host, not a shared fact owner. Authority and control modules must retain separate APIs, single-writer storage ownership and audit streams.
@@ -66,8 +66,8 @@ verification or Task completion.
 - Local session boundary: account-level peer identity is resolved by a trusted policy adapter into a logical principal and permissions; sessions are process-ephemeral, connection/account-bound, expiring and revocable. An OS SID/UID never implies Founder identity.
 - Shared three-surface client kernel: G4-08C C1 provides the independent Rust `client-kernel` crate with digest-bound profiles, surface-neutral session/request state, typed authorization preflight and complete-snapshot replay/reset handling. It does not own facts or final authorization.
 - Shared profile interpretation: G4-08C C2 moves digest verification, profile parsing and fail-closed RPC/oneof authorization lookup into the framework-neutral `domain-contracts::profiles` boundary. Client and server consume that one interpreter; framework types still cannot enter `domain-contracts`.
-- Local API gateway: remains G4-08C C2/C3. The G4-08B session service is exercised over the real transport, but the full query/watch/await/command product path is not yet complete.
-- Supervised Worker/Harness transport: framed stdio or an official native protocol adapter; not implemented in this scaffold.
+- Local API gateway: G4-08C C2/C3 is exercised by the real CLI/TUI C5 fixtures over Windows Named Pipe; the default production provider bootstrap remains open.
+- Supervised Worker/Harness transport: the Codex App Server official native protocol adapter and durable Adapter Edge are implemented for V-01; additional Harness protocols remain separate adapter units.
 
 ## Repository rules
 

@@ -2,15 +2,18 @@
 
 EgoPulse is the clean implementation repository for the Founder-controlled Personal Agent OS.
 
-The repository starts from the frozen architecture and technology baseline, but it does not copy the historical governance runtime or claim that product capabilities already exist.
+The repository starts from the frozen architecture and technology baseline. It does not copy the historical governance runtime; each implemented vertical is carried by its own contracts, persistence boundaries, tests and release evidence.
 
 ## Foundation status
 
-Current maturity: **Gate 4 vertical implementation in progress**.
+Current maturity: **Gate 4 vertical implementation in progress — V-01/C5 CLI+TUI closed, Phase 2-02 composition still open**.
 
 Available now:
 
 - Rust workspace for deterministic authorities, collaboration control, daemon, CLI and TUI;
+- V-01 governed single-Harness control path: Task activation → Collaboration commit → Adapter dispatch → activation acknowledgement;
+- Codex App Server adapter with durable Adapter Edge and an explicit `CodexHarnessCompositionConfig` composition root;
+- C5 real Windows local-IPC E2E coverage for daemon, CLI and TUI (serial fixture run: 6/6 passed);
 - Tauri 2 + React + TypeScript desktop shell;
 - TypeScript packages for generated clients, Agent SDK and the bounded native Harness;
 - isolated CPython 3.14 Worker project managed by uv;
@@ -20,10 +23,10 @@ Available now:
 
 Not implemented yet:
 
-- Task, Memory, Policy, Verdict or Release authority behavior;
-- local API gateway and the shared Desktop/CLI/TUI client kernel;
-- SQLCipher persistence or Qdrant indexing;
-- Codex, Kimi or DeepSeek Harness adapters;
+- default production bootstrap that opens the authorities and injects reviewed local-user policy plus Harness workflow configuration from a user-owned configuration store;
+- second Harness adapter and multi-model collaboration path (Kimi CLI / DeepSeek Harness are next Phase 2-03 candidates);
+- governed Memory/RAG subsystem and its Python Worker boundary;
+- SQLCipher-backed Memory/RAG indexes and retrieval evaluation;
 - Sego verification integration;
 - production packaging or release.
 
@@ -39,7 +42,7 @@ crates/
   domain-contracts/  domain-facing Rust types only
   cognition-runtime/ authority boundary skeletons
   local-ide-control/ deterministic collaboration control skeletons
-  local-api/          local API client boundary
+  local-api/          local API client/server gateway boundary
   local-ipc-platform/ OS peer identity and owner-only local transport
   process-supervision/process and Attempt supervision primitives
 packages/

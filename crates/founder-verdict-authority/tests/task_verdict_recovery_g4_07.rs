@@ -163,6 +163,22 @@ fn task_commit_survives_abort_before_verdict_consumption_and_replays_once() {
     let guard = IntegratedGuard(shared.clone());
     let mut task = open_task(root.path(), guard.clone());
     let pending = advance_to_verdict_pending(&mut task);
+    let activations = task
+        .pending_task_activations()
+        .expect("activated Task handoff");
+    assert_eq!(activations.len(), 1);
+    assert!(
+        task.acknowledge_cross_authority_outbox(
+            &activations[0].message_id,
+            &activations[0].payload_digest_sha256,
+        )
+        .expect("acknowledge Collaboration activation handoff")
+    );
+    assert!(
+        task.pending_cross_authority_outbox()
+            .expect("activation outbox drained")
+            .is_empty()
+    );
     let scope = VerdictScope {
         task_id: pending.task_id.clone(),
         task_revision: pending.revision,
