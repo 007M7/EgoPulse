@@ -8,9 +8,11 @@
 $env:EGOPULSE_USER_CONFIG = "D:\\EgoPulse\\data\\agentos-config.json"
 ```
 
-配置中的六个 Authority 密钥必须由对应的环境变量提供，值是非零的 32 字节十六进制字符串：
+配置中的八个 Authority 密钥必须由对应的环境变量提供，值是非零的 32 字节十六进制字符串：
 
 - `EGOPULSE_TASK_KEY_HEX`
+- `EGOPULSE_MEMORY_KEY_HEX`
+- `EGOPULSE_ARTIFACT_KEY_HEX`
 - `EGOPULSE_VERIFICATION_KEY_HEX`
 - `EGOPULSE_POLICY_KEY_HEX`
 - `EGOPULSE_VERDICT_KEY_HEX`
