@@ -70,6 +70,17 @@ methods, verify a sealed ArtifactSet/Claim/Evidence lineage, and then invoke
 the separately supervised Sego checker. User configuration alone remains
 insufficient to authorize evidence.
 
+The agentosd composition now also contains
+`ArtifactAuthorityReferenceSource`. It accepts only the shared
+`Arc<Mutex<ArtifactAuthority<...>>>` owner handle and implements the
+provider-neutral Verification read boundary. Storage failures are surfaced as
+unavailability and decode/blob failures as corruption; neither is converted
+into an empty or trusted result. This adapter is intentionally not wired into
+production bootstrap yet, because the production Artifact admission guard and
+its user-owned policy have not been frozen. Until that guard exists, the
+deny-by-default Verification resolver remains the only valid production
+choice.
+
 ## Owner boundary
 
 ```text
@@ -115,6 +126,6 @@ reused; the three guards remain separate from identity mapping and from the
 client surfaces.
 
 The remaining Phase 2-02 obligation is the reviewed Sego/checker resolver
-composition. Until then `DenyVerificationReferences` keeps Verification
-external requests held while allowing its own store and projection boundary to
-be composed.
+composition and the production Artifact admission policy it depends on. Until
+then `DenyVerificationReferences` keeps Verification external requests held
+while allowing its own store and projection boundary to be composed.

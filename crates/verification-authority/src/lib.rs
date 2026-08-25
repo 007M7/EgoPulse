@@ -1,9 +1,14 @@
 #![forbid(unsafe_code)]
 
+mod reference_resolver;
 mod sego;
 mod store;
 mod supervisor;
 
+pub use reference_resolver::{
+    ArtifactBackedReferenceResolver, ArtifactReferenceSource, ArtifactReferenceSourceError,
+    ReferenceResolverConfigurationError,
+};
 pub use sego::{
     CheckerProcessFailure, SegoFindingEvidenceBinding, SegoMapError, SegoMappedResult,
     SegoMapperPolicy, checker_failure_result, map_sego_review,
@@ -107,6 +112,20 @@ pub trait VerificationReferenceResolver: Send + Sync + 'static {
         evidence_ids: &[String],
         artifact_ids: &[String],
     ) -> Result<(), ReferenceRejection>;
+
+    /// Contextual form used when a result is consumed inside a stored
+    /// verification request. The default preserves compatibility with
+    /// existing resolvers, while an owner-backed resolver can prove that the
+    /// references belong to this exact sealed ArtifactSet.
+    fn validate_result_references_for_binding(
+        &self,
+        binding: &VerificationBinding,
+        evidence_ids: &[String],
+        artifact_ids: &[String],
+    ) -> Result<(), ReferenceRejection> {
+        let _ = binding;
+        self.validate_result_references(evidence_ids, artifact_ids)
+    }
 }
 
 pub trait VerificationClock: Send + Sync + 'static {
@@ -616,6 +635,15 @@ where
                 "CRITERION_RESULT_ALREADY_RECORDED",
             ));
         }
+        let request_bytes = self
+            .store
+            .request(&run.verification_request_id)?
+            .ok_or(VerificationAuthorityFailure::Storage)?;
+        let request = VerificationRequest::decode(request_bytes.as_slice())?;
+        let binding = request
+            .binding
+            .as_ref()
+            .ok_or(VerificationAuthorityFailure::Storage)?;
         let policies = self.policy(&run.verification_request_id)?;
         let Some(policy) = policies
             .iter()
@@ -666,10 +694,11 @@ where
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        if let Err(rejection) = self
-            .resolver
-            .validate_result_references(&candidate.evidence_ids, &artifact_ids)
-        {
+        if let Err(rejection) = self.resolver.validate_result_references_for_binding(
+            binding,
+            &candidate.evidence_ids,
+            &artifact_ids,
+        ) {
             return Ok(Prepared::reference_rejection(rejection));
         }
         let result = candidate.clone();
@@ -779,10 +808,11 @@ where
             .into_iter()
             .collect::<Vec<_>>();
         let referenced_artifacts = artifact_reference_ids(candidate);
-        if let Err(rejection) = self
-            .resolver
-            .validate_result_references(&referenced_evidence, &referenced_artifacts)
-        {
+        if let Err(rejection) = self.resolver.validate_result_references_for_binding(
+            request.binding.as_ref().expect("validated request"),
+            &referenced_evidence,
+            &referenced_artifacts,
+        ) {
             return Ok(Prepared::reference_rejection(rejection));
         }
         let mut artifact = candidate.clone();
