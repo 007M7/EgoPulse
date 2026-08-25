@@ -680,6 +680,13 @@ impl LocalReadModel {
             .collect::<Result<Vec<_>, _>>()?;
         for payload in baseline_payloads {
             let mut frame = HarnessApprovalViewStreamFrame::decode(payload.as_slice())?;
+            if StreamFrameKind::try_from(frame.kind) != Ok(StreamFrameKind::Snapshot)
+                || frame.position.as_ref().is_none_or(|position| {
+                    position.epoch != current.epoch || position.sequence > current.sequence
+                })
+            {
+                return Err(ProjectionFailure::IntegrityFailure);
+            }
             let Some(view) = frame.snapshot.as_mut() else {
                 return Err(ProjectionFailure::IntegrityFailure);
             };
@@ -702,6 +709,13 @@ impl LocalReadModel {
         let mut frames = Vec::new();
         for payload in payloads {
             let mut frame = HarnessApprovalViewStreamFrame::decode(payload.as_slice())?;
+            if StreamFrameKind::try_from(frame.kind) != Ok(StreamFrameKind::Snapshot)
+                || frame.position.as_ref().is_none_or(|position| {
+                    position.epoch != current.epoch || position.sequence > current.sequence
+                })
+            {
+                return Err(ProjectionFailure::IntegrityFailure);
+            }
             let Some(view) = frame.snapshot.as_mut() else {
                 return Err(ProjectionFailure::IntegrityFailure);
             };
