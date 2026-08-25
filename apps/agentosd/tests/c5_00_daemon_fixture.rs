@@ -563,6 +563,17 @@ async fn run_cli(instance: &str, arguments: &[&str]) -> std::process::Output {
         .expect("run real egopulse CLI process")
 }
 
+async fn wait_for_cli_status(instance: &str) -> std::process::Output {
+    for _ in 0..80 {
+        let output = run_cli(instance, &["status", "--json"]).await;
+        if output.status.success() {
+            return output;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("CLI should attach to the real fixture daemon");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c5_00_real_daemon_fixture_opens_session_over_local_ipc() {
     let root = std::env::temp_dir().join(format!("egopulse-c5-00-{}", Uuid::now_v7()));
@@ -739,6 +750,50 @@ async fn c5_03_real_cli_process_attaches_and_preserves_authority_rejections() {
     let status = child.wait().await.expect("fixture child exit");
     assert!(status.success(), "fixture child failed: {status}");
     fs::remove_dir_all(&root).expect("remove C5 CLI fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c5_04_real_cli_fails_closed_on_daemon_restart_and_reconnects() {
+    let root = std::env::temp_dir().join(format!("egopulse-c5-04-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create C5 recovery fixture root");
+    let instance = format!("c5-04-{}", Uuid::now_v7());
+    let mut child = spawn_fixture(&root, &instance).await;
+
+    let first_status = wait_for_cli_status(&instance).await;
+    let first_json: serde_json::Value =
+        serde_json::from_slice(&first_status.stdout).expect("first status JSON envelope");
+    assert_eq!(first_json["ok"], true);
+
+    child.kill().await.expect("terminate fixture daemon");
+    let child_status = child.wait().await.expect("fixture daemon termination");
+    assert!(
+        !child_status.success(),
+        "fixture must be externally terminated"
+    );
+
+    let unavailable = run_cli(&instance, &["status", "--json"]).await;
+    assert_eq!(unavailable.status.code(), Some(3));
+    let unavailable_json: serde_json::Value =
+        serde_json::from_slice(&unavailable.stdout).expect("daemon unavailable JSON envelope");
+    assert_eq!(unavailable_json["ok"], false);
+    assert_eq!(unavailable_json["operation"], "status");
+    assert_eq!(unavailable_json["error"]["code"], "DAEMON_UNAVAILABLE");
+    assert_eq!(unavailable_json["data"], serde_json::Value::Null);
+
+    let mut restarted = spawn_fixture(&root, &instance).await;
+    let restarted_status = wait_for_cli_status(&instance).await;
+    let restarted_json: serde_json::Value =
+        serde_json::from_slice(&restarted_status.stdout).expect("restarted status JSON envelope");
+    assert_eq!(restarted_json["ok"], true);
+    assert_eq!(restarted_json["operation"], "status");
+
+    drop(restarted.stdin.take());
+    let status = restarted
+        .wait()
+        .await
+        .expect("restarted fixture child exit");
+    assert!(status.success(), "restarted fixture child failed: {status}");
+    fs::remove_dir_all(&root).expect("remove C5 recovery fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
