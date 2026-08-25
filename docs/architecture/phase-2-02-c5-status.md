@@ -120,7 +120,7 @@ database, blob path, or write handle crosses into Verification. This is the
 content-plane prerequisite for the supervised Sego runner and is covered by
 the Artifact G4-05 read-boundary test.
 
-The local G4-06 verification suite currently passes all 15 tests, including
+The local G4-06 verification suite currently passes all 16 tests, including
 Sego mapping, stale profile/input binding, checker policy rewrite rejection,
 timeout, crash, and output-limit probes. The existing supervisor and mapper
 are therefore reused rather than duplicated.
@@ -129,8 +129,10 @@ are therefore reused rather than duplicated.
 provider-neutral attempt boundary. It preserves a successful checker receipt
 for Artifact admission, maps invalid/untrusted output to an explicit checker
 error result, and maps timeout/crash/output-limit/spawn failures without
-silently producing a pass. It owns no Authority store and performs no Task or
-Verdict write; those remain the next explicit composition step.
+silently producing a pass. `GovernedVerificationExecutionCoordinator` now
+composes that runner with the Verification Authority start, criterion-record
+and immutable-artifact-completion commands. It is deliberately limited to one
+reviewed criterion and replays a completed artifact instead of rerunning it.
 
 Task Authority now emits a digest-bound `verification-authority` outbox message
 when `SubmitTaskEvidence` commits. `pending_task_verifications()` validates the
@@ -159,8 +161,12 @@ claim, evidence, artifact digest and lineage are checked by
 `ArtifactBackedReferenceResolver`; Verification attests the checker profile and
 commits exactly one request; only then does Task ACK the original message. A
 second intake poll observes no pending handoff, proving the committed-then-ACKed
-path is idempotent. This fixture does not claim Sego execution, verification
-completion, or Task verification write-back.
+path is idempotent. This fixture still covers only the Task-to-Verification
+handoff. The separate G4-06 execution test proves queued request start,
+governed checker failure mapping, criterion persistence, immutable completion
+and completed-artifact replay. The production daemon still needs one composed
+worker that connects the handoff intake, reviewed checker-profile attestation,
+the execution coordinator and system-only Task verification write-back.
 
 `with_codex_harness` and `ProductionBootstrapConfig::build` remain explicit
 production composition APIs and not implicit unsafe defaults. Verification
@@ -170,8 +176,9 @@ file: agentosd still has no Local API Verification command port, and the new
 Task outbox trigger is not itself a Verification request or run. A real Sego
 production path must therefore consume that handoff and compose the Artifact
 owner read boundary, supervised runner, mapper, Verification Authority
-commands, and system-only Task verification write-back as one unit. Until that
-vertical exists, `DenyVerificationReferences` stays active.
+commands, and system-only Task verification write-back as one worker. Until
+that worker is installed in production bootstrap, `DenyVerificationReferences`
+stays active.
 
 ## Next unit: Phase 2-03
 
