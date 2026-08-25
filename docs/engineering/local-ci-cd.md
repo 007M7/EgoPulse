@@ -54,7 +54,7 @@ Create a release candidate with:
 pnpm run cd:local
 ```
 
-`pnpm run cd:local` is an offline reproduction command. It runs local CI once, then calls the shared Windows packaging script. If local CI has already passed for the same clean `HEAD`, use `pnpm run cd:local -- -SkipCi` to avoid rerunning it. The packaging script requires a clean worktree, builds all four Windows binaries, includes dependency locks and available CI evidence, generates per-file SHA-256 hashes, and creates a ZIP plus an archive hash beneath `.artifacts/release-candidate/`. The packaging-only command is `pnpm run package:windows`.
+`pnpm run cd:local` is an offline reproduction command. It runs local CI once, then calls the shared Windows packaging script. If local CI has already passed for the same clean `HEAD`, use `pnpm run cd:local -- -SkipCi` to avoid rerunning it. The first candidate packages the shared kernel as three Windows x64 binaries: `agentosd.exe`, `egopulse.exe` and `egopulse-tui.exe`. Desktop packaging is an explicit later-phase opt-in via `scripts/package-windows.ps1 -IncludeDesktop`. The packaging script requires a clean worktree, includes dependency locks and available CI evidence, generates per-file SHA-256 hashes, and creates a ZIP plus an archive hash beneath `.artifacts/release-candidate/`. The packaging-only command is `pnpm run package:windows`.
 
 The candidate is explicitly classified as `unsigned-release-candidate`. It must not be represented as a production release. Code signing, SBOM generation, protected release approval and remote provenance attestation remain release-Gate requirements.
 
@@ -70,4 +70,4 @@ This gives the normal path:
 local fast check -> one remote CI run -> dependent remote Windows CD
 ```
 
-The release build is not a duplicate test gate: it produces optimized binaries that the debug/test CI job does not produce. Within CD, frontend assets are built first and the Rust workspace is compiled once; the Tauri CLI installer path is intentionally not invoked because the current unsigned candidate distributes the four executables directly. Local full CI/CD remains an opt-in diagnostic and offline path.
+The release build is not a duplicate test gate: it produces optimized binaries that the debug/test CI job does not produce. Within the first CD path, only the three CLI/TUI/kernel binaries are compiled; the Tauri CLI installer path and desktop frontend are intentionally not invoked until the desktop vertical is ready. Local full CI/CD remains an opt-in diagnostic and offline path.

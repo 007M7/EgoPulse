@@ -2,7 +2,8 @@ param(
     [string]$ArtifactRoot = '.artifacts/release-candidate',
     [string]$CiEvidencePath = '',
     [string]$CiProvider = 'unspecified',
-    [string]$CiRun = ''
+    [string]$CiRun = '',
+    [switch]$IncludeDesktop
 )
 
 $ErrorActionPreference = 'Stop'
@@ -84,11 +85,22 @@ if (-not [string]::IsNullOrWhiteSpace($CiEvidencePath)) {
     }
 }
 
-# Build the frontend assets first, then compile the entire Rust workspace once.
-# The Tauri CLI would compile the desktop Rust crate a second time; packaging
-# only needs the resulting executable, not a bundled installer.
-Invoke-External pnpm --filter '@egopulse/desktop' run build
-Invoke-External $cargo build --workspace --release --locked
+# Phase 1 ships the shared kernel through agentosd, CLI and TUI. Desktop is a
+# later vertical; keep an explicit opt-in for a future desktop candidate so
+# the first release does not accidentally claim desktop feature completeness.
+$cargoArguments = @(
+    'build',
+    '--release',
+    '--locked',
+    '-p', 'egopulse-agentosd',
+    '-p', 'egopulse-cli',
+    '-p', 'egopulse-tui'
+)
+if ($IncludeDesktop) {
+    Invoke-External pnpm --filter '@egopulse/desktop' run build
+    $cargoArguments += @('-p', 'egopulse-desktop')
+}
+Invoke-External $cargo @cargoArguments
 
 $version = (Get-Content -LiteralPath 'apps/desktop/src-tauri/tauri.conf.json' -Raw -Encoding utf8 | ConvertFrom-Json).version
 $stamp = [DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssZ')
@@ -102,9 +114,11 @@ New-Item -ItemType Directory -Force -Path $binRoot, $manifestRoot | Out-Null
 $binaries = @(
     'agentosd.exe',
     'egopulse.exe',
-    'egopulse-tui.exe',
-    'egopulse-desktop.exe'
+    'egopulse-tui.exe'
 )
+if ($IncludeDesktop) {
+    $binaries += 'egopulse-desktop.exe'
+}
 foreach ($binary in $binaries) {
     $source = Join-Path $repoRoot "target/release/$binary"
     if (-not (Test-Path -LiteralPath $source)) {
@@ -127,6 +141,7 @@ $metadata = [ordered]@{
     version = $version
     commit = $head
     platform = 'windows-x86_64'
+    surfaces = if ($IncludeDesktop) { @('cli', 'tui', 'desktop') } else { @('cli', 'tui') }
     created_at = [DateTimeOffset]::UtcNow.ToString('o')
     classification = 'unsigned-release-candidate'
     ci_provider = $CiProvider
