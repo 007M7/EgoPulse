@@ -30,8 +30,8 @@ use egopulse_domain_contracts::{
 };
 use egopulse_local_api::{
     command_gateway::{
-        CommandGatewayApplication, CommandPortFailure, CommandPortResult, PolicyCommandPort,
-        TaskCommandPort, VerdictCommandPort,
+        CommandGatewayApplication, CommandPortFailure, CommandPortResult, CommandPrincipal,
+        PolicyCommandPort, TaskCommandPort, VerdictCommandPort,
     },
     read_gateway_policy::ReadGatewayPolicy,
     read_tokens::{AwaitTarget, ReadTokenCodec, TokenMacKey},
@@ -90,16 +90,20 @@ impl SessionAuditSink for NoopSessionAudit {
 #[derive(Clone)]
 struct RecordingTaskPort {
     calls: Arc<AtomicUsize>,
+    last_principal: Arc<Mutex<Option<CommandPrincipal>>>,
+    last_metadata: Arc<Mutex<Option<CommandMetadata>>>,
     outcome: Arc<Mutex<Result<CommandPortResult<TaskCommandResult>, CommandPortFailure>>>,
 }
 
 impl TaskCommandPort for RecordingTaskPort {
     fn execute(
         &self,
-        _command: &TaskCommand,
-        _principal: &egopulse_local_api::command_gateway::CommandPrincipal,
+        command: &TaskCommand,
+        principal: &CommandPrincipal,
     ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_principal.lock().expect("principal lock") = Some(principal.clone());
+        *self.last_metadata.lock().expect("metadata lock") = task_metadata(command).cloned();
         self.outcome.lock().expect("task port lock").clone()
     }
 }
@@ -205,6 +209,8 @@ async fn test_context(
     ClientRequestMetadata,
     Arc<CommandGatewayApplication>,
     Arc<AtomicUsize>,
+    Arc<Mutex<Option<CommandPrincipal>>>,
+    Arc<Mutex<Option<CommandMetadata>>>,
 ) {
     let peer = real_peer().await;
     let clock: Arc<dyn SessionClock> = Arc::new(FixedClock(UNIX_EPOCH + Duration::from_secs(100)));
@@ -246,6 +252,8 @@ async fn test_context(
         correlation_id: Some("c3-correlation".to_owned()),
     };
     let task_calls = Arc::new(AtomicUsize::new(0));
+    let last_principal = Arc::new(Mutex::new(None));
+    let last_metadata = Arc::new(Mutex::new(None));
     let app = Arc::new(CommandGatewayApplication::new(
         endpoint.registry(),
         Arc::new(ContractProfiles::embedded().expect("profiles")),
@@ -256,6 +264,8 @@ async fn test_context(
         )),
         Arc::new(RecordingTaskPort {
             calls: Arc::clone(&task_calls),
+            last_principal: Arc::clone(&last_principal),
+            last_metadata: Arc::clone(&last_metadata),
             outcome: Arc::new(Mutex::new(task_outcome)),
         }),
         Arc::new(RecordingPolicyPort {
@@ -265,7 +275,15 @@ async fn test_context(
             outcome: Arc::new(Mutex::new(verdict_outcome)),
         }),
     ));
-    (peer, client, app, task_calls)
+    (peer, client, app, task_calls, last_principal, last_metadata)
+}
+
+fn task_metadata(command: &TaskCommand) -> Option<&CommandMetadata> {
+    match command.command.as_ref()? {
+        task_command::Command::CreateTask(value) => value.meta.as_ref(),
+        task_command::Command::ActivateTask(value) => value.meta.as_ref(),
+        _ => None,
+    }
 }
 
 fn task_command(oneof: task_command::Command) -> TaskCommand {
@@ -307,7 +325,7 @@ fn task_result_with_await() -> CommandPortResult<TaskCommandResult> {
 
 #[tokio::test]
 async fn task_success_propagates_result_and_typed_await_token() {
-    let (peer, client, app, calls) = test_context(
+    let (peer, client, app, calls, last_principal, last_metadata) = test_context(
         Ok(task_result_with_await()),
         Err(CommandPortFailure::Unavailable),
         Err(CommandPortFailure::Unavailable),
@@ -322,11 +340,27 @@ async fn task_success_propagates_result_and_typed_await_token() {
     assert!(response.authority_result.is_some());
     assert!(response.await_token.is_some());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        last_principal
+            .lock()
+            .expect("principal lock")
+            .as_ref()
+            .map(|value| value.required_authority_principal_kinds.clone()),
+        Some(vec!["TaskAuthority.Founder".to_owned()])
+    );
+    assert_eq!(
+        last_metadata
+            .lock()
+            .expect("metadata lock")
+            .as_ref()
+            .map(|value| value.correlation_id.as_str()),
+        Some("c3-correlation")
+    );
 }
 
 #[tokio::test]
 async fn system_only_task_branch_is_denied_before_owner_port() {
-    let (peer, client, app, calls) = test_context(
+    let (peer, client, app, calls, _last_principal, _last_metadata) = test_context(
         Ok(task_result_with_await()),
         Err(CommandPortFailure::Unavailable),
         Err(CommandPortFailure::Unavailable),
@@ -349,7 +383,7 @@ async fn system_only_task_branch_is_denied_before_owner_port() {
 
 #[tokio::test]
 async fn authority_unavailable_is_returned_without_fabricating_success() {
-    let (peer, client, app, calls) = test_context(
+    let (peer, client, app, calls, _last_principal, _last_metadata) = test_context(
         Err(CommandPortFailure::Unavailable),
         Err(CommandPortFailure::Unavailable),
         Err(CommandPortFailure::Unavailable),
@@ -372,7 +406,7 @@ async fn authority_unavailable_is_returned_without_fabricating_success() {
 
 #[tokio::test]
 async fn founder_verdict_returns_authority_result_without_unsupported_await_token() {
-    let (peer, client, app, _calls) = test_context(
+    let (peer, client, app, _calls, _last_principal, _last_metadata) = test_context(
         Err(CommandPortFailure::Unavailable),
         Err(CommandPortFailure::Unavailable),
         Ok(CommandPortResult {
@@ -404,7 +438,7 @@ async fn founder_verdict_returns_authority_result_without_unsupported_await_toke
 #[allow(deprecated)]
 #[tokio::test]
 async fn approval_success_returns_only_sanitized_authority_result() {
-    let (peer, client, app, _calls) = test_context(
+    let (peer, client, app, _calls, _last_principal, _last_metadata) = test_context(
         Err(CommandPortFailure::Unavailable),
         Ok(CommandPortResult {
             result: PolicyDecisionCommandResult {
