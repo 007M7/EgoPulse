@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from egopulse_memory_rag import (
+    MAX_QUERY_BYTES,
+    MAX_TOTAL_CONTENT_BYTES,
     MemoryRecord,
     RetrievalRequest,
     RetrievalWorkerError,
@@ -88,6 +90,21 @@ def test_input_digest_and_duplicate_identity_fail_closed() -> None:
 def test_invalid_request_is_rejected(retrieval_request: RetrievalRequest) -> None:
     with pytest.raises(RetrievalWorkerError):
         retrieve(retrieval_request, [])
+
+
+def test_utf8_query_limit_is_measured_in_bytes() -> None:
+    query = "界" * (MAX_QUERY_BYTES // len("界".encode("utf-8")) + 1)
+    with pytest.raises(RetrievalWorkerError, match="query exceeds"):
+        retrieve(RetrievalRequest(query, "scope:founder"), [])
+
+
+def test_total_supplied_content_limit_fails_closed() -> None:
+    content = "x" * (MAX_TOTAL_CONTENT_BYTES + 1)
+    with pytest.raises(RetrievalWorkerError, match="total content exceeds"):
+        retrieve(
+            RetrievalRequest("x", "scope:founder"),
+            [record("oversized", content)],
+        )
 
 
 def test_tie_break_and_evidence_are_deterministic() -> None:

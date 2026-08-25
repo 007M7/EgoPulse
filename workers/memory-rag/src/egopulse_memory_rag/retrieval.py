@@ -7,9 +7,11 @@ import re
 from typing import Literal
 
 
-MAX_QUERY_CHARS = 4096
-MAX_RECORDS = 10_000
-MAX_RESULTS = 100
+MAX_QUERY_BYTES = 16 * 1024
+MAX_ROUTING_FIELD_BYTES = 4 * 1024
+MAX_RECORDS = 2_048
+MAX_RESULTS = 64
+MAX_TOTAL_CONTENT_BYTES = 8 * 1024 * 1024
 ALGORITHM_ID = "lexical-overlap-v0"
 MemoryState = Literal["accepted", "candidate", "revoked"]
 _TOKEN_PATTERN = re.compile(r"[0-9a-zA-Z_]+|[\u4e00-\u9fff]")
@@ -41,6 +43,12 @@ class MemoryRecord:
             raise RetrievalWorkerError("memory_id is required")
         if not self.source_ref.strip() or not self.scope_ref.strip():
             raise RetrievalWorkerError("source_ref and scope_ref are required")
+        if len(self.memory_id.encode("utf-8")) > MAX_ROUTING_FIELD_BYTES:
+            raise RetrievalWorkerError("memory_id exceeds the worker limit")
+        if len(self.source_ref.encode("utf-8")) > MAX_ROUTING_FIELD_BYTES:
+            raise RetrievalWorkerError("source_ref exceeds the worker limit")
+        if len(self.scope_ref.encode("utf-8")) > MAX_ROUTING_FIELD_BYTES:
+            raise RetrievalWorkerError("scope_ref exceeds the worker limit")
         if self.state not in {"accepted", "candidate", "revoked"}:
             raise RetrievalWorkerError("memory state is unknown")
         if not 0.0 <= self.salience <= 1.0:
@@ -59,10 +67,12 @@ class RetrievalRequest:
     def validate(self) -> None:
         if not self.query.strip():
             raise RetrievalWorkerError("query is required")
-        if len(self.query) > MAX_QUERY_CHARS:
+        if len(self.query.encode("utf-8")) > MAX_QUERY_BYTES:
             raise RetrievalWorkerError("query exceeds the worker limit")
         if not self.scope_ref.strip():
             raise RetrievalWorkerError("scope_ref is required")
+        if len(self.scope_ref.encode("utf-8")) > MAX_ROUTING_FIELD_BYTES:
+            raise RetrievalWorkerError("scope_ref exceeds the worker limit")
         if not 1 <= self.max_results <= MAX_RESULTS:
             raise RetrievalWorkerError("max_results is outside the worker limit")
         if not 0.0 <= self.min_score <= 1.0:
@@ -107,8 +117,12 @@ def retrieve(
 
     seen_ids: set[str] = set()
     accepted: list[MemoryRecord] = []
+    total_content_bytes = 0
     for record in records:
         record.validate()
+        total_content_bytes += len(record.content.encode("utf-8"))
+        if total_content_bytes > MAX_TOTAL_CONTENT_BYTES:
+            raise RetrievalWorkerError("total content exceeds the worker limit")
         if record.memory_id in seen_ids:
             raise RetrievalWorkerError("duplicate memory_id in input")
         seen_ids.add(record.memory_id)

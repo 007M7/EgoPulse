@@ -36,6 +36,12 @@ and it has no database handle.
 - emits a deterministic evidence digest for the request and ranked result;
 - rejects malformed, duplicated, tampered, over-sized or out-of-scope input.
 
+The current candidate enforces the first approved-boundary limits in code:
+16 KiB UTF-8 query, 4 KiB routing fields, 2,048 supplied records, 64 returned
+candidates and 8 MiB total supplied content. These are resource and failure
+boundary limits, not retrieval-quality claims; the formal values remain
+subject to the Memory/RAG contract approval package.
+
 This baseline is intentionally not called semantic retrieval and does not
 freeze an embedding model, vector database or LangChain/LangGraph runtime.
 Those choices require a separate evaluation record covering model identity,

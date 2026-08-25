@@ -5,6 +5,8 @@ mutate, approve, revoke, or promote memory facts.
 """
 
 from .retrieval import (
+    MAX_QUERY_BYTES,
+    MAX_TOTAL_CONTENT_BYTES,
     MemoryRecord,
     RetrievalCandidate,
     RetrievalRequest,
@@ -15,6 +17,8 @@ from .retrieval import (
 )
 
 __all__ = [
+    "MAX_QUERY_BYTES",
+    "MAX_TOTAL_CONTENT_BYTES",
     "MemoryRecord",
     "RetrievalCandidate",
     "RetrievalRequest",
