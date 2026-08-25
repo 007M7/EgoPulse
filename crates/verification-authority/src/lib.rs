@@ -2,6 +2,7 @@
 
 mod reference_resolver;
 mod sego;
+mod sego_runner;
 mod store;
 mod supervisor;
 
@@ -13,6 +14,7 @@ pub use sego::{
     CheckerProcessFailure, SegoFindingEvidenceBinding, SegoMapError, SegoMappedResult,
     SegoMapperPolicy, checker_failure_result, map_sego_review,
 };
+pub use sego_runner::{GovernedSegoRunError, GovernedSegoRunResult, GovernedSegoRunner};
 pub use store::VerificationStoreInspection;
 pub use supervisor::{CheckerExecutionError, CheckerExecutionReceipt, GovernedCheckerSupervisor};
 

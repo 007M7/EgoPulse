@@ -113,10 +113,17 @@ database, blob path, or write handle crosses into Verification. This is the
 content-plane prerequisite for the supervised Sego runner and is covered by
 the Artifact G4-05 read-boundary test.
 
-The local G4-06 verification suite currently passes all 13 tests, including
+The local G4-06 verification suite currently passes all 15 tests, including
 Sego mapping, stale profile/input binding, checker policy rewrite rejection,
 timeout, crash, and output-limit probes. The existing supervisor and mapper
 are therefore reused rather than duplicated.
+
+`GovernedSegoRunner` now composes those two existing primitives into one
+provider-neutral attempt boundary. It preserves a successful checker receipt
+for Artifact admission, maps invalid/untrusted output to an explicit checker
+error result, and maps timeout/crash/output-limit/spawn failures without
+silently producing a pass. It owns no Authority store and performs no Task or
+Verdict write; those remain the next explicit composition step.
 
 `with_codex_harness` and `ProductionBootstrapConfig::build` remain explicit
 production composition APIs and not implicit unsafe defaults. Verification

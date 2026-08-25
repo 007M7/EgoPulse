@@ -12,7 +12,7 @@ use egopulse_domain_contracts::v01::egopulse::verification::v1::{
 };
 use egopulse_verification_authority::{
     AuthenticatedVerificationPrincipal, CheckerExecutionError, CheckerProcessFailure,
-    CriterionPolicySnapshot, GovernedCheckerSupervisor, ReferenceRejection,
+    CriterionPolicySnapshot, GovernedCheckerSupervisor, GovernedSegoRunner, ReferenceRejection,
     ResolvedVerificationInput, SegoFindingEvidenceBinding, SegoMapError, SegoMapperPolicy,
     VerificationAuthority, VerificationAuthorityConfig, VerificationClock,
     VerificationPrincipalKind, VerificationReferenceResolver, VerificationSqlCipherKey,
@@ -568,6 +568,40 @@ async fn governed_checker_supervisor_distinguishes_timeout_crash_and_output_limi
     );
 }
 
+#[tokio::test]
+async fn governed_sego_runner_maps_untrusted_output_without_dropping_receipt() {
+    let root = TempRoot::new("sego-runner-untrusted");
+    let runner = GovernedSegoRunner::new(
+        GovernedCheckerSupervisor::new(
+            std::env::current_exe().expect("test executable"),
+            vec![
+                "--exact".to_owned(),
+                "checker_invalid_output_probe".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            Duration::from_secs(2),
+            64 * 1024,
+        )
+        .expect("supervisor"),
+    );
+
+    let result = runner
+        .run(
+            root.path(),
+            b"{}",
+            "execution-untrusted-01",
+            &mapper_policy(),
+        )
+        .await
+        .expect("runner result");
+    assert_eq!(result.failure, Some(CheckerProcessFailure::OutputUntrusted));
+    assert!(result.receipt.is_some());
+    assert_eq!(
+        result.mapped.criterion_result.outcome,
+        CriterionOutcome::Error as i32
+    );
+}
+
 #[test]
 fn checker_timeout_probe() {
     if Path::new("timeout.marker").exists() {
@@ -587,6 +621,11 @@ fn checker_output_limit_probe() {
     if Path::new("output-limit.marker").exists() {
         print!("{}", "x".repeat(4096));
     }
+}
+
+#[test]
+fn checker_invalid_output_probe() {
+    print!("not-a-review-artifact");
 }
 
 fn running_fixture(name: &str, assurance: CheckerAssuranceClass) -> RunningFixture {
