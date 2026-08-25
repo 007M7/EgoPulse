@@ -48,7 +48,7 @@ pub use owners::{
 pub use projections::{
     AdapterApprovalProjectionSource, ArtifactProjectionSource, CollaborationProjectionSource,
     CompositeOwnerProjectionSource, OwnerProjectionSource, PendingOwnerProjection, ProjectionPump,
-    ProjectionPumpFailure, VerificationProjectionSource,
+    ProjectionPumpFailure, ProjectionSourceFailure, VerificationProjectionSource,
 };
 
 #[derive(Clone, Debug)]

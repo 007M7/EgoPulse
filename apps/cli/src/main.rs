@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+// The CLI keeps a structured, owned failure envelope so every surface can
+// render the same stable error facts. Its size is intentional at this
+// boundary; the process is short-lived and does not cross the kernel ABI.
+#![allow(clippy::result_large_err)]
 
 use std::{
     process::ExitCode,
@@ -8,18 +12,21 @@ use std::{
 use clap::{Parser, Subcommand};
 use egopulse_client_kernel::ClientKernel;
 use egopulse_domain_contracts::v01::egopulse::{
+    artifact::v1::{ContentAddress, HashAlgorithm},
     common::v1::{CommandMetadata, ContractReference},
     harness::v1::ApprovalDecision,
     localapi::v1::{
-        ClientSurface, DecideHarnessApprovalRequest, ExecuteFounderVerdictRequest,
-        ExecuteTaskCommandRequest, GetEvidenceGraphRequest, GetHarnessApprovalViewRequest,
-        GetProjectionStatusRequest, GetTaskViewRequest, ListHarnessApprovalViewsRequest,
-        ListTaskViewsRequest, LocalApiError, LocalApiErrorCode, ProjectionHealth,
-        ProjectionMetadata, TaskView, get_evidence_graph_response,
-        get_harness_approval_view_response, get_task_view_response,
+        AwaitProjectionRequest, ClientSurface, DecideHarnessApprovalRequest,
+        ExecuteFounderVerdictRequest, ExecuteTaskCommandRequest, GetEvidenceGraphRequest,
+        GetHarnessApprovalViewRequest, GetProjectionStatusRequest, GetTaskViewRequest,
+        ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError, LocalApiErrorCode,
+        ProjectionAwaitToken, ProjectionHealth, ProjectionMetadata, SourceRevision, TaskView,
+        await_projection_response, get_evidence_graph_response, get_harness_approval_view_response,
+        get_task_view_response,
     },
     policy::v1::{
-        IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
+        IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, PolicyDecisionErrorCode,
+        policy_decision_command,
     },
     task::v1::{
         CreateTaskCommand, TaskCommand, TaskErrorCode, TaskStatus, task_command,
@@ -51,6 +58,16 @@ enum Command {
     /// Attach to the local daemon and print typed projection status.
     Status {
         /// Emit stable JSON for scripts.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wait for a command's projection await token and return the projected view.
+    Await {
+        /// JSON object previously emitted as data.awaitToken by a write command.
+        #[arg(long)]
+        token_json: String,
+        #[arg(long, default_value_t = 5000)]
+        timeout_milliseconds: u32,
         #[arg(long)]
         json: bool,
     },
@@ -172,6 +189,7 @@ enum ApprovalCommand {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum VerdictCommandCli {
     /// Submit the user-owned issue_founder_verdict branch.
     Issue {
@@ -184,7 +202,15 @@ enum VerdictCommandCli {
         #[arg(long)]
         artifact_set_id: String,
         #[arg(long)]
+        artifact_set_manifest_sha256: String,
+        #[arg(long)]
+        artifact_set_manifest_byte_length: u64,
+        #[arg(long)]
         verification_artifact_id: String,
+        #[arg(long)]
+        verification_payload_sha256: String,
+        #[arg(long)]
+        verification_payload_byte_length: u64,
         #[arg(long)]
         acceptance_contract_id: String,
         #[arg(long)]
@@ -414,6 +440,47 @@ impl CliFailure {
         }
     }
 
+    fn policy_authority(
+        error_code: i32,
+        safe_fingerprint: Option<String>,
+        operation: &'static str,
+    ) -> Self {
+        let code = PolicyDecisionErrorCode::try_from(error_code)
+            .unwrap_or(PolicyDecisionErrorCode::IntegrityFailure);
+        let (exit_code, category, retryable, required_action_code) = match code {
+            PolicyDecisionErrorCode::Unauthenticated
+            | PolicyDecisionErrorCode::PermissionDenied => {
+                (4, "authentication", false, Some("USE_AUTHORIZED_SESSION"))
+            }
+            PolicyDecisionErrorCode::RevisionConflict
+            | PolicyDecisionErrorCode::IdempotencyConflict
+            | PolicyDecisionErrorCode::NotFound
+            | PolicyDecisionErrorCode::RequestMismatch
+            | PolicyDecisionErrorCode::FencingRejected
+            | PolicyDecisionErrorCode::PolicyDenied
+            | PolicyDecisionErrorCode::AlreadyConsumed
+            | PolicyDecisionErrorCode::Expired
+            | PolicyDecisionErrorCode::Revoked
+            | PolicyDecisionErrorCode::DeliveryReceiptInvalid => {
+                (6, "domain_conflict", false, Some("REVIEW_DOMAIN_STATE"))
+            }
+            PolicyDecisionErrorCode::IntegrityFailure => {
+                (8, "recovery", true, Some("RECOVERY_REQUIRED"))
+            }
+            _ => (70, "invalid_request", false, None),
+        };
+        Self {
+            exit_code,
+            reason_code: "POLICY_AUTHORITY_REJECTED",
+            message: "Policy Decision authority rejected the command".to_owned(),
+            category,
+            retryable,
+            required_action_code: required_action_code.map(str::to_owned),
+            safe_fingerprint,
+            operation,
+        }
+    }
+
     fn for_operation(mut self, operation: &'static str) -> Self {
         self.operation = operation;
         self
@@ -443,6 +510,11 @@ async fn main() -> ExitCode {
     let json_output = command_json(&cli.command);
     let result = match cli.command {
         Command::Status { json } => status(json).await,
+        Command::Await {
+            token_json,
+            timeout_milliseconds,
+            json,
+        } => await_projection(token_json, timeout_milliseconds, json).await,
         Command::Task { command } => task(command).await,
         Command::Evidence { command } => evidence(command).await,
         Command::Approval { command } => approval(command).await,
@@ -464,6 +536,7 @@ async fn main() -> ExitCode {
 fn command_json(command: &Command) -> bool {
     match command {
         Command::Status { json }
+        | Command::Await { json, .. }
         | Command::Task {
             command:
                 TaskCommandCli::Get { json, .. }
@@ -604,6 +677,85 @@ async fn status(json: bool) -> Result<(), CliFailure> {
         print!("{}", view.text());
     }
     Ok(())
+}
+
+async fn await_projection(
+    token_json: String,
+    timeout_milliseconds: u32,
+    json: bool,
+) -> Result<(), CliFailure> {
+    let token = parse_await_token(&token_json)
+        .map_err(|message| CliFailure::protocol(message).for_operation("await"))?;
+    let attached = attach("await").await?;
+    attached.require_rpc("LocalReadModelService/AwaitProjection", "await")?;
+    let metadata = attached.metadata(None)?;
+    let response = attached
+        .connection
+        .read_model_service()
+        .await_projection(AwaitProjectionRequest {
+            client: Some(metadata),
+            await_token: Some(token),
+            timeout_milliseconds: timeout_milliseconds.min(60_000),
+        })
+        .await
+        .map_err(|error| CliFailure::daemon_unavailable(error.to_string()))?
+        .into_inner();
+    match response.outcome {
+        Some(await_projection_response::Outcome::View(view)) => {
+            let payload = json!({
+                "schemaVersion": "egopulse.cli-result/v0.1",
+                "ok": true,
+                "operation": "await",
+                "data": { "kind": "task", "view": task_summary(&view) },
+                "correlationId": Uuid::now_v7().to_string(),
+            });
+            if json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                println!(
+                    "Awaited Task: {} revision={} status={}",
+                    payload["data"]["view"]["taskId"].as_str().unwrap_or(""),
+                    payload["data"]["view"]["revision"]
+                        .as_u64()
+                        .unwrap_or_default(),
+                    payload["data"]["view"]["status"].as_str().unwrap_or(""),
+                );
+            }
+            Ok(())
+        }
+        Some(await_projection_response::Outcome::ApprovalView(view)) => {
+            let payload = approval_json(&view, "await");
+            let payload = json!({
+                "schemaVersion": "egopulse.cli-result/v0.1",
+                "ok": true,
+                "operation": "await",
+                "data": { "kind": "approval", "view": payload["data"].clone() },
+                "projection": payload["projection"].clone(),
+                "correlationId": Uuid::now_v7().to_string(),
+            });
+            if json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                println!(
+                    "Awaited Approval: {} revision={} lifecycle={}",
+                    payload["data"]["view"]["approvalRequestId"]
+                        .as_str()
+                        .unwrap_or(""),
+                    payload["data"]["view"]["requestRevision"]
+                        .as_u64()
+                        .unwrap_or_default(),
+                    payload["data"]["view"]["requestLifecycle"]
+                        .as_str()
+                        .unwrap_or(""),
+                );
+            }
+            Ok(())
+        }
+        Some(await_projection_response::Outcome::Error(error)) => {
+            Err(CliFailure::from_local_api_error(error).for_operation("await"))
+        }
+        None => Err(CliFailure::protocol("await outcome missing").for_operation("await")),
+    }
 }
 
 async fn task(command: TaskCommandCli) -> Result<(), CliFailure> {
@@ -959,6 +1111,7 @@ async fn approval_list(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn approval_decide(
     approval_request_id: String,
     expected_action_digest_sha256: String,
@@ -1024,6 +1177,13 @@ async fn approval_decide(
     let result = response.sanitized_authority_result.ok_or_else(|| {
         CliFailure::protocol("sanitized approval result missing").for_operation("approval.decide")
     })?;
+    if result.error_code != 0 {
+        return Err(CliFailure::policy_authority(
+            result.error_code,
+            result.safe_error_fingerprint,
+            "approval.decide",
+        ));
+    }
     let payload = json!({
         "schemaVersion": "egopulse.cli-result/v0.1",
         "ok": true,
@@ -1034,7 +1194,7 @@ async fn approval_decide(
             "authorityDecisionRef": result.authority_decision_ref,
             "decision": ApprovalDecision::try_from(result.decision).map(|value| value.as_str_name()).unwrap_or("APPROVAL_DECISION_UNSPECIFIED"),
             "stateRevision": result.state_revision,
-            "awaitToken": response.await_token.map(|token| token.token),
+            "awaitToken": await_token_json(response.await_token),
         },
         "correlationId": correlation_id,
     });
@@ -1063,7 +1223,11 @@ async fn verdict(command: VerdictCommandCli) -> Result<(), CliFailure> {
             task_revision,
             work_revision,
             artifact_set_id,
+            artifact_set_manifest_sha256,
+            artifact_set_manifest_byte_length,
             verification_artifact_id,
+            verification_payload_sha256,
+            verification_payload_byte_length,
             acceptance_contract_id,
             acceptance_contract_version,
             acceptance_contract_sha256,
@@ -1080,6 +1244,16 @@ async fn verdict(command: VerdictCommandCli) -> Result<(), CliFailure> {
                 work_revision,
                 artifact_set_id,
                 verification_artifact_id,
+                ContentAddress {
+                    algorithm: HashAlgorithm::Sha256 as i32,
+                    digest: artifact_set_manifest_sha256,
+                    byte_length: artifact_set_manifest_byte_length,
+                },
+                ContentAddress {
+                    algorithm: HashAlgorithm::Sha256 as i32,
+                    digest: verification_payload_sha256,
+                    byte_length: verification_payload_byte_length,
+                },
                 ContractReference {
                     contract_id: acceptance_contract_id,
                     version: acceptance_contract_version,
@@ -1113,12 +1287,15 @@ async fn verdict(command: VerdictCommandCli) -> Result<(), CliFailure> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn verdict_issue(
     task_id: String,
     task_revision: u64,
     work_revision: u64,
     artifact_set_id: String,
     verification_artifact_id: String,
+    artifact_set_manifest: ContentAddress,
+    verification_payload: ContentAddress,
     acceptance_contract_ref: ContractReference,
     decision: String,
     observed_verification_conclusion: String,
@@ -1152,9 +1329,9 @@ async fn verdict_issue(
                     task_revision,
                     work_revision,
                     artifact_set_id,
-                    artifact_set_manifest: None,
+                    artifact_set_manifest: Some(artifact_set_manifest),
                     verification_artifact_id,
-                    verification_payload: None,
+                    verification_payload: Some(verification_payload),
                     acceptance_contract_ref: Some(acceptance_contract_ref),
                 }),
                 decision,
@@ -1211,7 +1388,7 @@ async fn verdict_issue(
             "replayed": result.replayed,
             "founderVerdictId": verdict_id,
             "stateRevision": result.state.as_ref().map(|state| state.revision),
-            "awaitToken": response.await_token.map(|token| token.token),
+            "awaitToken": await_token_json(response.await_token),
         },
         "correlationId": correlation_id,
     });
@@ -1293,7 +1470,7 @@ async fn verdict_revoke(
             "replayed": result.replayed,
             "founderVerdictId": result.state.as_ref().map(|state| state.founder_verdict_id.clone()),
             "stateRevision": result.state.as_ref().map(|state| state.revision),
-            "awaitToken": response.await_token.map(|token| token.token),
+            "awaitToken": await_token_json(response.await_token),
         },
         "correlationId": correlation_id,
     });
@@ -1395,7 +1572,7 @@ async fn task_create(
             "revision": task.revision,
             "status": TaskStatus::try_from(task.status).map(|status| status.as_str_name()).unwrap_or("TASK_STATUS_UNSPECIFIED"),
             "replayed": replayed,
-            "awaitToken": response.await_token.map(|token| token.token),
+            "awaitToken": await_token_json(response.await_token),
         },
         "correlationId": correlation_id,
     });
@@ -1415,14 +1592,14 @@ async fn task_create(
 
 fn canonical_task_digest(command: &TaskCommand) -> String {
     let mut canonical = command.clone();
-    if let Some(task_command::Command::CreateTask(create)) = canonical.command.as_mut() {
-        if let Some(meta) = create.meta.as_mut() {
-            meta.command_id.clear();
-            meta.request_digest_sha256.clear();
-            meta.issued_at = None;
-            meta.correlation_id.clear();
-            meta.causation_id = None;
-        }
+    if let Some(task_command::Command::CreateTask(create)) = canonical.command.as_mut()
+        && let Some(meta) = create.meta.as_mut()
+    {
+        meta.command_id.clear();
+        meta.request_digest_sha256.clear();
+        meta.issued_at = None;
+        meta.correlation_id.clear();
+        meta.causation_id = None;
     }
     hex::encode(Sha256::digest(canonical.encode_to_vec()))
 }
@@ -1443,14 +1620,13 @@ fn set_policy_digest(command: &mut PolicyDecisionCommand) {
     let mut canonical = command.clone();
     if let Some(policy_decision_command::Command::IssueHarnessApprovalDecision(issue)) =
         canonical.command.as_mut()
+        && let Some(metadata) = issue.metadata.as_mut()
     {
-        if let Some(metadata) = issue.metadata.as_mut() {
-            metadata.command_id.clear();
-            metadata.request_digest_sha256.clear();
-            metadata.issued_at = None;
-            metadata.correlation_id.clear();
-            metadata.causation_id = None;
-        }
+        metadata.command_id.clear();
+        metadata.request_digest_sha256.clear();
+        metadata.issued_at = None;
+        metadata.correlation_id.clear();
+        metadata.causation_id = None;
     }
     let digest = hex::encode(Sha256::digest(canonical.encode_to_vec()));
     if let Some(policy_decision_command::Command::IssueHarnessApprovalDecision(issue)) =
@@ -1632,6 +1808,86 @@ fn approval_json(
         },
         "projection": projection_json(view.metadata.as_ref()),
         "correlationId": Uuid::now_v7().to_string(),
+    })
+}
+
+fn await_token_json(token: Option<ProjectionAwaitToken>) -> serde_json::Value {
+    let Some(token) = token else {
+        return serde_json::Value::Null;
+    };
+    let source = token.required_source_revision.as_ref().map(|source| {
+        json!({
+            "domain": source.domain,
+            "aggregateId": source.aggregate_id,
+            "revision": source.revision,
+            "lastEventId": source.last_event_id,
+        })
+    });
+    let expires_at = token
+        .expires_at
+        .as_ref()
+        .map(|timestamp| json!({ "seconds": timestamp.seconds, "nanos": timestamp.nanos }));
+    json!({
+        "token": token.token,
+        "requiredSourceRevision": source,
+        "expiresAt": expires_at,
+    })
+}
+
+fn parse_await_token(input: &str) -> Result<ProjectionAwaitToken, String> {
+    let value: serde_json::Value = serde_json::from_str(input)
+        .map_err(|error| format!("token_json must be a write result awaitToken object: {error}"))?;
+    let token = value
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "awaitToken.token is required".to_owned())?
+        .to_owned();
+    let source = value
+        .get("requiredSourceRevision")
+        .ok_or_else(|| "awaitToken.requiredSourceRevision is required".to_owned())?;
+    let domain = source
+        .get("domain")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "awaitToken.requiredSourceRevision.domain is required".to_owned())?;
+    let aggregate_id = source
+        .get("aggregateId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "awaitToken.requiredSourceRevision.aggregateId is required".to_owned())?;
+    let revision = source
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "awaitToken.requiredSourceRevision.revision is required".to_owned())?;
+    let last_event_id = source
+        .get("lastEventId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "awaitToken.requiredSourceRevision.lastEventId is required".to_owned())?;
+    let expires_at = value
+        .get("expiresAt")
+        .ok_or_else(|| "awaitToken.expiresAt is required".to_owned())?;
+    let seconds = expires_at
+        .get("seconds")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "awaitToken.expiresAt.seconds is required".to_owned())?;
+    let nanos = expires_at
+        .get("nanos")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "awaitToken.expiresAt.nanos is required".to_owned())?;
+    let nanos =
+        i32::try_from(nanos).map_err(|_| "awaitToken.expiresAt.nanos is invalid".to_owned())?;
+    let domain = i32::try_from(domain)
+        .map_err(|_| "awaitToken.requiredSourceRevision.domain is invalid".to_owned())?;
+    Ok(ProjectionAwaitToken {
+        token,
+        required_source_revision: Some(SourceRevision {
+            domain,
+            aggregate_id: aggregate_id.to_owned(),
+            revision,
+            last_event_id: last_event_id.to_owned(),
+        }),
+        expires_at: Some(prost_types::Timestamp { seconds, nanos }),
     })
 }
 

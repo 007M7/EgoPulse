@@ -216,12 +216,12 @@ impl PolicyCommandPort for AuthorityCommandPorts {
                 result
                     .decision_record
                     .as_ref()
-                    .and_then(|record| record.request.as_ref())
-                    .map(|request| {
+                    .and_then(|record| record.request.as_ref().map(|request| (record, request)))
+                    .map(|(record, request)| {
                         (
                             SourceRevision {
                                 domain: SourceDomain::PolicyDecision as i32,
-                                aggregate_id: request.approval_request_id.clone(),
+                                aggregate_id: record.authority_decision_ref.clone(),
                                 revision: event.resulting_state_revision,
                                 last_event_id: event.event_id.clone(),
                             },
