@@ -86,7 +86,9 @@ fn map_process_failure(error: CheckerExecutionError) -> CheckerProcessFailure {
     match error {
         CheckerExecutionError::Timeout => CheckerProcessFailure::Timeout,
         CheckerExecutionError::Crashed => CheckerProcessFailure::Crashed,
-        CheckerExecutionError::OutputLimit => CheckerProcessFailure::OutputUntrusted,
+        CheckerExecutionError::OutputLimit | CheckerExecutionError::Protocol => {
+            CheckerProcessFailure::OutputUntrusted
+        }
         CheckerExecutionError::InvalidSpecification
         | CheckerExecutionError::Spawn
         | CheckerExecutionError::InputDelivery

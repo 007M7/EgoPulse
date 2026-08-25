@@ -1,0 +1,21 @@
+[package]
+name = "egopulse-dsh-adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+egopulse-domain-contracts.workspace = true
+egopulse-harness-adapter.workspace = true
+egopulse-process-supervision.workspace = true
+hex.workspace = true
+prost-types.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lib]
+path = "src/lib.rs"

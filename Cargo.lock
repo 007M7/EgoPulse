@@ -1197,6 +1197,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "egopulse-dsh-adapter"
+version = "0.1.0"
+dependencies = [
+ "egopulse-domain-contracts",
+ "egopulse-harness-adapter",
+ "egopulse-process-supervision",
+ "hex",
+ "prost-types",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "egopulse-founder-verdict-authority"
 version = "0.1.0"
 dependencies = [
