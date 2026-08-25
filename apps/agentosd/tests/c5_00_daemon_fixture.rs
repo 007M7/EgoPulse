@@ -118,7 +118,7 @@ impl AuthorityPrincipalResolver for FixtureAuthorityPrincipalResolver {
         &self,
         _principal: &CommandPrincipal,
     ) -> Result<TaskPrincipalKind, CommandPortFailure> {
-        Ok(TaskPrincipalKind::FounderAuthority)
+        Ok(TaskPrincipalKind::Founder)
     }
 
     fn resolve_policy(
@@ -243,6 +243,30 @@ async fn spawn_fixture(root: &Path, instance: &str) -> Child {
         .expect("spawn C5 fixture child")
 }
 
+fn cli_executable() -> PathBuf {
+    let test_executable = std::env::current_exe().expect("CLI E2E test executable path");
+    let target_debug = test_executable
+        .parent()
+        .and_then(Path::parent)
+        .expect("CLI E2E test must run below target/debug");
+    let executable = target_debug.join("egopulse.exe");
+    assert!(
+        executable.is_file(),
+        "CLI E2E requires the normal egopulse binary at {}",
+        executable.display()
+    );
+    executable
+}
+
+async fn run_cli(instance: &str, arguments: &[&str]) -> std::process::Output {
+    Command::new(cli_executable())
+        .env("EGOPULSE_IPC_INSTANCE", instance)
+        .args(arguments)
+        .output()
+        .await
+        .expect("run real egopulse CLI process")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c5_00_real_daemon_fixture_opens_session_over_local_ipc() {
     let root = std::env::temp_dir().join(format!("egopulse-c5-00-{}", Uuid::now_v7()));
@@ -322,4 +346,101 @@ async fn c5_00_daemon_fixture_child() {
         .serve(shutdown)
         .await
         .expect("fixture daemon serve");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c5_03_real_cli_process_attaches_and_preserves_authority_rejections() {
+    let root = std::env::temp_dir().join(format!("egopulse-c5-03-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create C5 CLI fixture root");
+    let instance = format!("c5-03-{}", Uuid::now_v7());
+    let mut child = spawn_fixture(&root, &instance).await;
+
+    let mut status_output = None;
+    for _ in 0..80 {
+        let output = run_cli(&instance, &["status", "--json"]).await;
+        if output.status.success() {
+            status_output = Some(output);
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let status_output = status_output.expect("CLI should attach to the real fixture daemon");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status_output.stdout).expect("status JSON envelope");
+    assert_eq!(status_json["ok"], true);
+    assert_eq!(status_json["operation"], "status");
+
+    let acceptance_sha = "11".repeat(32);
+    let budget_sha = "22".repeat(32);
+    let task_output = run_cli(
+        &instance,
+        &[
+            "task",
+            "create",
+            "--work-type",
+            "c5-03",
+            "--input-snapshot-id",
+            "input-001",
+            "--target-scope-ref",
+            "scope-001",
+            "--acceptance-contract-id",
+            "acceptance",
+            "--acceptance-contract-version",
+            "v0.1",
+            "--acceptance-contract-sha256",
+            acceptance_sha.as_str(),
+            "--budget-profile-id",
+            "budget",
+            "--budget-profile-version",
+            "v0.1",
+            "--budget-profile-sha256",
+            budget_sha.as_str(),
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(
+        task_output.status.code(),
+        Some(6),
+        "task CLI stdout={} stderr={}",
+        String::from_utf8_lossy(&task_output.stdout),
+        String::from_utf8_lossy(&task_output.stderr)
+    );
+    let task_json: serde_json::Value =
+        serde_json::from_slice(&task_output.stdout).expect("task rejection JSON envelope");
+    assert_eq!(task_json["operation"], "task.create");
+    assert_eq!(task_json["error"]["code"], "TASK_AUTHORITY_REJECTED");
+
+    let verdict_output = run_cli(
+        &instance,
+        &[
+            "verdict",
+            "revoke",
+            "verdict-001",
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "c5-03",
+            "--confirmation-proof-ref",
+            "proof-001",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(
+        verdict_output.status.code(),
+        Some(6),
+        "verdict CLI stdout={} stderr={}",
+        String::from_utf8_lossy(&verdict_output.stdout),
+        String::from_utf8_lossy(&verdict_output.stderr)
+    );
+    let verdict_json: serde_json::Value =
+        serde_json::from_slice(&verdict_output.stdout).expect("verdict rejection JSON envelope");
+    assert_eq!(verdict_json["operation"], "verdict.revoke");
+    assert_eq!(verdict_json["error"]["code"], "VERDICT_AUTHORITY_REJECTED");
+
+    drop(child.stdin.take());
+    let status = child.wait().await.expect("fixture child exit");
+    assert!(status.success(), "fixture child failed: {status}");
+    fs::remove_dir_all(&root).expect("remove C5 CLI fixture root");
 }

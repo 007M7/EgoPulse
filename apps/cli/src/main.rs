@@ -21,10 +21,13 @@ use egopulse_domain_contracts::v01::egopulse::{
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
     },
-    task::v1::{CreateTaskCommand, TaskCommand, TaskStatus, task_command, task_command_result},
+    task::v1::{
+        CreateTaskCommand, TaskCommand, TaskErrorCode, TaskStatus, task_command,
+        task_command_result,
+    },
     verdict::v1::{
         FounderVerdictDecision, IssueFounderVerdictCommand, RevokeFounderVerdictCommand,
-        VerdictCommand, VerdictScope, verdict_command,
+        VerdictCommand, VerdictErrorCode, VerdictScope, verdict_command,
     },
     verification::v1::VerificationConclusion,
 };
@@ -330,6 +333,87 @@ impl CliFailure {
         }
     }
 
+    fn task_authority(
+        error_code: i32,
+        safe_detail_code: impl Into<String>,
+        operation: &'static str,
+    ) -> Self {
+        let code = TaskErrorCode::try_from(error_code).unwrap_or(TaskErrorCode::Internal);
+        let (exit_code, category, retryable, required_action_code) = match code {
+            TaskErrorCode::Unauthenticated | TaskErrorCode::PermissionDenied => {
+                (4, "authentication", false, Some("USE_AUTHORIZED_SESSION"))
+            }
+            TaskErrorCode::ContractMismatch => (5, "contract", false, Some("REFRESH_CONTRACT")),
+            TaskErrorCode::RevisionConflict
+            | TaskErrorCode::StateConflict
+            | TaskErrorCode::IdempotencyConflict
+            | TaskErrorCode::NotFound
+            | TaskErrorCode::StaleReference
+            | TaskErrorCode::UnverifiedReference
+            | TaskErrorCode::TerminalGateUnsatisfied => {
+                (6, "domain_conflict", false, Some("REVIEW_DOMAIN_STATE"))
+            }
+            TaskErrorCode::RecoveryRequired
+            | TaskErrorCode::IntegrityFailure
+            | TaskErrorCode::Internal => (8, "recovery", true, Some("RECOVERY_REQUIRED")),
+            _ => (70, "invalid_request", false, None),
+        };
+        Self {
+            exit_code,
+            reason_code: "TASK_AUTHORITY_REJECTED",
+            message: safe_detail_code.into(),
+            category,
+            retryable,
+            required_action_code: required_action_code.map(str::to_owned),
+            safe_fingerprint: None,
+            operation,
+        }
+    }
+
+    fn verdict_authority(
+        error_code: i32,
+        safe_fingerprint: Option<String>,
+        operation: &'static str,
+    ) -> Self {
+        let code =
+            VerdictErrorCode::try_from(error_code).unwrap_or(VerdictErrorCode::IntegrityFailure);
+        let (exit_code, category, retryable, required_action_code) = match code {
+            VerdictErrorCode::Unauthenticated | VerdictErrorCode::PermissionDenied => {
+                (4, "authentication", false, Some("USE_AUTHORIZED_SESSION"))
+            }
+            VerdictErrorCode::RevisionConflict
+            | VerdictErrorCode::IdempotencyConflict
+            | VerdictErrorCode::NotFound
+            | VerdictErrorCode::TaskNotVerdictPending
+            | VerdictErrorCode::ScopeStale
+            | VerdictErrorCode::VerificationMismatch
+            | VerdictErrorCode::ConfirmationRequired
+            | VerdictErrorCode::RiskAcceptanceRequired
+            | VerdictErrorCode::RiskCoverageIncomplete
+            | VerdictErrorCode::NonOverridableGate
+            | VerdictErrorCode::ReworkDirectiveRequired
+            | VerdictErrorCode::AlreadyActive
+            | VerdictErrorCode::AlreadyConsumed
+            | VerdictErrorCode::Expired
+            | VerdictErrorCode::Revoked
+            | VerdictErrorCode::TaskCommitReceiptInvalid => {
+                (6, "domain_conflict", false, Some("REVIEW_DOMAIN_STATE"))
+            }
+            VerdictErrorCode::IntegrityFailure => (8, "recovery", true, Some("RECOVERY_REQUIRED")),
+            _ => (70, "invalid_request", false, None),
+        };
+        Self {
+            exit_code,
+            reason_code: "VERDICT_AUTHORITY_REJECTED",
+            message: "Founder Verdict authority rejected the command".to_owned(),
+            category,
+            retryable,
+            required_action_code: required_action_code.map(str::to_owned),
+            safe_fingerprint,
+            operation,
+        }
+    }
+
     fn for_operation(mut self, operation: &'static str) -> Self {
         self.operation = operation;
         self
@@ -452,7 +536,9 @@ impl AttachedClient {
 
 async fn attach(operation: &'static str) -> Result<AttachedClient, CliFailure> {
     let result = async {
-        let address = LocalIpcAddress::for_instance(DEFAULT_INSTANCE)
+        let instance =
+            std::env::var("EGOPULSE_IPC_INSTANCE").unwrap_or_else(|_| DEFAULT_INSTANCE.to_owned());
+        let address = LocalIpcAddress::for_instance(&instance)
             .map_err(|error| CliFailure::protocol(format!("invalid IPC instance: {error}")))?;
         let connection = LocalApiClient::platform_default()
             .connect(address)
@@ -1105,6 +1191,13 @@ async fn verdict_issue(
         CliFailure::protocol("Founder Verdict authority result missing")
             .for_operation("verdict.issue")
     })?;
+    if result.error_code != 0 {
+        return Err(CliFailure::verdict_authority(
+            result.error_code,
+            result.safe_error_fingerprint,
+            "verdict.issue",
+        ));
+    }
     let verdict_id = result
         .verdict
         .as_ref()
@@ -1185,14 +1278,11 @@ async fn verdict_revoke(
             .for_operation("verdict.revoke")
     })?;
     if result.error_code != 0 {
-        return Err(CliFailure::protocol(format!(
-            "Founder Verdict rejected: {}",
-            result
-                .safe_error_fingerprint
-                .as_deref()
-                .unwrap_or("VERDICT_ERROR")
-        ))
-        .for_operation("verdict.revoke"));
+        return Err(CliFailure::verdict_authority(
+            result.error_code,
+            result.safe_error_fingerprint,
+            "verdict.revoke",
+        ));
     }
     let payload = json!({
         "schemaVersion": "egopulse.cli-result/v0.1",
@@ -1284,11 +1374,11 @@ async fn task_create(
     let task = match result.outcome {
         Some(task_command_result::Outcome::Task(task)) => task,
         Some(task_command_result::Outcome::Error(error)) => {
-            return Err(CliFailure::protocol(format!(
-                "task authority rejected: {}",
-                error.safe_detail_code
-            ))
-            .for_operation("task.create"));
+            return Err(CliFailure::task_authority(
+                error.code,
+                error.safe_detail_code,
+                "task.create",
+            ));
         }
         None => {
             return Err(
