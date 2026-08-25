@@ -24,6 +24,16 @@ approval events, cancellation, restart reconciliation and independently
 addressable output evidence. A machine-readable stream can still be only a
 final-answer transport.
 
+An isolated local ACP handshake was then performed with `KIMI_SHARE_DIR` set
+to the repository cache (no user-home writes and no model prompt). The
+`initialize` response succeeded with `protocolVersion: 1`, agent name `Kimi
+Code CLI`, version `1.49.0`, and session capabilities for list/resume. The
+following empty `session/new` request was rejected with `Authentication
+required` and a terminal `login` auth method. Therefore the protocol boundary
+is real and structured, but the next session/lifecycle probe requires an
+explicitly authenticated user environment; no login was initiated by this
+probe.
+
 ## DeepSeek Harness / DSH 0.1.0-rc.5
 
 The local `dsh --help` entry point describes an ordered profile launcher with
