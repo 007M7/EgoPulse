@@ -59,7 +59,9 @@ The TUI command surface now also exposes the read-only `evidence.get` operation
 through `GetEvidenceGraph`, matching the CLI's Evidence Graph boundary. It
 returns only redacted graph counts and references; it does not add an evidence
 write path or bypass the read-model permission check. Local TUI tests cover the
-form-to-operation mapping.
+form-to-operation mapping. The real Windows C5 fixture additionally invokes
+the TUI command against a missing graph and verifies the typed `NOT_FOUND`
+failure, proving that this path reaches the daemon read model and fails closed.
 
 ## Composition root boundary
 

@@ -999,6 +999,35 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
         serde_json::from_slice(&tui_task_output.stdout).expect("TUI task JSON envelope");
     assert_eq!(tui_task_json["operation"], "task.create");
     assert_eq!(tui_task_json["data"]["replayed"], false);
+    let tui_task_id = tui_task_json["data"]["taskId"]
+        .as_str()
+        .expect("TUI created task id");
+
+    let tui_evidence_output = run_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "evidence-get",
+            tui_task_id,
+            "--artifact-set-id",
+            "missing-c5-03-tui-evidence",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(
+        tui_evidence_output.status.code(),
+        Some(3),
+        "TUI evidence read must fail closed for a missing graph: stdout={} stderr={}",
+        String::from_utf8_lossy(&tui_evidence_output.stdout),
+        String::from_utf8_lossy(&tui_evidence_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&tui_evidence_output.stderr).contains("NOT_FOUND"),
+        "TUI evidence read must preserve the typed not-found error: stderr={}",
+        String::from_utf8_lossy(&tui_evidence_output.stderr)
+    );
 
     let task_watch = run_cli(&instance, &["task", "watch", "--frames", "1", "--json"]).await;
     assert!(
