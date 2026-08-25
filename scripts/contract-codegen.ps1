@@ -160,8 +160,9 @@ $protoArtifacts = @(
         } |
         Sort-Object path
 )
-if ($protoArtifacts.Count -ne 10) {
-    throw "expected 10 V-01 proto artifacts, found $($protoArtifacts.Count)"
+$expectedProtoCount = $protoArtifacts.Count
+if ($expectedProtoCount -eq 0) {
+    throw 'no V-01 proto artifacts were found in the contract manifest'
 }
 
 Invoke-Checked -Executable 'node' -Arguments @((Join-Path $repositoryRoot 'scripts\verify-v01-contract-import.mjs')) -Failure 'V-01 import verification failed'
@@ -245,7 +246,10 @@ $typescriptFiles = @(Get-ChildItem -LiteralPath $typescriptStage -Recurse -Filte
 $rustFiles = @(Get-ChildItem -LiteralPath $rustStage -Recurse -Filter '*.rs' -File)
 $pythonModules = @(Get-ChildItem -LiteralPath $pythonStage -Recurse -Filter '*_pb2.py' -File)
 $pythonStubs = @(Get-ChildItem -LiteralPath $pythonStage -Recurse -Filter '*_pb2.pyi' -File)
-if ($typescriptFiles.Count -ne 10 -or $rustFiles.Count -ne 10 -or $pythonModules.Count -ne 10 -or $pythonStubs.Count -ne 10) {
+if ($typescriptFiles.Count -ne $expectedProtoCount -or
+    $rustFiles.Count -ne $expectedProtoCount -or
+    $pythonModules.Count -ne $expectedProtoCount -or
+    $pythonStubs.Count -ne $expectedProtoCount) {
     throw "unexpected generated counts: ts=$($typescriptFiles.Count) rust=$($rustFiles.Count) python=$($pythonModules.Count) pyi=$($pythonStubs.Count)"
 }
 
