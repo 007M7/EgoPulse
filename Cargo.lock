@@ -1093,7 +1093,11 @@ dependencies = [
  "egopulse-client-kernel",
  "egopulse-domain-contracts",
  "egopulse-local-api",
+ "hex",
+ "prost",
+ "prost-types",
  "serde_json",
+ "sha2",
  "tokio",
  "uuid",
 ]
