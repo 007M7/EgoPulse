@@ -70,4 +70,4 @@ This gives the normal path:
 local fast check -> one remote CI run -> dependent remote Windows CD
 ```
 
-The release build is not a duplicate test gate: it produces optimized binaries that the debug/test CI job does not produce. Local full CI/CD remains an opt-in diagnostic and offline path.
+The release build is not a duplicate test gate: it produces optimized binaries that the debug/test CI job does not produce. Within CD, frontend assets are built first and the Rust workspace is compiled once; the Tauri CLI installer path is intentionally not invoked because the current unsigned candidate distributes the four executables directly. Local full CI/CD remains an opt-in diagnostic and offline path.

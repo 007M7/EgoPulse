@@ -84,8 +84,11 @@ if (-not [string]::IsNullOrWhiteSpace($CiEvidencePath)) {
     }
 }
 
+# Build the frontend assets first, then compile the entire Rust workspace once.
+# The Tauri CLI would compile the desktop Rust crate a second time; packaging
+# only needs the resulting executable, not a bundled installer.
+Invoke-External pnpm --filter '@egopulse/desktop' run build
 Invoke-External $cargo build --workspace --release --locked
-Invoke-External pnpm run desktop:build
 
 $version = (Get-Content -LiteralPath 'apps/desktop/src-tauri/tauri.conf.json' -Raw -Encoding utf8 | ConvertFrom-Json).version
 $stamp = [DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssZ')
