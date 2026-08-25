@@ -17,18 +17,19 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     HarnessObservation, LifecycleKind, LifecycleObservation, NativeSessionStrategy,
     ObservationCriticality, SideEffectCertainty, dispatch_result, harness_observation,
 };
-use egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot;
+use egopulse_domain_contracts::v01::egopulse::task::v1::{TaskSnapshot, TaskStatus};
 use egopulse_harness_adapter::{
     AdapterClock, AdapterEdge, AdapterEdgeConfig, AdapterEdgeKey, DispatchMaterialResolver,
     GovernedHarnessAdapter, ReconciliationFinding, ResolvedDispatchMaterial,
 };
 use egopulse_local_ide_control::collaboration_control::{
-    AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
-    CollaborationControlConfig, CollaborationControlError, CollaborationPrincipalKind,
-    CollaborationReferenceGuard, CollaborationSqlCipherKey, DispatchMaterial,
-    HarnessEvidenceResolver, HarnessFactIngestionDisposition, LeaseAuthorization,
-    ReferenceAuthorization, ReferenceGuardRejection, ResolvedHarnessEvidence,
-    SingleHarnessWorkConfig, canonical_dispatch_fingerprint, canonical_request_digest,
+    AdapterBackedHarnessEvidenceResolver, AuthenticatedCollaborationPrincipal, AuthorityClock,
+    CollaborationControl, CollaborationControlConfig, CollaborationControlError,
+    CollaborationPrincipalKind, CollaborationReferenceGuard, CollaborationSqlCipherKey,
+    CompositeCollaborationGuard, DispatchMaterial, HarnessEvidenceResolver,
+    HarnessFactIngestionDisposition, LeaseAuthorization, ReferenceAuthorization,
+    ReferenceGuardRejection, ResolvedHarnessEvidence, SingleHarnessWorkConfig,
+    TaskActivationReferenceGuard, canonical_dispatch_fingerprint, canonical_request_digest,
     dispatch_pending, pump_observations, start_single_harness_workflow,
 };
 use prost_types::Timestamp;
@@ -1311,6 +1312,59 @@ fn single_harness_workflow_builds_run_attempt_lease_and_dispatch_outbox() {
         control
             .pending_dispatches(&harness_adapter())
             .expect("read pending dispatch outbox after retry")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn single_harness_workflow_accepts_only_task_activation_guard_evidence() {
+    let collaboration_store = IsolatedStore::new("collaboration-task-activation-guard");
+    let adapter_store = IsolatedStore::new("collaboration-task-activation-guard-edge");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let config = SingleHarnessWorkConfig {
+        run_id: "run-guarded-001".to_owned(),
+        attempt_id: "attempt-guarded-001".to_owned(),
+        dispatch_id: "dispatch-guarded-001".to_owned(),
+        plan: run_plan(),
+        harness_id: "codex".to_owned(),
+        capability_profile_ref: contract_ref("single-harness-capability", '3'),
+        workspace_ref: "workspace-001".to_owned(),
+        lease_policy_ref: contract_ref("v01-attempt-lease", 'a'),
+        owner_instance_id: "attempt-supervisor-001".to_owned(),
+        material: dispatch_material(),
+        task_authority_principal_id: "task-authority:guarded".to_owned(),
+        collaboration_principal_id: "collaboration-control:guarded".to_owned(),
+        attempt_supervisor_principal_id: "attempt-supervisor:guarded".to_owned(),
+        harness_adapter_principal_id: "adapter:codex".to_owned(),
+    };
+    let task = TaskSnapshot {
+        task_id: "task-guarded-001".to_owned(),
+        revision: 4,
+        work_revision: 2,
+        status: TaskStatus::Active as i32,
+        current_run_id: Some(config.run_id.clone()),
+        ..Default::default()
+    };
+    let reference = TaskActivationReferenceGuard::new(task.clone(), &config, 30);
+    let guard = CompositeCollaborationGuard::new(
+        reference,
+        AdapterBackedHarnessEvidenceResolver::new(open_loop_adapter_edge(&adapter_database)),
+    );
+    let mut control = open_control_with_guard(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+        guard,
+    );
+
+    let result = start_single_harness_workflow(&mut control, &task, &config)
+        .expect("start Task-activation-governed workflow");
+    assert_eq!(result.run_id, config.run_id);
+    assert_eq!(result.envelope.dispatch_id, config.dispatch_id);
+    assert_eq!(
+        control
+            .pending_dispatches(&harness_adapter())
+            .expect("read guarded dispatch")
             .len(),
         1
     );
