@@ -102,6 +102,14 @@ structured event support, approval behavior, cancellation, reconciliation and
 the semantic cost of any emulation. A candidate is not promoted to an active
 Harness merely because its process starts.
 
+The first candidate implementation is now `crates/kimi-adapter`. It reuses
+the existing process-supervision seam and performs only an ACP `initialize`
+probe. A reachable Kimi process is reported as `Degraded` until a reviewed
+schema digest exists; dispatch, observations, approvals, cancellation and
+reconciliation all return `CapabilityMismatch`. The crate is therefore a
+probe vehicle, not a second production Harness and is not wired into the
+agent daemon bootstrap.
+
 ## G4-09 evidence recorded
 
 The provider-neutral validator now accepts the workflow `StepPlan` directly:
@@ -132,3 +140,9 @@ drift fail closed as `ProtocolMismatch`.
 
 The provider-neutral unit evidence is in
 `crates/harness-adapter/src/runtime.rs` under `probe_tests`.
+
+The candidate-only Kimi evidence is in
+`crates/kimi-adapter/src/lib.rs` under `tests`, including an ignored live
+Windows probe that requires an explicitly configured executable and isolated
+share directory. It must not be promoted until the authenticated
+`session/new`/prompt lifecycle and recovery matrix is complete.

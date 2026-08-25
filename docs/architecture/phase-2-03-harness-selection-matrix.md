@@ -45,6 +45,11 @@ The follow-up protocol observations are recorded in
 next candidate for a no-side-effect structured-protocol probe; DSH remains
 held until its profile bootstrap permission failure is isolated.
 
+The candidate-only Rust probe is `crates/kimi-adapter`. Its explicit degraded
+result and fail-closed execution methods are part of the evidence: protocol
+reachability has been implemented without silently upgrading it to structured
+dispatch or recovery support.
+
 | Probe row | Pass condition | Failure disposition |
 | --- | --- | --- |
 | Executable/version | Pinned executable is discoverable and reports the expected version | `Unavailable` |

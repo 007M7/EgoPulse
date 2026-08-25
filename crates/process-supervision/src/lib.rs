@@ -35,6 +35,7 @@ pub struct SupervisedProcessSpec {
     pub working_directory: PathBuf,
     pub clear_environment: bool,
     pub inherited_environment: Vec<String>,
+    pub environment_overrides: Vec<(String, String)>,
 }
 
 impl SupervisedProcessSpec {
@@ -46,7 +47,18 @@ impl SupervisedProcessSpec {
             working_directory: working_directory.into(),
             clear_environment: false,
             inherited_environment: Vec::new(),
+            environment_overrides: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_environment_override(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.environment_overrides.push((name.into(), value.into()));
+        self
     }
 }
 
@@ -128,6 +140,9 @@ impl SupervisedProcess {
             for (name, value) in inherited {
                 command.env(name, value);
             }
+        }
+        for (name, value) in &spec.environment_overrides {
+            command.env(name, value);
         }
 
         let mut child = command.spawn().map_err(ProcessSupervisionError::Spawn)?;
