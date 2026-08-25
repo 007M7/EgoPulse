@@ -8,6 +8,7 @@ use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
 };
 pub use egopulse_local_ipc_platform::{LocalIpcAddress, LocalTransport};
 use hyper_util::rt::TokioIo;
+use std::time::Duration;
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
@@ -83,6 +84,7 @@ impl LocalApiClient {
     ) -> Result<LocalApiConnection, LocalApiConnectError> {
         let connector_address = address.clone();
         let channel = Endpoint::from_static("http://egopulse.local")
+            .connect_timeout(Duration::from_secs(3))
             .connect_with_connector(service_fn(move |_| {
                 let address = connector_address.clone();
                 async move {
