@@ -1,9 +1,11 @@
 mod adapter_evidence;
+mod composite_guard;
 mod harness_dispatch;
 mod ingestion;
 mod store;
 
 pub use adapter_evidence::AdapterBackedHarnessEvidenceResolver;
+pub use composite_guard::CompositeCollaborationGuard;
 pub use harness_dispatch::{
     HarnessDispatchCycleError, HarnessDispatchCycleReport, dispatch_pending, pump_observations,
 };
