@@ -41,6 +41,37 @@ struct CliFailure {
     safe_fingerprint: Option<String>,
 }
 
+struct ProjectionStatusView {
+    health: String,
+    stale: bool,
+    epoch: String,
+    sequence: u64,
+}
+
+impl ProjectionStatusView {
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "schemaVersion": "egopulse.cli-result/v0.1",
+            "ok": true,
+            "operation": "status",
+            "data": { "state": "connected" },
+            "projection": {
+                "position": { "epoch": self.epoch, "sequence": self.sequence },
+                "health": self.health,
+                "stale": self.stale,
+            },
+            "correlationId": Uuid::now_v7().to_string(),
+        })
+    }
+
+    fn text(&self) -> String {
+        format!(
+            "EgoPulse status: connected\nProjection: {}\nPosition: {}:{}\nStale: {}\n",
+            self.health, self.epoch, self.sequence, self.stale
+        )
+    }
+}
+
 impl CliFailure {
     fn daemon_unavailable(message: impl Into<String>) -> Self {
         Self {
@@ -183,25 +214,61 @@ async fn status(json: bool) -> Result<(), CliFailure> {
     let health = ProjectionHealth::try_from(metadata.health)
         .map_err(|_| CliFailure::protocol("projection health is unknown"))?;
 
+    let view = ProjectionStatusView {
+        health: health.as_str_name().to_owned(),
+        stale: metadata.stale,
+        epoch: position.epoch,
+        sequence: position.sequence,
+    };
     if json {
-        let output = json!({
-            "schemaVersion": "egopulse.cli-result/v0.1",
-            "ok": true,
-            "operation": "status",
-            "data": { "state": "connected" },
-            "projection": {
-                "position": { "epoch": position.epoch, "sequence": position.sequence },
-                "health": health.as_str_name(),
-                "stale": metadata.stale,
-            },
-            "correlationId": Uuid::now_v7().to_string(),
-        });
-        println!("{}", serde_json::to_string(&output).unwrap());
+        println!("{}", serde_json::to_string(&view.json()).unwrap());
     } else {
-        println!("EgoPulse status: connected");
-        println!("Projection: {}", health.as_str_name());
-        println!("Position: {}:{}", position.epoch, position.sequence);
-        println!("Stale: {}", metadata.stale);
+        print!("{}", view.text());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_text_and_json_share_the_same_projection_facts() {
+        let view = ProjectionStatusView {
+            health: "PROJECTION_HEALTH_READY".to_owned(),
+            stale: false,
+            epoch: "epoch-test".to_owned(),
+            sequence: 7,
+        };
+        let json = view.json();
+        assert_eq!(json["schemaVersion"], "egopulse.cli-result/v0.1");
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["operation"], "status");
+        assert_eq!(json["projection"]["health"], "PROJECTION_HEALTH_READY");
+        assert_eq!(json["projection"]["position"]["epoch"], "epoch-test");
+        assert_eq!(json["projection"]["position"]["sequence"], 7);
+        let text = view.text();
+        assert!(text.contains("Projection: PROJECTION_HEALTH_READY"));
+        assert!(text.contains("Position: epoch-test:7"));
+        assert!(text.contains("Stale: false"));
+    }
+
+    #[test]
+    fn json_error_envelope_does_not_include_transport_diagnostics() {
+        let error = CliFailure::daemon_unavailable("private pipe path");
+        let json = error.json_envelope();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"]["code"], "DAEMON_UNAVAILABLE");
+        assert_eq!(json["error"]["requiredActionCode"], "attach_to_daemon");
+        assert!(
+            serde_json::to_string(&json)
+                .unwrap()
+                .contains("attach_to_daemon")
+        );
+        assert!(
+            !serde_json::to_string(&json)
+                .unwrap()
+                .contains("private pipe path")
+        );
+    }
 }
