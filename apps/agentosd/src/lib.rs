@@ -293,6 +293,19 @@ pub struct AuthorityCompositionInputs {
     pub additional_projection_sources: Vec<Arc<dyn OwnerProjectionSource>>,
 }
 
+/// Composition input used when a cross-authority evidence source must share
+/// the Task Authority's single-writer handle with the command ports.
+pub struct SharedAuthorityCompositionInputs {
+    pub task: Arc<Mutex<egopulse_cognition_runtime::task_authority::TaskAuthority>>,
+    pub policy: egopulse_policy_decision_authority::PolicyDecisionAuthority,
+    pub verdict: egopulse_founder_verdict_authority::FounderVerdictAuthority,
+    pub principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
+    pub session_principal_resolver: Arc<dyn TrustedPrincipalResolver>,
+    pub session_clock: Arc<dyn SessionClock>,
+    pub session_audit: Arc<dyn SessionAuditSink>,
+    pub additional_projection_sources: Vec<Arc<dyn OwnerProjectionSource>>,
+}
+
 impl DaemonProviders {
     /// The default is deliberately non-serving from an authorization point of
     /// view. Production startup must inject a real trusted resolver and owner
@@ -343,6 +356,36 @@ impl DaemonProviders {
     #[must_use]
     pub fn from_authority_inputs(inputs: AuthorityCompositionInputs) -> Self {
         let ports = Arc::new(AuthorityCommandPorts::new(
+            inputs.task,
+            inputs.policy,
+            inputs.verdict,
+            inputs.principal_resolver,
+        ));
+        let mut projection_sources =
+            Vec::with_capacity(1 + inputs.additional_projection_sources.len());
+        projection_sources.push(Arc::clone(&ports) as Arc<dyn OwnerProjectionSource>);
+        projection_sources.extend(inputs.additional_projection_sources);
+        Self {
+            principal_resolver: inputs.session_principal_resolver,
+            session_clock: inputs.session_clock,
+            session_audit: inputs.session_audit,
+            task_port: Arc::clone(&ports) as Arc<dyn TaskCommandPort>,
+            policy_port: Arc::clone(&ports) as Arc<dyn PolicyCommandPort>,
+            verdict_port: Arc::clone(&ports) as Arc<dyn VerdictCommandPort>,
+            projection_source: Some(Arc::new(CompositeOwnerProjectionSource::new(
+                projection_sources,
+            ))),
+            harness_dispatch_runner: None,
+            task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
+        }
+    }
+
+    /// Builds daemon providers from a shared Task Authority handle. This is
+    /// the production path when Founder Verdict receipt validation and Task
+    /// command handling must observe the same owner instance.
+    #[must_use]
+    pub fn from_shared_authority_inputs(inputs: SharedAuthorityCompositionInputs) -> Self {
+        let ports = Arc::new(AuthorityCommandPorts::new_shared(
             inputs.task,
             inputs.policy,
             inputs.verdict,
