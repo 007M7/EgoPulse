@@ -112,6 +112,17 @@ real compiled ACP subprocess. The observed committed updates were `ONE` and
 stderr was empty, and no model/API call was made. This proves a replayable
 native prompt/committed-output boundary, but not live-provider semantics.
 
+The native cancellation row also passes with the DSH `cancel` replay fixture:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/probe-dsh-acp-cancel-windows.ps1
+```
+
+The probe waits for the fixture's ready marker, sends `session/cancel` as a
+native ACP notification, and receives the original prompt response with
+`stopReason=cancelled`. The subprocess exits cleanly with empty stderr and no
+model/API call.
+
 ## Candidate decision at this point
 
 Kimi is the next candidate for an authenticated lifecycle probe; DSH's
