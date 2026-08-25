@@ -1,13 +1,17 @@
 use egopulse_cognition_runtime::task_authority::{
     AuthenticatedPrincipal, CreationAuthorization, CreationGuardRejection, PrincipalKind,
-    SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCreationGuard, canonical_request_digest,
+    SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCreationGuard, TaskTransitionGuard,
+    TransitionAuthorization, TransitionGuardRejection, canonical_request_digest,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::task::v1::{
     ActivateTaskCommand, ApplyFounderVerdictCommand, CreateTaskCommand, TaskCommand, TaskErrorCode,
-    TaskSnapshot, TaskStatus, get_task_response, task_command, task_command_result,
+    TaskEvent, TaskEventKind, TaskSnapshot, TaskStatus, get_task_response, task_command,
+    task_command_result,
 };
+use prost::Message;
 use prost_types::Timestamp;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,6 +50,22 @@ impl TaskCreationGuard for FixtureCreationGuard {
     }
 }
 
+struct FixtureTransitionGuard;
+
+impl TaskTransitionGuard for FixtureTransitionGuard {
+    fn validate(
+        &self,
+        _command: &TaskCommand,
+        _current: &TaskSnapshot,
+    ) -> Result<TransitionAuthorization, TransitionGuardRejection> {
+        Ok(TransitionAuthorization {
+            evidence_refs: vec!["transition-proof:fixture".to_owned()],
+            founder_decision: None,
+            founder_verdict_state_revision: None,
+        })
+    }
+}
+
 struct IsolatedStore {
     root: PathBuf,
 }
@@ -73,13 +93,14 @@ impl Drop for IsolatedStore {
 }
 
 fn open_authority(path: &Path) -> TaskAuthority {
-    TaskAuthority::open(
+    TaskAuthority::open_with_transition_guard(
         TaskAuthorityConfig {
             database_path: path.to_owned(),
             store_epoch: STORE_EPOCH.to_owned(),
             key: SqlCipherKey::new(TEST_KEY),
         },
         FixtureCreationGuard,
+        FixtureTransitionGuard,
     )
     .expect("open encrypted Task Authority")
 }
@@ -391,6 +412,76 @@ fn task_projection_feed_is_typed_digest_bound_and_acknowledged_explicitly() {
         .expect("Task projection baseline");
     assert_eq!(baselines.len(), 1);
     assert_eq!(baselines[0].event.snapshot.as_ref(), Some(&task));
+}
+
+#[test]
+fn activation_emits_task_event_to_collaboration_outbox_and_requires_digest_ack() {
+    let isolated = IsolatedStore::new("task-activation-collaboration-outbox");
+    let mut authority = open_authority(&isolated.database_path());
+    let created = authority
+        .execute(&valid_create_command(), &founder())
+        .expect("create Task before activation");
+    let task = committed_task(&created);
+    let mut activate = TaskCommand {
+        command: Some(task_command::Command::ActivateTask(ActivateTaskCommand {
+            meta: Some(metadata(
+                "cmd-activate-001",
+                "activate-001",
+                "corr-activate-001",
+            )),
+            task_id: task.task_id.clone(),
+            expected_revision: task.revision,
+            work_revision: task.work_revision,
+            run_id: "run-001".to_owned(),
+        })),
+    };
+    set_digest(&mut activate);
+    let collaboration = AuthenticatedPrincipal {
+        kind: PrincipalKind::CollaborationControl,
+        principal_id: "collaboration-control:test".to_owned(),
+        authenticated: true,
+    };
+    let activated = authority
+        .execute(&activate, &collaboration)
+        .expect("activate Task");
+    let event = activated
+        .committed_event
+        .clone()
+        .expect("activated Task event");
+    assert_eq!(event.kind, TaskEventKind::Activated as i32);
+
+    let pending = authority
+        .pending_cross_authority_outbox()
+        .expect("read collaboration handoff");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].destination_domain, "collaboration-control");
+    assert_eq!(
+        pending[0].payload_digest_sha256,
+        hex::encode(Sha256::digest(&pending[0].payload))
+    );
+    assert_eq!(
+        TaskEvent::decode(pending[0].payload.as_slice()).expect("decode collaboration handoff"),
+        event
+    );
+    assert!(
+        !authority
+            .acknowledge_cross_authority_outbox(&pending[0].message_id, &"0".repeat(64))
+            .expect("reject wrong collaboration handoff digest")
+    );
+    assert!(
+        authority
+            .acknowledge_cross_authority_outbox(
+                &pending[0].message_id,
+                &pending[0].payload_digest_sha256,
+            )
+            .expect("ack collaboration handoff")
+    );
+    assert!(
+        authority
+            .pending_cross_authority_outbox()
+            .expect("read collaboration handoff after ack")
+            .is_empty()
+    );
 }
 
 #[test]

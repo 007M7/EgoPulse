@@ -428,6 +428,16 @@ impl TaskAuthority {
             .map_err(TaskAuthorityFailure::from)
     }
 
+    pub fn acknowledge_cross_authority_outbox(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, TaskAuthorityFailure> {
+        self.store
+            .acknowledge_cross_authority_outbox(message_id, expected_payload_digest_sha256)
+            .map_err(TaskAuthorityFailure::from)
+    }
+
     fn commit_create(
         &mut self,
         command: &CreateTaskCommand,
@@ -706,32 +716,38 @@ impl TaskAuthority {
         let event_bytes = event.encode_to_vec();
         let event_digest = hex::encode(Sha256::digest(&event_bytes));
         let read_outbox_id = format!("task-outbox-read-{}", Uuid::now_v7());
-        let cross_outbox_id = format!("task-outbox-verdict-{}", Uuid::now_v7());
-        let consume_payload = match (command.command.as_ref(), cross_verdict_state_revision) {
-            (Some(task_command::Command::ApplyFounderVerdict(value)), Some(state_revision)) => {
-                Some(build_consume_verdict_command(
-                    value,
-                    state_revision,
-                    &event,
-                    meta,
-                    now,
-                ))
-            }
-            _ => None,
-        };
-        let consume_bytes = consume_payload.as_ref().map(Message::encode_to_vec);
-        let consume_digest = consume_bytes
+        let cross_payload: Option<(String, &'static str, Vec<u8>, String)> =
+            match (command.command.as_ref(), cross_verdict_state_revision) {
+                (Some(task_command::Command::ApplyFounderVerdict(value)), Some(state_revision)) => {
+                    let consume_payload =
+                        build_consume_verdict_command(value, state_revision, &event, meta, now);
+                    let payload = consume_payload.encode_to_vec();
+                    let digest = hex::encode(Sha256::digest(&payload));
+                    Some((
+                        format!("task-outbox-verdict-{}", Uuid::now_v7()),
+                        "founder-verdict-authority",
+                        payload,
+                        digest,
+                    ))
+                }
+                (Some(task_command::Command::ActivateTask(_)), None) => Some((
+                    format!("task-outbox-collaboration-{}", event.event_id),
+                    "collaboration-control",
+                    event_bytes.clone(),
+                    event_digest.clone(),
+                )),
+                _ => None,
+            };
+        let cross = cross_payload
             .as_ref()
-            .map(|bytes| hex::encode(Sha256::digest(bytes)));
-        let cross = consume_bytes
-            .as_ref()
-            .zip(consume_digest.as_ref())
-            .map(|(payload, digest)| CrossAuthorityOutbox {
-                message_id: &cross_outbox_id,
-                destination_domain: "founder-verdict-authority",
-                payload_digest_sha256: digest,
-                payload,
-            });
+            .map(
+                |(message_id, destination, payload, digest)| CrossAuthorityOutbox {
+                    message_id,
+                    destination_domain: destination,
+                    payload_digest_sha256: digest,
+                    payload,
+                },
+            );
         let changed = self.store.commit_mutation(&MutationCommit {
             task_id,
             expected_revision,

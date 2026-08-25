@@ -575,6 +575,20 @@ impl TaskStore {
         Ok(changed == 1)
     }
 
+    pub fn acknowledge_cross_authority_outbox(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE task_cross_authority_outbox SET delivery_state='consumed'
+             WHERE message_id=?1 AND canonical_payload_digest_sha256=?2
+               AND delivery_state='pending'",
+            params![message_id, expected_payload_digest_sha256],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn inspect(&self) -> Result<TaskStoreInspection, StoreError> {
         let scalar = |sql: &str| -> Result<u64, StoreError> {
             let value: i64 = self.connection.query_row(sql, [], |row| row.get(0))?;

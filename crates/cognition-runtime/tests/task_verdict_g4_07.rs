@@ -147,7 +147,7 @@ fn accept_drives_one_terminal_task_commit_and_durable_verdict_consume_outbox() {
             .inspect_store()
             .expect("inspect")
             .cross_authority_outbox_count,
-        1
+        2
     );
 
     let denied = execute(
@@ -285,6 +285,20 @@ fn advance_to_verdict_pending(authority: &mut TaskAuthority) -> TaskSnapshot {
         activate_command(&created),
         principal(PrincipalKind::CollaborationControl),
     ));
+    let activation_handoff = authority
+        .pending_cross_authority_outbox()
+        .expect("read activation handoff")
+        .into_iter()
+        .find(|message| message.destination_domain == "collaboration-control")
+        .expect("activation handoff");
+    assert!(
+        authority
+            .acknowledge_cross_authority_outbox(
+                &activation_handoff.message_id,
+                &activation_handoff.payload_digest_sha256,
+            )
+            .expect("ack activation handoff")
+    );
     let evidence = task_from(execute(
         authority,
         evidence_command(&active),
