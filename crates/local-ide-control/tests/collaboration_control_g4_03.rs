@@ -17,6 +17,7 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     HarnessObservation, LifecycleKind, LifecycleObservation, NativeSessionStrategy,
     ObservationCriticality, SideEffectCertainty, dispatch_result, harness_observation,
 };
+use egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot;
 use egopulse_harness_adapter::{
     AdapterClock, AdapterEdge, AdapterEdgeConfig, AdapterEdgeKey, DispatchMaterialResolver,
     GovernedHarnessAdapter, ReconciliationFinding, ResolvedDispatchMaterial,
@@ -27,7 +28,8 @@ use egopulse_local_ide_control::collaboration_control::{
     CollaborationReferenceGuard, CollaborationSqlCipherKey, DispatchMaterial,
     HarnessEvidenceResolver, HarnessFactIngestionDisposition, LeaseAuthorization,
     ReferenceAuthorization, ReferenceGuardRejection, ResolvedHarnessEvidence,
-    canonical_dispatch_fingerprint, canonical_request_digest, dispatch_pending, pump_observations,
+    SingleHarnessWorkConfig, canonical_dispatch_fingerprint, canonical_request_digest,
+    dispatch_pending, pump_observations, start_single_harness_workflow,
 };
 use prost_types::Timestamp;
 use rusqlite::Connection;
@@ -1247,6 +1249,60 @@ fn advance_through_running(
             )
             .expect("running"),
     )
+}
+
+#[test]
+fn single_harness_workflow_builds_run_attempt_lease_and_dispatch_outbox() {
+    let collaboration_store = IsolatedStore::new("collaboration-single-harness-workflow");
+    let adapter_store = IsolatedStore::new("collaboration-single-harness-workflow-edge");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: "5".repeat(64),
+    };
+    let mut control = open_control_with_guard(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+        guard,
+    );
+    let task = TaskSnapshot {
+        task_id: "task-001".to_owned(),
+        revision: 2,
+        work_revision: 1,
+        ..Default::default()
+    };
+    let config = SingleHarnessWorkConfig {
+        run_id: "run-workflow-001".to_owned(),
+        attempt_id: "attempt-workflow-001".to_owned(),
+        dispatch_id: "dispatch-workflow-001".to_owned(),
+        plan: run_plan(),
+        harness_id: "codex".to_owned(),
+        capability_profile_ref: contract_ref("single-harness-capability", '3'),
+        workspace_ref: "workspace-001".to_owned(),
+        lease_policy_ref: contract_ref("v01-attempt-lease", 'a'),
+        owner_instance_id: "attempt-supervisor-001".to_owned(),
+        material: dispatch_material(),
+        task_authority_principal_id: "task-authority:workflow".to_owned(),
+        collaboration_principal_id: "collaboration-control:workflow".to_owned(),
+        attempt_supervisor_principal_id: "attempt-supervisor:workflow".to_owned(),
+        harness_adapter_principal_id: "adapter:codex".to_owned(),
+    };
+
+    let result = start_single_harness_workflow(&mut control, &task, &config)
+        .expect("start governed single harness workflow");
+    assert_eq!(result.run_id, config.run_id);
+    assert_eq!(result.attempt_id, config.attempt_id);
+    assert_eq!(result.dispatch_id, config.dispatch_id);
+    assert_eq!(result.envelope.dispatch_id, config.dispatch_id);
+    assert_eq!(result.envelope.input_bundle_ref, "input-001");
+    assert_eq!(result.envelope.input_bundle_sha256, "5".repeat(64));
+    assert_eq!(
+        control
+            .pending_dispatches(&harness_adapter())
+            .expect("read pending dispatch outbox")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

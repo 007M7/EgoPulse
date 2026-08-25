@@ -2,6 +2,7 @@ mod adapter_evidence;
 mod composite_guard;
 mod harness_dispatch;
 mod ingestion;
+mod single_harness_workflow;
 mod store;
 
 pub use adapter_evidence::AdapterBackedHarnessEvidenceResolver;
@@ -11,6 +12,10 @@ pub use harness_dispatch::{
     HarnessDispatchRunner, dispatch_pending, pump_observations,
 };
 pub use ingestion::{HarnessFactIngestionDisposition, HarnessFactIngestionResult};
+pub use single_harness_workflow::{
+    SingleHarnessWorkConfig, SingleHarnessWorkError, SingleHarnessWorkResult,
+    start_single_harness_workflow,
+};
 
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCancellationDisposition,
@@ -1885,6 +1890,15 @@ pub fn canonical_request_digest(command: &CollaborationCommand) -> Option<String
     let meta = command_metadata_mut(&mut canonical)?;
     clear_volatile_metadata(meta);
     Some(sha256_bytes(&canonical.encode_to_vec()))
+}
+
+/// Fills the request digest after a command has been assembled. Keeping this
+/// beside the canonicalization function prevents internal workflow builders
+/// from implementing subtly different digest rules.
+pub fn seal_request_digest(command: &mut CollaborationCommand) -> Option<String> {
+    let digest = canonical_request_digest(command)?;
+    command_metadata_mut(command)?.request_digest_sha256 = digest.clone();
+    Some(digest)
 }
 
 #[must_use]
