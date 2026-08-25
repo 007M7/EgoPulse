@@ -56,6 +56,7 @@ use tonic::transport::Server;
 
 mod owners;
 mod projections;
+mod security;
 
 pub use owners::{
     AuthorityCommandPorts, AuthorityPrincipalResolver, DenyAllAuthorityPrincipalResolver,
@@ -64,6 +65,10 @@ pub use projections::{
     AdapterApprovalProjectionSource, ArtifactProjectionSource, CollaborationProjectionSource,
     CompositeOwnerProjectionSource, OwnerProjectionSource, PendingOwnerProjection, ProjectionPump,
     ProjectionPumpFailure, ProjectionSourceFailure, VerificationProjectionSource,
+};
+pub use security::{
+    AllowlistedPrincipal, AllowlistedPrincipalResolver, AuthorityPrincipalBinding,
+    ConfiguredAuthorityPrincipalResolver, PrincipalPolicyError,
 };
 
 #[derive(Clone, Debug)]

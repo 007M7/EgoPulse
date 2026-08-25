@@ -58,6 +58,17 @@ real local bootstrap supplies all of the following as reviewed configuration:
 - Task/Policy/Verdict reference guards;
 - Codex executable, input bundle root, workspace root and workflow configuration.
 
+The reusable identity part of that boundary is now implemented in
+`apps/agentosd/src/security.rs`: `AllowlistedPrincipalResolver` matches only the
+platform-derived peer fingerprint against explicit grants, while
+`ConfiguredAuthorityPrincipalResolver` maps an authenticated session principal to
+owner kinds independently for Task, Policy and Verdict. Missing mappings fail
+closed; no OS identity or request field is promoted to Founder implicitly.
+
+This does not claim that Authority reference guards or the normal binary's full
+Codex bootstrap are complete. They remain separate obligations so that identity
+configuration cannot be mistaken for evidence validation or Harness configuration.
+
 Until that bootstrap exists, `with_codex_harness` is an explicit production composition API and not
 an implicit unsafe default.
 
