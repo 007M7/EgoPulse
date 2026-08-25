@@ -6,6 +6,9 @@ use std::{
     time::Duration,
 };
 
+use egopulse_artifact_authority::{
+    ArtifactAuthority, ArtifactAuthorityConfig, ArtifactAuthorityFailure, ArtifactSqlCipherKey,
+};
 use egopulse_cognition_runtime::task_authority::{
     PrincipalKind as TaskPrincipalKind, SqlCipherKey, TaskAuthority, TaskAuthorityConfig,
     TaskAuthorityFailure,
@@ -37,13 +40,14 @@ use thiserror::Error;
 
 use crate::{AllowlistedPrincipal, AllowlistedPrincipalResolver, PrincipalPolicyError};
 use crate::{
-    AuthorityPrincipalBinding, CodexHarnessCompositionConfig, ConfiguredAuthorityPrincipalResolver,
-    ConfiguredFounderVerdictResolver, ConfiguredFounderVerdictResolverConfig,
-    ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, DaemonCompositionError,
-    DaemonProviders, FounderVerdictConfigurationError, LocalUserPolicyResolver,
-    LocalUserPolicyResolverConfig, SharedAuthorityCompositionInputs,
-    TaskAuthorityCommitReceiptSource, VerificationAuthorityArtifactSource,
-    VerificationProjectionSource,
+    ArtifactProjectionSource, AuthorityPrincipalBinding, CodexHarnessCompositionConfig,
+    ConfiguredArtifactAdmissionGuard, ConfiguredArtifactAdmissionGuardConfig,
+    ConfiguredAuthorityPrincipalResolver, ConfiguredFounderVerdictResolver,
+    ConfiguredFounderVerdictResolverConfig, ConfiguredTaskCreationGuard,
+    ConfiguredTaskCreationGuardConfig, DaemonCompositionError, DaemonProviders,
+    FounderVerdictConfigurationError, LocalUserPolicyResolver, LocalUserPolicyResolverConfig,
+    SharedAuthorityCompositionInputs, TaskAuthorityCommitReceiptSource,
+    VerificationAuthorityArtifactSource, VerificationProjectionSource,
 };
 
 /// Explicit scalar configuration for the local-user Policy resolver. The
@@ -61,6 +65,8 @@ pub struct LocalUserPolicyBootstrapConfig {
 pub struct ProductionBootstrapConfig {
     pub task: TaskAuthorityConfig,
     pub task_guard: ConfiguredTaskCreationGuardConfig,
+    pub artifact: ArtifactAuthorityConfig,
+    pub artifact_guard: ConfiguredArtifactAdmissionGuardConfig,
     pub verification: VerificationAuthorityConfig,
     pub policy: PolicyAuthorityConfig,
     pub policy_resolver: LocalUserPolicyBootstrapConfig,
@@ -110,6 +116,12 @@ impl ProductionBootstrapConfig {
     pub fn build(self) -> Result<DaemonProviders, ProductionBootstrapError> {
         let task_guard = ConfiguredTaskCreationGuard::new(self.task_guard)?;
         let task = Arc::new(Mutex::new(TaskAuthority::open(self.task, task_guard)?));
+
+        let artifact_guard = ConfiguredArtifactAdmissionGuard::new(self.artifact_guard)?;
+        let artifact = Arc::new(Mutex::new(ArtifactAuthority::open(
+            self.artifact,
+            artifact_guard,
+        )?));
 
         // Verification is intentionally opened with a deny-by-default
         // reference resolver until the reviewed Sego checker composition is
@@ -162,9 +174,12 @@ impl ProductionBootstrapConfig {
                 session_principal_resolver,
                 session_clock: Arc::new(SystemSessionClock),
                 session_audit: Arc::new(NoopSessionAuditSink),
-                additional_projection_sources: vec![Arc::new(
-                    VerificationProjectionSource::new_shared(Arc::clone(&verification)),
-                )],
+                additional_projection_sources: vec![
+                    Arc::new(ArtifactProjectionSource::new_shared(Arc::clone(&artifact))),
+                    Arc::new(VerificationProjectionSource::new_shared(Arc::clone(
+                        &verification,
+                    ))),
+                ],
             });
         providers = providers.with_codex_harness(self.codex)?;
         Ok(providers)
@@ -178,6 +193,7 @@ struct UserOwnedBootstrapFile {
     stores: StoreFiles,
     identity: IdentityFile,
     task_guard: TaskGuardFile,
+    artifact: ArtifactPolicyFile,
     policy: PolicyFile,
     founder: FounderFile,
     codex: CodexFile,
@@ -187,11 +203,21 @@ struct UserOwnedBootstrapFile {
 #[serde(deny_unknown_fields)]
 struct StoreFiles {
     task: StoreFile,
+    artifact: ArtifactStoreFile,
     verification: StoreFile,
     policy: StoreFile,
     verdict: StoreFile,
     adapter: StoreFile,
     collaboration: StoreFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactStoreFile {
+    database_path: String,
+    blob_root: String,
+    store_epoch: String,
+    key_env: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +248,18 @@ struct TaskGuardFile {
     allowed_target_scope_refs: Vec<String>,
     acceptance_contract_ref: ReferenceFile,
     budget_profile_ref: ReferenceFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactPolicyFile {
+    allowed_workspace_refs: Vec<String>,
+    allowed_artifact_type_refs: Vec<ReferenceFile>,
+    allowed_transformation_contract_refs: Vec<ReferenceFile>,
+    allowed_retention_profile_refs: Vec<ReferenceFile>,
+    allowed_claim_semantic_profile_refs: Vec<ReferenceFile>,
+    allowed_claim_acceptance_contract_refs: Vec<ReferenceFile>,
+    allowed_evidence_profile_refs: Vec<ReferenceFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -325,6 +363,7 @@ impl UserOwnedBootstrapFile {
             ));
         }
         let task_store = typed_store(self.stores.task, "task authority")?;
+        let artifact_store = typed_artifact_store(self.stores.artifact)?;
         let verification_store = typed_store(self.stores.verification, "verification authority")?;
         let policy_store = typed_store(self.stores.policy, "policy authority")?;
         let verdict_store = typed_store(self.stores.verdict, "verdict authority")?;
@@ -372,6 +411,49 @@ impl UserOwnedBootstrapFile {
             budget_profile_ref: self.task_guard.budget_profile_ref.into_typed(),
         };
 
+        let artifact_guard = ConfiguredArtifactAdmissionGuardConfig {
+            allowed_workspace_refs: non_empty_set(
+                self.artifact.allowed_workspace_refs,
+                "artifact.allowed_workspace_refs",
+            )?,
+            allowed_artifact_type_refs: self
+                .artifact
+                .allowed_artifact_type_refs
+                .into_iter()
+                .map(ReferenceFile::into_typed)
+                .collect(),
+            allowed_transformation_contract_refs: self
+                .artifact
+                .allowed_transformation_contract_refs
+                .into_iter()
+                .map(ReferenceFile::into_typed)
+                .collect(),
+            allowed_retention_profile_refs: self
+                .artifact
+                .allowed_retention_profile_refs
+                .into_iter()
+                .map(ReferenceFile::into_typed)
+                .collect(),
+            allowed_claim_semantic_profile_refs: self
+                .artifact
+                .allowed_claim_semantic_profile_refs
+                .into_iter()
+                .map(ReferenceFile::into_typed)
+                .collect(),
+            allowed_claim_acceptance_contract_refs: self
+                .artifact
+                .allowed_claim_acceptance_contract_refs
+                .into_iter()
+                .map(ReferenceFile::into_typed)
+                .collect(),
+            allowed_evidence_profile_refs: self
+                .artifact
+                .allowed_evidence_profile_refs
+                .into_iter()
+                .map(ReferenceFile::into_typed)
+                .collect(),
+        };
+
         let workflow = self.codex.workflow.into_typed()?;
         let codex = CodexHarnessCompositionConfig {
             collaboration_database_path: collaboration_store.database_path,
@@ -403,6 +485,13 @@ impl UserOwnedBootstrapFile {
                 key: SqlCipherKey::new(task_store.key),
             },
             task_guard,
+            artifact: ArtifactAuthorityConfig {
+                database_path: artifact_store.database_path,
+                blob_root: artifact_store.blob_root,
+                store_epoch: artifact_store.store_epoch,
+                key: ArtifactSqlCipherKey::new(artifact_store.key),
+            },
+            artifact_guard,
             verification: VerificationAuthorityConfig {
                 database_path: verification_store.database_path,
                 store_epoch: verification_store.store_epoch,
@@ -471,6 +560,27 @@ struct TypedStore {
     database_path: PathBuf,
     store_epoch: String,
     key: [u8; 32],
+}
+
+struct TypedArtifactStore {
+    database_path: PathBuf,
+    blob_root: PathBuf,
+    store_epoch: String,
+    key: [u8; 32],
+}
+
+fn typed_artifact_store(
+    value: ArtifactStoreFile,
+) -> Result<TypedArtifactStore, ProductionBootstrapError> {
+    Ok(TypedArtifactStore {
+        database_path: PathBuf::from(required(
+            value.database_path,
+            "artifact authority database path",
+        )?),
+        blob_root: PathBuf::from(required(value.blob_root, "artifact authority blob root")?),
+        store_epoch: required(value.store_epoch, "artifact authority store epoch")?,
+        key: secret_from_environment(&value.key_env)?,
+    })
 }
 
 fn typed_store(
@@ -763,6 +873,10 @@ pub enum ProductionBootstrapError {
     TaskGuard(#[from] crate::TaskCreationGuardConfigurationError),
     #[error("Task Authority could not be opened")]
     TaskAuthority(#[from] TaskAuthorityFailure),
+    #[error("Artifact admission guard configuration is invalid")]
+    ArtifactGuard(#[from] crate::ArtifactAdmissionGuardConfigurationError),
+    #[error("Artifact Authority could not be opened")]
+    ArtifactAuthority(#[from] ArtifactAuthorityFailure),
     #[error("Verification Authority could not be opened")]
     VerificationAuthority(#[from] VerificationAuthorityFailure),
     #[error("Adapter edge for Policy could not be opened")]

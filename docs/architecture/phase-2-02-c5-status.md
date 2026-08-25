@@ -99,6 +99,14 @@ all Claim/Evidence/Artifact members remain inside that set. The resolver cannot
 obtain an Artifact store or write handle. The implementation is pushed as
 `df37f09`.
 
+The production bootstrap now opens the Artifact Authority with the configured
+`ConfiguredArtifactAdmissionGuard`. Its user-owned configuration contains the
+artifact blob/database locations and explicit workspace, artifact-type,
+transformation, retention, claim, and evidence contract allowlists. The same
+owner handle is shared with the typed Artifact projection source. This closes
+the artifact admission prerequisite, but does not yet authorize Verification
+requests or Sego output.
+
 The local G4-06 verification suite currently passes all 13 tests, including
 Sego mapping, stale profile/input binding, checker policy rewrite rejection,
 timeout, crash, and output-limit probes. The existing supervisor and mapper
@@ -107,11 +115,11 @@ are therefore reused rather than duplicated.
 `with_codex_harness` and `ProductionBootstrapConfig::build` remain explicit
 production composition APIs and not implicit unsafe defaults. Verification
 remains deny-by-default for unreviewed external references until Sego/checker
-composition is supplied. The remaining integration is not just a path in the
-JSON file: agentosd still has no Local API Verification command port. A real
-Sego production path must therefore add the reviewed Verification vertical
-entry and compose its Artifact admission policy, supervised runner, mapper,
-and Authority commands as one unit. Until that vertical exists,
+composition is supplied. The remaining integration is not a path in the JSON
+file: agentosd still has no Local API Verification command port. A real Sego
+production path must therefore compose the Artifact owner read boundary,
+supervised runner, mapper, Verification Authority commands, and the existing
+system-only Task verification handoff as one unit. Until that vertical exists,
 `DenyVerificationReferences` stays active.
 
 ## Next unit: Phase 2-03

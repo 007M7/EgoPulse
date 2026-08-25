@@ -202,15 +202,20 @@ where
 }
 
 pub struct ArtifactProjectionSource<G, C> {
-    owner: Mutex<egopulse_artifact_authority::ArtifactAuthority<G, C>>,
+    owner: Arc<Mutex<egopulse_artifact_authority::ArtifactAuthority<G, C>>>,
 }
 
 impl<G, C> ArtifactProjectionSource<G, C> {
     #[must_use]
     pub fn new(owner: egopulse_artifact_authority::ArtifactAuthority<G, C>) -> Self {
-        Self {
-            owner: Mutex::new(owner),
-        }
+        Self::new_shared(Arc::new(Mutex::new(owner)))
+    }
+
+    #[must_use]
+    pub fn new_shared(
+        owner: Arc<Mutex<egopulse_artifact_authority::ArtifactAuthority<G, C>>>,
+    ) -> Self {
+        Self { owner }
     }
 }
 

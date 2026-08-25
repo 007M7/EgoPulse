@@ -6,6 +6,12 @@
       "store_epoch": "replace-task-epoch",
       "key_env": "EGOPULSE_TASK_KEY_HEX"
     },
+    "artifact": {
+      "database_path": "egopulse-data/artifact.db",
+      "blob_root": "egopulse-data/artifact-blobs",
+      "store_epoch": "replace-artifact-epoch",
+      "key_env": "EGOPULSE_ARTIFACT_KEY_HEX"
+    },
     "verification": {
       "database_path": "egopulse-data/verification.db",
       "store_epoch": "replace-verification-epoch",
@@ -66,6 +72,51 @@
       "version": "v1",
       "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
     }
+  },
+  "artifact": {
+    "allowed_workspace_refs": ["workspace:replace-me"],
+    "allowed_artifact_type_refs": [
+      {
+        "contract_id": "replace-artifact-type",
+        "version": "v1",
+        "sha256": "1919191919191919191919191919191919191919191919191919191919191919"
+      }
+    ],
+    "allowed_transformation_contract_refs": [
+      {
+        "contract_id": "replace-artifact-transformation",
+        "version": "v1",
+        "sha256": "2020202020202020202020202020202020202020202020202020202020202020"
+      }
+    ],
+    "allowed_retention_profile_refs": [
+      {
+        "contract_id": "replace-artifact-retention",
+        "version": "v1",
+        "sha256": "2121212121212121212121212121212121212121212121212121212121212121"
+      }
+    ],
+    "allowed_claim_semantic_profile_refs": [
+      {
+        "contract_id": "replace-claim-semantic-profile",
+        "version": "v1",
+        "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    ],
+    "allowed_claim_acceptance_contract_refs": [
+      {
+        "contract_id": "replace-claim-acceptance",
+        "version": "v1",
+        "sha256": "2323232323232323232323232323232323232323232323232323232323232323"
+      }
+    ],
+    "allowed_evidence_profile_refs": [
+      {
+        "contract_id": "replace-evidence-profile",
+        "version": "v1",
+        "sha256": "2424242424242424242424242424242424242424242424242424242424242424"
+      }
+    ]
   },
   "policy": {
     "authentication_context_ref": "local-ipc:windows-named-pipe",

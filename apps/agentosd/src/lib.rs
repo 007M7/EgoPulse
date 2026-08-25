@@ -63,7 +63,10 @@ mod security;
 mod task;
 mod verdict;
 
-pub use artifact::ArtifactAuthorityReferenceSource;
+pub use artifact::{
+    ArtifactAdmissionGuardConfigurationError, ArtifactAuthorityReferenceSource,
+    ConfiguredArtifactAdmissionGuard, ConfiguredArtifactAdmissionGuardConfig,
+};
 pub use bootstrap::{
     DenyVerificationReferences, LocalUserPolicyBootstrapConfig, ProductionBootstrapConfig,
     ProductionBootstrapError,

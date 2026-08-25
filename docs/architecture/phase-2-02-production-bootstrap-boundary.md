@@ -75,11 +75,11 @@ The agentosd composition now also contains
 `Arc<Mutex<ArtifactAuthority<...>>>` owner handle and implements the
 provider-neutral Verification read boundary. Storage failures are surfaced as
 unavailability and decode/blob failures as corruption; neither is converted
-into an empty or trusted result. This adapter is intentionally not wired into
-production bootstrap yet, because the production Artifact admission guard and
-its user-owned policy have not been frozen. Until that guard exists, the
-deny-by-default Verification resolver remains the only valid production
-choice.
+into an empty or trusted result. Production bootstrap now opens Artifact
+Authority with `ConfiguredArtifactAdmissionGuard` and the user-owned
+workspace/contract allowlists, and shares that same owner with the projection
+source. This establishes the artifact admission boundary without exposing a
+store handle to Verification.
 
 ## Owner boundary
 
@@ -126,6 +126,7 @@ reused; the three guards remain separate from identity mapping and from the
 client surfaces.
 
 The remaining Phase 2-02 obligation is the reviewed Sego/checker resolver
-composition and the production Artifact admission policy it depends on. Until
-then `DenyVerificationReferences` keeps Verification external requests held
-while allowing its own store and projection boundary to be composed.
+composition. `DenyVerificationReferences` still keeps Verification external
+requests held while allowing its own store and projection boundary to be
+composed; merely opening Artifact Authority must not turn that deny boundary
+into an implicit Sego authorization.
