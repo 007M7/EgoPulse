@@ -586,6 +586,15 @@ async fn run_tui_once(instance: &str) -> std::process::Output {
         .expect("run real egopulse TUI process")
 }
 
+async fn run_tui(instance: &str, arguments: &[&str]) -> std::process::Output {
+    Command::new(tui_executable())
+        .env("EGOPULSE_IPC_INSTANCE", instance)
+        .args(arguments)
+        .output()
+        .await
+        .expect("run real egopulse TUI command")
+}
+
 async fn wait_for_cli_status(instance: &str) -> std::process::Output {
     for _ in 0..80 {
         let output = run_cli(instance, &["status", "--json"]).await;
@@ -945,6 +954,47 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
     );
     let tui_stdout = String::from_utf8_lossy(&tui_output.stdout);
     assert!(tui_stdout.contains("EgoPulse TUI: connected"));
+
+    let tui_acceptance_sha = "44".repeat(32);
+    let tui_budget_sha = "55".repeat(32);
+    let tui_task_output = run_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "task-create",
+            "--work-type",
+            "c5-03-tui",
+            "--input-snapshot-id",
+            "input-c5-03-tui",
+            "--target-scope-ref",
+            "scope-c5-03-tui",
+            "--acceptance-contract-id",
+            "acceptance-c5-03-tui",
+            "--acceptance-contract-version",
+            "v0.1",
+            "--acceptance-contract-sha256",
+            tui_acceptance_sha.as_str(),
+            "--budget-profile-id",
+            "budget-c5-03-tui",
+            "--budget-profile-version",
+            "v0.1",
+            "--budget-profile-sha256",
+            tui_budget_sha.as_str(),
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        tui_task_output.status.success(),
+        "TUI task create must use the governed client kernel: stdout={} stderr={}",
+        String::from_utf8_lossy(&tui_task_output.stdout),
+        String::from_utf8_lossy(&tui_task_output.stderr)
+    );
+    let tui_task_json: serde_json::Value =
+        serde_json::from_slice(&tui_task_output.stdout).expect("TUI task JSON envelope");
+    assert_eq!(tui_task_json["operation"], "task.create");
+    assert_eq!(tui_task_json["data"]["replayed"], false);
 
     let task_watch = run_cli(&instance, &["task", "watch", "--frames", "1", "--json"]).await;
     assert!(
