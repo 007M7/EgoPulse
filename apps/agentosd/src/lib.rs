@@ -62,6 +62,7 @@ mod projections;
 mod security;
 mod task;
 mod verdict;
+mod verification;
 
 pub use artifact::{
     ArtifactAdmissionGuardConfigurationError, ArtifactAuthorityReferenceSource,
@@ -96,6 +97,11 @@ pub use verdict::{
     FounderVerdictConfigurationError, FounderVerificationEvidenceError,
     FounderVerificationEvidenceSource, TaskAuthorityCommitReceiptSource,
     VerificationAuthorityArtifactSource,
+};
+pub use verification::{
+    VerificationBindingTemplate, VerificationHandoffConsumeResult, VerificationHandoffIntake,
+    VerificationHandoffIntakeError, VerificationHandoffPlan, VerificationHandoffPlanError,
+    VerificationHandoffRequest,
 };
 
 #[derive(Clone, Debug)]

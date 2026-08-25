@@ -141,6 +141,16 @@ receive a direct Task database or repository handle. This closes the durable
 Task-to-Verification trigger without pretending that the full Sego production
 composition is complete.
 
+The internal `VerificationHandoffIntake` boundary now turns that handoff into a
+deterministic, digest-bound `CreateVerificationRequest` command. Its reviewed
+plan supplies only claim, semantic-profile, criterion and checker-profile
+facts; the Artifact Authority read boundary supplies the sealed manifest and
+lineage, which are checked against the Task revision before command creation.
+The intake ACKs the Task outbox only after Verification commits or idempotently
+replays. It is not yet installed in `ProductionBootstrapConfig`: that remains
+deny-by-default until a real Artifact-backed resolver, reviewed plan source,
+checker profile and Sego runner are composed together.
+
 `with_codex_harness` and `ProductionBootstrapConfig::build` remain explicit
 production composition APIs and not implicit unsafe defaults. Verification
 remains deny-by-default for unreviewed external references until Sego/checker
