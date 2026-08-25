@@ -88,11 +88,19 @@ source and does not alter the frozen four-layer system architecture.
 
 ## Next implementation slice
 
-The next code unit is a provider-neutral capability binding validator and its
-fixture matrix. It will validate the relationship between a `StepPlan`'s
-required capability profile and an active attested profile before any native
-driver is started. Only after that evidence is green will the second Harness
-driver be added.
+The provider-neutral capability binding validator and its G4-09 fixture matrix
+are closed. The next code unit is the shared Probe Gate: it validates the
+adapter identity, readiness enum, independent probe evidence and native
+protocol fingerprint before a `Ready` result can become capability-attestation
+input. This gate is implemented in `GovernedHarnessAdapter`, so a future Kimi
+or DeepSeek adapter cannot bypass it by returning a provider-specific success
+shape.
+
+After the Probe Gate is closed, the next work is a local Windows x64 candidate
+probe matrix. It records executable discovery, protocol/schema fingerprint,
+structured event support, approval behavior, cancellation, reconciliation and
+the semantic cost of any emulation. A candidate is not promoted to an active
+Harness merely because its process starts.
 
 ## G4-09 evidence recorded
 
@@ -110,6 +118,17 @@ negative paths in addition to the valid binding:
 - expired profile validity window.
 
 The local evidence is `crates/harness-adapter/tests/capability_binding_g4_09.rs`.
-It proves the pre-driver binding boundary only. It does not yet select a
-second Harness, open production Verification execution, or authorize a native
-driver; those remain subsequent Phase 2-03 work.
+It proves the pre-driver binding boundary only. It does not select a second
+Harness or open production Verification execution.
+
+## Shared Probe Gate evidence
+
+`GovernedHarnessAdapter::probe` now rejects a mismatched adapter identity
+before invoking the native driver. A driver result marked `Ready` is accepted
+only when it has a stable probe ID, observation time, evidence references and
+an observed protocol fingerprint matching both the request's expected schema
+and the adapter's expected fingerprint. Unknown readiness values and protocol
+drift fail closed as `ProtocolMismatch`.
+
+The provider-neutral unit evidence is in
+`crates/harness-adapter/src/runtime.rs` under `probe_tests`.

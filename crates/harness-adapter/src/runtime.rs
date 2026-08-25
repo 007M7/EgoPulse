@@ -7,8 +7,8 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     CancelExecutionEnvelope, CancelExecutionReceipt, CancelExecutionResult,
     CancellationDeliveryDisposition, DeliveryDisposition, DiagnosticObservation, DispatchEnvelope,
     DispatchReceipt, DispatchResult, HarnessError, HarnessErrorCode, HarnessObservation,
-    NativeProtocolFingerprint, ObservationCriticality, ProbeHarnessRequest, ProbeHarnessResult,
-    ResumeExecutionEnvelope, ResumeExecutionResult, approval_decision_result,
+    HarnessReadiness, NativeProtocolFingerprint, ObservationCriticality, ProbeHarnessRequest,
+    ProbeHarnessResult, ResumeExecutionEnvelope, ResumeExecutionResult, approval_decision_result,
     cancel_execution_result, dispatch_result, harness_observation, resume_execution_result,
 };
 use prost::Message;
@@ -147,6 +147,26 @@ pub trait NativeHarnessDriver {
     ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum ProbeValidationError {
+    #[error("probe result has no stable probe ID")]
+    ProbeIdMissing,
+    #[error("probe result has no observation timestamp")]
+    ObservationTimeMissing,
+    #[error("probe result marked ready without an observed protocol fingerprint")]
+    ObservedProtocolMissing,
+    #[error("probe result marked ready without evidence")]
+    EvidenceMissing,
+    #[error("probe result marked ready with an incomplete protocol fingerprint")]
+    ProtocolFingerprintIncomplete,
+    #[error(
+        "probe result marked ready with a protocol fingerprint that does not match the request"
+    )]
+    ProtocolFingerprintMismatch,
+    #[error("probe result contains an unknown readiness value")]
+    ReadinessInvalid,
+}
+
 #[derive(Debug, Error)]
 pub enum GovernedAdapterError {
     #[error("persisted adapter data could not be decoded")]
@@ -199,8 +219,24 @@ where
     }
 
     pub async fn probe(&mut self, request: &ProbeHarnessRequest) -> ProbeHarnessResult {
+        if request.adapter_id != self.adapter_id {
+            return invalid_probe_result(
+                None,
+                &self.observed_protocol,
+                "PROBE_ADAPTER_ID_MISMATCH",
+                self.clock.now(),
+            );
+        }
         match self.driver.probe(request).await {
-            Ok(result) => result,
+            Ok(result) => match validate_probe_result(request, &result, &self.observed_protocol) {
+                Ok(()) => result,
+                Err(error) => invalid_probe_result(
+                    Some(result),
+                    &self.observed_protocol,
+                    probe_validation_code(error),
+                    self.clock.now(),
+                ),
+            },
             Err(error) => ProbeHarnessResult {
                 probe_id: Uuid::now_v7().to_string(),
                 readiness: readiness_for_error(&error) as i32,
@@ -836,6 +872,94 @@ where
     }
 }
 
+/// Validates the provider-neutral part of a native Harness probe. Provider
+/// adapters may discover their own native details, but a Ready result must
+/// match the adapter's expected fingerprint before the result can become a
+/// capability attestation input.
+pub fn validate_probe_result(
+    request: &ProbeHarnessRequest,
+    result: &ProbeHarnessResult,
+    expected: &NativeProtocolFingerprint,
+) -> Result<(), ProbeValidationError> {
+    if result.probe_id.trim().is_empty() {
+        return Err(ProbeValidationError::ProbeIdMissing);
+    }
+    if result.observed_at.is_none() {
+        return Err(ProbeValidationError::ObservationTimeMissing);
+    }
+    let readiness = HarnessReadiness::try_from(result.readiness)
+        .map_err(|_| ProbeValidationError::ReadinessInvalid)?;
+    if readiness != HarnessReadiness::Ready {
+        return Ok(());
+    }
+    let observed = result
+        .observed_protocol
+        .as_ref()
+        .ok_or(ProbeValidationError::ObservedProtocolMissing)?;
+    if result.evidence_refs.is_empty() {
+        return Err(ProbeValidationError::EvidenceMissing);
+    }
+    if observed.protocol_name.trim().is_empty()
+        || observed.protocol_version.trim().is_empty()
+        || observed.schema_sha256.trim().is_empty()
+        || observed.adapter_version.trim().is_empty()
+        || observed.native_executable_version.trim().is_empty()
+    {
+        return Err(ProbeValidationError::ProtocolFingerprintIncomplete);
+    }
+    if observed.protocol_name != expected.protocol_name
+        || observed.protocol_version != expected.protocol_version
+        || !observed
+            .schema_sha256
+            .eq_ignore_ascii_case(&request.expected_protocol_schema_sha256)
+        || !observed
+            .schema_sha256
+            .eq_ignore_ascii_case(&expected.schema_sha256)
+        || observed.adapter_version != expected.adapter_version
+        || observed.native_executable_version != expected.native_executable_version
+    {
+        return Err(ProbeValidationError::ProtocolFingerprintMismatch);
+    }
+    Ok(())
+}
+
+fn probe_validation_code(error: ProbeValidationError) -> &'static str {
+    match error {
+        ProbeValidationError::ProbeIdMissing => "PROBE_ID_MISSING",
+        ProbeValidationError::ObservationTimeMissing => "PROBE_OBSERVED_AT_MISSING",
+        ProbeValidationError::ObservedProtocolMissing => "PROBE_PROTOCOL_MISSING",
+        ProbeValidationError::EvidenceMissing => "PROBE_EVIDENCE_MISSING",
+        ProbeValidationError::ProtocolFingerprintIncomplete => "PROBE_PROTOCOL_INCOMPLETE",
+        ProbeValidationError::ProtocolFingerprintMismatch => "PROBE_PROTOCOL_FINGERPRINT_MISMATCH",
+        ProbeValidationError::ReadinessInvalid => "PROBE_READINESS_INVALID",
+    }
+}
+
+fn invalid_probe_result(
+    result: Option<ProbeHarnessResult>,
+    expected: &NativeProtocolFingerprint,
+    diagnostic_code: &str,
+    observed_at: Timestamp,
+) -> ProbeHarnessResult {
+    let result = result.unwrap_or_default();
+    ProbeHarnessResult {
+        probe_id: if result.probe_id.trim().is_empty() {
+            Uuid::now_v7().to_string()
+        } else {
+            result.probe_id
+        },
+        readiness: HarnessReadiness::ProtocolMismatch as i32,
+        observed_protocol: result.observed_protocol.or_else(|| Some(expected.clone())),
+        safe_diagnostic_codes: result
+            .safe_diagnostic_codes
+            .into_iter()
+            .chain(std::iter::once(diagnostic_code.to_owned()))
+            .collect(),
+        evidence_refs: result.evidence_refs,
+        observed_at: Some(result.observed_at.unwrap_or(observed_at)),
+    }
+}
+
 fn dispatch_receipt(receipt: DispatchReceipt) -> DispatchResult {
     DispatchResult {
         outcome: Some(dispatch_result::Outcome::Receipt(receipt)),
@@ -1101,5 +1225,104 @@ fn _unimplemented_resume_boundary(_: &ResumeExecutionEnvelope) -> ResumeExecutio
             true,
             None,
         ))),
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    fn fingerprint() -> NativeProtocolFingerprint {
+        NativeProtocolFingerprint {
+            protocol_name: "fixture-native-protocol".to_owned(),
+            protocol_version: "v1".to_owned(),
+            schema_sha256: "ab".repeat(32),
+            adapter_version: "0.1.0".to_owned(),
+            native_executable_version: "fixture-1".to_owned(),
+            native_binary_sha256: None,
+        }
+    }
+
+    fn request() -> ProbeHarnessRequest {
+        ProbeHarnessRequest {
+            adapter_id: "fixture-adapter".to_owned(),
+            expected_protocol_schema_sha256: "ab".repeat(32),
+            ..ProbeHarnessRequest::default()
+        }
+    }
+
+    fn ready_result(protocol: NativeProtocolFingerprint) -> ProbeHarnessResult {
+        ProbeHarnessResult {
+            probe_id: "probe-001".to_owned(),
+            readiness: HarnessReadiness::Ready as i32,
+            observed_protocol: Some(protocol),
+            safe_diagnostic_codes: vec!["FIXTURE_READY".to_owned()],
+            evidence_refs: vec!["fixture://probe/001".to_owned()],
+            observed_at: Some(Timestamp {
+                seconds: 1,
+                nanos: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn accepts_ready_probe_when_fingerprint_and_evidence_match() {
+        let expected = fingerprint();
+        assert_eq!(
+            validate_probe_result(&request(), &ready_result(expected.clone()), &expected),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_ready_probe_with_protocol_drift() {
+        let expected = fingerprint();
+        let mut observed = expected.clone();
+        observed.schema_sha256 = "cd".repeat(32);
+        assert_eq!(
+            validate_probe_result(&request(), &ready_result(observed), &expected),
+            Err(ProbeValidationError::ProtocolFingerprintMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_ready_probe_without_independent_evidence() {
+        let expected = fingerprint();
+        let mut result = ready_result(expected.clone());
+        result.evidence_refs.clear();
+        assert_eq!(
+            validate_probe_result(&request(), &result, &expected),
+            Err(ProbeValidationError::EvidenceMissing)
+        );
+    }
+
+    #[test]
+    fn permits_non_ready_probe_to_report_unavailable_without_fingerprint() {
+        let expected = fingerprint();
+        let result = ProbeHarnessResult {
+            probe_id: "probe-002".to_owned(),
+            readiness: HarnessReadiness::Unavailable as i32,
+            observed_protocol: None,
+            observed_at: Some(Timestamp {
+                seconds: 1,
+                nanos: 0,
+            }),
+            ..ProbeHarnessResult::default()
+        };
+        assert_eq!(
+            validate_probe_result(&request(), &result, &expected),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_readiness_even_when_probe_is_otherwise_well_formed() {
+        let expected = fingerprint();
+        let mut result = ready_result(expected.clone());
+        result.readiness = 99;
+        assert_eq!(
+            validate_probe_result(&request(), &result, &expected),
+            Err(ProbeValidationError::ReadinessInvalid)
+        );
     }
 }
