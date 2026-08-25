@@ -35,7 +35,10 @@ const RPC_EXECUTE_VERDICT: &str = "LocalCommandGatewayService/ExecuteFounderVerd
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandPrincipal {
     pub principal_id: String,
-    pub authority_principal_kind: String,
+    /// The profile's accepted Authority principal kinds are propagated as a
+    /// set of constraints. The gateway must not select one because a Local
+    /// Session does not authenticate an Authority principal kind.
+    pub required_authority_principal_kinds: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -305,20 +308,18 @@ impl CommandGatewayApplication {
             .profiles
             .authorize_command(rpc, oneof, &session.permission_codes)
             .map_err(|failure| Box::new(profile_error(failure, correlation_id.clone())))?;
-        let authority_principal_kind = authorized
-            .required_authority_principal_kinds
-            .first()
-            .cloned()
-            .ok_or_else(|| {
-                Box::new(critical_error(
-                    "authority_principal_kind_missing",
-                    correlation_id,
-                ))
-            })?;
+        if authorized.required_authority_principal_kinds.is_empty() {
+            return Err(Box::new(critical_error(
+                "authority_principal_kind_missing",
+                correlation_id,
+            )));
+        }
         Ok(CommandContext {
             principal: CommandPrincipal {
                 principal_id: session.authenticated_principal_id.clone(),
-                authority_principal_kind,
+                required_authority_principal_kinds: authorized
+                    .required_authority_principal_kinds
+                    .clone(),
             },
             session,
             _authorized: authorized,
@@ -332,8 +333,21 @@ impl CommandGatewayApplication {
         target: Option<AwaitTarget>,
         correlation_id: String,
     ) -> (Option<ProjectionAwaitToken>, Option<LocalApiError>) {
-        let (Some(source_revision), Some(target)) = (source_revision, target) else {
-            return (None, None);
+        let (source_revision, target) = match (source_revision, target) {
+            (None, None) => return (None, None),
+            (Some(source_revision), Some(target)) => (source_revision, target),
+            _ => {
+                return (
+                    None,
+                    Some(api_error(
+                        LocalApiErrorCode::IntegrityFailure,
+                        "await_token_binding_incomplete",
+                        false,
+                        Some("RESTART_DAEMON"),
+                        correlation_id,
+                    )),
+                );
+            }
         };
         let scope = match ReadTokenScope::from_session(session) {
             Ok(scope) => scope,
