@@ -32,7 +32,16 @@ following empty `session/new` request was rejected with `Authentication
 required` and a terminal `login` auth method. Therefore the protocol boundary
 is real and structured, but the next session/lifecycle probe requires an
 explicitly authenticated user environment; no login was initiated by this
-probe.
+probe. The 2026-08-26 isolated Rust probe emitted the following safe,
+structured result:
+
+```json
+{"candidate":"kimi-cli","protocol":"agent-client-protocol","prompt_sent":false,"model_call":false,"initialize":"passed","session_disposition":"authentication_required"}
+```
+
+This result is evidence of a reachable and controlled authentication boundary;
+it is not evidence of prompt execution, approval routing, cancellation or
+restart reconciliation.
 
 The Rust candidate adapter now records this boundary through
 `KimiAcpDriver::probe_session`. It preserves the `initialize` probe result and
@@ -142,7 +151,8 @@ promote DSH to a production Harness on ACP lifecycle evidence alone.
 
 ## Candidate decision at this point
 
-Kimi is the next candidate for an authenticated lifecycle probe. DSH's
-isolated profile and keyless ACP lifecycle evidence are now recorded, but its
-native recovery limitation keeps it held. Neither candidate receives an active
-capability profile from this note. Codex remains the only production Harness.
+Kimi is the next candidate for an authenticated lifecycle probe. Its current
+no-prompt disposition is `authentication_required`. DSH's isolated profile and
+keyless ACP lifecycle evidence are now recorded, but its native recovery
+limitation keeps it held. Neither candidate receives an active capability
+profile from this note. Codex remains the only production Harness.

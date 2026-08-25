@@ -501,6 +501,14 @@ mod tests {
             .probe_session()
             .await
             .expect("Kimi ACP session probe");
+        let disposition = match &session.session {
+            KimiSessionProbeDisposition::Created { .. } => "created",
+            KimiSessionProbeDisposition::AuthenticationRequired { .. } => "authentication_required",
+            KimiSessionProbeDisposition::Rejected { .. } => "rejected",
+        };
+        println!(
+            "{{\"candidate\":\"kimi-cli\",\"protocol\":\"agent-client-protocol\",\"prompt_sent\":false,\"model_call\":false,\"initialize\":\"passed\",\"session_disposition\":\"{disposition}\"}}"
+        );
         assert!(matches!(
             session.session,
             KimiSessionProbeDisposition::Created { .. }

@@ -21,7 +21,7 @@ boundary is the provider-neutral `NativeHarnessDriver` plus
 | Candidate | Why consider it | Cost / what we give up | Current status |
 | --- | --- | --- | --- |
 | Codex app-server | Already has a native structured protocol, an implemented adapter, durable approval/recovery fixtures and a pinned probe fingerprint | The protocol is version-sensitive; we pay adapter maintenance for native schema drift and retain Codex-specific process supervision | Active production Harness |
-| Kimi CLI | Existing research indicates a useful CLI workflow and a possible second model family for local users | Unless its native protocol exposes structured lifecycle, approval and reconciliation semantics, an adapter may degrade to process-only or emulated support; that weakens recovery guarantees | Candidate; authenticated lifecycle probe required |
+| Kimi CLI | Existing research indicates a useful CLI workflow and a possible second model family for local users; the ACP initialize/session boundary is locally reachable | The current isolated `session/new` requires authentication, so prompt, approval, cancellation and reconciliation semantics remain unproven; an adapter may otherwise degrade to process-only or emulated support | Candidate held at `authentication_required`; authenticated lifecycle probe required |
 | DeepSeek Harness | Local source is available for study and it is relevant to the planned multi-model product surface | Its internal event/runtime model is not automatically the EgoPulse contract; integrating it may create a large TypeScript/runtime coupling and unclear native recovery semantics | Candidate held; native recovery unsupported |
 
 The selection is intentionally not “the one with the most SDK code”. The
@@ -42,7 +42,8 @@ candidate ACP lifecycle evidence, but its recovery row is an explicit hold.
 
 The follow-up protocol observations are recorded in
 `phase-2-03-protocol-boundary-evidence-2026-08-26.md`. Kimi remains the next
-candidate for an authenticated lifecycle probe. DSH's isolated profile,
+candidate for an authenticated lifecycle probe; its current no-prompt probe
+is explicitly recorded as `authentication_required`. DSH's isolated profile,
 session creation, multi-turn prompt and cancellation probes pass, while its
 native recovery limitation keeps it held.
 
