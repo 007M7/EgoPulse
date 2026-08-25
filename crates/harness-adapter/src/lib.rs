@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 #![allow(async_fn_in_trait)]
 
+mod capability;
 mod edge;
 mod runtime;
 
+pub use capability::{CapabilityBindingError, validate_capability_binding};
 pub use edge::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeInspection, AdapterEdgeKey,
     AdapterObservationEvidence, DispatchPreparation, DurableWritePreparation,
