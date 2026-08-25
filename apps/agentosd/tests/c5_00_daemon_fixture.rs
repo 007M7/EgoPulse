@@ -1151,6 +1151,92 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
         "approval-c5-03"
     );
 
+    let tui_verdict_output = run_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "verdict-issue",
+            "--task-id",
+            "task-c5-03",
+            "--task-revision",
+            "1",
+            "--work-revision",
+            "1",
+            "--artifact-set-id",
+            "artifact-c5-03-tui",
+            "--artifact-set-manifest-sha256",
+            "66c5a1f0a0fbcdbb7f47c8a3fbe2f31e3a6a6b5f8e3f5c0b8b5d86b5c9a4e102",
+            "--artifact-set-manifest-byte-length",
+            "128",
+            "--verification-artifact-id",
+            "verification-c5-03-tui",
+            "--verification-payload-sha256",
+            "77c5a1f0a0fbcdbb7f47c8a3fbe2f31e3a6a6b5f8e3f5c0b8b5d86b5c9a4e102",
+            "--verification-payload-byte-length",
+            "256",
+            "--acceptance-contract-id",
+            "acceptance-c5-03-tui",
+            "--acceptance-contract-version",
+            "v0.1",
+            "--acceptance-contract-sha256",
+            "88c5a1f0a0fbcdbb7f47c8a3fbe2f31e3a6a6b5f8e3f5c0b8b5d86b5c9a4e102",
+            "--decision",
+            "accept",
+            "--observed-verification-conclusion",
+            "passed",
+            "--reason-code",
+            "c5-03-tui-accepted",
+            "--confirmation-class",
+            "explicit",
+            "--confirmation-proof-ref",
+            "confirmation-c5-03",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        tui_verdict_output.status.success(),
+        "TUI verdict issue must use the governed client kernel: stdout={} stderr={}",
+        String::from_utf8_lossy(&tui_verdict_output.stdout),
+        String::from_utf8_lossy(&tui_verdict_output.stderr)
+    );
+    let tui_verdict_json: serde_json::Value =
+        serde_json::from_slice(&tui_verdict_output.stdout).expect("TUI verdict JSON envelope");
+    assert_eq!(tui_verdict_json["operation"], "verdict.issue");
+    assert_eq!(tui_verdict_json["data"]["committed"], true);
+    let tui_verdict_id = tui_verdict_json["data"]["founderVerdictId"]
+        .as_str()
+        .expect("TUI issued Founder Verdict id");
+    let tui_verdict_revoke_output = run_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "verdict-revoke",
+            tui_verdict_id,
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "c5-03-tui-revoked",
+            "--confirmation-proof-ref",
+            "c5-03-founder-revoke-proof",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        tui_verdict_revoke_output.status.success(),
+        "TUI verdict revoke must use the governed client kernel: stdout={} stderr={}",
+        String::from_utf8_lossy(&tui_verdict_revoke_output.stdout),
+        String::from_utf8_lossy(&tui_verdict_revoke_output.stderr)
+    );
+    let tui_verdict_revoke_json: serde_json::Value =
+        serde_json::from_slice(&tui_verdict_revoke_output.stdout)
+            .expect("TUI verdict revoke JSON envelope");
+    assert_eq!(tui_verdict_revoke_json["operation"], "verdict.revoke");
+    assert_eq!(tui_verdict_revoke_json["data"]["committed"], true);
+
     let verdict_acceptance_sha = "55".repeat(32);
     let verdict_output = run_cli(
         &instance,

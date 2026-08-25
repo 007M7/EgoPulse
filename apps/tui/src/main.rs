@@ -14,14 +14,15 @@ use crossterm::{
 };
 use egopulse_client_kernel::ClientKernel;
 use egopulse_domain_contracts::v01::egopulse::{
+    artifact::v1::{ContentAddress, HashAlgorithm},
     common::v1::{CommandMetadata, ContractReference},
     harness::v1::ApprovalDecision,
     harness::v1::ApprovalRequestLifecycleKind,
     localapi::v1::{
         AwaitProjectionRequest, ClientSurface, DecideHarnessApprovalRequest,
-        ExecuteTaskCommandRequest, GetProjectionStatusRequest, HarnessApprovalView,
-        ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiErrorCode,
-        ProjectionAwaitToken, ProjectionHealth, SourceRevision, TaskView,
+        ExecuteFounderVerdictRequest, ExecuteTaskCommandRequest, GetProjectionStatusRequest,
+        HarnessApprovalView, ListHarnessApprovalViewsRequest, ListTaskViewsRequest,
+        LocalApiErrorCode, ProjectionAwaitToken, ProjectionHealth, SourceRevision, TaskView,
         await_projection_response,
     },
     policy::v1::{
@@ -29,6 +30,11 @@ use egopulse_domain_contracts::v01::egopulse::{
     },
     task::v1::TaskStatus,
     task::v1::{CreateTaskCommand, TaskCommand, task_command, task_command_result},
+    verdict::v1::{
+        FounderVerdictDecision, IssueFounderVerdictCommand, RevokeFounderVerdictCommand,
+        VerdictCommand, VerdictScope, verdict_command,
+    },
+    verification::v1::VerificationConclusion,
 };
 use egopulse_local_api::{LocalApiClient, LocalApiConnection, LocalIpcAddress};
 use prost::Message;
@@ -110,6 +116,57 @@ enum TuiCommand {
         token_json: String,
         #[arg(long, default_value_t = 5000)]
         timeout_milliseconds: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit the user-owned issue_founder_verdict branch.
+    VerdictIssue {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long)]
+        task_revision: u64,
+        #[arg(long)]
+        work_revision: u64,
+        #[arg(long)]
+        artifact_set_id: String,
+        #[arg(long)]
+        artifact_set_manifest_sha256: String,
+        #[arg(long)]
+        artifact_set_manifest_byte_length: u64,
+        #[arg(long)]
+        verification_artifact_id: String,
+        #[arg(long)]
+        verification_payload_sha256: String,
+        #[arg(long)]
+        verification_payload_byte_length: u64,
+        #[arg(long)]
+        acceptance_contract_id: String,
+        #[arg(long)]
+        acceptance_contract_version: String,
+        #[arg(long)]
+        acceptance_contract_sha256: String,
+        #[arg(long)]
+        decision: String,
+        #[arg(long)]
+        observed_verification_conclusion: String,
+        #[arg(long)]
+        reason_code: String,
+        #[arg(long, default_value = "explicit")]
+        confirmation_class: String,
+        #[arg(long)]
+        confirmation_proof_ref: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit the user-owned revoke_founder_verdict branch.
+    VerdictRevoke {
+        founder_verdict_id: String,
+        #[arg(long)]
+        expected_state_revision: u64,
+        #[arg(long)]
+        reason_code: String,
+        #[arg(long)]
+        confirmation_proof_ref: String,
         #[arg(long)]
         json: bool,
     },
@@ -541,6 +598,198 @@ async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> 
                 None => Err("await outcome missing".to_owned()),
             }
         }
+        TuiCommand::VerdictIssue {
+            task_id,
+            task_revision,
+            work_revision,
+            artifact_set_id,
+            artifact_set_manifest_sha256,
+            artifact_set_manifest_byte_length,
+            verification_artifact_id,
+            verification_payload_sha256,
+            verification_payload_byte_length,
+            acceptance_contract_id,
+            acceptance_contract_version,
+            acceptance_contract_sha256,
+            decision,
+            observed_verification_conclusion,
+            reason_code,
+            confirmation_class,
+            confirmation_proof_ref,
+            json,
+        } => {
+            let decision = parse_verdict_decision(&decision)?;
+            let conclusion = parse_verification_conclusion(&observed_verification_conclusion)?;
+            let confirmation_class = parse_confirmation_class(&confirmation_class)?;
+            let attached = AttachedClient::open(instance).await?;
+            attached.require_command(
+                "LocalCommandGatewayService/ExecuteFounderVerdict",
+                "issue_founder_verdict",
+            )?;
+            let correlation_id = Uuid::now_v7().to_string();
+            let mut command = VerdictCommand {
+                command: Some(verdict_command::Command::IssueFounderVerdict(
+                    IssueFounderVerdictCommand {
+                        metadata: Some(command_metadata(
+                            &correlation_id,
+                            "egopulse-tui/verdict-issue",
+                        )),
+                        scope: Some(VerdictScope {
+                            task_id,
+                            task_revision,
+                            work_revision,
+                            artifact_set_id,
+                            artifact_set_manifest: Some(ContentAddress {
+                                algorithm: HashAlgorithm::Sha256 as i32,
+                                digest: artifact_set_manifest_sha256,
+                                byte_length: artifact_set_manifest_byte_length,
+                            }),
+                            verification_artifact_id,
+                            verification_payload: Some(ContentAddress {
+                                algorithm: HashAlgorithm::Sha256 as i32,
+                                digest: verification_payload_sha256,
+                                byte_length: verification_payload_byte_length,
+                            }),
+                            acceptance_contract_ref: Some(ContractReference {
+                                contract_id: acceptance_contract_id,
+                                version: acceptance_contract_version,
+                                sha256: acceptance_contract_sha256,
+                            }),
+                        }),
+                        decision,
+                        observed_verification_conclusion: conclusion,
+                        risk_acceptances: Vec::new(),
+                        rework_directive: None,
+                        reason_code,
+                        rationale_artifact_id: None,
+                        required_confirmation_class: confirmation_class,
+                        confirmation_proof_ref,
+                        expires_at: Some(timestamp_after(Duration::from_secs(3600))),
+                        supersedes_founder_verdict_id: None,
+                    },
+                )),
+            };
+            set_verdict_digest(&mut command);
+            let response = attached
+                .connection
+                .command_gateway_service()
+                .execute_founder_verdict(ExecuteFounderVerdictRequest {
+                    client: Some(attached.metadata_with_correlation(correlation_id.clone())?),
+                    command: Some(command),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .into_inner();
+            if let Some(error) = response.gateway_error {
+                return Err(local_error_message(error));
+            }
+            let result = response
+                .authority_result
+                .ok_or_else(|| "Founder Verdict authority result missing".to_owned())?;
+            if result.error_code != 0 {
+                return Err(format!("verdict authority rejected: {}", result.error_code));
+            }
+            let verdict_id = result
+                .verdict
+                .as_ref()
+                .map(|verdict| verdict.founder_verdict_id.clone());
+            let payload = json!({
+                "schemaVersion": "egopulse.tui-result/v0.1",
+                "ok": true,
+                "operation": "verdict.issue",
+                "data": {
+                    "committed": result.committed,
+                    "replayed": result.replayed,
+                    "founderVerdictId": verdict_id,
+                    "stateRevision": result.state.as_ref().map(|state| state.revision),
+                    "awaitToken": await_token_json(response.await_token),
+                },
+                "correlationId": correlation_id,
+            });
+            if json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                println!(
+                    "TUI Founder Verdict issued: id={} committed={} replayed={}",
+                    payload["data"]["founderVerdictId"].as_str().unwrap_or(""),
+                    payload["data"]["committed"].as_bool().unwrap_or(false),
+                    payload["data"]["replayed"].as_bool().unwrap_or(false),
+                );
+            }
+            Ok(())
+        }
+        TuiCommand::VerdictRevoke {
+            founder_verdict_id,
+            expected_state_revision,
+            reason_code,
+            confirmation_proof_ref,
+            json,
+        } => {
+            let attached = AttachedClient::open(instance).await?;
+            attached.require_command(
+                "LocalCommandGatewayService/ExecuteFounderVerdict",
+                "revoke_founder_verdict",
+            )?;
+            let correlation_id = Uuid::now_v7().to_string();
+            let mut command = VerdictCommand {
+                command: Some(verdict_command::Command::RevokeFounderVerdict(
+                    RevokeFounderVerdictCommand {
+                        metadata: Some(command_metadata(
+                            &correlation_id,
+                            "egopulse-tui/verdict-revoke",
+                        )),
+                        founder_verdict_id,
+                        expected_state_revision,
+                        reason_code,
+                        confirmation_proof_ref,
+                    },
+                )),
+            };
+            set_verdict_digest(&mut command);
+            let response = attached
+                .connection
+                .command_gateway_service()
+                .execute_founder_verdict(ExecuteFounderVerdictRequest {
+                    client: Some(attached.metadata_with_correlation(correlation_id.clone())?),
+                    command: Some(command),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .into_inner();
+            if let Some(error) = response.gateway_error {
+                return Err(local_error_message(error));
+            }
+            let result = response
+                .authority_result
+                .ok_or_else(|| "Founder Verdict authority result missing".to_owned())?;
+            if result.error_code != 0 {
+                return Err(format!("verdict authority rejected: {}", result.error_code));
+            }
+            let payload = json!({
+                "schemaVersion": "egopulse.tui-result/v0.1",
+                "ok": true,
+                "operation": "verdict.revoke",
+                "data": {
+                    "committed": result.committed,
+                    "replayed": result.replayed,
+                    "founderVerdictId": result.state.as_ref().map(|state| state.founder_verdict_id.clone()),
+                    "stateRevision": result.state.as_ref().map(|state| state.revision),
+                    "awaitToken": await_token_json(response.await_token),
+                },
+                "correlationId": correlation_id,
+            });
+            if json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                println!(
+                    "TUI Founder Verdict revoked: id={} committed={} replayed={}",
+                    payload["data"]["founderVerdictId"].as_str().unwrap_or(""),
+                    payload["data"]["committed"].as_bool().unwrap_or(false),
+                    payload["data"]["replayed"].as_bool().unwrap_or(false),
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -594,12 +843,83 @@ fn set_policy_digest(command: &mut PolicyDecisionCommand) {
     }
 }
 
+fn set_verdict_digest(command: &mut VerdictCommand) {
+    let mut canonical = command.clone();
+    match canonical.command.as_mut() {
+        Some(verdict_command::Command::IssueFounderVerdict(issue)) => {
+            clear_command_metadata(issue.metadata.as_mut());
+        }
+        Some(verdict_command::Command::RevokeFounderVerdict(revoke)) => {
+            clear_command_metadata(revoke.metadata.as_mut());
+        }
+        _ => {}
+    }
+    let digest = hex::encode(Sha256::digest(canonical.encode_to_vec()));
+    match command.command.as_mut() {
+        Some(verdict_command::Command::IssueFounderVerdict(issue)) => {
+            issue
+                .metadata
+                .as_mut()
+                .expect("TUI always supplies verdict command metadata")
+                .request_digest_sha256 = digest;
+        }
+        Some(verdict_command::Command::RevokeFounderVerdict(revoke)) => {
+            revoke
+                .metadata
+                .as_mut()
+                .expect("TUI always supplies verdict command metadata")
+                .request_digest_sha256 = digest;
+        }
+        _ => {}
+    }
+}
+
+fn clear_command_metadata(metadata: Option<&mut CommandMetadata>) {
+    if let Some(metadata) = metadata {
+        metadata.command_id.clear();
+        metadata.request_digest_sha256.clear();
+        metadata.issued_at = None;
+        metadata.correlation_id.clear();
+        metadata.causation_id = None;
+    }
+}
+
 fn parse_approval_decision(value: &str) -> Result<i32, String> {
     match value {
         "allow-once" => Ok(ApprovalDecision::AllowOnce as i32),
         "deny" => Ok(ApprovalDecision::Deny as i32),
         "cancel-attempt" => Ok(ApprovalDecision::CancelAttempt as i32),
         _ => Err("decision must be allow-once, deny, or cancel-attempt".to_owned()),
+    }
+}
+
+fn parse_verdict_decision(value: &str) -> Result<i32, String> {
+    match value {
+        "accept" => Ok(FounderVerdictDecision::Accept as i32),
+        "rework" => Ok(FounderVerdictDecision::Rework as i32),
+        "reject" => Ok(FounderVerdictDecision::Reject as i32),
+        _ => Err("decision must be accept, rework, or reject".to_owned()),
+    }
+}
+
+fn parse_verification_conclusion(value: &str) -> Result<i32, String> {
+    match value {
+        "passed" => Ok(VerificationConclusion::Passed as i32),
+        "failed" => Ok(VerificationConclusion::Failed as i32),
+        "partial" => Ok(VerificationConclusion::Partial as i32),
+        "indeterminate" => Ok(VerificationConclusion::Indeterminate as i32),
+        _ => Err(
+            "observed verification conclusion must be passed, failed, partial, or indeterminate"
+                .to_owned(),
+        ),
+    }
+}
+
+fn parse_confirmation_class(value: &str) -> Result<i32, String> {
+    match value {
+        "explicit" => Ok(1),
+        "elevated-risk-acceptance" => Ok(2),
+        _ => Err("confirmation class must be explicit or elevated-risk-acceptance".to_owned()),
     }
 }
 
@@ -695,6 +1015,14 @@ fn now_timestamp() -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: duration.as_secs() as i64,
         nanos: duration.subsec_nanos() as i32,
+    }
+}
+
+fn timestamp_after(duration: Duration) -> prost_types::Timestamp {
+    let now = now_timestamp();
+    prost_types::Timestamp {
+        seconds: now.seconds + duration.as_secs() as i64,
+        nanos: now.nanos,
     }
 }
 
