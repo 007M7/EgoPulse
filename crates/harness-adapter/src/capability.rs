@@ -1,9 +1,26 @@
 use egopulse_domain_contracts::v01::egopulse::{
+    collaboration::v1::StepPlan,
     common::v1::ContractReference,
     harness::v1::{AttestationLevel, CapabilityProfile, CapabilityProfileStatus},
 };
 use prost_types::Timestamp;
 use thiserror::Error;
+
+/// Validates the immutable workflow-to-Harness capability binding before a
+/// native driver is started. It does not select a provider and it does not
+/// inspect provider-private protocol data.
+pub fn validate_step_capability_binding(
+    step: &StepPlan,
+    model_family_selector: &str,
+    profile: &CapabilityProfile,
+    now: &Timestamp,
+) -> Result<(), CapabilityBindingError> {
+    let required_profile_ref = step
+        .required_capability_profile_ref
+        .as_ref()
+        .ok_or(CapabilityBindingError::RequiredProfileMissing)?;
+    validate_capability_binding(required_profile_ref, model_family_selector, profile, now)
+}
 
 /// Validates the immutable workflow-to-Harness capability binding before a
 /// native driver is started. It does not select a provider and it does not
@@ -68,6 +85,8 @@ pub fn validate_capability_binding(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
 pub enum CapabilityBindingError {
+    #[error("workflow step does not declare a required capability profile")]
+    RequiredProfileMissing,
     #[error("capability binding requirement is incomplete or malformed")]
     InvalidRequirement,
     #[error("capability profile ID or digest does not match the workflow binding")]

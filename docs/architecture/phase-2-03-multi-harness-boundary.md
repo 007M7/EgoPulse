@@ -94,3 +94,22 @@ required capability profile and an active attested profile before any native
 driver is started. Only after that evidence is green will the second Harness
 driver be added.
 
+## G4-09 evidence recorded
+
+The provider-neutral validator now accepts the workflow `StepPlan` directly:
+`validate_step_capability_binding` requires a non-empty, digest-addressed
+`required_capability_profile_ref` and delegates the remaining checks to the
+existing capability validator. The fixture matrix covers the following
+negative paths in addition to the valid binding:
+
+- missing required profile binding;
+- profile or digest drift;
+- inactive profile;
+- declaration-only profile without probe attestation;
+- model-family selector drift;
+- expired profile validity window.
+
+The local evidence is `crates/harness-adapter/tests/capability_binding_g4_09.rs`.
+It proves the pre-driver binding boundary only. It does not yet select a
+second Harness, open production Verification execution, or authorize a native
+driver; those remain subsequent Phase 2-03 work.

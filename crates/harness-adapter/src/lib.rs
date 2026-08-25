@@ -5,7 +5,9 @@ mod capability;
 mod edge;
 mod runtime;
 
-pub use capability::{CapabilityBindingError, validate_capability_binding};
+pub use capability::{
+    CapabilityBindingError, validate_capability_binding, validate_step_capability_binding,
+};
 pub use edge::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeInspection, AdapterEdgeKey,
     AdapterObservationEvidence, DispatchPreparation, DurableWritePreparation,
