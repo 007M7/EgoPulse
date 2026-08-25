@@ -55,6 +55,12 @@ are command-line parsing, terminal interaction, rendering, and user-facing
 error presentation. The shared client snapshot path and the real Windows IPC
 fixture both pass locally; no surface-specific write authority was introduced.
 
+The TUI command surface now also exposes the read-only `evidence.get` operation
+through `GetEvidenceGraph`, matching the CLI's Evidence Graph boundary. It
+returns only redacted graph counts and references; it does not add an evidence
+write path or bypass the read-model permission check. Local TUI tests cover the
+form-to-operation mapping.
+
 ## Composition root boundary
 
 The normal `agentosd` binary now loads the reusable `ProductionBootstrapConfig`
