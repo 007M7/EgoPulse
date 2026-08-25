@@ -1,6 +1,8 @@
+mod adapter_evidence;
 mod ingestion;
 mod store;
 
+pub use adapter_evidence::AdapterBackedHarnessEvidenceResolver;
 pub use ingestion::{HarnessFactIngestionDisposition, HarnessFactIngestionResult};
 
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
