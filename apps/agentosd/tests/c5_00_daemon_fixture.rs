@@ -797,6 +797,102 @@ async fn c5_04_real_cli_fails_closed_on_daemon_restart_and_reconnects() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c5_04_real_cli_rejects_malformed_await_and_stale_approval_without_partial_commit() {
+    let root = std::env::temp_dir().join(format!(
+        "egopulse-c5-04-contract-recovery-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&root).expect("create C5 contract recovery fixture root");
+    let instance = format!("c5-04-contract-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, "allow").await;
+    let ready = wait_for_cli_status(&instance).await;
+    assert!(ready.status.success());
+
+    let malformed = run_cli(
+        &instance,
+        &["await", "--token-json", r#"{"token":"broken"}"#, "--json"],
+    )
+    .await;
+    assert_eq!(malformed.status.code(), Some(70));
+    let malformed_json: serde_json::Value =
+        serde_json::from_slice(&malformed.stdout).expect("malformed await JSON envelope");
+    assert_eq!(malformed_json["operation"], "await");
+    assert_eq!(malformed_json["error"]["code"], "LOCAL_API_PROTOCOL_ERROR");
+    assert_eq!(malformed_json["data"], serde_json::Value::Null);
+
+    let stale = run_cli(
+        &instance,
+        &[
+            "approval",
+            "decide",
+            "approval-c5-03",
+            "--expected-action-digest-sha256",
+            &"33".repeat(32),
+            "--expected-request-observation-id",
+            "observation-c5-03",
+            "--expected-request-observation-sequence",
+            "1",
+            "--expected-request-revision",
+            "2",
+            "--decision",
+            "allow-once",
+            "--reason-code",
+            "c5-04-stale",
+            "--confirmation-proof-ref",
+            "confirmation-c5-04-stale",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(stale.status.code(), Some(6));
+    let stale_json: serde_json::Value =
+        serde_json::from_slice(&stale.stdout).expect("stale approval JSON envelope");
+    assert_eq!(stale_json["operation"], "approval.decide");
+    assert_eq!(stale_json["error"]["code"], "POLICY_AUTHORITY_REJECTED");
+    assert_eq!(stale_json["data"], serde_json::Value::Null);
+
+    let accepted = run_cli(
+        &instance,
+        &[
+            "approval",
+            "decide",
+            "approval-c5-03",
+            "--expected-action-digest-sha256",
+            &"33".repeat(32),
+            "--expected-request-observation-id",
+            "observation-c5-03",
+            "--expected-request-observation-sequence",
+            "1",
+            "--expected-request-revision",
+            "1",
+            "--decision",
+            "allow-once",
+            "--reason-code",
+            "c5-04-accepted-after-stale",
+            "--confirmation-proof-ref",
+            "confirmation-c5-04-accepted",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        accepted.status.success(),
+        "stale rejection must not consume the approval: stdout={} stderr={}",
+        String::from_utf8_lossy(&accepted.stdout),
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let accepted_json: serde_json::Value =
+        serde_json::from_slice(&accepted.stdout).expect("accepted approval JSON envelope");
+    assert_eq!(accepted_json["data"]["committed"], true);
+    assert_eq!(accepted_json["data"]["replayed"], false);
+
+    drop(child.stdin.take());
+    let status = child.wait().await.expect("fixture child exit");
+    assert!(status.success(), "fixture child failed: {status}");
+    fs::remove_dir_all(&root).expect("remove C5 contract recovery fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
     let root = std::env::temp_dir().join(format!("egopulse-c5-03-allow-{}", Uuid::now_v7()));
     fs::create_dir_all(&root).expect("create C5 successful CLI fixture root");
