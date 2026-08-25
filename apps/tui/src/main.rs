@@ -23,8 +23,9 @@ use egopulse_domain_contracts::v01::egopulse::{
     harness::v1::ApprovalRequestLifecycleKind,
     localapi::v1::{
         AwaitProjectionRequest, DecideHarnessApprovalRequest, ExecuteFounderVerdictRequest,
-        ExecuteTaskCommandRequest, HarnessApprovalView, LocalApiErrorCode, ProjectionAwaitToken,
-        ProjectionHealth, SourceRevision, TaskView, await_projection_response,
+        ExecuteTaskCommandRequest, GetEvidenceGraphRequest, HarnessApprovalView, LocalApiErrorCode,
+        ProjectionAwaitToken, ProjectionHealth, SourceRevision, TaskView,
+        await_projection_response, get_evidence_graph_response,
     },
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
@@ -169,6 +170,14 @@ enum TuiCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Read a redacted Evidence Graph through the same local read model as the CLI.
+    EvidenceGet {
+        task_id: String,
+        #[arg(long)]
+        artifact_set_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,15 +211,17 @@ enum CommandKind {
     Await,
     VerdictIssue,
     VerdictRevoke,
+    EvidenceGet,
 }
 
 impl CommandKind {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::TaskCreate,
         Self::ApprovalDecide,
         Self::Await,
         Self::VerdictIssue,
         Self::VerdictRevoke,
+        Self::EvidenceGet,
     ];
 
     const fn label(self) -> &'static str {
@@ -220,6 +231,7 @@ impl CommandKind {
             Self::Await => "Await projection",
             Self::VerdictIssue => "Issue Founder Verdict",
             Self::VerdictRevoke => "Revoke Founder Verdict",
+            Self::EvidenceGet => "Read Evidence Graph",
         }
     }
 }
@@ -314,6 +326,10 @@ impl CommandForm {
                 FormField::required("expected-state-revision").with_value("1"),
                 FormField::required("reason-code"),
                 FormField::required("confirmation-proof-ref"),
+            ],
+            CommandKind::EvidenceGet => vec![
+                FormField::required("task-id"),
+                FormField::required("artifact-set-id"),
             ],
         };
         Self {
@@ -435,6 +451,11 @@ impl CommandForm {
                 confirmation_proof_ref: next(&mut values, "confirmation-proof-ref")?,
                 json: false,
             }),
+            CommandKind::EvidenceGet => Ok(TuiCommand::EvidenceGet {
+                task_id: next(&mut values, "task-id")?,
+                artifact_set_id: next(&mut values, "artifact-set-id")?,
+                json: false,
+            }),
         }
     }
 }
@@ -481,6 +502,12 @@ impl AttachedClient {
         self.0
             .require_command(rpc, oneof)
             .map_err(|error| error.to_string())
+    }
+
+    fn require_rpc(&self, rpc: &str, operation: &str) -> Result<(), String> {
+        self.0
+            .require_rpc(rpc)
+            .map_err(|error| format!("{operation}: {error}"))
     }
 
     async fn snapshot(&self) -> Result<Snapshot, String> {
@@ -1001,6 +1028,71 @@ async fn run_command_with_output(
             }
             Ok(())
         }
+        TuiCommand::EvidenceGet {
+            task_id,
+            artifact_set_id,
+            json,
+        } => {
+            let attached = AttachedClient::open(instance).await?;
+            attached.require_rpc("LocalReadModelService/GetEvidenceGraph", "evidence.get")?;
+            let correlation_id = Uuid::now_v7().to_string();
+            let response = attached
+                .0
+                .connection
+                .read_model_service()
+                .get_evidence_graph(GetEvidenceGraphRequest {
+                    client: Some(attached.metadata_with_correlation(correlation_id.clone())?),
+                    task_id,
+                    artifact_set_id,
+                    minimum_position: None,
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .into_inner();
+            let graph = match response.outcome {
+                Some(get_evidence_graph_response::Outcome::Graph(graph)) => graph,
+                Some(get_evidence_graph_response::Outcome::Error(error)) => {
+                    return Err(local_error_message(error));
+                }
+                None => return Err("evidence graph outcome missing".to_owned()),
+            };
+            let payload = json!({
+                "schemaVersion": "egopulse.tui-result/v0.1",
+                "ok": true,
+                "operation": "evidence.get",
+                "data": {
+                    "taskId": graph.task_id,
+                    "artifactSetId": graph.artifact_set_id,
+                    "artifactCount": graph.artifacts.len(),
+                    "claimCount": graph.claims.len(),
+                    "evidenceCount": graph.evidence.len(),
+                    "redactions": graph.redactions.iter().map(|item| json!({
+                        "fieldPath": item.field_path,
+                        "reasonCode": item.reason_code,
+                    })).collect::<Vec<_>>(),
+                },
+                "correlationId": correlation_id,
+            });
+            if output == CommandOutput::Console {
+                if json {
+                    println!("{}", serde_json::to_string(&payload).unwrap());
+                } else {
+                    println!(
+                        "TUI Evidence Graph: task={} artifact_set={} artifacts={} claims={} evidence={}",
+                        payload["data"]["taskId"].as_str().unwrap_or(""),
+                        payload["data"]["artifactSetId"].as_str().unwrap_or(""),
+                        payload["data"]["artifactCount"]
+                            .as_u64()
+                            .unwrap_or_default(),
+                        payload["data"]["claimCount"].as_u64().unwrap_or_default(),
+                        payload["data"]["evidenceCount"]
+                            .as_u64()
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1011,6 +1103,7 @@ fn command_kind(command: &TuiCommand) -> &'static str {
         TuiCommand::Await { .. } => "await",
         TuiCommand::VerdictIssue { .. } => "verdict.issue",
         TuiCommand::VerdictRevoke { .. } => "verdict.revoke",
+        TuiCommand::EvidenceGet { .. } => "evidence.get",
     }
 }
 
@@ -1715,6 +1808,28 @@ mod tests {
                 kind: CommandKind::ApprovalDecide,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn evidence_form_maps_to_read_only_operation() {
+        let mut form = CommandForm::new(CommandKind::EvidenceGet);
+        for (field, value) in form
+            .fields
+            .iter_mut()
+            .zip(["task-1".to_owned(), "artifact-set-1".to_owned()])
+        {
+            field.value = value;
+        }
+        let command = form.into_command().expect("valid evidence form");
+        assert_eq!(command_kind(&command), "evidence.get");
+        assert!(matches!(
+            command,
+            TuiCommand::EvidenceGet {
+                task_id,
+                artifact_set_id,
+                json: false,
+            } if task_id == "task-1" && artifact_set_id == "artifact-set-1"
         ));
     }
 }
