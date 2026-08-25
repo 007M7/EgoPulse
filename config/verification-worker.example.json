@@ -1,0 +1,70 @@
+{
+  "handoff": {
+    "claim_id": "claim:replace-me",
+    "claim_semantic_profile_ref": {
+      "contract_id": "replace-claim-semantic-profile",
+      "version": "v1",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "criterion_ids": ["replace-criterion-id"],
+    "checker_profile_refs": [
+      {
+        "contract_id": "replace-checker-profile-id",
+        "version": "v1",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ]
+  },
+  "checker_profile": {
+    "checker_profile_id": "replace-checker-profile-id",
+    "revision": 1,
+    "status": 1,
+    "checker_id": "sego",
+    "checker_version": "replace-sego-version",
+    "input_contract_ref": null,
+    "output_contract_ref": null,
+    "supported_criterion_types": ["replace-criterion-id"],
+    "assurance_class": 2,
+    "sandbox_profile_ref": null,
+    "tool_policy_ref": null,
+    "data_egress_policy_ref": null,
+    "timeout_ms": 30000,
+    "network_allowed": false,
+    "profile_digest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "attestation_evidence_artifact_ids": ["replace-checker-probe-artifact"],
+    "attested_at": null
+  },
+  "checker_executable": "C:/path/to/sego.exe",
+  "checker_arguments": [],
+  "working_directory": "C:/path/to/workspace",
+  "checker_request_hex": "7b7d",
+  "mapper": {
+    "criterion_id": "replace-criterion-id",
+    "requirement": 1,
+    "checker_profile_ref": {
+      "contract_id": "replace-checker-profile-id",
+      "version": "v1",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "expected_scope": "replace-scope",
+    "expected_diff_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "expected_reviewer": "replace-reviewer",
+    "expected_engine_version": "replace-sego-version",
+    "expected_review_mode": "strict",
+    "failure_threshold": 2,
+    "raw_output_artifact_id": "replace-raw-output-artifact",
+    "raw_output_address": {
+      "algorithm": 1,
+      "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "byte_length": 0
+    },
+    "finding_evidence": {}
+  },
+  "verification_run_id_prefix": "verification-run:",
+  "verification_artifact_id_prefix": "verification-artifact:",
+  "execution_id_prefix": "verification-execution:",
+  "tool_receipt_artifact_ids": [],
+  "model_call_receipt_artifact_ids": [],
+  "checker_timeout_ms": 30000,
+  "checker_output_limit": 1048576
+}

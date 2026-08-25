@@ -1,6 +1,6 @@
 # Phase 2-02 / C5 implementation status
 
-- Status: C5 CLI/TUI E2E closed; Phase 2-02 composition root remains in progress
+- Status: C5 CLI/TUI E2E closed; Phase 2-02 composition root configuration closed
 - Evidence date: 2026-08-26
 - Decision owner: Founder
 
@@ -55,7 +55,7 @@ are command-line parsing, terminal interaction, rendering, and user-facing
 error presentation. The shared client snapshot path and the real Windows IPC
 fixture both pass locally; no surface-specific write authority was introduced.
 
-## Remaining Phase 2-02 work
+## Composition root boundary
 
 The normal `agentosd` binary now loads the reusable `ProductionBootstrapConfig`
 from `EGOPULSE_USER_CONFIG` (default `egopulse-data/agentos-config.json`). It
@@ -157,8 +157,24 @@ lineage, which are checked against the Task revision before command creation.
 The intake ACKs the Task outbox only after Verification commits or idempotently
 replays. It is now composed into `ConfiguredVerificationWorker` together with
 the reviewed profile, Sego coordinator, Verification recovery scan and Task
-write-back. The user JSON bootstrap path still leaves this optional worker
-unset until its external configuration contract is finalized.
+write-back. The user JSON bootstrap path now accepts the same worker through an
+explicit `verification_worker` object. It decodes the handoff plan, complete
+checker profile, checker request bytes, executable/workspace paths, Sego mapper
+policy, deterministic ID prefixes and process limits. Invalid hex, unknown
+enum values, non-SHA256 output addresses, or a worker without Verification
+criteria fail before any daemon is built.
+
+The user-owned worker contract is covered by the bootstrap unit matrix in
+`apps/agentosd/src/bootstrap.rs`: one case proves every execution boundary is
+decoded, and negative cases prove invalid request bytes and hash algorithms
+are rejected. The worker remains optional; when omitted, Verification stays
+deny-by-default and no background execution worker is started.
+
+The field-level example is maintained at
+`config/verification-worker.example.json`; it is merged as the
+`verification_worker` property of the root production bootstrap JSON. It is a
+configuration template, not a claim that the placeholder executable,
+workspace, profile or artifact references are usable without replacement.
 
 The G4-10 integration fixture in
 `apps/agentosd/tests/verification_intake_g4_10.rs` now proves this boundary with
@@ -177,10 +193,10 @@ the provider-neutral coordinator in isolation.
 
 `with_codex_harness` and `ProductionBootstrapConfig::build` remain explicit
 production composition APIs and not implicit unsafe defaults. Verification
-remains deny-by-default for unreviewed external references. The programmatic
-bootstrap path can install the reviewed worker through explicit
-`VerificationWorkerConfig`; the user JSON path keeps it unset until a stable
-external worker configuration contract is finalized. agentosd still has no
+remains deny-by-default for unreviewed external references. The worker may be
+installed either through explicit `VerificationWorkerConfig` injection or the
+equivalent user-owned JSON contract; neither path derives execution policy
+from a Task, UI, Memory/RAG result or checker response. agentosd still has no
 Local API Verification command port; execution remains a daemon-owned
 background workflow rather than a client-injected command.
 

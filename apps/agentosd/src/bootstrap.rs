@@ -14,6 +14,7 @@ use egopulse_cognition_runtime::task_authority::{
     TaskAuthorityFailure,
 };
 use egopulse_domain_contracts::v01::egopulse::{
+    artifact::v1::{ContentAddress, HashAlgorithm},
     collaboration::v1::{RunPlan, StepPlan},
     common::v1::ContractReference,
     harness::v1::NativeSessionStrategy,
@@ -32,9 +33,11 @@ use egopulse_policy_decision_authority::{
 };
 use egopulse_verification_authority::{
     ArtifactBackedReferenceResolver, ReferenceRejection, ResolvedVerificationInput,
-    VerificationAuthority, VerificationAuthorityConfig, VerificationAuthorityFailure,
-    VerificationReferenceResolver, VerificationSqlCipherKey,
+    SegoFindingEvidenceBinding, SegoMapperPolicy, VerificationAuthority,
+    VerificationAuthorityConfig, VerificationAuthorityFailure, VerificationReferenceResolver,
+    VerificationSqlCipherKey,
 };
+use prost_types::Timestamp;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -73,8 +76,9 @@ pub struct ProductionBootstrapConfig {
     /// absent, production remains deny-by-default for external Verification
     /// requests and checker profile attestation.
     pub verification_references: Option<VerificationReferenceBootstrapConfig>,
-    /// Optional explicit worker composition. It is not inferred from the
-    /// user JSON policy file; callers inject reviewed execution material.
+    /// Optional explicit worker composition. When supplied by the user JSON
+    /// file, every execution field is decoded from an explicit reviewed
+    /// configuration object and validated before daemon construction.
     pub verification_worker: Option<VerificationWorkerConfig>,
     pub policy: PolicyAuthorityConfig,
     pub policy_resolver: LocalUserPolicyBootstrapConfig,
@@ -230,6 +234,8 @@ struct UserOwnedBootstrapFile {
     artifact: ArtifactPolicyFile,
     #[serde(default)]
     verification: Option<VerificationFile>,
+    #[serde(default)]
+    verification_worker: Option<VerificationWorkerFile>,
     policy: PolicyFile,
     founder: FounderFile,
     codex: CodexFile,
@@ -312,6 +318,103 @@ struct CriterionFile {
     minimum_assurance: i32,
     not_applicable_allowed: bool,
     checker_profile_ids: Vec<String>,
+}
+
+/// Explicit user-owned configuration for the daemon's Verification worker.
+/// Every field that affects execution is part of the reviewed file; no value
+/// is inferred from a Task payload, checker output, or model response.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerificationWorkerFile {
+    handoff: VerificationWorkerHandoffFile,
+    checker_profile: CheckerProfileFile,
+    checker_executable: String,
+    #[serde(default)]
+    checker_arguments: Vec<String>,
+    working_directory: String,
+    checker_request_hex: String,
+    mapper: SegoMapperFile,
+    verification_run_id_prefix: String,
+    verification_artifact_id_prefix: String,
+    execution_id_prefix: String,
+    #[serde(default)]
+    tool_receipt_artifact_ids: Vec<String>,
+    #[serde(default)]
+    model_call_receipt_artifact_ids: Vec<String>,
+    checker_timeout_ms: u64,
+    checker_output_limit: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerificationWorkerHandoffFile {
+    claim_id: String,
+    claim_semantic_profile_ref: ReferenceFile,
+    criterion_ids: Vec<String>,
+    checker_profile_refs: Vec<ReferenceFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckerProfileFile {
+    checker_profile_id: String,
+    revision: u64,
+    status: i32,
+    checker_id: String,
+    checker_version: String,
+    input_contract_ref: Option<ReferenceFile>,
+    output_contract_ref: Option<ReferenceFile>,
+    supported_criterion_types: Vec<String>,
+    assurance_class: i32,
+    sandbox_profile_ref: Option<ReferenceFile>,
+    tool_policy_ref: Option<ReferenceFile>,
+    data_egress_policy_ref: Option<ReferenceFile>,
+    timeout_ms: u64,
+    network_allowed: bool,
+    profile_digest_sha256: String,
+    attestation_evidence_artifact_ids: Vec<String>,
+    attested_at: Option<TimestampFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimestampFile {
+    seconds: i64,
+    nanos: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SegoMapperFile {
+    criterion_id: String,
+    requirement: i32,
+    checker_profile_ref: ReferenceFile,
+    expected_scope: String,
+    expected_diff_hash: String,
+    expected_reviewer: String,
+    expected_engine_version: String,
+    expected_review_mode: String,
+    failure_threshold: i32,
+    raw_output_artifact_id: String,
+    raw_output_address: ContentAddressFile,
+    #[serde(default)]
+    finding_evidence: std::collections::BTreeMap<String, FindingEvidenceFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentAddressFile {
+    algorithm: i32,
+    digest: String,
+    byte_length: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindingEvidenceFile {
+    evidence_id: String,
+    description_artifact_id: String,
+    suggested_fix_artifact_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -510,6 +613,15 @@ impl UserOwnedBootstrapFile {
             .verification
             .map(VerificationFile::into_typed)
             .transpose()?;
+        let verification_worker = self
+            .verification_worker
+            .map(VerificationWorkerFile::into_typed)
+            .transpose()?;
+        if verification_worker.is_some() && verification_references.is_none() {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker requires verification criteria",
+            ));
+        }
 
         let workflow = self.codex.workflow.into_typed()?;
         let codex = CodexHarnessCompositionConfig {
@@ -555,7 +667,7 @@ impl UserOwnedBootstrapFile {
                 key: VerificationSqlCipherKey::new(verification_store.key),
             },
             verification_references,
-            verification_worker: None,
+            verification_worker,
             policy: PolicyAuthorityConfig {
                 database_path: policy_store.database_path,
                 store_epoch: policy_store.store_epoch,
@@ -710,6 +822,178 @@ impl ReferenceFile {
             contract_id: self.contract_id,
             version: self.version,
             sha256: self.sha256,
+        }
+    }
+}
+
+impl VerificationWorkerFile {
+    fn into_typed(self) -> Result<VerificationWorkerConfig, ProductionBootstrapError> {
+        let checker_request = hex::decode(&self.checker_request_hex).map_err(|_| {
+            ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.checker_request_hex",
+            )
+        })?;
+        Ok(VerificationWorkerConfig {
+            handoff_plan: self.handoff.into_typed(),
+            checker_profile: self.checker_profile.into_typed()?,
+            checker_executable: PathBuf::from(required(
+                self.checker_executable,
+                "verification_worker.checker_executable",
+            )?),
+            checker_arguments: self.checker_arguments,
+            working_directory: PathBuf::from(required(
+                self.working_directory,
+                "verification_worker.working_directory",
+            )?),
+            checker_request,
+            mapper_policy: self.mapper.into_typed()?,
+            verification_run_id_prefix: required(
+                self.verification_run_id_prefix,
+                "verification_worker.verification_run_id_prefix",
+            )?,
+            verification_artifact_id_prefix: required(
+                self.verification_artifact_id_prefix,
+                "verification_worker.verification_artifact_id_prefix",
+            )?,
+            execution_id_prefix: required(
+                self.execution_id_prefix,
+                "verification_worker.execution_id_prefix",
+            )?,
+            tool_receipt_artifact_ids: self.tool_receipt_artifact_ids,
+            model_call_receipt_artifact_ids: self.model_call_receipt_artifact_ids,
+            checker_timeout: Duration::from_millis(self.checker_timeout_ms),
+            checker_output_limit: self.checker_output_limit,
+        })
+    }
+}
+
+impl VerificationWorkerHandoffFile {
+    fn into_typed(self) -> crate::VerificationHandoffPlan {
+        crate::VerificationHandoffPlan {
+            binding: crate::VerificationBindingTemplate {
+                claim_id: self.claim_id,
+                claim_semantic_profile_ref: self.claim_semantic_profile_ref.into_typed(),
+            },
+            criterion_ids: self.criterion_ids,
+            checker_profile_refs: self
+                .checker_profile_refs
+                .into_iter()
+                .map(ReferenceFile::into_typed)
+                .collect(),
+        }
+    }
+}
+
+impl CheckerProfileFile {
+    fn into_typed(self) -> Result<CheckerProfile, ProductionBootstrapError> {
+        let status = egopulse_domain_contracts::v01::egopulse::verification::v1::CheckerProfileStatus::try_from(self.status)
+            .map_err(|_| ProductionBootstrapError::InvalidConfiguration("verification_worker.checker_profile.status"))?;
+        if status == egopulse_domain_contracts::v01::egopulse::verification::v1::CheckerProfileStatus::Unspecified {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.checker_profile.status",
+            ));
+        }
+        let assurance_class = egopulse_domain_contracts::v01::egopulse::verification::v1::CheckerAssuranceClass::try_from(self.assurance_class)
+            .map_err(|_| ProductionBootstrapError::InvalidConfiguration("verification_worker.checker_profile.assurance_class"))?;
+        if assurance_class == egopulse_domain_contracts::v01::egopulse::verification::v1::CheckerAssuranceClass::Unspecified {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.checker_profile.assurance_class",
+            ));
+        }
+        Ok(CheckerProfile {
+            checker_profile_id: self.checker_profile_id,
+            revision: self.revision,
+            status: self.status,
+            checker_id: self.checker_id,
+            checker_version: self.checker_version,
+            input_contract_ref: self.input_contract_ref.map(ReferenceFile::into_typed),
+            output_contract_ref: self.output_contract_ref.map(ReferenceFile::into_typed),
+            supported_criterion_types: self.supported_criterion_types,
+            assurance_class: self.assurance_class,
+            sandbox_profile_ref: self.sandbox_profile_ref.map(ReferenceFile::into_typed),
+            tool_policy_ref: self.tool_policy_ref.map(ReferenceFile::into_typed),
+            data_egress_policy_ref: self.data_egress_policy_ref.map(ReferenceFile::into_typed),
+            timeout_ms: self.timeout_ms,
+            network_allowed: self.network_allowed,
+            profile_digest_sha256: self.profile_digest_sha256,
+            attestation_evidence_artifact_ids: self.attestation_evidence_artifact_ids,
+            attested_at: self.attested_at.map(TimestampFile::into_typed),
+        })
+    }
+}
+
+impl TimestampFile {
+    fn into_typed(self) -> Timestamp {
+        Timestamp {
+            seconds: self.seconds,
+            nanos: self.nanos,
+        }
+    }
+}
+
+impl SegoMapperFile {
+    fn into_typed(self) -> Result<SegoMapperPolicy, ProductionBootstrapError> {
+        let requirement = egopulse_domain_contracts::v01::egopulse::verification::v1::CriterionRequirement::try_from(self.requirement)
+            .map_err(|_| ProductionBootstrapError::InvalidConfiguration("verification_worker.mapper.requirement"))?;
+        if requirement == egopulse_domain_contracts::v01::egopulse::verification::v1::CriterionRequirement::Unspecified {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.mapper.requirement",
+            ));
+        }
+        let failure_threshold = egopulse_domain_contracts::v01::egopulse::verification::v1::DiscrepancySeverity::try_from(self.failure_threshold)
+            .map_err(|_| ProductionBootstrapError::InvalidConfiguration("verification_worker.mapper.failure_threshold"))?;
+        if failure_threshold == egopulse_domain_contracts::v01::egopulse::verification::v1::DiscrepancySeverity::Unspecified {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.mapper.failure_threshold",
+            ));
+        }
+        Ok(SegoMapperPolicy {
+            criterion_id: self.criterion_id,
+            requirement,
+            checker_profile_ref: self.checker_profile_ref.into_typed(),
+            expected_scope: self.expected_scope,
+            expected_diff_hash: self.expected_diff_hash,
+            expected_reviewer: self.expected_reviewer,
+            expected_engine_version: self.expected_engine_version,
+            expected_review_mode: self.expected_review_mode,
+            failure_threshold,
+            raw_output_artifact_id: self.raw_output_artifact_id,
+            raw_output_address: self.raw_output_address.into_typed()?,
+            finding_evidence: self
+                .finding_evidence
+                .into_iter()
+                .map(|(key, value)| (key, value.into_typed()))
+                .collect(),
+        })
+    }
+}
+
+impl ContentAddressFile {
+    fn into_typed(self) -> Result<ContentAddress, ProductionBootstrapError> {
+        let algorithm = HashAlgorithm::try_from(self.algorithm).map_err(|_| {
+            ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.mapper.raw_output_address.algorithm",
+            )
+        })?;
+        if algorithm != HashAlgorithm::Sha256 {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.mapper.raw_output_address.algorithm",
+            ));
+        }
+        Ok(ContentAddress {
+            algorithm: self.algorithm,
+            digest: self.digest,
+            byte_length: self.byte_length,
+        })
+    }
+}
+
+impl FindingEvidenceFile {
+    fn into_typed(self) -> SegoFindingEvidenceBinding {
+        SegoFindingEvidenceBinding {
+            evidence_id: self.evidence_id,
+            description_artifact_id: self.description_artifact_id,
+            suggested_fix_artifact_id: self.suggested_fix_artifact_id,
         }
     }
 }
@@ -1094,5 +1378,170 @@ mod tests {
             Err(ProductionBootstrapError::ConfigurationFormat { .. })
         ));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn user_owned_worker_contract_decodes_all_execution_boundaries_explicitly() {
+        let reference = serde_json::json!({
+            "contract_id": "criterion:one",
+            "version": "v1",
+            "sha256": "a".repeat(64)
+        });
+        let value = serde_json::json!({
+            "handoff": {
+                "claim_id": "claim:one",
+                "claim_semantic_profile_ref": reference,
+                "criterion_ids": ["criterion:one"],
+                "checker_profile_refs": [{
+                    "contract_id": "checker-profile:one",
+                    "version": "v1",
+                    "sha256": "b".repeat(64)
+                }]
+            },
+            "checker_profile": {
+                "checker_profile_id": "checker-profile:one",
+                "revision": 1,
+                "status": 1,
+                "checker_id": "sego",
+                "checker_version": "v1",
+                "input_contract_ref": null,
+                "output_contract_ref": null,
+                "supported_criterion_types": ["criterion:one"],
+                "assurance_class": 2,
+                "sandbox_profile_ref": null,
+                "tool_policy_ref": null,
+                "data_egress_policy_ref": null,
+                "timeout_ms": 1000,
+                "network_allowed": false,
+                "profile_digest_sha256": "b".repeat(64),
+                "attestation_evidence_artifact_ids": ["artifact:probe"],
+                "attested_at": {"seconds": 1700000000, "nanos": 0}
+            },
+            "checker_executable": "C:/tools/sego.exe",
+            "checker_arguments": ["--check"],
+            "working_directory": "C:/workspace",
+            "checker_request_hex": "7b7d",
+            "mapper": {
+                "criterion_id": "criterion:one",
+                "requirement": 1,
+                "checker_profile_ref": {
+                    "contract_id": "checker-profile:one",
+                    "version": "v1",
+                    "sha256": "b".repeat(64)
+                },
+                "expected_scope": "scope:one",
+                "expected_diff_hash": "c".repeat(64),
+                "expected_reviewer": "reviewer:one",
+                "expected_engine_version": "sego-v1",
+                "expected_review_mode": "strict",
+                "failure_threshold": 2,
+                "raw_output_artifact_id": "artifact:raw",
+                "raw_output_address": {
+                    "algorithm": 1,
+                    "digest": "d".repeat(64),
+                    "byte_length": 2
+                },
+                "finding_evidence": {}
+            },
+            "verification_run_id_prefix": "run:",
+            "verification_artifact_id_prefix": "artifact:verification:",
+            "execution_id_prefix": "execution:",
+            "tool_receipt_artifact_ids": [],
+            "model_call_receipt_artifact_ids": [],
+            "checker_timeout_ms": 1000,
+            "checker_output_limit": 4096
+        });
+
+        let file: VerificationWorkerFile = serde_json::from_value(value).expect("worker JSON");
+        let config = file.into_typed().expect("typed worker config");
+        assert_eq!(config.checker_request, b"{}".to_vec());
+        assert_eq!(config.handoff_plan.criterion_ids, ["criterion:one"]);
+        assert_eq!(
+            config.checker_profile.checker_profile_id,
+            "checker-profile:one"
+        );
+        assert_eq!(
+            config.mapper_policy.raw_output_address.algorithm,
+            HashAlgorithm::Sha256 as i32
+        );
+        assert_eq!(config.checker_timeout, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn user_owned_worker_contract_rejects_invalid_hex_and_hash_algorithm() {
+        let mut value = serde_json::json!({
+            "handoff": {
+                "claim_id": "claim:one",
+                "claim_semantic_profile_ref": {
+                    "contract_id": "claim-profile:one",
+                    "version": "v1",
+                    "sha256": "a".repeat(64)
+                },
+                "criterion_ids": ["criterion:one"],
+                "checker_profile_refs": []
+            },
+            "checker_profile": {
+                "checker_profile_id": "checker-profile:one",
+                "revision": 1,
+                "status": 1,
+                "checker_id": "sego",
+                "checker_version": "v1",
+                "input_contract_ref": null,
+                "output_contract_ref": null,
+                "supported_criterion_types": ["criterion:one"],
+                "assurance_class": 2,
+                "sandbox_profile_ref": null,
+                "tool_policy_ref": null,
+                "data_egress_policy_ref": null,
+                "timeout_ms": 1000,
+                "network_allowed": false,
+                "profile_digest_sha256": "b".repeat(64),
+                "attestation_evidence_artifact_ids": [],
+                "attested_at": null
+            },
+            "checker_executable": "C:/tools/sego.exe",
+            "working_directory": "C:/workspace",
+            "checker_request_hex": "not-hex",
+            "mapper": {
+                "criterion_id": "criterion:one",
+                "requirement": 1,
+                "checker_profile_ref": {
+                    "contract_id": "checker-profile:one",
+                    "version": "v1",
+                    "sha256": "b".repeat(64)
+                },
+                "expected_scope": "scope:one",
+                "expected_diff_hash": "c".repeat(64),
+                "expected_reviewer": "reviewer:one",
+                "expected_engine_version": "sego-v1",
+                "expected_review_mode": "strict",
+                "failure_threshold": 2,
+                "raw_output_artifact_id": "artifact:raw",
+                "raw_output_address": {"algorithm": 99, "digest": "d", "byte_length": 1},
+                "finding_evidence": {}
+            },
+            "verification_run_id_prefix": "run:",
+            "verification_artifact_id_prefix": "artifact:verification:",
+            "execution_id_prefix": "execution:",
+            "checker_timeout_ms": 1000,
+            "checker_output_limit": 4096
+        });
+        let file: VerificationWorkerFile =
+            serde_json::from_value(value.clone()).expect("worker JSON");
+        assert!(matches!(
+            file.into_typed(),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.checker_request_hex"
+            ))
+        ));
+
+        value["checker_request_hex"] = serde_json::Value::String("7b7d".to_owned());
+        let file: VerificationWorkerFile = serde_json::from_value(value).expect("worker JSON");
+        assert!(matches!(
+            file.into_typed(),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.mapper.raw_output_address.algorithm"
+            ))
+        ));
     }
 }

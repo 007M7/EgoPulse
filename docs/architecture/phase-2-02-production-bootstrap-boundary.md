@@ -127,11 +127,11 @@ and is never read from the JSON file. No test fixture Allow implementation is
 reused; the three guards remain separate from identity mapping and from the
 client surfaces.
 
-The remaining Phase 2-02 obligation is the reviewed Sego/checker resolver
-composition. `DenyVerificationReferences` still keeps Verification external
-requests held while allowing its own store and projection boundary to be
-composed; merely opening Artifact Authority must not turn that deny boundary
-into an implicit Sego authorization.
+The reviewed Sego/checker resolver composition is now a separate explicit
+configuration branch. `DenyVerificationReferences` still keeps Verification
+external requests held when no reviewed criteria are supplied; merely opening
+Artifact Authority must not turn that deny boundary into an implicit Sego
+authorization.
 
 The bootstrap now accepts an optional `verification.criteria` section. When it
 is present, the composition root constructs `ArtifactBackedReferenceResolver`
@@ -147,9 +147,8 @@ fixes the principal to the local Verification Authority bootstrap identity,
 derives a stable idempotency key from the profile identity and digest, and
 accepts only a committed or replayed Authority result. A caller cannot inject
 a Task, Harness, Model, or client principal into this path. The helper is the
-attestation primitive; production configuration still has to explicitly supply
-the reviewed profile candidate and the next vertical must wire this primitive
-into its startup/recovery policy before declaring checker execution available.
+attestation primitive, and the configured daemon worker now wires it into its
+startup/recovery policy.
 
 Verification Authority also exposes decoded request and run snapshots as
 read-only owner APIs. The execution coordinator uses these snapshots to resume
@@ -177,8 +176,10 @@ scan, the single-criterion Sego coordinator, and Task write-back. Its reviewed
 configuration explicitly supplies the checker executable/arguments, workspace,
 request bytes, profile, mapper policy, stable IDs, and process budget. No
 checker, workspace, model, or policy is inferred from Task text or process
-output. The worker is installed only when `VerificationWorkerConfig` is
-explicitly injected; the default user JSON path remains deny-by-default.
+output. The worker can be installed through explicit
+`VerificationWorkerConfig` injection or the equivalent `verification_worker`
+object in the user-owned JSON file. Omitting that object remains
+deny-by-default.
 
 Verification exposes queued, running, and completed request snapshots as a
 read-only recovery feed. This is required because Task outbox acknowledgement
