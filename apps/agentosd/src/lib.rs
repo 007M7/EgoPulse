@@ -100,9 +100,10 @@ pub use verdict::{
 };
 pub use verification::{
     CheckerProfileAttestationError, CheckerProfileAttestationResult,
-    SystemCheckerProfileAttestation, VerificationBindingTemplate, VerificationHandoffConsumeResult,
-    VerificationHandoffIntake, VerificationHandoffIntakeError, VerificationHandoffPlan,
-    VerificationHandoffPlanError, VerificationHandoffRequest,
+    SystemCheckerProfileAttestation, SystemTaskVerificationWriteBack,
+    TaskVerificationWriteBackError, TaskVerificationWriteBackResult, VerificationBindingTemplate,
+    VerificationHandoffConsumeResult, VerificationHandoffIntake, VerificationHandoffIntakeError,
+    VerificationHandoffPlan, VerificationHandoffPlanError, VerificationHandoffRequest,
 };
 
 #[derive(Clone, Debug)]

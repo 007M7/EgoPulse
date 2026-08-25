@@ -163,3 +163,10 @@ records the criterion through the checker principal, and completes the artifact
 through the Verification Authority principal. A process-output failure is still
 recorded as an explicit non-passing result; a completed run is replayed from
 the immutable artifact instead of being executed again.
+
+`SystemTaskVerificationWriteBack` is the corresponding Task-side owner
+boundary. Before issuing `RecordTaskVerification`, it reads the completed
+artifact through Verification Authority, checks the artifact lineage against
+the exact pending Task revision/work revision, then submits a deterministic
+write using the fixed `SegoVerification` system principal. It does not accept
+an API/client principal or an artifact ID whose lineage was not proven.

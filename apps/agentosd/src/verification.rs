@@ -1,12 +1,16 @@
 use std::sync::{Arc, Mutex};
 
 use egopulse_cognition_runtime::task_authority::{
-    PendingTaskVerification, TaskAuthority, TaskAuthorityFailure,
+    AuthenticatedPrincipal, PendingTaskVerification, PrincipalKind as TaskPrincipalKind,
+    TaskAuthority, TaskAuthorityFailure, canonical_request_digest as task_canonical_request_digest,
 };
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ArtifactSet, ArtifactSetStatus, ContentAddress, HashAlgorithm},
     common::v1::{CommandMetadata, ContractReference},
-    task::v1::{TaskEventKind, TaskStatus},
+    task::v1::{
+        RecordTaskVerificationCommand, TaskCommand, TaskEventKind, TaskStatus, get_task_response,
+        task_command,
+    },
     verification::v1::{
         AttestCheckerProfileCommand, CheckerProfile, CreateVerificationRequestCommand,
         VerificationBinding, VerificationCommand, VerificationRequest, verification_command,
@@ -25,6 +29,8 @@ const TASK_ACCEPTANCE: &str = "task_acceptance";
 const HANDOFF_IDEMPOTENCY_SCOPE: &str = "task-verification-handoff-v1";
 const PROFILE_ATTESTATION_SCOPE: &str = "system-checker-profile-attestation-v1";
 const SYSTEM_VERIFICATION_PRINCIPAL: &str = "verification-bootstrap:local";
+const TASK_VERIFICATION_WRITEBACK_SCOPE: &str = "system-task-verification-writeback-v1";
+const SYSTEM_TASK_VERIFICATION_PRINCIPAL: &str = "verification-worker:local";
 
 /// The parts of Artifact/Verification binding that cannot be inferred from a
 /// Task handoff. They are reviewed configuration, not Agent output.
@@ -120,6 +126,177 @@ impl SystemCheckerProfileAttestation {
             checker_profile_id,
             committed: result.committed,
             replayed: result.replayed,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskVerificationWriteBackResult {
+    pub task_id: String,
+    pub verification_artifact_id: String,
+    pub committed: bool,
+    pub replayed: bool,
+    pub task_revision: u64,
+}
+
+#[derive(Debug, Error)]
+pub enum TaskVerificationWriteBackError {
+    #[error("Task ID or Verification artifact ID is empty")]
+    InvalidIdentity,
+    #[error("Task revision or work revision is invalid")]
+    InvalidRevision,
+    #[error("Task Authority lock is poisoned")]
+    TaskLock,
+    #[error("Verification Authority lock is poisoned")]
+    VerificationLock,
+    #[error("Task Authority read failed: {0}")]
+    Task(#[from] TaskAuthorityFailure),
+    #[error("Verification Authority read failed: {0}")]
+    Verification(#[from] VerificationAuthorityFailure),
+    #[error("completed Verification artifact was not found")]
+    ArtifactNotFound,
+    #[error("Verification artifact does not bind the expected Task revision")]
+    ArtifactBindingMismatch,
+    #[error("Task is not the expected VerificationPending snapshot")]
+    TaskSnapshotMismatch,
+    #[error("Task verification write-back command could not be canonicalized")]
+    Canonicalization,
+    #[error("Task verification write-back was rejected: {0}")]
+    Rejected(String),
+}
+
+/// System-only write-back boundary. It proves the completed artifact belongs
+/// to the exact pending Task snapshot before submitting the sole Task mutation
+/// through Task Authority. No client or checker principal can be injected.
+pub struct SystemTaskVerificationWriteBack {
+    task: Arc<Mutex<TaskAuthority>>,
+    verification: Arc<Mutex<VerificationAuthority>>,
+}
+
+impl SystemTaskVerificationWriteBack {
+    #[must_use]
+    pub fn new(
+        task: Arc<Mutex<TaskAuthority>>,
+        verification: Arc<Mutex<VerificationAuthority>>,
+    ) -> Self {
+        Self { task, verification }
+    }
+
+    pub fn record_one(
+        &self,
+        task_id: &str,
+        expected_revision: u64,
+        work_revision: u64,
+        verification_artifact_id: &str,
+        issued_at: Timestamp,
+    ) -> Result<TaskVerificationWriteBackResult, TaskVerificationWriteBackError> {
+        if task_id.trim().is_empty() || verification_artifact_id.trim().is_empty() {
+            return Err(TaskVerificationWriteBackError::InvalidIdentity);
+        }
+        if expected_revision == 0 || work_revision == 0 {
+            return Err(TaskVerificationWriteBackError::InvalidRevision);
+        }
+        {
+            let verification = self
+                .verification
+                .lock()
+                .map_err(|_| TaskVerificationWriteBackError::VerificationLock)?;
+            let artifact = verification
+                .verification_artifact(verification_artifact_id)?
+                .ok_or(TaskVerificationWriteBackError::ArtifactNotFound)?;
+            let lineage = artifact
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.lineage.as_ref())
+                .ok_or(TaskVerificationWriteBackError::ArtifactBindingMismatch)?;
+            if lineage.task_id != task_id
+                || lineage.task_revision != expected_revision
+                || lineage.work_revision != work_revision
+            {
+                return Err(TaskVerificationWriteBackError::ArtifactBindingMismatch);
+            }
+        }
+        let task_snapshot = {
+            let task = self
+                .task
+                .lock()
+                .map_err(|_| TaskVerificationWriteBackError::TaskLock)?;
+            match task.get_task(task_id)?.outcome {
+                Some(get_task_response::Outcome::Task(snapshot)) => snapshot,
+                _ => return Err(TaskVerificationWriteBackError::TaskSnapshotMismatch),
+            }
+        };
+        if task_snapshot.task_id != task_id
+            || task_snapshot.revision != expected_revision
+            || task_snapshot.work_revision != work_revision
+            || task_snapshot.status != TaskStatus::VerificationPending as i32
+        {
+            return Err(TaskVerificationWriteBackError::TaskSnapshotMismatch);
+        }
+        let idempotency_key = format!("{task_id}:{verification_artifact_id}:{expected_revision}");
+        let mut command = TaskCommand {
+            command: Some(task_command::Command::RecordTaskVerification(
+                RecordTaskVerificationCommand {
+                    meta: Some(CommandMetadata {
+                        command_id: format!("task-verification-writeback-{idempotency_key}"),
+                        idempotency_key,
+                        idempotency_scope: TASK_VERIFICATION_WRITEBACK_SCOPE.to_owned(),
+                        request_digest_sha256: String::new(),
+                        issued_at: Some(issued_at),
+                        correlation_id: verification_artifact_id.to_owned(),
+                        causation_id: None,
+                    }),
+                    task_id: task_id.to_owned(),
+                    expected_revision,
+                    work_revision,
+                    verification_artifact_id: verification_artifact_id.to_owned(),
+                },
+            )),
+        };
+        let digest = task_canonical_request_digest(&command)?;
+        if let Some(task_command::Command::RecordTaskVerification(value)) = command.command.as_mut()
+        {
+            value
+                .meta
+                .as_mut()
+                .expect("write-back metadata")
+                .request_digest_sha256 = digest;
+        } else {
+            return Err(TaskVerificationWriteBackError::Canonicalization);
+        }
+        let result = self
+            .task
+            .lock()
+            .map_err(|_| TaskVerificationWriteBackError::TaskLock)?
+            .execute(
+                &command,
+                &AuthenticatedPrincipal {
+                    kind: TaskPrincipalKind::SegoVerification,
+                    principal_id: SYSTEM_TASK_VERIFICATION_PRINCIPAL.to_owned(),
+                    authenticated: true,
+                },
+            )?;
+        if let Some(error) = result.outcome.as_ref().and_then(|outcome| {
+            match outcome {
+            egopulse_domain_contracts::v01::egopulse::task::v1::task_command_result::Outcome::Error(
+                error,
+            ) => Some(error.safe_detail_code.clone()),
+            _ => None,
+        }
+        }) {
+            return Err(TaskVerificationWriteBackError::Rejected(error));
+        }
+        let task_revision = result
+            .committed_event
+            .as_ref()
+            .map(|event| event.resulting_revision)
+            .unwrap_or(expected_revision + 1);
+        Ok(TaskVerificationWriteBackResult {
+            task_id: task_id.to_owned(),
+            verification_artifact_id: verification_artifact_id.to_owned(),
+            committed: result.committed_event.is_some(),
+            replayed: result.replayed,
+            task_revision,
         })
     }
 }

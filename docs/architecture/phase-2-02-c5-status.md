@@ -134,6 +134,14 @@ composes that runner with the Verification Authority start, criterion-record
 and immutable-artifact-completion commands. It is deliberately limited to one
 reviewed criterion and replays a completed artifact instead of rerunning it.
 
+The application boundary also now provides
+`SystemTaskVerificationWriteBack`. It accepts only a completed artifact that
+binds to the exact pending Task revision/work revision, and then submits the
+Task mutation with a fixed `SegoVerification` system principal and deterministic
+idempotency key. This closes the write-side owner primitive; the remaining
+production work is to compose it into the worker with the handoff intake,
+profile attestation and execution coordinator.
+
 Task Authority now emits a digest-bound `verification-authority` outbox message
 when `SubmitTaskEvidence` commits. `pending_task_verifications()` validates the
 event kind, task/revision/work-revision binding, `VerificationPending` state and
@@ -166,7 +174,8 @@ handoff. The separate G4-06 execution test proves queued request start,
 governed checker failure mapping, criterion persistence, immutable completion
 and completed-artifact replay. The production daemon still needs one composed
 worker that connects the handoff intake, reviewed checker-profile attestation,
-the execution coordinator and system-only Task verification write-back.
+the execution coordinator and the now-available system-only Task verification
+write-back boundary.
 
 `with_codex_harness` and `ProductionBootstrapConfig::build` remain explicit
 production composition APIs and not implicit unsafe defaults. Verification
