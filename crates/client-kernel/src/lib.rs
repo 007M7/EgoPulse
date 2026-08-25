@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ops::Deref,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -230,8 +230,14 @@ impl ClientKernel {
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotStreamTracker {
     last_position: Option<ProjectionPosition>,
-    last_payload_digest: Option<String>,
+    last_entity_digests: BTreeMap<StreamEntityIdentity, String>,
     refetch_required: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum StreamEntityIdentity {
+    Task(String),
+    HarnessApproval(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,7 +271,18 @@ impl SnapshotStreamTracker {
         {
             return Err(KernelError::IncompleteStreamFrame);
         }
-        self.apply_message(frame.kind, frame.position.clone(), frame.snapshot.as_ref())
+        let identity = frame.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .task
+                .as_ref()
+                .map(|task| StreamEntityIdentity::Task(task.task_id.clone()))
+        });
+        self.apply_message(
+            frame.kind,
+            frame.position.clone(),
+            frame.snapshot.as_ref(),
+            identity,
+        )
     }
 
     pub fn apply_harness_approval_frame(
@@ -279,7 +296,15 @@ impl SnapshotStreamTracker {
         {
             return Err(KernelError::IncompleteStreamFrame);
         }
-        self.apply_message(frame.kind, frame.position.clone(), frame.snapshot.as_ref())
+        let identity = frame.snapshot.as_ref().map(|snapshot| {
+            StreamEntityIdentity::HarnessApproval(snapshot.approval_request_id.clone())
+        });
+        self.apply_message(
+            frame.kind,
+            frame.position.clone(),
+            frame.snapshot.as_ref(),
+            identity,
+        )
     }
 
     fn apply_message<M: Message>(
@@ -287,6 +312,7 @@ impl SnapshotStreamTracker {
         kind: i32,
         position: Option<ProjectionPosition>,
         snapshot: Option<&M>,
+        identity: Option<StreamEntityIdentity>,
     ) -> Result<StreamApply, KernelError> {
         let kind = StreamFrameKind::try_from(kind).map_err(|_| KernelError::UnknownStreamFrame)?;
         let position = position
@@ -300,7 +326,7 @@ impl SnapshotStreamTracker {
                 return Err(KernelError::IncompleteStreamFrame);
             }
             self.last_position = Some(position);
-            self.last_payload_digest = None;
+            self.last_entity_digests.clear();
             self.refetch_required = true;
             return Ok(StreamApply::ResetRequired);
         }
@@ -318,17 +344,23 @@ impl SnapshotStreamTracker {
         match kind {
             StreamFrameKind::Snapshot => {
                 let snapshot = snapshot.ok_or(KernelError::IncompleteStreamFrame)?;
+                let identity = identity.ok_or(KernelError::IncompleteStreamFrame)?;
                 let digest = sha256_hex(&snapshot.encode_to_vec());
                 if self.last_position.as_ref().is_some_and(|last| {
                     last.epoch == position.epoch && last.sequence == position.sequence
                 }) {
-                    if self.last_payload_digest.as_deref() == Some(digest.as_str()) {
-                        return Ok(StreamApply::Replay);
+                    if let Some(previous_digest) = self.last_entity_digests.get(&identity) {
+                        if previous_digest == &digest {
+                            return Ok(StreamApply::Replay);
+                        }
+                        return Err(KernelError::ConflictingStreamReplay);
                     }
-                    return Err(KernelError::ConflictingStreamReplay);
+                    self.last_entity_digests.insert(identity, digest);
+                    return Ok(StreamApply::Applied);
                 }
                 self.last_position = Some(position);
-                self.last_payload_digest = Some(digest);
+                self.last_entity_digests.clear();
+                self.last_entity_digests.insert(identity, digest);
                 Ok(StreamApply::Applied)
             }
             StreamFrameKind::Heartbeat => {
@@ -341,7 +373,7 @@ impl SnapshotStreamTracker {
                     .is_none_or(|last| position.sequence > last.sequence)
                 {
                     self.last_position = Some(position);
-                    self.last_payload_digest = None;
+                    self.last_entity_digests.clear();
                 }
                 Ok(StreamApply::Heartbeat)
             }
@@ -359,7 +391,7 @@ impl SnapshotStreamTracker {
             return Err(KernelError::RefetchNotRequired);
         }
         self.last_position = Some(position);
-        self.last_payload_digest = None;
+        self.last_entity_digests.clear();
         self.refetch_required = false;
         Ok(())
     }
@@ -421,7 +453,7 @@ pub enum KernelError {
     StreamResetMissing,
     #[error("stream frame is out of order")]
     StreamOutOfOrder,
-    #[error("same stream position carried a different snapshot")]
+    #[error("same stream entity position carried a different snapshot")]
     ConflictingStreamReplay,
     #[error("stream reset requires refetch")]
     RefetchRequired,

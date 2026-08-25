@@ -91,7 +91,10 @@ fn task_frame(
     }
 }
 
-fn approval_frame(frame_position: &ProjectionPosition) -> HarnessApprovalViewStreamFrame {
+fn approval_frame(
+    frame_position: &ProjectionPosition,
+    approval_request_id: &str,
+) -> HarnessApprovalViewStreamFrame {
     HarnessApprovalViewStreamFrame {
         kind: StreamFrameKind::Snapshot as i32,
         position: Some(frame_position.clone()),
@@ -105,7 +108,7 @@ fn approval_frame(frame_position: &ProjectionPosition) -> HarnessApprovalViewStr
                 position: Some(frame_position.clone()),
                 source_revisions: vec![SourceRevision {
                     domain: SourceDomain::HarnessAdapter as i32,
-                    aggregate_id: "approval_01".to_owned(),
+                    aggregate_id: approval_request_id.to_owned(),
                     revision: 1,
                     last_event_id: "observation_01".to_owned(),
                 }],
@@ -113,7 +116,7 @@ fn approval_frame(frame_position: &ProjectionPosition) -> HarnessApprovalViewStr
                 stale: false,
                 safe_health_reason_code: None,
             }),
-            approval_request_id: "approval_01".to_owned(),
+            approval_request_id: approval_request_id.to_owned(),
             task_id: "task_01".to_owned(),
             run_id: "run_01".to_owned(),
             step_id: "step_01".to_owned(),
@@ -334,19 +337,57 @@ fn stream_tracker_deduplicates_exact_replay_and_rejects_conflicts() {
         tracker.apply_task_frame(&first_frame).unwrap(),
         StreamApply::Replay
     );
-    let changed = task_view(&first_position, "task_changed");
+    let second = task_view(&first_position, "task_02");
+    let second_frame = task_frame(
+        StreamFrameKind::Snapshot as i32,
+        first_position.clone(),
+        Some(second),
+    );
+    assert_eq!(
+        tracker.apply_task_frame(&second_frame).unwrap(),
+        StreamApply::Applied
+    );
+    assert_eq!(
+        tracker.apply_task_frame(&second_frame).unwrap(),
+        StreamApply::Replay
+    );
+
+    let mut changed = first;
+    changed.task.as_mut().unwrap().revision = 2;
+    changed.metadata.as_mut().unwrap().source_revisions[0].revision = 2;
     let changed_frame = task_frame(
         StreamFrameKind::Snapshot as i32,
-        first_position,
+        first_position.clone(),
         Some(changed),
     );
     assert!(matches!(
         tracker.apply_task_frame(&changed_frame),
         Err(KernelError::ConflictingStreamReplay)
     ));
+
+    let jumped_position = position("epoch_01", 15);
+    let jumped_frame = task_frame(
+        StreamFrameKind::Snapshot as i32,
+        jumped_position.clone(),
+        Some(task_view(&jumped_position, "task_03")),
+    );
+    assert_eq!(
+        tracker.apply_task_frame(&jumped_frame).unwrap(),
+        StreamApply::Applied
+    );
+    let same_position_heartbeat =
+        task_frame(StreamFrameKind::Heartbeat as i32, jumped_position, None);
+    assert_eq!(
+        tracker.apply_task_frame(&same_position_heartbeat).unwrap(),
+        StreamApply::Heartbeat
+    );
+    assert_eq!(
+        tracker.apply_task_frame(&jumped_frame).unwrap(),
+        StreamApply::Replay
+    );
     let old_heartbeat = task_frame(
         StreamFrameKind::Heartbeat as i32,
-        position("epoch_01", 9),
+        position("epoch_01", 14),
         None,
     );
     assert!(matches!(
@@ -447,7 +488,8 @@ fn unknown_or_incomplete_stream_frames_fail_closed() {
 #[test]
 fn harness_approval_stream_uses_the_same_complete_snapshot_kernel() {
     let mut tracker = SnapshotStreamTracker::default();
-    let frame = approval_frame(&position("epoch_01", 3));
+    let frame_position = position("epoch_01", 3);
+    let frame = approval_frame(&frame_position, "approval_01");
     assert_eq!(
         tracker.apply_harness_approval_frame(&frame).unwrap(),
         StreamApply::Applied
@@ -456,6 +498,23 @@ fn harness_approval_stream_uses_the_same_complete_snapshot_kernel() {
         tracker.apply_harness_approval_frame(&frame).unwrap(),
         StreamApply::Replay
     );
+
+    let second = approval_frame(&frame_position, "approval_02");
+    assert_eq!(
+        tracker.apply_harness_approval_frame(&second).unwrap(),
+        StreamApply::Applied
+    );
+    assert_eq!(
+        tracker.apply_harness_approval_frame(&second).unwrap(),
+        StreamApply::Replay
+    );
+
+    let mut conflicting = frame.clone();
+    conflicting.snapshot.as_mut().unwrap().request_revision = 2;
+    assert!(matches!(
+        tracker.apply_harness_approval_frame(&conflicting),
+        Err(KernelError::ConflictingStreamReplay)
+    ));
 
     let incomplete = HarnessApprovalViewStreamFrame {
         kind: StreamFrameKind::Snapshot as i32,
