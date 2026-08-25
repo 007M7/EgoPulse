@@ -35,6 +35,9 @@ use egopulse_local_api::{
         SystemSessionClock, TrustedPrincipalResolver,
     },
 };
+use egopulse_local_ide_control::collaboration_control::{
+    HarnessDispatchCycleError, HarnessDispatchRunner,
+};
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
 use tonic::transport::Server;
@@ -59,6 +62,7 @@ pub struct DaemonConfig {
     pub read_model_key: [u8; 32],
     pub token_mac_key: [u8; 32],
     pub session_ttl: Duration,
+    pub harness_dispatch_interval: Duration,
 }
 
 impl DaemonConfig {
@@ -83,6 +87,19 @@ impl DaemonConfig {
                 return Err(DaemonBootstrapError::InvalidSetting("session TTL"));
             }
         };
+        let harness_dispatch_interval = match std::env::var("EGOPULSE_HARNESS_DISPATCH_INTERVAL_MS")
+        {
+            Ok(value) => value
+                .parse::<u64>()
+                .map(Duration::from_millis)
+                .map_err(|_| DaemonBootstrapError::InvalidSetting("Harness dispatch interval"))?,
+            Err(std::env::VarError::NotPresent) => Duration::from_millis(250),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(DaemonBootstrapError::InvalidSetting(
+                    "Harness dispatch interval",
+                ));
+            }
+        };
 
         Ok(Self {
             instance: std::env::var("EGOPULSE_IPC_INSTANCE")
@@ -95,6 +112,7 @@ impl DaemonConfig {
             read_model_key,
             token_mac_key,
             session_ttl,
+            harness_dispatch_interval,
         })
     }
 
@@ -124,6 +142,13 @@ impl DaemonConfig {
         }
         if self.session_ttl.is_zero() || self.session_ttl > Duration::from_secs(24 * 60 * 60) {
             return Err(DaemonCompositionError::InvalidConfiguration("session TTL"));
+        }
+        if self.harness_dispatch_interval < Duration::from_millis(10)
+            || self.harness_dispatch_interval > Duration::from_secs(60)
+        {
+            return Err(DaemonCompositionError::InvalidConfiguration(
+                "Harness dispatch interval",
+            ));
         }
         Ok(())
     }
@@ -157,6 +182,7 @@ pub struct DaemonProviders {
     pub policy_port: Arc<dyn PolicyCommandPort>,
     pub verdict_port: Arc<dyn VerdictCommandPort>,
     pub projection_source: Option<Arc<dyn OwnerProjectionSource>>,
+    pub harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
 }
 
 pub struct AuthorityCompositionInputs {
@@ -185,6 +211,7 @@ impl DaemonProviders {
             policy_port: Arc::new(FailClosedPolicyPort),
             verdict_port: Arc::new(FailClosedVerdictPort),
             projection_source: None,
+            harness_dispatch_runner: None,
         }
     }
 
@@ -237,7 +264,14 @@ impl DaemonProviders {
             projection_source: Some(Arc::new(CompositeOwnerProjectionSource::new(
                 projection_sources,
             ))),
+            harness_dispatch_runner: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_harness_dispatch_runner(mut self, runner: Arc<dyn HarnessDispatchRunner>) -> Self {
+        self.harness_dispatch_runner = Some(runner);
+        self
     }
 }
 
@@ -277,6 +311,10 @@ pub enum DaemonServeError {
     Server(#[from] tonic::transport::Error),
     #[error("projection pump failed")]
     Projection(#[from] ProjectionPumpFailure),
+    #[error("harness dispatch runner failed")]
+    Dispatch(#[from] HarnessDispatchCycleError),
+    #[error("daemon background worker stopped unexpectedly")]
+    BackgroundStopped,
 }
 
 pub struct DaemonComposition {
@@ -286,6 +324,8 @@ pub struct DaemonComposition {
     read_model: LocalReadModelEndpoint,
     command: LocalCommandGatewayEndpoint,
     projection_pump: Option<ProjectionPump>,
+    harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
+    harness_dispatch_interval: Duration,
 }
 
 impl DaemonComposition {
@@ -357,6 +397,7 @@ impl DaemonComposition {
         let projection_pump = providers
             .projection_source
             .map(|source| ProjectionPump::new(Arc::clone(&model), notifier, source));
+        let harness_dispatch_runner = providers.harness_dispatch_runner;
 
         Ok(Self {
             address,
@@ -365,6 +406,8 @@ impl DaemonComposition {
             read_model,
             command,
             projection_pump,
+            harness_dispatch_runner,
+            harness_dispatch_interval: config.harness_dispatch_interval,
         })
     }
 
@@ -383,6 +426,8 @@ impl DaemonComposition {
             read_model,
             command,
             projection_pump,
+            harness_dispatch_runner,
+            harness_dispatch_interval,
             ..
         } = self;
         let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
@@ -400,25 +445,78 @@ impl DaemonComposition {
                 .add_service(LocalCommandGatewayServiceServer::new(command))
                 .serve_with_incoming_shutdown(listener.into_incoming(), server_shutdown),
         );
-        let Some(projection_pump) = projection_pump else {
-            return server.await.map_err(DaemonServeError::Server);
-        };
-        let mut pump = Box::pin(projection_pump.run(stop_receiver));
+        let mut background = Box::pin(run_background_workers(
+            projection_pump,
+            harness_dispatch_runner,
+            harness_dispatch_interval,
+            stop_receiver,
+        ));
         tokio::select! {
             result = &mut server => {
                 let _ = stop_sender.send(true);
-                let _ = pump.await;
+                let _ = background.await;
                 result.map_err(DaemonServeError::Server)
             }
-            result = &mut pump => {
+            result = &mut background => {
+                let _ = stop_sender.send(true);
+                let _ = server.await;
                 match result {
-                    Ok(()) => server.await.map_err(DaemonServeError::Server),
-                    Err(error) => {
-                        let _ = stop_sender.send(true);
-                        let _ = server.await;
-                        Err(DaemonServeError::Projection(error))
-                    }
+                    Ok(()) => Err(DaemonServeError::BackgroundStopped),
+                    Err(error) => Err(error),
                 }
+            }
+        }
+    }
+}
+
+async fn run_background_workers(
+    projection_pump: Option<ProjectionPump>,
+    harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
+    harness_dispatch_interval: Duration,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), DaemonServeError> {
+    match (projection_pump, harness_dispatch_runner) {
+        (Some(projection_pump), Some(runner)) => {
+            tokio::select! {
+                result = projection_pump.run(stop.clone()) => {
+                    result.map_err(DaemonServeError::Projection)
+                }
+                result = run_harness_dispatch_worker(runner, harness_dispatch_interval, stop) => {
+                    result.map_err(DaemonServeError::Dispatch)
+                }
+            }
+        }
+        (Some(projection_pump), None) => projection_pump
+            .run(stop)
+            .await
+            .map_err(DaemonServeError::Projection),
+        (None, Some(runner)) => {
+            run_harness_dispatch_worker(runner, harness_dispatch_interval, stop)
+                .await
+                .map_err(DaemonServeError::Dispatch)
+        }
+        (None, None) => std::future::pending().await,
+    }
+}
+
+async fn run_harness_dispatch_worker(
+    runner: Arc<dyn HarnessDispatchRunner>,
+    interval: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), HarnessDispatchCycleError> {
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        if *stop.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = ticker.tick() => {
+                runner.run_once().await?;
             }
         }
     }
@@ -509,6 +607,7 @@ mod tests {
                 read_model_key: [0x11; 32],
                 token_mac_key: [0x22; 32],
                 session_ttl: Duration::from_secs(60),
+                harness_dispatch_interval: Duration::from_millis(25),
             },
             root,
         )

@@ -7,7 +7,7 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
 };
 use egopulse_harness_adapter::{
     DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, NativeHarnessDriver,
-    ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
+    NativeHarnessFuture, ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
 };
 use egopulse_process_supervision::{SupervisedProcess, SupervisedProcessSpec};
 use prost_types::Timestamp;
@@ -832,208 +832,223 @@ impl CodexAppServerDriver {
 }
 
 impl NativeHarnessDriver for CodexAppServerDriver {
-    async fn probe(
-        &mut self,
-        request: &ProbeHarnessRequest,
-    ) -> Result<ProbeHarnessResult, DriverError> {
-        let observed_version = probe_version(&self.config).await?;
-        let observed_schema = probe_schema(&self.config).await?;
-        let expected = request.expected_protocol_schema_sha256.to_ascii_lowercase();
-        let ready = observed_version == CODEX_EXECUTABLE_VERSION
-            && observed_schema == expected
-            && expected == CODEX_APP_SERVER_SCHEMA_SHA256;
-        Ok(ProbeHarnessResult {
-            probe_id: Uuid::now_v7().to_string(),
-            readiness: if ready {
-                HarnessReadiness::Ready
-            } else {
-                HarnessReadiness::ProtocolMismatch
-            } as i32,
-            observed_protocol: Some(NativeProtocolFingerprint {
-                native_executable_version: observed_version,
-                schema_sha256: observed_schema.clone(),
-                ..codex_protocol_fingerprint()
-            }),
-            safe_diagnostic_codes: vec![if ready {
-                "CODEX_APP_SERVER_READY".to_owned()
-            } else {
-                "CODEX_APP_SERVER_FINGERPRINT_MISMATCH".to_owned()
-            }],
-            evidence_refs: vec![format!("schema-sha256:{observed_schema}")],
-            observed_at: Some(now()),
+    fn probe<'a>(
+        &'a mut self,
+        request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        Box::pin(async move {
+            let observed_version = probe_version(&self.config).await?;
+            let observed_schema = probe_schema(&self.config).await?;
+            let expected = request.expected_protocol_schema_sha256.to_ascii_lowercase();
+            let ready = observed_version == CODEX_EXECUTABLE_VERSION
+                && observed_schema == expected
+                && expected == CODEX_APP_SERVER_SCHEMA_SHA256;
+            Ok(ProbeHarnessResult {
+                probe_id: Uuid::now_v7().to_string(),
+                readiness: if ready {
+                    HarnessReadiness::Ready
+                } else {
+                    HarnessReadiness::ProtocolMismatch
+                } as i32,
+                observed_protocol: Some(NativeProtocolFingerprint {
+                    native_executable_version: observed_version,
+                    schema_sha256: observed_schema.clone(),
+                    ..codex_protocol_fingerprint()
+                }),
+                safe_diagnostic_codes: vec![if ready {
+                    "CODEX_APP_SERVER_READY".to_owned()
+                } else {
+                    "CODEX_APP_SERVER_FINGERPRINT_MISMATCH".to_owned()
+                }],
+                evidence_refs: vec![format!("schema-sha256:{observed_schema}")],
+                observed_at: Some(now()),
+            })
         })
     }
 
-    async fn send_dispatch(
-        &mut self,
-        envelope: &DispatchEnvelope,
-        material: &ResolvedDispatchMaterial,
-    ) -> Result<DriverDelivery, DriverError> {
-        self.ensure_session(&material.workspace_root).await?;
-        let thread_id = self.start_or_resume_thread(envelope, material).await?;
-        let session = self.session.as_mut().expect("session initialized");
-        let request_id = session.next_id();
-        let request = json!({
-            "id": request_id,
-            "method": "turn/start",
-            "params": {
-                "threadId": thread_id,
-                "input": [{ "type": "text", "text": material.prompt }],
-                "cwd": material.workspace_root,
-                "approvalPolicy": "untrusted",
-                "model": material.model
-            }
-        });
-        let raw = serde_json::to_vec(&request).unwrap_or_default();
-        session.write_value(&request).await.map_err(|mut error| {
-            error.certainty = DriverErrorCertainty::DeliveryUnknown;
-            error
-        })?;
-        self.active = Some(ActiveDispatch {
-            dispatch_id: envelope.dispatch_id.clone(),
-            thread_id: thread_id.clone(),
-            turn_id: None,
-            turn_request_id: request_id,
-        });
-        Ok(DriverDelivery {
-            native_request_ref: format!("codex-jsonrpc:{request_id}"),
-            native_session_ref: thread_id,
-            native_execution_ref: None,
-            raw_evidence: raw,
-        })
-    }
-
-    async fn next_event(
-        &mut self,
-        envelope: &DispatchEnvelope,
-    ) -> Result<Option<DriverEvent>, DriverError> {
-        if let Some(event) = self.queued_events.pop_front() {
-            return Ok(Some(event));
-        }
-        if self
-            .active
-            .as_ref()
-            .is_none_or(|active| active.dispatch_id != envelope.dispatch_id)
-        {
-            return Err(dependency_error("CODEX_ACTIVE_DISPATCH_NOT_FOUND"));
-        }
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| dependency_error("CODEX_SESSION_NOT_RUNNING"))?;
-        let (value, raw) = session.read_next_value(self.config.request_timeout).await?;
-        self.map_value(envelope, value, raw)
-    }
-
-    async fn decide_approval(
-        &mut self,
-        envelope: &ApprovalDecisionEnvelope,
-    ) -> Result<Vec<u8>, DriverError> {
-        self.send_approval_response(envelope).await
-    }
-
-    async fn cancel(&mut self, envelope: &CancelExecutionEnvelope) -> Result<Vec<u8>, DriverError> {
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| dependency_error("CODEX_SESSION_NOT_RUNNING"))?;
-        let request_id = session.next_id();
-        let request = json!({
-            "id": request_id,
-            "method": "turn/interrupt",
-            "params": {
-                "threadId": envelope.native_session_ref,
-                "turnId": envelope.native_execution_ref
-            }
-        });
-        let raw = serde_json::to_vec(&request).unwrap_or_default();
-        session.write_value(&request).await.map_err(|mut error| {
-            error.certainty = DriverErrorCertainty::DeliveryUnknown;
-            error
-        })?;
-        self.pending_control_requests
-            .insert(request_id, "turn-interrupt");
-        Ok(raw)
-    }
-
-    async fn reconcile(
-        &mut self,
-        context: &ReconciliationContext,
-    ) -> Result<ReconciliationFinding, DriverError> {
-        self.ensure_session(&context.material.workspace_root)
-            .await?;
-        let active = self
-            .active
-            .as_ref()
-            .filter(|active| active.dispatch_id == context.envelope.dispatch_id);
-        let thread_id = active.map(|active| active.thread_id.clone()).or_else(|| {
-            context
-                .delivery_receipt
-                .as_ref()
-                .and_then(|receipt| receipt.native_session_ref.clone())
-        });
-        let Some(thread_id) = thread_id else {
-            return Ok(ReconciliationFinding::OutcomeUnknown {
-                evidence_ref: "codex-reconcile:no-durable-thread-reference".to_owned(),
+    fn send_dispatch<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+        material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        Box::pin(async move {
+            self.ensure_session(&material.workspace_root).await?;
+            let thread_id = self.start_or_resume_thread(envelope, material).await?;
+            let session = self.session.as_mut().expect("session initialized");
+            let request_id = session.next_id();
+            let request = json!({
+                "id": request_id,
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "input": [{ "type": "text", "text": material.prompt }],
+                    "cwd": material.workspace_root,
+                    "approvalPolicy": "untrusted",
+                    "model": material.model
+                }
             });
-        };
-        let expected_turn_id = active
-            .and_then(|active| active.turn_id.clone())
-            .or_else(|| {
+            let raw = serde_json::to_vec(&request).unwrap_or_default();
+            session.write_value(&request).await.map_err(|mut error| {
+                error.certainty = DriverErrorCertainty::DeliveryUnknown;
+                error
+            })?;
+            self.active = Some(ActiveDispatch {
+                dispatch_id: envelope.dispatch_id.clone(),
+                thread_id: thread_id.clone(),
+                turn_id: None,
+                turn_request_id: request_id,
+            });
+            Ok(DriverDelivery {
+                native_request_ref: format!("codex-jsonrpc:{request_id}"),
+                native_session_ref: thread_id,
+                native_execution_ref: None,
+                raw_evidence: raw,
+            })
+        })
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        Box::pin(async move {
+            if let Some(event) = self.queued_events.pop_front() {
+                return Ok(Some(event));
+            }
+            if self
+                .active
+                .as_ref()
+                .is_none_or(|active| active.dispatch_id != envelope.dispatch_id)
+            {
+                return Err(dependency_error("CODEX_ACTIVE_DISPATCH_NOT_FOUND"));
+            }
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| dependency_error("CODEX_SESSION_NOT_RUNNING"))?;
+            let (value, raw) = session.read_next_value(self.config.request_timeout).await?;
+            self.map_value(envelope, value, raw)
+        })
+    }
+
+    fn decide_approval<'a>(
+        &'a mut self,
+        envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async move { self.send_approval_response(envelope).await })
+    }
+
+    fn cancel<'a>(
+        &'a mut self,
+        envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async move {
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| dependency_error("CODEX_SESSION_NOT_RUNNING"))?;
+            let request_id = session.next_id();
+            let request = json!({
+                "id": request_id,
+                "method": "turn/interrupt",
+                "params": {
+                    "threadId": envelope.native_session_ref,
+                    "turnId": envelope.native_execution_ref
+                }
+            });
+            let raw = serde_json::to_vec(&request).unwrap_or_default();
+            session.write_value(&request).await.map_err(|mut error| {
+                error.certainty = DriverErrorCertainty::DeliveryUnknown;
+                error
+            })?;
+            self.pending_control_requests
+                .insert(request_id, "turn-interrupt");
+            Ok(raw)
+        })
+    }
+
+    fn reconcile<'a>(
+        &'a mut self,
+        context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        Box::pin(async move {
+            self.ensure_session(&context.material.workspace_root)
+                .await?;
+            let active = self
+                .active
+                .as_ref()
+                .filter(|active| active.dispatch_id == context.envelope.dispatch_id);
+            let thread_id = active.map(|active| active.thread_id.clone()).or_else(|| {
                 context
                     .delivery_receipt
                     .as_ref()
-                    .and_then(|receipt| receipt.native_execution_ref.clone())
+                    .and_then(|receipt| receipt.native_session_ref.clone())
             });
-        let session = self.session.as_mut().expect("session initialized");
-        let request_id = session.next_id();
-        session
-            .write_value(&json!({
-                "id": request_id,
-                "method": "thread/read",
-                "params": { "threadId": thread_id, "includeTurns": true }
-            }))
-            .await?;
-        let (response, raw) = session
-            .read_response(request_id, self.config.request_timeout)
-            .await?;
-        let evidence_ref = format!("codex-thread-read-sha256:{}", sha256(&raw));
-        let status = response
-            .pointer("/result/thread/status/type")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let turns = response
-            .pointer("/result/thread/turns")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let turn = expected_turn_id
-            .as_ref()
-            .and_then(|expected| {
-                turns
-                    .iter()
-                    .find(|turn| turn.get("id").and_then(Value::as_str) == Some(expected))
-            })
-            .or_else(|| {
-                (context.envelope.native_session_ref.is_none() && turns.len() == 1)
-                    .then(|| turns.first())
-                    .flatten()
-            });
-        if status == "active" {
-            return Ok(ReconciliationFinding::NativeExecutionActive { evidence_ref });
-        }
-        if let Some(turn_status) = turn
-            .and_then(|turn| turn.get("status"))
-            .and_then(Value::as_str)
-        {
-            if matches!(turn_status, "completed" | "interrupted" | "failed") {
-                return Ok(ReconciliationFinding::TerminalObservationRecovered { evidence_ref });
-            }
-            if turn_status == "inProgress" {
+            let Some(thread_id) = thread_id else {
+                return Ok(ReconciliationFinding::OutcomeUnknown {
+                    evidence_ref: "codex-reconcile:no-durable-thread-reference".to_owned(),
+                });
+            };
+            let expected_turn_id = active
+                .and_then(|active| active.turn_id.clone())
+                .or_else(|| {
+                    context
+                        .delivery_receipt
+                        .as_ref()
+                        .and_then(|receipt| receipt.native_execution_ref.clone())
+                });
+            let session = self.session.as_mut().expect("session initialized");
+            let request_id = session.next_id();
+            session
+                .write_value(&json!({
+                    "id": request_id,
+                    "method": "thread/read",
+                    "params": { "threadId": thread_id, "includeTurns": true }
+                }))
+                .await?;
+            let (response, raw) = session
+                .read_response(request_id, self.config.request_timeout)
+                .await?;
+            let evidence_ref = format!("codex-thread-read-sha256:{}", sha256(&raw));
+            let status = response
+                .pointer("/result/thread/status/type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let turns = response
+                .pointer("/result/thread/turns")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let turn = expected_turn_id
+                .as_ref()
+                .and_then(|expected| {
+                    turns
+                        .iter()
+                        .find(|turn| turn.get("id").and_then(Value::as_str) == Some(expected))
+                })
+                .or_else(|| {
+                    (context.envelope.native_session_ref.is_none() && turns.len() == 1)
+                        .then(|| turns.first())
+                        .flatten()
+                });
+            if status == "active" {
                 return Ok(ReconciliationFinding::NativeExecutionActive { evidence_ref });
             }
-        }
-        Ok(ReconciliationFinding::OutcomeUnknown { evidence_ref })
+            if let Some(turn_status) = turn
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str)
+            {
+                if matches!(turn_status, "completed" | "interrupted" | "failed") {
+                    return Ok(ReconciliationFinding::TerminalObservationRecovered {
+                        evidence_ref,
+                    });
+                }
+                if turn_status == "inProgress" {
+                    return Ok(ReconciliationFinding::NativeExecutionActive { evidence_ref });
+                }
+            }
+            Ok(ReconciliationFinding::OutcomeUnknown { evidence_ref })
+        })
     }
 }
 

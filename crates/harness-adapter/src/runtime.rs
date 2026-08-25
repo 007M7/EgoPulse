@@ -14,8 +14,8 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
 use prost::Message;
 use prost_types::Timestamp;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{future::Future, path::PathBuf, pin::Pin};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -112,34 +112,39 @@ pub struct ReconciliationContext {
     pub material: ResolvedDispatchMaterial,
 }
 
+pub type NativeHarnessFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 pub trait NativeHarnessDriver {
-    async fn probe(
-        &mut self,
-        request: &ProbeHarnessRequest,
-    ) -> Result<ProbeHarnessResult, DriverError>;
+    fn probe<'a>(
+        &'a mut self,
+        request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>>;
 
-    async fn send_dispatch(
-        &mut self,
-        envelope: &DispatchEnvelope,
-        material: &ResolvedDispatchMaterial,
-    ) -> Result<DriverDelivery, DriverError>;
+    fn send_dispatch<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+        material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>>;
 
-    async fn next_event(
-        &mut self,
-        envelope: &DispatchEnvelope,
-    ) -> Result<Option<DriverEvent>, DriverError>;
+    fn next_event<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>>;
 
-    async fn decide_approval(
-        &mut self,
-        envelope: &ApprovalDecisionEnvelope,
-    ) -> Result<Vec<u8>, DriverError>;
+    fn decide_approval<'a>(
+        &'a mut self,
+        envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>>;
 
-    async fn cancel(&mut self, envelope: &CancelExecutionEnvelope) -> Result<Vec<u8>, DriverError>;
+    fn cancel<'a>(
+        &'a mut self,
+        envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>>;
 
-    async fn reconcile(
-        &mut self,
-        context: &ReconciliationContext,
-    ) -> Result<ReconciliationFinding, DriverError>;
+    fn reconcile<'a>(
+        &'a mut self,
+        context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>>;
 }
 
 #[derive(Debug, Error)]

@@ -10,6 +10,7 @@ use egopulse_harness_adapter::{
     AdapterClock, DispatchMaterialResolver, GovernedAdapterError, GovernedHarnessAdapter,
     NativeHarnessDriver,
 };
+use std::{future::Future, pin::Pin};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -30,6 +31,74 @@ pub enum HarnessDispatchCycleError {
     Collaboration(#[from] CollaborationControlError),
     #[error("harness adapter operation failed")]
     Adapter(#[from] GovernedAdapterError),
+}
+
+pub trait HarnessDispatchRunner: Send + Sync {
+    fn run_once(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>>
+                + Send
+                + '_,
+        >,
+    >;
+}
+
+struct GovernedDispatchRuntime<G, C, R, D, A> {
+    control: CollaborationControl<G, C>,
+    adapter: GovernedHarnessAdapter<R, D, A>,
+}
+
+pub struct GovernedHarnessDispatchRunner<G, C, R, D, A> {
+    runtime: tokio::sync::Mutex<GovernedDispatchRuntime<G, C, R, D, A>>,
+    principal: AuthenticatedCollaborationPrincipal,
+}
+
+impl<G, C, R, D, A> GovernedHarnessDispatchRunner<G, C, R, D, A>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver + Send,
+    C: AuthorityClock + Send,
+    R: DispatchMaterialResolver + Send,
+    D: NativeHarnessDriver + Send,
+    A: AdapterClock + Send,
+{
+    #[must_use]
+    pub fn new(
+        control: CollaborationControl<G, C>,
+        adapter: GovernedHarnessAdapter<R, D, A>,
+        principal: AuthenticatedCollaborationPrincipal,
+    ) -> Self {
+        Self {
+            runtime: tokio::sync::Mutex::new(GovernedDispatchRuntime { control, adapter }),
+            principal,
+        }
+    }
+}
+
+impl<G, C, R, D, A> HarnessDispatchRunner for GovernedHarnessDispatchRunner<G, C, R, D, A>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver + Send,
+    C: AuthorityClock + Send,
+    R: DispatchMaterialResolver + Send,
+    D: NativeHarnessDriver + Send,
+    A: AdapterClock + Send,
+{
+    fn run_once(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let mut runtime = self.runtime.lock().await;
+            let GovernedDispatchRuntime { control, adapter } = &mut *runtime;
+            dispatch_pending(control, adapter, &self.principal).await
+        })
+    }
 }
 
 /// Delivers all currently pending Collaboration dispatch intents to one

@@ -12,6 +12,6 @@ pub use edge::{
 pub use runtime::{
     AdapterClock, AdapterReconciliationEvidence, DispatchMaterialResolver, DriverDelivery,
     DriverError, DriverErrorCertainty, DriverEvent, GovernedAdapterError, GovernedHarnessAdapter,
-    NativeHarnessDriver, ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
-    SystemAdapterClock,
+    NativeHarnessDriver, NativeHarnessFuture, ReconciliationContext, ReconciliationFinding,
+    ResolvedDispatchMaterial, SystemAdapterClock,
 };

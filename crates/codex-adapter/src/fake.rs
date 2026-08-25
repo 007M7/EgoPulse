@@ -5,8 +5,8 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     harness_observation,
 };
 use egopulse_harness_adapter::{
-    DriverDelivery, DriverError, DriverEvent, NativeHarnessDriver, ReconciliationContext,
-    ReconciliationFinding, ResolvedDispatchMaterial,
+    DriverDelivery, DriverError, DriverEvent, NativeHarnessDriver, NativeHarnessFuture,
+    ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
 };
 use prost_types::Timestamp;
 use std::collections::VecDeque;
@@ -47,111 +47,119 @@ impl FakeCodexDriver {
 }
 
 impl NativeHarnessDriver for FakeCodexDriver {
-    async fn probe(
-        &mut self,
-        _request: &ProbeHarnessRequest,
-    ) -> Result<ProbeHarnessResult, DriverError> {
-        Ok(ProbeHarnessResult {
-            probe_id: Uuid::now_v7().to_string(),
-            readiness: HarnessReadiness::Ready as i32,
-            observed_protocol: Some(codex_protocol_fingerprint()),
-            safe_diagnostic_codes: vec!["FAKE_CODEX_READY".to_owned()],
-            evidence_refs: vec!["fixture://codex/fake/probe".to_owned()],
-            observed_at: Some(timestamp(1_787_488_000)),
+    fn probe<'a>(
+        &'a mut self,
+        _request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        Box::pin(async move {
+            Ok(ProbeHarnessResult {
+                probe_id: Uuid::now_v7().to_string(),
+                readiness: HarnessReadiness::Ready as i32,
+                observed_protocol: Some(codex_protocol_fingerprint()),
+                safe_diagnostic_codes: vec!["FAKE_CODEX_READY".to_owned()],
+                evidence_refs: vec!["fixture://codex/fake/probe".to_owned()],
+                observed_at: Some(timestamp(1_787_488_000)),
+            })
         })
     }
 
-    async fn send_dispatch(
-        &mut self,
-        envelope: &DispatchEnvelope,
-        _material: &ResolvedDispatchMaterial,
-    ) -> Result<DriverDelivery, DriverError> {
-        self.dispatch_count += 1;
-        let thread_id = format!("fake-thread-{}", envelope.dispatch_id);
-        let turn_id = format!("fake-turn-{}", envelope.dispatch_id);
-        self.events.push_back(event(
-            "fake-ack",
-            ObservationCriticality::Control,
-            harness_observation::Payload::Ack(HarnessAckObservation {
-                disposition: AckDisposition::Accepted as i32,
-                ack_receipt_id: format!("fake-ack-{}", envelope.dispatch_id),
-                native_session_ref: Some(thread_id.clone()),
-                native_execution_ref: Some(turn_id.clone()),
-            }),
-        ));
-        self.events.push_back(event(
-            "fake-running",
-            ObservationCriticality::Control,
-            harness_observation::Payload::Lifecycle(LifecycleObservation {
-                kind: LifecycleKind::ExecutionStarted as i32,
-                native_item_ref: None,
-                safe_status_code: Some("inProgress".to_owned()),
-                side_effect_certainty: SideEffectCertainty::Unknown as i32,
-                native_will_retry: None,
-            }),
-        ));
-        self.events.push_back(event(
-            "fake-completed",
-            ObservationCriticality::Terminal,
-            harness_observation::Payload::Lifecycle(LifecycleObservation {
-                kind: LifecycleKind::ExecutionCompleted as i32,
-                native_item_ref: None,
-                safe_status_code: Some("completed".to_owned()),
-                side_effect_certainty: SideEffectCertainty::Unknown as i32,
-                native_will_retry: None,
-            }),
-        ));
-        Ok(DriverDelivery {
-            native_request_ref: format!("fake-request-{}", envelope.dispatch_id),
-            native_session_ref: thread_id,
-            native_execution_ref: Some(turn_id),
-            raw_evidence: b"fake-dispatch-delivered".to_vec(),
+    fn send_dispatch<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+        _material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        Box::pin(async move {
+            self.dispatch_count += 1;
+            let thread_id = format!("fake-thread-{}", envelope.dispatch_id);
+            let turn_id = format!("fake-turn-{}", envelope.dispatch_id);
+            self.events.push_back(event(
+                "fake-ack",
+                ObservationCriticality::Control,
+                harness_observation::Payload::Ack(HarnessAckObservation {
+                    disposition: AckDisposition::Accepted as i32,
+                    ack_receipt_id: format!("fake-ack-{}", envelope.dispatch_id),
+                    native_session_ref: Some(thread_id.clone()),
+                    native_execution_ref: Some(turn_id.clone()),
+                }),
+            ));
+            self.events.push_back(event(
+                "fake-running",
+                ObservationCriticality::Control,
+                harness_observation::Payload::Lifecycle(LifecycleObservation {
+                    kind: LifecycleKind::ExecutionStarted as i32,
+                    native_item_ref: None,
+                    safe_status_code: Some("inProgress".to_owned()),
+                    side_effect_certainty: SideEffectCertainty::Unknown as i32,
+                    native_will_retry: None,
+                }),
+            ));
+            self.events.push_back(event(
+                "fake-completed",
+                ObservationCriticality::Terminal,
+                harness_observation::Payload::Lifecycle(LifecycleObservation {
+                    kind: LifecycleKind::ExecutionCompleted as i32,
+                    native_item_ref: None,
+                    safe_status_code: Some("completed".to_owned()),
+                    side_effect_certainty: SideEffectCertainty::Unknown as i32,
+                    native_will_retry: None,
+                }),
+            ));
+            Ok(DriverDelivery {
+                native_request_ref: format!("fake-request-{}", envelope.dispatch_id),
+                native_session_ref: thread_id,
+                native_execution_ref: Some(turn_id),
+                raw_evidence: b"fake-dispatch-delivered".to_vec(),
+            })
         })
     }
 
-    async fn next_event(
-        &mut self,
-        _envelope: &DispatchEnvelope,
-    ) -> Result<Option<DriverEvent>, DriverError> {
-        Ok(self.events.pop_front())
+    fn next_event<'a>(
+        &'a mut self,
+        _envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        Box::pin(async move { Ok(self.events.pop_front()) })
     }
 
-    async fn decide_approval(
-        &mut self,
-        _envelope: &ApprovalDecisionEnvelope,
-    ) -> Result<Vec<u8>, DriverError> {
-        Ok(b"fake-approval-delivered".to_vec())
+    fn decide_approval<'a>(
+        &'a mut self,
+        _envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async move { Ok(b"fake-approval-delivered".to_vec()) })
     }
 
-    async fn cancel(
-        &mut self,
-        _envelope: &CancelExecutionEnvelope,
-    ) -> Result<Vec<u8>, DriverError> {
-        self.cancel_count += 1;
-        self.events.push_back(event(
-            "fake-interrupted",
-            ObservationCriticality::Terminal,
-            harness_observation::Payload::Lifecycle(LifecycleObservation {
-                kind: LifecycleKind::ExecutionInterrupted as i32,
-                native_item_ref: None,
-                safe_status_code: Some("interrupted".to_owned()),
-                side_effect_certainty: SideEffectCertainty::Unknown as i32,
-                native_will_retry: None,
-            }),
-        ));
-        Ok(b"fake-cancel-delivered".to_vec())
+    fn cancel<'a>(
+        &'a mut self,
+        _envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async move {
+            self.cancel_count += 1;
+            self.events.push_back(event(
+                "fake-interrupted",
+                ObservationCriticality::Terminal,
+                harness_observation::Payload::Lifecycle(LifecycleObservation {
+                    kind: LifecycleKind::ExecutionInterrupted as i32,
+                    native_item_ref: None,
+                    safe_status_code: Some("interrupted".to_owned()),
+                    side_effect_certainty: SideEffectCertainty::Unknown as i32,
+                    native_will_retry: None,
+                }),
+            ));
+            Ok(b"fake-cancel-delivered".to_vec())
+        })
     }
 
-    async fn reconcile(
-        &mut self,
-        _context: &ReconciliationContext,
-    ) -> Result<ReconciliationFinding, DriverError> {
-        self.reconcile_count += 1;
-        Ok(self.reconciliation_finding.clone().unwrap_or_else(|| {
-            ReconciliationFinding::TerminalObservationRecovered {
-                evidence_ref: "fixture://codex/fake/reconciled".to_owned(),
-            }
-        }))
+    fn reconcile<'a>(
+        &'a mut self,
+        _context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        Box::pin(async move {
+            self.reconcile_count += 1;
+            Ok(self.reconciliation_finding.clone().unwrap_or_else(|| {
+                ReconciliationFinding::TerminalObservationRecovered {
+                    evidence_ref: "fixture://codex/fake/reconciled".to_owned(),
+                }
+            }))
+        })
     }
 }
 
