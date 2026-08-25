@@ -99,9 +99,10 @@ pub use verdict::{
     VerificationAuthorityArtifactSource,
 };
 pub use verification::{
-    VerificationBindingTemplate, VerificationHandoffConsumeResult, VerificationHandoffIntake,
-    VerificationHandoffIntakeError, VerificationHandoffPlan, VerificationHandoffPlanError,
-    VerificationHandoffRequest,
+    CheckerProfileAttestationError, CheckerProfileAttestationResult,
+    SystemCheckerProfileAttestation, VerificationBindingTemplate, VerificationHandoffConsumeResult,
+    VerificationHandoffIntake, VerificationHandoffIntakeError, VerificationHandoffPlan,
+    VerificationHandoffPlanError, VerificationHandoffRequest,
 };
 
 #[derive(Clone, Debug)]

@@ -8,13 +8,14 @@ use egopulse_domain_contracts::v01::egopulse::{
     common::v1::{CommandMetadata, ContractReference},
     task::v1::{TaskEventKind, TaskStatus},
     verification::v1::{
-        CreateVerificationRequestCommand, VerificationBinding, VerificationCommand,
-        VerificationRequest, verification_command,
+        AttestCheckerProfileCommand, CheckerProfile, CreateVerificationRequestCommand,
+        VerificationBinding, VerificationCommand, VerificationRequest, verification_command,
     },
 };
 use egopulse_verification_authority::{
     ArtifactReferenceSource, ArtifactReferenceSourceError, AuthenticatedVerificationPrincipal,
-    VerificationAuthority, VerificationAuthorityFailure, canonical_request_digest,
+    VerificationAuthority, VerificationAuthorityFailure, VerificationPrincipalKind,
+    canonical_request_digest,
 };
 use prost_types::Timestamp;
 use sha2::{Digest, Sha256};
@@ -22,6 +23,8 @@ use thiserror::Error;
 
 const TASK_ACCEPTANCE: &str = "task_acceptance";
 const HANDOFF_IDEMPOTENCY_SCOPE: &str = "task-verification-handoff-v1";
+const PROFILE_ATTESTATION_SCOPE: &str = "system-checker-profile-attestation-v1";
+const SYSTEM_VERIFICATION_PRINCIPAL: &str = "verification-bootstrap:local";
 
 /// The parts of Artifact/Verification binding that cannot be inferred from a
 /// Task handoff. They are reviewed configuration, not Agent output.
@@ -44,6 +47,123 @@ pub struct VerificationHandoffRequest {
     pub request: VerificationRequest,
     pub message_id: String,
     pub payload_digest_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckerProfileAttestationResult {
+    pub checker_profile_id: String,
+    pub committed: bool,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum CheckerProfileAttestationError {
+    #[error("checker profile ID is empty")]
+    InvalidProfileId,
+    #[error("checker profile attestation command could not be canonicalized")]
+    Canonicalization,
+    #[error("Verification Authority lock is poisoned")]
+    VerificationLock,
+    #[error("Verification Authority command failed: {0}")]
+    Verification(#[from] VerificationAuthorityFailure),
+    #[error("checker profile attestation was rejected: {0}")]
+    Rejected(String),
+}
+
+/// System-only application entry point for checker profile attestation.
+///
+/// The caller supplies a reviewed profile candidate, but never supplies the
+/// authority principal. Verification Authority remains responsible for
+/// validating profile structure, canonical digest and Artifact-backed
+/// attestation evidence before activating it.
+pub struct SystemCheckerProfileAttestation {
+    verification: Arc<Mutex<VerificationAuthority>>,
+}
+
+impl SystemCheckerProfileAttestation {
+    #[must_use]
+    pub fn new(verification: Arc<Mutex<VerificationAuthority>>) -> Self {
+        Self { verification }
+    }
+
+    pub fn attest_one(
+        &self,
+        profile: CheckerProfile,
+        issued_at: Timestamp,
+    ) -> Result<CheckerProfileAttestationResult, CheckerProfileAttestationError> {
+        if profile.checker_profile_id.trim().is_empty() {
+            return Err(CheckerProfileAttestationError::InvalidProfileId);
+        }
+        let checker_profile_id = profile.checker_profile_id.clone();
+        let command = checker_profile_attestation_command(profile, issued_at)?;
+        let result = self
+            .verification
+            .lock()
+            .map_err(|_| CheckerProfileAttestationError::VerificationLock)?
+            .execute(
+                &command,
+                &AuthenticatedVerificationPrincipal {
+                    kind: VerificationPrincipalKind::VerificationAuthority,
+                    principal_id: SYSTEM_VERIFICATION_PRINCIPAL.to_owned(),
+                    authenticated: true,
+                    checker_profile_id: None,
+                },
+            )?;
+        if !result.committed && !result.replayed {
+            return Err(CheckerProfileAttestationError::Rejected(
+                result
+                    .safe_error_fingerprint
+                    .unwrap_or_else(|| "CHECKER_PROFILE_ATTESTATION_REJECTED".to_owned()),
+            ));
+        }
+        Ok(CheckerProfileAttestationResult {
+            checker_profile_id,
+            committed: result.committed,
+            replayed: result.replayed,
+        })
+    }
+}
+
+fn checker_profile_attestation_command(
+    profile: CheckerProfile,
+    issued_at: Timestamp,
+) -> Result<VerificationCommand, CheckerProfileAttestationError> {
+    let idempotency_key = format!(
+        "{}:{}",
+        profile.checker_profile_id, profile.profile_digest_sha256
+    );
+    let command_id = format!(
+        "checker-profile-attestation-{}",
+        hex::encode(Sha256::digest(idempotency_key.as_bytes()))
+    );
+    let mut command = VerificationCommand {
+        command: Some(verification_command::Command::AttestCheckerProfile(
+            AttestCheckerProfileCommand {
+                metadata: Some(CommandMetadata {
+                    command_id,
+                    idempotency_key,
+                    idempotency_scope: PROFILE_ATTESTATION_SCOPE.to_owned(),
+                    request_digest_sha256: String::new(),
+                    issued_at: Some(issued_at),
+                    correlation_id: profile.checker_profile_id.clone(),
+                    causation_id: None,
+                }),
+                profile: Some(profile),
+            },
+        )),
+    };
+    let digest = canonical_request_digest(&command)
+        .ok_or(CheckerProfileAttestationError::Canonicalization)?;
+    if let Some(verification_command::Command::AttestCheckerProfile(value)) =
+        command.command.as_mut()
+    {
+        value
+            .metadata
+            .as_mut()
+            .expect("attestation metadata was constructed")
+            .request_digest_sha256 = digest;
+    }
+    Ok(command)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -514,6 +634,35 @@ mod tests {
         let metadata = create.metadata.as_ref().expect("metadata");
         assert_eq!(metadata.idempotency_key, "task-outbox-verification-1");
         assert_eq!(metadata.idempotency_scope, HANDOFF_IDEMPOTENCY_SCOPE);
+        assert_eq!(
+            canonical_request_digest(&command).as_deref(),
+            Some(metadata.request_digest_sha256.as_str())
+        );
+    }
+
+    #[test]
+    fn checker_profile_attestation_command_is_system_scoped_and_digest_bound() {
+        let profile = CheckerProfile {
+            checker_profile_id: "checker-profile-1".to_owned(),
+            profile_digest_sha256: "a".repeat(64),
+            ..CheckerProfile::default()
+        };
+        let command = checker_profile_attestation_command(
+            profile,
+            Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            },
+        )
+        .expect("command should canonicalize");
+        let verification_command::Command::AttestCheckerProfile(attest) =
+            command.command.as_ref().expect("command")
+        else {
+            panic!("wrong command");
+        };
+        let metadata = attest.metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.idempotency_scope, PROFILE_ATTESTATION_SCOPE);
+        assert_eq!(metadata.correlation_id, "checker-profile-1");
         assert_eq!(
             canonical_request_digest(&command).as_deref(),
             Some(metadata.request_digest_sha256.as_str())

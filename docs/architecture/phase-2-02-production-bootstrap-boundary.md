@@ -141,3 +141,12 @@ absent, the deny resolver remains active. This section authorizes neither a
 checker profile nor a Sego process: checker profiles still require an explicit
 Verification Authority attestation command whose evidence artifacts pass the
 same owner-backed resolver.
+
+The application boundary now provides `SystemCheckerProfileAttestation`. It
+fixes the principal to the local Verification Authority bootstrap identity,
+derives a stable idempotency key from the profile identity and digest, and
+accepts only a committed or replayed Authority result. A caller cannot inject
+a Task, Harness, Model, or client principal into this path. The helper is the
+attestation primitive; production configuration still has to explicitly supply
+the reviewed profile candidate and the next vertical must wire this primitive
+into its startup/recovery policy before declaring checker execution available.
