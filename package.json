@@ -18,6 +18,7 @@
     "check:typescript": "node scripts/check-typescript.mjs",
     "desktop:dev": "pnpm --filter @egopulse/desktop tauri dev",
     "desktop:build": "pnpm --filter @egopulse/desktop tauri build",
+    "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1",
     "ci:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/local-ci.ps1",
     "cd:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/local-cd.ps1"
   },

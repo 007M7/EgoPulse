@@ -12,4 +12,4 @@ if ($configured -ne '.githooks') {
     throw "Unexpected Git hooks path after installation: $configured"
 }
 
-Write-Output 'git_hooks=installed path=.githooks pre_push=local_ci'
+Write-Output 'git_hooks=installed path=.githooks pre_push=fast-contract-typescript-check'

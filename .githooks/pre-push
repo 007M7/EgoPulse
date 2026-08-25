@@ -2,4 +2,4 @@
 set -eu
 
 repo_root=$(git rev-parse --show-toplevel)
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$repo_root/scripts/local-ci.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$repo_root/scripts/pre-push-check.ps1"

@@ -2,7 +2,7 @@
 
 ## Decision
 
-Until the private GitHub repository can enforce protected branches and protected release environments, the authoritative engineering gate runs locally. Every code push must pass the tracked pre-push hook. Release operations produce an unsigned, commit-bound Windows candidate; they do not publish a production release.
+The authoritative engineering gate runs in GitHub Actions for pull requests, `main` pushes and release tags. The workflow owns the reproducible Windows runner, exact-SHA CI evidence and the release dependency chain. Local checks remain useful for fast feedback and offline reproduction, but are not repeated as a mandatory full Rust gate before every push. Release operations produce an unsigned, commit-bound Windows early-access candidate; they do not imply code signing or a production release.
 
 The two repositories have different classifications:
 
@@ -13,7 +13,7 @@ The two repositories have different classifications:
 
 Private governance material must not be copied into `EgoPulse`. `pnpm run check:public-boundary` fails when tracked files appear under a reserved private-governance root or use a credential-bearing file type. This keeps the implementation repository suitable for later publication without relying on deleting reachable Git history.
 
-## Local CI
+## Local fast pre-push check
 
 Install the repository hook once per clone or worktree:
 
@@ -21,7 +21,22 @@ Install the repository hook once per clone or worktree:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-git-hooks.ps1
 ```
 
-Run the same gate directly with:
+The tracked hook runs the fast, non-release check:
+
+- `git diff --check`;
+- repository boundaries, contracts, generated bindings and TypeScript checks.
+
+This deliberately does not compile and test the complete Rust workspace on every push; that expensive authoritative gate runs once in GitHub Actions.
+
+Run the fast check directly with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/pre-push-check.ps1
+```
+
+## Local full CI
+
+Run the complete local reproduction gate only when working offline, diagnosing a failure, or validating a risky Rust change:
 
 ```powershell
 pnpm run ci:local
@@ -29,7 +44,7 @@ pnpm run ci:local
 
 Bootstrap a new checkout once with `pnpm install --frozen-lockfile`. The recurring gate verifies Git diff integrity, Node manifest/lock consistency without reinstalling an already materialized dependency tree, repository boundaries, contracts, generated code, TypeScript, the Desktop frontend, the complete Rust workspace, and both Python projects. Missing or stale installed packages fail closed in the TypeScript or Desktop steps. Machine-readable evidence is written beneath `.local-ci/evidence/` and is intentionally ignored by Git.
 
-Why a tracked hook instead of relying on developer memory: it makes the gate the default for every push and keeps the command reviewable with the source. The cost is slower pushes and local machine prerequisites. Git hooks can still be bypassed with `--no-verify`, so this is an interim control rather than a substitute for remote required checks.
+Why keep a tracked fast hook: it catches contract and boundary failures before a push without duplicating the long remote Rust job. Git hooks can still be bypassed with `--no-verify`; GitHub required checks remain the authoritative control.
 
 ## Local CD
 
@@ -39,8 +54,20 @@ Create a release candidate with:
 pnpm run cd:local
 ```
 
-CD reruns local CI, requires a clean worktree and evidence matching the exact `HEAD`, builds all four Windows binaries, includes dependency locks and CI evidence, generates per-file SHA-256 hashes, and creates a ZIP plus an archive hash beneath `.artifacts/release-candidate/`.
+`pnpm run cd:local` is an offline reproduction command. It runs local CI once, then calls the shared Windows packaging script. If local CI has already passed for the same clean `HEAD`, use `pnpm run cd:local -- -SkipCi` to avoid rerunning it. The packaging script requires a clean worktree, builds all four Windows binaries, includes dependency locks and available CI evidence, generates per-file SHA-256 hashes, and creates a ZIP plus an archive hash beneath `.artifacts/release-candidate/`. The packaging-only command is `pnpm run package:windows`.
 
 The candidate is explicitly classified as `unsigned-release-candidate`. It must not be represented as a production release. Code signing, SBOM generation, protected release approval and remote provenance attestation remain release-Gate requirements.
 
-Why a candidate pipeline now: packaging layout and commit traceability are expensive to change late and affect every delivery surface. Why not automatic production publishing: the product is still in Gate 4 and no trusted Windows signing identity or protected remote release environment has been bound. The cost is a manual promotion step and duplicated local/remote verification when remote enforcement becomes available.
+## GitHub CI/CD
+
+`.github/workflows/ci.yml` runs three parallel CI jobs—Rust, TypeScript/contracts and Python—on pull requests, `main` pushes and `v*` tags. The `windows-cd` job is conditional: it requires those same three jobs from the current workflow run, then runs only the optimized Windows release build and packaging step. It does not rerun `local-ci.ps1` or the full test suite.
+
+For a candidate without creating a release tag, use the workflow-dispatch input `publish_candidate=true`; the package is uploaded as a workflow artifact. Pushing a `v*` tag additionally creates a GitHub prerelease with the ZIP and `.sha256` file. Until a code-signing certificate exists, the release remains explicitly unsigned and must document SmartScreen risk.
+
+This gives the normal path:
+
+```text
+local fast check -> one remote CI run -> dependent remote Windows CD
+```
+
+The release build is not a duplicate test gate: it produces optimized binaries that the debug/test CI job does not produce. Local full CI/CD remains an opt-in diagnostic and offline path.

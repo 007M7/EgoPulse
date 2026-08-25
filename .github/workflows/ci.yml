@@ -3,7 +3,15 @@ name: foundation
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
+    inputs:
+      publish_candidate:
+        description: 'Build and upload a Windows x64 unsigned early-access candidate'
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -47,3 +55,58 @@ jobs:
       - run: uv run --project workers/foundation-probe --frozen pytest workers/foundation-probe --rootdir workers/foundation-probe
       - run: uv sync --project workers/contract-bindings --frozen
       - run: uv run --project workers/contract-bindings --frozen pytest workers/contract-bindings --rootdir workers/contract-bindings
+
+  windows-cd:
+    name: windows-cd
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_candidate == true)
+    needs: [rust, typescript-and-contracts, python]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.21.0
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Package Windows x64 candidate
+        shell: pwsh
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: >-
+          powershell -NoProfile -ExecutionPolicy Bypass
+          -File scripts/package-windows.ps1
+          -CiProvider github-actions
+          -CiRun "$env:GITHUB_RUN_ID"
+
+      - name: Upload Windows candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: egopulse-windows-x86_64-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            .artifacts/release-candidate/*.zip
+            .artifacts/release-candidate/*.zip.sha256
+
+      - name: Publish tagged GitHub release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $archive = Get-ChildItem -LiteralPath '.artifacts/release-candidate' -Filter '*.zip' -File | Select-Object -First 1
+          $checksum = Get-ChildItem -LiteralPath '.artifacts/release-candidate' -Filter '*.zip.sha256' -File | Select-Object -First 1
+          if (-not $archive -or -not $checksum) { throw 'Windows candidate or checksum is missing' }
+          gh release create $env:GITHUB_REF_NAME $archive.FullName $checksum.FullName --repo $env:GH_REPO --title "EgoPulse $env:GITHUB_REF_NAME" --prerelease --generate-notes
