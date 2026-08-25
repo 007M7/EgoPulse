@@ -21,10 +21,15 @@ use egopulse_domain_contracts::{
         policy::v1::{
             HarnessApprovalDecisionRecord, HarnessApprovalDecisionState,
             IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult,
+            PolicyDecisionErrorCode,
         },
-        task::v1::{CreateTaskCommand, TaskCommand, TaskCommandResult, task_command},
+        task::v1::{
+            CreateTaskCommand, TaskCommand, TaskCommandResult, TaskError, TaskErrorCode,
+            task_command, task_command_result,
+        },
         verdict::v1::{
-            IssueFounderVerdictCommand, VerdictCommand, VerdictCommandResult, verdict_command,
+            IssueFounderVerdictCommand, VerdictCommand, VerdictCommandResult, VerdictErrorCode,
+            verdict_command,
         },
     },
 };
@@ -323,6 +328,34 @@ fn task_result_with_await() -> CommandPortResult<TaskCommandResult> {
     }
 }
 
+fn task_result_with_error(
+    code: TaskErrorCode,
+    detail: &str,
+) -> CommandPortResult<TaskCommandResult> {
+    CommandPortResult {
+        result: TaskCommandResult {
+            replayed: false,
+            committed_event: None,
+            outcome: Some(task_command_result::Outcome::Error(TaskError {
+                code: code as i32,
+                safe_detail_code: detail.to_owned(),
+                retryable: false,
+                recovery_required: false,
+                current_revision: None,
+                audit_ref: None,
+            })),
+        },
+        source_revision: None,
+        await_target: None,
+    }
+}
+
+fn replayed_task_result() -> CommandPortResult<TaskCommandResult> {
+    let mut result = task_result_with_await();
+    result.result.replayed = true;
+    result
+}
+
 #[tokio::test]
 async fn task_success_propagates_result_and_typed_await_token() {
     let (peer, client, app, calls, last_principal, last_metadata) = test_context(
@@ -400,6 +433,165 @@ async fn authority_unavailable_is_returned_without_fabricating_success() {
         response.gateway_error.as_ref().map(|error| error.code),
         Some(LocalApiErrorCode::AuthorityUnavailable as i32)
     );
+    assert!(response.authority_result.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn identical_request_identity_returns_owner_replay_without_gateway_rewrite() {
+    let (peer, client, app, calls, _last_principal, _last_metadata) = test_context(
+        Ok(replayed_task_result()),
+        Err(CommandPortFailure::Unavailable),
+        Err(CommandPortFailure::Unavailable),
+    )
+    .await;
+    let command = create_task_command();
+    let request = ExecuteTaskCommandRequest {
+        client: Some(client.clone()),
+        command: Some(command.clone()),
+    };
+    let first = app.execute_task_command(Some(&peer), request.clone());
+    let second = app.execute_task_command(Some(&peer), request);
+    assert!(first.gateway_error.is_none());
+    assert!(second.gateway_error.is_none());
+    assert_eq!(first.authority_result, second.authority_result);
+    assert_eq!(first.await_token, second.await_token);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn idempotency_conflict_is_preserved_as_owner_result() {
+    let (peer, client, app, calls, _last_principal, _last_metadata) = test_context(
+        Ok(task_result_with_error(
+            TaskErrorCode::IdempotencyConflict,
+            "task_idempotency_conflict",
+        )),
+        Err(CommandPortFailure::Unavailable),
+        Err(CommandPortFailure::Unavailable),
+    )
+    .await;
+    let response = app.execute_task_command(
+        Some(&peer),
+        ExecuteTaskCommandRequest {
+            client: Some(client),
+            command: Some(create_task_command()),
+        },
+    );
+    assert!(response.gateway_error.is_none());
+    let authority_result = response.authority_result.expect("owner result");
+    assert!(matches!(
+        authority_result.outcome,
+        Some(task_command_result::Outcome::Error(TaskError {
+            code,
+            ..
+        })) if code == TaskErrorCode::IdempotencyConflict as i32
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[allow(deprecated)]
+#[tokio::test]
+async fn authority_denial_is_preserved_in_sanitized_approval_result() {
+    let (peer, client, app, _calls, _last_principal, _last_metadata) = test_context(
+        Err(CommandPortFailure::Unavailable),
+        Ok(CommandPortResult {
+            result: PolicyDecisionCommandResult {
+                error_code: PolicyDecisionErrorCode::PolicyDenied as i32,
+                safe_error_fingerprint: Some("policy_denied".to_owned()),
+                ..Default::default()
+            },
+            source_revision: None,
+            await_target: None,
+        }),
+        Err(CommandPortFailure::Unavailable),
+    )
+    .await;
+    let response = app.decide_harness_approval(
+        Some(&peer),
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::DecideHarnessApprovalRequest {
+            client: Some(client),
+            command: Some(IssueHarnessApprovalDecisionCommand {
+                metadata: Some(metadata("c3-correlation")),
+                ..Default::default()
+            }),
+        },
+    );
+    assert!(response.gateway_error.is_none());
+    let sanitized = response
+        .sanitized_authority_result
+        .expect("sanitized owner result");
+    assert_eq!(
+        sanitized.error_code,
+        PolicyDecisionErrorCode::PolicyDenied as i32
+    );
+    assert_eq!(
+        sanitized.safe_error_fingerprint.as_deref(),
+        Some("policy_denied")
+    );
+}
+
+#[tokio::test]
+async fn authority_expiry_is_preserved_in_founder_verdict_result() {
+    let (peer, client, app, _calls, _last_principal, _last_metadata) = test_context(
+        Err(CommandPortFailure::Unavailable),
+        Err(CommandPortFailure::Unavailable),
+        Ok(CommandPortResult {
+            result: VerdictCommandResult {
+                error_code: VerdictErrorCode::Expired as i32,
+                safe_error_fingerprint: Some("verdict_expired".to_owned()),
+                ..Default::default()
+            },
+            source_revision: None,
+            await_target: None,
+        }),
+    )
+    .await;
+    let response = app.execute_founder_verdict(
+        Some(&peer),
+        ExecuteFounderVerdictRequest {
+            client: Some(client),
+            command: Some(VerdictCommand {
+                command: Some(verdict_command::Command::IssueFounderVerdict(
+                    IssueFounderVerdictCommand {
+                        metadata: Some(metadata("c3-correlation")),
+                        ..Default::default()
+                    },
+                )),
+            }),
+        },
+    );
+    assert!(response.gateway_error.is_none());
+    let result = response.authority_result.expect("owner result");
+    assert_eq!(result.error_code, VerdictErrorCode::Expired as i32);
+    assert_eq!(
+        result.safe_error_fingerprint.as_deref(),
+        Some("verdict_expired")
+    );
+}
+
+#[tokio::test]
+async fn delivery_unknown_is_held_for_reconciliation_without_success() {
+    let (peer, client, app, calls, _last_principal, _last_metadata) = test_context(
+        Err(CommandPortFailure::DeliveryUnknown),
+        Err(CommandPortFailure::Unavailable),
+        Err(CommandPortFailure::Unavailable),
+    )
+    .await;
+    let response = app.execute_task_command(
+        Some(&peer),
+        ExecuteTaskCommandRequest {
+            client: Some(client),
+            command: Some(create_task_command()),
+        },
+    );
+    let error = response.gateway_error.expect("delivery unknown error");
+    assert_eq!(error.code, LocalApiErrorCode::AuthorityUnavailable as i32);
+    assert_eq!(error.safe_fingerprint, "authority_delivery_unknown");
+    assert_eq!(
+        error.required_action_code.as_deref(),
+        Some("RECONCILE_BEFORE_RETRY")
+    );
+    assert!(!error.retryable);
     assert!(response.authority_result.is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

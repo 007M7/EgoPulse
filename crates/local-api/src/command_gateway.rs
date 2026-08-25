@@ -53,6 +53,9 @@ pub struct CommandPortResult<R> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandPortFailure {
     Unavailable,
+    /// The owner may have committed an external side effect, but the result
+    /// of delivery is not known. Callers must reconcile before retrying.
+    DeliveryUnknown,
     IntegrityFailure,
 }
 
@@ -670,6 +673,13 @@ fn port_error(failure: CommandPortFailure, correlation_id: String) -> LocalApiEr
             "authority_unavailable",
             true,
             Some("RETRY"),
+            correlation_id,
+        ),
+        CommandPortFailure::DeliveryUnknown => api_error(
+            LocalApiErrorCode::AuthorityUnavailable,
+            "authority_delivery_unknown",
+            false,
+            Some("RECONCILE_BEFORE_RETRY"),
             correlation_id,
         ),
         CommandPortFailure::IntegrityFailure => api_error(
