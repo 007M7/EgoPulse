@@ -12,7 +12,7 @@ Probe date: 2026-08-26 (Asia/Shanghai)
 | Candidate | Local entry point | Version output | Result |
 | --- | --- | --- | --- |
 | Codex | `C:\Users\Administrator\AppData\Roaming\npm\codex.cmd` | `codex-cli 0.148.0-alpha.15` | Executable discovery passed; existing native app-server probe remains the reference |
-| Kimi CLI | `C:\Users\Administrator\AppData\Roaming\npm\kimi.cmd` → `C:\Users\Administrator\.local\bin\kimi.exe` | `kimi, version 1.49.0` | Executable discovery passed; structured protocol probe pending |
+| Kimi CLI | `C:\Users\Administrator\AppData\Roaming\npm\kimi.cmd` → `C:\Users\Administrator\.local\bin\kimi.exe` | `kimi, version 1.49.0` | Executable, ACP initialize and empty-session boundary probed; dispatch/lifecycle attestation pending |
 | DeepSeek Harness | `D:\deepseek harness\dsh.cmd` | `0.1.0-rc.5` | Executable discovery passed; structured protocol probe pending |
 
 The Codex version command emitted a non-fatal warning about cleaning stale

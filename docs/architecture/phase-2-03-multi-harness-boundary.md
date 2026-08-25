@@ -101,6 +101,13 @@ disposition, but it does not send a prompt. A candidate is not promoted to an
 active Harness merely because its process starts or its session can be
 created.
 
+The ACP codec is now isolated in `crates/kimi-adapter/src/acp.rs`. It keeps
+`session/update`, prompt/cancel request construction and server-side
+`session/request_permission` messages separate from provider-neutral Driver
+events. Unknown update kinds are preserved as explicit candidate evidence;
+they are not silently treated as terminal success. The codec is not itself a
+production dispatch implementation.
+
 The first candidate implementation is now `crates/kimi-adapter`. It reuses
 the existing process-supervision seam and performs only an ACP `initialize`
 and empty-session probe. A reachable Kimi process is reported as `Degraded`

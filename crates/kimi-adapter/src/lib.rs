@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 #![allow(async_fn_in_trait)]
 
+mod acp;
+
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ApprovalDecisionEnvelope, CancelExecutionEnvelope, DispatchEnvelope, HarnessErrorCode,
     HarnessReadiness, NativeProtocolFingerprint, ProbeHarnessRequest, ProbeHarnessResult,

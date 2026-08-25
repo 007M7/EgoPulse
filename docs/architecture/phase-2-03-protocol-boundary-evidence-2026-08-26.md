@@ -44,6 +44,15 @@ SHA-256 evidence reference. This is probe evidence only: no prompt is sent,
 no session is installed into a capability profile, and all execution,
 approval, cancellation and reconciliation methods remain fail-closed.
 
+The installed Kimi 1.49.0 package's local ACP integration notes further
+record the native lifecycle names `session/prompt`, `session/update` and
+`session/cancel`, plus the server request `session/request_permission`.
+EgoPulse now has an isolated Rust codec for these message shapes. It preserves
+unknown `session/update` kinds instead of converting them into completion, and
+it has fixture coverage for message identity, permission requests and native
+prompt/cancel method construction. This is protocol-shape evidence only; it
+does not attest structured ACK, approval routing or recovery semantics.
+
 ## DeepSeek Harness / DSH 0.1.0-rc.5
 
 The local `dsh --help` entry point describes an ordered profile launcher with
