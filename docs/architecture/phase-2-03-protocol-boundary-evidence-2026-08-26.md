@@ -70,9 +70,39 @@ real Windows packaging/permission finding, but it is not evidence that DSH's
 native workflow semantics are unsupported. It must be fixed or isolated in a
 dedicated probe workspace before a fair semantic comparison.
 
+The isolated follow-up probe now sets `DSH_HOME` to a temporary workspace and
+uses `DSH_PERMISSION_MODE=read-only`. With that boundary, `dsh --profile cli
+--dump-config` and `dsh --profile cli --help` both completed successfully. The
+reproducible command is:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/probe-dsh-windows.ps1
+```
+
+This upgrades DSH's result from “default profile bootstrap blocked” to
+“isolated CLI profile bootstrap passed”. It still does not prove native
+structured dispatch, approval, cancellation or reconciliation; no prompt or
+API call was made.
+
+A second no-model-call probe started the compiled `dsh-acp-demo` binary with
+the local ACP composition and exchanged two JSON-RPC requests over stdio:
+
+1. `initialize` returned protocol version `1`, agent identity
+   `deepseek-harness-acp`, and baseline-only prompt capabilities;
+2. `session/new` returned an opaque session id for an absolute workspace,
+   with empty additional directories and MCP servers.
+
+The process exited cleanly after stdin EOF and emitted no stderr. This is the
+first DSH evidence for a native structured session boundary, not merely CLI
+text. It still does not attest `session/prompt`, committed output ordering,
+permission routing, cancellation or restart reconciliation. Those rows remain
+held until a keyless replay fixture or an explicitly authenticated local run
+can exercise them without changing the user environment.
+
 ## Candidate decision at this point
 
-Kimi is the next candidate for a no-side-effect structured-protocol probe;
-DSH remains a source-study candidate until its profile bootstrap can run in an
-isolated Windows workspace. Neither candidate receives an active capability
-profile from this note. Codex remains the only production Harness.
+Kimi is the next candidate for an authenticated lifecycle probe; DSH's
+isolated profile and native ACP session-creation boundary now pass, so its
+keyless lifecycle fixture can proceed in parallel. Neither candidate receives
+an active capability profile from this note. Codex remains the only production
+Harness.

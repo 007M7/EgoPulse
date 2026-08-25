@@ -41,9 +41,10 @@ are discoverable; only Codex currently has an implemented native structured
 probe and contract fixture in EgoPulse.
 
 The follow-up protocol observations are recorded in
-`phase-2-03-protocol-boundary-evidence-2026-08-26.md`. Kimi is currently the
-next candidate for a no-side-effect structured-protocol probe; DSH remains
-held until its profile bootstrap permission failure is isolated.
+`phase-2-03-protocol-boundary-evidence-2026-08-26.md`. Kimi remains the next
+candidate for an authenticated lifecycle probe; DSH's isolated profile and
+native ACP session-creation boundary now pass, so its keyless lifecycle fixture
+can proceed in parallel.
 
 The candidate-only Rust probe is `crates/kimi-adapter`. Its explicit degraded
 result and fail-closed execution methods are part of the evidence: protocol
