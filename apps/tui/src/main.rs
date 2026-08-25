@@ -43,7 +43,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Tabs, Wrap},
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -196,6 +196,257 @@ impl Panel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandKind {
+    TaskCreate,
+    ApprovalDecide,
+    Await,
+    VerdictIssue,
+    VerdictRevoke,
+}
+
+impl CommandKind {
+    const ALL: [Self; 5] = [
+        Self::TaskCreate,
+        Self::ApprovalDecide,
+        Self::Await,
+        Self::VerdictIssue,
+        Self::VerdictRevoke,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::TaskCreate => "Create governed task",
+            Self::ApprovalDecide => "Decide harness approval",
+            Self::Await => "Await projection",
+            Self::VerdictIssue => "Issue Founder Verdict",
+            Self::VerdictRevoke => "Revoke Founder Verdict",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FormField {
+    label: &'static str,
+    value: String,
+    required: bool,
+}
+
+impl FormField {
+    fn required(label: &'static str) -> Self {
+        Self {
+            label,
+            value: String::new(),
+            required: true,
+        }
+    }
+
+    fn optional(label: &'static str) -> Self {
+        Self {
+            label,
+            value: String::new(),
+            required: false,
+        }
+    }
+
+    fn with_value(mut self, value: &'static str) -> Self {
+        self.value = value.to_owned();
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CommandForm {
+    kind: CommandKind,
+    fields: Vec<FormField>,
+    active: usize,
+    error: Option<String>,
+}
+
+impl CommandForm {
+    fn new(kind: CommandKind) -> Self {
+        let fields = match kind {
+            CommandKind::TaskCreate => vec![
+                FormField::required("work-type"),
+                FormField::required("input-snapshot-id"),
+                FormField::required("target-scope-ref"),
+                FormField::required("acceptance-contract-id"),
+                FormField::required("acceptance-contract-version").with_value("v0.1"),
+                FormField::required("acceptance-contract-sha256"),
+                FormField::required("budget-profile-id"),
+                FormField::required("budget-profile-version").with_value("v0.1"),
+                FormField::required("budget-profile-sha256"),
+            ],
+            CommandKind::ApprovalDecide => vec![
+                FormField::required("approval-request-id"),
+                FormField::required("expected-action-digest-sha256"),
+                FormField::required("expected-request-observation-id"),
+                FormField::required("expected-request-observation-sequence"),
+                FormField::required("expected-request-revision"),
+                FormField::required("decision").with_value("allow-once"),
+                FormField::required("reason-code"),
+                FormField::optional("confirmation-proof-ref"),
+            ],
+            CommandKind::Await => vec![
+                FormField::required("token-json"),
+                FormField::required("timeout-milliseconds").with_value("5000"),
+            ],
+            CommandKind::VerdictIssue => vec![
+                FormField::required("task-id"),
+                FormField::required("task-revision"),
+                FormField::required("work-revision"),
+                FormField::required("artifact-set-id"),
+                FormField::required("artifact-set-manifest-sha256"),
+                FormField::required("artifact-set-manifest-byte-length"),
+                FormField::required("verification-artifact-id"),
+                FormField::required("verification-payload-sha256"),
+                FormField::required("verification-payload-byte-length"),
+                FormField::required("acceptance-contract-id"),
+                FormField::required("acceptance-contract-version").with_value("v0.1"),
+                FormField::required("acceptance-contract-sha256"),
+                FormField::required("decision").with_value("accept"),
+                FormField::required("observed-verification-conclusion").with_value("passed"),
+                FormField::required("reason-code"),
+                FormField::required("confirmation-class").with_value("explicit"),
+                FormField::required("confirmation-proof-ref"),
+            ],
+            CommandKind::VerdictRevoke => vec![
+                FormField::required("founder-verdict-id"),
+                FormField::required("expected-state-revision").with_value("1"),
+                FormField::required("reason-code"),
+                FormField::required("confirmation-proof-ref"),
+            ],
+        };
+        Self {
+            kind,
+            fields,
+            active: 0,
+            error: None,
+        }
+    }
+
+    fn active_field_mut(&mut self) -> &mut FormField {
+        &mut self.fields[self.active]
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for field in &self.fields {
+            if field.required && field.value.trim().is_empty() {
+                return Err(format!("{} is required", field.label));
+            }
+        }
+        Ok(())
+    }
+
+    fn into_command(self) -> Result<TuiCommand, String> {
+        self.validate()?;
+        let mut values = self.fields.into_iter().map(|field| field.value);
+        let next = |values: &mut dyn Iterator<Item = String>, label: &str| {
+            values.next().ok_or_else(|| format!("{label} is missing"))
+        };
+        match self.kind {
+            CommandKind::TaskCreate => Ok(TuiCommand::TaskCreate {
+                work_type: next(&mut values, "work-type")?,
+                input_snapshot_id: next(&mut values, "input-snapshot-id")?,
+                target_scope_ref: next(&mut values, "target-scope-ref")?,
+                acceptance_contract_id: next(&mut values, "acceptance-contract-id")?,
+                acceptance_contract_version: next(&mut values, "acceptance-contract-version")?,
+                acceptance_contract_sha256: next(&mut values, "acceptance-contract-sha256")?,
+                budget_profile_id: next(&mut values, "budget-profile-id")?,
+                budget_profile_version: next(&mut values, "budget-profile-version")?,
+                budget_profile_sha256: next(&mut values, "budget-profile-sha256")?,
+                json: false,
+            }),
+            CommandKind::ApprovalDecide => Ok(TuiCommand::ApprovalDecide {
+                approval_request_id: next(&mut values, "approval-request-id")?,
+                expected_action_digest_sha256: next(&mut values, "expected-action-digest-sha256")?,
+                expected_request_observation_id: next(
+                    &mut values,
+                    "expected-request-observation-id",
+                )?,
+                expected_request_observation_sequence: next(
+                    &mut values,
+                    "expected-request-observation-sequence",
+                )?
+                .parse()
+                .map_err(|_| {
+                    "expected-request-observation-sequence must be an integer".to_owned()
+                })?,
+                expected_request_revision: next(&mut values, "expected-request-revision")?
+                    .parse()
+                    .map_err(|_| "expected-request-revision must be an integer".to_owned())?,
+                decision: next(&mut values, "decision")?,
+                reason_code: next(&mut values, "reason-code")?,
+                confirmation_proof_ref: {
+                    let value = next(&mut values, "confirmation-proof-ref")?;
+                    (!value.trim().is_empty()).then_some(value)
+                },
+                json: false,
+            }),
+            CommandKind::Await => Ok(TuiCommand::Await {
+                token_json: next(&mut values, "token-json")?,
+                timeout_milliseconds: next(&mut values, "timeout-milliseconds")?
+                    .parse()
+                    .map_err(|_| "timeout-milliseconds must be an integer".to_owned())?,
+                json: false,
+            }),
+            CommandKind::VerdictIssue => Ok(TuiCommand::VerdictIssue {
+                task_id: next(&mut values, "task-id")?,
+                task_revision: next(&mut values, "task-revision")?
+                    .parse()
+                    .map_err(|_| "task-revision must be an integer".to_owned())?,
+                work_revision: next(&mut values, "work-revision")?
+                    .parse()
+                    .map_err(|_| "work-revision must be an integer".to_owned())?,
+                artifact_set_id: next(&mut values, "artifact-set-id")?,
+                artifact_set_manifest_sha256: next(&mut values, "artifact-set-manifest-sha256")?,
+                artifact_set_manifest_byte_length: next(
+                    &mut values,
+                    "artifact-set-manifest-byte-length",
+                )?
+                .parse()
+                .map_err(|_| "artifact-set-manifest-byte-length must be an integer".to_owned())?,
+                verification_artifact_id: next(&mut values, "verification-artifact-id")?,
+                verification_payload_sha256: next(&mut values, "verification-payload-sha256")?,
+                verification_payload_byte_length: next(
+                    &mut values,
+                    "verification-payload-byte-length",
+                )?
+                .parse()
+                .map_err(|_| "verification-payload-byte-length must be an integer".to_owned())?,
+                acceptance_contract_id: next(&mut values, "acceptance-contract-id")?,
+                acceptance_contract_version: next(&mut values, "acceptance-contract-version")?,
+                acceptance_contract_sha256: next(&mut values, "acceptance-contract-sha256")?,
+                decision: next(&mut values, "decision")?,
+                observed_verification_conclusion: next(
+                    &mut values,
+                    "observed-verification-conclusion",
+                )?,
+                reason_code: next(&mut values, "reason-code")?,
+                confirmation_class: next(&mut values, "confirmation-class")?,
+                confirmation_proof_ref: next(&mut values, "confirmation-proof-ref")?,
+                json: false,
+            }),
+            CommandKind::VerdictRevoke => Ok(TuiCommand::VerdictRevoke {
+                founder_verdict_id: next(&mut values, "founder-verdict-id")?,
+                expected_state_revision: next(&mut values, "expected-state-revision")?
+                    .parse()
+                    .map_err(|_| "expected-state-revision must be an integer".to_owned())?,
+                reason_code: next(&mut values, "reason-code")?,
+                confirmation_proof_ref: next(&mut values, "confirmation-proof-ref")?,
+                json: false,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum InteractiveMode {
+    Dashboard,
+    Palette { selected: usize },
+    Form(CommandForm),
+}
+
 struct AttachedClient {
     connection: LocalApiConnection,
     kernel: ClientKernel,
@@ -332,7 +583,25 @@ impl AttachedClient {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandOutput {
+    Console,
+    Quiet,
+}
+
 async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> {
+    run_command_with_output(instance, command, CommandOutput::Console).await
+}
+
+async fn run_command_quiet(instance: &str, command: TuiCommand) -> Result<(), String> {
+    run_command_with_output(instance, command, CommandOutput::Quiet).await
+}
+
+async fn run_command_with_output(
+    instance: &str,
+    command: TuiCommand,
+    output: CommandOutput,
+) -> Result<(), String> {
     match command {
         TuiCommand::TaskCreate {
             work_type,
@@ -422,16 +691,18 @@ async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> 
                 },
                 "correlationId": correlation_id,
             });
-            if json {
-                println!("{}", serde_json::to_string(&payload).unwrap());
-            } else {
-                println!(
-                    "TUI task created: {} revision={} status={} replayed={}",
-                    payload["data"]["taskId"].as_str().unwrap_or(""),
-                    payload["data"]["revision"].as_u64().unwrap_or_default(),
-                    payload["data"]["status"].as_str().unwrap_or(""),
-                    payload["data"]["replayed"].as_bool().unwrap_or(false),
-                );
+            if output == CommandOutput::Console {
+                if json {
+                    println!("{}", serde_json::to_string(&payload).unwrap());
+                } else {
+                    println!(
+                        "TUI task created: {} revision={} status={} replayed={}",
+                        payload["data"]["taskId"].as_str().unwrap_or(""),
+                        payload["data"]["revision"].as_u64().unwrap_or_default(),
+                        payload["data"]["status"].as_str().unwrap_or(""),
+                        payload["data"]["replayed"].as_bool().unwrap_or(false),
+                    );
+                }
             }
             Ok(())
         }
@@ -517,19 +788,21 @@ async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> 
                 },
                 "correlationId": correlation_id,
             });
-            if json {
-                println!("{}", serde_json::to_string(&payload).unwrap());
-            } else {
-                println!(
-                    "TUI approval decided: ref={} committed={} revision={}",
-                    payload["data"]["authorityDecisionRef"]
-                        .as_str()
-                        .unwrap_or(""),
-                    payload["data"]["committed"].as_bool().unwrap_or(false),
-                    payload["data"]["stateRevision"]
-                        .as_u64()
-                        .unwrap_or_default(),
-                );
+            if output == CommandOutput::Console {
+                if json {
+                    println!("{}", serde_json::to_string(&payload).unwrap());
+                } else {
+                    println!(
+                        "TUI approval decided: ref={} committed={} revision={}",
+                        payload["data"]["authorityDecisionRef"]
+                            .as_str()
+                            .unwrap_or(""),
+                        payload["data"]["committed"].as_bool().unwrap_or(false),
+                        payload["data"]["stateRevision"]
+                            .as_u64()
+                            .unwrap_or_default(),
+                    );
+                }
             }
             Ok(())
         }
@@ -562,15 +835,17 @@ async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> 
                         "operation": "await",
                         "data": {"kind": "task", "taskId": task.task_id, "revision": task.revision, "status": egopulse_domain_contracts::v01::egopulse::task::v1::TaskStatus::try_from(task.status).map(|value| value.as_str_name()).unwrap_or("TASK_STATUS_UNSPECIFIED")}
                     });
-                    if json {
-                        println!("{}", serde_json::to_string(&payload).unwrap());
-                    } else {
-                        println!(
-                            "TUI awaited task: {} revision={} status={}",
-                            payload["data"]["taskId"].as_str().unwrap_or(""),
-                            payload["data"]["revision"].as_u64().unwrap_or_default(),
-                            payload["data"]["status"].as_str().unwrap_or("")
-                        );
+                    if output == CommandOutput::Console {
+                        if json {
+                            println!("{}", serde_json::to_string(&payload).unwrap());
+                        } else {
+                            println!(
+                                "TUI awaited task: {} revision={} status={}",
+                                payload["data"]["taskId"].as_str().unwrap_or(""),
+                                payload["data"]["revision"].as_u64().unwrap_or_default(),
+                                payload["data"]["status"].as_str().unwrap_or("")
+                            );
+                        }
                     }
                     Ok(())
                 }
@@ -581,14 +856,16 @@ async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> 
                         "operation": "await",
                         "data": {"kind": "approval", "approvalRequestId": view.approval_request_id, "revision": view.request_revision, "lifecycle": view.request_lifecycle}
                     });
-                    if json {
-                        println!("{}", serde_json::to_string(&payload).unwrap());
-                    } else {
-                        println!(
-                            "TUI awaited approval: {} revision={}",
-                            payload["data"]["approvalRequestId"].as_str().unwrap_or(""),
-                            payload["data"]["revision"].as_u64().unwrap_or_default()
-                        );
+                    if output == CommandOutput::Console {
+                        if json {
+                            println!("{}", serde_json::to_string(&payload).unwrap());
+                        } else {
+                            println!(
+                                "TUI awaited approval: {} revision={}",
+                                payload["data"]["approvalRequestId"].as_str().unwrap_or(""),
+                                payload["data"]["revision"].as_u64().unwrap_or_default()
+                            );
+                        }
                     }
                     Ok(())
                 }
@@ -706,15 +983,17 @@ async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> 
                 },
                 "correlationId": correlation_id,
             });
-            if json {
-                println!("{}", serde_json::to_string(&payload).unwrap());
-            } else {
-                println!(
-                    "TUI Founder Verdict issued: id={} committed={} replayed={}",
-                    payload["data"]["founderVerdictId"].as_str().unwrap_or(""),
-                    payload["data"]["committed"].as_bool().unwrap_or(false),
-                    payload["data"]["replayed"].as_bool().unwrap_or(false),
-                );
+            if output == CommandOutput::Console {
+                if json {
+                    println!("{}", serde_json::to_string(&payload).unwrap());
+                } else {
+                    println!(
+                        "TUI Founder Verdict issued: id={} committed={} replayed={}",
+                        payload["data"]["founderVerdictId"].as_str().unwrap_or(""),
+                        payload["data"]["committed"].as_bool().unwrap_or(false),
+                        payload["data"]["replayed"].as_bool().unwrap_or(false),
+                    );
+                }
             }
             Ok(())
         }
@@ -778,18 +1057,30 @@ async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> 
                 },
                 "correlationId": correlation_id,
             });
-            if json {
-                println!("{}", serde_json::to_string(&payload).unwrap());
-            } else {
-                println!(
-                    "TUI Founder Verdict revoked: id={} committed={} replayed={}",
-                    payload["data"]["founderVerdictId"].as_str().unwrap_or(""),
-                    payload["data"]["committed"].as_bool().unwrap_or(false),
-                    payload["data"]["replayed"].as_bool().unwrap_or(false),
-                );
+            if output == CommandOutput::Console {
+                if json {
+                    println!("{}", serde_json::to_string(&payload).unwrap());
+                } else {
+                    println!(
+                        "TUI Founder Verdict revoked: id={} committed={} replayed={}",
+                        payload["data"]["founderVerdictId"].as_str().unwrap_or(""),
+                        payload["data"]["committed"].as_bool().unwrap_or(false),
+                        payload["data"]["replayed"].as_bool().unwrap_or(false),
+                    );
+                }
             }
             Ok(())
         }
+    }
+}
+
+fn command_kind(command: &TuiCommand) -> &'static str {
+    match command {
+        TuiCommand::TaskCreate { .. } => "task.create",
+        TuiCommand::ApprovalDecide { .. } => "approval.decide",
+        TuiCommand::Await { .. } => "await",
+        TuiCommand::VerdictIssue { .. } => "verdict.issue",
+        TuiCommand::VerdictRevoke { .. } => "verdict.revoke",
     }
 }
 
@@ -1041,6 +1332,7 @@ struct App {
     panel: Panel,
     message: String,
     refresh_interval: Duration,
+    mode: InteractiveMode,
 }
 
 impl App {
@@ -1052,6 +1344,110 @@ impl App {
             panel: Panel::Tasks,
             message: "Connecting to local daemon…".to_owned(),
             refresh_interval: Duration::from_secs(2),
+            mode: InteractiveMode::Dashboard,
+        }
+    }
+
+    fn open_palette(&mut self) {
+        self.mode = InteractiveMode::Palette { selected: 0 };
+        self.message = "Choose a governed command; Esc returns to the dashboard".to_owned();
+    }
+
+    fn open_form(&mut self, kind: CommandKind) {
+        self.mode = InteractiveMode::Form(CommandForm::new(kind));
+        self.message = format!(
+            "{}: type a value, Tab/Down advances, Enter submits, Esc cancels",
+            kind.label()
+        );
+    }
+
+    fn handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<Option<TuiCommand>, String> {
+        match &mut self.mode {
+            InteractiveMode::Dashboard => match key.code {
+                KeyCode::Char('c') => {
+                    self.open_palette();
+                    Ok(None)
+                }
+                KeyCode::Char('r') => Ok(None),
+                _ => Ok(None),
+            },
+            InteractiveMode::Palette { selected } => match key.code {
+                KeyCode::Esc => {
+                    self.mode = InteractiveMode::Dashboard;
+                    self.message = "Command palette cancelled".to_owned();
+                    Ok(None)
+                }
+                KeyCode::Up | KeyCode::Left => {
+                    *selected = selected
+                        .checked_sub(1)
+                        .unwrap_or(CommandKind::ALL.len() - 1);
+                    Ok(None)
+                }
+                KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                    *selected = (*selected + 1) % CommandKind::ALL.len();
+                    Ok(None)
+                }
+                KeyCode::Enter => {
+                    let kind = CommandKind::ALL[*selected];
+                    self.open_form(kind);
+                    Ok(None)
+                }
+                _ => Ok(None),
+            },
+            InteractiveMode::Form(form) => match key.code {
+                KeyCode::Esc => {
+                    self.mode = InteractiveMode::Palette { selected: 0 };
+                    self.message = "Form cancelled; choose another governed command".to_owned();
+                    Ok(None)
+                }
+                KeyCode::Up | KeyCode::Left => {
+                    form.active = form.active.saturating_sub(1);
+                    form.error = None;
+                    Ok(None)
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    form.active = (form.active + 1) % form.fields.len();
+                    form.error = None;
+                    Ok(None)
+                }
+                KeyCode::Backspace => {
+                    form.active_field_mut().value.pop();
+                    form.error = None;
+                    Ok(None)
+                }
+                KeyCode::Char(character) => {
+                    if !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                    {
+                        form.active_field_mut().value.push(character);
+                        form.error = None;
+                    }
+                    Ok(None)
+                }
+                KeyCode::Enter => {
+                    if form.active + 1 < form.fields.len() {
+                        form.active += 1;
+                        form.error = None;
+                        return Ok(None);
+                    }
+                    match form.clone().into_command() {
+                        Ok(command) => {
+                            self.mode = InteractiveMode::Dashboard;
+                            Ok(Some(command))
+                        }
+                        Err(error) => {
+                            form.error = Some(error.clone());
+                            self.message = error;
+                            Ok(None)
+                        }
+                    }
+                }
+                _ => Ok(None),
+            },
         }
     }
 
@@ -1144,23 +1540,108 @@ impl App {
             .constraints([Constraint::Length(3), Constraint::Min(1)])
             .split(layout[1]);
         frame.render_widget(tabs, body[0]);
-        match (self.panel, snapshot) {
-            (Panel::Tasks, Some(snapshot)) => render_tasks(frame, body[1], &snapshot.tasks),
-            (Panel::Approvals, Some(snapshot)) => {
-                render_approvals(frame, body[1], &snapshot.approvals)
+        match &self.mode {
+            InteractiveMode::Dashboard => match (self.panel, snapshot) {
+                (Panel::Tasks, Some(snapshot)) => render_tasks(frame, body[1], &snapshot.tasks),
+                (Panel::Approvals, Some(snapshot)) => {
+                    render_approvals(frame, body[1], &snapshot.approvals)
+                }
+                (_, None) => frame.render_widget(
+                    Paragraph::new("No projection snapshot available.")
+                        .block(Block::default().borders(Borders::ALL))
+                        .wrap(Wrap { trim: true }),
+                    body[1],
+                ),
+            },
+            InteractiveMode::Palette { selected } => {
+                render_command_palette(frame, body[1], *selected)
             }
-            (_, None) => frame.render_widget(
-                Paragraph::new("No projection snapshot available.")
-                    .block(Block::default().borders(Borders::ALL))
-                    .wrap(Wrap { trim: true }),
-                body[1],
-            ),
+            InteractiveMode::Form(form) => render_command_form(frame, body[1], form),
         }
         frame.render_widget(
-            Paragraph::new(self.message.as_str()).style(Style::default().fg(Color::Gray)),
+            Paragraph::new(self.footer_text())
+                .style(Style::default().fg(Color::Gray))
+                .wrap(Wrap { trim: true }),
             layout[2],
         );
     }
+
+    fn footer_text(&self) -> String {
+        match &self.mode {
+            InteractiveMode::Dashboard => format!(
+                "{} · c command palette · r refresh · Tab/←/→ panel · q quit",
+                self.message
+            ),
+            InteractiveMode::Palette { .. } => {
+                format!("{} · ↑/↓ select · Enter open · Esc cancel", self.message)
+            }
+            InteractiveMode::Form(form) => format!(
+                "{}{}",
+                self.message,
+                form.error
+                    .as_deref()
+                    .map_or(String::new(), |error| format!(" · error: {error}"))
+            ),
+        }
+    }
+}
+
+fn render_command_palette(frame: &mut Frame<'_>, area: Rect, selected: usize) {
+    frame.render_widget(Clear, area);
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(
+        List::new(
+            CommandKind::ALL
+                .iter()
+                .map(|kind| ListItem::new(kind.label())),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Governed command palette"),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ "),
+        area,
+        &mut state,
+    );
+}
+
+fn render_command_form(frame: &mut Frame<'_>, area: Rect, form: &CommandForm) {
+    let height = area.height.saturating_sub(2) as usize;
+    let start = form.active.saturating_sub(height.saturating_sub(1));
+    let end = (start + height).min(form.fields.len());
+    let items = form.fields[start..end]
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let actual = start + index;
+            let marker = if actual == form.active { "▶" } else { " " };
+            let required = if field.required { "*" } else { " " };
+            let value = if field.value.is_empty() {
+                "<empty>".to_owned()
+            } else {
+                field.value.clone()
+            };
+            ListItem::new(format!("{marker} {required} {:<42} {}", field.label, value))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("{} · * required", form.kind.label())),
+            )
+            .highlight_style(Style::default().fg(Color::Yellow)),
+        area,
+    );
 }
 
 fn render_tasks(frame: &mut Frame<'_>, area: Rect, tasks: &[TaskView]) {
@@ -1286,15 +1767,30 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
             && let Event::Key(key) = event::read().map_err(|error| error.to_string())?
             && key.kind == KeyEventKind::Press
         {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                KeyCode::Char('r') => {
-                    app.message = "Refreshing…".to_owned();
-                    app.refresh().await;
-                    next_refresh = tokio::time::Instant::now() + app.refresh_interval;
-                }
-                KeyCode::Tab | KeyCode::Right | KeyCode::Left => app.panel = app.panel.next(),
-                _ => {}
+            let dashboard = matches!(app.mode, InteractiveMode::Dashboard);
+            if dashboard && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                return Ok(());
+            }
+            if dashboard && key.code == KeyCode::Char('r') {
+                app.message = "Refreshing…".to_owned();
+                app.refresh().await;
+                next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+                continue;
+            }
+            if dashboard && matches!(key.code, KeyCode::Tab | KeyCode::Right | KeyCode::Left) {
+                app.panel = app.panel.next();
+                continue;
+            }
+            if let Some(command) = app.handle_key(key)? {
+                app.message = format!("Executing {}…", command_kind(&command));
+                let result = run_command_quiet(&app.instance, command).await;
+                app.message = match result {
+                    Ok(()) => "Governed command committed; projection will refresh automatically"
+                        .to_owned(),
+                    Err(error) => format!("Governed command rejected: {error}"),
+                };
+                app.refresh().await;
+                next_refresh = tokio::time::Instant::now() + app.refresh_interval;
             }
         }
     }
@@ -1335,5 +1831,69 @@ async fn main() -> ExitCode {
             eprintln!("EgoPulse TUI: {error}");
             ExitCode::from(3)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn command_form_rejects_missing_required_values() {
+        let form = CommandForm::new(CommandKind::TaskCreate);
+        let error = form.into_command().expect_err("empty form must not submit");
+        assert_eq!(error, "work-type is required");
+    }
+
+    #[test]
+    fn command_form_maps_optional_confirmation_and_numeric_fields() {
+        let mut form = CommandForm::new(CommandKind::ApprovalDecide);
+        for (field, value) in form.fields.iter_mut().zip([
+            "approval-1".to_owned(),
+            "a".repeat(64),
+            "observation-1".to_owned(),
+            "7".to_owned(),
+            "3".to_owned(),
+            "deny".to_owned(),
+            "user-denied".to_owned(),
+            String::new(),
+        ]) {
+            field.value = value;
+        }
+        let command = form.into_command().expect("valid approval form");
+        match command {
+            TuiCommand::ApprovalDecide {
+                expected_request_observation_sequence,
+                expected_request_revision,
+                confirmation_proof_ref,
+                decision,
+                ..
+            } => {
+                assert_eq!(expected_request_observation_sequence, 7);
+                assert_eq!(expected_request_revision, 3);
+                assert_eq!(confirmation_proof_ref, None);
+                assert_eq!(decision, "deny");
+            }
+            _ => panic!("wrong command kind"),
+        }
+    }
+
+    #[test]
+    fn command_palette_and_form_use_same_command_surface() {
+        let mut app = App::new("default".to_owned());
+        app.open_palette();
+        assert!(matches!(app.mode, InteractiveMode::Palette { selected: 0 }));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("palette navigation");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open form");
+        assert!(matches!(
+            app.mode,
+            InteractiveMode::Form(CommandForm {
+                kind: CommandKind::ApprovalDecide,
+                ..
+            })
+        ));
     }
 }
