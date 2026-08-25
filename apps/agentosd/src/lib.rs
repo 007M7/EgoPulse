@@ -36,7 +36,7 @@ use egopulse_local_api::{
     },
 };
 use egopulse_local_ide_control::collaboration_control::{
-    HarnessDispatchCycleError, HarnessDispatchCycleReport, HarnessDispatchRunner,
+    HarnessDispatchCycleError, HarnessDispatchRunner,
 };
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
@@ -505,10 +505,12 @@ async fn run_harness_dispatch_worker(
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), HarnessDispatchCycleError> {
     let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
     loop {
         if *stop.borrow() {
             return Ok(());
         }
+        runner.run_once().await?;
         tokio::select! {
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
@@ -516,7 +518,6 @@ async fn run_harness_dispatch_worker(
                 }
             }
             _ = ticker.tick() => {
-                runner.run_once().await?;
             }
         }
     }
@@ -584,6 +585,7 @@ mod tests {
         local_read_model_service_client::LocalReadModelServiceClient,
         local_session_service_client::LocalSessionServiceClient,
     };
+    use egopulse_local_ide_control::collaboration_control::HarnessDispatchCycleReport;
     use hyper_util::rt::TokioIo;
     use std::{
         fs,

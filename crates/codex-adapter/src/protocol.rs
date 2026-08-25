@@ -80,6 +80,7 @@ pub struct CodexAppServerDriver {
     config: CodexAppServerConfig,
     session: Option<CodexSession>,
     active: Option<ActiveDispatch>,
+    completed_dispatch_id: Option<String>,
     pending_approvals: HashMap<String, PendingApproval>,
     responded_approvals: HashMap<String, ApprovalRequestObservation>,
     queued_events: VecDeque<DriverEvent>,
@@ -94,6 +95,7 @@ impl CodexAppServerDriver {
             config,
             session: None,
             active: None,
+            completed_dispatch_id: None,
             pending_approvals: HashMap::new(),
             responded_approvals: HashMap::new(),
             queued_events: VecDeque::new(),
@@ -392,7 +394,7 @@ impl CodexAppServerDriver {
 
     fn map_notification(
         &mut self,
-        _envelope: &DispatchEnvelope,
+        envelope: &DispatchEnvelope,
         method: &str,
         value: Value,
         raw: Vec<u8>,
@@ -764,6 +766,10 @@ impl CodexAppServerDriver {
                 ));
             }
         };
+        if event.criticality == ObservationCriticality::Terminal {
+            self.completed_dispatch_id = Some(envelope.dispatch_id.clone());
+            self.active = None;
+        }
         Ok(Some(event))
     }
 
@@ -898,6 +904,7 @@ impl NativeHarnessDriver for CodexAppServerDriver {
                 turn_id: None,
                 turn_request_id: request_id,
             });
+            self.completed_dispatch_id = None;
             Ok(DriverDelivery {
                 native_request_ref: format!("codex-jsonrpc:{request_id}"),
                 native_session_ref: thread_id,
@@ -912,6 +919,9 @@ impl NativeHarnessDriver for CodexAppServerDriver {
         envelope: &'a DispatchEnvelope,
     ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
         Box::pin(async move {
+            if self.completed_dispatch_id.as_deref() == Some(envelope.dispatch_id.as_str()) {
+                return Ok(None);
+            }
             if let Some(event) = self.queued_events.pop_front() {
                 return Ok(Some(event));
             }
@@ -1403,5 +1413,36 @@ mod tests {
             ApprovalRequestLifecycleKind::Resolved as i32
         );
         assert_eq!(completed.request_revision, 2);
+    }
+
+    #[tokio::test]
+    async fn terminal_notification_closes_dispatch_observation_stream() {
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch-terminal".to_owned(),
+            ..Default::default()
+        };
+        let notification = json!({
+            "method": "turn/completed",
+            "params": { "turn": { "status": "completed" } }
+        });
+        let raw = serde_json::to_vec(&notification).expect("notification bytes");
+        let event = driver
+            .map_notification(&envelope, "turn/completed", notification, raw)
+            .expect("map terminal notification")
+            .expect("terminal event");
+        assert_eq!(event.criticality, ObservationCriticality::Terminal);
+        assert!(driver.active.is_none());
+        assert_eq!(
+            driver.completed_dispatch_id.as_deref(),
+            Some("dispatch-terminal")
+        );
+        assert!(
+            driver
+                .next_event(&envelope)
+                .await
+                .expect("terminal stream close")
+                .is_none()
+        );
     }
 }
