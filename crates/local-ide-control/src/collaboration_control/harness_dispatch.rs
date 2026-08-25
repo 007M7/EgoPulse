@@ -1,7 +1,8 @@
 use super::{
     AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
     CollaborationControlError, CollaborationReferenceGuard, HarnessEvidenceResolver,
-    HarnessFactIngestionDisposition, HarnessFactIngestionResult,
+    HarnessFactIngestionDisposition, HarnessFactIngestionResult, SingleHarnessWorkflowResolver,
+    TaskActivationGuardSet, TaskActivationReferenceHandle, TaskActivationSource,
 };
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     DeliveryDisposition, DispatchEnvelope, HarnessObservation, dispatch_result,
@@ -23,6 +24,9 @@ pub struct HarnessDispatchCycleReport {
     pub observations_deferred: u64,
     pub observations_retained: u64,
     pub observations_quarantined: u64,
+    pub activations_seen: u64,
+    pub activations_started: u64,
+    pub activations_acknowledged: u64,
 }
 
 #[derive(Debug, Error)]
@@ -31,6 +35,12 @@ pub enum HarnessDispatchCycleError {
     Collaboration(#[from] CollaborationControlError),
     #[error("harness adapter operation failed")]
     Adapter(#[from] GovernedAdapterError),
+    #[error("task activation source operation failed")]
+    TaskActivationSource,
+    #[error("task activation resolver rejected the explicit workflow configuration")]
+    TaskActivationResolver,
+    #[error("task activation workflow failed")]
+    TaskActivationWorkflow,
 }
 
 pub trait HarnessDispatchRunner: Send + Sync {
@@ -97,6 +107,140 @@ where
             let mut runtime = self.runtime.lock().await;
             let GovernedDispatchRuntime { control, adapter } = &mut *runtime;
             dispatch_pending(control, adapter, &self.principal).await
+        })
+    }
+}
+
+struct GovernedTaskActivationRuntime<S, W, E, C, R, D, A> {
+    control: CollaborationControl<TaskActivationGuardSet<E>, C>,
+    adapter: GovernedHarnessAdapter<R, D, A>,
+    source: S,
+    resolver: W,
+    reference: TaskActivationReferenceHandle,
+    lease_ttl_seconds: u64,
+}
+
+/// The production single-writer worker for the first vertical. It consumes
+/// Task activation handoffs, binds the immutable activation reference, starts
+/// the explicit single-Harness workflow, acknowledges the Task outbox only
+/// after the Collaboration commit, and then dispatches through the same
+/// CollaborationControl/Adapter runtime.
+pub struct GovernedTaskActivationRunner<S, W, E, C, R, D, A> {
+    runtime: tokio::sync::Mutex<GovernedTaskActivationRuntime<S, W, E, C, R, D, A>>,
+    principal: AuthenticatedCollaborationPrincipal,
+}
+
+impl<S, W, E, C, R, D, A> GovernedTaskActivationRunner<S, W, E, C, R, D, A>
+where
+    S: TaskActivationSource + Send,
+    W: SingleHarnessWorkflowResolver + Send,
+    E: HarnessEvidenceResolver + Send,
+    C: AuthorityClock + Send,
+    R: DispatchMaterialResolver + Send,
+    D: NativeHarnessDriver + Send,
+    A: AdapterClock + Send,
+{
+    #[must_use]
+    pub fn new(
+        control: CollaborationControl<TaskActivationGuardSet<E>, C>,
+        adapter: GovernedHarnessAdapter<R, D, A>,
+        source: S,
+        resolver: W,
+        principal: AuthenticatedCollaborationPrincipal,
+        reference: TaskActivationReferenceHandle,
+        lease_ttl_seconds: u64,
+    ) -> Self {
+        Self {
+            runtime: tokio::sync::Mutex::new(GovernedTaskActivationRuntime {
+                control,
+                adapter,
+                source,
+                resolver,
+                reference,
+                lease_ttl_seconds,
+            }),
+            principal,
+        }
+    }
+}
+
+impl<S, W, E, C, R, D, A> HarnessDispatchRunner
+    for GovernedTaskActivationRunner<S, W, E, C, R, D, A>
+where
+    S: TaskActivationSource + Send,
+    W: SingleHarnessWorkflowResolver + Send,
+    E: HarnessEvidenceResolver + Send,
+    C: AuthorityClock + Send,
+    R: DispatchMaterialResolver + Send,
+    D: NativeHarnessDriver + Send,
+    A: AdapterClock + Send,
+{
+    fn run_once(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let mut runtime = self.runtime.lock().await;
+            let GovernedTaskActivationRuntime {
+                control,
+                adapter,
+                source,
+                resolver,
+                reference,
+                lease_ttl_seconds,
+            } = &mut *runtime;
+            let activations = source
+                .pending_task_activations()
+                .map_err(|_| HarnessDispatchCycleError::TaskActivationSource)?;
+            let mut report = HarnessDispatchCycleReport {
+                activations_seen: activations.len() as u64,
+                ..HarnessDispatchCycleReport::default()
+            };
+            for activation in activations {
+                let config = resolver
+                    .resolve(&activation)
+                    .map_err(|_| HarnessDispatchCycleError::TaskActivationResolver)?;
+                reference
+                    .bind(activation.task.clone(), &config, *lease_ttl_seconds)
+                    .map_err(|_| HarnessDispatchCycleError::TaskActivationWorkflow)?;
+                super::start_single_harness_workflow(control, &activation.task, &config)
+                    .map_err(|_| HarnessDispatchCycleError::TaskActivationWorkflow)?;
+                if !source
+                    .acknowledge_task_activation(
+                        &activation.message_id,
+                        &activation.payload_digest_sha256,
+                    )
+                    .map_err(|_| HarnessDispatchCycleError::TaskActivationSource)?
+                {
+                    return Err(HarnessDispatchCycleError::TaskActivationSource);
+                }
+                report.activations_started += 1;
+                report.activations_acknowledged += 1;
+                let dispatched = dispatch_pending(control, adapter, &self.principal).await?;
+                report.dispatches_seen += dispatched.dispatches_seen;
+                report.dispatches_delivered += dispatched.dispatches_delivered;
+                report.dispatches_rejected += dispatched.dispatches_rejected;
+                report.observations_seen += dispatched.observations_seen;
+                report.observations_consumed += dispatched.observations_consumed;
+                report.observations_deferred += dispatched.observations_deferred;
+                report.observations_retained += dispatched.observations_retained;
+                report.observations_quarantined += dispatched.observations_quarantined;
+            }
+            let dispatched = dispatch_pending(control, adapter, &self.principal).await?;
+            report.dispatches_seen += dispatched.dispatches_seen;
+            report.dispatches_delivered += dispatched.dispatches_delivered;
+            report.dispatches_rejected += dispatched.dispatches_rejected;
+            report.observations_seen += dispatched.observations_seen;
+            report.observations_consumed += dispatched.observations_consumed;
+            report.observations_deferred += dispatched.observations_deferred;
+            report.observations_retained += dispatched.observations_retained;
+            report.observations_quarantined += dispatched.observations_quarantined;
+            Ok(report)
         })
     }
 }

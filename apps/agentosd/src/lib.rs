@@ -36,7 +36,8 @@ use egopulse_local_api::{
     },
 };
 use egopulse_local_ide_control::collaboration_control::{
-    HarnessDispatchCycleError, HarnessDispatchRunner,
+    HarnessDispatchCycleError, HarnessDispatchRunner, SingleHarnessWorkflowResolver,
+    SingleHarnessWorkflowResolverError, TaskActivationSource,
 };
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
@@ -183,6 +184,40 @@ pub struct DaemonProviders {
     pub verdict_port: Arc<dyn VerdictCommandPort>,
     pub projection_source: Option<Arc<dyn OwnerProjectionSource>>,
     pub harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
+    pub task_activation_source: Option<Arc<dyn TaskActivationSource>>,
+}
+
+/// Explicit workflow configuration boundary for the first vertical. It does
+/// not derive a plan, model, workspace, or material from a Task payload; all
+/// of those are injected as one reviewed configuration and only the activated
+/// run id is checked against the handoff.
+#[derive(Clone, Debug)]
+pub struct ConfiguredSingleHarnessWorkflow {
+    config: egopulse_local_ide_control::collaboration_control::SingleHarnessWorkConfig,
+}
+
+impl ConfiguredSingleHarnessWorkflow {
+    #[must_use]
+    pub fn new(
+        config: egopulse_local_ide_control::collaboration_control::SingleHarnessWorkConfig,
+    ) -> Self {
+        Self { config }
+    }
+}
+
+impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
+    fn resolve(
+        &self,
+        activation: &egopulse_local_ide_control::collaboration_control::TaskActivationHandoff,
+    ) -> Result<
+        egopulse_local_ide_control::collaboration_control::SingleHarnessWorkConfig,
+        SingleHarnessWorkflowResolverError,
+    > {
+        if activation.task.current_run_id.as_deref() != Some(self.config.run_id.as_str()) {
+            return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+        }
+        Ok(self.config.clone())
+    }
 }
 
 pub struct AuthorityCompositionInputs {
@@ -212,6 +247,7 @@ impl DaemonProviders {
             verdict_port: Arc::new(FailClosedVerdictPort),
             projection_source: None,
             harness_dispatch_runner: None,
+            task_activation_source: None,
         }
     }
 
@@ -265,6 +301,7 @@ impl DaemonProviders {
                 projection_sources,
             ))),
             harness_dispatch_runner: None,
+            task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
         }
     }
 
@@ -652,7 +689,12 @@ mod tests {
             Duration::from_millis(1),
             stop_receiver,
         ));
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        for _ in 0..100 {
+            if runs.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         stop_sender.send(true).expect("worker stop signal");
         worker
             .await

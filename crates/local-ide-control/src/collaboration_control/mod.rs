@@ -9,15 +9,17 @@ mod task_activation_guard;
 pub use adapter_evidence::AdapterBackedHarnessEvidenceResolver;
 pub use composite_guard::CompositeCollaborationGuard;
 pub use harness_dispatch::{
-    GovernedHarnessDispatchRunner, HarnessDispatchCycleError, HarnessDispatchCycleReport,
-    HarnessDispatchRunner, dispatch_pending, pump_observations,
+    GovernedHarnessDispatchRunner, GovernedTaskActivationRunner, HarnessDispatchCycleError,
+    HarnessDispatchCycleReport, HarnessDispatchRunner, dispatch_pending, pump_observations,
 };
 pub use ingestion::{HarnessFactIngestionDisposition, HarnessFactIngestionResult};
 pub use single_harness_workflow::{
     SingleHarnessWorkConfig, SingleHarnessWorkError, SingleHarnessWorkResult,
     start_single_harness_workflow,
 };
-pub use task_activation_guard::TaskActivationReferenceGuard;
+pub use task_activation_guard::{
+    TaskActivationGuardSet, TaskActivationReferenceGuard, TaskActivationReferenceHandle,
+};
 
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCancellationDisposition,
@@ -233,6 +235,47 @@ pub struct PendingDispatch {
     pub source_event_id: String,
     pub canonical_payload_digest_sha256: String,
     pub envelope: DispatchEnvelope,
+}
+
+/// Typed, digest-checked evidence handed from Task Authority to the
+/// Collaboration single writer. The source owns the original outbox and is
+/// responsible for acknowledging it only after the collaboration commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskActivationHandoff {
+    pub message_id: String,
+    pub payload_digest_sha256: String,
+    pub task: egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskActivationSourceError {
+    Unavailable,
+    Integrity,
+}
+
+pub trait TaskActivationSource: Send + Sync {
+    fn pending_task_activations(
+        &self,
+    ) -> Result<Vec<TaskActivationHandoff>, TaskActivationSourceError>;
+
+    fn acknowledge_task_activation(
+        &self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, TaskActivationSourceError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SingleHarnessWorkflowResolverError {
+    Unavailable,
+    InvalidConfiguration,
+}
+
+pub trait SingleHarnessWorkflowResolver: Send + Sync {
+    fn resolve(
+        &self,
+        activation: &TaskActivationHandoff,
+    ) -> Result<SingleHarnessWorkConfig, SingleHarnessWorkflowResolverError>;
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -1,13 +1,17 @@
 use super::{
     AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptSnapshot, CollaborationReferenceGuard,
     CollaborationSnapshot, CreateAttemptCommand, CreateRunCommand, DispatchMaterial,
-    LeaseAuthorization, MarkAttemptOutcomeUnknownCommand, RecordDispatchIntentCommand,
-    ReferenceAuthorization, ReferenceGuardRejection, RequestAttemptCancellationCommand,
-    RunSnapshot, SingleHarnessWorkConfig, StepSnapshot,
+    HarnessEvidenceResolver, LeaseAuthorization, MarkAttemptOutcomeUnknownCommand,
+    RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
+    RecordDeliveryReceiptCommand, RecordDispatchIntentCommand, RecordHarnessAckCommand,
+    RecordRunningObservationCommand, ReferenceAuthorization, ReferenceGuardRejection,
+    RequestAttemptCancellationCommand, ResolvedHarnessEvidence, RunSnapshot,
+    SingleHarnessWorkConfig, StepSnapshot,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::RunPlan;
 use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
 use egopulse_domain_contracts::v01::egopulse::task::v1::{TaskSnapshot, TaskStatus};
+use std::sync::{Arc, Mutex};
 
 /// Reference guard for the first production vertical: a Task activation event
 /// is the only source from which a single governed Harness run may be created.
@@ -25,6 +29,183 @@ pub struct TaskActivationReferenceGuard {
     lease_policy_ref: ContractReference,
     lease_ttl_seconds: u64,
     material: DispatchMaterial,
+}
+
+/// A shared binding used by the single-writer worker. The binding changes only
+/// between activation transactions, while CollaborationControl and the
+/// Harness Adapter continue to share one runtime and one durable writer.
+#[derive(Clone, Default)]
+pub struct TaskActivationReferenceHandle {
+    state: Arc<Mutex<Option<TaskActivationReferenceGuard>>>,
+}
+
+impl TaskActivationReferenceHandle {
+    pub(crate) fn new(state: Arc<Mutex<Option<TaskActivationReferenceGuard>>>) -> Self {
+        Self { state }
+    }
+
+    pub(crate) fn bind(
+        &self,
+        task: TaskSnapshot,
+        config: &SingleHarnessWorkConfig,
+        lease_ttl_seconds: u64,
+    ) -> Result<(), ()> {
+        let mut state = self.state.lock().map_err(|_| ())?;
+        *state = Some(TaskActivationReferenceGuard::new(
+            task,
+            config,
+            lease_ttl_seconds,
+        ));
+        Ok(())
+    }
+
+    fn with_guard<T>(
+        &self,
+        operation: impl FnOnce(&TaskActivationReferenceGuard) -> Result<T, ReferenceGuardRejection>,
+    ) -> Result<T, ReferenceGuardRejection> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?;
+        state
+            .as_ref()
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)
+            .and_then(operation)
+    }
+}
+
+/// A Collaboration guard whose task reference is explicitly rebound by the
+/// activation consumer. Harness evidence remains delegated to the separate
+/// Adapter owner; this type only joins the two at the Collaboration boundary.
+pub struct TaskActivationGuardSet<E> {
+    reference: TaskActivationReferenceHandle,
+    evidence: E,
+}
+
+impl<E> TaskActivationGuardSet<E> {
+    #[must_use]
+    pub fn new(evidence: E) -> (Self, TaskActivationReferenceHandle) {
+        let handle = TaskActivationReferenceHandle::new(Arc::new(Mutex::new(None)));
+        (
+            Self {
+                reference: handle.clone(),
+                evidence,
+            },
+            handle,
+        )
+    }
+}
+
+impl<E> CollaborationReferenceGuard for TaskActivationGuardSet<E> {
+    fn validate_create_run(
+        &self,
+        command: &CreateRunCommand,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.reference
+            .with_guard(|guard| guard.validate_create_run(command))
+    }
+
+    fn validate_activate_run(
+        &self,
+        command: &ActivateRunCommand,
+        run: &RunSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.reference
+            .with_guard(|guard| guard.validate_activate_run(command, run))
+    }
+
+    fn validate_create_attempt(
+        &self,
+        command: &CreateAttemptCommand,
+        run: &RunSnapshot,
+        step: &StepSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.reference
+            .with_guard(|guard| guard.validate_create_attempt(command, run, step))
+    }
+
+    fn authorize_lease(
+        &self,
+        command: &AcquireAttemptLeaseCommand,
+        attempt: &AttemptSnapshot,
+    ) -> Result<LeaseAuthorization, ReferenceGuardRejection> {
+        self.reference
+            .with_guard(|guard| guard.authorize_lease(command, attempt))
+    }
+
+    fn resolve_dispatch_material(
+        &self,
+        command: &RecordDispatchIntentCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<DispatchMaterial, ReferenceGuardRejection> {
+        self.reference
+            .with_guard(|guard| guard.resolve_dispatch_material(command, snapshot))
+    }
+
+    fn validate_unknown_outcome(
+        &self,
+        command: &MarkAttemptOutcomeUnknownCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.reference
+            .with_guard(|guard| guard.validate_unknown_outcome(command, snapshot))
+    }
+
+    fn validate_cancellation_request(
+        &self,
+        command: &RequestAttemptCancellationCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.reference
+            .with_guard(|guard| guard.validate_cancellation_request(command, snapshot))
+    }
+}
+
+impl<E> HarnessEvidenceResolver for TaskActivationGuardSet<E>
+where
+    E: HarnessEvidenceResolver,
+{
+    fn resolve_delivery_receipt(
+        &self,
+        command: &RecordDeliveryReceiptCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+        self.evidence.resolve_delivery_receipt(command, snapshot)
+    }
+
+    fn resolve_harness_ack(
+        &self,
+        command: &RecordHarnessAckCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+        self.evidence.resolve_harness_ack(command, snapshot)
+    }
+
+    fn validate_running_observation(
+        &self,
+        command: &RecordRunningObservationCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.evidence
+            .validate_running_observation(command, snapshot)
+    }
+
+    fn validate_cancellation_outcome(
+        &self,
+        command: &RecordAttemptCancellationOutcomeCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.evidence
+            .validate_cancellation_outcome(command, snapshot)
+    }
+
+    fn validate_reconciliation(
+        &self,
+        command: &RecordAttemptReconciliationCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.evidence.validate_reconciliation(command, snapshot)
+    }
 }
 
 impl TaskActivationReferenceGuard {

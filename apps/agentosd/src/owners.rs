@@ -19,6 +19,9 @@ use egopulse_local_api::command_gateway::{
     VerdictCommandPort,
 };
 use egopulse_local_api::read_tokens::AwaitTarget;
+use egopulse_local_ide_control::collaboration_control::{
+    TaskActivationHandoff, TaskActivationSource, TaskActivationSourceError,
+};
 use egopulse_policy_decision_authority::{
     AuthenticatedPolicyPrincipal, PolicyAuthorityFailure, PolicyDecisionAuthority,
     PolicyPrincipalKind,
@@ -186,6 +189,48 @@ impl TaskCommandPort for AuthorityCommandPorts {
             source_revision,
             await_target,
         })
+    }
+}
+
+impl TaskActivationSource for AuthorityCommandPorts {
+    fn pending_task_activations(
+        &self,
+    ) -> Result<Vec<TaskActivationHandoff>, TaskActivationSourceError> {
+        let authority = self
+            .task
+            .lock()
+            .map_err(|_| TaskActivationSourceError::Unavailable)?;
+        authority
+            .pending_task_activations()
+            .map_err(task_activation_source_error)
+            .and_then(|messages| {
+                messages
+                    .into_iter()
+                    .map(|message| {
+                        let task = message
+                            .event
+                            .snapshot
+                            .ok_or(TaskActivationSourceError::Integrity)?;
+                        Ok(TaskActivationHandoff {
+                            message_id: message.message_id,
+                            payload_digest_sha256: message.payload_digest_sha256,
+                            task,
+                        })
+                    })
+                    .collect()
+            })
+    }
+
+    fn acknowledge_task_activation(
+        &self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, TaskActivationSourceError> {
+        self.task
+            .lock()
+            .map_err(|_| TaskActivationSourceError::Unavailable)?
+            .acknowledge_cross_authority_outbox(message_id, payload_digest_sha256)
+            .map_err(task_activation_source_error)
     }
 }
 
@@ -382,9 +427,22 @@ fn verdict_kind_name(kind: VerdictPrincipalKind) -> &'static str {
 
 fn task_failure(error: TaskAuthorityFailure) -> CommandPortFailure {
     match error {
-        TaskAuthorityFailure::Decode(_) => CommandPortFailure::IntegrityFailure,
+        TaskAuthorityFailure::Decode(_) | TaskAuthorityFailure::InvalidCrossAuthorityHandoff => {
+            CommandPortFailure::IntegrityFailure
+        }
         TaskAuthorityFailure::Storage | TaskAuthorityFailure::Clock => {
             CommandPortFailure::Unavailable
+        }
+    }
+}
+
+fn task_activation_source_error(error: TaskAuthorityFailure) -> TaskActivationSourceError {
+    match error {
+        TaskAuthorityFailure::Decode(_) | TaskAuthorityFailure::InvalidCrossAuthorityHandoff => {
+            TaskActivationSourceError::Integrity
+        }
+        TaskAuthorityFailure::Storage | TaskAuthorityFailure::Clock => {
+            TaskActivationSourceError::Unavailable
         }
     }
 }
@@ -599,6 +657,12 @@ mod tests {
         .expect("verdict owner");
         let ports =
             AuthorityCommandPorts::new(task, policy, verdict, Arc::new(StaticPrincipalResolver));
+
+        assert!(
+            TaskActivationSource::pending_task_activations(&ports)
+                .expect("Task activation source")
+                .is_empty()
+        );
 
         let task_result = TaskCommandPort::execute(
             &ports,
