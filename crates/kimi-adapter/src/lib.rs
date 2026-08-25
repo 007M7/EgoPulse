@@ -507,4 +507,67 @@ mod tests {
                 | KimiSessionProbeDisposition::AuthenticationRequired { .. }
         ));
     }
+
+    #[tokio::test]
+    async fn unverified_execution_surface_is_fail_closed_and_proven_not_sent() {
+        let mut driver = KimiAcpDriver::new(KimiAcpConfig::new(
+            r"C:\kimi.exe",
+            std::env::current_dir().expect("cwd"),
+        ));
+        let envelope = DispatchEnvelope::default();
+        let material = ResolvedDispatchMaterial {
+            canonical_input_bundle: Vec::new(),
+            prompt: "not sent".to_owned(),
+            workspace_root: std::env::current_dir().expect("cwd"),
+            model: None,
+        };
+        let dispatch_error = driver
+            .send_dispatch(&envelope, &material)
+            .await
+            .expect_err("dispatch must remain unsupported");
+        assert_eq!(
+            (dispatch_error.code, dispatch_error.certainty),
+            (
+                HarnessErrorCode::CapabilityMismatch,
+                DriverErrorCertainty::ProvenNotSent
+            )
+        );
+        assert_eq!(
+            driver
+                .next_event(&envelope)
+                .await
+                .expect_err("events must remain unsupported")
+                .safe_detail_code,
+            "KIMI_NATIVE_EVENTS_NOT_ATTESTED"
+        );
+        assert_eq!(
+            driver
+                .decide_approval(&ApprovalDecisionEnvelope::default())
+                .await
+                .expect_err("approvals must remain unsupported")
+                .safe_detail_code,
+            "KIMI_NATIVE_APPROVALS_NOT_ATTESTED"
+        );
+        assert_eq!(
+            driver
+                .cancel(&CancelExecutionEnvelope::default())
+                .await
+                .expect_err("cancellation must remain unsupported")
+                .safe_detail_code,
+            "KIMI_NATIVE_CANCELLATION_NOT_ATTESTED"
+        );
+        let context = ReconciliationContext {
+            envelope,
+            delivery_receipt: None,
+            material,
+        };
+        assert_eq!(
+            driver
+                .reconcile(&context)
+                .await
+                .expect_err("reconciliation must remain unsupported")
+                .safe_detail_code,
+            "KIMI_NATIVE_RECONCILIATION_NOT_ATTESTED"
+        );
+    }
 }

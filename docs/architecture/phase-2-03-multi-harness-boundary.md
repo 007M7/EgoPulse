@@ -153,3 +153,8 @@ The candidate-only Kimi evidence is in
 Windows probe that requires an explicitly configured executable and isolated
 share directory. It must not be promoted until the authenticated
 `session/new`/prompt lifecycle and recovery matrix is complete.
+
+The same test module now proves that the unverified dispatch, event, approval,
+cancellation and reconciliation surfaces all return `CapabilityMismatch` with
+`ProvenNotSent`. This is a candidate safety invariant, not evidence of
+second-Harness support.
