@@ -34,6 +34,16 @@ is real and structured, but the next session/lifecycle probe requires an
 explicitly authenticated user environment; no login was initiated by this
 probe.
 
+The Rust candidate adapter now records this boundary through
+`KimiAcpDriver::probe_session`. It preserves the `initialize` probe result and
+classifies `session/new` as one of three controlled dispositions:
+`Created` with an opaque native session reference,
+`AuthenticationRequired` with non-secret auth method identifiers, or
+`Rejected` with a safe detail code. Each session response is represented by a
+SHA-256 evidence reference. This is probe evidence only: no prompt is sent,
+no session is installed into a capability profile, and all execution,
+approval, cancellation and reconciliation methods remain fail-closed.
+
 ## DeepSeek Harness / DSH 0.1.0-rc.5
 
 The local `dsh --help` entry point describes an ordered profile launcher with

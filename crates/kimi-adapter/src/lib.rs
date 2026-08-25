@@ -23,6 +23,28 @@ pub const KIMI_ADAPTER_ID: &str = "kimi-adapter";
 pub const KIMI_ACP_PROTOCOL: &str = "agent-client-protocol";
 pub const KIMI_ACP_PROTOCOL_VERSION: &str = "v1";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KimiSessionProbeDisposition {
+    Created {
+        native_session_ref: String,
+        evidence_ref: String,
+    },
+    AuthenticationRequired {
+        auth_method_ids: Vec<String>,
+        evidence_ref: String,
+    },
+    Rejected {
+        safe_detail_code: String,
+        evidence_ref: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KimiSessionProbeResult {
+    pub initialize: ProbeHarnessResult,
+    pub session: KimiSessionProbeDisposition,
+}
+
 #[derive(Clone, Debug)]
 pub struct KimiAcpConfig {
     pub executable: PathBuf,
@@ -64,6 +86,14 @@ impl KimiAcpDriver {
     #[must_use]
     pub fn new(config: KimiAcpConfig) -> Self {
         Self { config }
+    }
+
+    /// Performs the ACP initialize plus empty-session setup probe. It does not
+    /// send a prompt or invoke model inference. A created session is returned
+    /// only as an opaque probe result and is not installed into a production
+    /// capability profile.
+    pub async fn probe_session(&self) -> Result<KimiSessionProbeResult, DriverError> {
+        probe_session(&self.config).await
     }
 }
 
@@ -116,16 +146,78 @@ async fn probe_initialize(
     config: &KimiAcpConfig,
     _request: &ProbeHarnessRequest,
 ) -> Result<ProbeHarnessResult, DriverError> {
+    let mut process = spawn_process(config).await?;
+    let encoded = initialize_request();
+    write_json_line(&mut process, &encoded, "KIMI_ACP_INITIALIZE_WRITE_FAILED").await?;
+    let line = read_json_line(
+        &mut process,
+        config.request_timeout,
+        "KIMI_ACP_INITIALIZE_TIMEOUT",
+        "KIMI_ACP_INITIALIZE_READ_FAILED",
+        &encoded,
+    )
+    .await?;
+    let _ = process.terminate().await;
+    let _ = process.wait().await;
+    parse_initialize_response(line.as_bytes())
+}
+
+async fn probe_session(config: &KimiAcpConfig) -> Result<KimiSessionProbeResult, DriverError> {
+    let mut process = spawn_process(config).await?;
+    let initialize = initialize_request();
+    write_json_line(
+        &mut process,
+        &initialize,
+        "KIMI_ACP_INITIALIZE_WRITE_FAILED",
+    )
+    .await?;
+    let initialize_line = read_json_line(
+        &mut process,
+        config.request_timeout,
+        "KIMI_ACP_INITIALIZE_TIMEOUT",
+        "KIMI_ACP_INITIALIZE_READ_FAILED",
+        &initialize,
+    )
+    .await?;
+    let initialize_result = parse_initialize_response(initialize_line.as_bytes())?;
+
+    let session_request = session_new_request(&config.working_directory);
+    write_json_line(
+        &mut process,
+        &session_request,
+        "KIMI_ACP_SESSION_NEW_WRITE_FAILED",
+    )
+    .await?;
+    let session_line = read_json_line(
+        &mut process,
+        config.request_timeout,
+        "KIMI_ACP_SESSION_NEW_TIMEOUT",
+        "KIMI_ACP_SESSION_NEW_READ_FAILED",
+        &session_request,
+    )
+    .await?;
+    let session_result = parse_session_new_response(session_line.as_bytes())?;
+    let _ = process.terminate().await;
+    let _ = process.wait().await;
+    Ok(KimiSessionProbeResult {
+        initialize: initialize_result,
+        session: session_result,
+    })
+}
+
+async fn spawn_process(config: &KimiAcpConfig) -> Result<SupervisedProcess, DriverError> {
     let mut spec = SupervisedProcessSpec::new(&config.executable, &config.working_directory);
     spec.arguments = vec!["acp".to_owned()];
     if let Some(directory) = &config.share_directory {
         spec = spec.with_environment_override("KIMI_SHARE_DIR", directory.display().to_string());
     }
-    let mut process = SupervisedProcess::spawn(&spec)
+    SupervisedProcess::spawn(&spec)
         .await
-        .map_err(|error| driver_error("KIMI_ACP_SPAWN_FAILED", format!("{error:?}").as_bytes()))?;
+        .map_err(|error| driver_error("KIMI_ACP_SPAWN_FAILED", format!("{error:?}").as_bytes()))
+}
 
-    let request = json!({
+fn initialize_request() -> Vec<u8> {
+    serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
@@ -137,40 +229,59 @@ async fn probe_initialize(
             },
             "clientInfo": { "name": "egopulse-probe", "version": env!("CARGO_PKG_VERSION") }
         }
-    });
-    let encoded = serde_json::to_vec(&request).unwrap_or_default();
-    process.stdin.write_all(&encoded).await.map_err(|error| {
-        driver_error(
-            "KIMI_ACP_INITIALIZE_WRITE_FAILED",
-            error.to_string().as_bytes(),
-        )
-    })?;
-    process.stdin.write_all(b"\n").await.map_err(|error| {
-        driver_error(
-            "KIMI_ACP_INITIALIZE_WRITE_FAILED",
-            error.to_string().as_bytes(),
-        )
-    })?;
-    process.stdin.flush().await.map_err(|error| {
-        driver_error(
-            "KIMI_ACP_INITIALIZE_WRITE_FAILED",
-            error.to_string().as_bytes(),
-        )
-    })?;
+    }))
+    .unwrap_or_default()
+}
 
-    let mut line = String::new();
-    timeout(config.request_timeout, process.stdout.read_line(&mut line))
+fn session_new_request(working_directory: &PathBuf) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/new",
+        "params": {
+            "cwd": working_directory,
+            "mcpServers": [],
+            "additionalDirectories": []
+        }
+    }))
+    .unwrap_or_default()
+}
+
+async fn write_json_line(
+    process: &mut SupervisedProcess,
+    encoded: &[u8],
+    detail_code: &str,
+) -> Result<(), DriverError> {
+    process
+        .stdin
+        .write_all(encoded)
         .await
-        .map_err(|_| driver_error("KIMI_ACP_INITIALIZE_TIMEOUT", &encoded))?
-        .map_err(|error| {
-            driver_error(
-                "KIMI_ACP_INITIALIZE_READ_FAILED",
-                error.to_string().as_bytes(),
-            )
-        })?;
-    let _ = process.terminate().await;
-    let _ = process.wait().await;
-    parse_initialize_response(line.as_bytes())
+        .map_err(|error| driver_error(detail_code, error.to_string().as_bytes()))?;
+    process
+        .stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|error| driver_error(detail_code, error.to_string().as_bytes()))?;
+    process
+        .stdin
+        .flush()
+        .await
+        .map_err(|error| driver_error(detail_code, error.to_string().as_bytes()))
+}
+
+async fn read_json_line(
+    process: &mut SupervisedProcess,
+    request_timeout: Duration,
+    timeout_code: &str,
+    read_code: &str,
+    request: &[u8],
+) -> Result<String, DriverError> {
+    let mut line = String::new();
+    timeout(request_timeout, process.stdout.read_line(&mut line))
+        .await
+        .map_err(|_| driver_error(timeout_code, request))?
+        .map_err(|error| driver_error(read_code, error.to_string().as_bytes()))?;
+    Ok(line)
 }
 
 fn parse_initialize_response(raw: &[u8]) -> Result<ProbeHarnessResult, DriverError> {
@@ -213,6 +324,53 @@ fn parse_initialize_response(raw: &[u8]) -> Result<ProbeHarnessResult, DriverErr
         ],
         evidence_refs: vec![format!("kimi-acp-initialize-sha256:{}", sha256(raw))],
         observed_at: Some(now()),
+    })
+}
+
+fn parse_session_new_response(raw: &[u8]) -> Result<KimiSessionProbeDisposition, DriverError> {
+    let value: Value = serde_json::from_slice(raw).map_err(|error| {
+        driver_error(
+            "KIMI_ACP_SESSION_NEW_INVALID_JSON",
+            error.to_string().as_bytes(),
+        )
+    })?;
+    let evidence_ref = format!("kimi-acp-session-new-sha256:{}", sha256(raw));
+    if let Some(error) = value.get("error") {
+        let auth_method_ids = error
+            .pointer("/data/authMethods")
+            .and_then(Value::as_array)
+            .map(|methods| {
+                methods
+                    .iter()
+                    .filter_map(|method| method.get("id").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !auth_method_ids.is_empty()
+            || error
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.eq_ignore_ascii_case("authentication required"))
+        {
+            return Ok(KimiSessionProbeDisposition::AuthenticationRequired {
+                auth_method_ids,
+                evidence_ref,
+            });
+        }
+        return Ok(KimiSessionProbeDisposition::Rejected {
+            safe_detail_code: "KIMI_ACP_SESSION_NEW_REJECTED".to_owned(),
+            evidence_ref,
+        });
+    }
+    let session_id = value
+        .pointer("/result/sessionId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| driver_error("KIMI_ACP_SESSION_ID_MISSING", raw))?;
+    Ok(KimiSessionProbeDisposition::Created {
+        native_session_ref: session_id.to_owned(),
+        evidence_ref,
     })
 }
 
@@ -285,6 +443,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_authentication_error_is_a_controlled_probe_disposition() {
+        let result = parse_session_new_response(
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required","data":{"authMethods":[{"id":"login"}]}}}"#,
+        )
+        .expect("parse authentication response");
+        assert_eq!(
+            result,
+            KimiSessionProbeDisposition::AuthenticationRequired {
+                auth_method_ids: vec!["login".to_owned()],
+                evidence_ref: format!(
+                    "kimi-acp-session-new-sha256:{}",
+                    sha256(
+                        br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required","data":{"authMethods":[{"id":"login"}]}}}"#
+                    )
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn session_creation_keeps_native_session_reference_opaque() {
+        let result = parse_session_new_response(
+            br#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kimi-session-001"}}"#,
+        )
+        .expect("parse session response");
+        assert!(matches!(
+            result,
+            KimiSessionProbeDisposition::Created {
+                native_session_ref,
+                ..
+            } if native_session_ref == "kimi-session-001"
+        ));
+    }
+
     #[tokio::test]
     #[ignore = "requires an authenticated or anonymously probeable local Kimi installation"]
     async fn live_kimi_initialize_probe_is_reachable_without_promoting_capability() {
@@ -302,5 +495,14 @@ mod tests {
             .await
             .expect("Kimi ACP initialize probe");
         assert_eq!(result.readiness, HarnessReadiness::Degraded as i32);
+        let session = KimiAcpDriver::new(config)
+            .probe_session()
+            .await
+            .expect("Kimi ACP session probe");
+        assert!(matches!(
+            session.session,
+            KimiSessionProbeDisposition::Created { .. }
+                | KimiSessionProbeDisposition::AuthenticationRequired { .. }
+        ));
     }
 }

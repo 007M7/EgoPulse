@@ -89,26 +89,26 @@ source and does not alter the frozen four-layer system architecture.
 ## Next implementation slice
 
 The provider-neutral capability binding validator and its G4-09 fixture matrix
-are closed. The next code unit is the shared Probe Gate: it validates the
-adapter identity, readiness enum, independent probe evidence and native
-protocol fingerprint before a `Ready` result can become capability-attestation
-input. This gate is implemented in `GovernedHarnessAdapter`, so a future Kimi
-or DeepSeek adapter cannot bypass it by returning a provider-specific success
-shape.
+are closed. The shared Probe Gate is also implemented in
+`GovernedHarnessAdapter`: it validates adapter identity, readiness enum,
+independent probe evidence and native protocol fingerprint before a `Ready`
+result can become capability-attestation input. A future Kimi or DeepSeek
+adapter cannot bypass it by returning a provider-specific success shape.
 
-After the Probe Gate is closed, the next work is a local Windows x64 candidate
-probe matrix. It records executable discovery, protocol/schema fingerprint,
-structured event support, approval behavior, cancellation, reconciliation and
-the semantic cost of any emulation. A candidate is not promoted to an active
-Harness merely because its process starts.
+The current code unit is the authenticated-session boundary for the Kimi
+candidate. It records the ACP `initialize` result and the empty `session/new`
+disposition, but it does not send a prompt. A candidate is not promoted to an
+active Harness merely because its process starts or its session can be
+created.
 
 The first candidate implementation is now `crates/kimi-adapter`. It reuses
 the existing process-supervision seam and performs only an ACP `initialize`
-probe. A reachable Kimi process is reported as `Degraded` until a reviewed
-schema digest exists; dispatch, observations, approvals, cancellation and
-reconciliation all return `CapabilityMismatch`. The crate is therefore a
-probe vehicle, not a second production Harness and is not wired into the
-agent daemon bootstrap.
+and empty-session probe. A reachable Kimi process is reported as `Degraded`
+until a reviewed schema digest exists; an unauthenticated `session/new` is a
+controlled `AuthenticationRequired` disposition; dispatch, observations,
+approvals, cancellation and reconciliation all return `CapabilityMismatch`.
+The crate is therefore a probe vehicle, not a second production Harness and
+is not wired into the agent daemon bootstrap.
 
 ## G4-09 evidence recorded
 
