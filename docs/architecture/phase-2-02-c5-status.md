@@ -72,8 +72,13 @@ configuration cannot be mistaken for evidence validation or Harness configuratio
 The first concrete production-side guard is now `LocalUserPolicyResolver`.
 It resolves approval requests from the Adapter Edge's durable projection,
 restricts requested scopes to an explicit reviewed set, and validates the
-Adapter-owned approval receipt on consumption. Task creation and Founder
-Verdict still require their own evidence-backed resolvers.
+Adapter-owned approval receipt on consumption. Founder Verdict still requires
+its own evidence-backed resolver.
+
+Task creation now has the concrete `ConfiguredTaskCreationGuard`, which binds
+the first vertical to reviewed work types, input snapshot IDs, target scopes,
+and exact acceptance/budget contract references. It is an explicit composition
+input and does not make the normal daemon serving by itself.
 
 Until that bootstrap exists, `with_codex_harness` is an explicit production composition API and not
 an implicit unsafe default.

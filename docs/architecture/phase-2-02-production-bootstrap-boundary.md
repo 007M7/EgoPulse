@@ -27,6 +27,12 @@ proof bound to the authenticated local principal, embedded authorization
 contract, request observation and short expiry. A missing or divergent durable
 record is rejected.
 
+The Task Create side now has the corresponding `ConfiguredTaskCreationGuard`.
+It accepts only explicitly reviewed work types, input snapshot IDs, target
+scope references and exact acceptance/budget contract references. Its evidence
+refs describe those reviewed inputs; it does not infer approval from the
+client request or write a second Task record.
+
 The normal `agentosd` entrypoint remains fail-closed until all three decisions,
 the encrypted Authority stores and the explicit Codex workflow configuration
 are assembled as one reviewed bootstrap. This is deliberate: a daemon that
@@ -69,8 +75,8 @@ The agentosd unit suite covers:
 - the existing real Windows Named Pipe C5 suite continues to pass in serial
   mode.
 
-The remaining bootstrap work is to provide reviewed configuration and actual
-Task/Verdict reference guards, then wire the explicit Codex composition into
+The remaining bootstrap work is to provide reviewed configuration and the
+Founder Verdict reference guard, then wire the explicit Codex composition into
 the normal binary. No test fixture Allow implementation is reused for that
-step; the Policy resolver is not a substitute for the still-missing Task and
-Verdict evidence guards.
+step; the Policy and Task guards are not substitutes for the still-missing
+Verdict evidence guard.

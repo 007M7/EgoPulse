@@ -58,6 +58,7 @@ mod owners;
 mod policy;
 mod projections;
 mod security;
+mod task;
 
 pub use owners::{
     AuthorityCommandPorts, AuthorityPrincipalResolver, DenyAllAuthorityPrincipalResolver,
@@ -73,6 +74,10 @@ pub use projections::{
 pub use security::{
     AllowlistedPrincipal, AllowlistedPrincipalResolver, AuthorityPrincipalBinding,
     ConfiguredAuthorityPrincipalResolver, PrincipalPolicyError,
+};
+pub use task::{
+    ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig,
+    TaskCreationGuardConfigurationError,
 };
 
 #[derive(Clone, Debug)]
