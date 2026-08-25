@@ -2,21 +2,31 @@
 
 use std::{
     process::ExitCode,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Parser, Subcommand};
 use egopulse_client_kernel::ClientKernel;
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::{CommandMetadata, ContractReference},
+    harness::v1::ApprovalDecision,
     localapi::v1::{
-        ClientSurface, ExecuteTaskCommandRequest, GetEvidenceGraphRequest,
-        GetHarnessApprovalViewRequest, GetProjectionStatusRequest, GetTaskViewRequest,
-        ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError, LocalApiErrorCode,
-        ProjectionHealth, ProjectionMetadata, TaskView, get_evidence_graph_response,
+        ClientSurface, DecideHarnessApprovalRequest, ExecuteFounderVerdictRequest,
+        ExecuteTaskCommandRequest, GetEvidenceGraphRequest, GetHarnessApprovalViewRequest,
+        GetProjectionStatusRequest, GetTaskViewRequest, ListHarnessApprovalViewsRequest,
+        ListTaskViewsRequest, LocalApiError, LocalApiErrorCode, ProjectionHealth,
+        ProjectionMetadata, TaskView, get_evidence_graph_response,
         get_harness_approval_view_response, get_task_view_response,
     },
+    policy::v1::{
+        IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
+    },
     task::v1::{CreateTaskCommand, TaskCommand, TaskStatus, task_command, task_command_result},
+    verdict::v1::{
+        FounderVerdictDecision, IssueFounderVerdictCommand, RevokeFounderVerdictCommand,
+        VerdictCommand, VerdictScope, verdict_command,
+    },
+    verification::v1::VerificationConclusion,
 };
 use egopulse_local_api::{LocalApiClient, LocalApiConnection, LocalIpcAddress};
 use prost::Message;
@@ -55,6 +65,11 @@ enum Command {
     Approval {
         #[command(subcommand)]
         command: ApprovalCommand,
+    },
+    /// Submit or revoke a Founder Verdict through its owning Authority.
+    Verdict {
+        #[command(subcommand)]
+        command: VerdictCommandCli,
     },
 }
 
@@ -131,6 +146,73 @@ enum ApprovalCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Submit the user-owned issue_harness_approval_decision branch.
+    Decide {
+        approval_request_id: String,
+        #[arg(long)]
+        expected_action_digest_sha256: String,
+        #[arg(long)]
+        expected_request_observation_id: String,
+        #[arg(long)]
+        expected_request_observation_sequence: u64,
+        #[arg(long)]
+        expected_request_revision: u64,
+        #[arg(long)]
+        decision: String,
+        #[arg(long)]
+        reason_code: String,
+        #[arg(long)]
+        confirmation_proof_ref: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum VerdictCommandCli {
+    /// Submit the user-owned issue_founder_verdict branch.
+    Issue {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long)]
+        task_revision: u64,
+        #[arg(long)]
+        work_revision: u64,
+        #[arg(long)]
+        artifact_set_id: String,
+        #[arg(long)]
+        verification_artifact_id: String,
+        #[arg(long)]
+        acceptance_contract_id: String,
+        #[arg(long)]
+        acceptance_contract_version: String,
+        #[arg(long)]
+        acceptance_contract_sha256: String,
+        #[arg(long)]
+        decision: String,
+        #[arg(long)]
+        observed_verification_conclusion: String,
+        #[arg(long)]
+        reason_code: String,
+        #[arg(long, default_value = "explicit")]
+        confirmation_class: String,
+        #[arg(long)]
+        confirmation_proof_ref: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit the user-owned revoke_founder_verdict branch.
+    Revoke {
+        founder_verdict_id: String,
+        #[arg(long)]
+        expected_state_revision: u64,
+        #[arg(long)]
+        reason_code: String,
+        #[arg(long)]
+        confirmation_proof_ref: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -203,6 +285,19 @@ impl CliFailure {
         }
     }
 
+    fn permission(operation: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 4,
+            reason_code: "PERMISSION_DENIED",
+            message: message.into(),
+            category: "authentication",
+            retryable: false,
+            required_action_code: Some("USE_AUTHORIZED_SESSION".to_owned()),
+            safe_fingerprint: Some("client_profile_denied".to_owned()),
+            operation,
+        }
+    }
+
     fn from_local_api_error(error: LocalApiError) -> Self {
         let code = LocalApiErrorCode::try_from(error.code)
             .map(|code| code.as_str_name())
@@ -267,6 +362,7 @@ async fn main() -> ExitCode {
         Command::Task { command } => task(command).await,
         Command::Evidence { command } => evidence(command).await,
         Command::Approval { command } => approval(command).await,
+        Command::Verdict { command } => verdict(command).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -294,7 +390,13 @@ fn command_json(command: &Command) -> bool {
             command: EvidenceCommand::Get { json, .. },
         }
         | Command::Approval {
-            command: ApprovalCommand::Get { json, .. } | ApprovalCommand::List { json, .. },
+            command:
+                ApprovalCommand::Get { json, .. }
+                | ApprovalCommand::List { json, .. }
+                | ApprovalCommand::Decide { json, .. },
+        }
+        | Command::Verdict {
+            command: VerdictCommandCli::Issue { json, .. } | VerdictCommandCli::Revoke { json, .. },
         } => *json,
     }
 }
@@ -319,6 +421,32 @@ impl AttachedClient {
                 SystemTime::now(),
             )
             .map_err(|error| CliFailure::protocol(error.to_string()))
+    }
+
+    fn require_rpc(&self, rpc: &str, operation: &'static str) -> Result<(), CliFailure> {
+        let session = self.kernel.session().ok_or_else(|| {
+            CliFailure::protocol("session binding missing").for_operation(operation)
+        })?;
+        self.kernel
+            .profiles()
+            .authorize_rpc(rpc, &session.granted_permission_codes)
+            .map_err(|error| CliFailure::permission(operation, error.to_string()))
+    }
+
+    fn require_command(
+        &self,
+        rpc: &str,
+        oneof: &str,
+        operation: &'static str,
+    ) -> Result<(), CliFailure> {
+        let session = self.kernel.session().ok_or_else(|| {
+            CliFailure::protocol("session binding missing").for_operation(operation)
+        })?;
+        self.kernel
+            .profiles()
+            .authorize_command(rpc, oneof, &session.granted_permission_codes)
+            .map(|_| ())
+            .map_err(|error| CliFailure::permission(operation, error.to_string()))
     }
 }
 
@@ -355,6 +483,7 @@ async fn attach(operation: &'static str) -> Result<AttachedClient, CliFailure> {
 
 async fn status(json: bool) -> Result<(), CliFailure> {
     let attached = attach("status").await?;
+    attached.require_rpc("LocalReadModelService/GetProjectionStatus", "status")?;
     let metadata = attached.metadata(None)?;
     let response = attached
         .connection
@@ -434,6 +563,7 @@ async fn task(command: TaskCommandCli) -> Result<(), CliFailure> {
 
 async fn task_get(task_id: String, json: bool) -> Result<(), CliFailure> {
     let attached = attach("task.get").await?;
+    attached.require_rpc("LocalReadModelService/GetTaskView", "task.get")?;
     let metadata = attached.metadata(None)?;
     let response = attached
         .connection
@@ -468,6 +598,7 @@ async fn task_list(page_size: u32, cursor: Option<String>, json: bool) -> Result
         );
     }
     let attached = attach("task.list").await?;
+    attached.require_rpc("LocalReadModelService/ListTaskViews", "task.list")?;
     let metadata = attached.metadata(None)?;
     let response = attached
         .connection
@@ -534,6 +665,7 @@ async fn evidence_get(
     json: bool,
 ) -> Result<(), CliFailure> {
     let attached = attach("evidence.get").await?;
+    attached.require_rpc("LocalReadModelService/GetEvidenceGraph", "evidence.get")?;
     let metadata = attached.metadata(None)?;
     let response = attached
         .connection
@@ -605,11 +737,39 @@ async fn approval(command: ApprovalCommand) -> Result<(), CliFailure> {
             actionable_only,
             json,
         } => approval_list(page_size, cursor, actionable_only, json).await,
+        ApprovalCommand::Decide {
+            approval_request_id,
+            expected_action_digest_sha256,
+            expected_request_observation_id,
+            expected_request_observation_sequence,
+            expected_request_revision,
+            decision,
+            reason_code,
+            confirmation_proof_ref,
+            json,
+        } => {
+            approval_decide(
+                approval_request_id,
+                expected_action_digest_sha256,
+                expected_request_observation_id,
+                expected_request_observation_sequence,
+                expected_request_revision,
+                decision,
+                reason_code,
+                confirmation_proof_ref,
+                json,
+            )
+            .await
+        }
     }
 }
 
 async fn approval_get(approval_request_id: String, json: bool) -> Result<(), CliFailure> {
     let attached = attach("approval.get").await?;
+    attached.require_rpc(
+        "LocalReadModelService/GetHarnessApprovalView",
+        "approval.get",
+    )?;
     let metadata = attached.metadata(None)?;
     let response = attached
         .connection
@@ -663,6 +823,10 @@ async fn approval_list(
             .for_operation("approval.list"));
     }
     let attached = attach("approval.list").await?;
+    attached.require_rpc(
+        "LocalReadModelService/ListHarnessApprovalViews",
+        "approval.list",
+    )?;
     let metadata = attached.metadata(None)?;
     let response = attached
         .connection
@@ -709,6 +873,353 @@ async fn approval_list(
     Ok(())
 }
 
+async fn approval_decide(
+    approval_request_id: String,
+    expected_action_digest_sha256: String,
+    expected_request_observation_id: String,
+    expected_request_observation_sequence: u64,
+    expected_request_revision: u64,
+    decision: String,
+    reason_code: String,
+    confirmation_proof_ref: Option<String>,
+    json: bool,
+) -> Result<(), CliFailure> {
+    let decision = parse_approval_decision(&decision)
+        .map_err(|message| CliFailure::protocol(message).for_operation("approval.decide"))?;
+    let attached = attach("approval.decide").await?;
+    attached.require_command(
+        "LocalCommandGatewayService/DecideHarnessApproval",
+        "issue_harness_approval_decision",
+        "approval.decide",
+    )?;
+    let correlation_id = Uuid::now_v7().to_string();
+    let mut command = PolicyDecisionCommand {
+        command: Some(
+            policy_decision_command::Command::IssueHarnessApprovalDecision(
+                IssueHarnessApprovalDecisionCommand {
+                    metadata: Some(command_metadata(
+                        &correlation_id,
+                        "egopulse-cli/approval-decide",
+                    )),
+                    approval_request_id,
+                    expected_action_digest_sha256,
+                    expected_request_observation_id,
+                    expected_request_observation_sequence,
+                    decision,
+                    reason_code,
+                    confirmation_proof_ref,
+                    expected_request_revision,
+                },
+            ),
+        ),
+    };
+    set_policy_digest(&mut command);
+    let metadata = attached.metadata(Some(correlation_id.clone()))?;
+    let response = attached
+        .connection
+        .command_gateway_service()
+        .decide_harness_approval(DecideHarnessApprovalRequest {
+            client: Some(metadata),
+            command: Some(match command.command {
+                Some(policy_decision_command::Command::IssueHarnessApprovalDecision(command)) => {
+                    command
+                }
+                _ => unreachable!("CLI always constructs issue approval decision"),
+            }),
+        })
+        .await
+        .map_err(|error| {
+            CliFailure::daemon_unavailable(error.to_string()).for_operation("approval.decide")
+        })?
+        .into_inner();
+    if let Some(error) = response.gateway_error {
+        return Err(CliFailure::from_local_api_error(error).for_operation("approval.decide"));
+    }
+    let result = response.sanitized_authority_result.ok_or_else(|| {
+        CliFailure::protocol("sanitized approval result missing").for_operation("approval.decide")
+    })?;
+    let payload = json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": "approval.decide",
+        "data": {
+            "committed": result.committed,
+            "replayed": result.replayed,
+            "authorityDecisionRef": result.authority_decision_ref,
+            "decision": ApprovalDecision::try_from(result.decision).map(|value| value.as_str_name()).unwrap_or("APPROVAL_DECISION_UNSPECIFIED"),
+            "stateRevision": result.state_revision,
+            "awaitToken": response.await_token.map(|token| token.token),
+        },
+        "correlationId": correlation_id,
+    });
+    if json {
+        println!("{}", serde_json::to_string(&payload).unwrap());
+    } else {
+        println!(
+            "Approval decision: ref={} committed={} replayed={} revision={}",
+            payload["data"]["authorityDecisionRef"]
+                .as_str()
+                .unwrap_or(""),
+            payload["data"]["committed"].as_bool().unwrap_or(false),
+            payload["data"]["replayed"].as_bool().unwrap_or(false),
+            payload["data"]["stateRevision"]
+                .as_u64()
+                .unwrap_or_default(),
+        );
+    }
+    Ok(())
+}
+
+async fn verdict(command: VerdictCommandCli) -> Result<(), CliFailure> {
+    match command {
+        VerdictCommandCli::Issue {
+            task_id,
+            task_revision,
+            work_revision,
+            artifact_set_id,
+            verification_artifact_id,
+            acceptance_contract_id,
+            acceptance_contract_version,
+            acceptance_contract_sha256,
+            decision,
+            observed_verification_conclusion,
+            reason_code,
+            confirmation_class,
+            confirmation_proof_ref,
+            json,
+        } => {
+            verdict_issue(
+                task_id,
+                task_revision,
+                work_revision,
+                artifact_set_id,
+                verification_artifact_id,
+                ContractReference {
+                    contract_id: acceptance_contract_id,
+                    version: acceptance_contract_version,
+                    sha256: acceptance_contract_sha256,
+                },
+                decision,
+                observed_verification_conclusion,
+                reason_code,
+                confirmation_class,
+                confirmation_proof_ref,
+                json,
+            )
+            .await
+        }
+        VerdictCommandCli::Revoke {
+            founder_verdict_id,
+            expected_state_revision,
+            reason_code,
+            confirmation_proof_ref,
+            json,
+        } => {
+            verdict_revoke(
+                founder_verdict_id,
+                expected_state_revision,
+                reason_code,
+                confirmation_proof_ref,
+                json,
+            )
+            .await
+        }
+    }
+}
+
+async fn verdict_issue(
+    task_id: String,
+    task_revision: u64,
+    work_revision: u64,
+    artifact_set_id: String,
+    verification_artifact_id: String,
+    acceptance_contract_ref: ContractReference,
+    decision: String,
+    observed_verification_conclusion: String,
+    reason_code: String,
+    confirmation_class: String,
+    confirmation_proof_ref: String,
+    json: bool,
+) -> Result<(), CliFailure> {
+    let decision = parse_verdict_decision(&decision)
+        .map_err(|message| CliFailure::protocol(message).for_operation("verdict.issue"))?;
+    let conclusion = parse_verification_conclusion(&observed_verification_conclusion)
+        .map_err(|message| CliFailure::protocol(message).for_operation("verdict.issue"))?;
+    let confirmation_class = parse_confirmation_class(&confirmation_class)
+        .map_err(|message| CliFailure::protocol(message).for_operation("verdict.issue"))?;
+    let attached = attach("verdict.issue").await?;
+    attached.require_command(
+        "LocalCommandGatewayService/ExecuteFounderVerdict",
+        "issue_founder_verdict",
+        "verdict.issue",
+    )?;
+    let correlation_id = Uuid::now_v7().to_string();
+    let mut command = VerdictCommand {
+        command: Some(verdict_command::Command::IssueFounderVerdict(
+            IssueFounderVerdictCommand {
+                metadata: Some(command_metadata(
+                    &correlation_id,
+                    "egopulse-cli/verdict-issue",
+                )),
+                scope: Some(VerdictScope {
+                    task_id,
+                    task_revision,
+                    work_revision,
+                    artifact_set_id,
+                    artifact_set_manifest: None,
+                    verification_artifact_id,
+                    verification_payload: None,
+                    acceptance_contract_ref: Some(acceptance_contract_ref),
+                }),
+                decision,
+                observed_verification_conclusion: conclusion,
+                risk_acceptances: Vec::new(),
+                rework_directive: None,
+                reason_code,
+                rationale_artifact_id: None,
+                required_confirmation_class: confirmation_class,
+                confirmation_proof_ref,
+                expires_at: Some(timestamp_after(Duration::from_secs(3600))),
+                supersedes_founder_verdict_id: None,
+            },
+        )),
+    };
+    set_verdict_digest(&mut command);
+    let metadata = attached.metadata(Some(correlation_id.clone()))?;
+    let response = attached
+        .connection
+        .command_gateway_service()
+        .execute_founder_verdict(ExecuteFounderVerdictRequest {
+            client: Some(metadata),
+            command: Some(command),
+        })
+        .await
+        .map_err(|error| {
+            CliFailure::daemon_unavailable(error.to_string()).for_operation("verdict.issue")
+        })?
+        .into_inner();
+    if let Some(error) = response.gateway_error {
+        return Err(CliFailure::from_local_api_error(error).for_operation("verdict.issue"));
+    }
+    let result = response.authority_result.ok_or_else(|| {
+        CliFailure::protocol("Founder Verdict authority result missing")
+            .for_operation("verdict.issue")
+    })?;
+    let verdict_id = result
+        .verdict
+        .as_ref()
+        .map(|verdict| verdict.founder_verdict_id.clone());
+    let payload = json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": "verdict.issue",
+        "data": {
+            "committed": result.committed,
+            "replayed": result.replayed,
+            "founderVerdictId": verdict_id,
+            "stateRevision": result.state.as_ref().map(|state| state.revision),
+            "awaitToken": response.await_token.map(|token| token.token),
+        },
+        "correlationId": correlation_id,
+    });
+    if json {
+        println!("{}", serde_json::to_string(&payload).unwrap());
+    } else {
+        println!(
+            "Founder Verdict issued: id={} committed={} replayed={}",
+            payload["data"]["founderVerdictId"].as_str().unwrap_or(""),
+            payload["data"]["committed"].as_bool().unwrap_or(false),
+            payload["data"]["replayed"].as_bool().unwrap_or(false),
+        );
+    }
+    Ok(())
+}
+
+async fn verdict_revoke(
+    founder_verdict_id: String,
+    expected_state_revision: u64,
+    reason_code: String,
+    confirmation_proof_ref: String,
+    json: bool,
+) -> Result<(), CliFailure> {
+    let attached = attach("verdict.revoke").await?;
+    attached.require_command(
+        "LocalCommandGatewayService/ExecuteFounderVerdict",
+        "revoke_founder_verdict",
+        "verdict.revoke",
+    )?;
+    let correlation_id = Uuid::now_v7().to_string();
+    let mut command = VerdictCommand {
+        command: Some(verdict_command::Command::RevokeFounderVerdict(
+            RevokeFounderVerdictCommand {
+                metadata: Some(command_metadata(
+                    &correlation_id,
+                    "egopulse-cli/verdict-revoke",
+                )),
+                founder_verdict_id,
+                expected_state_revision,
+                reason_code,
+                confirmation_proof_ref,
+            },
+        )),
+    };
+    set_verdict_digest(&mut command);
+    let metadata = attached.metadata(Some(correlation_id.clone()))?;
+    let response = attached
+        .connection
+        .command_gateway_service()
+        .execute_founder_verdict(ExecuteFounderVerdictRequest {
+            client: Some(metadata),
+            command: Some(command),
+        })
+        .await
+        .map_err(|error| {
+            CliFailure::daemon_unavailable(error.to_string()).for_operation("verdict.revoke")
+        })?
+        .into_inner();
+    if let Some(error) = response.gateway_error {
+        return Err(CliFailure::from_local_api_error(error).for_operation("verdict.revoke"));
+    }
+    let result = response.authority_result.ok_or_else(|| {
+        CliFailure::protocol("Founder Verdict authority result missing")
+            .for_operation("verdict.revoke")
+    })?;
+    if result.error_code != 0 {
+        return Err(CliFailure::protocol(format!(
+            "Founder Verdict rejected: {}",
+            result
+                .safe_error_fingerprint
+                .as_deref()
+                .unwrap_or("VERDICT_ERROR")
+        ))
+        .for_operation("verdict.revoke"));
+    }
+    let payload = json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": "verdict.revoke",
+        "data": {
+            "committed": result.committed,
+            "replayed": result.replayed,
+            "founderVerdictId": result.state.as_ref().map(|state| state.founder_verdict_id.clone()),
+            "stateRevision": result.state.as_ref().map(|state| state.revision),
+            "awaitToken": response.await_token.map(|token| token.token),
+        },
+        "correlationId": correlation_id,
+    });
+    if json {
+        println!("{}", serde_json::to_string(&payload).unwrap());
+    } else {
+        println!(
+            "Founder Verdict revoked: id={} committed={} replayed={}",
+            payload["data"]["founderVerdictId"].as_str().unwrap_or(""),
+            payload["data"]["committed"].as_bool().unwrap_or(false),
+            payload["data"]["replayed"].as_bool().unwrap_or(false),
+        );
+    }
+    Ok(())
+}
+
 async fn task_create(
     work_type: String,
     input_snapshot_id: String,
@@ -718,6 +1229,11 @@ async fn task_create(
     json: bool,
 ) -> Result<(), CliFailure> {
     let attached = attach("task.create").await?;
+    attached.require_command(
+        "LocalCommandGatewayService/ExecuteTaskCommand",
+        "create_task",
+        "task.create",
+    )?;
     let correlation_id = Uuid::now_v7().to_string();
     let mut command = TaskCommand {
         command: Some(task_command::Command::CreateTask(CreateTaskCommand {
@@ -819,6 +1335,131 @@ fn canonical_task_digest(command: &TaskCommand) -> String {
         }
     }
     hex::encode(Sha256::digest(canonical.encode_to_vec()))
+}
+
+fn command_metadata(correlation_id: &str, scope: &str) -> CommandMetadata {
+    CommandMetadata {
+        command_id: Uuid::now_v7().to_string(),
+        idempotency_key: Uuid::now_v7().to_string(),
+        idempotency_scope: scope.to_owned(),
+        request_digest_sha256: String::new(),
+        issued_at: Some(now_timestamp()),
+        correlation_id: correlation_id.to_owned(),
+        causation_id: None,
+    }
+}
+
+fn set_policy_digest(command: &mut PolicyDecisionCommand) {
+    let mut canonical = command.clone();
+    if let Some(policy_decision_command::Command::IssueHarnessApprovalDecision(issue)) =
+        canonical.command.as_mut()
+    {
+        if let Some(metadata) = issue.metadata.as_mut() {
+            metadata.command_id.clear();
+            metadata.request_digest_sha256.clear();
+            metadata.issued_at = None;
+            metadata.correlation_id.clear();
+            metadata.causation_id = None;
+        }
+    }
+    let digest = hex::encode(Sha256::digest(canonical.encode_to_vec()));
+    if let Some(policy_decision_command::Command::IssueHarnessApprovalDecision(issue)) =
+        command.command.as_mut()
+    {
+        issue
+            .metadata
+            .as_mut()
+            .expect("CLI always supplies policy command metadata")
+            .request_digest_sha256 = digest;
+    }
+}
+
+fn set_verdict_digest(command: &mut VerdictCommand) {
+    let mut canonical = command.clone();
+    match canonical.command.as_mut() {
+        Some(verdict_command::Command::IssueFounderVerdict(issue)) => {
+            clear_command_metadata(issue.metadata.as_mut());
+        }
+        Some(verdict_command::Command::RevokeFounderVerdict(revoke)) => {
+            clear_command_metadata(revoke.metadata.as_mut());
+        }
+        _ => {}
+    }
+    let digest = hex::encode(Sha256::digest(canonical.encode_to_vec()));
+    match command.command.as_mut() {
+        Some(verdict_command::Command::IssueFounderVerdict(issue)) => {
+            issue
+                .metadata
+                .as_mut()
+                .expect("CLI always supplies verdict command metadata")
+                .request_digest_sha256 = digest;
+        }
+        Some(verdict_command::Command::RevokeFounderVerdict(revoke)) => {
+            revoke
+                .metadata
+                .as_mut()
+                .expect("CLI always supplies verdict command metadata")
+                .request_digest_sha256 = digest;
+        }
+        _ => {}
+    }
+}
+
+fn clear_command_metadata(metadata: Option<&mut CommandMetadata>) {
+    if let Some(metadata) = metadata {
+        metadata.command_id.clear();
+        metadata.request_digest_sha256.clear();
+        metadata.issued_at = None;
+        metadata.correlation_id.clear();
+        metadata.causation_id = None;
+    }
+}
+
+fn parse_approval_decision(value: &str) -> Result<i32, String> {
+    match value {
+        "allow-once" => Ok(ApprovalDecision::AllowOnce as i32),
+        "deny" => Ok(ApprovalDecision::Deny as i32),
+        "cancel-attempt" => Ok(ApprovalDecision::CancelAttempt as i32),
+        _ => Err("decision must be allow-once, deny, or cancel-attempt".to_owned()),
+    }
+}
+
+fn parse_verdict_decision(value: &str) -> Result<i32, String> {
+    match value {
+        "accept" => Ok(FounderVerdictDecision::Accept as i32),
+        "rework" => Ok(FounderVerdictDecision::Rework as i32),
+        "reject" => Ok(FounderVerdictDecision::Reject as i32),
+        _ => Err("decision must be accept, rework, or reject".to_owned()),
+    }
+}
+
+fn parse_verification_conclusion(value: &str) -> Result<i32, String> {
+    match value {
+        "passed" => Ok(VerificationConclusion::Passed as i32),
+        "failed" => Ok(VerificationConclusion::Failed as i32),
+        "partial" => Ok(VerificationConclusion::Partial as i32),
+        "indeterminate" => Ok(VerificationConclusion::Indeterminate as i32),
+        _ => Err(
+            "observed verification conclusion must be passed, failed, partial, or indeterminate"
+                .to_owned(),
+        ),
+    }
+}
+
+fn parse_confirmation_class(value: &str) -> Result<i32, String> {
+    match value {
+        "explicit" => Ok(1),
+        "elevated-risk-acceptance" => Ok(2),
+        _ => Err("confirmation class must be explicit or elevated-risk-acceptance".to_owned()),
+    }
+}
+
+fn timestamp_after(duration: Duration) -> prost_types::Timestamp {
+    let now = now_timestamp();
+    prost_types::Timestamp {
+        seconds: now.seconds + duration.as_secs() as i64,
+        nanos: now.nanos,
+    }
 }
 
 fn now_timestamp() -> prost_types::Timestamp {
