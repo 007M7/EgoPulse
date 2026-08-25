@@ -62,6 +62,14 @@ production bootstrap uses `DenyVerificationReferences`: Verification storage
 and projection are available, but unreviewed external verification requests
 cannot be accepted.
 
+The first prerequisite for replacing that deny boundary is now available in
+Artifact Authority: `read_artifact`, `read_claim`, `read_evidence` and
+`read_artifact_set` expose decoded immutable snapshots without exposing the
+private store or a write path. The next resolver must consume only these
+methods, verify a sealed ArtifactSet/Claim/Evidence lineage, and then invoke
+the separately supervised Sego checker. User configuration alone remains
+insufficient to authorize evidence.
+
 ## Owner boundary
 
 ```text

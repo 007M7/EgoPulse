@@ -11,6 +11,13 @@
 the rules that make metadata eligible to reference a content-addressed blob. `agentosd` may host it,
 but Harness, Collaboration, Sego, UI and Python workers receive commands and receipts only.
 
+Consumers that need evidence resolution use the read-only `read_artifact`,
+`read_claim`, `read_evidence` and `read_artifact_set` methods. These methods
+decode immutable owner snapshots and do not expose the SQLCipher store, its
+connection or any write capability. Verification can therefore bind Sego
+inputs to sealed Artifact Authority facts without importing the private store
+or allowing a checker to repair evidence.
+
 ```text
 Harness / collector / supervised runner
              |

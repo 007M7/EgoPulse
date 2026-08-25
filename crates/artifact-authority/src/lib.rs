@@ -236,6 +236,41 @@ where
         self.blobs.put_verified(bytes, expected).map(|_| ())
     }
 
+    pub fn read_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<ArtifactDescriptor>, ArtifactAuthorityFailure> {
+        self.read_snapshot(artifact_id, self.store.artifact(artifact_id)?)
+    }
+
+    pub fn read_claim(&self, claim_id: &str) -> Result<Option<Claim>, ArtifactAuthorityFailure> {
+        self.read_snapshot(claim_id, self.store.claim(claim_id)?)
+    }
+
+    pub fn read_evidence(
+        &self,
+        evidence_id: &str,
+    ) -> Result<Option<Evidence>, ArtifactAuthorityFailure> {
+        self.read_snapshot(evidence_id, self.store.evidence(evidence_id)?)
+    }
+
+    pub fn read_artifact_set(
+        &self,
+        artifact_set_id: &str,
+    ) -> Result<Option<ArtifactSet>, ArtifactAuthorityFailure> {
+        self.read_snapshot(artifact_set_id, self.store.artifact_set(artifact_set_id)?)
+    }
+
+    fn read_snapshot<T: prost::Message + Default>(
+        &self,
+        _id: &str,
+        snapshot: Option<Vec<u8>>,
+    ) -> Result<Option<T>, ArtifactAuthorityFailure> {
+        snapshot
+            .map(|bytes| T::decode(bytes.as_slice()).map_err(ArtifactAuthorityFailure::Decode))
+            .transpose()
+    }
+
     pub fn execute(
         &mut self,
         command: &ArtifactCommand,

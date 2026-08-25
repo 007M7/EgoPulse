@@ -682,6 +682,37 @@ fn immutable_return_intake_is_atomic_and_duplicate_safe() {
 }
 
 #[test]
+fn cross_authority_reads_expose_only_decoded_immutable_snapshots() {
+    let isolated = IsolatedStore::new("artifact-read-boundary");
+    let mut authority = open_authority(&isolated.database_path(), &isolated.blob_root());
+    let manifest = advance_to_sealed_set(&mut authority);
+
+    let artifact_set = authority
+        .read_artifact_set("artifact-set-001")
+        .expect("read sealed ArtifactSet")
+        .expect("ArtifactSet exists");
+    assert_eq!(artifact_set.status, ArtifactSetStatus::Sealed as i32);
+    assert_eq!(artifact_set.canonical_manifest, Some(manifest));
+
+    let claim = authority
+        .read_claim("claim-code-change-001")
+        .expect("read Claim")
+        .expect("Claim exists");
+    assert_eq!(claim.status, ClaimStatus::Proposed as i32);
+    assert_eq!(
+        claim.acceptance_contract_ref,
+        Some(contract_ref("repository_change_acceptance"))
+    );
+
+    let evidence = authority
+        .read_evidence("evidence-command-001")
+        .expect("read Evidence")
+        .expect("Evidence exists");
+    assert_eq!(evidence.status, EvidenceStatus::Recorded as i32);
+    assert_eq!(evidence.claim_id, "claim-code-change-001");
+}
+
+#[test]
 fn blob_must_be_durable_and_verified_before_metadata() {
     let isolated = IsolatedStore::new("artifact-blob-order");
     let database = isolated.database_path();
