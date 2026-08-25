@@ -69,6 +69,12 @@ This does not claim that Authority reference guards or the normal binary's full
 Codex bootstrap are complete. They remain separate obligations so that identity
 configuration cannot be mistaken for evidence validation or Harness configuration.
 
+The first concrete production-side guard is now `LocalUserPolicyResolver`.
+It resolves approval requests from the Adapter Edge's durable projection,
+restricts requested scopes to an explicit reviewed set, and validates the
+Adapter-owned approval receipt on consumption. Task creation and Founder
+Verdict still require their own evidence-backed resolvers.
+
 Until that bootstrap exists, `with_codex_harness` is an explicit production composition API and not
 an implicit unsafe default.
 

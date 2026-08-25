@@ -55,11 +55,15 @@ use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadM
 use tonic::transport::Server;
 
 mod owners;
+mod policy;
 mod projections;
 mod security;
 
 pub use owners::{
     AuthorityCommandPorts, AuthorityPrincipalResolver, DenyAllAuthorityPrincipalResolver,
+};
+pub use policy::{
+    LocalUserPolicyConfigurationError, LocalUserPolicyResolver, LocalUserPolicyResolverConfig,
 };
 pub use projections::{
     AdapterApprovalProjectionSource, ArtifactProjectionSource, CollaborationProjectionSource,

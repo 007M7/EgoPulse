@@ -19,6 +19,14 @@ to conflate:
    configuration does not authorize a task reference, adapter receipt,
    verification conclusion or founder confirmation.
 
+The Policy side now has a concrete first implementation:
+`LocalUserPolicyResolver` reads the pending approval projection and later the
+Adapter-owned approval receipt through provider-neutral `AdapterEdge` methods.
+It permits only explicitly configured scope references and emits an authority
+proof bound to the authenticated local principal, embedded authorization
+contract, request observation and short expiry. A missing or divergent durable
+record is rejected.
+
 The normal `agentosd` entrypoint remains fail-closed until all three decisions,
 the encrypted Authority stores and the explicit Codex workflow configuration
 are assembled as one reviewed bootstrap. This is deliberate: a daemon that
@@ -62,5 +70,7 @@ The agentosd unit suite covers:
   mode.
 
 The remaining bootstrap work is to provide reviewed configuration and actual
-Authority reference guards, then wire the explicit Codex composition into the
-normal binary. No test fixture Allow implementation is reused for that step.
+Task/Verdict reference guards, then wire the explicit Codex composition into
+the normal binary. No test fixture Allow implementation is reused for that
+step; the Policy resolver is not a substitute for the still-missing Task and
+Verdict evidence guards.

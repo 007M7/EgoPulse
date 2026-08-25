@@ -1,6 +1,6 @@
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    CancelExecutionReceipt, DeliveryDisposition, DispatchEnvelope, DispatchReceipt,
-    HarnessObservation, harness_observation,
+    ApprovalDecisionReceipt, CancelExecutionReceipt, DeliveryDisposition, DispatchEnvelope,
+    DispatchReceipt, HarnessObservation, harness_observation,
 };
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -951,6 +951,28 @@ impl AdapterEdge {
             now_seconds,
             &["delivered", "rejected", "delivery_unknown"],
         )
+    }
+
+    /// Reads the provider-neutral approval receipt owned by this Adapter
+    /// edge. The Policy Authority uses this only as delivery evidence; it
+    /// never writes or repairs the Adapter record through this method.
+    pub fn approval_receipt(
+        &self,
+        approval_request_id: &str,
+    ) -> Result<Option<ApprovalDecisionReceipt>, AdapterEdgeError> {
+        let bytes: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT receipt FROM adapter_approvals
+                 WHERE approval_request_id = ?1",
+                [approval_request_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        bytes
+            .map(|value| ApprovalDecisionReceipt::decode(value.as_slice()).map_err(Into::into))
+            .transpose()
     }
 
     pub fn prepare_cancellation(
