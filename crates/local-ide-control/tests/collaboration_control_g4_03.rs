@@ -1303,6 +1303,17 @@ fn single_harness_workflow_builds_run_attempt_lease_and_dispatch_outbox() {
             .len(),
         1
     );
+
+    let retry = start_single_harness_workflow(&mut control, &task, &config)
+        .expect("retry governed single harness workflow idempotently");
+    assert_eq!(retry, result);
+    assert_eq!(
+        control
+            .pending_dispatches(&harness_adapter())
+            .expect("read pending dispatch outbox after retry")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

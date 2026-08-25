@@ -16,7 +16,6 @@ use egopulse_domain_contracts::v01::egopulse::{
 use prost_types::Timestamp;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SingleHarnessWorkConfig {
@@ -412,15 +411,19 @@ fn metadata(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| SingleHarnessWorkError::Clock)?;
     Ok(CommandMetadata {
-        command_id: format!("egopulse-{command_id}-{}", Uuid::now_v7()),
-        idempotency_key: format!("egopulse-{idempotency_key}-{}", Uuid::now_v7()),
+        // A workflow retry must address the same command identity. The
+        // request timestamp is deliberately volatile and is removed by
+        // `seal_request_digest`, but command/idempotency/correlation IDs are
+        // durable protocol identity and therefore must not be regenerated.
+        command_id: format!("egopulse-{command_id}"),
+        idempotency_key: format!("egopulse-{idempotency_key}"),
         idempotency_scope: scope.to_owned(),
         request_digest_sha256: String::new(),
         issued_at: Some(Timestamp {
             seconds: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
             nanos: i32::try_from(duration.subsec_nanos()).unwrap_or_default(),
         }),
-        correlation_id: format!("egopulse-correlation-{}", Uuid::now_v7()),
+        correlation_id: format!("egopulse-correlation-{scope}"),
         causation_id: None,
     })
 }
