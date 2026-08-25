@@ -36,7 +36,7 @@ use egopulse_local_api::{
     },
 };
 use egopulse_local_ide_control::collaboration_control::{
-    HarnessDispatchCycleError, HarnessDispatchRunner,
+    HarnessDispatchCycleError, HarnessDispatchCycleReport, HarnessDispatchRunner,
 };
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
@@ -587,6 +587,12 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use std::{
         fs,
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
     use tonic::transport::Endpoint;
@@ -611,6 +617,46 @@ mod tests {
             },
             root,
         )
+    }
+
+    struct CountingDispatchRunner {
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl HarnessDispatchRunner for CountingDispatchRunner {
+        fn run_once(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(HarnessDispatchCycleReport::default()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_dispatch_worker_polls_and_stops_with_daemon_signal() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = Arc::new(CountingDispatchRunner {
+            runs: Arc::clone(&runs),
+        });
+        let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(run_harness_dispatch_worker(
+            runner,
+            Duration::from_millis(1),
+            stop_receiver,
+        ));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stop_sender.send(true).expect("worker stop signal");
+        worker
+            .await
+            .expect("worker join")
+            .expect("worker should stop cleanly");
+        assert!(runs.load(Ordering::SeqCst) > 0);
     }
 
     #[test]
