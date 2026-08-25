@@ -92,10 +92,27 @@ consumption is fail-closed by default, while the typed production composition
 supplies its Task Authority evidence source. The consumption resolver contract carries the stored verdict scope
 into receipt validation, binding the check to the exact task and revision.
 
+The Verification side now has the owner-backed reference resolver and the
+agentosd `ArtifactAuthorityReferenceSource` adapter. It proves that a request
+references one sealed ArtifactSet with matching manifest and lineage, and that
+all Claim/Evidence/Artifact members remain inside that set. The resolver cannot
+obtain an Artifact store or write handle. The implementation is pushed as
+`df37f09`.
+
+The local G4-06 verification suite currently passes all 13 tests, including
+Sego mapping, stale profile/input binding, checker policy rewrite rejection,
+timeout, crash, and output-limit probes. The existing supervisor and mapper
+are therefore reused rather than duplicated.
+
 `with_codex_harness` and `ProductionBootstrapConfig::build` remain explicit
 production composition APIs and not implicit unsafe defaults. Verification
 remains deny-by-default for unreviewed external references until Sego/checker
-composition is supplied.
+composition is supplied. The remaining integration is not just a path in the
+JSON file: agentosd still has no Local API Verification command port. A real
+Sego production path must therefore add the reviewed Verification vertical
+entry and compose its Artifact admission policy, supervised runner, mapper,
+and Authority commands as one unit. Until that vertical exists,
+`DenyVerificationReferences` stays active.
 
 ## Next unit: Phase 2-03
 
