@@ -450,6 +450,42 @@ fn stale_lifecycle_and_old_epoch_resume_fail_closed() {
 }
 
 #[test]
+fn approval_watch_emits_current_snapshot_when_filter_membership_exits() {
+    let root = TempRoot::new("approval-watch-filter-transition");
+    let mut model = open(&root, "epoch-01");
+    model
+        .apply_adapter_approval(&adapter_input(ApprovalRequestLifecycleKind::Open, 1, 11))
+        .expect("project initial matching approval");
+    let resume_after = model.position().expect("resume position");
+    model
+        .apply_adapter_approval(&adapter_input(
+            ApprovalRequestLifecycleKind::Withdrawn,
+            2,
+            12,
+        ))
+        .expect("project approval leaving filter");
+
+    let batch = model
+        .approval_frames_after_filtered(
+            &resume_after,
+            &ApprovalListFilter {
+                request_lifecycles: vec![ApprovalRequestLifecycleKind::Open as i32],
+                ..ApprovalListFilter::default()
+            },
+            &[],
+            founder_access(),
+        )
+        .expect("read filter transition");
+    assert_eq!(batch.frames.len(), 1);
+    let current = batch.frames[0].snapshot.as_ref().expect("snapshot");
+    assert_eq!(
+        current.request_lifecycle,
+        ApprovalRequestLifecycleKind::Withdrawn as i32
+    );
+    assert_eq!(batch.observed_position.sequence, 2);
+}
+
+#[test]
 fn new_epoch_rebuild_reconstructs_view_from_retained_owner_messages() {
     let root = TempRoot::new("retained-rebuild");
     let mut model = open(&root, "epoch-01");

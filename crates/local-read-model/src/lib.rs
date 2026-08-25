@@ -29,6 +29,7 @@ use prost_types::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -230,6 +231,12 @@ pub struct HistoricalPage<T> {
     pub snapshot_position: ProjectionPosition,
     pub retention_floor: ProjectionPosition,
     pub items: Vec<T>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamBatch<T> {
+    pub observed_position: ProjectionPosition,
+    pub frames: Vec<T>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -619,6 +626,17 @@ impl LocalReadModel {
         after: &ProjectionPosition,
         access: ApprovalViewAccess,
     ) -> Result<Vec<HarnessApprovalViewStreamFrame>, ProjectionFailure> {
+        self.approval_frames_after_filtered(after, &ApprovalListFilter::default(), &[], access)
+            .map(|batch| batch.frames)
+    }
+
+    pub fn approval_frames_after_filtered(
+        &self,
+        after: &ProjectionPosition,
+        filter: &ApprovalListFilter,
+        approval_request_ids: &[String],
+        access: ApprovalViewAccess,
+    ) -> Result<StreamBatch<HarnessApprovalViewStreamFrame>, ProjectionFailure> {
         if !access.can_read {
             return Err(ProjectionFailure::PermissionDenied);
         }
@@ -630,18 +648,49 @@ impl LocalReadModel {
             || after.sequence < floor.sequence
             || health != ProjectionHealth::Ready
         {
-            return Ok(vec![HarnessApprovalViewStreamFrame {
-                kind: StreamFrameKind::ResetRequired as i32,
-                position: Some(current.clone()),
-                snapshot: None,
-                reset_reason_code: Some(if health != ProjectionHealth::Ready {
-                    "PROJECTION_NOT_READY".to_owned()
-                } else if after.epoch == current.epoch && after.sequence < floor.sequence {
-                    "PROJECTION_RETENTION_GAP".to_owned()
-                } else {
-                    "PROJECTION_EPOCH_OR_POSITION_INVALID".to_owned()
-                }),
-            }]);
+            return Ok(StreamBatch {
+                observed_position: current.clone(),
+                frames: vec![HarnessApprovalViewStreamFrame {
+                    kind: StreamFrameKind::ResetRequired as i32,
+                    position: Some(current.clone()),
+                    snapshot: None,
+                    reset_reason_code: Some(if health != ProjectionHealth::Ready {
+                        "PROJECTION_NOT_READY".to_owned()
+                    } else if after.epoch == current.epoch && after.sequence < floor.sequence {
+                        "PROJECTION_RETENTION_GAP".to_owned()
+                    } else {
+                        "PROJECTION_EPOCH_OR_POSITION_INVALID".to_owned()
+                    }),
+                }],
+            });
+        }
+        let mut previous_matches = BTreeMap::new();
+        let mut baseline = self.connection.prepare(
+            "SELECT current.frame
+             FROM harness_approval_frames current
+             WHERE current.sequence<=?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM harness_approval_frames newer
+                 WHERE newer.approval_request_id=current.approval_request_id
+                   AND newer.sequence<=?1 AND newer.sequence>current.sequence
+               )",
+        )?;
+        let baseline_payloads = baseline
+            .query_map([after.sequence as i64], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for payload in baseline_payloads {
+            let mut frame = HarnessApprovalViewStreamFrame::decode(payload.as_slice())?;
+            let Some(view) = frame.snapshot.as_mut() else {
+                return Err(ProjectionFailure::IntegrityFailure);
+            };
+            let approval_request_id = view.approval_request_id.clone();
+            apply_access(view, access, health);
+            previous_matches.insert(
+                approval_request_id.clone(),
+                approval_matches_filter(view, filter)
+                    && (approval_request_ids.is_empty()
+                        || approval_request_ids.contains(&approval_request_id)),
+            );
         }
         let mut statement = self.connection.prepare(
             "SELECT frame FROM harness_approval_frames
@@ -650,16 +699,28 @@ impl LocalReadModel {
         let payloads = statement
             .query_map([after.sequence as i64], |row| row.get::<_, Vec<u8>>(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        payloads
-            .into_iter()
-            .map(|payload| {
-                let mut frame = HarnessApprovalViewStreamFrame::decode(payload.as_slice())?;
-                if let Some(view) = frame.snapshot.as_mut() {
-                    apply_access(view, access, health);
-                }
-                Ok(frame)
-            })
-            .collect()
+        let mut frames = Vec::new();
+        for payload in payloads {
+            let mut frame = HarnessApprovalViewStreamFrame::decode(payload.as_slice())?;
+            let Some(view) = frame.snapshot.as_mut() else {
+                return Err(ProjectionFailure::IntegrityFailure);
+            };
+            let approval_request_id = view.approval_request_id.clone();
+            apply_access(view, access, health);
+            let id_matches = approval_request_ids.is_empty()
+                || approval_request_ids.contains(&approval_request_id);
+            let current_matches = id_matches && approval_matches_filter(view, filter);
+            let previous = previous_matches
+                .insert(approval_request_id, current_matches)
+                .unwrap_or(false);
+            if id_matches && (previous || current_matches) {
+                frames.push(frame);
+            }
+        }
+        Ok(StreamBatch {
+            observed_position: current,
+            frames,
+        })
     }
 
     pub fn position(&self) -> Result<ProjectionPosition, ProjectionFailure> {

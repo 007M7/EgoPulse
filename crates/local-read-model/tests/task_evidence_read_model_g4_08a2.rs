@@ -800,6 +800,37 @@ fn historical_task_snapshot_is_stable_until_retention_floor_advances() {
 }
 
 #[test]
+fn task_watch_emits_current_snapshot_when_filter_membership_exits() {
+    let root = TempRoot::new("task-watch-filter-transition");
+    let mut model = open(&root, "epoch-01");
+    model
+        .apply_task(&task_input(1, TaskStatus::Ready, None, None, None, None))
+        .expect("project initial matching task");
+    let resume_after = model.position().expect("resume position");
+    model
+        .apply_task(&task_input(2, TaskStatus::Active, None, None, None, None))
+        .expect("project task leaving filter");
+
+    let batch = model
+        .task_frames_after_batch(
+            &resume_after,
+            &TaskListFilter {
+                statuses: vec![TaskStatus::Ready as i32],
+            },
+            &[],
+            access(),
+        )
+        .expect("read filter transition");
+    assert_eq!(batch.frames.len(), 1);
+    let current = batch.frames[0].snapshot.as_ref().expect("snapshot");
+    assert_eq!(
+        current.task.as_ref().expect("task").status,
+        TaskStatus::Active as i32
+    );
+    assert_eq!(batch.observed_position.sequence, 2);
+}
+
+#[test]
 fn task_owner_redelivery_after_projector_abort_is_exactly_once_then_acknowledged() {
     let root = TempRoot::new("owner-abort-before-ack");
     let status =

@@ -1194,6 +1194,7 @@ dependencies = [
  "egopulse-domain-contracts",
  "egopulse-local-ipc-platform",
  "egopulse-local-read-model",
+ "futures-util",
  "hmac",
  "hyper-util",
  "prost-types",

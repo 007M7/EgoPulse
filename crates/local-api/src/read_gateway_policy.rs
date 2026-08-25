@@ -10,6 +10,7 @@ pub struct ReadGatewayPolicy {
     default_page_size: u32,
     max_page_size: u32,
     minimum_position_wait_timeout: Duration,
+    watch_heartbeat_interval: Duration,
     cursor_ttl: Duration,
     await_token_ttl: Duration,
     default_await_timeout: Duration,
@@ -38,11 +39,41 @@ impl ReadGatewayPolicy {
         retained_sequences: u64,
         compaction_interval_sequences: u64,
     ) -> Result<Self, ReadGatewayPolicyError> {
+        Self::new_with_watch_heartbeat_interval(
+            version,
+            default_page_size,
+            max_page_size,
+            minimum_position_wait_timeout,
+            Duration::from_secs(15),
+            cursor_ttl,
+            await_token_ttl,
+            default_await_timeout,
+            max_await_timeout,
+            retained_sequences,
+            compaction_interval_sequences,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_watch_heartbeat_interval(
+        version: impl Into<String>,
+        default_page_size: u32,
+        max_page_size: u32,
+        minimum_position_wait_timeout: Duration,
+        watch_heartbeat_interval: Duration,
+        cursor_ttl: Duration,
+        await_token_ttl: Duration,
+        default_await_timeout: Duration,
+        max_await_timeout: Duration,
+        retained_sequences: u64,
+        compaction_interval_sequences: u64,
+    ) -> Result<Self, ReadGatewayPolicyError> {
         let policy = Self {
             version: version.into(),
             default_page_size,
             max_page_size,
             minimum_position_wait_timeout,
+            watch_heartbeat_interval,
             cursor_ttl,
             await_token_ttl,
             default_await_timeout,
@@ -78,6 +109,7 @@ impl ReadGatewayPolicy {
             || self.default_page_size == 0
             || self.max_page_size < self.default_page_size
             || self.minimum_position_wait_timeout.is_zero()
+            || self.watch_heartbeat_interval.is_zero()
             || self.cursor_ttl.is_zero()
             || self.await_token_ttl.is_zero()
             || self.default_await_timeout.is_zero()
@@ -110,6 +142,11 @@ impl ReadGatewayPolicy {
     #[must_use]
     pub const fn minimum_position_wait_timeout(&self) -> Duration {
         self.minimum_position_wait_timeout
+    }
+
+    #[must_use]
+    pub const fn watch_heartbeat_interval(&self) -> Duration {
+        self.watch_heartbeat_interval
     }
 
     #[must_use]
@@ -202,6 +239,7 @@ mod tests {
             policy.minimum_position_wait_timeout(),
             Duration::from_secs(5)
         );
+        assert_eq!(policy.watch_heartbeat_interval(), Duration::from_secs(15));
         assert_eq!(policy.cursor_ttl(), Duration::from_secs(1_800));
         assert_eq!(policy.await_token_ttl(), Duration::from_secs(300));
         assert_eq!(policy.effective_await_timeout(0), Duration::from_secs(5));

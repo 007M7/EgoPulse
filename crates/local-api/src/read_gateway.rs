@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use egopulse_domain_contracts::{
     profiles::{
@@ -8,14 +12,17 @@ use egopulse_domain_contracts::{
         common::v1::ContractReference,
         harness::v1::ApprovalRequestLifecycleKind,
         localapi::v1::{
-            ClientRequestMetadata, GetEvidenceGraphRequest, GetEvidenceGraphResponse,
-            GetHarnessApprovalViewRequest, GetHarnessApprovalViewResponse,
-            GetProjectionStatusRequest, GetProjectionStatusResponse, GetTaskViewRequest,
-            GetTaskViewResponse, HarnessApprovalView, ListHarnessApprovalViewsRequest,
+            AwaitProjectionRequest, AwaitProjectionResponse, ClientRequestMetadata,
+            GetEvidenceGraphRequest, GetEvidenceGraphResponse, GetHarnessApprovalViewRequest,
+            GetHarnessApprovalViewResponse, GetProjectionStatusRequest,
+            GetProjectionStatusResponse, GetTaskViewRequest, GetTaskViewResponse,
+            HarnessApprovalView, HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest,
             ListHarnessApprovalViewsResponse, ListTaskViewsRequest, ListTaskViewsResponse,
             LocalApiError, LocalApiErrorCode, ProjectionHealth, ProjectionMetadata,
-            ProjectionPosition, TaskView, get_evidence_graph_response,
-            get_harness_approval_view_response, get_task_view_response,
+            ProjectionPosition, StreamFrameKind, TaskView, TaskViewStreamFrame,
+            WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, await_projection_response,
+            get_evidence_graph_response, get_harness_approval_view_response,
+            get_task_view_response,
         },
         policy::v1::HarnessApprovalDecisionStateKind,
         task::v1::TaskStatus,
@@ -27,7 +34,7 @@ use egopulse_local_read_model::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::time::Instant;
+use tokio::{sync::watch, time::Instant};
 use uuid::Uuid;
 
 use crate::{
@@ -37,8 +44,8 @@ use crate::{
         ReadModelStatus,
     },
     read_tokens::{
-        CursorAnchor, CursorCollection, CursorExpectation, CursorIssue, CursorSort, ReadTokenCodec,
-        ReadTokenError, ReadTokenScope, VerifiedCursor,
+        AwaitTarget, CursorAnchor, CursorCollection, CursorExpectation, CursorIssue, CursorSort,
+        ReadTokenCodec, ReadTokenError, ReadTokenScope, VerifiedCursor,
     },
     session::{AuthenticatedSession, SessionAuthenticationFailure, SessionRegistry},
 };
@@ -53,6 +60,9 @@ const RPC_GET_APPROVAL: &str = "LocalReadModelService/GetHarnessApprovalView";
 const RPC_GET_STATUS: &str = "LocalReadModelService/GetProjectionStatus";
 const RPC_LIST_TASKS: &str = "LocalReadModelService/ListTaskViews";
 const RPC_LIST_APPROVALS: &str = "LocalReadModelService/ListHarnessApprovalViews";
+const RPC_WATCH_TASKS: &str = "LocalReadModelService/WatchTaskViews";
+const RPC_WATCH_APPROVALS: &str = "LocalReadModelService/WatchHarnessApprovalViews";
+const RPC_AWAIT: &str = "LocalReadModelService/AwaitProjection";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectionGateFailureKind {
@@ -762,6 +772,325 @@ impl ReadGatewayApplication {
         }
     }
 
+    pub async fn await_projection(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: AwaitProjectionRequest,
+    ) -> AwaitProjectionResponse {
+        let correlation_id = correlation_id(request.client.as_ref());
+        let context = match self.authorize(peer, request.client.as_ref(), RPC_AWAIT) {
+            Ok(value) => value,
+            Err(failure) => return await_error(failure.into_error(correlation_id)),
+        };
+        let scope = match ReadTokenScope::from_session(&context.session) {
+            Ok(value) => value,
+            Err(error) => return await_error(token_error(error, correlation_id)),
+        };
+        let token = match request.await_token.as_ref() {
+            Some(value) => value,
+            None => {
+                return await_error(api_error(
+                    LocalApiErrorCode::InvalidArgument,
+                    "await_token_missing",
+                    false,
+                    Some("RETRY_COMMAND"),
+                    None,
+                    correlation_id,
+                ));
+            }
+        };
+        let verified = match self.token_codec.verify_await_token(token, &scope) {
+            Ok(value) => value,
+            Err(error) => return await_error(await_token_error(error, correlation_id)),
+        };
+        let mut commits = self.minimum_gate.subscribe();
+        let deadline = Instant::now()
+            + self
+                .token_codec
+                .policy()
+                .effective_await_timeout(request.timeout_milliseconds);
+        let mut final_check = false;
+        loop {
+            let status = match self.reader.status().await {
+                Ok(value) => value,
+                Err(error) => return await_error(read_error(error, correlation_id.clone())),
+            };
+            if let Err(failure) = evaluate_status(&status, None) {
+                return await_error(gate_error(failure, correlation_id.clone()));
+            }
+            let projected = match self
+                .reader
+                .has_projected_source(verified.required_source_revision.clone())
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => return await_error(read_error(error, correlation_id.clone())),
+            };
+            if projected {
+                return match verified.target {
+                    AwaitTarget::Task { task_id } => match self
+                        .reader
+                        .get_task_view(task_id, task_access(&context.session.permission_codes))
+                        .await
+                    {
+                        Ok(Some(view)) => AwaitProjectionResponse {
+                            outcome: Some(await_projection_response::Outcome::View(view)),
+                        },
+                        Ok(None) => await_error(api_error(
+                            LocalApiErrorCode::NotFound,
+                            "await_task_view_not_found",
+                            false,
+                            Some("RESET_AND_REFETCH"),
+                            Some(status.position),
+                            correlation_id,
+                        )),
+                        Err(error) => await_error(read_error(error, correlation_id)),
+                    },
+                    AwaitTarget::HarnessApproval {
+                        approval_request_id,
+                    } => match self
+                        .reader
+                        .get_harness_approval_view(
+                            approval_request_id,
+                            approval_access(&context.session.permission_codes),
+                        )
+                        .await
+                    {
+                        Ok(Some(view)) => AwaitProjectionResponse {
+                            outcome: Some(await_projection_response::Outcome::ApprovalView(view)),
+                        },
+                        Ok(None) => await_error(api_error(
+                            LocalApiErrorCode::NotFound,
+                            "await_approval_view_not_found",
+                            false,
+                            Some("RESET_AND_REFETCH"),
+                            Some(status.position),
+                            correlation_id,
+                        )),
+                        Err(error) => await_error(read_error(error, correlation_id)),
+                    },
+                };
+            }
+            if final_check {
+                return await_error(api_error(
+                    LocalApiErrorCode::DeadlineExceeded,
+                    "projection_await_deadline_exceeded",
+                    true,
+                    Some("RETRY_AWAIT"),
+                    Some(status.position),
+                    correlation_id,
+                ));
+            }
+            match tokio::time::timeout_at(deadline, commits.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => final_check = true,
+            }
+        }
+    }
+
+    pub async fn open_task_watch(
+        self: &Arc<Self>,
+        peer: PeerConnectionInfo,
+        request: WatchTaskViewsRequest,
+    ) -> Result<TaskWatchSubscription, Box<LocalApiError>> {
+        let correlation_id = correlation_id(request.client.as_ref());
+        let context = self
+            .authorize(Some(&peer), request.client.as_ref(), RPC_WATCH_TASKS)
+            .map_err(|failure| Box::new(failure.into_error(correlation_id.clone())))?;
+        let statuses =
+            normalize_enum_filter::<TaskStatus>(&request.status_filter).map_err(|()| {
+                Box::new(api_error(
+                    LocalApiErrorCode::InvalidArgument,
+                    "invalid_task_status_filter",
+                    false,
+                    None,
+                    None,
+                    correlation_id.clone(),
+                ))
+            })?;
+        let task_ids = normalize_identifiers(&request.task_ids).map_err(|()| {
+            Box::new(api_error(
+                LocalApiErrorCode::InvalidArgument,
+                "invalid_task_watch_ids",
+                false,
+                None,
+                None,
+                correlation_id.clone(),
+            ))
+        })?;
+        let position = match request.resume_after {
+            Some(ref value) => {
+                validate_minimum_position(value)
+                    .map_err(|failure| Box::new(gate_error(failure, correlation_id.clone())))?;
+                value.clone()
+            }
+            None => {
+                self.reader
+                    .status()
+                    .await
+                    .map_err(|error| Box::new(read_error(error, correlation_id.clone())))?
+                    .position
+            }
+        };
+        let mut pending = VecDeque::new();
+        if request.resume_after.is_none() {
+            let status = self
+                .reader
+                .status()
+                .await
+                .map_err(|error| Box::new(read_error(error, correlation_id.clone())))?;
+            evaluate_status(&status, None)
+                .map_err(|failure| Box::new(gate_error(failure, correlation_id.clone())))?;
+            pending.push_back(TaskViewStreamFrame {
+                kind: StreamFrameKind::Heartbeat as i32,
+                position: Some(status.position),
+                snapshot: None,
+                reset_reason_code: None,
+            });
+        }
+        Ok(TaskWatchSubscription {
+            app: Arc::clone(self),
+            peer,
+            metadata: request.client.ok_or_else(|| {
+                Box::new(api_error(
+                    LocalApiErrorCode::InvalidArgument,
+                    "invalid_client_metadata",
+                    false,
+                    None,
+                    None,
+                    correlation_id.clone(),
+                ))
+            })?,
+            filter: TaskListFilter { statuses },
+            task_ids,
+            position,
+            pending,
+            pending_observed: None,
+            notifier: self.minimum_gate.subscribe(),
+            next_heartbeat: Instant::now() + self.token_codec.policy().watch_heartbeat_interval(),
+            heartbeat_interval: self.token_codec.policy().watch_heartbeat_interval(),
+            terminated: false,
+            _authorized_principal_id: context.session.authenticated_principal_id,
+        })
+    }
+
+    pub async fn open_approval_watch(
+        self: &Arc<Self>,
+        peer: PeerConnectionInfo,
+        request: WatchHarnessApprovalViewsRequest,
+    ) -> Result<ApprovalWatchSubscription, Box<LocalApiError>> {
+        let correlation_id = correlation_id(request.client.as_ref());
+        let context = self
+            .authorize(Some(&peer), request.client.as_ref(), RPC_WATCH_APPROVALS)
+            .map_err(|failure| Box::new(failure.into_error(correlation_id.clone())))?;
+        let request_lifecycles = normalize_enum_filter::<ApprovalRequestLifecycleKind>(
+            &request.request_lifecycle_filter,
+        )
+        .map_err(|()| {
+            Box::new(api_error(
+                LocalApiErrorCode::InvalidArgument,
+                "invalid_approval_lifecycle_filter",
+                false,
+                None,
+                None,
+                correlation_id.clone(),
+            ))
+        })?;
+        let decision_states = normalize_enum_filter::<HarnessApprovalDecisionStateKind>(
+            &request.decision_state_filter,
+        )
+        .map_err(|()| {
+            Box::new(api_error(
+                LocalApiErrorCode::InvalidArgument,
+                "invalid_approval_decision_filter",
+                false,
+                None,
+                None,
+                correlation_id.clone(),
+            ))
+        })?;
+        let task_ids = normalize_identifiers(&request.task_ids).map_err(|()| {
+            Box::new(api_error(
+                LocalApiErrorCode::InvalidArgument,
+                "invalid_approval_task_filter",
+                false,
+                None,
+                None,
+                correlation_id.clone(),
+            ))
+        })?;
+        let approval_request_ids =
+            normalize_identifiers(&request.approval_request_ids).map_err(|()| {
+                Box::new(api_error(
+                    LocalApiErrorCode::InvalidArgument,
+                    "invalid_approval_watch_ids",
+                    false,
+                    None,
+                    None,
+                    correlation_id.clone(),
+                ))
+            })?;
+        let position = match request.resume_after {
+            Some(ref value) => {
+                validate_minimum_position(value)
+                    .map_err(|failure| Box::new(gate_error(failure, correlation_id.clone())))?;
+                value.clone()
+            }
+            None => {
+                self.reader
+                    .status()
+                    .await
+                    .map_err(|error| Box::new(read_error(error, correlation_id.clone())))?
+                    .position
+            }
+        };
+        let mut pending = VecDeque::new();
+        if request.resume_after.is_none() {
+            let status = self
+                .reader
+                .status()
+                .await
+                .map_err(|error| Box::new(read_error(error, correlation_id.clone())))?;
+            evaluate_status(&status, None)
+                .map_err(|failure| Box::new(gate_error(failure, correlation_id.clone())))?;
+            pending.push_back(HarnessApprovalViewStreamFrame {
+                kind: StreamFrameKind::Heartbeat as i32,
+                position: Some(status.position),
+                snapshot: None,
+                reset_reason_code: None,
+            });
+        }
+        Ok(ApprovalWatchSubscription {
+            app: Arc::clone(self),
+            peer,
+            metadata: request.client.ok_or_else(|| {
+                Box::new(api_error(
+                    LocalApiErrorCode::InvalidArgument,
+                    "invalid_client_metadata",
+                    false,
+                    None,
+                    None,
+                    correlation_id.clone(),
+                ))
+            })?,
+            filter: ApprovalListFilter {
+                request_lifecycles,
+                decision_states,
+                task_ids,
+                actionable_only: request.actionable_only,
+            },
+            approval_request_ids,
+            position,
+            pending,
+            pending_observed: None,
+            notifier: self.minimum_gate.subscribe(),
+            next_heartbeat: Instant::now() + self.token_codec.policy().watch_heartbeat_interval(),
+            heartbeat_interval: self.token_codec.policy().watch_heartbeat_interval(),
+            terminated: false,
+            _authorized_principal_id: context.session.authenticated_principal_id,
+        })
+    }
+
     fn authorize(
         &self,
         peer: Option<&PeerConnectionInfo>,
@@ -905,6 +1234,174 @@ impl ReadGatewayApplication {
 
 struct ReadRequestContext {
     session: AuthenticatedSession,
+}
+
+pub struct TaskWatchSubscription {
+    app: Arc<ReadGatewayApplication>,
+    peer: PeerConnectionInfo,
+    metadata: ClientRequestMetadata,
+    filter: TaskListFilter,
+    task_ids: Vec<String>,
+    position: ProjectionPosition,
+    pending: VecDeque<TaskViewStreamFrame>,
+    pending_observed: Option<ProjectionPosition>,
+    notifier: watch::Receiver<ProjectionPosition>,
+    next_heartbeat: Instant,
+    heartbeat_interval: Duration,
+    terminated: bool,
+    _authorized_principal_id: String,
+}
+
+impl TaskWatchSubscription {
+    pub async fn next_frame(&mut self) -> Result<Option<TaskViewStreamFrame>, Box<LocalApiError>> {
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                if let Some(position) = frame.position.clone() {
+                    self.position = position;
+                }
+                if self.pending.is_empty()
+                    && let Some(observed) = self.pending_observed.take()
+                {
+                    self.position = observed;
+                }
+                self.next_heartbeat = Instant::now() + self.heartbeat_interval;
+                if frame.kind == StreamFrameKind::ResetRequired as i32 {
+                    self.terminated = true;
+                }
+                return Ok(Some(frame));
+            }
+            if self.terminated {
+                return Ok(None);
+            }
+            let context = self
+                .app
+                .authorize(Some(&self.peer), Some(&self.metadata), RPC_WATCH_TASKS)
+                .map_err(|failure| {
+                    Box::new(failure.into_error(correlation_id(Some(&self.metadata))))
+                })?;
+            let batch = self
+                .app
+                .reader
+                .task_frames_after(
+                    self.position.clone(),
+                    self.filter.clone(),
+                    self.task_ids.clone(),
+                    task_access(&context.session.permission_codes),
+                )
+                .await
+                .map_err(|error| {
+                    Box::new(read_error(error, correlation_id(Some(&self.metadata))))
+                })?;
+            if !batch.frames.is_empty() {
+                self.pending = batch.frames.into();
+                self.pending_observed = Some(batch.observed_position);
+                continue;
+            }
+            self.position = batch.observed_position;
+            if Instant::now() >= self.next_heartbeat {
+                return Ok(Some(TaskViewStreamFrame {
+                    kind: StreamFrameKind::Heartbeat as i32,
+                    position: Some(self.position.clone()),
+                    snapshot: None,
+                    reset_reason_code: None,
+                }));
+            }
+            let mut sleep = Box::pin(tokio::time::sleep_until(self.next_heartbeat));
+            tokio::select! {
+                changed = self.notifier.changed() => {
+                    if changed.is_err() {
+                        return Ok(None);
+                    }
+                }
+                _ = &mut sleep => {}
+            }
+        }
+    }
+}
+
+pub struct ApprovalWatchSubscription {
+    app: Arc<ReadGatewayApplication>,
+    peer: PeerConnectionInfo,
+    metadata: ClientRequestMetadata,
+    filter: ApprovalListFilter,
+    approval_request_ids: Vec<String>,
+    position: ProjectionPosition,
+    pending: VecDeque<HarnessApprovalViewStreamFrame>,
+    pending_observed: Option<ProjectionPosition>,
+    notifier: watch::Receiver<ProjectionPosition>,
+    next_heartbeat: Instant,
+    heartbeat_interval: Duration,
+    terminated: bool,
+    _authorized_principal_id: String,
+}
+
+impl ApprovalWatchSubscription {
+    pub async fn next_frame(
+        &mut self,
+    ) -> Result<Option<HarnessApprovalViewStreamFrame>, Box<LocalApiError>> {
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                if let Some(position) = frame.position.clone() {
+                    self.position = position;
+                }
+                if self.pending.is_empty()
+                    && let Some(observed) = self.pending_observed.take()
+                {
+                    self.position = observed;
+                }
+                self.next_heartbeat = Instant::now() + self.heartbeat_interval;
+                if frame.kind == StreamFrameKind::ResetRequired as i32 {
+                    self.terminated = true;
+                }
+                return Ok(Some(frame));
+            }
+            if self.terminated {
+                return Ok(None);
+            }
+            let context = self
+                .app
+                .authorize(Some(&self.peer), Some(&self.metadata), RPC_WATCH_APPROVALS)
+                .map_err(|failure| {
+                    Box::new(failure.into_error(correlation_id(Some(&self.metadata))))
+                })?;
+            let batch = self
+                .app
+                .reader
+                .approval_frames_after(
+                    self.position.clone(),
+                    self.filter.clone(),
+                    self.approval_request_ids.clone(),
+                    approval_access(&context.session.permission_codes),
+                )
+                .await
+                .map_err(|error| {
+                    Box::new(read_error(error, correlation_id(Some(&self.metadata))))
+                })?;
+            if !batch.frames.is_empty() {
+                self.pending = batch.frames.into();
+                self.pending_observed = Some(batch.observed_position);
+                continue;
+            }
+            self.position = batch.observed_position;
+            if Instant::now() >= self.next_heartbeat {
+                return Ok(Some(HarnessApprovalViewStreamFrame {
+                    kind: StreamFrameKind::Heartbeat as i32,
+                    position: Some(self.position.clone()),
+                    snapshot: None,
+                    reset_reason_code: None,
+                }));
+            }
+            let mut sleep = Box::pin(tokio::time::sleep_until(self.next_heartbeat));
+            tokio::select! {
+                changed = self.notifier.changed() => {
+                    if changed.is_err() {
+                        return Ok(None);
+                    }
+                }
+                _ = &mut sleep => {}
+            }
+        }
+    }
 }
 
 struct DeferredApiError {
@@ -1051,6 +1548,11 @@ impl MinimumPositionGate {
             notifier,
             wait_timeout: policy.minimum_position_wait_timeout(),
         }
+    }
+
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<ProjectionPosition> {
+        self.notifier.subscribe()
     }
 
     pub async fn wait<R>(
@@ -1324,6 +1826,38 @@ fn token_error(error: ReadTokenError, correlation_id: String) -> LocalApiError {
     DeferredApiError::from_token(error).with_correlation(correlation_id)
 }
 
+fn await_token_error(error: ReadTokenError, correlation_id: String) -> LocalApiError {
+    let (code, fingerprint, retryable, action) = match error {
+        ReadTokenError::Expired => (
+            LocalApiErrorCode::CursorExpired,
+            "await_token_expired",
+            false,
+            Some("RETRY_COMMAND"),
+        ),
+        ReadTokenError::InvalidToken
+        | ReadTokenError::ScopeMismatch
+        | ReadTokenError::BindingMismatch => (
+            LocalApiErrorCode::CursorInvalid,
+            "await_token_invalid",
+            false,
+            Some("RETRY_COMMAND"),
+        ),
+        ReadTokenError::ResetRequired => (
+            LocalApiErrorCode::ProjectionResetRequired,
+            "await_token_projection_reset_required",
+            true,
+            Some("RESET_AND_REFETCH"),
+        ),
+        ReadTokenError::InvalidConfiguration | ReadTokenError::InvalidInput => (
+            LocalApiErrorCode::IntegrityFailure,
+            "await_token_configuration_failure",
+            false,
+            Some("RESTART_DAEMON"),
+        ),
+    };
+    api_error(code, fingerprint, retryable, action, None, correlation_id)
+}
+
 fn resolve_verified_cursor(
     cursor: VerifiedCursor,
     minimum: Option<&ProjectionPosition>,
@@ -1474,6 +2008,12 @@ fn api_error(
 fn task_error(error: LocalApiError) -> GetTaskViewResponse {
     GetTaskViewResponse {
         outcome: Some(get_task_view_response::Outcome::Error(error)),
+    }
+}
+
+fn await_error(error: LocalApiError) -> AwaitProjectionResponse {
+    AwaitProjectionResponse {
+        outcome: Some(await_projection_response::Outcome::Error(error)),
     }
 }
 

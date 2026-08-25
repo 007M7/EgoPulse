@@ -348,6 +348,17 @@ impl LocalReadModel {
         task_ids: &[String],
         access: TaskViewAccess,
     ) -> Result<Vec<TaskViewStreamFrame>, ProjectionFailure> {
+        self.task_frames_after_batch(after, filter, task_ids, access)
+            .map(|batch| batch.frames)
+    }
+
+    pub fn task_frames_after_batch(
+        &self,
+        after: &ProjectionPosition,
+        filter: &TaskListFilter,
+        task_ids: &[String],
+        access: TaskViewAccess,
+    ) -> Result<StreamBatch<TaskViewStreamFrame>, ProjectionFailure> {
         if !access.can_read {
             return Err(ProjectionFailure::PermissionDenied);
         }
@@ -359,18 +370,51 @@ impl LocalReadModel {
             || after.sequence < floor.sequence
             || health != ProjectionHealth::Ready
         {
-            return Ok(vec![TaskViewStreamFrame {
-                kind: StreamFrameKind::ResetRequired as i32,
-                position: Some(current.clone()),
-                snapshot: None,
-                reset_reason_code: Some(if health != ProjectionHealth::Ready {
-                    "PROJECTION_NOT_READY".to_owned()
-                } else if after.epoch == current.epoch && after.sequence < floor.sequence {
-                    "PROJECTION_RETENTION_GAP".to_owned()
-                } else {
-                    "PROJECTION_EPOCH_OR_POSITION_INVALID".to_owned()
-                }),
-            }]);
+            return Ok(StreamBatch {
+                observed_position: current.clone(),
+                frames: vec![TaskViewStreamFrame {
+                    kind: StreamFrameKind::ResetRequired as i32,
+                    position: Some(current.clone()),
+                    snapshot: None,
+                    reset_reason_code: Some(if health != ProjectionHealth::Ready {
+                        "PROJECTION_NOT_READY".to_owned()
+                    } else if after.epoch == current.epoch && after.sequence < floor.sequence {
+                        "PROJECTION_RETENTION_GAP".to_owned()
+                    } else {
+                        "PROJECTION_EPOCH_OR_POSITION_INVALID".to_owned()
+                    }),
+                }],
+            });
+        }
+        let mut previous_matches = BTreeMap::new();
+        let mut baseline = self.connection.prepare(
+            "SELECT current.frame
+             FROM task_view_frames current
+             WHERE current.sequence<=?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM task_view_frames newer
+                 WHERE newer.task_id=current.task_id
+                   AND newer.sequence<=?1 AND newer.sequence>current.sequence
+               )",
+        )?;
+        let baseline_payloads = baseline
+            .query_map([after.sequence as i64], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for payload in baseline_payloads {
+            let mut frame = TaskViewStreamFrame::decode(payload.as_slice())?;
+            let Some(view) = frame.snapshot.as_mut() else {
+                return Err(ProjectionFailure::IntegrityFailure);
+            };
+            let Some(task) = view.task.as_ref() else {
+                return Err(ProjectionFailure::IntegrityFailure);
+            };
+            let task_id = task.task_id.clone();
+            apply_task_access(view, access, health);
+            previous_matches.insert(
+                task_id.clone(),
+                task_matches_filter(view, filter)
+                    && (task_ids.is_empty() || task_ids.contains(&task_id)),
+            );
         }
         let mut statement = self.connection.prepare(
             "SELECT frame FROM task_view_frames WHERE sequence>?1 ORDER BY sequence,task_id",
@@ -382,20 +426,26 @@ impl LocalReadModel {
         for payload in payloads {
             let mut frame = TaskViewStreamFrame::decode(payload.as_slice())?;
             let Some(view) = frame.snapshot.as_mut() else {
-                continue;
+                return Err(ProjectionFailure::IntegrityFailure);
             };
             let Some(task) = view.task.as_ref() else {
                 return Err(ProjectionFailure::IntegrityFailure);
             };
-            if (!task_ids.is_empty() && !task_ids.contains(&task.task_id))
-                || (!filter.statuses.is_empty() && !filter.statuses.contains(&task.status))
-            {
-                continue;
-            }
+            let task_id = task.task_id.clone();
             apply_task_access(view, access, health);
-            frames.push(frame);
+            let id_matches = task_ids.is_empty() || task_ids.contains(&task_id);
+            let current_matches = id_matches && task_matches_filter(view, filter);
+            let previous = previous_matches
+                .insert(task_id, current_matches)
+                .unwrap_or(false);
+            if id_matches && (previous || current_matches) {
+                frames.push(frame);
+            }
         }
-        Ok(frames)
+        Ok(StreamBatch {
+            observed_position: current,
+            frames,
+        })
     }
 
     pub fn get_evidence_graph(

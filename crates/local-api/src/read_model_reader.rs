@@ -5,7 +5,7 @@ use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
 };
 use egopulse_local_read_model::{
     ApprovalListFilter, ApprovalViewAccess, EvidenceGraphAccess, HistoricalPage, LocalReadModel,
-    ProjectionFailure, TaskListFilter, TaskViewAccess,
+    ProjectionFailure, StreamBatch, TaskListFilter, TaskViewAccess,
 };
 use thiserror::Error;
 use tokio::sync::{Semaphore, watch};
@@ -34,6 +34,44 @@ pub trait ProjectionStatusReader: Send + Sync + 'static {
 
 #[tonic::async_trait]
 pub trait ReadModelReader: ProjectionStatusReader {
+    async fn task_frames_after(
+        &self,
+        after: ProjectionPosition,
+        filter: TaskListFilter,
+        task_ids: Vec<String>,
+        access: TaskViewAccess,
+    ) -> Result<
+        StreamBatch<egopulse_domain_contracts::v01::egopulse::localapi::v1::TaskViewStreamFrame>,
+        ReadModelAccessError,
+    > {
+        let _ = (after, filter, task_ids, access);
+        Err(ReadModelAccessError::Unavailable)
+    }
+
+    async fn approval_frames_after(
+        &self,
+        after: ProjectionPosition,
+        filter: ApprovalListFilter,
+        approval_request_ids: Vec<String>,
+        access: ApprovalViewAccess,
+    ) -> Result<
+        StreamBatch<
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::HarnessApprovalViewStreamFrame,
+        >,
+        ReadModelAccessError,
+    > {
+        let _ = (after, filter, approval_request_ids, access);
+        Err(ReadModelAccessError::Unavailable)
+    }
+
+    async fn has_projected_source(
+        &self,
+        required: egopulse_domain_contracts::v01::egopulse::localapi::v1::SourceRevision,
+    ) -> Result<bool, ReadModelAccessError> {
+        let _ = required;
+        Err(ReadModelAccessError::Unavailable)
+    }
+
     async fn get_task_view(
         &self,
         task_id: String,
@@ -124,6 +162,46 @@ impl ProjectionStatusReader for BlockingLocalReadModelReader {
 
 #[tonic::async_trait]
 impl ReadModelReader for BlockingLocalReadModelReader {
+    async fn task_frames_after(
+        &self,
+        after: ProjectionPosition,
+        filter: TaskListFilter,
+        task_ids: Vec<String>,
+        access: TaskViewAccess,
+    ) -> Result<
+        StreamBatch<egopulse_domain_contracts::v01::egopulse::localapi::v1::TaskViewStreamFrame>,
+        ReadModelAccessError,
+    > {
+        self.run(move |model| model.task_frames_after_batch(&after, &filter, &task_ids, access))
+            .await
+    }
+
+    async fn approval_frames_after(
+        &self,
+        after: ProjectionPosition,
+        filter: ApprovalListFilter,
+        approval_request_ids: Vec<String>,
+        access: ApprovalViewAccess,
+    ) -> Result<
+        StreamBatch<
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::HarnessApprovalViewStreamFrame,
+        >,
+        ReadModelAccessError,
+    > {
+        self.run(move |model| {
+            model.approval_frames_after_filtered(&after, &filter, &approval_request_ids, access)
+        })
+        .await
+    }
+
+    async fn has_projected_source(
+        &self,
+        required: egopulse_domain_contracts::v01::egopulse::localapi::v1::SourceRevision,
+    ) -> Result<bool, ReadModelAccessError> {
+        self.run(move |model| model.has_projected_source(&required))
+            .await
+    }
+
     async fn get_task_view(
         &self,
         task_id: String,
