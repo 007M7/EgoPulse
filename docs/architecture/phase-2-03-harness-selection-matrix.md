@@ -40,6 +40,11 @@ The zero-API-call executable discovery slice is recorded in
 are discoverable; only Codex currently has an implemented native structured
 probe and contract fixture in EgoPulse.
 
+The follow-up protocol observations are recorded in
+`phase-2-03-protocol-boundary-evidence-2026-08-26.md`. Kimi is currently the
+next candidate for a no-side-effect structured-protocol probe; DSH remains
+held until its profile bootstrap permission failure is isolated.
+
 | Probe row | Pass condition | Failure disposition |
 | --- | --- | --- |
 | Executable/version | Pinned executable is discoverable and reports the expected version | `Unavailable` |
