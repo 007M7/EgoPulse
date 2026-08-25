@@ -36,7 +36,6 @@ class MemoryRecord:
     source_ref: str
     scope_ref: str
     state: MemoryState = "accepted"
-    salience: float = 0.0
 
     def validate(self) -> None:
         if not self.memory_id.strip():
@@ -51,8 +50,6 @@ class MemoryRecord:
             raise RetrievalWorkerError("scope_ref exceeds the worker limit")
         if self.state not in {"accepted", "candidate", "revoked"}:
             raise RetrievalWorkerError("memory state is unknown")
-        if not 0.0 <= self.salience <= 1.0:
-            raise RetrievalWorkerError("salience must be between 0 and 1")
         if digest_text(self.content) != self.content_sha256.lower():
             raise RetrievalWorkerError("memory content digest mismatch")
 
@@ -126,8 +123,11 @@ def retrieve(
         if record.memory_id in seen_ids:
             raise RetrievalWorkerError("duplicate memory_id in input")
         seen_ids.add(record.memory_id)
-        if record.state == "accepted" and record.scope_ref == request.scope_ref:
-            accepted.append(record)
+        if record.state != "accepted":
+            raise RetrievalWorkerError("memory state is not accepted")
+        if record.scope_ref != request.scope_ref:
+            raise RetrievalWorkerError("memory scope does not match the request")
+        accepted.append(record)
 
     document_terms = [_tokens(record.content) for record in accepted]
     document_frequency: dict[str, int] = {}
@@ -149,7 +149,7 @@ def retrieve(
             for term in query_terms
         )
         lexical_score = weighted_matches / query_weight if query_weight else 0.0
-        score = min(1.0, (lexical_score * 0.95) + (record.salience * 0.05))
+        score = lexical_score
         if score >= request.min_score:
             scored.append(
                 RetrievalCandidate(
@@ -169,11 +169,15 @@ def retrieve(
         "candidates": [
             {
                 "memory_id": candidate.memory_id,
-                "score": candidate.score,
+                "source_ref": candidate.source_ref,
                 "content_sha256": candidate.content_sha256,
+                "score": candidate.score,
+                "matched_terms": list(candidate.matched_terms),
             }
             for candidate in candidates
         ],
+        "max_results": request.max_results,
+        "min_score": request.min_score,
         "query_sha256": query_sha256,
         "scope_ref": request.scope_ref,
     }

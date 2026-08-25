@@ -28,12 +28,15 @@ and it has no database handle.
 `workers/memory-rag` implements a dependency-free lexical baseline:
 
 - verifies every supplied record's content SHA-256 before use;
-- accepts only records already marked `accepted` and in the requested scope;
+- fails the entire request if any supplied record is not `accepted` or is
+  outside the requested scope, so an upstream snapshot error is not hidden;
 - returns memory IDs, source references, content digests, scores and matched
   terms, not authoritative content ownership;
-- uses deterministic tokenization, smoothed IDF weighting, salience as a small
-  bounded tie-break signal, and memory ID tie-breaking;
-- emits a deterministic evidence digest for the request and ranked result;
+- uses deterministic tokenization, smoothed IDF weighting and memory ID
+  tie-breaking, with no undeclared salience or model-owned ranking input;
+- emits a deterministic evidence digest that binds request limits and every
+  returned candidate's identity, source reference, content digest, score and
+  matched terms;
 - rejects malformed, duplicated, tampered, over-sized or out-of-scope input.
 
 The current candidate enforces the initial proposed-boundary limits in code:
@@ -73,9 +76,10 @@ the Memory Authority and retrieval contract are frozen.
 
 ## Acceptance evidence
 
-The local tests cover normal ranking, scope/state filtering, digest mismatch,
-duplicate identity, invalid request limits and deterministic tie/evidence
-replay. The first deterministic golden vector is pinned in
+The local tests cover normal ranking, scope/state rejection, digest mismatch,
+duplicate identity, routing/query/content/record/result limits, non-searchable
+queries and deterministic tie/evidence replay. The first deterministic golden
+vector is pinned in
 `workers/memory-rag/tests/test_retrieval.py`; it fixes the ordered candidate
 identity, matched terms, query digest and evidence digest for the
 `lexical-overlap-v0` baseline. This is algorithm regression evidence only. It

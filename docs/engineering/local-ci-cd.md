@@ -42,7 +42,7 @@ Run the complete local reproduction gate only when working offline, diagnosing a
 pnpm run ci:local
 ```
 
-Bootstrap a new checkout once with `pnpm install --frozen-lockfile`. The recurring gate verifies Git diff integrity, Node manifest/lock consistency without reinstalling an already materialized dependency tree, repository boundaries, contracts, generated code, TypeScript, the Desktop frontend, the complete Rust workspace, and both Python projects. Missing or stale installed packages fail closed in the TypeScript or Desktop steps. Machine-readable evidence is written beneath `.local-ci/evidence/` and is intentionally ignored by Git.
+Bootstrap a new checkout once with `pnpm install --frozen-lockfile`. The recurring gate verifies Git diff integrity, Node manifest/lock consistency without reinstalling an already materialized dependency tree, repository boundaries, contracts, generated code, TypeScript, the Desktop frontend, the complete Rust workspace, and all three Python projects, including the Memory/RAG Worker. Missing or stale installed packages fail closed in the TypeScript or Desktop steps. Machine-readable evidence is written beneath `.local-ci/evidence/` and is intentionally ignored by Git.
 
 Why keep a tracked fast hook: it catches contract and boundary failures before a push without duplicating the long remote Rust job. Git hooks can still be bypassed with `--no-verify`; GitHub required checks remain the authoritative control.
 

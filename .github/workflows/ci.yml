@@ -55,6 +55,8 @@ jobs:
       - run: uv run --project workers/foundation-probe --frozen pytest workers/foundation-probe --rootdir workers/foundation-probe
       - run: uv sync --project workers/contract-bindings --frozen
       - run: uv run --project workers/contract-bindings --frozen pytest workers/contract-bindings --rootdir workers/contract-bindings
+      - run: uv sync --project workers/memory-rag --frozen
+      - run: uv run --project workers/memory-rag --frozen pytest workers/memory-rag --rootdir workers/memory-rag
 
   windows-cd:
     name: windows-cd

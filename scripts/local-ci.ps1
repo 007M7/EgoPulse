@@ -118,6 +118,11 @@ try {
         Invoke-External uv run --project workers/contract-bindings --frozen pytest workers/contract-bindings --rootdir workers/contract-bindings
     }
 
+    Invoke-GateStep 'python-memory-rag' {
+        Invoke-External uv sync --project workers/memory-rag --frozen
+        Invoke-External uv run --project workers/memory-rag --frozen pytest workers/memory-rag --rootdir workers/memory-rag
+    }
+
     Write-Evidence -Status 'passed' -Failure $null
     Write-Output "local_ci=passed commit=$head dirty_at_start=$dirty"
 } catch {
