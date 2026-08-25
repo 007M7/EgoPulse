@@ -1043,11 +1043,27 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 name = "egopulse-agentosd"
 version = "0.1.0"
 dependencies = [
+ "egopulse-client-kernel",
  "egopulse-cognition-runtime",
+ "egopulse-domain-contracts",
+ "egopulse-founder-verdict-authority",
+ "egopulse-local-api",
  "egopulse-local-ide-control",
+ "egopulse-local-ipc-platform",
+ "egopulse-local-read-model",
+ "egopulse-policy-decision-authority",
  "egopulse-process-supervision",
+ "hex",
+ "hyper-util",
+ "prost",
+ "prost-types",
+ "sha2",
+ "thiserror 2.0.20",
  "tokio",
+ "tonic",
+ "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
