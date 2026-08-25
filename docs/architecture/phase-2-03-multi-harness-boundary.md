@@ -1,5 +1,12 @@
 # Phase 2-03 multi-Harness / multi-model boundary
 
+## Status
+
+The provider-neutral candidate boundary and G4-09 pre-driver capability gate
+are implemented and locally verified. Codex remains the only production
+Harness. Kimi and DeepSeek remain explicitly held candidates until their
+native lifecycle, approval and recovery evidence satisfies the same contract.
+
 ## Current decision
 
 Phase 2-03 starts with a capability-and-evidence boundary, not with a second
@@ -158,3 +165,17 @@ The same test module now proves that the unverified dispatch, event, approval,
 cancellation and reconciliation surfaces all return `CapabilityMismatch` with
 `ProvenNotSent`. This is a candidate safety invariant, not evidence of
 second-Harness support.
+
+## Phase 2-03 exit disposition
+
+Phase 2-03 closes its provider-neutral boundary and candidate-probe slice, but
+does not close second-Harness admission. The authoritative evidence is:
+
+- G4-09 capability-binding and shared Probe Gate tests;
+- the Kimi no-prompt ACP probe recorded as `authentication_required`;
+- DSH isolated ACP prompt/cancel evidence with native recovery explicitly held;
+- Codex remaining the sole active production Harness.
+
+The next implementation slice is Phase 2-04/2-06 Memory/RAG. Its pure Worker
+and generic framing work may proceed, while cross-language contract and daemon
+wiring remain pending Founder approval.
