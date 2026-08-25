@@ -253,6 +253,24 @@ fn immutable_verification_artifact_commit_is_atomic_and_duplicate_safe() {
             .canonical_payload
             .is_some()
     );
+    assert_eq!(
+        fixture
+            .authority
+            .verification_request(&fixture.request.verification_request_id)
+            .expect("read request snapshot")
+            .expect("request exists")
+            .status,
+        VerificationStatus::Completed as i32
+    );
+    assert_eq!(
+        fixture
+            .authority
+            .verification_run(&fixture.run_id)
+            .expect("read run snapshot")
+            .expect("run exists")
+            .status,
+        VerificationStatus::Completed as i32
+    );
 
     let replay = fixture
         .authority

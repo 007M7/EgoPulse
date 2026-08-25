@@ -349,6 +349,32 @@ where
             .transpose()
     }
 
+    /// Reads a committed Verification request through the owner boundary.
+    /// Callers receive a decoded snapshot and never obtain the private store
+    /// or a mutation handle.
+    pub fn verification_request(
+        &self,
+        verification_request_id: &str,
+    ) -> Result<Option<VerificationRequest>, VerificationAuthorityFailure> {
+        self.store
+            .request(verification_request_id)?
+            .map(|bytes| VerificationRequest::decode(bytes.as_slice()).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Reads a committed Verification run through the owner boundary. This is
+    /// used by the execution coordinator to resume after a crash without
+    /// reconstructing state from client payloads.
+    pub fn verification_run(
+        &self,
+        verification_run_id: &str,
+    ) -> Result<Option<VerificationRun>, VerificationAuthorityFailure> {
+        self.store
+            .run(verification_run_id)?
+            .map(|bytes| VerificationRun::decode(bytes.as_slice()).map_err(Into::into))
+            .transpose()
+    }
+
     pub fn drain_projection_outbox(
         &self,
     ) -> Result<Vec<VerificationProjectionMessage>, VerificationAuthorityFailure> {

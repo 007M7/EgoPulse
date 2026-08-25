@@ -150,3 +150,8 @@ a Task, Harness, Model, or client principal into this path. The helper is the
 attestation primitive; production configuration still has to explicitly supply
 the reviewed profile candidate and the next vertical must wire this primitive
 into its startup/recovery policy before declaring checker execution available.
+
+Verification Authority also exposes decoded request and run snapshots as
+read-only owner APIs. The execution coordinator uses these snapshots to resume
+from the last durable revision after a crash; it does not reconstruct
+revisions from a Task payload or a client-side cache.
