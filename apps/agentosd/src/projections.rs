@@ -249,15 +249,20 @@ where
 }
 
 pub struct VerificationProjectionSource<C> {
-    owner: Mutex<egopulse_verification_authority::VerificationAuthority<C>>,
+    owner: Arc<Mutex<egopulse_verification_authority::VerificationAuthority<C>>>,
 }
 
 impl<C> VerificationProjectionSource<C> {
     #[must_use]
     pub fn new(owner: egopulse_verification_authority::VerificationAuthority<C>) -> Self {
-        Self {
-            owner: Mutex::new(owner),
-        }
+        Self::new_shared(Arc::new(Mutex::new(owner)))
+    }
+
+    #[must_use]
+    pub fn new_shared(
+        owner: Arc<Mutex<egopulse_verification_authority::VerificationAuthority<C>>>,
+    ) -> Self {
+        Self { owner }
     }
 }
 

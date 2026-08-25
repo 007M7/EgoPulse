@@ -112,7 +112,7 @@ pub struct VerificationAuthorityArtifactSource<
 > where
     C: VerificationClock,
 {
-    authority: Mutex<VerificationAuthority<C>>,
+    authority: Arc<Mutex<VerificationAuthority<C>>>,
 }
 
 impl<C> VerificationAuthorityArtifactSource<C>
@@ -121,9 +121,12 @@ where
 {
     #[must_use]
     pub fn new(authority: VerificationAuthority<C>) -> Self {
-        Self {
-            authority: Mutex::new(authority),
-        }
+        Self::new_shared(Arc::new(Mutex::new(authority)))
+    }
+
+    #[must_use]
+    pub fn new_shared(authority: Arc<Mutex<VerificationAuthority<C>>>) -> Self {
+        Self { authority }
     }
 }
 
