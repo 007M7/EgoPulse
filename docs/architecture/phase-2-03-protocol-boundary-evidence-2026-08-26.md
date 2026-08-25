@@ -99,6 +99,19 @@ permission routing, cancellation or restart reconciliation. Those rows remain
 held until a keyless replay fixture or an explicitly authenticated local run
 can exercise them without changing the user environment.
 
+The keyless replay lifecycle probe has now passed with the repository's
+`multi-turn` fixture:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/probe-dsh-acp-replay-windows.ps1
+```
+
+It drove `initialize`, `session/new`, and two `session/prompt` calls over the
+real compiled ACP subprocess. The observed committed updates were `ONE` and
+`TWO`, each followed by `stopReason=end_turn`; stdout contained only JSON-RPC,
+stderr was empty, and no model/API call was made. This proves a replayable
+native prompt/committed-output boundary, but not live-provider semantics.
+
 ## Candidate decision at this point
 
 Kimi is the next candidate for an authenticated lifecycle probe; DSH's

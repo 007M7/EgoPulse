@@ -39,11 +39,12 @@ independent recovery evidence.
 - Isolated `DSH_HOME` CLI profile dump/help passed in read-only mode.
 - Compiled ACP composition returned successful `initialize` and `session/new`
   responses over stdio without a prompt or API call.
+- Keyless `multi-turn` replay returned two committed assistant updates and two
+  `end_turn` prompt responses over the same compiled ACP subprocess.
 - Adapter tests: 6/6 passed.
 - DSH adapter Clippy with warnings denied: passed.
 
-The next DSH gate is a keyless replay lifecycle fixture for `session/prompt`,
-committed assistant output, permission request handling and cancellation. A
-live model run is not required if replay can provide independently inspectable
-native observations; otherwise an explicitly authenticated local run is
-needed.
+The next DSH gate is a keyless replay fixture for permission request handling
+and cancellation, followed by restart/reconciliation evidence. A live model
+run is not required if replay can provide independently inspectable native
+observations; otherwise an explicitly authenticated local run is needed.
