@@ -35,6 +35,11 @@ Each candidate receives the same provider-neutral probe request and the same
 fixture expectations. The probe must record an evidence reference for every
 row; a missing or self-reported row is not treated as support.
 
+The zero-API-call executable discovery slice is recorded in
+`phase-2-03-windows-probe-2026-08-26.md`. All three local command entry points
+are discoverable; only Codex currently has an implemented native structured
+probe and contract fixture in EgoPulse.
+
 | Probe row | Pass condition | Failure disposition |
 | --- | --- | --- |
 | Executable/version | Pinned executable is discoverable and reports the expected version | `Unavailable` |
