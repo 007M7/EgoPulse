@@ -12,6 +12,7 @@ use tokio::{
     net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions},
     sync::mpsc,
 };
+use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::server::Connected;
 use uuid::Uuid;
@@ -114,7 +115,7 @@ impl LocalIpcListener {
     #[must_use]
     pub fn into_incoming(mut self) -> LocalIpcIncoming {
         let (sender, receiver) = mpsc::channel(INCOMING_CAPACITY);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 let accepted = self.accept().await;
                 let failed = accepted.is_err();
@@ -123,11 +124,33 @@ impl LocalIpcListener {
                 }
             }
         });
-        ReceiverStream::new(receiver)
+        LocalIpcIncoming {
+            receiver: ReceiverStream::new(receiver),
+            abort_handle: task.abort_handle(),
+        }
     }
 }
 
-pub type LocalIpcIncoming = ReceiverStream<io::Result<LocalIpcConnection>>;
+pub struct LocalIpcIncoming {
+    receiver: ReceiverStream<io::Result<LocalIpcConnection>>,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+impl Stream for LocalIpcIncoming {
+    type Item = io::Result<LocalIpcConnection>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(cx)
+    }
+}
+
+impl Unpin for LocalIpcIncoming {}
+
+impl Drop for LocalIpcIncoming {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+    }
+}
 
 pub struct LocalIpcConnection {
     io: NamedPipeServer,

@@ -1043,16 +1043,19 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 name = "egopulse-agentosd"
 version = "0.1.0"
 dependencies = [
+ "egopulse-artifact-authority",
  "egopulse-client-kernel",
  "egopulse-cognition-runtime",
  "egopulse-domain-contracts",
  "egopulse-founder-verdict-authority",
+ "egopulse-harness-adapter",
  "egopulse-local-api",
  "egopulse-local-ide-control",
  "egopulse-local-ipc-platform",
  "egopulse-local-read-model",
  "egopulse-policy-decision-authority",
  "egopulse-process-supervision",
+ "egopulse-verification-authority",
  "hex",
  "hyper-util",
  "prost",

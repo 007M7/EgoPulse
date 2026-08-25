@@ -295,8 +295,15 @@ impl OwnerProjectionSource for AuthorityCommandPorts {
         Ok(task.chain(policy).chain(verdict).collect())
     }
 
-    fn acknowledge(&self, message: &PendingOwnerProjection) -> Result<(), ProjectionSourceFailure> {
+    fn acknowledge(
+        &self,
+        message: &PendingOwnerProjection,
+    ) -> Result<bool, ProjectionSourceFailure> {
         let acknowledged = match message {
+            PendingOwnerProjection::Collaboration(_)
+            | PendingOwnerProjection::AdapterApproval(_)
+            | PendingOwnerProjection::Artifact(_)
+            | PendingOwnerProjection::Verification(_) => return Ok(false),
             PendingOwnerProjection::Task(message) => self
                 .task
                 .lock()
@@ -316,11 +323,7 @@ impl OwnerProjectionSource for AuthorityCommandPorts {
                 .acknowledge_projection(&message.message_id, &message.payload_digest_sha256)
                 .map_err(|_| ProjectionSourceFailure::Verdict)?,
         };
-        if acknowledged {
-            Ok(())
-        } else {
-            Err(ProjectionSourceFailure::Acknowledgement)
-        }
+        if acknowledged { Ok(true) } else { Ok(false) }
     }
 }
 

@@ -46,7 +46,9 @@ pub use owners::{
     AuthorityCommandPorts, AuthorityPrincipalResolver, DenyAllAuthorityPrincipalResolver,
 };
 pub use projections::{
-    OwnerProjectionSource, PendingOwnerProjection, ProjectionPump, ProjectionPumpFailure,
+    AdapterApprovalProjectionSource, ArtifactProjectionSource, CollaborationProjectionSource,
+    CompositeOwnerProjectionSource, OwnerProjectionSource, PendingOwnerProjection, ProjectionPump,
+    ProjectionPumpFailure, VerificationProjectionSource,
 };
 
 #[derive(Clone, Debug)]
@@ -60,6 +62,42 @@ pub struct DaemonConfig {
 }
 
 impl DaemonConfig {
+    pub fn from_environment() -> Result<Self, DaemonBootstrapError> {
+        let read_model_key = parse_secret_key(
+            "EGOPULSE_READ_MODEL_KEY_HEX",
+            std::env::var("EGOPULSE_READ_MODEL_KEY_HEX")
+                .map_err(|_| DaemonBootstrapError::MissingSecret("read model key"))?,
+        )?;
+        let token_mac_key = parse_secret_key(
+            "EGOPULSE_TOKEN_MAC_KEY_HEX",
+            std::env::var("EGOPULSE_TOKEN_MAC_KEY_HEX")
+                .map_err(|_| DaemonBootstrapError::MissingSecret("token MAC key"))?,
+        )?;
+        let session_ttl = match std::env::var("EGOPULSE_SESSION_TTL_SECONDS") {
+            Ok(value) => value
+                .parse::<u64>()
+                .map(Duration::from_secs)
+                .map_err(|_| DaemonBootstrapError::InvalidSetting("session TTL"))?,
+            Err(std::env::VarError::NotPresent) => Duration::from_secs(60 * 60),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(DaemonBootstrapError::InvalidSetting("session TTL"));
+            }
+        };
+
+        Ok(Self {
+            instance: std::env::var("EGOPULSE_IPC_INSTANCE")
+                .unwrap_or_else(|_| "default".to_owned()),
+            read_model_database_path: std::env::var_os("EGOPULSE_READ_MODEL_DB")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("egopulse-data/read-model.db")),
+            read_model_epoch: std::env::var("EGOPULSE_READ_MODEL_EPOCH")
+                .unwrap_or_else(|_| "local-default".to_owned()),
+            read_model_key,
+            token_mac_key,
+            session_ttl,
+        })
+    }
+
     pub fn validate(&self) -> Result<(), DaemonCompositionError> {
         if self.instance.trim().is_empty() || self.instance.len() > 80 {
             return Err(DaemonCompositionError::InvalidConfiguration("ipc instance"));
@@ -91,6 +129,26 @@ impl DaemonConfig {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum DaemonBootstrapError {
+    #[error("required secret is missing: {0}")]
+    MissingSecret(&'static str),
+    #[error("secret is not a non-zero 32-byte hex value: {0}")]
+    InvalidSecret(&'static str),
+    #[error("bootstrap setting is invalid: {0}")]
+    InvalidSetting(&'static str),
+}
+
+fn parse_secret_key(name: &'static str, value: String) -> Result<[u8; 32], DaemonBootstrapError> {
+    let bytes = hex::decode(value).map_err(|_| DaemonBootstrapError::InvalidSecret(name))?;
+    let key = <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| DaemonBootstrapError::InvalidSecret(name))?;
+    if key.iter().all(|byte| *byte == 0) {
+        return Err(DaemonBootstrapError::InvalidSecret(name));
+    }
+    Ok(key)
+}
+
 pub struct DaemonProviders {
     pub principal_resolver: Arc<dyn TrustedPrincipalResolver>,
     pub session_clock: Arc<dyn SessionClock>,
@@ -99,6 +157,17 @@ pub struct DaemonProviders {
     pub policy_port: Arc<dyn PolicyCommandPort>,
     pub verdict_port: Arc<dyn VerdictCommandPort>,
     pub projection_source: Option<Arc<dyn OwnerProjectionSource>>,
+}
+
+pub struct AuthorityCompositionInputs {
+    pub task: egopulse_cognition_runtime::task_authority::TaskAuthority,
+    pub policy: egopulse_policy_decision_authority::PolicyDecisionAuthority,
+    pub verdict: egopulse_founder_verdict_authority::FounderVerdictAuthority,
+    pub principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
+    pub session_principal_resolver: Arc<dyn TrustedPrincipalResolver>,
+    pub session_clock: Arc<dyn SessionClock>,
+    pub session_audit: Arc<dyn SessionAuditSink>,
+    pub additional_projection_sources: Vec<Arc<dyn OwnerProjectionSource>>,
 }
 
 impl DaemonProviders {
@@ -131,21 +200,56 @@ impl DaemonProviders {
         session_clock: Arc<dyn SessionClock>,
         session_audit: Arc<dyn SessionAuditSink>,
     ) -> Self {
-        let ports = Arc::new(AuthorityCommandPorts::new(
+        Self::from_authority_inputs(AuthorityCompositionInputs {
             task,
             policy,
             verdict,
             principal_resolver,
-        ));
-        Self {
-            principal_resolver: session_principal_resolver,
+            session_principal_resolver,
             session_clock,
             session_audit,
+            additional_projection_sources: Vec::new(),
+        })
+    }
+
+    /// Builds the command ports and joins any additional typed owner feeds
+    /// into the same projector. Additional feeds are still independently
+    /// owned; this method only gives the daemon a polling/ack boundary.
+    #[must_use]
+    pub fn from_authority_inputs(inputs: AuthorityCompositionInputs) -> Self {
+        let ports = Arc::new(AuthorityCommandPorts::new(
+            inputs.task,
+            inputs.policy,
+            inputs.verdict,
+            inputs.principal_resolver,
+        ));
+        let mut projection_sources =
+            Vec::with_capacity(1 + inputs.additional_projection_sources.len());
+        projection_sources.push(Arc::clone(&ports) as Arc<dyn OwnerProjectionSource>);
+        projection_sources.extend(inputs.additional_projection_sources);
+        Self {
+            principal_resolver: inputs.session_principal_resolver,
+            session_clock: inputs.session_clock,
+            session_audit: inputs.session_audit,
             task_port: Arc::clone(&ports) as Arc<dyn TaskCommandPort>,
             policy_port: Arc::clone(&ports) as Arc<dyn PolicyCommandPort>,
             verdict_port: Arc::clone(&ports) as Arc<dyn VerdictCommandPort>,
-            projection_source: Some(Arc::clone(&ports) as Arc<dyn OwnerProjectionSource>),
+            projection_source: Some(Arc::new(CompositeOwnerProjectionSource::new(
+                projection_sources,
+            ))),
         }
+    }
+}
+
+pub trait DaemonProviderFactory: Send + Sync {
+    fn build(&self) -> DaemonProviders;
+}
+
+pub struct FailClosedProviderFactory;
+
+impl DaemonProviderFactory for FailClosedProviderFactory {
+    fn build(&self) -> DaemonProviders {
+        DaemonProviders::fail_closed()
     }
 }
 
@@ -434,6 +538,40 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn composition_can_restart_after_the_first_instance_is_dropped() {
+        let instance = format!("c4-restart-{}", Uuid::now_v7());
+        let (config, root) = config(&instance);
+        let daemon = DaemonComposition::build(config.clone(), DaemonProviders::fail_closed())
+            .expect("first daemon");
+        drop(daemon);
+        let daemon = DaemonComposition::build(config, DaemonProviders::fail_closed())
+            .expect("daemon should restart after drop");
+        drop(daemon);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn serve_can_be_cancelled_and_then_rebound() {
+        let instance = format!("c4-cancel-{}", Uuid::now_v7());
+        let (config, root) = config(&instance);
+        let daemon = DaemonComposition::build(config.clone(), DaemonProviders::fail_closed())
+            .expect("daemon");
+        let server = tokio::spawn(async move {
+            daemon
+                .serve(std::future::pending::<()>())
+                .await
+                .expect("daemon server");
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        server.abort();
+        let _ = server.await;
+        let daemon = DaemonComposition::build(config, DaemonProviders::fail_closed())
+            .expect("daemon should rebind after cancellation");
+        drop(daemon);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn composition_serves_session_over_real_named_pipe_and_fails_closed() {
@@ -493,9 +631,26 @@ mod tests {
             .await
             .expect("command gateway RPC should be registered");
 
+        drop(command_client);
+        drop(read_client);
+        drop(client);
+        let reconnect_address = address.clone();
+        let reconnect_channel = Endpoint::try_from("http://egopulse.local")
+            .expect("endpoint")
+            .connect_with_connector(service_fn(move |_| {
+                let address = reconnect_address.clone();
+                async move {
+                    egopulse_local_ipc_platform::LocalIpcClient::connect(&address)
+                        .await
+                        .map(TokioIo::new)
+                }
+            }))
+            .await
+            .expect("client should reconnect after disconnect");
+        drop(reconnect_channel);
+
         shutdown_sender.send(()).expect("shutdown");
         server.await.expect("server join");
-        drop(client);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -508,6 +663,22 @@ mod tests {
             Err(DaemonCompositionError::InvalidConfiguration("session TTL"))
         ));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bootstrap_parser_requires_non_zero_32_byte_hex_secrets() {
+        assert!(matches!(
+            parse_secret_key("test key", "00".repeat(32)),
+            Err(DaemonBootstrapError::InvalidSecret("test key"))
+        ));
+        assert!(matches!(
+            parse_secret_key("test key", "not-hex".to_owned()),
+            Err(DaemonBootstrapError::InvalidSecret("test key"))
+        ));
+        assert_eq!(
+            parse_secret_key("test key", "11".repeat(32)).expect("valid key"),
+            [0x11; 32]
+        );
     }
 
     #[tokio::test]
