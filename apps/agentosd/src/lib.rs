@@ -6,6 +6,10 @@ use std::{
     time::Duration,
 };
 
+use egopulse_codex_adapter::{
+    CODEX_ADAPTER_ID, CODEX_CAPABILITY_PROFILE_ID, CodexAppServerConfig, CodexAppServerDriver,
+    FileDispatchMaterialResolver, codex_protocol_fingerprint,
+};
 use egopulse_domain_contracts::v01::egopulse::{
     policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
     task::v1::{TaskCommand, TaskCommandResult},
@@ -18,6 +22,10 @@ use egopulse_domain_contracts::{
         local_read_model_service_server::LocalReadModelServiceServer,
         local_session_service_server::LocalSessionServiceServer,
     },
+};
+use egopulse_harness_adapter::{
+    AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeKey, GovernedHarnessAdapter,
+    SystemAdapterClock,
 };
 use egopulse_local_api::{
     command_gateway::{
@@ -36,8 +44,11 @@ use egopulse_local_api::{
     },
 };
 use egopulse_local_ide_control::collaboration_control::{
-    HarnessDispatchCycleError, HarnessDispatchRunner, SingleHarnessWorkflowResolver,
-    SingleHarnessWorkflowResolverError, TaskActivationSource,
+    AuthenticatedCollaborationPrincipal, CollaborationControl, CollaborationControlConfig,
+    CollaborationControlError, CollaborationPrincipalKind, CollaborationSqlCipherKey,
+    GovernedTaskActivationRunner, HarnessDispatchCycleError, HarnessDispatchRunner,
+    SingleHarnessWorkConfig, SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError,
+    SystemAuthorityClock, TaskActivationGuardSet, TaskActivationSource,
 };
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
@@ -193,14 +204,12 @@ pub struct DaemonProviders {
 /// run id is checked against the handoff.
 #[derive(Clone, Debug)]
 pub struct ConfiguredSingleHarnessWorkflow {
-    config: egopulse_local_ide_control::collaboration_control::SingleHarnessWorkConfig,
+    config: SingleHarnessWorkConfig,
 }
 
 impl ConfiguredSingleHarnessWorkflow {
     #[must_use]
-    pub fn new(
-        config: egopulse_local_ide_control::collaboration_control::SingleHarnessWorkConfig,
-    ) -> Self {
+    pub fn new(config: SingleHarnessWorkConfig) -> Self {
         Self { config }
     }
 }
@@ -209,14 +218,45 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
     fn resolve(
         &self,
         activation: &egopulse_local_ide_control::collaboration_control::TaskActivationHandoff,
-    ) -> Result<
-        egopulse_local_ide_control::collaboration_control::SingleHarnessWorkConfig,
-        SingleHarnessWorkflowResolverError,
-    > {
+    ) -> Result<SingleHarnessWorkConfig, SingleHarnessWorkflowResolverError> {
         if activation.task.current_run_id.as_deref() != Some(self.config.run_id.as_str()) {
             return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
         }
         Ok(self.config.clone())
+    }
+}
+
+/// Explicit composition input for the first real Harness vertical. The
+/// workflow configuration is reviewed data; no value is inferred from a Task
+/// payload or from a provider response.
+pub struct CodexHarnessCompositionConfig {
+    pub collaboration_database_path: PathBuf,
+    pub collaboration_store_epoch: String,
+    pub collaboration_key: [u8; 32],
+    pub adapter_database_path: PathBuf,
+    pub adapter_store_epoch: String,
+    pub adapter_key: [u8; 32],
+    pub input_bundle_root: PathBuf,
+    pub workspace_root: PathBuf,
+    pub codex_executable: PathBuf,
+    pub workflow: SingleHarnessWorkConfig,
+    pub lease_ttl_seconds: u64,
+}
+
+impl CodexHarnessCompositionConfig {
+    fn validate(&self) -> Result<(), DaemonCompositionError> {
+        if self.collaboration_store_epoch.trim().is_empty()
+            || self.adapter_store_epoch.trim().is_empty()
+            || self.collaboration_key.iter().all(|byte| *byte == 0)
+            || self.adapter_key.iter().all(|byte| *byte == 0)
+            || self.codex_executable.as_os_str().is_empty()
+            || self.lease_ttl_seconds == 0
+        {
+            return Err(DaemonCompositionError::InvalidConfiguration(
+                "Codex Harness composition",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -310,6 +350,82 @@ impl DaemonProviders {
         self.harness_dispatch_runner = Some(runner);
         self
     }
+
+    /// Installs the first production Harness composition. Task Authority,
+    /// Collaboration Control, and the Harness Adapter remain separate owners;
+    /// the returned runner is the only process-local writer that sequences
+    /// activation consumption and dispatch for this vertical.
+    pub fn with_codex_harness(
+        mut self,
+        config: CodexHarnessCompositionConfig,
+    ) -> Result<Self, DaemonCompositionError> {
+        config.validate()?;
+        if self.harness_dispatch_runner.is_some() {
+            return Err(DaemonCompositionError::InvalidConfiguration(
+                "Harness runner already configured",
+            ));
+        }
+        let source = self.task_activation_source.take().ok_or(
+            DaemonCompositionError::InvalidConfiguration("Task activation source"),
+        )?;
+        let adapter_id = CODEX_ADAPTER_ID.to_owned();
+        let capability_profile_id = CODEX_CAPABILITY_PROFILE_ID.to_owned();
+        let reader_edge = AdapterEdge::open(AdapterEdgeConfig {
+            database_path: config.adapter_database_path.clone(),
+            adapter_id: adapter_id.clone(),
+            store_epoch: config.adapter_store_epoch.clone(),
+            key: AdapterEdgeKey::new(config.adapter_key),
+        })
+        .map_err(DaemonCompositionError::AdapterEdge)?;
+        let writer_edge = AdapterEdge::open(AdapterEdgeConfig {
+            database_path: config.adapter_database_path,
+            adapter_id: adapter_id.clone(),
+            store_epoch: config.adapter_store_epoch,
+            key: AdapterEdgeKey::new(config.adapter_key),
+        })
+        .map_err(DaemonCompositionError::AdapterEdge)?;
+        let evidence =
+            egopulse_local_ide_control::collaboration_control::AdapterBackedHarnessEvidenceResolver::new(
+                reader_edge,
+            );
+        let (guard, reference) = TaskActivationGuardSet::new(evidence);
+        let control = CollaborationControl::open(
+            CollaborationControlConfig {
+                database_path: config.collaboration_database_path,
+                store_epoch: config.collaboration_store_epoch,
+                key: CollaborationSqlCipherKey::new(config.collaboration_key),
+            },
+            guard,
+            SystemAuthorityClock,
+        )
+        .map_err(DaemonCompositionError::Collaboration)?;
+        let adapter = GovernedHarnessAdapter::new(
+            adapter_id,
+            capability_profile_id,
+            codex_protocol_fingerprint(),
+            writer_edge,
+            FileDispatchMaterialResolver::new(config.input_bundle_root, config.workspace_root),
+            CodexAppServerDriver::new(CodexAppServerConfig::new(config.codex_executable)),
+            SystemAdapterClock,
+        );
+        let principal = AuthenticatedCollaborationPrincipal {
+            kind: CollaborationPrincipalKind::HarnessAdapter,
+            principal_id: config.workflow.harness_adapter_principal_id.clone(),
+            authenticated: true,
+        };
+        let resolver = ConfiguredSingleHarnessWorkflow::new(config.workflow);
+        let runner = GovernedTaskActivationRunner::new(
+            control,
+            adapter,
+            source,
+            resolver,
+            principal,
+            reference,
+            config.lease_ttl_seconds,
+        );
+        self.harness_dispatch_runner = Some(Arc::new(runner));
+        Ok(self)
+    }
 }
 
 pub trait DaemonProviderFactory: Send + Sync {
@@ -340,6 +456,10 @@ pub enum DaemonCompositionError {
     TokenKey,
     #[error("session configuration is invalid")]
     Session(#[source] egopulse_local_api::session::SessionConfigurationError),
+    #[error("Collaboration Control could not be opened")]
+    Collaboration(#[source] CollaborationControlError),
+    #[error("Harness Adapter edge could not be opened")]
+    AdapterEdge(#[source] AdapterEdgeError),
 }
 
 #[derive(Debug, thiserror::Error)]

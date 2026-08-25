@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 egopulse-client-kernel.workspace = true
+egopulse-codex-adapter.workspace = true
 egopulse-cognition-runtime.workspace = true
 egopulse-domain-contracts.workspace = true
 egopulse-artifact-authority.workspace = true

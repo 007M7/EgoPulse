@@ -265,6 +265,25 @@ pub trait TaskActivationSource: Send + Sync {
     ) -> Result<bool, TaskActivationSourceError>;
 }
 
+impl<T> TaskActivationSource for std::sync::Arc<T>
+where
+    T: TaskActivationSource + ?Sized,
+{
+    fn pending_task_activations(
+        &self,
+    ) -> Result<Vec<TaskActivationHandoff>, TaskActivationSourceError> {
+        (**self).pending_task_activations()
+    }
+
+    fn acknowledge_task_activation(
+        &self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, TaskActivationSourceError> {
+        (**self).acknowledge_task_activation(message_id, payload_digest_sha256)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SingleHarnessWorkflowResolverError {
     Unavailable,

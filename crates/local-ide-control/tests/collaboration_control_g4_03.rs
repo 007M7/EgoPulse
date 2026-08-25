@@ -26,11 +26,13 @@ use egopulse_local_ide_control::collaboration_control::{
     AdapterBackedHarnessEvidenceResolver, AuthenticatedCollaborationPrincipal, AuthorityClock,
     CollaborationControl, CollaborationControlConfig, CollaborationControlError,
     CollaborationPrincipalKind, CollaborationReferenceGuard, CollaborationSqlCipherKey,
-    CompositeCollaborationGuard, DispatchMaterial, HarnessEvidenceResolver,
-    HarnessFactIngestionDisposition, LeaseAuthorization, ReferenceAuthorization,
-    ReferenceGuardRejection, ResolvedHarnessEvidence, SingleHarnessWorkConfig,
-    TaskActivationReferenceGuard, canonical_dispatch_fingerprint, canonical_request_digest,
-    dispatch_pending, pump_observations, start_single_harness_workflow,
+    CompositeCollaborationGuard, DispatchMaterial, GovernedTaskActivationRunner,
+    HarnessDispatchRunner, HarnessEvidenceResolver, HarnessFactIngestionDisposition,
+    LeaseAuthorization, ReferenceAuthorization, ReferenceGuardRejection, ResolvedHarnessEvidence,
+    SingleHarnessWorkConfig, SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError,
+    TaskActivationGuardSet, TaskActivationHandoff, TaskActivationReferenceGuard,
+    TaskActivationSource, TaskActivationSourceError, canonical_dispatch_fingerprint,
+    canonical_request_digest, dispatch_pending, pump_observations, start_single_harness_workflow,
 };
 use prost_types::Timestamp;
 use rusqlite::Connection;
@@ -70,6 +72,54 @@ impl AuthorityClock for FixedClock {
 impl AdapterClock for FixedClock {
     fn now(&self) -> Timestamp {
         *self.0.lock().expect("clock mutex")
+    }
+}
+
+struct FixtureActivationSource {
+    pending: Mutex<Vec<TaskActivationHandoff>>,
+    acknowledged: Mutex<Vec<String>>,
+}
+
+impl TaskActivationSource for FixtureActivationSource {
+    fn pending_task_activations(
+        &self,
+    ) -> Result<Vec<TaskActivationHandoff>, TaskActivationSourceError> {
+        Ok(self
+            .pending
+            .lock()
+            .expect("activation source mutex")
+            .clone())
+    }
+
+    fn acknowledge_task_activation(
+        &self,
+        message_id: &str,
+        _payload_digest_sha256: &str,
+    ) -> Result<bool, TaskActivationSourceError> {
+        self.acknowledged
+            .lock()
+            .expect("activation acknowledgement mutex")
+            .push(message_id.to_owned());
+        self.pending
+            .lock()
+            .expect("activation source mutex")
+            .retain(|value| value.message_id != message_id);
+        Ok(true)
+    }
+}
+
+#[derive(Clone)]
+struct FixtureWorkflowResolver(SingleHarnessWorkConfig);
+
+impl SingleHarnessWorkflowResolver for FixtureWorkflowResolver {
+    fn resolve(
+        &self,
+        activation: &TaskActivationHandoff,
+    ) -> Result<SingleHarnessWorkConfig, SingleHarnessWorkflowResolverError> {
+        if activation.task.current_run_id.as_deref() != Some(self.0.run_id.as_str()) {
+            return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+        }
+        Ok(self.0.clone())
     }
 }
 
@@ -1367,6 +1417,88 @@ fn single_harness_workflow_accepts_only_task_activation_guard_evidence() {
             .expect("read guarded dispatch")
             .len(),
         1
+    );
+}
+
+#[tokio::test]
+async fn task_activation_runner_commits_then_dispatches_through_one_runtime() {
+    let collaboration_store = IsolatedStore::new("task-activation-runner-collaboration");
+    let adapter_store = IsolatedStore::new("task-activation-runner-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let bundle = br#"{"input":"activation-runner"}"#.to_vec();
+    let mut material = dispatch_material();
+    material.input_bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+    let config = SingleHarnessWorkConfig {
+        run_id: "run-activation-runner-001".to_owned(),
+        attempt_id: "attempt-activation-runner-001".to_owned(),
+        dispatch_id: "dispatch-activation-runner-001".to_owned(),
+        plan: run_plan(),
+        harness_id: "codex".to_owned(),
+        capability_profile_ref: contract_ref("single-harness-capability", '3'),
+        workspace_ref: "workspace-001".to_owned(),
+        lease_policy_ref: contract_ref("v01-attempt-lease", 'a'),
+        owner_instance_id: "attempt-supervisor-001".to_owned(),
+        material,
+        task_authority_principal_id: "task-authority:runner".to_owned(),
+        collaboration_principal_id: "collaboration-control:runner".to_owned(),
+        attempt_supervisor_principal_id: "attempt-supervisor:runner".to_owned(),
+        harness_adapter_principal_id: "adapter:codex".to_owned(),
+    };
+    let task = TaskSnapshot {
+        task_id: "task-activation-runner-001".to_owned(),
+        revision: 2,
+        work_revision: 1,
+        status: TaskStatus::Active as i32,
+        current_run_id: Some(config.run_id.clone()),
+        ..Default::default()
+    };
+    let source = Arc::new(FixtureActivationSource {
+        pending: Mutex::new(vec![TaskActivationHandoff {
+            message_id: "task-outbox-activation-runner-001".to_owned(),
+            payload_digest_sha256: "d".repeat(64),
+            task: task.clone(),
+        }]),
+        acknowledged: Mutex::new(Vec::new()),
+    });
+    let (guard, binding) = TaskActivationGuardSet::new(AdapterBackedHarnessEvidenceResolver::new(
+        open_loop_adapter_edge(&adapter_database),
+    ));
+    let clock = FixedClock::new(FIXED_TIME);
+    let control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        FakeCodexDriver::default(),
+        clock,
+    );
+    let runner = GovernedTaskActivationRunner::new(
+        control,
+        adapter,
+        Arc::clone(&source),
+        FixtureWorkflowResolver(config),
+        harness_adapter(),
+        binding,
+        30,
+    );
+    let cycle = runner.run_once().await.expect("activation runner cycle");
+    assert_eq!(cycle.activations_seen, 1);
+    assert_eq!(cycle.activations_started, 1);
+    assert_eq!(cycle.activations_acknowledged, 1);
+    assert_eq!(cycle.dispatches_delivered, 1);
+    assert_eq!(
+        source
+            .acknowledged
+            .lock()
+            .expect("activation acknowledgement mutex")
+            .as_slice(),
+        ["task-outbox-activation-runner-001"]
     );
 }
 
