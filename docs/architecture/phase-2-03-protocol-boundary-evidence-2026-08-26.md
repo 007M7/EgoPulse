@@ -123,6 +123,23 @@ native ACP notification, and receives the original prompt response with
 `stopReason=cancelled`. The subprocess exits cleanly with empty stderr and no
 model/API call.
 
+The recovery capability probe now records the opposite result explicitly:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/probe-dsh-acp-recovery-capability-windows.ps1
+```
+
+The compiled DSH ACP server does not advertise `loadSession`; native
+`session/load` and `session/resume` requests are rejected as unsupported. This
+is a known, fail-closed recovery disposition (`held_native_recovery_unsupported`),
+not evidence that a new session is equivalent to recovery of an old session.
+The server also logs the expected JSON-RPC "Method not found" diagnostics to
+stderr and keeps its stdio loop alive after those requests, so the isolated
+probe terminates the child explicitly after the assertions. This is recorded
+as probe behavior rather than hidden as a clean shutdown. EgoPulse must
+therefore retain the dispatch/attempt outcome in its own Authority and cannot
+promote DSH to a production Harness on ACP lifecycle evidence alone.
+
 ## Candidate decision at this point
 
 Kimi is the next candidate for an authenticated lifecycle probe; DSH's

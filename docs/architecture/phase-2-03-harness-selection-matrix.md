@@ -59,7 +59,7 @@ dispatch or recovery support.
 | ACK/lifecycle | Accepted, started and terminal observations are ordered and replayable | Candidate held |
 | Approval | Native request maps to reviewed approval kind and Adapter Edge routing | Candidate held; no auto-approval |
 | Cancel | Native cancellation or explicitly supported process termination has known semantics | Candidate held or restricted |
-| Restart/reconcile | A restarted adapter can distinguish active, terminal and unknown outcomes | Candidate held |
+| Restart/reconcile | A restarted adapter can distinguish active, terminal and unknown outcomes | DSH probe: native load/resume unsupported; candidate held |
 | Artifact/evidence | Returned output can be independently hashed and associated with the dispatch | Candidate held |
 | Model binding | Two model selectors remain profile-bound and isolated | Candidate held |
 

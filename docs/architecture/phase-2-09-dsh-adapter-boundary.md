@@ -46,7 +46,11 @@ independent recovery evidence.
 - Adapter tests: 6/6 passed.
 - DSH adapter Clippy with warnings denied: passed.
 
-The next DSH gate is a keyless replay fixture for permission request handling,
-followed by restart/reconciliation evidence. A live model run is not required
-if replay can provide independently inspectable native observations; otherwise
-an explicitly authenticated local run is needed.
+The keyless lifecycle evidence is now complete for the ACP operations DSH
+actually implements: multi-turn prompt, committed update, and cancellation.
+The recovery capability probe also confirms that DSH advertises fresh sessions
+only: `session/load` and `session/resume` are rejected. The candidate therefore
+remains held rather than being promoted; a restarted DSH process cannot be
+treated as recovery of a prior native session. Any future adapter would need
+EgoPulse-owned dispatch receipts and an explicit uncertain-outcome policy, not a
+synthetic native recovery claim.
