@@ -13,7 +13,7 @@ Probe date: 2026-08-26 (Asia/Shanghai)
 | --- | --- | --- | --- |
 | Codex | `C:\Users\Administrator\AppData\Roaming\npm\codex.cmd` | `codex-cli 0.148.0-alpha.15` | Executable discovery passed; existing native app-server probe remains the reference |
 | Kimi CLI | `C:\Users\Administrator\AppData\Roaming\npm\kimi.cmd` → `C:\Users\Administrator\.local\bin\kimi.exe` | `kimi, version 1.49.0` | Executable, ACP initialize and empty-session boundary probed; dispatch/lifecycle attestation pending |
-| DeepSeek Harness | `D:\deepseek harness\dsh.cmd` | `0.1.0-rc.5` | Executable discovery and isolated CLI profile bootstrap passed; structured protocol probe pending |
+| DeepSeek Harness | `D:\deepseek harness\dsh.cmd` | `0.1.0-rc.5` | ACP initialize/session, multi-turn and cancel replay passed; native load/resume unsupported, candidate held |
 
 The Codex version command emitted a non-fatal warning about cleaning stale
 temporary argument-alias directories under the user's Codex directory. The
@@ -35,7 +35,8 @@ shared Probe Gate before any capability profile can become `ProbeVerified`.
 2. Inspect Kimi CLI's machine-readable/non-interactive protocol boundary. If
    it exposes only terminal text, record it as process-only or unsupported
    rather than emulating lifecycle truth.
-3. Inspect DeepSeek Harness's local CLI/runtime boundary and identify whether
-   structured events, approvals and reconciliation are native or internal-only.
-4. Run the first no-side-effect dispatch fixture only for a candidate whose
-   protocol fingerprint can be independently recorded.
+3. Run Kimi's authenticated session/prompt/cancel/approval lifecycle only when
+   an explicitly authorized local credential is available; keep the share
+   directory isolated.
+4. Do not promote DSH on fresh-session evidence; its native recovery limitation
+   requires an EgoPulse-owned uncertain-outcome policy before reconsideration.

@@ -142,8 +142,7 @@ promote DSH to a production Harness on ACP lifecycle evidence alone.
 
 ## Candidate decision at this point
 
-Kimi is the next candidate for an authenticated lifecycle probe; DSH's
-isolated profile and native ACP session-creation boundary now pass, so its
-keyless lifecycle fixture can proceed in parallel. Neither candidate receives
-an active capability profile from this note. Codex remains the only production
-Harness.
+Kimi is the next candidate for an authenticated lifecycle probe. DSH's
+isolated profile and keyless ACP lifecycle evidence are now recorded, but its
+native recovery limitation keeps it held. Neither candidate receives an active
+capability profile from this note. Codex remains the only production Harness.

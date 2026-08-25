@@ -21,8 +21,8 @@ boundary is the provider-neutral `NativeHarnessDriver` plus
 | Candidate | Why consider it | Cost / what we give up | Current status |
 | --- | --- | --- | --- |
 | Codex app-server | Already has a native structured protocol, an implemented adapter, durable approval/recovery fixtures and a pinned probe fingerprint | The protocol is version-sensitive; we pay adapter maintenance for native schema drift and retain Codex-specific process supervision | Active production Harness |
-| Kimi CLI | Existing research indicates a useful CLI workflow and a possible second model family for local users | Unless its native protocol exposes structured lifecycle, approval and reconciliation semantics, an adapter may degrade to process-only or emulated support; that weakens recovery guarantees | Candidate; probe required |
-| DeepSeek Harness | Local source is available for study and it is relevant to the planned multi-model product surface | Its internal event/runtime model is not automatically the EgoPulse contract; integrating it may create a large TypeScript/runtime coupling and unclear native cancellation semantics | Candidate; probe required |
+| Kimi CLI | Existing research indicates a useful CLI workflow and a possible second model family for local users | Unless its native protocol exposes structured lifecycle, approval and reconciliation semantics, an adapter may degrade to process-only or emulated support; that weakens recovery guarantees | Candidate; authenticated lifecycle probe required |
+| DeepSeek Harness | Local source is available for study and it is relevant to the planned multi-model product surface | Its internal event/runtime model is not automatically the EgoPulse contract; integrating it may create a large TypeScript/runtime coupling and unclear native recovery semantics | Candidate held; native recovery unsupported |
 
 The selection is intentionally not “the one with the most SDK code”. The
 winner must show the lowest semantic gap while preserving the same authority,
@@ -37,14 +37,14 @@ row; a missing or self-reported row is not treated as support.
 
 The zero-API-call executable discovery slice is recorded in
 `phase-2-03-windows-probe-2026-08-26.md`. All three local command entry points
-are discoverable; only Codex currently has an implemented native structured
-probe and contract fixture in EgoPulse.
+are discoverable. Codex remains the only production Harness; DSH now has
+candidate ACP lifecycle evidence, but its recovery row is an explicit hold.
 
 The follow-up protocol observations are recorded in
 `phase-2-03-protocol-boundary-evidence-2026-08-26.md`. Kimi remains the next
-candidate for an authenticated lifecycle probe; DSH's isolated profile and
-native ACP session-creation boundary now pass, so its keyless lifecycle fixture
-can proceed in parallel.
+candidate for an authenticated lifecycle probe. DSH's isolated profile,
+session creation, multi-turn prompt and cancellation probes pass, while its
+native recovery limitation keeps it held.
 
 The candidate-only Rust probe is `crates/kimi-adapter`. Its explicit degraded
 result and fail-closed execution methods are part of the evidence: protocol
