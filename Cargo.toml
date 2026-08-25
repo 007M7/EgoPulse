@@ -10,6 +10,7 @@ members = [
   "crates/local-ide-control",
   "crates/local-api",
   "crates/client-kernel",
+  "crates/client-operations",
   "crates/local-ipc-platform",
   "crates/local-read-model",
   "crates/process-supervision",
@@ -62,6 +63,7 @@ egopulse-cognition-runtime = { path = "crates/cognition-runtime" }
 egopulse-local-ide-control = { path = "crates/local-ide-control" }
 egopulse-local-api = { path = "crates/local-api" }
 egopulse-client-kernel = { path = "crates/client-kernel" }
+egopulse-client-operations = { path = "crates/client-operations" }
 egopulse-local-ipc-platform = { path = "crates/local-ipc-platform" }
 egopulse-local-read-model = { path = "crates/local-read-model" }
 egopulse-process-supervision = { path = "crates/process-supervision" }

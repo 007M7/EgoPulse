@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 clap.workspace = true
 egopulse-client-kernel.workspace = true
+egopulse-client-operations.workspace = true
 egopulse-domain-contracts.workspace = true
 egopulse-local-api.workspace = true
 hex.workspace = true

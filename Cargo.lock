@@ -1092,6 +1092,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "egopulse-client-kernel",
+ "egopulse-client-operations",
  "egopulse-domain-contracts",
  "egopulse-local-api",
  "hex",
@@ -1113,6 +1114,17 @@ dependencies = [
  "prost-types",
  "sha2",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "egopulse-client-operations"
+version = "0.1.0"
+dependencies = [
+ "egopulse-client-kernel",
+ "egopulse-domain-contracts",
+ "egopulse-local-api",
+ "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]
@@ -1320,6 +1332,7 @@ dependencies = [
  "clap",
  "crossterm",
  "egopulse-client-kernel",
+ "egopulse-client-operations",
  "egopulse-domain-contracts",
  "egopulse-local-api",
  "hex",

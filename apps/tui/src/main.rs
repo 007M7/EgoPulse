@@ -13,16 +13,17 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use egopulse_client_kernel::ClientKernel;
+use egopulse_client_operations::attach as attach_client;
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
     common::v1::{CommandMetadata, ContractReference},
     harness::v1::ApprovalDecision,
     harness::v1::ApprovalRequestLifecycleKind,
     localapi::v1::{
-        AwaitProjectionRequest, ClientSurface, DecideHarnessApprovalRequest,
-        ExecuteFounderVerdictRequest, ExecuteTaskCommandRequest, GetProjectionStatusRequest,
-        HarnessApprovalView, ListHarnessApprovalViewsRequest, ListTaskViewsRequest,
-        LocalApiErrorCode, ProjectionAwaitToken, ProjectionHealth, SourceRevision, TaskView,
+        AwaitProjectionRequest, DecideHarnessApprovalRequest, ExecuteFounderVerdictRequest,
+        ExecuteTaskCommandRequest, GetProjectionStatusRequest, HarnessApprovalView,
+        ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiErrorCode,
+        ProjectionAwaitToken, ProjectionHealth, SourceRevision, TaskView,
         await_projection_response,
     },
     policy::v1::{
@@ -36,7 +37,7 @@ use egopulse_domain_contracts::v01::egopulse::{
     },
     verification::v1::VerificationConclusion,
 };
-use egopulse_local_api::{LocalApiClient, LocalApiConnection, LocalIpcAddress};
+use egopulse_local_api::{LocalApiClient, LocalApiConnection};
 use prost::Message;
 use ratatui::{
     DefaultTerminal, Frame,
@@ -454,29 +455,17 @@ struct AttachedClient {
 
 impl AttachedClient {
     async fn open(instance: &str) -> Result<Self, String> {
-        let address = LocalIpcAddress::for_instance(instance).map_err(|error| error.to_string())?;
-        let connection = LocalApiClient::platform_default()
-            .connect(address)
-            .await
-            .map_err(|error| format!("daemon unavailable: {error}"))?;
-        let mut kernel = ClientKernel::new(
+        let attached = attach_client(
+            instance,
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::ClientSurface::Tui,
             format!("egopulse-tui-{}", Uuid::now_v7()),
-            ClientSurface::Tui,
         )
-        .map_err(|error| format!("client kernel unavailable: {error}"))?;
-        let request = kernel
-            .open_session_request(Uuid::now_v7().to_string())
-            .map_err(|error| format!("session request invalid: {error}"))?;
-        let response = connection
-            .session_service()
-            .open_session(request)
-            .await
-            .map_err(|error| format!("open session failed: {error}"))?
-            .into_inner();
-        kernel
-            .accept_open_session(response, SystemTime::now())
-            .map_err(|error| format!("session rejected: {error}"))?;
-        Ok(Self { connection, kernel })
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            connection: attached.connection,
+            kernel: attached.kernel,
+        })
     }
 
     fn metadata(

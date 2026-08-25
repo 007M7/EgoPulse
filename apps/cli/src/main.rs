@@ -11,6 +11,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use egopulse_client_kernel::{ClientKernel, SnapshotStreamTracker, StreamApply};
+use egopulse_client_operations::{AttachError, attach as attach_client};
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
     common::v1::{CommandMetadata, ContractReference},
@@ -39,7 +40,7 @@ use egopulse_domain_contracts::v01::egopulse::{
     },
     verification::v1::VerificationConclusion,
 };
-use egopulse_local_api::{LocalApiClient, LocalApiConnection, LocalIpcAddress};
+use egopulse_local_api::LocalApiConnection;
 use prost::Message;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -649,27 +650,19 @@ async fn attach(operation: &'static str) -> Result<AttachedClient, CliFailure> {
     let result = async {
         let instance =
             std::env::var("EGOPULSE_IPC_INSTANCE").unwrap_or_else(|_| DEFAULT_INSTANCE.to_owned());
-        let address = LocalIpcAddress::for_instance(&instance)
-            .map_err(|error| CliFailure::protocol(format!("invalid IPC instance: {error}")))?;
-        let connection = LocalApiClient::platform_default()
-            .connect(address)
+        let attached = attach_client(&instance, ClientSurface::Cli, "egopulse-cli")
             .await
-            .map_err(|error| CliFailure::daemon_unavailable(error.to_string()))?;
-        let mut kernel = ClientKernel::new("egopulse-cli", ClientSurface::Cli)
-            .map_err(|error| CliFailure::protocol(error.to_string()))?;
-        let open_request = kernel
-            .open_session_request(Uuid::now_v7().to_string())
-            .map_err(|error| CliFailure::protocol(error.to_string()))?;
-        let open_response = connection
-            .session_service()
-            .open_session(open_request)
-            .await
-            .map_err(|error| CliFailure::daemon_unavailable(error.to_string()))?
-            .into_inner();
-        kernel
-            .accept_open_session(open_response, SystemTime::now())
-            .map_err(|error| CliFailure::protocol(error.to_string()))?;
-        Ok::<_, CliFailure>(AttachedClient { connection, kernel })
+            .map_err(|error| match error {
+                AttachError::DaemonUnavailable(detail) => CliFailure::daemon_unavailable(detail),
+                AttachError::InvalidInstance(detail) => {
+                    CliFailure::protocol(format!("invalid IPC instance: {detail}"))
+                }
+                AttachError::Kernel(error) => CliFailure::protocol(error.to_string()),
+            })?;
+        Ok::<_, CliFailure>(AttachedClient {
+            connection: attached.connection,
+            kernel: attached.kernel,
+        })
     }
     .await;
     result.map_err(|mut error| {

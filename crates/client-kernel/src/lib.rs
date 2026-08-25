@@ -119,6 +119,11 @@ impl ClientKernel {
     }
 
     #[must_use]
+    pub const fn surface(&self) -> ClientSurface {
+        self.surface
+    }
+
+    #[must_use]
     pub fn session(&self) -> Option<&SessionBinding> {
         self.session.as_ref()
     }
