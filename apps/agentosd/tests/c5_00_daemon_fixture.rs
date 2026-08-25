@@ -946,6 +946,37 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
     let tui_stdout = String::from_utf8_lossy(&tui_output.stdout);
     assert!(tui_stdout.contains("EgoPulse TUI: connected"));
 
+    let task_watch = run_cli(&instance, &["task", "watch", "--frames", "1", "--json"]).await;
+    assert!(
+        task_watch.status.success(),
+        "Task watch must consume the frozen stream: stdout={} stderr={}",
+        String::from_utf8_lossy(&task_watch.stdout),
+        String::from_utf8_lossy(&task_watch.stderr)
+    );
+    let task_watch_json: serde_json::Value =
+        serde_json::from_slice(&task_watch.stdout).expect("Task watch JSON envelope");
+    assert_eq!(task_watch_json["operation"], "task.watch");
+    assert_eq!(
+        task_watch_json["data"]["kind"],
+        "STREAM_FRAME_KIND_HEARTBEAT"
+    );
+
+    let approval_watch =
+        run_cli(&instance, &["approval", "watch", "--frames", "1", "--json"]).await;
+    assert!(
+        approval_watch.status.success(),
+        "Approval watch must consume the frozen stream: stdout={} stderr={}",
+        String::from_utf8_lossy(&approval_watch.stdout),
+        String::from_utf8_lossy(&approval_watch.stderr)
+    );
+    let approval_watch_json: serde_json::Value =
+        serde_json::from_slice(&approval_watch.stdout).expect("Approval watch JSON envelope");
+    assert_eq!(approval_watch_json["operation"], "approval.watch");
+    assert_eq!(
+        approval_watch_json["data"]["kind"],
+        "STREAM_FRAME_KIND_HEARTBEAT"
+    );
+
     let acceptance_sha = "11".repeat(32);
     let budget_sha = "22".repeat(32);
     let task_output = run_cli(

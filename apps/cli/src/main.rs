@@ -10,7 +10,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
-use egopulse_client_kernel::ClientKernel;
+use egopulse_client_kernel::{ClientKernel, SnapshotStreamTracker, StreamApply};
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
     common::v1::{CommandMetadata, ContractReference},
@@ -19,10 +19,11 @@ use egopulse_domain_contracts::v01::egopulse::{
         AwaitProjectionRequest, ClientSurface, DecideHarnessApprovalRequest,
         ExecuteFounderVerdictRequest, ExecuteTaskCommandRequest, GetEvidenceGraphRequest,
         GetHarnessApprovalViewRequest, GetProjectionStatusRequest, GetTaskViewRequest,
-        ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError, LocalApiErrorCode,
-        ProjectionAwaitToken, ProjectionHealth, ProjectionMetadata, SourceRevision, TaskView,
-        await_projection_response, get_evidence_graph_response, get_harness_approval_view_response,
-        get_task_view_response,
+        HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest, ListTaskViewsRequest,
+        LocalApiError, LocalApiErrorCode, ProjectionAwaitToken, ProjectionHealth,
+        ProjectionMetadata, SourceRevision, TaskView, TaskViewStreamFrame,
+        WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, await_projection_response,
+        get_evidence_graph_response, get_harness_approval_view_response, get_task_view_response,
     },
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, PolicyDecisionErrorCode,
@@ -110,6 +111,17 @@ enum TaskCommandCli {
         #[arg(long)]
         json: bool,
     },
+    /// Consume a bounded governed Task projection stream.
+    Watch {
+        #[arg(long, default_value_t = 1)]
+        frames: u32,
+        #[arg(long)]
+        resume_epoch: Option<String>,
+        #[arg(long)]
+        resume_sequence: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Submit the user-owned create_task branch.
     Create {
         #[arg(long)]
@@ -163,6 +175,17 @@ enum ApprovalCommand {
         cursor: Option<String>,
         #[arg(long)]
         actionable_only: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Consume a bounded governed Harness Approval projection stream.
+    Watch {
+        #[arg(long, default_value_t = 1)]
+        frames: u32,
+        #[arg(long)]
+        resume_epoch: Option<String>,
+        #[arg(long)]
+        resume_sequence: Option<u64>,
         #[arg(long)]
         json: bool,
     },
@@ -311,6 +334,19 @@ impl CliFailure {
             required_action_code: None,
             safe_fingerprint: None,
             operation: "status",
+        }
+    }
+
+    fn stream_recovery(operation: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 7,
+            reason_code: "PROJECTION_STREAM_RECOVERY_REQUIRED",
+            message: message.into(),
+            category: "projection",
+            retryable: true,
+            required_action_code: Some("REFETCH_PROJECTION".to_owned()),
+            safe_fingerprint: None,
+            operation,
         }
     }
 
@@ -541,6 +577,7 @@ fn command_json(command: &Command) -> bool {
             command:
                 TaskCommandCli::Get { json, .. }
                 | TaskCommandCli::List { json, .. }
+                | TaskCommandCli::Watch { json, .. }
                 | TaskCommandCli::Create { json, .. },
         }
         | Command::Evidence {
@@ -550,6 +587,7 @@ fn command_json(command: &Command) -> bool {
             command:
                 ApprovalCommand::Get { json, .. }
                 | ApprovalCommand::List { json, .. }
+                | ApprovalCommand::Watch { json, .. }
                 | ApprovalCommand::Decide { json, .. },
         }
         | Command::Verdict {
@@ -766,6 +804,12 @@ async fn task(command: TaskCommandCli) -> Result<(), CliFailure> {
             cursor,
             json,
         } => task_list(page_size, cursor, json).await,
+        TaskCommandCli::Watch {
+            frames,
+            resume_epoch,
+            resume_sequence,
+            json,
+        } => task_watch(frames, resume_epoch, resume_sequence, json).await,
         TaskCommandCli::Create {
             work_type,
             input_snapshot_id,
@@ -887,6 +931,116 @@ async fn task_list(page_size: u32, cursor: Option<String>, json: bool) -> Result
     Ok(())
 }
 
+async fn task_watch(
+    frames: u32,
+    resume_epoch: Option<String>,
+    resume_sequence: Option<u64>,
+    json: bool,
+) -> Result<(), CliFailure> {
+    if frames == 0 {
+        return Err(
+            CliFailure::protocol("frames must be greater than zero").for_operation("task.watch")
+        );
+    }
+    if resume_epoch.is_some() != resume_sequence.is_some() {
+        return Err(CliFailure::protocol(
+            "resume_epoch and resume_sequence must be supplied together",
+        )
+        .for_operation("task.watch"));
+    }
+    let attached = attach("task.watch").await?;
+    attached.require_rpc("LocalReadModelService/WatchTaskViews", "task.watch")?;
+    let resume_after = resume_epoch.map(|epoch| {
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition {
+            epoch,
+            sequence: resume_sequence.expect("validated resume sequence"),
+            projected_at: None,
+        }
+    });
+    let metadata = attached.metadata(None)?;
+    let mut stream = attached
+        .connection
+        .read_model_service()
+        .watch_task_views(WatchTaskViewsRequest {
+            client: Some(metadata),
+            resume_after,
+            task_ids: Vec::new(),
+            status_filter: Vec::new(),
+        })
+        .await
+        .map_err(|error| {
+            CliFailure::daemon_unavailable(error.to_string()).for_operation("task.watch")
+        })?
+        .into_inner();
+    let mut tracker = SnapshotStreamTracker::default();
+    let mut emitted = 0_u32;
+    while let Some(frame) = stream.message().await.map_err(|error| {
+        CliFailure::daemon_unavailable(error.to_string()).for_operation("task.watch")
+    })? {
+        let applied = tracker
+            .apply_task_frame(&frame)
+            .map_err(|error| CliFailure::stream_recovery("task.watch", error.to_string()))?;
+        if applied == StreamApply::ResetRequired {
+            return Err(CliFailure::stream_recovery(
+                "task.watch",
+                frame
+                    .reset_reason_code
+                    .as_deref()
+                    .unwrap_or("stream reset required"),
+            ));
+        }
+        let payload = task_stream_frame_json(&frame, applied);
+        if json {
+            println!("{}", serde_json::to_string(&payload).unwrap());
+        } else {
+            println!(
+                "Task watch: kind={} apply={} position={}",
+                payload["data"]["kind"].as_str().unwrap_or("unknown"),
+                payload["data"]["apply"].as_str().unwrap_or("unknown"),
+                payload["projection"]["position"]
+            );
+        }
+        emitted += 1;
+        if emitted >= frames.min(1000) {
+            break;
+        }
+    }
+    if emitted == 0 {
+        return Err(CliFailure::stream_recovery(
+            "task.watch",
+            "stream ended without frames",
+        ));
+    }
+    Ok(())
+}
+
+fn task_stream_frame_json(frame: &TaskViewStreamFrame, applied: StreamApply) -> serde_json::Value {
+    let kind = egopulse_domain_contracts::v01::egopulse::localapi::v1::StreamFrameKind::try_from(
+        frame.kind,
+    )
+    .map(|value| value.as_str_name())
+    .unwrap_or("STREAM_FRAME_KIND_UNKNOWN");
+    let apply = match applied {
+        StreamApply::Applied => "applied",
+        StreamApply::Replay => "replay",
+        StreamApply::Heartbeat => "heartbeat",
+        StreamApply::ResetRequired => "reset_required",
+    };
+    json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": "task.watch",
+        "data": {
+            "kind": kind,
+            "apply": apply,
+            "view": frame.snapshot.as_ref().map(task_summary),
+            "resetReasonCode": frame.reset_reason_code,
+        },
+        "projection": projection_position_json(frame.position.as_ref()),
+        "correlationId": Uuid::now_v7().to_string(),
+    })
+}
+
 async fn evidence(command: EvidenceCommand) -> Result<(), CliFailure> {
     match command {
         EvidenceCommand::Get {
@@ -975,6 +1129,12 @@ async fn approval(command: ApprovalCommand) -> Result<(), CliFailure> {
             actionable_only,
             json,
         } => approval_list(page_size, cursor, actionable_only, json).await,
+        ApprovalCommand::Watch {
+            frames,
+            resume_epoch,
+            resume_sequence,
+            json,
+        } => approval_watch(frames, resume_epoch, resume_sequence, json).await,
         ApprovalCommand::Decide {
             approval_request_id,
             expected_action_digest_sha256,
@@ -1109,6 +1269,124 @@ async fn approval_list(
         );
     }
     Ok(())
+}
+
+async fn approval_watch(
+    frames: u32,
+    resume_epoch: Option<String>,
+    resume_sequence: Option<u64>,
+    json: bool,
+) -> Result<(), CliFailure> {
+    if frames == 0 {
+        return Err(CliFailure::protocol("frames must be greater than zero")
+            .for_operation("approval.watch"));
+    }
+    if resume_epoch.is_some() != resume_sequence.is_some() {
+        return Err(CliFailure::protocol(
+            "resume_epoch and resume_sequence must be supplied together",
+        )
+        .for_operation("approval.watch"));
+    }
+    let attached = attach("approval.watch").await?;
+    attached.require_rpc(
+        "LocalReadModelService/WatchHarnessApprovalViews",
+        "approval.watch",
+    )?;
+    let resume_after = resume_epoch.map(|epoch| {
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition {
+            epoch,
+            sequence: resume_sequence.expect("validated resume sequence"),
+            projected_at: None,
+        }
+    });
+    let metadata = attached.metadata(None)?;
+    let mut stream = attached
+        .connection
+        .read_model_service()
+        .watch_harness_approval_views(WatchHarnessApprovalViewsRequest {
+            client: Some(metadata),
+            resume_after,
+            approval_request_ids: Vec::new(),
+            task_ids: Vec::new(),
+            request_lifecycle_filter: Vec::new(),
+            decision_state_filter: Vec::new(),
+            actionable_only: false,
+        })
+        .await
+        .map_err(|error| {
+            CliFailure::daemon_unavailable(error.to_string()).for_operation("approval.watch")
+        })?
+        .into_inner();
+    let mut tracker = SnapshotStreamTracker::default();
+    let mut emitted = 0_u32;
+    while let Some(frame) = stream.message().await.map_err(|error| {
+        CliFailure::daemon_unavailable(error.to_string()).for_operation("approval.watch")
+    })? {
+        let applied = tracker
+            .apply_harness_approval_frame(&frame)
+            .map_err(|error| CliFailure::stream_recovery("approval.watch", error.to_string()))?;
+        if applied == StreamApply::ResetRequired {
+            return Err(CliFailure::stream_recovery(
+                "approval.watch",
+                frame
+                    .reset_reason_code
+                    .as_deref()
+                    .unwrap_or("stream reset required"),
+            ));
+        }
+        let payload = approval_stream_frame_json(&frame, applied);
+        if json {
+            println!("{}", serde_json::to_string(&payload).unwrap());
+        } else {
+            println!(
+                "Approval watch: kind={} apply={} position={}",
+                payload["data"]["kind"].as_str().unwrap_or("unknown"),
+                payload["data"]["apply"].as_str().unwrap_or("unknown"),
+                payload["projection"]["position"]
+            );
+        }
+        emitted += 1;
+        if emitted >= frames.min(1000) {
+            break;
+        }
+    }
+    if emitted == 0 {
+        return Err(CliFailure::stream_recovery(
+            "approval.watch",
+            "stream ended without frames",
+        ));
+    }
+    Ok(())
+}
+
+fn approval_stream_frame_json(
+    frame: &HarnessApprovalViewStreamFrame,
+    applied: StreamApply,
+) -> serde_json::Value {
+    let kind = egopulse_domain_contracts::v01::egopulse::localapi::v1::StreamFrameKind::try_from(
+        frame.kind,
+    )
+    .map(|value| value.as_str_name())
+    .unwrap_or("STREAM_FRAME_KIND_UNKNOWN");
+    let apply = match applied {
+        StreamApply::Applied => "applied",
+        StreamApply::Replay => "replay",
+        StreamApply::Heartbeat => "heartbeat",
+        StreamApply::ResetRequired => "reset_required",
+    };
+    json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": "approval.watch",
+        "data": {
+            "kind": kind,
+            "apply": apply,
+            "view": frame.snapshot.as_ref().map(|view| approval_json(view, "approval.watch")["data"].clone()),
+            "resetReasonCode": frame.reset_reason_code,
+        },
+        "projection": projection_position_json(frame.position.as_ref()),
+        "correlationId": Uuid::now_v7().to_string(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
