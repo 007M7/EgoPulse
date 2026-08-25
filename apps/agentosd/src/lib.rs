@@ -203,7 +203,10 @@ pub enum DaemonBootstrapError {
     InvalidSetting(&'static str),
 }
 
-fn parse_secret_key(name: &'static str, value: String) -> Result<[u8; 32], DaemonBootstrapError> {
+pub(crate) fn parse_secret_key(
+    name: &'static str,
+    value: String,
+) -> Result<[u8; 32], DaemonBootstrapError> {
     let bytes = hex::decode(value).map_err(|_| DaemonBootstrapError::InvalidSecret(name))?;
     let key = <[u8; 32]>::try_from(bytes.as_slice())
         .map_err(|_| DaemonBootstrapError::InvalidSecret(name))?;

@@ -98,7 +98,15 @@ The agentosd unit suite covers:
 - the existing real Windows Named Pipe C5 suite continues to pass in serial
   mode.
 
-The remaining bootstrap work is the user-owned configuration loader and normal
-binary wiring. No test fixture Allow implementation is reused for that step;
-the three guards remain separate from identity mapping and from the client
-surfaces.
+The normal binary now loads the typed composition through
+`EGOPULSE_USER_CONFIG` (default `egopulse-data/agentos-config.json`). The
+user-owned JSON contains paths, epochs, identity mappings, reviewed references
+and workflow data; each SQLCipher/API key is named by an environment variable
+and is never read from the JSON file. No test fixture Allow implementation is
+reused; the three guards remain separate from identity mapping and from the
+client surfaces.
+
+The remaining Phase 2-02 obligation is the reviewed Sego/checker resolver
+composition. Until then `DenyVerificationReferences` keeps Verification
+external requests held while allowing its own store and projection boundary to
+be composed.

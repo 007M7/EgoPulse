@@ -1,0 +1,166 @@
+{
+  "schema_version": "egopulse.production-bootstrap/v1",
+  "stores": {
+    "task": {
+      "database_path": "egopulse-data/task.db",
+      "store_epoch": "replace-task-epoch",
+      "key_env": "EGOPULSE_TASK_KEY_HEX"
+    },
+    "verification": {
+      "database_path": "egopulse-data/verification.db",
+      "store_epoch": "replace-verification-epoch",
+      "key_env": "EGOPULSE_VERIFICATION_KEY_HEX"
+    },
+    "policy": {
+      "database_path": "egopulse-data/policy.db",
+      "store_epoch": "replace-policy-epoch",
+      "key_env": "EGOPULSE_POLICY_KEY_HEX"
+    },
+    "verdict": {
+      "database_path": "egopulse-data/verdict.db",
+      "store_epoch": "replace-verdict-epoch",
+      "key_env": "EGOPULSE_VERDICT_KEY_HEX"
+    },
+    "adapter": {
+      "database_path": "egopulse-data/codex-adapter.db",
+      "store_epoch": "replace-adapter-epoch",
+      "key_env": "EGOPULSE_ADAPTER_KEY_HEX"
+    },
+    "collaboration": {
+      "database_path": "egopulse-data/collaboration.db",
+      "store_epoch": "replace-collaboration-epoch",
+      "key_env": "EGOPULSE_COLLABORATION_KEY_HEX"
+    }
+  },
+  "identity": {
+    "os_fingerprint_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "principal_id": "local-user:replace-me",
+    "permission_codes": [
+      "local.task.read",
+      "local.task.write",
+      "local.approval.read",
+      "local.approval.decide",
+      "local.founder-verdict.issue",
+      "local.evidence.read"
+    ],
+    "authorization_policy_ref": {
+      "contract_id": "replace-authorization-policy",
+      "version": "v1",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "task_kind": "Founder",
+    "policy_kind": "LocalUser",
+    "verdict_kind": "FounderAuthority"
+  },
+  "task_guard": {
+    "allowed_work_types": ["governed_repository_change"],
+    "allowed_input_snapshot_ids": ["replace-input-snapshot"],
+    "allowed_target_scope_refs": ["replace-target-scope"],
+    "acceptance_contract_ref": {
+      "contract_id": "replace-acceptance-contract",
+      "version": "v1",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "budget_profile_ref": {
+      "contract_id": "replace-budget-profile",
+      "version": "v1",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  },
+  "policy": {
+    "authentication_context_ref": "local-ipc:windows-named-pipe",
+    "authorization_policy_ref": {
+      "contract_id": "replace-authorization-policy",
+      "version": "v1",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "allowed_scope_refs": ["adapter-edge://codex/approval/scope"],
+    "decision_ttl_seconds": 300
+  },
+  "founder": {
+    "allowed_founder_principal_ids": ["local-user:replace-me"],
+    "authority_ref": "founder-authority:local",
+    "authority_policy_ref": {
+      "contract_id": "replace-founder-policy",
+      "version": "v1",
+      "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "allowed_confirmation_proof_refs": ["confirmation://replace-me"],
+    "non_overridable_gate_ids": ["G0", "G1", "G2", "G3"],
+    "confirmation_ttl_seconds": 300
+  },
+  "codex": {
+    "input_bundle_root": "egopulse-data/input-bundles",
+    "workspace_root": "egopulse-workspaces",
+    "codex_executable": "codex",
+    "lease_ttl_seconds": 300,
+    "workflow": {
+      "run_id": "run:replace-me",
+      "attempt_id": "attempt:replace-me",
+      "dispatch_id": "dispatch:replace-me",
+      "harness_id": "codex",
+      "capability_profile_ref": {
+        "contract_id": "replace-capability-profile",
+        "version": "v1",
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "workspace_ref": "workspace:replace-me",
+      "lease_policy_ref": {
+        "contract_id": "replace-lease-policy",
+        "version": "v1",
+        "sha256": "1212121212121212121212121212121212121212121212121212121212121212"
+      },
+      "owner_instance_id": "agentosd:default",
+      "task_authority_principal_id": "task-authority:local",
+      "collaboration_principal_id": "collaboration-control:local",
+      "attempt_supervisor_principal_id": "attempt-supervisor:local",
+      "harness_adapter_principal_id": "harness-adapter:codex",
+      "plan": {
+        "plan_id": "plan:replace-me",
+        "digest_sha256": "1313131313131313131313131313131313131313131313131313131313131313",
+        "max_active_attempts": 1,
+        "step": {
+          "step_id": "step:replace-me",
+          "step_kind": "governed_repository_change",
+          "depends_on_step_ids": [],
+          "input_bundle_ref": "input-bundle:replace-me",
+          "expected_output_contract_ref": null,
+          "required_capability_profile_ref": null,
+          "max_attempts": 1
+        },
+        "budget_profile_ref": {
+          "contract_id": "replace-budget-profile",
+          "version": "v1",
+          "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        }
+      },
+      "material": {
+        "input_bundle_sha256": "1414141414141414141414141414141414141414141414141414141414141414",
+        "sandbox_profile_ref": {
+          "contract_id": "replace-sandbox-profile",
+          "version": "v1",
+          "sha256": "1515151515151515151515151515151515151515151515151515151515151515"
+        },
+        "tool_policy_ref": {
+          "contract_id": "replace-tool-policy",
+          "version": "v1",
+          "sha256": "1616161616161616161616161616161616161616161616161616161616161616"
+        },
+        "data_egress_policy_ref": {
+          "contract_id": "replace-egress-policy",
+          "version": "v1",
+          "sha256": "1717171717171717171717171717171717171717171717171717171717171717"
+        },
+        "approval_policy_ref": {
+          "contract_id": "replace-approval-policy",
+          "version": "v1",
+          "sha256": "1818181818181818181818181818181818181818181818181818181818181818"
+        },
+        "session_strategy": "create_new",
+        "native_session_ref": null,
+        "checkpoint_ref": null,
+        "evidence_refs": ["config://replace-me"]
+      }
+    }
+  }
+}

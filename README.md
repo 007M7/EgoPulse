@@ -6,7 +6,7 @@ The repository starts from the frozen architecture and technology baseline. It d
 
 ## Foundation status
 
-Current maturity: **Gate 4 vertical implementation in progress — V-01/C5 CLI+TUI closed, Phase 2-02 composition still open**.
+Current maturity: **Gate 4 vertical implementation in progress — V-01/C5 CLI+TUI closed, typed production bootstrap wired, Sego/second Harness pending**.
 
 Available now:
 
@@ -14,6 +14,7 @@ Available now:
 - V-01 governed single-Harness control path: Task activation → Collaboration commit → Adapter dispatch → activation acknowledgement;
 - Codex App Server adapter with durable Adapter Edge and an explicit `CodexHarnessCompositionConfig` composition root;
 - C5 real Windows local-IPC E2E coverage for daemon, CLI and TUI (serial fixture run: 6/6 passed);
+- user-owned production bootstrap JSON with environment-resolved secret keys and fail-closed validation;
 - Tauri 2 + React + TypeScript desktop shell;
 - TypeScript packages for generated clients, Agent SDK and the bounded native Harness;
 - isolated CPython 3.14 Worker project managed by uv;
@@ -23,7 +24,6 @@ Available now:
 
 Not implemented yet:
 
-- default production bootstrap that opens the authorities and injects reviewed local-user policy plus Harness workflow configuration from a user-owned configuration store;
 - second Harness adapter and multi-model collaboration path (Kimi CLI / DeepSeek Harness are next Phase 2-03 candidates);
 - governed Memory/RAG subsystem and its Python Worker boundary;
 - SQLCipher-backed Memory/RAG indexes and retrieval evaluation;

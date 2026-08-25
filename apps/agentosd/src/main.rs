@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
 
-use egopulse_agentosd::{
-    DaemonComposition, DaemonConfig, DaemonProviderFactory, FailClosedProviderFactory,
-};
+use egopulse_agentosd::{DaemonComposition, DaemonConfig, ProductionBootstrapConfig};
 
 #[tokio::main]
 async fn main() {
@@ -14,7 +12,15 @@ async fn main() {
         }
     };
 
-    let providers = FailClosedProviderFactory.build();
+    let providers = match ProductionBootstrapConfig::from_environment()
+        .and_then(ProductionBootstrapConfig::build)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("agentosd startup refused: {error}");
+            std::process::exit(78);
+        }
+    };
     let daemon = match DaemonComposition::build(config, providers) {
         Ok(value) => value,
         Err(error) => {
