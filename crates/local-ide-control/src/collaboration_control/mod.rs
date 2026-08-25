@@ -4,6 +4,7 @@ mod harness_dispatch;
 mod ingestion;
 mod single_harness_workflow;
 mod store;
+mod task_activation_guard;
 
 pub use adapter_evidence::AdapterBackedHarnessEvidenceResolver;
 pub use composite_guard::CompositeCollaborationGuard;
@@ -16,6 +17,7 @@ pub use single_harness_workflow::{
     SingleHarnessWorkConfig, SingleHarnessWorkError, SingleHarnessWorkResult,
     start_single_harness_workflow,
 };
+pub use task_activation_guard::TaskActivationReferenceGuard;
 
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCancellationDisposition,
