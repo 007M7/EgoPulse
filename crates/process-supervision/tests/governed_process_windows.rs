@@ -5,7 +5,9 @@ use egopulse_process_supervision::{
     run_governed_framed_process, run_governed_process,
 };
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::process::Command;
 
 fn powershell_executable() -> PathBuf {
     let system_root = std::env::var_os("SystemRoot").expect("SystemRoot is available");
@@ -40,6 +42,63 @@ fn budget(timeout: Duration, output_limit_bytes: u64) -> GovernedProcessBudget {
         timeout,
         output_limit_bytes,
     }
+}
+
+fn unique_pid_file(test_name: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "egopulse-process-supervision-{test_name}-{}-{nonce}.pid",
+        std::process::id()
+    ))
+}
+
+fn pid_writer_script(pid_file: &std::path::Path) -> String {
+    let escaped = pid_file.to_string_lossy().replace('\'', "''");
+    format!("Set-Content -NoNewline -LiteralPath '{escaped}' -Value $PID; Start-Sleep -Seconds 30")
+}
+
+async fn wait_for_pid(pid_file: &std::path::Path) -> u32 {
+    for _ in 0..100 {
+        if let Ok(value) = std::fs::read_to_string(pid_file)
+            && let Ok(pid) = value.trim().parse()
+        {
+            return pid;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("child did not publish its PID: {pid_file:?}");
+}
+
+async fn process_is_running(pid: u32) -> bool {
+    let status = Command::new(powershell_executable())
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+            ),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .expect("query child process state");
+    status.success()
+}
+
+async fn wait_until_process_stops(pid: u32) -> bool {
+    for _ in 0..100 {
+        if !process_is_running(pid).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
 }
 
 #[tokio::test]
@@ -82,14 +141,44 @@ async fn governed_process_maps_real_child_crash() {
 
 #[tokio::test]
 async fn governed_process_maps_real_child_timeout() {
+    let pid_file = unique_pid_file("timeout");
     let error = run_governed_process(
-        &powershell_spec("Start-Sleep -Seconds 2"),
+        &powershell_spec(&pid_writer_script(&pid_file)),
         b"request",
-        budget(Duration::from_millis(100), 64),
+        budget(Duration::from_secs(3), 64),
     )
     .await
     .expect_err("long-running child must time out");
     assert_eq!(error, GovernedProcessError::Timeout);
+    let pid = wait_for_pid(&pid_file).await;
+    assert!(
+        !process_is_running(pid).await,
+        "timed-out child process remained alive: {pid}"
+    );
+    let _ = std::fs::remove_file(pid_file);
+}
+
+#[tokio::test]
+async fn dropping_a_governed_exchange_kills_the_real_child() {
+    let pid_file = unique_pid_file("cancel");
+    let spec = powershell_spec(&pid_writer_script(&pid_file));
+    let exchange = tokio::spawn(async move {
+        run_governed_process(&spec, b"request", budget(Duration::from_secs(60), 64)).await
+    });
+    let pid = wait_for_pid(&pid_file).await;
+    assert!(
+        process_is_running(pid).await,
+        "child never became observable"
+    );
+
+    exchange.abort();
+    let join_error = exchange.await.expect_err("exchange must be cancelled");
+    assert!(join_error.is_cancelled());
+    assert!(
+        wait_until_process_stops(pid).await,
+        "cancelled child process remained alive: {pid}"
+    );
+    let _ = std::fs::remove_file(pid_file);
 }
 
 #[tokio::test]

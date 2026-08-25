@@ -18,11 +18,14 @@ same `SupervisedProcessSpec` path used by a Worker. It proves:
 | non-zero child exit | `Crashed` |
 | child exceeds deadline | `Timeout` |
 | child exceeds stdout budget | `OutputLimit` |
+| caller cancels the exchange | child PID is terminated by `kill_on_drop` |
 
 The tests intentionally use a system executable only as a deterministic test
-fixture. Production Workers remain explicit absolute executable paths with
-their own working directory, environment policy, native protocol and approved
-business contract.
+fixture. Timeout performs an explicit terminate-and-reap before returning;
+caller cancellation is verified against the real Windows PID after the
+exchange future is dropped. Production Workers remain explicit absolute
+executable paths with their own working directory, environment policy, native
+protocol and approved business contract.
 
 ## Boundary interpretation
 

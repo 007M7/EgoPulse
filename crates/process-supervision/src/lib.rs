@@ -333,9 +333,17 @@ pub async fn run_governed_process(
             duration_ms: started.elapsed().as_millis() as u64,
         })
     };
-    tokio::time::timeout(budget.timeout, operation)
-        .await
-        .map_err(|_| GovernedProcessError::Timeout)?
+    match tokio::time::timeout(budget.timeout, operation).await {
+        Ok(Ok(receipt)) => Ok(receipt),
+        Ok(Err(error)) => {
+            terminate_and_reap(&mut child).await;
+            Err(error)
+        }
+        Err(_) => {
+            terminate_and_reap(&mut child).await;
+            Err(GovernedProcessError::Timeout)
+        }
+    }
 }
 
 /// Runs one request/response exchange using a fixed 4-byte big-endian length
@@ -369,6 +377,13 @@ async fn read_bounded(
         .read_to_end(&mut bytes)
         .await?;
     Ok(bytes)
+}
+
+async fn terminate_and_reap(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
 }
 
 fn absolute_file_candidate(path: &Path) -> bool {
