@@ -6,8 +6,8 @@ mod store;
 mod supervisor;
 
 pub use reference_resolver::{
-    ArtifactBackedReferenceResolver, ArtifactReferenceSource, ArtifactReferenceSourceError,
-    ReferenceResolverConfigurationError,
+    ArtifactBackedReferenceResolver, ArtifactContentSource, ArtifactReferenceSource,
+    ArtifactReferenceSourceError, ReferenceResolverConfigurationError,
 };
 pub use sego::{
     CheckerProcessFailure, SegoFindingEvidenceBinding, SegoMapError, SegoMappedResult,

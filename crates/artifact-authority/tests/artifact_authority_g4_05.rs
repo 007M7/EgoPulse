@@ -694,6 +694,13 @@ fn cross_authority_reads_expose_only_decoded_immutable_snapshots() {
     assert_eq!(artifact_set.status, ArtifactSetStatus::Sealed as i32);
     assert_eq!(artifact_set.canonical_manifest, Some(manifest));
 
+    assert_eq!(
+        authority
+            .read_blob(&content_address(b"baseline-tree"))
+            .expect("read verified Artifact content"),
+        b"baseline-tree"
+    );
+
     let claim = authority
         .read_claim("claim-code-change-001")
         .expect("read Claim")

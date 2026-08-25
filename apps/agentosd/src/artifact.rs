@@ -7,10 +7,12 @@ use egopulse_artifact_authority::{
     ArtifactAdmissionGuard, ArtifactAuthority, ArtifactAuthorityFailure, ArtifactClock,
 };
 use egopulse_domain_contracts::v01::egopulse::artifact::v1::{
-    ArtifactDescriptor, ArtifactSet, Claim, Evidence, ReturnHandoff,
+    ArtifactDescriptor, ArtifactSet, Claim, ContentAddress, Evidence, ReturnHandoff,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
-use egopulse_verification_authority::{ArtifactReferenceSource, ArtifactReferenceSourceError};
+use egopulse_verification_authority::{
+    ArtifactContentSource, ArtifactReferenceSource, ArtifactReferenceSourceError,
+};
 
 /// Read-only adapter from the Artifact Authority's shared owner handle to the
 /// Verification Authority reference boundary.
@@ -235,6 +237,23 @@ where
             .lock()
             .map_err(|_| ArtifactReferenceSourceError::Unavailable)?
             .read_artifact_set(artifact_set_id)
+            .map_err(map_authority_failure)
+    }
+}
+
+impl<G, C> ArtifactContentSource for ArtifactAuthorityReferenceSource<G, C>
+where
+    G: ArtifactAdmissionGuard + Send + 'static,
+    C: ArtifactClock + Send + 'static,
+{
+    fn read_content(
+        &self,
+        address: &ContentAddress,
+    ) -> Result<Vec<u8>, ArtifactReferenceSourceError> {
+        self.authority
+            .lock()
+            .map_err(|_| ArtifactReferenceSourceError::Unavailable)?
+            .read_blob(address)
             .map_err(map_authority_failure)
     }
 }

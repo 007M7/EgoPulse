@@ -107,6 +107,12 @@ owner handle is shared with the typed Artifact projection source. This closes
 the artifact admission prerequisite, but does not yet authorize Verification
 requests or Sego output.
 
+The read boundary now also exposes digest-reverified content bytes through the
+separate `ArtifactContentSource` contract. It returns bytes only; no Artifact
+database, blob path, or write handle crosses into Verification. This is the
+content-plane prerequisite for the supervised Sego runner and is covered by
+the Artifact G4-05 read-boundary test.
+
 The local G4-06 verification suite currently passes all 13 tests, including
 Sego mapping, stale profile/input binding, checker policy rewrite rejection,
 timeout, crash, and output-limit probes. The existing supervisor and mapper

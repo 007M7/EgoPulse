@@ -63,12 +63,14 @@ and projection are available, but unreviewed external verification requests
 cannot be accepted.
 
 The first prerequisite for replacing that deny boundary is now available in
-Artifact Authority: `read_artifact`, `read_claim`, `read_evidence` and
-`read_artifact_set` expose decoded immutable snapshots without exposing the
-private store or a write path. The next resolver must consume only these
-methods, verify a sealed ArtifactSet/Claim/Evidence lineage, and then invoke
-the separately supervised Sego checker. User configuration alone remains
-insufficient to authorize evidence.
+Artifact Authority: `read_artifact`, `read_claim`, `read_evidence`,
+`read_artifact_set` and digest-reverified `read_blob` expose immutable
+snapshots or bytes without exposing the private store, filesystem path, or a
+write path. The Verification boundary models the content plane separately as
+`ArtifactContentSource`; the next resolver/runner must consume only these
+owner-backed methods, verify a sealed ArtifactSet/Claim/Evidence lineage, and
+then invoke the separately supervised Sego checker. User configuration alone
+remains insufficient to authorize evidence.
 
 The agentosd composition now also contains
 `ArtifactAuthorityReferenceSource`. It accepts only the shared

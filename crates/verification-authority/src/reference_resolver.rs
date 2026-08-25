@@ -1,7 +1,7 @@
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{
         ArtifactDescriptor, ArtifactSet, ArtifactSetStatus, ArtifactStatus, Claim, ClaimStatus,
-        Evidence, EvidenceStatus, IntegrityStatus,
+        ContentAddress, Evidence, EvidenceStatus, IntegrityStatus,
     },
     verification::v1::{CheckerProfile, VerificationBinding, VerificationRequest},
 };
@@ -32,6 +32,16 @@ pub trait ArtifactReferenceSource: Send + Sync + 'static {
         &self,
         artifact_set_id: &str,
     ) -> Result<Option<ArtifactSet>, ArtifactReferenceSourceError>;
+}
+
+/// Optional content-plane companion to the immutable metadata boundary. The
+/// implementation may return bytes, but must re-verify the supplied content
+/// address and must not expose a filesystem path, blob store, or writer.
+pub trait ArtifactContentSource: ArtifactReferenceSource {
+    fn read_content(
+        &self,
+        address: &ContentAddress,
+    ) -> Result<Vec<u8>, ArtifactReferenceSourceError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]

@@ -236,6 +236,15 @@ where
         self.blobs.put_verified(bytes, expected).map(|_| ())
     }
 
+    /// Reads a content-addressed payload only after re-verifying its digest
+    /// and length. The blob store remains private to Artifact Authority; a
+    /// caller receives bytes, never a path or store handle.
+    pub fn read_blob(&self, address: &ContentAddress) -> Result<Vec<u8>, ArtifactAuthorityFailure> {
+        self.blobs
+            .read_verified(address)
+            .map_err(ArtifactAuthorityFailure::Blob)
+    }
+
     pub fn read_artifact(
         &self,
         artifact_id: &str,
