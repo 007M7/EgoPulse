@@ -6,7 +6,7 @@ The repository starts from the frozen architecture and technology baseline. It d
 
 ## Foundation status
 
-Current maturity: **Gate 4 vertical implementation in progress — V-01/C5 CLI+TUI closed, typed production bootstrap wired, Sego/second Harness pending**.
+Current maturity: **Gate 4 vertical implementation in progress – V-01/C5 CLI+TUI closed, typed production bootstrap wired, Sego single-criterion verification closed, second Harness and Memory/RAG contract pending**.
 
 Available now:
 
@@ -20,17 +20,20 @@ Available now:
 - isolated CPython 3.14 Worker project managed by uv;
 - internal Rust Memory Authority with SQLCipher persistence, candidate-only
   agent writes, Founder promotion/revocation and accepted retrieval snapshots;
+- explicit Sego/checker verification composition with owner-backed Artifact
+  reads, supervised execution, immutable verification artifacts and Task
+  write-back; the real G4-10 handoff/replay fixture passes;
 - Protobuf/Buf and JSON Schema contract roots;
 - local CI, repository-boundary checks and commit-bound release-candidate packaging.
 - account-authenticated Windows Named Pipe / Unix Domain Socket transport and an ephemeral, policy-resolved local session service.
 
 Not implemented yet:
 
-- second Harness adapter and multi-model collaboration path (Kimi CLI / DeepSeek Harness are next Phase 2-03 candidates);
 - public Memory/RAG API and the frozen Rust/Python Worker contract (internal
   Authority and read-only Worker slices exist, but are not wired to the daemon);
 - SQLCipher-backed Memory/RAG indexes and retrieval evaluation;
-- Sego verification integration;
+- authenticated second Harness lifecycle and multi-model production dispatch;
+- approved Rust/Python Memory/RAG wire contract and daemon wiring;
 - production packaging or release.
 
 ## Repository map
