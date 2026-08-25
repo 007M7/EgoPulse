@@ -27,7 +27,7 @@ use egopulse_local_ide_control::collaboration_control::{
     CollaborationReferenceGuard, CollaborationSqlCipherKey, DispatchMaterial,
     HarnessEvidenceResolver, HarnessFactIngestionDisposition, LeaseAuthorization,
     ReferenceAuthorization, ReferenceGuardRejection, ResolvedHarnessEvidence,
-    canonical_dispatch_fingerprint, canonical_request_digest,
+    canonical_dispatch_fingerprint, canonical_request_digest, dispatch_pending, pump_observations,
 };
 use prost_types::Timestamp;
 use rusqlite::Connection;
@@ -1289,53 +1289,13 @@ async fn fake_adapter_consumes_collaboration_outbox_and_settles_durable_candidat
         clock,
     );
 
-    let dispatched = adapter
-        .dispatch(&envelope)
+    let cycle = dispatch_pending(&mut control, &mut adapter, &harness_adapter())
         .await
-        .expect("dispatch committed envelope to fake Adapter");
-    let receipt = match dispatched.outcome.expect("dispatch outcome") {
-        dispatch_result::Outcome::Receipt(value) => value,
-        dispatch_result::Outcome::Error(error) => panic!("unexpected dispatch error: {error:?}"),
-    };
-    let delivered = control
-        .ingest_dispatch_receipt(&receipt, &harness_adapter())
-        .expect("commit Adapter delivery candidate");
-    assert_eq!(
-        delivered.disposition,
-        HarnessFactIngestionDisposition::Consumed
-    );
-
-    let ack = adapter
-        .pump_one(&envelope)
-        .await
-        .expect("pump ACK")
-        .expect("ACK observation");
-    let acknowledged = control
-        .ingest_harness_observation(&ack, &harness_adapter())
-        .expect("commit ACK candidate");
-    assert_eq!(
-        acknowledged.disposition,
-        HarnessFactIngestionDisposition::Consumed
-    );
-    adapter
-        .mark_observation_consumed(&ack.observation_id)
-        .expect("settle committed ACK candidate");
-
-    let running = adapter
-        .pump_one(&envelope)
-        .await
-        .expect("pump running")
-        .expect("running observation");
-    let started = control
-        .ingest_harness_observation(&running, &harness_adapter())
-        .expect("commit running candidate");
-    assert_eq!(
-        started.disposition,
-        HarnessFactIngestionDisposition::Consumed
-    );
-    adapter
-        .mark_observation_consumed(&running.observation_id)
-        .expect("settle committed running candidate");
+        .expect("run provider-neutral dispatch cycle");
+    assert_eq!(cycle.dispatches_seen, 1);
+    assert_eq!(cycle.dispatches_delivered, 1);
+    assert_eq!(cycle.observations_seen, 3);
+    assert_eq!(cycle.observations_deferred, 1);
 
     let snapshot = load_snapshot(&control);
     assert_eq!(
@@ -1368,46 +1328,13 @@ async fn fake_adapter_consumes_collaboration_outbox_and_settles_durable_candidat
         )
         .await
         .expect("deliver cancellation by dispatch ID");
-    let interrupted = loop {
-        let observation = adapter
-            .pump_one(&envelope)
+    let cancellation_cycle =
+        pump_observations(&mut control, &mut adapter, &envelope, &harness_adapter())
             .await
-            .expect("pump cancellation candidate")
-            .expect("cancellation candidate");
-        if matches!(
-            observation.payload,
-            Some(harness_observation::Payload::Lifecycle(ref lifecycle))
-                if lifecycle.kind == LifecycleKind::ExecutionInterrupted as i32
-        ) {
-            break observation;
-        }
-        let routed = control
-            .ingest_harness_observation(&observation, &harness_adapter())
-            .expect("route pre-existing terminal candidate");
-        assert_eq!(
-            routed.disposition,
-            HarnessFactIngestionDisposition::DeferredToArtifactAuthority
-        );
-        adapter
-            .mark_observation_consumed(&observation.observation_id)
-            .expect("settle deferred terminal candidate");
-    };
-    let cancelled = control
-        .ingest_harness_observation(&interrupted, &harness_adapter())
-        .expect("confirm cancellation from durable Adapter interruption");
-    assert_eq!(
-        cancelled.disposition,
-        HarnessFactIngestionDisposition::Consumed
-    );
-    adapter
-        .mark_observation_consumed(&interrupted.observation_id)
-        .expect("settle committed interruption candidate");
-    let cancelled_snapshot = committed_snapshot(
-        cancelled
-            .authority_result
-            .as_ref()
-            .expect("cancel authority result"),
-    );
+            .expect("confirm cancellation from durable Adapter interruption");
+    assert_eq!(cancellation_cycle.observations_seen, 1);
+    assert_eq!(cancellation_cycle.observations_consumed, 1);
+    let cancelled_snapshot = load_snapshot(&control);
     assert_eq!(
         cancelled_snapshot.attempts[0].status,
         AttemptStatus::Cancelled as i32

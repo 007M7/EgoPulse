@@ -1,8 +1,12 @@
 mod adapter_evidence;
+mod harness_dispatch;
 mod ingestion;
 mod store;
 
 pub use adapter_evidence::AdapterBackedHarnessEvidenceResolver;
+pub use harness_dispatch::{
+    HarnessDispatchCycleError, HarnessDispatchCycleReport, dispatch_pending, pump_observations,
+};
 pub use ingestion::{HarnessFactIngestionDisposition, HarnessFactIngestionResult};
 
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
