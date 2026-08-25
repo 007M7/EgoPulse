@@ -44,7 +44,30 @@ def test_retrieval_returns_references_without_returning_memory_content() -> None
     assert result.algorithm_id == "lexical-overlap-v0"
     assert [candidate.memory_id for candidate in result.candidates] == ["m-01", "m-02"]
     assert not hasattr(result.candidates[0], "content")
-    assert result.evidence_ref.startswith("memory-rag-evidence-sha256:")
+    assert result.query_sha256 == (
+        "f569a1af01e40d1065be4369029f6a64c0b1ac5fb9bcad6dfcb0e41920fbcb52"
+    )
+    assert [
+        (candidate.memory_id, candidate.content_sha256, candidate.score, candidate.matched_terms)
+        for candidate in result.candidates
+    ] == [
+        (
+            "m-01",
+            "a3fe7f4a473dd1cdcea1ab86dfc4382f2918b11c498909f48cd5d40934e766d2",
+            1.0,
+            ("authority", "boundary", "rust"),
+        ),
+        (
+            "m-02",
+            "0d2951eb451b0535a50fc662d39a06ca48e977fd8f7dacb6ef68e9943627fc3d",
+            0.55792673,
+            ("authority", "rust"),
+        ),
+    ]
+    assert (
+        result.evidence_ref
+        == "memory-rag-evidence-sha256:ba14827d1ca52484521d8662a8ddcc98c8e4bf39395727ec76b35e51b48432cd"
+    )
 
 
 def test_candidate_revoked_and_out_of_scope_records_are_not_retrieved() -> None:

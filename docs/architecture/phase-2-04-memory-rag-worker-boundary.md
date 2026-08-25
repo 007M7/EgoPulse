@@ -75,5 +75,10 @@ the Memory Authority and retrieval contract are frozen.
 
 The local tests cover normal ranking, scope/state filtering, digest mismatch,
 duplicate identity, invalid request limits and deterministic tie/evidence
-replay. The worker has no persistence dependency and therefore cannot silently
-write Memory facts during retrieval.
+replay. The first deterministic golden vector is pinned in
+`workers/memory-rag/tests/test_retrieval.py`; it fixes the ordered candidate
+identity, matched terms, query digest and evidence digest for the
+`lexical-overlap-v0` baseline. This is algorithm regression evidence only. It
+does not freeze the future cross-language Memory contract or authorize a
+particular embedding, index or reranker. The worker has no persistence
+dependency and therefore cannot silently write Memory facts during retrieval.
