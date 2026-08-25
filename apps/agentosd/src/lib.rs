@@ -99,11 +99,13 @@ pub use verdict::{
     VerificationAuthorityArtifactSource,
 };
 pub use verification::{
-    CheckerProfileAttestationError, CheckerProfileAttestationResult,
+    CheckerProfileAttestationError, CheckerProfileAttestationResult, ConfiguredVerificationWorker,
     SystemCheckerProfileAttestation, SystemTaskVerificationWriteBack,
     TaskVerificationWriteBackError, TaskVerificationWriteBackResult, VerificationBindingTemplate,
     VerificationHandoffConsumeResult, VerificationHandoffIntake, VerificationHandoffIntakeError,
     VerificationHandoffPlan, VerificationHandoffPlanError, VerificationHandoffRequest,
+    VerificationWorker, VerificationWorkerConfig, VerificationWorkerConfigurationError,
+    VerificationWorkerCycleError, VerificationWorkerCycleResult,
 };
 
 #[derive(Clone, Debug)]
@@ -115,6 +117,7 @@ pub struct DaemonConfig {
     pub token_mac_key: [u8; 32],
     pub session_ttl: Duration,
     pub harness_dispatch_interval: Duration,
+    pub verification_interval: Duration,
 }
 
 impl DaemonConfig {
@@ -152,6 +155,18 @@ impl DaemonConfig {
                 ));
             }
         };
+        let verification_interval = match std::env::var("EGOPULSE_VERIFICATION_INTERVAL_MS") {
+            Ok(value) => value
+                .parse::<u64>()
+                .map(Duration::from_millis)
+                .map_err(|_| DaemonBootstrapError::InvalidSetting("Verification interval"))?,
+            Err(std::env::VarError::NotPresent) => Duration::from_millis(250),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(DaemonBootstrapError::InvalidSetting(
+                    "Verification interval",
+                ));
+            }
+        };
 
         Ok(Self {
             instance: std::env::var("EGOPULSE_IPC_INSTANCE")
@@ -165,6 +180,7 @@ impl DaemonConfig {
             token_mac_key,
             session_ttl,
             harness_dispatch_interval,
+            verification_interval,
         })
     }
 
@@ -200,6 +216,13 @@ impl DaemonConfig {
         {
             return Err(DaemonCompositionError::InvalidConfiguration(
                 "Harness dispatch interval",
+            ));
+        }
+        if self.verification_interval < Duration::from_millis(10)
+            || self.verification_interval > Duration::from_secs(60)
+        {
+            return Err(DaemonCompositionError::InvalidConfiguration(
+                "Verification interval",
             ));
         }
         Ok(())
@@ -238,6 +261,7 @@ pub struct DaemonProviders {
     pub verdict_port: Arc<dyn VerdictCommandPort>,
     pub projection_source: Option<Arc<dyn OwnerProjectionSource>>,
     pub harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
+    pub verification_worker: Option<Arc<dyn VerificationWorker>>,
     pub task_activation_source: Option<Arc<dyn TaskActivationSource>>,
 }
 
@@ -343,6 +367,7 @@ impl DaemonProviders {
             verdict_port: Arc::new(FailClosedVerdictPort),
             projection_source: None,
             harness_dispatch_runner: None,
+            verification_worker: None,
             task_activation_source: None,
         }
     }
@@ -397,6 +422,7 @@ impl DaemonProviders {
                 projection_sources,
             ))),
             harness_dispatch_runner: None,
+            verification_worker: None,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
         }
     }
@@ -427,6 +453,7 @@ impl DaemonProviders {
                 projection_sources,
             ))),
             harness_dispatch_runner: None,
+            verification_worker: None,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
         }
     }
@@ -434,6 +461,12 @@ impl DaemonProviders {
     #[must_use]
     pub fn with_harness_dispatch_runner(mut self, runner: Arc<dyn HarnessDispatchRunner>) -> Self {
         self.harness_dispatch_runner = Some(runner);
+        self
+    }
+
+    #[must_use]
+    pub fn with_verification_worker(mut self, worker: Arc<dyn VerificationWorker>) -> Self {
+        self.verification_worker = Some(worker);
         self
     }
 
@@ -556,6 +589,8 @@ pub enum DaemonServeError {
     Projection(#[from] ProjectionPumpFailure),
     #[error("harness dispatch runner failed")]
     Dispatch(#[from] HarnessDispatchCycleError),
+    #[error("verification worker failed")]
+    Verification(#[from] VerificationWorkerCycleError),
     #[error("daemon background worker stopped unexpectedly")]
     BackgroundStopped,
 }
@@ -569,6 +604,8 @@ pub struct DaemonComposition {
     projection_pump: Option<ProjectionPump>,
     harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
     harness_dispatch_interval: Duration,
+    verification_worker: Option<Arc<dyn VerificationWorker>>,
+    verification_interval: Duration,
 }
 
 impl DaemonComposition {
@@ -641,6 +678,7 @@ impl DaemonComposition {
             .projection_source
             .map(|source| ProjectionPump::new(Arc::clone(&model), notifier, source));
         let harness_dispatch_runner = providers.harness_dispatch_runner;
+        let verification_worker = providers.verification_worker;
 
         Ok(Self {
             address,
@@ -651,6 +689,8 @@ impl DaemonComposition {
             projection_pump,
             harness_dispatch_runner,
             harness_dispatch_interval: config.harness_dispatch_interval,
+            verification_worker,
+            verification_interval: config.verification_interval,
         })
     }
 
@@ -671,6 +711,8 @@ impl DaemonComposition {
             projection_pump,
             harness_dispatch_runner,
             harness_dispatch_interval,
+            verification_worker,
+            verification_interval,
             ..
         } = self;
         let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
@@ -692,6 +734,8 @@ impl DaemonComposition {
             projection_pump,
             harness_dispatch_runner,
             harness_dispatch_interval,
+            verification_worker,
+            verification_interval,
             stop_receiver,
         ));
         tokio::select! {
@@ -716,43 +760,55 @@ async fn run_background_workers(
     projection_pump: Option<ProjectionPump>,
     harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
     harness_dispatch_interval: Duration,
+    verification_worker: Option<Arc<dyn VerificationWorker>>,
+    verification_interval: Duration,
     stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), DaemonServeError> {
-    match (projection_pump, harness_dispatch_runner) {
-        (Some(projection_pump), Some(runner)) => {
-            tokio::select! {
-                result = projection_pump.run(stop.clone()) => {
-                    result.map_err(DaemonServeError::Projection)
-                }
-                result = run_harness_dispatch_worker(runner, harness_dispatch_interval, stop) => {
-                    result.map_err(DaemonServeError::Dispatch)
-                }
-            }
-        }
-        (Some(projection_pump), None) => projection_pump
-            .run(stop)
-            .await
-            .map_err(DaemonServeError::Projection),
-        (None, Some(runner)) => {
+    let mut workers = tokio::task::JoinSet::new();
+    if let Some(projection_pump) = projection_pump {
+        let stop = stop.clone();
+        workers.spawn(async move {
+            projection_pump
+                .run(stop)
+                .await
+                .map_err(DaemonServeError::Projection)
+        });
+    }
+    if let Some(runner) = harness_dispatch_runner {
+        let stop = stop.clone();
+        workers.spawn(async move {
             run_harness_dispatch_worker(runner, harness_dispatch_interval, stop)
                 .await
                 .map_err(DaemonServeError::Dispatch)
-        }
-        (None, None) => {
-            // A fail-closed daemon has no projection or Harness worker, but
-            // it must still observe the server shutdown signal. Waiting
-            // forever here would make a clean IPC shutdown hang after the
-            // gRPC server has already stopped.
-            let mut stop = stop;
-            loop {
-                if *stop.borrow() {
-                    return Ok(());
-                }
-                if stop.changed().await.is_err() {
-                    return Ok(());
-                }
+        });
+    }
+    if let Some(worker) = verification_worker {
+        let stop_for_worker = stop.clone();
+        workers.spawn(async move {
+            run_verification_worker(worker, verification_interval, stop_for_worker)
+                .await
+                .map_err(DaemonServeError::Verification)
+        });
+    }
+    if workers.is_empty() {
+        let mut stop = stop;
+        loop {
+            if *stop.borrow() {
+                return Ok(());
+            }
+            if stop.changed().await.is_err() {
+                return Ok(());
             }
         }
+    }
+    if let Some(result) = workers.join_next().await {
+        workers.abort_all();
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(DaemonServeError::BackgroundStopped),
+        }
+    } else {
+        Err(DaemonServeError::BackgroundStopped)
     }
 }
 
@@ -776,6 +832,29 @@ async fn run_harness_dispatch_worker(
             }
             _ = ticker.tick() => {
             }
+        }
+    }
+}
+
+async fn run_verification_worker(
+    worker: Arc<dyn VerificationWorker>,
+    interval: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), VerificationWorkerCycleError> {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
+    loop {
+        if *stop.borrow() {
+            return Ok(());
+        }
+        worker.run_once().await?;
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = ticker.tick() => {}
         }
     }
 }
@@ -873,6 +952,7 @@ mod tests {
                 token_mac_key: [0x22; 32],
                 session_ttl: Duration::from_secs(60),
                 harness_dispatch_interval: Duration::from_millis(25),
+                verification_interval: Duration::from_millis(25),
             },
             root,
         )

@@ -170,3 +170,26 @@ artifact through Verification Authority, checks the artifact lineage against
 the exact pending Task revision/work revision, then submits a deterministic
 write using the fixed `SegoVerification` system principal. It does not accept
 an API/client principal or an artifact ID whose lineage was not proven.
+
+`ConfiguredVerificationWorker` now composes the full single-worker boundary:
+profile attestation, Task handoff intake, Verification-owned request recovery
+scan, the single-criterion Sego coordinator, and Task write-back. Its reviewed
+configuration explicitly supplies the checker executable/arguments, workspace,
+request bytes, profile, mapper policy, stable IDs, and process budget. No
+checker, workspace, model, or policy is inferred from Task text or process
+output. The worker is installed only when `VerificationWorkerConfig` is
+explicitly injected; the default user JSON path remains deny-by-default.
+
+Verification exposes queued, running, and completed request snapshots as a
+read-only recovery feed. This is required because Task outbox acknowledgement
+and Verification execution are separate durable commits. A crash after the
+handoff ACK or after artifact completion is recovered from Verification state,
+not from an already-consumed Task message. Same-digest active profile
+attestation and same-artifact Task write-back are safe replays; digest,
+lineage, work-revision, or artifact drift remains a hard failure.
+
+`DaemonConfig` has a separate `EGOPULSE_VERIFICATION_INTERVAL_MS` polling
+interval. The daemon runs the Verification worker alongside projection and
+Harness workers, and a worker failure stops the serving composition. The local
+G4-10 fixture covers the real chain through checker process, immutable
+Verification artifact, Task transition, and a second-cycle replay.

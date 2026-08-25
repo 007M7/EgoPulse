@@ -354,6 +354,19 @@ where
             .transpose()
     }
 
+    /// Reads a committed checker profile through the owner boundary. A
+    /// system worker may use this only to recognize an already active,
+    /// digest-identical attestation; it never replaces the profile.
+    pub fn checker_profile(
+        &self,
+        checker_profile_id: &str,
+    ) -> Result<Option<CheckerProfile>, VerificationAuthorityFailure> {
+        self.store
+            .profile(checker_profile_id)?
+            .map(|bytes| CheckerProfile::decode(bytes.as_slice()).map_err(Into::into))
+            .transpose()
+    }
+
     /// Reads a committed Verification request through the owner boundary.
     /// Callers receive a decoded snapshot and never obtain the private store
     /// or a mutation handle.
@@ -365,6 +378,19 @@ where
             .request(verification_request_id)?
             .map(|bytes| VerificationRequest::decode(bytes.as_slice()).map_err(Into::into))
             .transpose()
+    }
+
+    /// Lists queued, running, and completed requests that still belong to the
+    /// durable execution/recovery surface. The list is a read-only owner
+    /// snapshot; callers must still use the command path for every mutation.
+    pub fn execution_requests(
+        &self,
+    ) -> Result<Vec<VerificationRequest>, VerificationAuthorityFailure> {
+        self.store
+            .execution_requests()?
+            .into_iter()
+            .map(|bytes| VerificationRequest::decode(bytes.as_slice()).map_err(Into::into))
+            .collect()
     }
 
     /// Reads a committed Verification run through the owner boundary. This is

@@ -44,11 +44,11 @@ use crate::{
     CodexHarnessCompositionConfig, ConfiguredArtifactAdmissionGuard,
     ConfiguredArtifactAdmissionGuardConfig, ConfiguredAuthorityPrincipalResolver,
     ConfiguredFounderVerdictResolver, ConfiguredFounderVerdictResolverConfig,
-    ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, DaemonCompositionError,
-    DaemonProviders, FounderVerdictConfigurationError, LocalUserPolicyResolver,
-    LocalUserPolicyResolverConfig, SharedAuthorityCompositionInputs,
+    ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ConfiguredVerificationWorker,
+    DaemonCompositionError, DaemonProviders, FounderVerdictConfigurationError,
+    LocalUserPolicyResolver, LocalUserPolicyResolverConfig, SharedAuthorityCompositionInputs,
     TaskAuthorityCommitReceiptSource, VerificationAuthorityArtifactSource,
-    VerificationProjectionSource,
+    VerificationProjectionSource, VerificationWorkerConfig,
 };
 
 /// Explicit scalar configuration for the local-user Policy resolver. The
@@ -73,6 +73,9 @@ pub struct ProductionBootstrapConfig {
     /// absent, production remains deny-by-default for external Verification
     /// requests and checker profile attestation.
     pub verification_references: Option<VerificationReferenceBootstrapConfig>,
+    /// Optional explicit worker composition. It is not inferred from the
+    /// user JSON policy file; callers inject reviewed execution material.
+    pub verification_worker: Option<VerificationWorkerConfig>,
     pub policy: PolicyAuthorityConfig,
     pub policy_resolver: LocalUserPolicyBootstrapConfig,
     pub verdict: VerdictAuthorityConfig,
@@ -188,7 +191,7 @@ impl ProductionBootstrapConfig {
             Arc::new(AllowlistedPrincipalResolver::new([self.os_principal])?);
         let mut providers =
             DaemonProviders::from_shared_authority_inputs(SharedAuthorityCompositionInputs {
-                task,
+                task: Arc::clone(&task),
                 policy,
                 verdict,
                 principal_resolver,
@@ -202,6 +205,16 @@ impl ProductionBootstrapConfig {
                     ))),
                 ],
             });
+        if let Some(worker_config) = self.verification_worker {
+            let worker = ConfiguredVerificationWorker::new(
+                task,
+                Box::new(ArtifactAuthorityReferenceSource::new_shared(artifact)),
+                Arc::clone(&verification),
+                worker_config,
+            )
+            .map_err(ProductionBootstrapError::VerificationWorker)?;
+            providers = providers.with_verification_worker(Arc::new(worker));
+        }
         providers = providers.with_codex_harness(self.codex)?;
         Ok(providers)
     }
@@ -542,6 +555,7 @@ impl UserOwnedBootstrapFile {
                 key: VerificationSqlCipherKey::new(verification_store.key),
             },
             verification_references,
+            verification_worker: None,
             policy: PolicyAuthorityConfig {
                 database_path: policy_store.database_path,
                 store_epoch: policy_store.store_epoch,
@@ -1029,6 +1043,8 @@ pub enum ProductionBootstrapError {
     PrincipalPolicy(#[from] PrincipalPolicyError),
     #[error("Codex Harness composition is invalid")]
     Codex(#[from] DaemonCompositionError),
+    #[error("Verification worker composition is invalid: {0}")]
+    VerificationWorker(#[from] crate::VerificationWorkerConfigurationError),
 }
 
 impl From<AdapterEdgeError> for ProductionBootstrapError {

@@ -6,6 +6,9 @@ use std::path::Path;
 use thiserror::Error;
 
 const SCHEMA_PROFILE_ID: &str = "egopulse/verification-authority-store/v1";
+const VERIFICATION_STATUS_QUEUED: i32 = 1;
+const VERIFICATION_STATUS_RUNNING: i32 = 2;
+const VERIFICATION_STATUS_COMPLETED: i32 = 4;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE verification_store_metadata (
@@ -336,6 +339,24 @@ impl VerificationStore {
 
     pub fn request(&self, id: &str) -> Result<Option<Vec<u8>>, StoreError> {
         self.snapshot("verification_requests", "verification_request_id", id)
+    }
+
+    pub fn execution_requests(&self) -> Result<Vec<Vec<u8>>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT snapshot FROM verification_requests
+             WHERE status IN (?1, ?2, ?3)
+             ORDER BY revision ASC, verification_request_id ASC",
+        )?;
+        let rows = statement.query_map(
+            params![
+                VERIFICATION_STATUS_QUEUED,
+                VERIFICATION_STATUS_RUNNING,
+                VERIFICATION_STATUS_COMPLETED
+            ],
+            |row| row.get(0),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn request_policy(&self, id: &str) -> Result<Option<Vec<u8>>, StoreError> {

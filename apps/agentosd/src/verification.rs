@@ -12,17 +12,21 @@ use egopulse_domain_contracts::v01::egopulse::{
         task_command,
     },
     verification::v1::{
-        AttestCheckerProfileCommand, CheckerProfile, CreateVerificationRequestCommand,
-        VerificationBinding, VerificationCommand, VerificationRequest, verification_command,
+        AttestCheckerProfileCommand, CheckerProfile, CheckerProfileStatus,
+        CreateVerificationRequestCommand, VerificationBinding, VerificationCommand,
+        VerificationRequest, verification_command,
     },
 };
 use egopulse_verification_authority::{
     ArtifactReferenceSource, ArtifactReferenceSourceError, AuthenticatedVerificationPrincipal,
-    VerificationAuthority, VerificationAuthorityFailure, VerificationPrincipalKind,
-    canonical_request_digest,
+    GovernedCheckerSupervisor, GovernedSegoRunner, GovernedVerificationExecutionCoordinator,
+    GovernedVerificationExecutionError, GovernedVerificationExecutionPlan, SegoMapperPolicy,
+    SystemVerificationClock, VerificationAuthority, VerificationAuthorityFailure,
+    VerificationClock, VerificationPrincipalKind, canonical_request_digest,
 };
 use prost_types::Timestamp;
 use sha2::{Digest, Sha256};
+use std::{future::Future, path::PathBuf, pin::Pin, time::Duration};
 use thiserror::Error;
 
 const TASK_ACCEPTANCE: &str = "task_acceptance";
@@ -101,6 +105,25 @@ impl SystemCheckerProfileAttestation {
             return Err(CheckerProfileAttestationError::InvalidProfileId);
         }
         let checker_profile_id = profile.checker_profile_id.clone();
+        if let Some(existing) = self
+            .verification
+            .lock()
+            .map_err(|_| CheckerProfileAttestationError::VerificationLock)?
+            .checker_profile(&checker_profile_id)?
+        {
+            if existing.profile_digest_sha256 == profile.profile_digest_sha256
+                && existing.status == CheckerProfileStatus::Active as i32
+            {
+                return Ok(CheckerProfileAttestationResult {
+                    checker_profile_id,
+                    committed: false,
+                    replayed: true,
+                });
+            }
+            return Err(CheckerProfileAttestationError::Rejected(
+                "CHECKER_PROFILE_DIGEST_CONFLICT".to_owned(),
+            ));
+        }
         let command = checker_profile_attestation_command(profile, issued_at)?;
         let result = self
             .verification
@@ -226,11 +249,25 @@ impl SystemTaskVerificationWriteBack {
                 _ => return Err(TaskVerificationWriteBackError::TaskSnapshotMismatch),
             }
         };
-        if task_snapshot.task_id != task_id
-            || task_snapshot.revision != expected_revision
-            || task_snapshot.work_revision != work_revision
-            || task_snapshot.status != TaskStatus::VerificationPending as i32
-        {
+        if task_snapshot.task_id != task_id || task_snapshot.work_revision != work_revision {
+            return Err(TaskVerificationWriteBackError::TaskSnapshotMismatch);
+        }
+        if task_snapshot.status != TaskStatus::VerificationPending as i32 {
+            if task_snapshot.revision > expected_revision
+                && task_snapshot.verification_artifact_id.as_deref()
+                    == Some(verification_artifact_id)
+            {
+                return Ok(TaskVerificationWriteBackResult {
+                    task_id: task_id.to_owned(),
+                    verification_artifact_id: verification_artifact_id.to_owned(),
+                    committed: false,
+                    replayed: true,
+                    task_revision: task_snapshot.revision,
+                });
+            }
+            return Err(TaskVerificationWriteBackError::TaskSnapshotMismatch);
+        }
+        if task_snapshot.revision != expected_revision {
             return Err(TaskVerificationWriteBackError::TaskSnapshotMismatch);
         }
         let idempotency_key = format!("{task_id}:{verification_artifact_id}:{expected_revision}");
@@ -521,6 +558,267 @@ pub struct VerificationHandoffConsumeResult {
     pub committed: bool,
     pub replayed: bool,
     pub task_outbox_acknowledged: bool,
+}
+
+/// Explicit reviewed composition for the first single-checker Verification
+/// worker. The worker never derives a checker, workspace, request bytes, or
+/// mapper policy from a Task payload.
+#[derive(Clone, Debug)]
+pub struct VerificationWorkerConfig {
+    pub handoff_plan: VerificationHandoffPlan,
+    pub checker_profile: CheckerProfile,
+    pub checker_executable: PathBuf,
+    pub checker_arguments: Vec<String>,
+    pub working_directory: PathBuf,
+    pub checker_request: Vec<u8>,
+    pub mapper_policy: SegoMapperPolicy,
+    pub verification_run_id_prefix: String,
+    pub verification_artifact_id_prefix: String,
+    pub execution_id_prefix: String,
+    pub tool_receipt_artifact_ids: Vec<String>,
+    pub model_call_receipt_artifact_ids: Vec<String>,
+    pub checker_timeout: Duration,
+    pub checker_output_limit: u64,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum VerificationWorkerConfigurationError {
+    #[error("Verification worker configuration is invalid: {0}")]
+    Invalid(&'static str),
+    #[error("checker supervisor specification is invalid")]
+    CheckerSupervisor,
+    #[error("Verification handoff plan is invalid: {0}")]
+    HandoffPlan(#[from] VerificationHandoffPlanError),
+}
+
+impl VerificationWorkerConfig {
+    fn validate(&self) -> Result<(), VerificationWorkerConfigurationError> {
+        self.handoff_plan.validate()?;
+        if self.handoff_plan.criterion_ids.len() != 1
+            || self.mapper_policy.criterion_id != self.handoff_plan.criterion_ids[0]
+            || !self
+                .handoff_plan
+                .checker_profile_refs
+                .iter()
+                .any(|value| value == &self.mapper_policy.checker_profile_ref)
+            || self.checker_profile.checker_profile_id.trim().is_empty()
+            || self.checker_executable.as_os_str().is_empty()
+            || self.working_directory.as_os_str().is_empty()
+            || self.checker_request.is_empty()
+            || self.verification_run_id_prefix.trim().is_empty()
+            || self.verification_artifact_id_prefix.trim().is_empty()
+            || self.execution_id_prefix.trim().is_empty()
+            || self.mapper_policy.raw_output_artifact_id.trim().is_empty()
+            || self.checker_timeout.is_zero()
+            || self.checker_output_limit == 0
+        {
+            return Err(VerificationWorkerConfigurationError::Invalid(
+                "single-checker reviewed inputs",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerificationWorkerCycleResult {
+    Idle,
+    Completed {
+        verification_request_id: String,
+        task_id: String,
+        verification_artifact_id: String,
+        execution_replayed: bool,
+        write_back_replayed: bool,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum VerificationWorkerCycleError {
+    #[error("checker profile attestation failed: {0}")]
+    Attestation(#[from] CheckerProfileAttestationError),
+    #[error("verification handoff intake failed: {0}")]
+    Intake(#[from] VerificationHandoffIntakeError),
+    #[error("verification handoff was rejected by the Authority")]
+    HandoffRejected,
+    #[error("Verification Authority read failed: {0}")]
+    Authority(#[from] VerificationAuthorityFailure),
+    #[error("Verification Authority lock is poisoned")]
+    AuthorityLock,
+    #[error("verification request is missing a valid Task lineage")]
+    RequestLineage,
+    #[error("verification request does not match this worker's reviewed plan")]
+    RequestConfigurationMismatch,
+    #[error("verification execution failed: {0}")]
+    Execution(#[from] GovernedVerificationExecutionError),
+    #[error("Task verification write-back failed: {0}")]
+    WriteBack(#[from] TaskVerificationWriteBackError),
+}
+
+/// The daemon's one durable Verification worker boundary. A cycle first
+/// attests the configured profile, consumes at most one new Task handoff, then
+/// scans Verification-owned queued/running/completed requests so a crash after
+/// handoff ACK or after artifact completion remains recoverable.
+pub trait VerificationWorker: Send + Sync + 'static {
+    fn run_once<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<VerificationWorkerCycleResult, VerificationWorkerCycleError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
+pub struct ConfiguredVerificationWorker {
+    config: VerificationWorkerConfig,
+    verification: Arc<Mutex<VerificationAuthority>>,
+    attestation: SystemCheckerProfileAttestation,
+    intake: VerificationHandoffIntake,
+    coordinator: GovernedVerificationExecutionCoordinator<SystemVerificationClock>,
+    write_back: SystemTaskVerificationWriteBack,
+}
+
+impl ConfiguredVerificationWorker {
+    pub fn new(
+        task: Arc<Mutex<TaskAuthority>>,
+        artifact: Box<dyn ArtifactReferenceSource>,
+        verification: Arc<Mutex<VerificationAuthority>>,
+        config: VerificationWorkerConfig,
+    ) -> Result<Self, VerificationWorkerConfigurationError> {
+        config.validate()?;
+        let supervisor = GovernedCheckerSupervisor::new(
+            config.checker_executable.clone(),
+            config.checker_arguments.clone(),
+            config.checker_timeout,
+            config.checker_output_limit,
+        )
+        .map_err(|_| VerificationWorkerConfigurationError::CheckerSupervisor)?;
+        let intake = VerificationHandoffIntake::new(
+            Arc::clone(&task),
+            artifact,
+            Arc::clone(&verification),
+            config.handoff_plan.clone(),
+            AuthenticatedVerificationPrincipal {
+                kind: VerificationPrincipalKind::TaskAuthority,
+                principal_id: "task-authority:verification-worker".to_owned(),
+                authenticated: true,
+                checker_profile_id: None,
+            },
+        )?;
+        let coordinator = GovernedVerificationExecutionCoordinator::new(
+            Arc::clone(&verification),
+            GovernedSegoRunner::new(supervisor),
+        );
+        Ok(Self {
+            config,
+            verification: Arc::clone(&verification),
+            attestation: SystemCheckerProfileAttestation::new(Arc::clone(&verification)),
+            intake,
+            coordinator,
+            write_back: SystemTaskVerificationWriteBack::new(task, verification),
+        })
+    }
+
+    async fn run_cycle(
+        &self,
+    ) -> Result<VerificationWorkerCycleResult, VerificationWorkerCycleError> {
+        let issued_at = VerificationClock::now(&SystemVerificationClock);
+        self.attestation
+            .attest_one(self.config.checker_profile.clone(), issued_at)?;
+        if let Some(handoff) = self.intake.consume_one(issued_at)?
+            && !handoff.committed
+            && !handoff.replayed
+        {
+            return Err(VerificationWorkerCycleError::HandoffRejected);
+        }
+        let request = {
+            let verification = self
+                .verification
+                .lock()
+                .map_err(|_| VerificationWorkerCycleError::AuthorityLock)?;
+            verification
+                .execution_requests()?
+                .into_iter()
+                .find(|request| {
+                    request.criterion_ids == self.config.handoff_plan.criterion_ids
+                        && request.checker_profile_refs
+                            == self.config.handoff_plan.checker_profile_refs
+                })
+        };
+        let Some(request) = request else {
+            return Ok(VerificationWorkerCycleResult::Idle);
+        };
+        let lineage = request
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.lineage.as_ref())
+            .ok_or(VerificationWorkerCycleError::RequestLineage)?;
+        if lineage.task_id.trim().is_empty()
+            || lineage.task_revision == 0
+            || lineage.work_revision == 0
+        {
+            return Err(VerificationWorkerCycleError::RequestLineage);
+        }
+        let verification_run_id = format!(
+            "{}{}",
+            self.config.verification_run_id_prefix, request.verification_request_id
+        );
+        let verification_artifact_id = format!(
+            "{}{}",
+            self.config.verification_artifact_id_prefix, request.verification_request_id
+        );
+        let execution_id = format!(
+            "{}{}",
+            self.config.execution_id_prefix, request.verification_request_id
+        );
+        let outcome = self
+            .coordinator
+            .execute_one(GovernedVerificationExecutionPlan {
+                verification_request_id: request.verification_request_id.clone(),
+                verification_run_id,
+                execution_id,
+                working_directory: self.config.working_directory.clone(),
+                checker_request: self.config.checker_request.clone(),
+                mapper_policy: self.config.mapper_policy.clone(),
+                verification_artifact_id: verification_artifact_id.clone(),
+                tool_receipt_artifact_ids: self.config.tool_receipt_artifact_ids.clone(),
+                model_call_receipt_artifact_ids: self
+                    .config
+                    .model_call_receipt_artifact_ids
+                    .clone(),
+                issued_at,
+            })
+            .await?;
+        let write_back = self.write_back.record_one(
+            &lineage.task_id,
+            lineage.task_revision,
+            lineage.work_revision,
+            &verification_artifact_id,
+            issued_at,
+        )?;
+        Ok(VerificationWorkerCycleResult::Completed {
+            verification_request_id: request.verification_request_id,
+            task_id: lineage.task_id.clone(),
+            verification_artifact_id,
+            execution_replayed: outcome.replayed || outcome.recovered_existing_result,
+            write_back_replayed: write_back.replayed,
+        })
+    }
+}
+
+impl VerificationWorker for ConfiguredVerificationWorker {
+    fn run_once<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<VerificationWorkerCycleResult, VerificationWorkerCycleError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(self.run_cycle())
+    }
 }
 
 /// Consumes one durable Task handoff. ACK is deliberately after the

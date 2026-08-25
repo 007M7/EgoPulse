@@ -333,6 +333,18 @@ fn advance_to_verdict_pending(task: &mut TaskAuthority) -> TaskSnapshot {
         },
         PrincipalKind::CollaborationControl,
     ));
+    let verification_handoff = task
+        .pending_task_verifications()
+        .expect("verification handoff")
+        .pop()
+        .expect("EvidenceSubmitted handoff");
+    assert!(
+        task.acknowledge_cross_authority_outbox(
+            &verification_handoff.message_id,
+            &verification_handoff.payload_digest_sha256,
+        )
+        .expect("acknowledge Verification handoff")
+    );
     task_from(execute_task(
         task,
         TaskCommand {

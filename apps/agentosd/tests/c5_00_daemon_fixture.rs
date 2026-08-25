@@ -436,6 +436,7 @@ fn fixture_config(root: &Path, instance: &str) -> DaemonConfig {
         token_mac_key: [0x42; 32],
         session_ttl: Duration::from_secs(60),
         harness_dispatch_interval: Duration::from_millis(25),
+        verification_interval: Duration::from_millis(25),
     }
 }
 

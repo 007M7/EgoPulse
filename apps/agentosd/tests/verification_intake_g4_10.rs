@@ -1,5 +1,6 @@
 use egopulse_agentosd::{
-    VerificationBindingTemplate, VerificationHandoffIntake, VerificationHandoffPlan,
+    ConfiguredVerificationWorker, VerificationBindingTemplate, VerificationHandoffIntake,
+    VerificationHandoffPlan, VerificationWorker, VerificationWorkerConfig,
 };
 use egopulse_cognition_runtime::task_authority::{
     AuthenticatedPrincipal, CreationAuthorization, CreationGuardRejection, PrincipalKind,
@@ -15,11 +16,11 @@ use egopulse_domain_contracts::v01::egopulse::{
     common::v1::{CommandMetadata, ContractReference},
     task::v1::{
         ActivateTaskCommand, CreateTaskCommand, SubmitTaskEvidenceCommand, TaskCommand,
-        TaskSnapshot, TaskStatus, task_command, task_command_result,
+        TaskSnapshot, TaskStatus, get_task_response, task_command, task_command_result,
     },
     verification::v1::{
         AttestCheckerProfileCommand, CheckerAssuranceClass, CheckerProfile, CheckerProfileStatus,
-        CriterionRequirement, VerificationCommand, verification_command,
+        CriterionRequirement, DiscrepancySeverity, VerificationCommand, verification_command,
     },
 };
 use egopulse_verification_authority::{
@@ -29,6 +30,7 @@ use egopulse_verification_authority::{
     canonical_checker_profile_digest, canonical_request_digest,
 };
 use prost_types::Timestamp;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -129,8 +131,8 @@ impl Drop for TempRoot {
     }
 }
 
-#[test]
-fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox() {
+#[tokio::test(flavor = "current_thread")]
+async fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox() {
     let root = TempRoot::new();
     let acceptance = contract("task-acceptance", SHA_A);
     let mut task = TaskAuthority::open_with_transition_guard(
@@ -255,7 +257,7 @@ fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox() {
         vec![CriterionPolicySnapshot {
             criterion_id: "criterion-g4-10".to_owned(),
             requirement: CriterionRequirement::MustPass as i32,
-            minimum_assurance: CheckerAssuranceClass::Deterministic as i32,
+            minimum_assurance: CheckerAssuranceClass::ModelAssisted as i32,
             not_applicable_allowed: false,
             checker_profile_ids: vec![profile.checker_profile_id.clone()],
         }],
@@ -305,7 +307,7 @@ fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox() {
     let verification = Arc::new(Mutex::new(verification));
     let intake = VerificationHandoffIntake::new(
         Arc::clone(&task),
-        Box::new(source),
+        Box::new(source.clone()),
         Arc::clone(&verification),
         VerificationHandoffPlan {
             binding: VerificationBindingTemplate {
@@ -313,7 +315,7 @@ fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox() {
                 claim_semantic_profile_ref: semantic,
             },
             criterion_ids: vec!["criterion-g4-10".to_owned()],
-            checker_profile_refs: vec![profile_ref],
+            checker_profile_refs: vec![profile_ref.clone()],
         },
         AuthenticatedVerificationPrincipal {
             kind: VerificationPrincipalKind::TaskAuthority,
@@ -352,6 +354,98 @@ fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox() {
             .expect("replay-safe empty poll")
             .is_none()
     );
+
+    let mapper_profile_ref = profile_ref.clone();
+    let worker = ConfiguredVerificationWorker::new(
+        Arc::clone(&task),
+        Box::new(source),
+        Arc::clone(&verification),
+        VerificationWorkerConfig {
+            handoff_plan: VerificationHandoffPlan {
+                binding: VerificationBindingTemplate {
+                    claim_id: "claim-g4-10".to_owned(),
+                    claim_semantic_profile_ref: contract("claim-semantic", SHA_B),
+                },
+                criterion_ids: vec!["criterion-g4-10".to_owned()],
+                checker_profile_refs: vec![mapper_profile_ref.clone()],
+            },
+            checker_profile: profile,
+            checker_executable: std::env::current_exe().expect("current test executable"),
+            checker_arguments: vec![
+                "--exact".to_owned(),
+                "checker_invalid_output_probe".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            working_directory: root.path().to_owned(),
+            checker_request: b"{}".to_vec(),
+            mapper_policy: egopulse_verification_authority::SegoMapperPolicy {
+                criterion_id: "criterion-g4-10".to_owned(),
+                requirement: CriterionRequirement::MustPass,
+                checker_profile_ref: mapper_profile_ref,
+                expected_scope: "g4-10".to_owned(),
+                expected_diff_hash: SHA_A.to_owned(),
+                expected_reviewer: "sego".to_owned(),
+                expected_engine_version: "v1".to_owned(),
+                expected_review_mode: "model_code_review".to_owned(),
+                failure_threshold: DiscrepancySeverity::Major,
+                raw_output_artifact_id: "attestation-artifact-g4-10".to_owned(),
+                raw_output_address: ContentAddress {
+                    algorithm: HashAlgorithm::Sha256 as i32,
+                    digest: "e".repeat(64),
+                    byte_length: 16,
+                },
+                finding_evidence: BTreeMap::new(),
+            },
+            verification_run_id_prefix: "worker-run-".to_owned(),
+            verification_artifact_id_prefix: "worker-artifact-".to_owned(),
+            execution_id_prefix: "worker-execution-".to_owned(),
+            tool_receipt_artifact_ids: Vec::new(),
+            model_call_receipt_artifact_ids: Vec::new(),
+            checker_timeout: std::time::Duration::from_secs(2),
+            checker_output_limit: 64 * 1024,
+        },
+    )
+    .expect("compose configured verification worker");
+    let first = worker
+        .run_once()
+        .await
+        .expect("run governed verification worker");
+    assert!(matches!(
+        first,
+        egopulse_agentosd::VerificationWorkerCycleResult::Completed {
+            execution_replayed: false,
+            write_back_replayed: false,
+            ..
+        }
+    ));
+    let written = task
+        .lock()
+        .expect("task lock")
+        .get_task(&created.task_id)
+        .expect("read written task");
+    let task_after_write = match written.outcome.expect("task outcome") {
+        get_task_response::Outcome::Task(snapshot) => snapshot,
+        get_task_response::Outcome::Error(error) => panic!("unexpected task error: {error:?}"),
+    };
+    assert_eq!(task_after_write.status, TaskStatus::VerdictPending as i32);
+    assert!(
+        task_after_write
+            .verification_artifact_id
+            .as_deref()
+            .is_some_and(|value| value.starts_with("worker-artifact-verification-request-"))
+    );
+    let second = worker
+        .run_once()
+        .await
+        .expect("replay completed worker and write-back");
+    assert!(matches!(
+        second,
+        egopulse_agentosd::VerificationWorkerCycleResult::Completed {
+            execution_replayed: true,
+            write_back_replayed: true,
+            ..
+        }
+    ));
 }
 
 fn contract(id: &str, digest: &str) -> ContractReference {
@@ -480,7 +574,7 @@ fn checker_profile() -> CheckerProfile {
         input_contract_ref: Some(contract("verification-input", SHA_A)),
         output_contract_ref: Some(contract("verification-output", SHA_B)),
         supported_criterion_types: vec!["criterion-g4-10".to_owned()],
-        assurance_class: CheckerAssuranceClass::Deterministic as i32,
+        assurance_class: CheckerAssuranceClass::ModelAssisted as i32,
         sandbox_profile_ref: Some(contract("verification-sandbox", SHA_A)),
         tool_policy_ref: Some(contract("verification-tools", SHA_B)),
         data_egress_policy_ref: Some(contract("local-only", SHA_A)),
