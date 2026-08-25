@@ -175,6 +175,13 @@ pub struct PendingTaskActivation {
     pub event: TaskEvent,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingTaskVerification {
+    pub message_id: String,
+    pub payload_digest_sha256: String,
+    pub event: TaskEvent,
+}
+
 impl TaskAuthority {
     pub fn open(
         config: TaskAuthorityConfig,
@@ -412,6 +419,44 @@ impl TaskAuthority {
                     return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
                 }
                 Ok(PendingTaskActivation {
+                    message_id: message.message_id,
+                    payload_digest_sha256: message.payload_digest_sha256,
+                    event,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns only durable EvidenceSubmitted handoffs addressed to the
+    /// Verification vertical. The event and snapshot are revalidated before
+    /// a worker may consume them; an arbitrary Task outbox message cannot be
+    /// promoted to a verification request by string inspection.
+    pub fn pending_task_verifications(
+        &self,
+    ) -> Result<Vec<PendingTaskVerification>, TaskAuthorityFailure> {
+        self.store
+            .pending_cross_authority_outbox()?
+            .into_iter()
+            .filter(|message| message.destination_domain == "verification-authority")
+            .map(|message| {
+                let actual_digest = hex::encode(Sha256::digest(&message.payload));
+                if actual_digest != message.payload_digest_sha256 {
+                    return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+                }
+                let event = TaskEvent::decode(message.payload.as_slice())?;
+                let Some(snapshot) = event.snapshot.as_ref() else {
+                    return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+                };
+                if event.kind != TaskEventKind::EvidenceSubmitted as i32
+                    || event.task_id != snapshot.task_id
+                    || event.resulting_revision != snapshot.revision
+                    || event.work_revision != snapshot.work_revision
+                    || snapshot.status != TaskStatus::VerificationPending as i32
+                    || snapshot.artifact_set_id.is_none()
+                {
+                    return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+                }
+                Ok(PendingTaskVerification {
                     message_id: message.message_id,
                     payload_digest_sha256: message.payload_digest_sha256,
                     event,
@@ -775,6 +820,12 @@ impl TaskAuthority {
                 (Some(task_command::Command::ActivateTask(_)), None) => Some((
                     format!("task-outbox-collaboration-{}", event.event_id),
                     "collaboration-control",
+                    event_bytes.clone(),
+                    event_digest.clone(),
+                )),
+                (Some(task_command::Command::SubmitTaskEvidence(_)), None) => Some((
+                    format!("task-outbox-verification-{}", event.event_id),
+                    "verification-authority",
                     event_bytes.clone(),
                     event_digest.clone(),
                 )),

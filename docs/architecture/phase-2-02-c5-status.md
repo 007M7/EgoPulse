@@ -125,15 +125,25 @@ error result, and maps timeout/crash/output-limit/spawn failures without
 silently producing a pass. It owns no Authority store and performs no Task or
 Verdict write; those remain the next explicit composition step.
 
+Task Authority now emits a digest-bound `verification-authority` outbox message
+when `SubmitTaskEvidence` commits. `pending_task_verifications()` validates the
+event kind, task/revision/work-revision binding, `VerificationPending` state and
+Artifact set presence before exposing the handoff. The verification worker must
+ACK that exact message digest after it durably accepts the handoff; it does not
+receive a direct Task database or repository handle. This closes the durable
+Task-to-Verification trigger without pretending that the full Sego production
+composition is complete.
+
 `with_codex_harness` and `ProductionBootstrapConfig::build` remain explicit
 production composition APIs and not implicit unsafe defaults. Verification
 remains deny-by-default for unreviewed external references until Sego/checker
 composition is supplied. The remaining integration is not a path in the JSON
-file: agentosd still has no Local API Verification command port. A real Sego
-production path must therefore compose the Artifact owner read boundary,
-supervised runner, mapper, Verification Authority commands, and the existing
-system-only Task verification handoff as one unit. Until that vertical exists,
-`DenyVerificationReferences` stays active.
+file: agentosd still has no Local API Verification command port, and the new
+Task outbox trigger is not itself a Verification request or run. A real Sego
+production path must therefore consume that handoff and compose the Artifact
+owner read boundary, supervised runner, mapper, Verification Authority
+commands, and system-only Task verification write-back as one unit. Until that
+vertical exists, `DenyVerificationReferences` stays active.
 
 ## Next unit: Phase 2-03
 

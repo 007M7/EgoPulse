@@ -147,7 +147,7 @@ fn accept_drives_one_terminal_task_commit_and_durable_verdict_consume_outbox() {
             .inspect_store()
             .expect("inspect")
             .cross_authority_outbox_count,
-        2
+        3
     );
 
     let denied = execute(
@@ -304,6 +304,27 @@ fn advance_to_verdict_pending(authority: &mut TaskAuthority) -> TaskSnapshot {
         evidence_command(&active),
         principal(PrincipalKind::CollaborationControl),
     ));
+    let verification_handoff = authority
+        .pending_task_verifications()
+        .expect("read verification handoff")
+        .pop()
+        .expect("verification handoff");
+    assert_eq!(
+        verification_handoff
+            .event
+            .snapshot
+            .as_ref()
+            .map(|task| task.task_id.as_str()),
+        Some(evidence.task_id.as_str())
+    );
+    assert!(
+        authority
+            .acknowledge_cross_authority_outbox(
+                &verification_handoff.message_id,
+                &verification_handoff.payload_digest_sha256,
+            )
+            .expect("ack verification handoff")
+    );
     let verified = task_from(execute(
         authority,
         verification_command(&evidence),
