@@ -315,6 +315,19 @@ where
         Ok(self.store.integrity_is_ok()?)
     }
 
+    /// Reads a committed verification artifact without exposing the Authority
+    /// store or allowing a consumer to mutate it. Founder Verdict resolution
+    /// uses this as evidence; it never repairs or re-derives the artifact.
+    pub fn verification_artifact(
+        &self,
+        verification_artifact_id: &str,
+    ) -> Result<Option<VerificationArtifact>, VerificationAuthorityFailure> {
+        self.store
+            .artifact(verification_artifact_id)?
+            .map(|bytes| VerificationArtifact::decode(bytes.as_slice()).map_err(Into::into))
+            .transpose()
+    }
+
     pub fn drain_projection_outbox(
         &self,
     ) -> Result<Vec<VerificationProjectionMessage>, VerificationAuthorityFailure> {

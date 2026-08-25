@@ -59,6 +59,7 @@ mod policy;
 mod projections;
 mod security;
 mod task;
+mod verdict;
 
 pub use owners::{
     AuthorityCommandPorts, AuthorityPrincipalResolver, DenyAllAuthorityPrincipalResolver,
@@ -78,6 +79,12 @@ pub use security::{
 pub use task::{
     ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig,
     TaskCreationGuardConfigurationError,
+};
+pub use verdict::{
+    ConfiguredFounderVerdictResolver, ConfiguredFounderVerdictResolverConfig,
+    DenyFounderTaskCommitEvidence, FounderTaskCommitEvidenceSource,
+    FounderVerdictConfigurationError, FounderVerificationEvidenceError,
+    FounderVerificationEvidenceSource, VerificationAuthorityArtifactSource,
 };
 
 #[derive(Clone, Debug)]

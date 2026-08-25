@@ -80,6 +80,13 @@ the first vertical to reviewed work types, input snapshot IDs, target scopes,
 and exact acceptance/budget contract references. It is an explicit composition
 input and does not make the normal daemon serving by itself.
 
+Founder Verdict now has `ConfiguredFounderVerdictResolver`. It reads a
+committed Verification artifact through an Authority-owned read boundary,
+checks scope/conclusion consistency, requires an allowlisted Founder
+confirmation proof, and bounds the verdict expiry. Task commit receipt
+consumption remains fail-closed until its Task Authority evidence source is
+composed.
+
 Until that bootstrap exists, `with_codex_harness` is an explicit production composition API and not
 an implicit unsafe default.
 

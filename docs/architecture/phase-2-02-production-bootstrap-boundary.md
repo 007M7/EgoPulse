@@ -33,6 +33,14 @@ scope references and exact acceptance/budget contract references. Its evidence
 refs describe those reviewed inputs; it does not infer approval from the
 client request or write a second Task record.
 
+The Founder Verdict side now has `ConfiguredFounderVerdictResolver`. Its
+Verification evidence source reads a committed artifact through the owning
+Verification Authority's read API, then binds the verdict scope and observed
+conclusion to that artifact. It also requires an explicitly allowlisted Founder
+confirmation proof and a bounded expiry. Task commit receipt validation remains
+a separate injected source and defaults to fail-closed until the Task Authority
+receipt source is composed.
+
 The normal `agentosd` entrypoint remains fail-closed until all three decisions,
 the encrypted Authority stores and the explicit Codex workflow configuration
 are assembled as one reviewed bootstrap. This is deliberate: a daemon that
@@ -75,8 +83,8 @@ The agentosd unit suite covers:
 - the existing real Windows Named Pipe C5 suite continues to pass in serial
   mode.
 
-The remaining bootstrap work is to provide reviewed configuration and the
-Founder Verdict reference guard, then wire the explicit Codex composition into
-the normal binary. No test fixture Allow implementation is reused for that
-step; the Policy and Task guards are not substitutes for the still-missing
-Verdict evidence guard.
+The remaining bootstrap work is to provide reviewed configuration, compose the
+Task commit receipt source, and wire the explicit Codex composition plus all
+three Authority stores into the normal binary. No test fixture Allow
+implementation is reused for that step; the three guards remain separate from
+identity mapping and from the client surfaces.

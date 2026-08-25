@@ -353,6 +353,10 @@ impl VerificationStore {
         self.snapshot("verification_runs", "verification_run_id", id)
     }
 
+    pub fn artifact(&self, id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        self.snapshot("verification_artifacts", "verification_artifact_id", id)
+    }
+
     pub fn criterion_results(&self, run_id: &str) -> Result<Vec<Vec<u8>>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT snapshot FROM criterion_results
