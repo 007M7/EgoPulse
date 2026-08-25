@@ -73,6 +73,10 @@ verification or Task completion.
   already-accepted records; the worker returns ranked references and an
   evidence digest. It has no authority database access and is not yet the
   production Memory Authority or a frozen cross-language contract.
+- Generic Worker process framing: `egopulse-process-supervision` provides a
+  bounded, supervised one-request/one-response length-delimited stdin/stdout
+  boundary for future Workers. It carries opaque bytes and does not freeze
+  Memory/RAG messages or serialization choices.
 - Memory Authority implementation: `cognition-runtime::memory_authority` is
   the Rust single-writer for local Memory facts. Agent/Model/Harness writes
   enter as `candidate`; only Founder-controlled principals may accept, while
