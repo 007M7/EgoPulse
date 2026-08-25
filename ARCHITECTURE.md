@@ -73,6 +73,12 @@ verification or Task completion.
   already-accepted records; the worker returns ranked references and an
   evidence digest. It has no authority database access and is not yet the
   production Memory Authority or a frozen cross-language contract.
+- Memory Authority implementation: `cognition-runtime::memory_authority` is
+  the Rust single-writer for local Memory facts. Agent/Model/Harness writes
+  enter as `candidate`; only Founder-controlled principals may accept, while
+  governance/recovery principals may revoke with evidence. SQLCipher,
+  idempotency, optimistic revision checks and an audit event stream are
+  internal Rust behavior until the cross-language contract is approved.
 
 ## Repository rules
 

@@ -18,6 +18,8 @@ Available now:
 - Tauri 2 + React + TypeScript desktop shell;
 - TypeScript packages for generated clients, Agent SDK and the bounded native Harness;
 - isolated CPython 3.14 Worker project managed by uv;
+- internal Rust Memory Authority with SQLCipher persistence, candidate-only
+  agent writes, Founder promotion/revocation and accepted retrieval snapshots;
 - Protobuf/Buf and JSON Schema contract roots;
 - local CI, repository-boundary checks and commit-bound release-candidate packaging.
 - account-authenticated Windows Named Pipe / Unix Domain Socket transport and an ephemeral, policy-resolved local session service.
@@ -25,8 +27,8 @@ Available now:
 Not implemented yet:
 
 - second Harness adapter and multi-model collaboration path (Kimi CLI / DeepSeek Harness are next Phase 2-03 candidates);
-- production Memory/RAG authority and its cross-language contract (a read-only
-  lexical retrieval candidate worker now exists under `workers/memory-rag`);
+- public Memory/RAG API and the frozen Rust/Python Worker contract (internal
+  Authority and read-only Worker slices exist, but are not wired to the daemon);
 - SQLCipher-backed Memory/RAG indexes and retrieval evaluation;
 - Sego verification integration;
 - production packaging or release.
