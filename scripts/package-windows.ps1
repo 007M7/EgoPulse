@@ -128,6 +128,15 @@ foreach ($binary in $binaries) {
 }
 
 Copy-Item -LiteralPath 'README.md', 'SECURITY.md' -Destination $candidateRoot
+$configRoot = Join-Path $candidateRoot 'config'
+New-Item -ItemType Directory -Force -Path $configRoot | Out-Null
+Copy-Item -LiteralPath @(
+    'config/agentos-config.example.json',
+    'config/README.md',
+    'config/artifact-authority.md',
+    'config/memory-authority.md',
+    'config/verification-worker.example.json'
+) -Destination $configRoot
 Copy-Item -LiteralPath 'Cargo.lock', 'pnpm-lock.yaml' -Destination $manifestRoot
 Copy-Item -LiteralPath 'workers/foundation-probe/uv.lock' -Destination (Join-Path $manifestRoot 'foundation-probe.uv.lock')
 Copy-Item -LiteralPath 'workers/contract-bindings/uv.lock' -Destination (Join-Path $manifestRoot 'contract-bindings.uv.lock')
