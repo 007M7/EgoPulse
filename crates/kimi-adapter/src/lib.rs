@@ -156,6 +156,7 @@ async fn probe_initialize(
         config.request_timeout,
         "KIMI_ACP_INITIALIZE_TIMEOUT",
         "KIMI_ACP_INITIALIZE_READ_FAILED",
+        "KIMI_ACP_INITIALIZE_EOF",
         &encoded,
     )
     .await?;
@@ -178,6 +179,7 @@ async fn probe_session(config: &KimiAcpConfig) -> Result<KimiSessionProbeResult,
         config.request_timeout,
         "KIMI_ACP_INITIALIZE_TIMEOUT",
         "KIMI_ACP_INITIALIZE_READ_FAILED",
+        "KIMI_ACP_INITIALIZE_EOF",
         &initialize,
     )
     .await?;
@@ -195,6 +197,7 @@ async fn probe_session(config: &KimiAcpConfig) -> Result<KimiSessionProbeResult,
         config.request_timeout,
         "KIMI_ACP_SESSION_NEW_TIMEOUT",
         "KIMI_ACP_SESSION_NEW_READ_FAILED",
+        "KIMI_ACP_SESSION_NEW_EOF",
         &session_request,
     )
     .await?;
@@ -276,13 +279,17 @@ async fn read_json_line(
     request_timeout: Duration,
     timeout_code: &str,
     read_code: &str,
+    eof_code: &str,
     request: &[u8],
 ) -> Result<String, DriverError> {
     let mut line = String::new();
-    timeout(request_timeout, process.stdout.read_line(&mut line))
+    let bytes_read = timeout(request_timeout, process.stdout.read_line(&mut line))
         .await
         .map_err(|_| driver_error(timeout_code, request))?
         .map_err(|error| driver_error(read_code, error.to_string().as_bytes()))?;
+    if bytes_read == 0 {
+        return Err(driver_error(eof_code, request));
+    }
     Ok(line)
 }
 
@@ -514,6 +521,47 @@ mod tests {
             KimiSessionProbeDisposition::Created { .. }
                 | KimiSessionProbeDisposition::AuthenticationRequired { .. }
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an explicitly authorized local Kimi user profile"]
+    async fn live_kimi_default_profile_probe_records_safe_boundary_without_prompt() {
+        let executable = PathBuf::from(
+            std::env::var_os("EGOPULSE_KIMI_NATIVE_EXE")
+                .expect("EGOPULSE_KIMI_NATIVE_EXE must point to Kimi executable"),
+        );
+        let config = KimiAcpConfig::new(executable, std::env::current_dir().expect("cwd"));
+        let result = match probe_initialize(&config, &ProbeHarnessRequest::default()).await {
+            Ok(result) => result,
+            Err(error) => {
+                assert_eq!(error.certainty, DriverErrorCertainty::ProvenNotSent);
+                println!(
+                    "{{\"candidate\":\"kimi-cli\",\"profile\":\"default-user\",\"protocol\":\"agent-client-protocol\",\"prompt_sent\":false,\"model_call\":false,\"initialize\":\"failed\",\"safe_detail_code\":\"{}\"}}",
+                    error.safe_detail_code
+                );
+                return;
+            }
+        };
+        assert_eq!(result.readiness, HarnessReadiness::Degraded as i32);
+        let session = match KimiAcpDriver::new(config).probe_session().await {
+            Ok(session) => session,
+            Err(error) => {
+                assert_eq!(error.certainty, DriverErrorCertainty::ProvenNotSent);
+                println!(
+                    "{{\"candidate\":\"kimi-cli\",\"profile\":\"default-user\",\"protocol\":\"agent-client-protocol\",\"prompt_sent\":false,\"model_call\":false,\"initialize\":\"passed\",\"session_disposition\":\"probe_failed\",\"safe_detail_code\":\"{}\"}}",
+                    error.safe_detail_code
+                );
+                return;
+            }
+        };
+        let disposition = match &session.session {
+            KimiSessionProbeDisposition::Created { .. } => "created",
+            KimiSessionProbeDisposition::AuthenticationRequired { .. } => "authentication_required",
+            KimiSessionProbeDisposition::Rejected { .. } => "rejected",
+        };
+        println!(
+            "{{\"candidate\":\"kimi-cli\",\"profile\":\"default-user\",\"protocol\":\"agent-client-protocol\",\"prompt_sent\":false,\"model_call\":false,\"initialize\":\"passed\",\"session_disposition\":\"{disposition}\"}}"
+        );
     }
 
     #[tokio::test]

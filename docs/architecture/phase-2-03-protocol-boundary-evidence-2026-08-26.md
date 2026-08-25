@@ -43,6 +43,16 @@ This result is evidence of a reachable and controlled authentication boundary;
 it is not evidence of prompt execution, approval routing, cancellation or
 restart reconciliation.
 
+A second probe used the installed user's default Kimi profile without setting
+`KIMI_SHARE_DIR`. The process closed its ACP stdout before returning the first
+`initialize` response. EgoPulse now classifies that condition as
+`KIMI_ACP_INITIALIZE_EOF` with `ProvenNotSent`, rather than misclassifying an
+empty stream as invalid JSON. The probe therefore records `initialize: failed`,
+`prompt_sent: false` and `model_call: false`; it did not reach `session/new`.
+This is a default-profile startup/protocol failure observation, not evidence
+that the user's authentication is absent or invalid, and it does not promote
+or demote Kimi by itself.
+
 The Rust candidate adapter now records this boundary through
 `KimiAcpDriver::probe_session`. It preserves the `initialize` probe result and
 classifies `session/new` as one of three controlled dispositions:

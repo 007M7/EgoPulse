@@ -41,11 +41,12 @@ are discoverable. Codex remains the only production Harness; DSH now has
 candidate ACP lifecycle evidence, but its recovery row is an explicit hold.
 
 The follow-up protocol observations are recorded in
-`phase-2-03-protocol-boundary-evidence-2026-08-26.md`. Kimi remains the next
-candidate for an authenticated lifecycle probe; its current no-prompt probe
-is explicitly recorded as `authentication_required`. DSH's isolated profile,
-session creation, multi-turn prompt and cancellation probes pass, while its
-native recovery limitation keeps it held.
+`phase-2-03-protocol-boundary-evidence-2026-08-26.md`. Kimi remains held: its
+isolated no-prompt probe reaches `authentication_required`, while the default
+user-profile probe exits before the first ACP response and is classified as
+`KIMI_ACP_INITIALIZE_EOF`. An authenticated lifecycle probe is still required.
+DSH's isolated profile, session creation, multi-turn prompt and cancellation
+probes pass, while its native recovery limitation keeps it held.
 
 The candidate-only Rust probe is `crates/kimi-adapter`. Its explicit degraded
 result and fail-closed execution methods are part of the evidence: protocol
