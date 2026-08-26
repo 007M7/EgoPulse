@@ -131,9 +131,19 @@ Codex protocol evidence for the adapter runtime; it does not claim that the
 full user-owned production bootstrap and background runner have been exercised
 by the same test.
 
+The Codex driver now treats an unresolved native approval request as a clean
+observation-stream handoff: the dispatch worker returns control instead of
+blocking on a response that requires a separate `decide_approval` call. This
+is covered by `unresolved_approval_pauses_dispatch_observation_stream` and is
+an execution-safety fix, not approval authorization. The approval authority
+and the full production runner path remain outside this evidence.
+
 Therefore G4-04 remains open for one specific reason: the implemented
 composition boundary still needs a real authenticated Codex lifecycle result
 through the production runner, plus the corresponding provider-boundary
-review. The existence of the composition code is recorded as implementation
-evidence, not promoted to runtime acceptance. The candidate DSH ACP slice is
-separately documented in Phase 2-09 and does not alter this disposition.
+review. A diagnostic attempt to run that full path with the local authenticated
+Codex CLI did not converge within the bounded test command and is explicitly
+not accepted as evidence. The existence of the composition code is recorded as
+implementation evidence, not promoted to runtime acceptance. The candidate
+DSH ACP slice is separately documented in Phase 2-09 and does not alter this
+disposition.

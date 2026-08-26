@@ -925,6 +925,13 @@ impl NativeHarnessDriver for CodexAppServerDriver {
             if let Some(event) = self.queued_events.pop_front() {
                 return Ok(Some(event));
             }
+            // An unresolved server request is an explicit handoff to the
+            // approval authority. Do not block the governed dispatch worker
+            // waiting for a native response that requires a separate
+            // decide_approval call.
+            if !self.pending_approvals.is_empty() {
+                return Ok(None);
+            }
             if self
                 .active
                 .as_ref()
@@ -1442,6 +1449,35 @@ mod tests {
                 .next_event(&envelope)
                 .await
                 .expect("terminal stream close")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_approval_pauses_dispatch_observation_stream() {
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch-approval-pause".to_owned(),
+            ..Default::default()
+        };
+        driver.active = Some(ActiveDispatch {
+            dispatch_id: envelope.dispatch_id.clone(),
+            thread_id: "thread-approval-pause".to_owned(),
+            turn_id: Some("turn-approval-pause".to_owned()),
+            turn_request_id: 1,
+        });
+        let request = approval_request(9);
+        let raw = serde_json::to_vec(&request).expect("request bytes");
+        driver
+            .map_server_request("item/commandExecution/requestApproval", request, raw)
+            .expect("map request")
+            .expect("approval event");
+
+        assert!(
+            driver
+                .next_event(&envelope)
+                .await
+                .expect("approval pause must be a clean boundary")
                 .is_none()
         );
     }
