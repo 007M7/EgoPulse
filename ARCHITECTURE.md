@@ -50,6 +50,12 @@ data plane stores bytes by verified digest. Harnesses and collectors may submit 
 neither receives the Authority database handle nor may a terminal Harness event decide Artifact,
 verification or Task completion.
 
+The Artifact Authority `collaboration-control` ReturnReceipt outbox is consumed by the same
+single-writer Collaboration runner. It joins the receipt to the consumed Adapter terminal
+candidate by `dispatch_id` and sequence, then records Attempt return under the ArtifactAuthority
+principal. A digest, lineage, fence, sequence or revision mismatch leaves the receipt pending and
+produces no Collaboration write.
+
 The production return path is provider-neutral and durable. A native Harness driver emits one
 terminal output candidate; Adapter Edge atomically binds it to the terminal observation, immutable
 dispatch envelope and Collaboration-owned Task/work lineage. The governed return collector may

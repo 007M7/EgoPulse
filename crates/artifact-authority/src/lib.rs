@@ -270,6 +270,23 @@ where
         self.read_snapshot(artifact_set_id, self.store.artifact_set(artifact_set_id)?)
     }
 
+    pub fn read_return_handoff(
+        &self,
+        return_handoff_id: &str,
+    ) -> Result<Option<ReturnHandoff>, ArtifactAuthorityFailure> {
+        self.read_snapshot(
+            return_handoff_id,
+            self.store.return_handoff(return_handoff_id)?,
+        )
+    }
+
+    pub fn read_return_receipt(
+        &self,
+        receipt_id: &str,
+    ) -> Result<Option<ReturnReceipt>, ArtifactAuthorityFailure> {
+        self.read_snapshot(receipt_id, self.store.return_receipt(receipt_id)?)
+    }
+
     fn read_snapshot<T: prost::Message + Default>(
         &self,
         _id: &str,
@@ -1158,6 +1175,15 @@ where
         self.decode_projection_messages(self.store.pending_projection_outbox()?)
     }
 
+    /// Returns only the durable technical-return messages addressed to
+    /// Collaboration Control. Read-model consumers cannot acknowledge this
+    /// destination, and Collaboration cannot consume read-model projections.
+    pub fn drain_collaboration_outbox(
+        &self,
+    ) -> Result<Vec<ArtifactProjectionMessage>, ArtifactAuthorityFailure> {
+        self.decode_projection_messages(self.store.pending_collaboration_outbox()?)
+    }
+
     pub fn projection_baselines(
         &self,
     ) -> Result<Vec<ArtifactProjectionMessage>, ArtifactAuthorityFailure> {
@@ -1202,6 +1228,16 @@ where
     ) -> Result<bool, ArtifactAuthorityFailure> {
         self.store
             .acknowledge_projection_outbox(message_id, expected_payload_digest_sha256)
+            .map_err(ArtifactAuthorityFailure::from)
+    }
+
+    pub fn acknowledge_collaboration_projection(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, ArtifactAuthorityFailure> {
+        self.store
+            .acknowledge_collaboration_outbox(message_id, expected_payload_digest_sha256)
             .map_err(ArtifactAuthorityFailure::from)
     }
 }

@@ -94,6 +94,9 @@ dispatch by itself.
   evidence ID without another native reconcile call;
 - the Adapter-backed evidence resolver verifies delivery, ACK, running, structured interruption and
   reconciliation evidence from the independent Adapter SQLCipher edge before Collaboration writes;
+- the return projection resolver verifies an Artifact Authority ReturnReceipt against its encoded
+  digest and joins it to the consumed Adapter terminal candidate by dispatch, fence and observation
+  sequence before Collaboration records Attempt return;
 - the integrated fake-Harness path now proves committed outbox consumption, delivery, ACK, running,
   terminal-candidate deferral, cancellation confirmation and `outcome_unknown -> reconciling ->
   interrupted/retry-idempotent` recovery from a matching `no_effect_proven` finding without leaking

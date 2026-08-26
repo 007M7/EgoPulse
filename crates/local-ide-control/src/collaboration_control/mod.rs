@@ -28,10 +28,10 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     CollaborationEventKind, CollaborationSnapshot, CreateAttemptCommand, CreateRunCommand,
     GetCollaborationResponse, Lease, MarkAttemptOutcomeUnknownCommand, ReconciliationDisposition,
     RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
-    RecordDeliveryReceiptCommand, RecordDispatchIntentCommand, RecordHarnessAckCommand,
-    RecordRunningObservationCommand, RecoveryClass, RequestAttemptCancellationCommand, RunSnapshot,
-    RunStatus, StepSnapshot, StepStatus, collaboration_command, collaboration_command_result,
-    get_collaboration_response,
+    RecordAttemptReturnCommand, RecordDeliveryReceiptCommand, RecordDispatchIntentCommand,
+    RecordHarnessAckCommand, RecordRunningObservationCommand, RecoveryClass,
+    RequestAttemptCancellationCommand, RunSnapshot, RunStatus, StepSnapshot, StepStatus,
+    collaboration_command, collaboration_command_result, get_collaboration_response,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
@@ -164,6 +164,43 @@ pub trait HarnessEvidenceResolver {
         command: &RecordAttemptReconciliationCommand,
         snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection>;
+
+    /// Independent read port that joins an Artifact Authority technical
+    /// receipt to the exact terminal Adapter evidence. The default is
+    /// fail-closed so existing non-return guards cannot accidentally authorize
+    /// a return transition.
+    fn resolve_attempt_return(
+        &self,
+        command: &RecordAttemptReturnCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
+        let _ = (command, snapshot);
+        Err(ReferenceGuardRejection::UnverifiedReference)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedArtifactReturn {
+    pub artifact_set_id: String,
+    pub return_handoff_id: String,
+    pub dispatch_id: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingArtifactReturn {
+    pub message_id: String,
+    pub payload_digest_sha256: String,
+    pub receipt: egopulse_domain_contracts::v01::egopulse::artifact::v1::ReturnReceipt,
+}
+
+pub trait ArtifactReturnSource: Send + Sync {
+    fn pending_returns(&self) -> Result<Vec<PendingArtifactReturn>, String>;
+    fn acknowledge_return(
+        &self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, String>;
 }
 
 pub trait CollaborationReferenceGuard {
@@ -458,6 +495,9 @@ where
             }
             collaboration_command::Command::RecordRunningObservation(value) => {
                 self.record_running_observation(value, command, principal)
+            }
+            collaboration_command::Command::RecordAttemptReturn(value) => {
+                self.record_attempt_return(value, command, principal)
             }
             collaboration_command::Command::RequestAttemptCancellation(value) => {
                 self.request_attempt_cancellation(value, command, principal)
@@ -1268,6 +1308,105 @@ where
             Some(step_previous),
             Some(attempt_previous),
             CollaborationEventKind::RunningObserved,
+            evidence,
+            None,
+            now,
+        )
+    }
+
+    fn record_attempt_return(
+        &mut self,
+        value: &RecordAttemptReturnCommand,
+        command: &CollaborationCommand,
+        principal: &AuthenticatedCollaborationPrincipal,
+    ) -> Result<CollaborationCommandResult, CollaborationControlError> {
+        let Some(base) = value.base.as_ref() else {
+            return Ok(invalid("ATTEMPT_RETURN_BASE_REQUIRED"));
+        };
+        let Some(mut snapshot) = self.load_snapshot(&base.run_id)? else {
+            return Ok(not_found("COLLABORATION_RUN_NOT_FOUND"));
+        };
+        let (step_index, attempt_index) = match validate_attempt_preconditions(&snapshot, base) {
+            Ok(indexes) => indexes,
+            Err(result) => return Ok(*result),
+        };
+        let attempt = &snapshot.attempts[attempt_index];
+        if !matches!(
+            AttemptStatus::try_from(attempt.status),
+            Ok(AttemptStatus::Acknowledged | AttemptStatus::Running)
+        ) {
+            return Ok(state_conflict("ATTEMPT_NOT_ACCEPTING_RETURN"));
+        }
+        if !current_fence_matches(attempt, value.fencing_token) {
+            return Ok(fencing_rejected(
+                snapshot.run.as_ref().expect("stored run").revision,
+                attempt.revision,
+            ));
+        }
+        if value.harness_sequence <= attempt.last_harness_sequence {
+            return Ok(sequence_conflict(
+                snapshot.run.as_ref().expect("stored run").revision,
+                attempt.revision,
+            ));
+        }
+        if value.artifact_return_receipt_id.trim().is_empty()
+            || !sha256_is_complete(&value.receipt_digest_sha256)
+        {
+            return Ok(invalid("ARTIFACT_RETURN_RECEIPT_IDENTITY_INVALID"));
+        }
+        let resolved = match self.guard.resolve_attempt_return(value, &snapshot) {
+            Ok(value) => value,
+            Err(rejection) => return Ok(guard_error(rejection)),
+        };
+        if resolved.artifact_set_id.trim().is_empty()
+            || resolved.return_handoff_id.trim().is_empty()
+            || resolved.dispatch_id.trim().is_empty()
+            || resolved.evidence_refs.is_empty()
+            || resolved
+                .evidence_refs
+                .iter()
+                .any(|reference| reference.trim().is_empty())
+        {
+            return Ok(invalid("ARTIFACT_RETURN_RESOLUTION_INVALID"));
+        }
+
+        let now = self.clock.now();
+        let run_previous = snapshot.run.as_ref().expect("stored run").revision;
+        let step_previous = snapshot.steps[step_index].revision;
+        let attempt_previous = attempt.revision;
+        let run = snapshot.run.as_mut().expect("stored run");
+        run.revision += 1;
+        run.status = RunStatus::ReturnPending as i32;
+        run.updated_at = Some(now);
+        let step = &mut snapshot.steps[step_index];
+        step.revision += 1;
+        step.status = StepStatus::ReturnPending as i32;
+        step.updated_at = Some(now);
+        let attempt = &mut snapshot.attempts[attempt_index];
+        attempt.revision += 1;
+        attempt.status = AttemptStatus::Returned as i32;
+        attempt.last_harness_sequence = value.harness_sequence;
+        attempt.updated_at = Some(now);
+        let mut evidence = resolved.evidence_refs;
+        evidence.push(format!(
+            "artifact-return-receipt:{}",
+            value.artifact_return_receipt_id
+        ));
+        evidence.push(format!(
+            "artifact-return-receipt-digest:{}",
+            value.receipt_digest_sha256
+        ));
+        evidence.push(format!("artifact-set:{}", resolved.artifact_set_id));
+        evidence.push(format!("return-handoff:{}", resolved.return_handoff_id));
+        evidence.push(format!("dispatch:{}", resolved.dispatch_id));
+        self.persist(
+            command,
+            principal,
+            snapshot,
+            Some(run_previous),
+            Some(step_previous),
+            Some(attempt_previous),
+            CollaborationEventKind::ReturnRecorded,
             evidence,
             None,
             now,
@@ -2201,10 +2340,7 @@ fn operation_allowed(operation: &str, kind: CollaborationPrincipalKind) -> bool 
             kind == CollaborationPrincipalKind::TaskAuthority
         }
         "create_attempt" => kind == CollaborationPrincipalKind::CollaborationControl,
-        "commit_step_return" => {
-            kind == CollaborationPrincipalKind::CollaborationControl
-                || kind == CollaborationPrincipalKind::ArtifactAuthority
-        }
+        "commit_step_return" => kind == CollaborationPrincipalKind::CollaborationControl,
         "acquire_attempt_lease" | "renew_attempt_lease" | "record_dispatch_intent" => {
             kind == CollaborationPrincipalKind::CollaborationControl
                 || kind == CollaborationPrincipalKind::AttemptSupervisor
@@ -2224,10 +2360,10 @@ fn operation_allowed(operation: &str, kind: CollaborationPrincipalKind) -> bool 
                 || kind == CollaborationPrincipalKind::CollaborationControl
                 || kind == CollaborationPrincipalKind::AttemptSupervisor
         }
-        "record_delivery_receipt"
-        | "record_harness_ack"
-        | "record_running_observation"
-        | "record_attempt_return" => kind == CollaborationPrincipalKind::HarnessAdapter,
+        "record_delivery_receipt" | "record_harness_ack" | "record_running_observation" => {
+            kind == CollaborationPrincipalKind::HarnessAdapter
+        }
+        "record_attempt_return" => kind == CollaborationPrincipalKind::ArtifactAuthority,
         "mark_attempt_outcome_unknown" => {
             kind == CollaborationPrincipalKind::RecoveryWorker
                 || kind == CollaborationPrincipalKind::CollaborationControl

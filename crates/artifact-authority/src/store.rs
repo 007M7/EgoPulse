@@ -357,6 +357,10 @@ impl ArtifactStore {
         self.snapshot("return_handoffs", "return_handoff_id", id)
     }
 
+    pub fn return_receipt(&self, id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        self.snapshot("return_receipts", "receipt_id", id)
+    }
+
     fn snapshot(
         &self,
         table: &str,
@@ -583,13 +587,24 @@ impl ArtifactStore {
     }
 
     pub fn pending_projection_outbox(&self) -> Result<Vec<PendingProjectionOutbox>, StoreError> {
+        self.pending_outbox_for_destination("local-read-model")
+    }
+
+    pub fn pending_collaboration_outbox(&self) -> Result<Vec<PendingProjectionOutbox>, StoreError> {
+        self.pending_outbox_for_destination("collaboration-control")
+    }
+
+    fn pending_outbox_for_destination(
+        &self,
+        destination_domain: &str,
+    ) -> Result<Vec<PendingProjectionOutbox>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT message_id,source_event_id,source_revision,canonical_payload_digest_sha256,payload
              FROM artifact_outbox
-             WHERE destination_domain='local-read-model' AND delivery_state='pending'
+             WHERE destination_domain=?1 AND delivery_state='pending'
              ORDER BY created_at_seconds,message_id",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([destination_domain], |row| {
             let revision: i64 = row.get(2)?;
             Ok(PendingProjectionOutbox {
                 message_id: row.get(0)?,
@@ -636,11 +651,40 @@ impl ArtifactStore {
         message_id: &str,
         expected_payload_digest_sha256: &str,
     ) -> Result<bool, StoreError> {
+        self.acknowledge_outbox_for_destination(
+            "local-read-model",
+            message_id,
+            expected_payload_digest_sha256,
+        )
+    }
+
+    pub fn acknowledge_collaboration_outbox(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        self.acknowledge_outbox_for_destination(
+            "collaboration-control",
+            message_id,
+            expected_payload_digest_sha256,
+        )
+    }
+
+    fn acknowledge_outbox_for_destination(
+        &mut self,
+        destination_domain: &str,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
         let changed = self.connection.execute(
             "UPDATE artifact_outbox SET delivery_state='consumed'
-             WHERE message_id=?1 AND destination_domain='local-read-model'
-               AND canonical_payload_digest_sha256=?2 AND delivery_state='pending'",
-            params![message_id, expected_payload_digest_sha256],
+             WHERE message_id=?1 AND destination_domain=?2
+               AND canonical_payload_digest_sha256=?3 AND delivery_state='pending'",
+            params![
+                message_id,
+                destination_domain,
+                expected_payload_digest_sha256
+            ],
         )?;
         Ok(changed == 1)
     }

@@ -69,6 +69,8 @@ mutable workspace path.
 - Adapter Edge settles its source candidate only after that receipt reports evidence intake=true,
   verification=false and task-completion=false. Empty, truncated or admission-rejected candidates
   are held without fabricating artifacts;
+- the Collaboration runner consumes only the `collaboration-control` destination and acknowledges
+  that outbox message only after the Collaboration `ReturnRecorded` event is durable;
 - orphan-blob reuse and process-abort replay after committed return;
 - encrypted metadata-store reopen/integrity and private-store dependency boundary checks.
 
@@ -97,8 +99,8 @@ weaken the frozen single-writer or blob-before-metadata boundaries.
 
 ## Return-path boundary still open
 
-The collector closes the Harness-to-Artifact-Authority technical intake path only. Artifact
-Authority's receipt outbox is not yet projected into Collaboration's `RecordAttemptReturn`, Sego
-verification and `CommitStepReturn` transitions. Therefore a successful technical receipt is not a
-V-01 workflow completion claim. The next vertical slice must consume that outbox through a typed,
-idempotent resolver and preserve the existing single-writer/fencing checks.
+The collector plus typed outbox projector now close the Artifact Authority-to-Collaboration
+`RecordAttemptReturn` boundary. A successful technical receipt still is not a V-01 workflow
+completion claim: Sego verification and `CommitStepReturn` remain open. The next vertical slice
+must consume the returned ArtifactSet through the Verification Authority and commit the Step only
+from a governed verification result.

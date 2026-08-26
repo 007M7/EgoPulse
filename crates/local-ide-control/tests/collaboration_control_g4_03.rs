@@ -6,10 +6,10 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     CollaborationSnapshot, CreateAttemptCommand, CreateRunCommand,
     MarkAttemptOutcomeUnknownCommand, ReconciliationDisposition,
     RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
-    RecordDeliveryReceiptCommand, RecordDispatchIntentCommand, RecordHarnessAckCommand,
-    RecordRunningObservationCommand, RecoveryClass, RequestAttemptCancellationCommand,
-    RunCommandBase, RunPlan, RunStatus, StepPlan, StepStatus, collaboration_command,
-    collaboration_command_result, get_collaboration_response,
+    RecordAttemptReturnCommand, RecordDeliveryReceiptCommand, RecordDispatchIntentCommand,
+    RecordHarnessAckCommand, RecordRunningObservationCommand, RecoveryClass,
+    RequestAttemptCancellationCommand, RunCommandBase, RunPlan, RunStatus, StepPlan, StepStatus,
+    collaboration_command, collaboration_command_result, get_collaboration_response,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
@@ -28,11 +28,12 @@ use egopulse_local_ide_control::collaboration_control::{
     CollaborationPrincipalKind, CollaborationReferenceGuard, CollaborationSqlCipherKey,
     CompositeCollaborationGuard, DispatchMaterial, GovernedTaskActivationRunner,
     HarnessDispatchRunner, HarnessEvidenceResolver, HarnessFactIngestionDisposition,
-    LeaseAuthorization, ReferenceAuthorization, ReferenceGuardRejection, ResolvedHarnessEvidence,
-    SingleHarnessWorkConfig, SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError,
-    TaskActivationGuardSet, TaskActivationHandoff, TaskActivationReferenceGuard,
-    TaskActivationSource, TaskActivationSourceError, canonical_dispatch_fingerprint,
-    canonical_request_digest, dispatch_pending, pump_observations, start_single_harness_workflow,
+    LeaseAuthorization, ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
+    ResolvedHarnessEvidence, SingleHarnessWorkConfig, SingleHarnessWorkflowResolver,
+    SingleHarnessWorkflowResolverError, TaskActivationGuardSet, TaskActivationHandoff,
+    TaskActivationReferenceGuard, TaskActivationSource, TaskActivationSourceError,
+    canonical_dispatch_fingerprint, canonical_request_digest, dispatch_pending, pump_observations,
+    start_single_harness_workflow,
 };
 use prost_types::Timestamp;
 use rusqlite::Connection;
@@ -290,6 +291,28 @@ impl HarnessEvidenceResolver for FixtureGuard {
         }
         Ok(ReferenceAuthorization {
             evidence_refs: vec!["adapter-reconciliation:durable".to_owned()],
+        })
+    }
+
+    fn resolve_attempt_return(
+        &self,
+        command: &RecordAttemptReturnCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
+        if command.artifact_return_receipt_id != "return-receipt-001"
+            || command.receipt_digest_sha256 != "a".repeat(64)
+            || command.harness_sequence != 3
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ResolvedArtifactReturn {
+            artifact_set_id: "artifact-set-001".to_owned(),
+            return_handoff_id: "return-handoff-001".to_owned(),
+            dispatch_id: "dispatch-001".to_owned(),
+            evidence_refs: vec![
+                "artifact-return-receipt:return-receipt-001@durable".to_owned(),
+                "adapter-terminal-observation:terminal-001@durable".to_owned(),
+            ],
         })
     }
 }
@@ -643,6 +666,13 @@ fn harness_adapter() -> AuthenticatedCollaborationPrincipal {
     principal(CollaborationPrincipalKind::HarnessAdapter, "adapter:codex")
 }
 
+fn artifact_authority() -> AuthenticatedCollaborationPrincipal {
+    principal(
+        CollaborationPrincipalKind::ArtifactAuthority,
+        "artifact-authority:test",
+    )
+}
+
 fn metadata(command_id: &str, key: &str, scope: &str) -> CommandMetadata {
     CommandMetadata {
         command_id: command_id.to_owned(),
@@ -815,6 +845,16 @@ fn set_digest(command: &mut CollaborationCommand) {
                 .request_digest_sha256 = digest;
         }
         collaboration_command::Command::MarkAttemptOutcomeUnknown(value) => {
+            value
+                .base
+                .as_mut()
+                .expect("base")
+                .meta
+                .as_mut()
+                .expect("metadata")
+                .request_digest_sha256 = digest;
+        }
+        collaboration_command::Command::RecordAttemptReturn(value) => {
             value
                 .base
                 .as_mut()
@@ -1122,6 +1162,26 @@ fn running_command(
                 harness_sequence,
                 lifecycle_event_id: "running-001".to_owned(),
                 event_digest_sha256: "f".repeat(64),
+            },
+        )),
+    };
+    set_digest(&mut command);
+    command
+}
+
+fn attempt_return_command(
+    snapshot: &CollaborationSnapshot,
+    fencing_token: u64,
+    harness_sequence: u64,
+) -> CollaborationCommand {
+    let mut command = CollaborationCommand {
+        command: Some(collaboration_command::Command::RecordAttemptReturn(
+            RecordAttemptReturnCommand {
+                base: Some(attempt_base(snapshot, "cmd-return-001")),
+                fencing_token,
+                harness_sequence,
+                artifact_return_receipt_id: "return-receipt-001".to_owned(),
+                receipt_digest_sha256: "a".repeat(64),
             },
         )),
     };
@@ -2070,6 +2130,58 @@ fn cancellation_delivery_unknown_reconciliation_and_retry_are_distinct_facts() {
         recovered.attempts[0].recovery_class,
         RecoveryClass::RetryIdempotent as i32
     );
+}
+
+#[test]
+fn governed_artifact_return_records_attempt_once_and_not_step_completion() {
+    let isolated = IsolatedStore::new("collaboration-artifact-return");
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut control = open_control(&isolated.database_path(), clock);
+    let running = advance_through_running(&mut control);
+    let fence = running.attempts[0]
+        .lease
+        .as_ref()
+        .expect("lease")
+        .fencing_token;
+    let before_unauthorized = control.inspect_store().expect("before unauthorized return");
+    let unauthorized = control
+        .execute(
+            &attempt_return_command(&running, fence, 3),
+            &harness_adapter(),
+        )
+        .expect("reject Harness return authority");
+    assert_eq!(
+        error_code(&unauthorized),
+        CollaborationErrorCode::PermissionDenied
+    );
+    assert_eq!(
+        control.inspect_store().expect("after unauthorized return"),
+        before_unauthorized
+    );
+
+    let committed = control
+        .execute(
+            &attempt_return_command(&running, fence, 3),
+            &artifact_authority(),
+        )
+        .expect("record governed Artifact return");
+    let returned = committed_snapshot(&committed);
+    assert_eq!(returned.attempts[0].status, AttemptStatus::Returned as i32);
+    assert_eq!(returned.attempts[0].last_harness_sequence, 3);
+    assert_eq!(returned.steps[0].status, StepStatus::ReturnPending as i32);
+    assert_eq!(
+        returned.run.as_ref().expect("run").status,
+        RunStatus::ReturnPending as i32
+    );
+
+    let replayed = control
+        .execute(
+            &attempt_return_command(&running, fence, 3),
+            &artifact_authority(),
+        )
+        .expect("replay governed Artifact return");
+    assert!(replayed.replayed);
+    assert_eq!(committed_snapshot(&replayed), returned);
 }
 
 #[test]

@@ -632,6 +632,50 @@ fn immutable_return_intake_is_atomic_and_duplicate_safe() {
     assert!(!receipt.verification_performed);
     assert!(!receipt.task_completion_decided);
 
+    let collaboration_messages = authority
+        .drain_collaboration_outbox()
+        .expect("drain Collaboration return outbox");
+    assert_eq!(collaboration_messages.len(), 1);
+    assert_eq!(
+        collaboration_messages[0]
+            .result
+            .return_receipt
+            .as_ref()
+            .expect("outbox technical receipt")
+            .receipt_id,
+        receipt.receipt_id
+    );
+    assert!(
+        !authority
+            .acknowledge_projection(
+                &collaboration_messages[0].message_id,
+                &collaboration_messages[0].payload_digest_sha256,
+            )
+            .expect("read-model ACK cannot consume Collaboration message")
+    );
+    assert!(
+        !authority
+            .acknowledge_collaboration_projection(
+                &collaboration_messages[0].message_id,
+                &"0".repeat(64),
+            )
+            .expect("reject mismatched Collaboration ACK")
+    );
+    assert!(
+        authority
+            .acknowledge_collaboration_projection(
+                &collaboration_messages[0].message_id,
+                &collaboration_messages[0].payload_digest_sha256,
+            )
+            .expect("acknowledge Collaboration return")
+    );
+    assert!(
+        authority
+            .drain_collaboration_outbox()
+            .expect("Collaboration return outbox after ACK")
+            .is_empty()
+    );
+
     let counts = authority.inspect_store().expect("inspect Artifact store");
     assert_eq!(counts.artifact_count, 3);
     assert_eq!(counts.claim_count, 1);

@@ -67,6 +67,7 @@ mod owners;
 mod policy;
 mod projections;
 mod return_collector;
+mod return_projection;
 mod security;
 mod task;
 mod verdict;
@@ -96,6 +97,7 @@ pub use projections::{
     ProjectionPumpFailure, ProjectionSourceFailure, VerificationProjectionSource,
 };
 pub use return_collector::{GovernedReturnCollectorConfig, GovernedReturnCollectorRunner};
+pub use return_projection::{ArtifactAuthorityReturnSource, GovernedReturnEvidenceResolver};
 pub use security::{
     AllowlistedPrincipal, AllowlistedPrincipalResolver, AuthorityPrincipalBinding,
     ConfiguredAuthorityPrincipalResolver, PrincipalPolicyError,
@@ -551,9 +553,7 @@ impl DaemonProviders {
         })
         .map_err(DaemonCompositionError::AdapterEdge)?;
         let evidence =
-            egopulse_local_ide_control::collaboration_control::AdapterBackedHarnessEvidenceResolver::new(
-                reader_edge,
-            );
+            GovernedReturnEvidenceResolver::new(reader_edge, Arc::clone(&artifact_authority));
         let (guard, reference) = TaskActivationGuardSet::new(evidence);
         let control = CollaborationControl::open(
             CollaborationControlConfig {
@@ -580,6 +580,19 @@ impl DaemonProviders {
             authenticated: true,
         };
         let resolver = ConfiguredSingleHarnessWorkflow::new(config.workflow);
+        let artifact_return_principal = AuthenticatedCollaborationPrincipal {
+            kind: CollaborationPrincipalKind::ArtifactAuthority,
+            principal_id: config
+                .return_collector
+                .artifact_authority_principal_id
+                .clone(),
+            authenticated: true,
+        };
+        let artifact_return_source: Arc<
+            dyn egopulse_local_ide_control::collaboration_control::ArtifactReturnSource,
+        > = Arc::new(ArtifactAuthorityReturnSource::new(Arc::clone(
+            &artifact_authority,
+        )));
         let runner = GovernedTaskActivationRunner::new(
             control,
             adapter,
@@ -588,7 +601,8 @@ impl DaemonProviders {
             principal,
             reference,
             config.lease_ttl_seconds,
-        );
+        )
+        .with_artifact_return_source(artifact_return_source, artifact_return_principal);
         let harness: Arc<dyn HarnessDispatchRunner> = Arc::new(runner);
         let collector = GovernedReturnCollectorRunner::new(
             harness,

@@ -135,4 +135,12 @@ where
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
         self.evidence.validate_reconciliation(command, snapshot)
     }
+
+    fn resolve_attempt_return(
+        &self,
+        command: &RecordAttemptReturnCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
+        self.evidence.resolve_attempt_return(command, snapshot)
+    }
 }

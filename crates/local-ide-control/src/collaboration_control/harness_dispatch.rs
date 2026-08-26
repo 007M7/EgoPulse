@@ -1,10 +1,15 @@
 use super::{
-    AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
-    CollaborationControlError, CollaborationReferenceGuard, HarnessEvidenceResolver,
-    HarnessFactIngestionDisposition, HarnessFactIngestionResult, SingleHarnessWorkflowResolver,
-    TaskActivationGuardSet, TaskActivationReferenceHandle, TaskActivationSource,
+    ArtifactReturnSource, AuthenticatedCollaborationPrincipal, AuthorityClock,
+    CollaborationControl, CollaborationControlError, CollaborationReferenceGuard,
+    HarnessEvidenceResolver, HarnessFactIngestionDisposition, HarnessFactIngestionResult,
+    SingleHarnessWorkflowResolver, TaskActivationGuardSet, TaskActivationReferenceHandle,
+    TaskActivationSource, seal_request_digest,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::get_collaboration_response;
+use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
+    AttemptCommandBase, CollaborationCommand, RecordAttemptReturnCommand, collaboration_command,
+};
+use egopulse_domain_contracts::v01::egopulse::common::v1::CommandMetadata;
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     DeliveryDisposition, DispatchEnvelope, HarnessObservation, LifecycleKind,
     ObservationCriticality, dispatch_result, harness_observation,
@@ -13,6 +18,8 @@ use egopulse_harness_adapter::{
     AdapterClock, DispatchMaterialResolver, GovernedAdapterError, GovernedHarnessAdapter,
     NativeHarnessDriver,
 };
+use prost::Message;
+use sha2::Digest;
 use std::{future::Future, pin::Pin};
 use thiserror::Error;
 
@@ -150,6 +157,8 @@ struct GovernedTaskActivationRuntime<S, W, E, C, R, D, A> {
     reference: TaskActivationReferenceHandle,
     lease_ttl_seconds: u64,
     active_envelopes: Vec<DispatchEnvelope>,
+    artifact_return_source: Option<std::sync::Arc<dyn ArtifactReturnSource>>,
+    artifact_return_principal: Option<AuthenticatedCollaborationPrincipal>,
 }
 
 /// The production single-writer worker for the first vertical. It consumes
@@ -191,9 +200,23 @@ where
                 reference,
                 lease_ttl_seconds,
                 active_envelopes: Vec::new(),
+                artifact_return_source: None,
+                artifact_return_principal: None,
             }),
             principal,
         }
+    }
+
+    #[must_use]
+    pub fn with_artifact_return_source(
+        mut self,
+        source: std::sync::Arc<dyn ArtifactReturnSource>,
+        principal: AuthenticatedCollaborationPrincipal,
+    ) -> Self {
+        let runtime = self.runtime.get_mut();
+        runtime.artifact_return_source = Some(source);
+        runtime.artifact_return_principal = Some(principal);
+        self
     }
 }
 
@@ -227,7 +250,15 @@ where
                 reference,
                 lease_ttl_seconds,
                 active_envelopes,
+                artifact_return_source,
+                artifact_return_principal,
             } = &mut *runtime;
+            consume_artifact_returns(
+                control,
+                adapter,
+                artifact_return_source.as_ref(),
+                artifact_return_principal.as_ref(),
+            )?;
             let activations = source
                 .pending_task_activations()
                 .map_err(|_| HarnessDispatchCycleError::TaskActivationSource)?;
@@ -280,6 +311,121 @@ where
             Ok(report)
         })
     }
+}
+
+fn consume_artifact_returns<G, C, R, D, A>(
+    control: &mut CollaborationControl<G, C>,
+    adapter: &mut GovernedHarnessAdapter<R, D, A>,
+    source: Option<&std::sync::Arc<dyn ArtifactReturnSource>>,
+    principal: Option<&AuthenticatedCollaborationPrincipal>,
+) -> Result<(), HarnessDispatchCycleError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+    R: DispatchMaterialResolver,
+    D: NativeHarnessDriver,
+    A: AdapterClock,
+{
+    let (Some(source), Some(principal)) = (source, principal) else {
+        return Ok(());
+    };
+    for pending in source
+        .pending_returns()
+        .map_err(HarnessDispatchCycleError::ReturnCollector)?
+    {
+        let lineage = pending.receipt.lineage.as_ref().ok_or_else(|| {
+            HarnessDispatchCycleError::ReturnCollector(
+                "Artifact return receipt has no lineage".to_owned(),
+            )
+        })?;
+        let candidate = adapter
+            .terminal_output_candidate_for_dispatch(&lineage.dispatch_id)?
+            .ok_or_else(|| {
+                HarnessDispatchCycleError::ReturnCollector(
+                    "terminal Adapter evidence for Artifact return is unavailable".to_owned(),
+                )
+            })?;
+        let snapshot = match control.get_collaboration(&lineage.run_id)?.outcome {
+            Some(get_collaboration_response::Outcome::Snapshot(snapshot)) => snapshot,
+            _ => {
+                return Err(HarnessDispatchCycleError::ReturnCollector(
+                    "Collaboration snapshot for Artifact return is unavailable".to_owned(),
+                ));
+            }
+        };
+        let run = snapshot.run.as_ref().ok_or_else(|| {
+            HarnessDispatchCycleError::ReturnCollector(
+                "Collaboration run is unavailable".to_owned(),
+            )
+        })?;
+        let step = snapshot
+            .steps
+            .iter()
+            .find(|step| step.step_id == lineage.step_id)
+            .ok_or_else(|| {
+                HarnessDispatchCycleError::ReturnCollector(
+                    "Collaboration step is unavailable".to_owned(),
+                )
+            })?;
+        let attempt = snapshot
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == lineage.attempt_id)
+            .ok_or_else(|| {
+                HarnessDispatchCycleError::ReturnCollector(
+                    "Collaboration attempt is unavailable".to_owned(),
+                )
+            })?;
+        let mut command = CollaborationCommand {
+            command: Some(collaboration_command::Command::RecordAttemptReturn(
+                RecordAttemptReturnCommand {
+                    base: Some(AttemptCommandBase {
+                        meta: Some(CommandMetadata {
+                            command_id: format!("artifact-return:{}", pending.receipt.receipt_id),
+                            idempotency_key: pending.receipt.receipt_id.clone(),
+                            idempotency_scope: attempt.attempt_id.clone(),
+                            request_digest_sha256: String::new(),
+                            issued_at: pending.receipt.committed_at,
+                            correlation_id: pending.receipt.return_handoff_id.clone(),
+                            causation_id: None,
+                        }),
+                        run_id: run.run_id.clone(),
+                        expected_run_revision: run.revision,
+                        step_id: step.step_id.clone(),
+                        expected_step_revision: step.revision,
+                        attempt_id: attempt.attempt_id.clone(),
+                        expected_attempt_revision: attempt.revision,
+                    }),
+                    fencing_token: lineage.fencing_token,
+                    harness_sequence: candidate.source_revision,
+                    artifact_return_receipt_id: pending.receipt.receipt_id.clone(),
+                    receipt_digest_sha256: hex::encode(sha2::Sha256::digest(
+                        pending.receipt.encode_to_vec(),
+                    )),
+                },
+            )),
+        };
+        seal_request_digest(&mut command).ok_or_else(|| {
+            HarnessDispatchCycleError::ReturnCollector(
+                "Artifact return command could not be sealed".to_owned(),
+            )
+        })?;
+        let result = control.execute(&command, principal)?;
+        if result.committed_event.is_none() && !result.replayed {
+            return Err(HarnessDispatchCycleError::ReturnCollector(
+                "Collaboration rejected Artifact return".to_owned(),
+            ));
+        }
+        if !source
+            .acknowledge_return(&pending.message_id, &pending.payload_digest_sha256)
+            .map_err(HarnessDispatchCycleError::ReturnCollector)?
+        {
+            return Err(HarnessDispatchCycleError::ReturnCollector(
+                "Artifact return outbox acknowledgement was not persisted".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Delivers all currently pending Collaboration dispatch intents to one

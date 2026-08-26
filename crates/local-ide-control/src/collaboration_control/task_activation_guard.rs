@@ -3,10 +3,10 @@ use super::{
     CollaborationSnapshot, CreateAttemptCommand, CreateRunCommand, DispatchMaterial,
     HarnessEvidenceResolver, LeaseAuthorization, MarkAttemptOutcomeUnknownCommand,
     RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
-    RecordDeliveryReceiptCommand, RecordDispatchIntentCommand, RecordHarnessAckCommand,
-    RecordRunningObservationCommand, ReferenceAuthorization, ReferenceGuardRejection,
-    RequestAttemptCancellationCommand, ResolvedHarnessEvidence, RunSnapshot,
-    SingleHarnessWorkConfig, StepSnapshot,
+    RecordAttemptReturnCommand, RecordDeliveryReceiptCommand, RecordDispatchIntentCommand,
+    RecordHarnessAckCommand, RecordRunningObservationCommand, ReferenceAuthorization,
+    ReferenceGuardRejection, RequestAttemptCancellationCommand, ResolvedArtifactReturn,
+    ResolvedHarnessEvidence, RunSnapshot, SingleHarnessWorkConfig, StepSnapshot,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::RunPlan;
 use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
@@ -205,6 +205,14 @@ where
         snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
         self.evidence.validate_reconciliation(command, snapshot)
+    }
+
+    fn resolve_attempt_return(
+        &self,
+        command: &RecordAttemptReturnCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
+        self.evidence.resolve_attempt_return(command, snapshot)
     }
 }
 

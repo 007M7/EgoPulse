@@ -873,6 +873,31 @@ impl AdapterEdge {
     pub fn pending_terminal_output_candidates(
         &self,
     ) -> Result<Vec<PendingTerminalOutputCandidate>, AdapterEdgeError> {
+        self.terminal_output_candidates(None)
+    }
+
+    /// Resolves the durable terminal candidate for a dispatch after either
+    /// pending or consumed delivery. This is a read-only evidence port for
+    /// binding an Artifact Authority receipt back to the exact Harness
+    /// sequence; held candidates are deliberately ineligible.
+    pub fn terminal_output_candidate_for_dispatch(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<PendingTerminalOutputCandidate>, AdapterEdgeError> {
+        if dispatch_id.trim().is_empty() {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        let mut candidates = self.terminal_output_candidates(Some(dispatch_id))?;
+        if candidates.len() > 1 {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        Ok(candidates.pop())
+    }
+
+    fn terminal_output_candidates(
+        &self,
+        dispatch_id: Option<&str>,
+    ) -> Result<Vec<PendingTerminalOutputCandidate>, AdapterEdgeError> {
         let mut statement = self.connection.prepare(
             "SELECT o.message_id, o.source_observation_id, o.source_revision,
                     o.payload_digest_sha256, o.dispatch_id, o.native_completion_ref,
@@ -884,10 +909,12 @@ impl AdapterEdge {
              JOIN adapter_observations a ON a.observation_id = o.source_observation_id
              JOIN adapter_dispatches d ON d.dispatch_id = o.dispatch_id
              JOIN adapter_dispatch_task_lineage l ON l.dispatch_id = o.dispatch_id
-             WHERE o.delivery_state = 'pending'
+             WHERE ((?1 IS NULL AND o.delivery_state = 'pending')
+                OR (?1 IS NOT NULL AND o.dispatch_id = ?1
+                    AND o.delivery_state IN ('pending', 'consumed')))
              ORDER BY o.source_revision",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([dispatch_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1865,6 +1892,12 @@ mod tests {
                 .expect("candidate is settled")
                 .is_empty()
         );
+        let durable = reopened
+            .terminal_output_candidate_for_dispatch("dispatch-001")
+            .expect("resolve consumed candidate")
+            .expect("consumed candidate remains evidence-readable");
+        assert_eq!(durable.source_revision, 1);
+        assert_eq!(durable.dispatch_id, "dispatch-001");
     }
 
     #[test]

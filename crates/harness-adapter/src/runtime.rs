@@ -802,6 +802,15 @@ where
             .map_err(Into::into)
     }
 
+    pub fn terminal_output_candidate_for_dispatch(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<crate::PendingTerminalOutputCandidate>, GovernedAdapterError> {
+        self.edge
+            .terminal_output_candidate_for_dispatch(dispatch_id)
+            .map_err(Into::into)
+    }
+
     pub fn acknowledge_terminal_output_candidate(
         &mut self,
         message_id: &str,

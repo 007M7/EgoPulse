@@ -1,6 +1,6 @@
 # Phase 2-17 governed Harness return intake
 
-- Status: implementation complete; local focused gate passed
+- Status: technical intake and Attempt-return projection implemented; local focused gate passed
 - Date: 2026-08-26
 - Scope: native terminal output through technical Artifact Authority receipt
 - Not in scope: verification verdict, Attempt return decision, Step commit or Task completion
@@ -25,12 +25,16 @@ native Harness driver
        verification = false
        task completion = false
   -> exact-digest Adapter Edge acknowledgement
+  -> Collaboration runner
+       receipt digest + consumed terminal sequence + current fence/revisions
+       -> Attempt RETURNED; Run/Step RETURN_PENDING
 ```
 
 No component gains a second fact store writer. Collaboration supplies authoritative Task/work
 lineage, Adapter Edge owns native evidence and delivery recovery, the collector is orchestration
-only, and Artifact Authority remains the sole writer of Artifact/Claim/Evidence/ArtifactSet and
-ReturnReceipt facts.
+only, Artifact Authority remains the sole writer of Artifact/Claim/Evidence/ArtifactSet and
+ReturnReceipt facts, and the Collaboration runner remains the sole writer of Attempt/Run/Step
+facts.
 
 ## Recovery and failure semantics
 
@@ -39,6 +43,8 @@ ReturnReceipt facts.
 - A crash before the receipt leaves the candidate pending; replay resumes the same Authority chain.
 - A crash after Authority commit but before Adapter acknowledgement replays to the same receipt and
   then settles the candidate.
+- A crash after `ReturnRecorded` but before Authority outbox acknowledgement replays the same
+  idempotency key; the outbox is acknowledged only after the Collaboration event is durable.
 - Reuse of a source identity with another digest and direct storage tampering fail closed.
 - Empty output, output over 16 MiB and policy rejection enter `held`; they do not create a fake
   artifact or silently disappear.
@@ -47,7 +53,7 @@ ReturnReceipt facts.
 ## Local evidence
 
 The focused gate covers Harness Adapter, Codex Adapter, DSH Adapter, Artifact Authority,
-Collaboration Control and `agentosd` return-collector composition:
+Collaboration Control and `agentosd` return-collector/projection composition:
 
 ```powershell
 cargo test `
@@ -61,15 +67,16 @@ cargo test `
 
 Result on Windows x64: all selected suites passed. The tests include atomic/reopen recovery,
 idempotent replay, conflicting replay, storage tamper, bounded oversized output, empty-output hold,
-collector replay and the real Collaboration dispatch ordering that persists an envelope before
-binding Task lineage.
+collector replay, destination-specific Authority outbox acknowledgement, consumed-candidate
+lookup and the real Collaboration dispatch ordering that persists an envelope before binding Task
+lineage. Collaboration tests also prove unauthorized Harness return writes, ArtifactAuthority
+return ownership, fence/sequence checks, Attempt idempotency and that Step/Task completion does
+not occur at technical intake.
 
 ## Next boundary
 
-Implement the receipt-consumer side without widening collector authority:
+Continue the next side without widening collector authority:
 
-1. project the Artifact Authority receipt outbox into a typed, digest-bound Collaboration input;
-2. record the Attempt return exactly once under the active fence;
-3. request Sego verification using sealed Artifact Authority references;
-4. commit the Step only from the governed verification result;
-5. expose the resulting state through the shared CLI/TUI kernel.
+1. request Sego verification using sealed Artifact Authority references;
+2. commit the Step only from the governed verification result;
+3. expose the resulting state through the shared CLI/TUI kernel.
