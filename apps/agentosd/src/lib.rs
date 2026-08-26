@@ -1299,6 +1299,33 @@ mod tests {
     }
 
     #[test]
+    fn multi_harness_composition_is_fail_closed_before_daemon_build() {
+        let empty = DaemonProviders::fail_closed().with_harness_dispatch_runners(Vec::new());
+        assert!(matches!(
+            empty,
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "at least one Harness dispatch runner is required"
+            ))
+        ));
+
+        let configured = DaemonProviders::fail_closed().with_harness_dispatch_runner(Arc::new(
+            CountingDispatchRunner {
+                runs: Arc::new(AtomicUsize::new(0)),
+            },
+        ));
+        let replacement =
+            configured.with_harness_dispatch_runners(vec![Arc::new(CountingDispatchRunner {
+                runs: Arc::new(AtomicUsize::new(0)),
+            })]);
+        assert!(matches!(
+            replacement,
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "Harness runner already configured"
+            ))
+        ));
+    }
+
+    #[test]
     fn composition_rejects_missing_secret_material_before_opening_storage() {
         let (mut config, root) = config("missing-key");
         config.read_model_key = [0; 32];
