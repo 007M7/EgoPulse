@@ -32,7 +32,9 @@ Not implemented yet:
 
 - Desktop product surface and Tauri distribution (the desktop shell exists, but phase one ships CLI/TUI capabilities first);
 - production semantic/vector retrieval, reranking and representative-corpus evaluation; exact-vector and RRF plumbing exists only behind the offline experiment gate, while the first release still defaults to the deterministic lexical Worker baseline;
-- authenticated second Harness lifecycle and multi-model production dispatch;
+- authenticated second Harness lifecycle and provider admission (the
+  provider-neutral multi-model composition boundary exists, but DSH/Kimi are
+  still candidate-only);
 - signed production release and SmartScreen reputation.
 
 ## Repository map

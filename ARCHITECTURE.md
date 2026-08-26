@@ -113,14 +113,16 @@ Collaboration/Sego stages after technical evidence intake.
   idempotency, optimistic revision checks and an audit event stream remain
   Rust-owned. The approved Worker contract exposes only a bounded accepted
   snapshot; it does not expose authority storage or write operations.
-- Multi-Harness composition: `CompositeHarnessDispatchRunner` sequences
-  provider-specific runners through one daemon scheduling hook. Each runner
-  must be bound to its own reviewed capability profile and Adapter Edge; the
-  exact `ContractReference` route matches profile ID, version and SHA-256; an
-  ID-only route is not a supported production API. The
-  composite does not choose models or merge provider-owned facts. This is a
-  composition prerequisite, not evidence that a second Harness has been
-  admitted.
+- Multi-Harness composition: `DaemonProviders::with_profiled_native_harness_drivers`
+  builds heterogeneous provider-specific runners behind one
+  `CompositeHarnessDispatchRunner`. They share the real Task activation source,
+  but each runner must be bound to its own reviewed capability profile,
+  Collaboration store and Adapter Edge; duplicate per-provider store paths are
+  rejected. The exact `ContractReference` route matches profile ID, version
+  and SHA-256; an ID-only route is not a supported production API. The
+  composite sequences runners and does not choose models or merge
+  provider-owned facts. This is a multi-model composition capability, not
+  evidence that a second Harness has been admitted.
 - Task activation routing: the production native composition binds the same
   exact profile reference at activation consumption, Collaboration dispatch
   registration and dispatch selection. Workflow resolution distinguishes an

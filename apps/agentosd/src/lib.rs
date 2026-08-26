@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -370,6 +371,15 @@ pub struct NativeHarnessCompositionConfig {
 pub struct CodexHarnessCompositionConfig {
     pub native: NativeHarnessCompositionConfig,
     pub codex_executable: PathBuf,
+}
+
+/// One provider-specific native Harness unit for the multi-model composition
+/// boundary. Admission is still external: `profile` must come from the
+/// attested capability path before this unit is passed to the daemon.
+pub struct ProfiledNativeHarnessComposition {
+    pub config: NativeHarnessCompositionConfig,
+    pub profile: NativeHarnessCompositionProfile,
+    pub driver: Box<dyn NativeHarnessDriver + Send>,
 }
 
 /// Provider-neutral identity that binds a native driver to the capability
@@ -763,7 +773,7 @@ impl DaemonProviders {
     /// multi-model support provider-neutral without allowing an unverified
     /// driver to become production merely by being wired into the daemon.
     pub fn with_profiled_native_harness_driver<D>(
-        mut self,
+        self,
         config: NativeHarnessCompositionConfig,
         artifact_authority: Arc<
             Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
@@ -775,118 +785,171 @@ impl DaemonProviders {
     where
         D: NativeHarnessDriver + Send + 'static,
     {
-        config.validate()?;
-        profile.validate()?;
+        self.with_profiled_native_harness_drivers(
+            vec![ProfiledNativeHarnessComposition {
+                config,
+                profile,
+                driver: Box::new(driver),
+            }],
+            artifact_authority,
+            verification,
+        )
+    }
+
+    /// Installs multiple independently profile-bound native Harness units.
+    /// All units share the Task activation source, but each owns an isolated
+    /// Collaboration store and Adapter Edge. The daemon invokes the resulting
+    /// composite as one scheduled worker; it does not select, merge or
+    /// downgrade providers.
+    pub fn with_profiled_native_harness_drivers(
+        mut self,
+        compositions: Vec<ProfiledNativeHarnessComposition>,
+        artifact_authority: Arc<
+            Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
+        >,
+        verification: Arc<Mutex<egopulse_verification_authority::VerificationAuthority>>,
+    ) -> Result<Self, DaemonCompositionError> {
         if self.harness_dispatch_runner.is_some() {
             return Err(DaemonCompositionError::InvalidConfiguration(
                 "Harness runner already configured",
             ));
         }
-        if profile.capability_profile_ref != config.workflow.capability_profile_ref {
+        if compositions.is_empty() {
             return Err(DaemonCompositionError::InvalidConfiguration(
-                "native Harness workflow/profile reference mismatch",
+                "at least one profiled native Harness is required",
             ));
+        }
+        let mut collaboration_paths = HashSet::new();
+        let mut adapter_paths = HashSet::new();
+        for composition in &compositions {
+            composition.config.validate()?;
+            composition.profile.validate()?;
+            if composition.profile.capability_profile_ref
+                != composition.config.workflow.capability_profile_ref
+            {
+                return Err(DaemonCompositionError::InvalidConfiguration(
+                    "native Harness workflow/profile reference mismatch",
+                ));
+            }
+            if !collaboration_paths.insert(composition.config.collaboration_database_path.clone())
+                || !adapter_paths.insert(composition.config.adapter_database_path.clone())
+            {
+                return Err(DaemonCompositionError::InvalidConfiguration(
+                    "multi-Harness stores must be isolated",
+                ));
+            }
         }
         let source = self.task_activation_source.take().ok_or(
             DaemonCompositionError::InvalidConfiguration("Task activation source"),
         )?;
-        let NativeHarnessCompositionProfile {
-            adapter_id,
-            capability_profile_id,
-            capability_profile_ref: _,
-            observed_protocol,
-        } = profile;
-        let reader_edge = AdapterEdge::open(AdapterEdgeConfig {
-            database_path: config.adapter_database_path.clone(),
-            adapter_id: adapter_id.clone(),
-            store_epoch: config.adapter_store_epoch.clone(),
-            key: AdapterEdgeKey::new(config.adapter_key),
-        })
-        .map_err(DaemonCompositionError::AdapterEdge)?;
-        let collector_edge = AdapterEdge::open(AdapterEdgeConfig {
-            database_path: config.adapter_database_path.clone(),
-            adapter_id: adapter_id.clone(),
-            store_epoch: config.adapter_store_epoch.clone(),
-            key: AdapterEdgeKey::new(config.adapter_key),
-        })
-        .map_err(DaemonCompositionError::AdapterEdge)?;
-        let writer_edge = AdapterEdge::open(AdapterEdgeConfig {
-            database_path: config.adapter_database_path,
-            adapter_id: adapter_id.clone(),
-            store_epoch: config.adapter_store_epoch,
-            key: AdapterEdgeKey::new(config.adapter_key),
-        })
-        .map_err(DaemonCompositionError::AdapterEdge)?;
-        let evidence = GovernedReturnEvidenceResolver::new(
-            reader_edge,
-            Arc::clone(&artifact_authority),
-            Arc::clone(&verification),
-        );
-        let (guard, reference) = TaskActivationGuardSet::new(evidence);
-        let control = CollaborationControl::open(
-            CollaborationControlConfig {
-                database_path: config.collaboration_database_path,
-                store_epoch: config.collaboration_store_epoch,
-                key: CollaborationSqlCipherKey::new(config.collaboration_key),
-            },
-            guard,
-            SystemAuthorityClock,
-        )
-        .map_err(DaemonCompositionError::Collaboration)?;
-        let adapter = GovernedHarnessAdapter::new(
-            adapter_id,
-            capability_profile_id,
-            observed_protocol,
-            writer_edge,
-            FileDispatchMaterialResolver::new(config.input_bundle_root, config.workspace_root),
-            driver,
-            SystemAdapterClock,
-        );
-        let principal = AuthenticatedCollaborationPrincipal {
-            kind: CollaborationPrincipalKind::HarnessAdapter,
-            principal_id: config.workflow.harness_adapter_principal_id.clone(),
-            authenticated: true,
-        };
-        let capability_profile_ref = config.workflow.capability_profile_ref.clone();
-        let resolver = ConfiguredSingleHarnessWorkflow::new(config.workflow);
-        let artifact_return_principal = AuthenticatedCollaborationPrincipal {
-            kind: CollaborationPrincipalKind::ArtifactAuthority,
-            principal_id: config
-                .return_collector
-                .artifact_authority_principal_id
-                .clone(),
-            authenticated: true,
-        };
-        let artifact_return_source: Arc<
-            dyn egopulse_local_ide_control::collaboration_control::ArtifactReturnSource,
-        > = Arc::new(ArtifactAuthorityReturnSource::new(Arc::clone(
-            &artifact_authority,
-        )));
-        let runner = GovernedTaskActivationRunner::new(
-            control,
-            adapter,
-            source,
-            resolver,
-            principal,
-            reference,
-            config.lease_ttl_seconds,
-        )
-        .with_capability_profile_ref(capability_profile_ref)
-        .with_artifact_return_source(artifact_return_source, artifact_return_principal)
-        .with_step_return_principal(AuthenticatedCollaborationPrincipal {
-            kind: CollaborationPrincipalKind::CollaborationControl,
-            principal_id: "collaboration-control:return-settlement".to_owned(),
-            authenticated: true,
-        });
-        let harness: Arc<dyn HarnessDispatchRunner> = Arc::new(runner);
-        let collector = GovernedReturnCollectorRunner::new(
-            harness,
-            collector_edge,
-            artifact_authority,
-            config.return_collector,
-        )
-        .map_err(DaemonCompositionError::InvalidConfiguration)?;
-        self.harness_dispatch_runner = Some(Arc::new(collector));
+        let mut runners = Vec::with_capacity(compositions.len());
+        for composition in compositions {
+            let ProfiledNativeHarnessComposition {
+                config,
+                profile,
+                driver,
+            } = composition;
+            let NativeHarnessCompositionProfile {
+                adapter_id,
+                capability_profile_id,
+                capability_profile_ref: _,
+                observed_protocol,
+            } = profile;
+            let reader_edge = AdapterEdge::open(AdapterEdgeConfig {
+                database_path: config.adapter_database_path.clone(),
+                adapter_id: adapter_id.clone(),
+                store_epoch: config.adapter_store_epoch.clone(),
+                key: AdapterEdgeKey::new(config.adapter_key),
+            })
+            .map_err(DaemonCompositionError::AdapterEdge)?;
+            let collector_edge = AdapterEdge::open(AdapterEdgeConfig {
+                database_path: config.adapter_database_path.clone(),
+                adapter_id: adapter_id.clone(),
+                store_epoch: config.adapter_store_epoch.clone(),
+                key: AdapterEdgeKey::new(config.adapter_key),
+            })
+            .map_err(DaemonCompositionError::AdapterEdge)?;
+            let writer_edge = AdapterEdge::open(AdapterEdgeConfig {
+                database_path: config.adapter_database_path,
+                adapter_id: adapter_id.clone(),
+                store_epoch: config.adapter_store_epoch,
+                key: AdapterEdgeKey::new(config.adapter_key),
+            })
+            .map_err(DaemonCompositionError::AdapterEdge)?;
+            let evidence = GovernedReturnEvidenceResolver::new(
+                reader_edge,
+                Arc::clone(&artifact_authority),
+                Arc::clone(&verification),
+            );
+            let (guard, reference) = TaskActivationGuardSet::new(evidence);
+            let control = CollaborationControl::open(
+                CollaborationControlConfig {
+                    database_path: config.collaboration_database_path,
+                    store_epoch: config.collaboration_store_epoch,
+                    key: CollaborationSqlCipherKey::new(config.collaboration_key),
+                },
+                guard,
+                SystemAuthorityClock,
+            )
+            .map_err(DaemonCompositionError::Collaboration)?;
+            let adapter = GovernedHarnessAdapter::new(
+                adapter_id,
+                capability_profile_id,
+                observed_protocol,
+                writer_edge,
+                FileDispatchMaterialResolver::new(config.input_bundle_root, config.workspace_root),
+                driver,
+                SystemAdapterClock,
+            );
+            let principal = AuthenticatedCollaborationPrincipal {
+                kind: CollaborationPrincipalKind::HarnessAdapter,
+                principal_id: config.workflow.harness_adapter_principal_id.clone(),
+                authenticated: true,
+            };
+            let capability_profile_ref = config.workflow.capability_profile_ref.clone();
+            let resolver = ConfiguredSingleHarnessWorkflow::new(config.workflow);
+            let artifact_return_principal = AuthenticatedCollaborationPrincipal {
+                kind: CollaborationPrincipalKind::ArtifactAuthority,
+                principal_id: config
+                    .return_collector
+                    .artifact_authority_principal_id
+                    .clone(),
+                authenticated: true,
+            };
+            let artifact_return_source: Arc<
+                dyn egopulse_local_ide_control::collaboration_control::ArtifactReturnSource,
+            > = Arc::new(ArtifactAuthorityReturnSource::new(Arc::clone(
+                &artifact_authority,
+            )));
+            let runner = GovernedTaskActivationRunner::new(
+                control,
+                adapter,
+                Arc::clone(&source),
+                resolver,
+                principal,
+                reference,
+                config.lease_ttl_seconds,
+            )
+            .with_capability_profile_ref(capability_profile_ref)
+            .with_artifact_return_source(artifact_return_source, artifact_return_principal)
+            .with_step_return_principal(AuthenticatedCollaborationPrincipal {
+                kind: CollaborationPrincipalKind::CollaborationControl,
+                principal_id: "collaboration-control:return-settlement".to_owned(),
+                authenticated: true,
+            });
+            let harness: Arc<dyn HarnessDispatchRunner> = Arc::new(runner);
+            let collector = GovernedReturnCollectorRunner::new(
+                harness,
+                collector_edge,
+                Arc::clone(&artifact_authority),
+                config.return_collector,
+            )
+            .map_err(DaemonCompositionError::InvalidConfiguration)?;
+            runners.push(Arc::new(collector) as Arc<dyn HarnessDispatchRunner>);
+        }
+        let composite = CompositeHarnessDispatchRunner::new(runners)
+            .map_err(DaemonCompositionError::InvalidConfiguration)?;
+        self.harness_dispatch_runner = Some(Arc::new(composite));
         Ok(self)
     }
 }
@@ -1693,6 +1756,248 @@ mod tests {
                 "native Harness composition"
             ))
         ));
+    }
+
+    struct EmptyTaskActivationSource;
+
+    impl TaskActivationSource for EmptyTaskActivationSource {
+        fn pending_task_activations(
+            &self,
+        ) -> Result<
+            Vec<egopulse_local_ide_control::collaboration_control::TaskActivationHandoff>,
+            egopulse_local_ide_control::collaboration_control::TaskActivationSourceError,
+        > {
+            Ok(Vec::new())
+        }
+
+        fn acknowledge_task_activation(
+            &self,
+            _message_id: &str,
+            _payload_digest_sha256: &str,
+        ) -> Result<
+            bool,
+            egopulse_local_ide_control::collaboration_control::TaskActivationSourceError,
+        > {
+            Ok(false)
+        }
+    }
+
+    fn composition_reference(id: &str) -> ContractReference {
+        ContractReference {
+            contract_id: id.to_owned(),
+            version: "v1".to_owned(),
+            sha256: "ab".repeat(32),
+        }
+    }
+
+    fn multi_native_config(root: &std::path::Path, suffix: &str) -> NativeHarnessCompositionConfig {
+        NativeHarnessCompositionConfig {
+            collaboration_database_path: root.join(format!("{suffix}-collaboration.db")),
+            collaboration_store_epoch: format!("{suffix}-collaboration-epoch"),
+            collaboration_key: [0x31; 32],
+            adapter_database_path: root.join(format!("{suffix}-adapter.db")),
+            adapter_store_epoch: format!("{suffix}-adapter-epoch"),
+            adapter_key: [0x32; 32],
+            input_bundle_root: root.join(format!("{suffix}-input")),
+            workspace_root: root.join(format!("{suffix}-workspace")),
+            workflow: SingleHarnessWorkConfig {
+                run_id: format!("{suffix}-run"),
+                attempt_id: format!("{suffix}-attempt"),
+                dispatch_id: format!("{suffix}-dispatch"),
+                plan: Default::default(),
+                harness_id: format!("{suffix}-harness"),
+                capability_profile_ref: composition_reference(&format!("{suffix}-profile")),
+                workspace_ref: "workspace".to_owned(),
+                lease_policy_ref: composition_reference("lease"),
+                owner_instance_id: format!("{suffix}-owner"),
+                material:
+                    egopulse_local_ide_control::collaboration_control::DispatchMaterial {
+                        input_bundle_sha256: "cd".repeat(32),
+                        sandbox_profile_ref: composition_reference("sandbox"),
+                        tool_policy_ref: composition_reference("tool"),
+                        data_egress_policy_ref: composition_reference("egress"),
+                        approval_policy_ref: composition_reference("approval"),
+                        session_strategy: egopulse_domain_contracts::v01::egopulse::harness::v1::NativeSessionStrategy::CreateNew,
+                        native_session_ref: None,
+                        checkpoint_ref: None,
+                        evidence_refs: vec!["evidence".to_owned()],
+                    },
+                task_authority_principal_id: format!("{suffix}-task"),
+                collaboration_principal_id: format!("{suffix}-collaboration"),
+                attempt_supervisor_principal_id: format!("{suffix}-supervisor"),
+                harness_adapter_principal_id: format!("{suffix}-adapter"),
+            },
+            lease_ttl_seconds: 30,
+            return_collector: GovernedReturnCollectorConfig {
+                artifact_type_ref: composition_reference("artifact-type"),
+                transformation_contract_ref: composition_reference("transformation"),
+                retention_profile_ref: composition_reference("retention"),
+                claim_semantic_profile_ref: composition_reference("claim-semantic"),
+                claim_acceptance_contract_ref: composition_reference("claim-acceptance"),
+                evidence_profile_ref: composition_reference("evidence-profile"),
+                workspace_ref: "workspace".to_owned(),
+                collector_principal_id: format!("{suffix}-collector"),
+                artifact_authority_principal_id: format!("{suffix}-artifact-authority"),
+            },
+        }
+    }
+
+    fn multi_native_profile(
+        config: &NativeHarnessCompositionConfig,
+    ) -> NativeHarnessCompositionProfile {
+        NativeHarnessCompositionProfile {
+            adapter_id: config.workflow.harness_adapter_principal_id.clone(),
+            capability_profile_id: config.workflow.capability_profile_ref.contract_id.clone(),
+            capability_profile_ref: config.workflow.capability_profile_ref.clone(),
+            observed_protocol: NativeProtocolFingerprint {
+                protocol_name: "test-native".to_owned(),
+                protocol_version: "v1".to_owned(),
+                schema_sha256: "schema".to_owned(),
+                adapter_version: "adapter-v1".to_owned(),
+                native_executable_version: "native-v1".to_owned(),
+                native_binary_sha256: None,
+            },
+        }
+    }
+
+    fn multi_native_authorities(
+        root: &std::path::Path,
+    ) -> (
+        Arc<
+            Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
+        >,
+        Arc<Mutex<egopulse_verification_authority::VerificationAuthority>>,
+    ) {
+        let all_refs = [
+            composition_reference("artifact-type"),
+            composition_reference("transformation"),
+            composition_reference("retention"),
+            composition_reference("claim-semantic"),
+            composition_reference("claim-acceptance"),
+            composition_reference("evidence-profile"),
+        ];
+        let artifact_guard =
+            ConfiguredArtifactAdmissionGuard::new(ConfiguredArtifactAdmissionGuardConfig {
+                allowed_workspace_refs: ["workspace".to_owned()].into_iter().collect(),
+                allowed_artifact_type_refs: vec![all_refs[0].clone()],
+                allowed_transformation_contract_refs: vec![all_refs[1].clone()],
+                allowed_retention_profile_refs: vec![all_refs[2].clone()],
+                allowed_claim_semantic_profile_refs: vec![all_refs[3].clone()],
+                allowed_claim_acceptance_contract_refs: vec![all_refs[4].clone()],
+                allowed_evidence_profile_refs: vec![all_refs[5].clone()],
+            })
+            .expect("test artifact guard");
+        let artifact = egopulse_artifact_authority::ArtifactAuthority::open(
+            egopulse_artifact_authority::ArtifactAuthorityConfig {
+                database_path: root.join("artifact-authority.db"),
+                blob_root: root.join("artifact-blobs"),
+                store_epoch: "multi-harness-artifact-epoch".to_owned(),
+                key: egopulse_artifact_authority::ArtifactSqlCipherKey::new([0x41; 32]),
+            },
+            artifact_guard,
+        )
+        .expect("test artifact authority");
+        let verification = egopulse_verification_authority::VerificationAuthority::open(
+            egopulse_verification_authority::VerificationAuthorityConfig {
+                database_path: root.join("verification-authority.db"),
+                store_epoch: "multi-harness-verification-epoch".to_owned(),
+                key: egopulse_verification_authority::VerificationSqlCipherKey::new([0x42; 32]),
+            },
+            DenyVerificationReferences,
+        )
+        .expect("test verification authority");
+        (
+            Arc::new(Mutex::new(artifact)),
+            Arc::new(Mutex::new(verification)),
+        )
+    }
+
+    #[tokio::test]
+    async fn multi_profile_native_builder_assembles_isolated_runners_over_one_source() {
+        let root = std::env::temp_dir().join(format!(
+            "egopulse-agentosd-multi-harness-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).expect("test root");
+        let config_a = multi_native_config(&root, "a");
+        let config_b = multi_native_config(&root, "b");
+        let (artifact, verification) = multi_native_authorities(&root);
+        let mut providers = DaemonProviders::fail_closed();
+        providers.task_activation_source = Some(Arc::new(EmptyTaskActivationSource));
+
+        let mut providers = providers
+            .with_profiled_native_harness_drivers(
+                vec![
+                    ProfiledNativeHarnessComposition {
+                        profile: multi_native_profile(&config_a),
+                        config: config_a,
+                        driver: Box::new(CodexAppServerDriver::new(CodexAppServerConfig::new(
+                            PathBuf::from("codex"),
+                        ))),
+                    },
+                    ProfiledNativeHarnessComposition {
+                        profile: multi_native_profile(&config_b),
+                        config: config_b,
+                        driver: Box::new(CodexAppServerDriver::new(CodexAppServerConfig::new(
+                            PathBuf::from("codex"),
+                        ))),
+                    },
+                ],
+                artifact,
+                verification,
+            )
+            .expect("two admitted profiles should compose");
+        let runner = providers
+            .harness_dispatch_runner
+            .take()
+            .expect("composite dispatch runner");
+        let report = runner.run_once().await.expect("empty source cycle");
+        assert_eq!(report.activations_seen, 0);
+        drop(runner);
+        drop(providers);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn multi_profile_native_builder_rejects_shared_store_paths_before_opening_edges() {
+        let root = std::env::temp_dir().join(format!(
+            "egopulse-agentosd-multi-harness-duplicate-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).expect("test root");
+        let config_a = multi_native_config(&root, "a");
+        let config_b = multi_native_config(&root, "a");
+        let (artifact, verification) = multi_native_authorities(&root);
+        let mut providers = DaemonProviders::fail_closed();
+        providers.task_activation_source = Some(Arc::new(EmptyTaskActivationSource));
+
+        let result = providers.with_profiled_native_harness_drivers(
+            vec![
+                ProfiledNativeHarnessComposition {
+                    profile: multi_native_profile(&config_a),
+                    config: config_a,
+                    driver: Box::new(CodexAppServerDriver::new(CodexAppServerConfig::new(
+                        PathBuf::from("codex"),
+                    ))),
+                },
+                ProfiledNativeHarnessComposition {
+                    profile: multi_native_profile(&config_b),
+                    config: config_b,
+                    driver: Box::new(CodexAppServerDriver::new(CodexAppServerConfig::new(
+                        PathBuf::from("codex"),
+                    ))),
+                },
+            ],
+            artifact,
+            verification,
+        );
+        assert!(matches!(
+            result,
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "multi-Harness stores must be isolated"
+            ))
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

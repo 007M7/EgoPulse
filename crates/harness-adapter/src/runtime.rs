@@ -171,6 +171,62 @@ pub trait NativeHarnessDriver {
     ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>>;
 }
 
+// A daemon that composes more than one provider needs to hold heterogeneous
+// native drivers behind one runner collection. Keep the type-erasure utility
+// at the provider-neutral adapter boundary; no provider-specific code needs to
+// know how another provider is stored.
+impl NativeHarnessDriver for Box<dyn NativeHarnessDriver + Send> {
+    fn probe<'a>(
+        &'a mut self,
+        request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        (**self).probe(request)
+    }
+
+    fn send_dispatch<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+        material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        (**self).send_dispatch(envelope, material)
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        (**self).next_event(envelope)
+    }
+
+    fn take_terminal_output_candidate<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<TerminalOutputCandidate>, DriverError>> {
+        (**self).take_terminal_output_candidate(envelope)
+    }
+
+    fn decide_approval<'a>(
+        &'a mut self,
+        envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        (**self).decide_approval(envelope)
+    }
+
+    fn cancel<'a>(
+        &'a mut self,
+        envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        (**self).cancel(envelope)
+    }
+
+    fn reconcile<'a>(
+        &'a mut self,
+        context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        (**self).reconcile(context)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
 pub enum ProbeValidationError {
     #[error("probe result has no stable probe ID")]
