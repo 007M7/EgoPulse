@@ -8,15 +8,13 @@
 //! guard; no client-facing activation bypass is introduced.
 
 use egopulse_agentosd::{
-    ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig,
-    ProductionBootstrapConfig,
+    ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ProductionBootstrapConfig,
 };
 use egopulse_codex_adapter::CODEX_CAPABILITY_PROFILE_ID;
 use egopulse_cognition_runtime::task_authority::{
     AuthenticatedPrincipal, CreationAuthorization, CreationGuardRejection, PrincipalKind,
-    SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCreationGuard,
-    TaskTransitionGuard, TransitionAuthorization, TransitionGuardRejection,
-    canonical_request_digest,
+    SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCreationGuard, TaskTransitionGuard,
+    TransitionAuthorization, TransitionGuardRejection, canonical_request_digest,
 };
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::{CommandMetadata, ContractReference},
@@ -160,7 +158,8 @@ fn key_from_env(name: &str) -> [u8; 32] {
 fn set_string(root: &mut Value, pointer: &str, value: impl Into<String>) {
     *root
         .pointer_mut(pointer)
-        .unwrap_or_else(|| panic!("missing config pointer {pointer}")) = Value::String(value.into());
+        .unwrap_or_else(|| panic!("missing config pointer {pointer}")) =
+        Value::String(value.into());
 }
 
 fn set_value(root: &mut Value, pointer: &str, value: Value) {
@@ -216,9 +215,21 @@ fn user_config(root: &TempRoot, input_digest: &str, codex_executable: &Path) -> 
         "/stores/artifact/blob_root",
         data_root.join("artifact-blobs").display().to_string(),
     );
-    set_string(&mut config, "/task_guard/allowed_input_snapshot_ids/0", INPUT_SNAPSHOT_ID);
-    set_string(&mut config, "/task_guard/allowed_target_scope_refs/0", TARGET_SCOPE_REF);
-    set_string(&mut config, "/artifact/allowed_workspace_refs/0", WORKSPACE_REF);
+    set_string(
+        &mut config,
+        "/task_guard/allowed_input_snapshot_ids/0",
+        INPUT_SNAPSHOT_ID,
+    );
+    set_string(
+        &mut config,
+        "/task_guard/allowed_target_scope_refs/0",
+        TARGET_SCOPE_REF,
+    );
+    set_string(
+        &mut config,
+        "/artifact/allowed_workspace_refs/0",
+        WORKSPACE_REF,
+    );
     set_string(
         &mut config,
         "/codex/input_bundle_root",
@@ -253,10 +264,26 @@ fn user_config(root: &TempRoot, input_digest: &str, codex_executable: &Path) -> 
         "f".repeat(64),
     );
     set_string(&mut config, "/codex/workflow/workspace_ref", WORKSPACE_REF);
-    set_string(&mut config, "/codex/workflow/plan/step/input_bundle_ref", "bundle.json");
-    set_string(&mut config, "/codex/workflow/material/input_bundle_sha256", input_digest);
-    set_string(&mut config, "/identity/principal_id", "local-user:g4-04-test");
-    set_string(&mut config, "/founder/allowed_founder_principal_ids/0", "local-user:g4-04-test");
+    set_string(
+        &mut config,
+        "/codex/workflow/plan/step/input_bundle_ref",
+        "bundle.json",
+    );
+    set_string(
+        &mut config,
+        "/codex/workflow/material/input_bundle_sha256",
+        input_digest,
+    );
+    set_string(
+        &mut config,
+        "/identity/principal_id",
+        "local-user:g4-04-test",
+    );
+    set_string(
+        &mut config,
+        "/founder/allowed_founder_principal_ids/0",
+        "local-user:g4-04-test",
+    );
     set_value(
         &mut config,
         "/memory_retrieval/worker_executable",
@@ -322,11 +349,10 @@ fn seed_activation(root: &TempRoot) {
         principal_id: "local-user:g4-04-test".to_owned(),
         authenticated: true,
     };
-    let created = authority.execute(&create, &founder).expect("create seeded Task");
-    let task = match created
-        .outcome
-        .expect("created Task outcome")
-    {
+    let created = authority
+        .execute(&create, &founder)
+        .expect("create seeded Task");
+    let task = match created.outcome.expect("created Task outcome") {
         egopulse_domain_contracts::v01::egopulse::task::v1::task_command_result::Outcome::Task(
             task,
         ) => task,
