@@ -116,7 +116,8 @@ Collaboration/Sego stages after technical evidence intake.
 - Multi-Harness composition: `CompositeHarnessDispatchRunner` sequences
   provider-specific runners through one daemon scheduling hook. Each runner
   must be bound to its own reviewed capability profile and Adapter Edge; the
-  exact `ContractReference` route matches profile ID, version and SHA-256. The
+  exact `ContractReference` route matches profile ID, version and SHA-256; an
+  ID-only route is not a supported production API. The
   composite does not choose models or merge provider-owned facts. This is a
   composition prerequisite, not evidence that a second Harness has been
   admitted.

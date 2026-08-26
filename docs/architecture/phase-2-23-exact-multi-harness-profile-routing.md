@@ -26,15 +26,13 @@ one GovernedHarnessDispatchRunner
 its own Adapter Edge + native driver + evidence path
 ```
 
-`GovernedHarnessDispatchRunner::with_capability_profile_ref` installs the
-exact filter. Both pending-envelope registration and dispatch selection use
-the same predicate, so a runner cannot activate one profile and dispatch
-another. Missing profile references do not match an exact route.
-
-The existing `with_capability_profile_id` method remains only as a compatibility
-entry for older callers that have not migrated to immutable references. It is
-not sufficient for a new multi-model production route because it intentionally
-does not distinguish version or digest.
+`GovernedHarnessDispatchRunner::with_capability_profile_ref` is the only
+profile-bound constructor. Both pending-envelope registration and dispatch
+selection use the same exact predicate, so a runner cannot activate one
+profile and dispatch another. Missing profile references do not match an exact
+route. The former ID-only constructor was removed while the repository is
+still pre-release; an ID without version and SHA is not a supported production
+routing key.
 
 ## Invariants and costs
 
@@ -52,8 +50,7 @@ does not distinguish version or digest.
 
 The `local-ide-control` regression suite covers:
 
-- unfiltered behavior for the single-runner compatibility path;
-- ID-based Codex/DSH separation;
+- exact Codex/DSH separation;
 - missing profile rejection;
 - exact match acceptance;
 - version drift rejection;

@@ -130,7 +130,6 @@ pub struct GovernedHarnessDispatchRunner<G, C, R, D, A> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CapabilityProfileFilter {
-    ContractId(String),
     Exact(ContractReference),
 }
 
@@ -157,16 +156,6 @@ where
             principal,
             capability_profile_filter: None,
         }
-    }
-
-    /// Restricts this runner to dispatch envelopes bound to one reviewed
-    /// capability profile. This is required when multiple provider runners
-    /// share one Collaboration Control database.
-    #[must_use]
-    pub fn with_capability_profile_id(mut self, profile_id: impl Into<String>) -> Self {
-        self.capability_profile_filter =
-            Some(CapabilityProfileFilter::ContractId(profile_id.into()));
-        self
     }
 
     /// Restricts this runner to one exact reviewed capability reference. The
@@ -781,7 +770,6 @@ fn envelope_matches_profile(
             .capability_profile_ref
             .as_ref()
             .is_some_and(|reference| match filter {
-                CapabilityProfileFilter::ContractId(expected) => reference.contract_id == *expected,
                 CapabilityProfileFilter::Exact(expected) => reference == expected,
             })
     })
@@ -988,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_filter_keeps_dispatches_on_their_bound_runner() {
+    fn exact_profile_filter_keeps_dispatches_on_their_bound_runner() {
         let envelope = DispatchEnvelope {
             capability_profile_ref: Some(ContractReference {
                 contract_id: "profile:codex".to_owned(),
@@ -997,8 +985,16 @@ mod tests {
             }),
             ..Default::default()
         };
-        let codex_id = CapabilityProfileFilter::ContractId("profile:codex".to_owned());
-        let dsh_id = CapabilityProfileFilter::ContractId("profile:dsh".to_owned());
+        let codex_id = CapabilityProfileFilter::Exact(ContractReference {
+            contract_id: "profile:codex".to_owned(),
+            version: "v1".to_owned(),
+            sha256: "a".repeat(64),
+        });
+        let dsh_id = CapabilityProfileFilter::Exact(ContractReference {
+            contract_id: "profile:dsh".to_owned(),
+            version: "v1".to_owned(),
+            sha256: "b".repeat(64),
+        });
         assert!(envelope_matches_profile(&envelope, None));
         assert!(envelope_matches_profile(&envelope, Some(&codex_id)));
         assert!(!envelope_matches_profile(&envelope, Some(&dsh_id)));
