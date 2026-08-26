@@ -53,10 +53,10 @@ use crate::{
     ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ConfiguredTaskTransitionGuard,
     ConfiguredVerificationWorker, DaemonCompositionError, DaemonProviders,
     FounderVerdictConfigurationError, GovernedReturnCollectorConfig, LocalUserPolicyResolver,
-    LocalUserPolicyResolverConfig, MemoryRetrievalCompositionConfig,
-    NativeHarnessCompositionConfig, SharedAuthorityCompositionInputs,
-    TaskAuthorityCommitReceiptSource, VerificationAuthorityArtifactSource,
-    VerificationProjectionSource, VerificationWorkerConfig,
+    LocalUserPolicyResolverConfig, MemoryCandidateProducerBinding,
+    MemoryRetrievalCompositionConfig, NativeHarnessCompositionConfig,
+    SharedAuthorityCompositionInputs, TaskAuthorityCommitReceiptSource,
+    VerificationAuthorityArtifactSource, VerificationProjectionSource, VerificationWorkerConfig,
 };
 
 /// Explicit scalar configuration for the local-user Policy resolver. The
@@ -75,6 +75,7 @@ pub struct ProductionBootstrapConfig {
     pub task: TaskAuthorityConfig,
     pub memory: MemoryAuthorityConfig,
     pub memory_retrieval: Option<MemoryRetrievalCompositionConfig>,
+    pub memory_candidate_producers: Vec<MemoryCandidateProducerBinding>,
     pub task_guard: ConfiguredTaskCreationGuardConfig,
     pub artifact: ArtifactAuthorityConfig,
     pub artifact_guard: ConfiguredArtifactAdmissionGuardConfig,
@@ -245,6 +246,12 @@ impl ProductionBootstrapConfig {
             providers = providers.with_memory_retrieval(Arc::clone(&memory), memory_retrieval)?;
         }
         providers = providers.with_memory_mutation(Arc::clone(&memory), memory_principal_resolver);
+        if !self.memory_candidate_producers.is_empty() {
+            providers = providers.with_memory_candidate_producers(
+                Arc::clone(&memory),
+                self.memory_candidate_producers,
+            )?;
+        }
         providers = providers.with_codex_harness(self.codex, artifact, verification)?;
         Ok(providers)
     }
@@ -264,6 +271,8 @@ struct UserOwnedBootstrapFile {
     verification_worker: Option<VerificationWorkerFile>,
     #[serde(default)]
     memory_retrieval: Option<MemoryRetrievalFile>,
+    #[serde(default)]
+    memory_candidate_producers: Vec<MemoryCandidateProducerFile>,
     policy: PolicyFile,
     founder: FounderFile,
     codex: CodexFile,
@@ -393,6 +402,15 @@ struct MemoryRetrievalFile {
     timeout_ms: u64,
     output_limit_bytes: u64,
     principal_scope_allowlist: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryCandidateProducerFile {
+    producer_id: String,
+    principal_id: String,
+    principal_kind: String,
+    scope_ref: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -679,6 +697,11 @@ impl UserOwnedBootstrapFile {
             .memory_retrieval
             .map(MemoryRetrievalFile::into_typed)
             .transpose()?;
+        let memory_candidate_producers = self
+            .memory_candidate_producers
+            .into_iter()
+            .map(MemoryCandidateProducerFile::into_typed)
+            .collect::<Result<Vec<_>, ProductionBootstrapError>>()?;
         if verification_worker.is_some() && verification_references.is_none() {
             return Err(ProductionBootstrapError::InvalidConfiguration(
                 "verification_worker requires verification criteria",
@@ -779,6 +802,7 @@ impl UserOwnedBootstrapFile {
                 key: SqlCipherKey::new(memory_store.key),
             },
             memory_retrieval,
+            memory_candidate_producers,
             task_guard,
             artifact: ArtifactAuthorityConfig {
                 database_path: artifact_store.database_path,
@@ -1024,6 +1048,18 @@ impl MemoryRetrievalFile {
             .validate()
             .map_err(|_| ProductionBootstrapError::InvalidConfiguration("memory_retrieval"))?;
         Ok(config)
+    }
+}
+
+impl MemoryCandidateProducerFile {
+    fn into_typed(self) -> Result<MemoryCandidateProducerBinding, ProductionBootstrapError> {
+        MemoryCandidateProducerBinding::new(
+            self.producer_id,
+            self.principal_id,
+            parse_memory_producer_principal(&self.principal_kind)?,
+            self.scope_ref,
+        )
+        .map_err(|_| ProductionBootstrapError::InvalidConfiguration("memory_candidate_producers"))
     }
 }
 
@@ -1380,6 +1416,19 @@ fn parse_memory_principal(value: &str) -> Result<MemoryPrincipalKind, Production
     }
 }
 
+fn parse_memory_producer_principal(
+    value: &str,
+) -> Result<MemoryPrincipalKind, ProductionBootstrapError> {
+    match value {
+        "Agent" => Ok(MemoryPrincipalKind::Agent),
+        "Model" => Ok(MemoryPrincipalKind::Model),
+        "Harness" => Ok(MemoryPrincipalKind::Harness),
+        _ => Err(ProductionBootstrapError::InvalidConfiguration(
+            "memory_candidate_producers.principal_kind",
+        )),
+    }
+}
+
 /// Production's temporary verification boundary. It prevents the daemon from
 /// accepting client-supplied verification references before the reviewed
 /// Sego/checker composition is installed in the next vertical. This resolver
@@ -1556,6 +1605,61 @@ mod tests {
             Err(ProductionBootstrapError::ConfigurationFormat { .. })
         ));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn user_owned_memory_candidate_binding_freezes_runtime_identity_at_composition() {
+        let binding = MemoryCandidateProducerFile {
+            producer_id: "harness:codex".to_owned(),
+            principal_id: "harness:codex".to_owned(),
+            principal_kind: "Harness".to_owned(),
+            scope_ref: "scope:founder".to_owned(),
+        }
+        .into_typed()
+        .expect("valid candidate producer binding");
+
+        assert_eq!(binding.producer_id, "harness:codex");
+        assert_eq!(binding.principal_id, "harness:codex");
+        assert_eq!(binding.principal_kind, MemoryPrincipalKind::Harness);
+        assert_eq!(binding.scope_ref, "scope:founder");
+    }
+
+    #[test]
+    fn user_owned_memory_candidate_binding_rejects_governance_identity_or_unknown_kind() {
+        for principal_kind in ["Founder", "GovernanceKernel", "unknown"] {
+            let result = MemoryCandidateProducerFile {
+                producer_id: "harness:codex".to_owned(),
+                principal_id: "harness:codex".to_owned(),
+                principal_kind: principal_kind.to_owned(),
+                scope_ref: "scope:founder".to_owned(),
+            }
+            .into_typed();
+
+            assert!(matches!(
+                result,
+                Err(ProductionBootstrapError::InvalidConfiguration(
+                    "memory_candidate_producers.principal_kind"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn user_owned_memory_candidate_binding_rejects_invalid_route_without_opening_authority() {
+        let result = MemoryCandidateProducerFile {
+            producer_id: " ".to_owned(),
+            principal_id: "harness:codex".to_owned(),
+            principal_kind: "Harness".to_owned(),
+            scope_ref: "scope:founder".to_owned(),
+        }
+        .into_typed();
+
+        assert!(matches!(
+            result,
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "memory_candidate_producers"
+            ))
+        ));
     }
 
     #[test]

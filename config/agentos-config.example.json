@@ -141,6 +141,14 @@
       "local-user:replace-me": ["scope:founder"]
     }
   },
+  "memory_candidate_producers": [
+    {
+      "producer_id": "harness:codex",
+      "principal_id": "harness:codex",
+      "principal_kind": "Harness",
+      "scope_ref": "scope:founder"
+    }
+  ],
   "verification": {
     "criteria": [
       {

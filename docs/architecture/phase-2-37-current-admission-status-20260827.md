@@ -23,7 +23,7 @@ The second fact never implies the third without provider-specific evidence.
 | V-01 / C5 | One governed Codex work loop is exercised through real Windows local IPC; CLI and TUI use the same client kernel and authority path | Closed for CLI/TUI |
 | G4 authorities | Task, Collaboration, Adapter, Artifact, Verification and Founder-Verdict slices have owner-backed local implementations and targeted evidence | Closed for the admitted V-01 slice; physical power-loss qualification and signing remain release obligations |
 | Memory Authority | Rust SQLCipher single writer; Agent/Model/Harness input is candidate-only; Founder acceptance and governance revocation are explicit | Closed for initial governance boundary |
-| Memory mutation path | CLI/TUI mutation RPC and fixed internal producer handles are implemented; a real Codex app-server candidate handoff reaches the Rust Authority in a cross-component test | Closed as candidate-only handoff; ordinary terminal output is not auto-promoted to Memory |
+| Memory mutation path | CLI/TUI mutation RPC, production-configured fixed internal producer bindings and a real Codex app-server candidate handoff are implemented | Closed as candidate-only handoff; ordinary terminal output is not auto-promoted to Memory |
 | Memory retrieval | Python Worker reads only accepted, scoped snapshots and returns reference-only lexical-overlap-v0 results | Production baseline |
 | Semantic RAG | Exact-vector/RRF experiment adapters exist; E5-small is the measured candidate, but package and runtime costs require an explicit Founder admission decision | Not admitted by default |
 | Multi-model composition | Exact profile routing and isolated per-provider Collaboration/Adapter stores support heterogeneous drivers under one scheduler | Boundary closed; provider admission remains independent |
@@ -113,13 +113,16 @@ provider is therefore selected by production configuration.
 2. Keep Codex as the sole admitted production Harness while running any Kimi or
    DSH probes as isolated candidate evidence.
 3. Keep the production Memory candidate bridge as an explicit,
-   user-reviewed proposal operation. It must not turn every terminal transcript
-   into a memory, must preserve the Artifact return path, and must use the
-   fixed producer binding already implemented. The current real Codex E2E is
-   the cross-component proof; CLI/TUI already expose the corresponding
-   user-reviewed `memory candidate` operation through the Local API. A future
-   terminal-output inbox may improve ergonomics, but it is not required for the
-   first release and must not bypass Founder acceptance.
+   user-reviewed proposal operation. The daemon now installs fixed producer
+   bindings from `memory_candidate_producers`, but a runtime still receives
+   only its own submit-only handle. The bridge must not turn every terminal
+   transcript into a memory, must preserve the Artifact return path, and must
+   use Founder acceptance. The current real Codex E2E is the cross-component
+   proof; CLI/TUI already expose the corresponding user-reviewed `memory
+   candidate` operation through the Local API. A future terminal-output inbox
+   may improve ergonomics, but it is not required for the first release and
+   must not bypass Founder acceptance. See
+   `phase-2-38-production-memory-producer-composition-20260827.md`.
 4. After the chosen Memory profile and product-facing candidate bridge are
    evidenced, refresh the CLI/TUI early-access package. The current package was
    refreshed for the fixed producer-proposal boundary; Desktop remains a later

@@ -42,5 +42,14 @@ directory to the package root, and preserve the two packaged `src` paths in
 `PYTHONPATH`. The daemon, not the client or Worker, owns the principal-to-scope
 allowlist.
 
+To enable candidate proposals from an admitted runtime, configure
+`memory_candidate_producers` with one entry per fixed route. Each entry binds
+`producer_id`, `principal_id`, `principal_kind` (`Agent`, `Model` or `Harness`)
+and `scope_ref` at daemon composition time. The runtime receives only its
+bound submit-only capability; it cannot select another producer, scope,
+principal, or call Memory acceptance/revocation. Omitting the list leaves the
+candidate-producer registry empty and does not affect Founder Memory
+governance.
+
 Unknown fields, missing or invalid keys, inconsistent contract references and
 unapproved verification profiles fail closed during startup.
