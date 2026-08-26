@@ -119,6 +119,13 @@ Collaboration/Sego stages after technical evidence intake.
   composite does not choose models or merge provider-owned facts. This is a
   composition prerequisite, not evidence that a second Harness has been
   admitted.
+- Profile-bound native composition: `agentosd` exposes one provider-neutral
+  native-driver assembly boundary carrying an explicit adapter id, capability
+  profile id and protocol fingerprint. The Codex entry point is a compatibility
+  wrapper that supplies the already-reviewed Codex values. Supplying a profile
+  to this boundary does not grant admission; profile attestation and the
+  provider-specific lifecycle evidence remain prerequisites before a Kimi, DSH
+  or other Harness can be wired into production selection.
 
 ## Repository rules
 

@@ -12,6 +12,7 @@ use egopulse_codex_adapter::{
 };
 use egopulse_cognition_runtime::memory_authority::MemoryAuthority;
 use egopulse_domain_contracts::v01::egopulse::{
+    harness::v1::NativeProtocolFingerprint,
     policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
     task::v1::{TaskCommand, TaskCommandResult},
     verdict::v1::{VerdictCommand, VerdictCommandResult},
@@ -360,6 +361,40 @@ pub struct CodexHarnessCompositionConfig {
     pub return_collector: GovernedReturnCollectorConfig,
 }
 
+/// Provider-neutral identity that binds a native driver to the capability
+/// profile and protocol evidence it was admitted with. This is deliberately
+/// separate from `CodexHarnessCompositionConfig`: the first production
+/// vertical still owns Codex-specific process configuration, while the
+/// composition boundary itself must not hard-code a provider identity.
+#[derive(Clone, Debug)]
+pub struct NativeHarnessCompositionProfile {
+    pub adapter_id: String,
+    pub capability_profile_id: String,
+    pub observed_protocol: NativeProtocolFingerprint,
+}
+
+impl NativeHarnessCompositionProfile {
+    fn validate(&self) -> Result<(), DaemonCompositionError> {
+        if self.adapter_id.trim().is_empty()
+            || self.capability_profile_id.trim().is_empty()
+            || self.observed_protocol.protocol_name.trim().is_empty()
+            || self.observed_protocol.protocol_version.trim().is_empty()
+            || self.observed_protocol.schema_sha256.trim().is_empty()
+            || self.observed_protocol.adapter_version.trim().is_empty()
+            || self
+                .observed_protocol
+                .native_executable_version
+                .trim()
+                .is_empty()
+        {
+            return Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition profile",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl CodexHarnessCompositionConfig {
     fn validate(&self) -> Result<(), DaemonCompositionError> {
         if self.collaboration_store_epoch.trim().is_empty()
@@ -619,7 +654,7 @@ impl DaemonProviders {
     /// bypassing Collaboration Control, Adapter Edge, Artifact Authority, or
     /// Verification Authority.
     pub fn with_native_harness_driver<D>(
-        mut self,
+        self,
         config: CodexHarnessCompositionConfig,
         artifact_authority: Arc<
             Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
@@ -630,7 +665,40 @@ impl DaemonProviders {
     where
         D: NativeHarnessDriver + Send + 'static,
     {
+        self.with_profiled_native_harness_driver(
+            config,
+            artifact_authority,
+            verification,
+            NativeHarnessCompositionProfile {
+                adapter_id: CODEX_ADAPTER_ID.to_owned(),
+                capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
+                observed_protocol: codex_protocol_fingerprint(),
+            },
+            driver,
+        )
+    }
+
+    /// Installs a native Harness composition using an explicitly admitted
+    /// provider profile. The profile is an input to composition, not an
+    /// admission mechanism: callers must obtain it from the relevant
+    /// capability-attestation path before invoking this method. This keeps
+    /// multi-model support provider-neutral without allowing an unverified
+    /// driver to become production merely by being wired into the daemon.
+    pub fn with_profiled_native_harness_driver<D>(
+        mut self,
+        config: CodexHarnessCompositionConfig,
+        artifact_authority: Arc<
+            Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
+        >,
+        verification: Arc<Mutex<egopulse_verification_authority::VerificationAuthority>>,
+        profile: NativeHarnessCompositionProfile,
+        driver: D,
+    ) -> Result<Self, DaemonCompositionError>
+    where
+        D: NativeHarnessDriver + Send + 'static,
+    {
         config.validate()?;
+        profile.validate()?;
         if self.harness_dispatch_runner.is_some() {
             return Err(DaemonCompositionError::InvalidConfiguration(
                 "Harness runner already configured",
@@ -639,8 +707,11 @@ impl DaemonProviders {
         let source = self.task_activation_source.take().ok_or(
             DaemonCompositionError::InvalidConfiguration("Task activation source"),
         )?;
-        let adapter_id = CODEX_ADAPTER_ID.to_owned();
-        let capability_profile_id = CODEX_CAPABILITY_PROFILE_ID.to_owned();
+        let NativeHarnessCompositionProfile {
+            adapter_id,
+            capability_profile_id,
+            observed_protocol,
+        } = profile;
         let reader_edge = AdapterEdge::open(AdapterEdgeConfig {
             database_path: config.adapter_database_path.clone(),
             adapter_id: adapter_id.clone(),
@@ -681,7 +752,7 @@ impl DaemonProviders {
         let adapter = GovernedHarnessAdapter::new(
             adapter_id,
             capability_profile_id,
-            codex_protocol_fingerprint(),
+            observed_protocol,
             writer_edge,
             FileDispatchMaterialResolver::new(config.input_bundle_root, config.workspace_root),
             driver,
@@ -1321,6 +1392,39 @@ mod tests {
             replacement,
             Err(DaemonCompositionError::InvalidConfiguration(
                 "Harness runner already configured"
+            ))
+        ));
+    }
+
+    #[test]
+    fn native_harness_profile_requires_explicit_identity_and_protocol_evidence() {
+        let mut profile = NativeHarnessCompositionProfile {
+            adapter_id: "adapter".to_owned(),
+            capability_profile_id: "profile".to_owned(),
+            observed_protocol: NativeProtocolFingerprint {
+                protocol_name: "acp".to_owned(),
+                protocol_version: "1".to_owned(),
+                schema_sha256: "schema".to_owned(),
+                adapter_version: "adapter-version".to_owned(),
+                native_executable_version: "native-version".to_owned(),
+                native_binary_sha256: None,
+            },
+        };
+        assert!(profile.validate().is_ok());
+
+        profile.adapter_id.clear();
+        assert!(matches!(
+            profile.validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition profile"
+            ))
+        ));
+        profile.adapter_id = "adapter".to_owned();
+        profile.observed_protocol.schema_sha256.clear();
+        assert!(matches!(
+            profile.validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition profile"
             ))
         ));
     }
