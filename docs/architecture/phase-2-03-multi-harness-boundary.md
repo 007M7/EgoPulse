@@ -208,6 +208,13 @@ not expose an independently hashable EgoPulse Artifact return. The driver is
 therefore still candidate-only and is not wired into daemon provider
 selection.
 
+The 2026-08-27 re-run is recorded in
+`phase-2-29-dsh-replay-rerun-2026-08-27.md`. In addition to the three real
+ACP replay scenarios, `apps/agentosd/tests/dsh_recovery_hold.rs` proves that
+the unsupported native recovery finding is persisted and replayed after an
+Adapter restart without automatic redispatch. This closes the safety
+behavior for the held capability; it does not close provider admission.
+
 The configured Windows x64 replay evidence was rerun against the local DSH
 workspace with the Rust driver and passed all three scenarios:
 
