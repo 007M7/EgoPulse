@@ -1,6 +1,6 @@
 {
     "schemaVersion":  "egopulse-generated-contract-bindings/v0.1",
-    "sourceManifestSha256":  "28d05e2533ea7650d8fedbc44abfa21d33c2845f8d105650e3287676e789e7bb",
+    "sourceManifestSha256":  "f9a10bf989f8aed99ac420ceaa30eaae20ee465b45acf0bcd5c27e914d806408",
     "generators":  {
                        "buf":  "1.72.0",
                        "protocGenEs":  "2.14.0",

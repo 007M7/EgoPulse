@@ -938,7 +938,7 @@
     },
     {
       "path": "profiles/authorization/v1/v01-default.json",
-      "sha256": "c9faacd839b431263be7b24dbe1527a990399f4edfa22a41208635a5e416f8de"
+      "sha256": "0aeecf723799d915e3a3362911e349a1c3ccdd62a013c1973d9d4d99ebb9bbe0"
     },
     {
       "path": "profiles/client-kernel/v1/v01-default.json",

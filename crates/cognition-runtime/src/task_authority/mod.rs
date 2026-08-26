@@ -925,9 +925,13 @@ fn operation_allowed(operation: &str, kind: PrincipalKind) -> bool {
         | "resume_task"
         | "record_task_cancellation_outcome" => kind == PrincipalKind::CollaborationControl,
         "record_task_verification" => kind == PrincipalKind::SegoVerification,
-        "apply_founder_verdict" | "revise_task" | "supersede_task" | "expire_task" => {
-            kind == PrincipalKind::FounderAuthority
+        "apply_founder_verdict" => {
+            matches!(
+                kind,
+                PrincipalKind::Founder | PrincipalKind::FounderAuthority
+            )
         }
+        "revise_task" | "supersede_task" | "expire_task" => kind == PrincipalKind::FounderAuthority,
         _ => false,
     }
 }

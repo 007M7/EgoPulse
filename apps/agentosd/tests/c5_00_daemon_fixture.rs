@@ -1240,6 +1240,41 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
         .as_str()
         .expect("TUI created task id");
 
+    let tui_apply_output = run_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "task-apply-verdict",
+            tui_task_id,
+            "--expected-revision",
+            "1",
+            "--work-revision",
+            "1",
+            "missing-founder-verdict-c5-03-tui",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(
+        tui_apply_output.status.code(),
+        Some(3),
+        "TUI apply-verdict must reach the real daemon and fail closed for a Draft Task: stdout={} stderr={}",
+        String::from_utf8_lossy(&tui_apply_output.stdout),
+        String::from_utf8_lossy(&tui_apply_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&tui_apply_output.stderr).contains("TASK_STATUS_INVALID")
+            || String::from_utf8_lossy(&tui_apply_output.stderr)
+                .contains("TASK_NOT_VERDICT_PENDING")
+            || String::from_utf8_lossy(&tui_apply_output.stderr)
+                .contains("TRANSITION_STATE_CONFLICT")
+            || String::from_utf8_lossy(&tui_apply_output.stderr)
+                .contains("TRANSITION_REFERENCE_UNVERIFIED"),
+        "TUI apply-verdict must preserve the typed Task rejection: stderr={}",
+        String::from_utf8_lossy(&tui_apply_output.stderr)
+    );
+
     let tui_evidence_output = run_tui(
         &instance,
         &[
@@ -1339,6 +1374,43 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
     let task_id = task_json["data"]["taskId"]
         .as_str()
         .expect("created task id");
+
+    let cli_apply_output = run_cli(
+        &instance,
+        &[
+            "task",
+            "apply-verdict",
+            task_id,
+            "--expected-revision",
+            "1",
+            "--work-revision",
+            "1",
+            "missing-founder-verdict-c5-03-cli",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(
+        cli_apply_output.status.code(),
+        Some(6),
+        "CLI apply-verdict must reach the real daemon and fail closed for a Draft Task: stdout={} stderr={}",
+        String::from_utf8_lossy(&cli_apply_output.stdout),
+        String::from_utf8_lossy(&cli_apply_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&cli_apply_output.stdout).contains("TASK_STATUS_INVALID")
+            || String::from_utf8_lossy(&cli_apply_output.stdout)
+                .contains("TASK_NOT_VERDICT_PENDING")
+            || String::from_utf8_lossy(&cli_apply_output.stdout)
+                .contains("TRANSITION_STATE_CONFLICT")
+            || String::from_utf8_lossy(&cli_apply_output.stdout)
+                .contains("TRANSITION_REFERENCE_UNVERIFIED")
+            || String::from_utf8_lossy(&cli_apply_output.stdout)
+                .contains("TASK_AUTHORITY_REJECTED"),
+        "CLI apply-verdict must preserve the typed Task rejection: stdout={} stderr={}",
+        String::from_utf8_lossy(&cli_apply_output.stdout),
+        String::from_utf8_lossy(&cli_apply_output.stderr)
+    );
     let task_await_token = task_json["data"]["awaitToken"].to_string();
     assert_ne!(task_await_token, "null");
 

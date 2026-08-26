@@ -1,69 +1,83 @@
-# Phase 2-18：CLI/TUI Founder Verdict 应用闭环
+# Phase 2-18: CLI/TUI Founder Verdict Apply Closure
 
-状态：已实现，待与 G4-07 daemon projection pump 做端到端验收
+Status: verified by real Windows daemon E2E.
 
-## 1. 用户动作与内核边界
+## Scope
+
+Both surfaces expose the same governed write capability:
 
 ```text
-CLI: egopulse task apply-verdict ... ─┐
-                                      ├─► Local API
-TUI: egopulse-tui task-apply-verdict ─┘       │
-                                              ▼
-                                   TaskAuthority.ApplyFounderVerdict
-                                              │
-                           ConfiguredTaskTransitionGuard
-                           读取 FounderVerdictAuthority 已签发状态
+CLI: egopulse task apply-verdict ...
+TUI: egopulse-tui task-apply-verdict ...
+                 |
+                 v
+       Client Kernel session handshake
+                 |
+                 v
+       LocalCommandGatewayService
+                 |
+                 v
+       TaskAuthority.ApplyFounderVerdict
+                 |
+                 v
+       ConfiguredTaskTransitionGuard
+                 |
+                 v
+       FounderVerdictAuthority (read-only validation)
 ```
 
-两端只是参数与呈现不同，实际写能力完全相同：都经过 Client Kernel session
-handshake、Contract Profile command authorization、Local API 和 Task Authority。
-两端不打开 Authority 数据库，也不自行解释 Founder decision。
+CLI and TUI differ in argument syntax and presentation only. Neither surface
+opens an Authority store or interprets the Founder decision locally.
 
-## 2. 命令契约
+## Authorization contract
 
-CLI：
+`apply_founder_verdict` is a user-facing command with the permission
+`local.founder-verdict.apply`. Its owner remains `TaskAuthority`, and its
+confirmation class remains `authority_contract`.
+
+The frozen command rule accepts both `TaskAuthority.Founder` (the normal CLI
+and TUI session) and `TaskAuthority.FounderAuthority` (a trusted authority
+path). This is only an entry-point distinction; Task Authority still performs
+the state, revision, work revision, verdict state, scope, artifact, and
+verification-reference checks.
+
+`revise_task`, `supersede_task`, and `expire_task` remain restricted to
+`TaskAuthority.FounderAuthority`.
+
+## Request contract
 
 ```text
 egopulse task apply-verdict <task-id> \
   --expected-revision <task-revision> \
   --work-revision <work-revision> \
   <founder-verdict-id>
-```
 
-TUI：
-
-```text
 egopulse-tui task-apply-verdict <task-id> \
   --expected-revision <task-revision> \
   --work-revision <work-revision> \
   <founder-verdict-id>
 ```
 
-交互式 TUI 命令面板也提供同一个 `Apply Founder Verdict` 表单。参数只有 Task
-并发控制和 Verdict 引用；decision 不由端侧传入，而由 Task guard 从已签发 Verdict
-读取。这避免客户端把“Accept”字符串伪装成 Founder 授权。
+The shared `client-operations::set_task_digest` function covers
+`ApplyFounderVerdict`; command identifiers, timestamps, correlation metadata,
+and request digests are excluded from the canonical digest consistently across
+CLI, TUI, and future Desktop clients.
 
-## 3. 公共 digest 规则
+## Real E2E evidence
 
-`crates/client-operations::set_task_digest` 现在覆盖全部 Task command oneof，
-包括 `ApplyFounderVerdict`。CLI、TUI 和未来 Desktop 使用同一函数生成请求摘要，
-与 Task Authority 清除 command id、issued_at、correlation id、causation id 和
-request digest 后的 canonical protobuf 规则一致。
+`apps/agentosd/tests/c5_00_daemon_fixture.rs` starts the real Windows daemon,
+attaches both real binaries, creates a Draft Task, and invokes apply-verdict
+through both surfaces. Both requests reach the same daemon and are rejected by
+the Task Authority with a typed domain rejection; no client-side shortcut is
+accepted.
 
-## 4. 返回与投影
+The surface exit protocol is intentionally different: TUI reports command
+errors with exit code 3, while CLI reports the JSON domain-conflict envelope
+with exit code 6. The governed capability and authority result are identical.
 
-成功返回统一包含：Task id、revision、Task status、Founder Verdict id、replayed
-和可选 projection await token。当前 await token 的投影目标仍由 Local Read Model
-决定；Founder Verdict Authority 本身没有被客户端伪造为 Task read model。
+## Downstream projection and consume
 
-`Completed`、`Rework`、`Rejected` 由 Task Authority 的真实 decision 映射产生，
-不是 CLI/TUI 的本地分支逻辑。
-
-## 5. 当前验收范围
-
-- CLI/TUI/Client Operations 编译通过；
-- 公共 Task digest 回归覆盖 `ApplyFounderVerdict`；
-- G4-07 生产组合测试覆盖已签发 Verdict → Task 终态和 Consume outbox；
-- 本阶段仍需在真实 daemon 中运行 CLI 和 TUI 两端命令，并由 projection pump
-  完成 Consume outbox 的 recovery/idempotency 观测，作为下一项 E2E 验收。
-
+On a valid transition, Task Authority remains the sole Task writer and emits
+the Founder Verdict consume outbox. The daemon's Founder Verdict consume
+worker validates the payload digest, invokes the shared Verdict Authority
+handle, and acknowledges the Task outbox only after commit or idempotent replay.

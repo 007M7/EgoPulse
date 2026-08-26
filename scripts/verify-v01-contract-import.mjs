@@ -7,11 +7,11 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
 const contractsRoot = join(repositoryRoot, "contracts");
 const manifestPath = join(contractsRoot, "manifest.json");
-const expectedManifestSha256 = "28d05e2533ea7650d8fedbc44abfa21d33c2845f8d105650e3287676e789e7bb";
+const expectedManifestSha256 = "f9a10bf989f8aed99ac420ceaa30eaae20ee465b45acf0bcd5c27e914d806408";
 const expectedArtifactCount = 239;
 const expectedFixtureCount = 182;
 const expectedClientKernelProfileSha256 = "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9";
-const expectedAuthorizationProfileSha256 = "c9faacd839b431263be7b24dbe1527a990399f4edfa22a41208635a5e416f8de";
+const expectedAuthorizationProfileSha256 = "0aeecf723799d915e3a3362911e349a1c3ccdd62a013c1973d9d4d99ebb9bbe0";
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
