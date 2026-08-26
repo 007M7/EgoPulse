@@ -444,6 +444,13 @@ impl AuthorityPrincipalResolver for FixtureAuthorityPrincipalResolver {
     ) -> Result<VerdictPrincipalKind, CommandPortFailure> {
         Ok(VerdictPrincipalKind::FounderAuthority)
     }
+
+    fn resolve_memory(
+        &self,
+        _principal: &CommandPrincipal,
+    ) -> Result<MemoryPrincipalKind, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
