@@ -132,7 +132,7 @@ impl MemoryCandidateProducerHandle {
         })
     }
 
-    pub fn submit_candidate(
+    pub(crate) fn submit_candidate(
         &self,
         command: &SubmitMemoryCandidate,
     ) -> Result<AuthorityMemoryMutationReceipt, MemoryCandidateProducerFailure> {
@@ -230,17 +230,6 @@ impl MemoryCandidateProducerRegistry {
             producers: Arc::new(producers),
             scope_refs: Arc::new(scope_refs),
         })
-    }
-
-    pub fn submit_candidate(
-        &self,
-        producer_id: &str,
-        command: &SubmitMemoryCandidate,
-    ) -> Result<AuthorityMemoryMutationReceipt, MemoryCandidateProducerFailure> {
-        self.producers
-            .get(producer_id)
-            .ok_or_else(|| MemoryCandidateProducerFailure::UnknownProducer(producer_id.to_owned()))?
-            .submit_candidate(command)
     }
 
     pub fn bind_producer(
@@ -693,7 +682,9 @@ mod tests {
         };
         assert_eq!(
             registry
-                .submit_candidate("agent:planner", &wrong_scope)
+                .bind_producer("agent:planner")
+                .expect("planner producer handle")
+                .submit_candidate(&wrong_scope)
                 .expect_err("producer scope must be fixed"),
             MemoryCandidateProducerFailure::ScopeViolation
         );
