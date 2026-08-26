@@ -344,10 +344,11 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
     }
 }
 
-/// Explicit composition input for the first real Harness vertical. The
+/// Provider-neutral composition input for one admitted native Harness. The
 /// workflow configuration is reviewed data; no value is inferred from a Task
-/// payload or from a provider response.
-pub struct CodexHarnessCompositionConfig {
+/// payload or from a provider response. Provider process configuration stays
+/// outside this type.
+pub struct NativeHarnessCompositionConfig {
     pub collaboration_database_path: PathBuf,
     pub collaboration_store_epoch: String,
     pub collaboration_key: [u8; 32],
@@ -356,17 +357,23 @@ pub struct CodexHarnessCompositionConfig {
     pub adapter_key: [u8; 32],
     pub input_bundle_root: PathBuf,
     pub workspace_root: PathBuf,
-    pub codex_executable: PathBuf,
     pub workflow: SingleHarnessWorkConfig,
     pub lease_ttl_seconds: u64,
     pub return_collector: GovernedReturnCollectorConfig,
 }
 
+/// Codex-specific process input wrapped around the provider-neutral native
+/// Harness composition. The user-owned JSON shape remains unchanged; only the
+/// typed daemon boundary separates process choice from governed composition.
+pub struct CodexHarnessCompositionConfig {
+    pub native: NativeHarnessCompositionConfig,
+    pub codex_executable: PathBuf,
+}
+
 /// Provider-neutral identity that binds a native driver to the capability
 /// profile and protocol evidence it was admitted with. This is deliberately
-/// separate from `CodexHarnessCompositionConfig`: the first production
-/// vertical still owns Codex-specific process configuration, while the
-/// composition boundary itself must not hard-code a provider identity.
+/// separate from provider process configuration so the composition boundary
+/// itself cannot hard-code an executable or provider identity.
 #[derive(Clone, Debug)]
 pub struct NativeHarnessCompositionProfile {
     adapter_id: String,
@@ -442,23 +449,33 @@ impl NativeHarnessCompositionProfile {
     }
 }
 
-impl CodexHarnessCompositionConfig {
+impl NativeHarnessCompositionConfig {
     fn validate(&self) -> Result<(), DaemonCompositionError> {
         if self.collaboration_store_epoch.trim().is_empty()
             || self.adapter_store_epoch.trim().is_empty()
             || self.collaboration_key.iter().all(|byte| *byte == 0)
             || self.adapter_key.iter().all(|byte| *byte == 0)
-            || self.codex_executable.as_os_str().is_empty()
             || self.lease_ttl_seconds == 0
         {
             return Err(DaemonCompositionError::InvalidConfiguration(
-                "Codex Harness composition",
+                "native Harness composition",
             ));
         }
         self.return_collector
             .validate()
             .map_err(DaemonCompositionError::InvalidConfiguration)?;
         Ok(())
+    }
+}
+
+impl CodexHarnessCompositionConfig {
+    fn validate(&self) -> Result<(), DaemonCompositionError> {
+        if self.codex_executable.as_os_str().is_empty() {
+            return Err(DaemonCompositionError::InvalidConfiguration(
+                "Codex Harness executable",
+            ));
+        }
+        self.native.validate()
     }
 }
 
@@ -686,12 +703,16 @@ impl DaemonProviders {
         >,
         verification: Arc<Mutex<egopulse_verification_authority::VerificationAuthority>>,
     ) -> Result<Self, DaemonCompositionError> {
-        let executable = config.codex_executable.clone();
+        config.validate()?;
+        let CodexHarnessCompositionConfig {
+            native,
+            codex_executable,
+        } = config;
         self.with_native_harness_driver(
-            config,
+            native,
             artifact_authority,
             verification,
-            CodexAppServerDriver::new(CodexAppServerConfig::new(executable)),
+            CodexAppServerDriver::new(CodexAppServerConfig::new(codex_executable)),
         )
     }
 
@@ -702,7 +723,7 @@ impl DaemonProviders {
     /// Verification Authority.
     pub fn with_native_harness_driver<D>(
         self,
-        config: CodexHarnessCompositionConfig,
+        config: NativeHarnessCompositionConfig,
         artifact_authority: Arc<
             Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
         >,
@@ -733,7 +754,7 @@ impl DaemonProviders {
     /// driver to become production merely by being wired into the daemon.
     pub fn with_profiled_native_harness_driver<D>(
         mut self,
-        config: CodexHarnessCompositionConfig,
+        config: NativeHarnessCompositionConfig,
         artifact_authority: Arc<
             Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
         >,
@@ -1538,6 +1559,90 @@ mod tests {
             profile.validate(),
             Err(DaemonCompositionError::InvalidConfiguration(
                 "native Harness composition profile"
+            ))
+        ));
+    }
+
+    #[test]
+    fn native_harness_composition_is_independent_from_provider_executable_config() {
+        fn reference(id: &str) -> ContractReference {
+            ContractReference {
+                contract_id: id.to_owned(),
+                version: "v1".to_owned(),
+                sha256: "ab".repeat(32),
+            }
+        }
+
+        fn native_config() -> NativeHarnessCompositionConfig {
+            NativeHarnessCompositionConfig {
+                collaboration_database_path: PathBuf::from("collaboration.db"),
+                collaboration_store_epoch: "collaboration-epoch".to_owned(),
+                collaboration_key: [1; 32],
+                adapter_database_path: PathBuf::from("adapter.db"),
+                adapter_store_epoch: "adapter-epoch".to_owned(),
+                adapter_key: [2; 32],
+                input_bundle_root: PathBuf::from("input"),
+                workspace_root: PathBuf::from("workspace"),
+                workflow: SingleHarnessWorkConfig {
+                    run_id: "run".to_owned(),
+                    attempt_id: "attempt".to_owned(),
+                    dispatch_id: "dispatch".to_owned(),
+                    plan: Default::default(),
+                    harness_id: "harness".to_owned(),
+                    capability_profile_ref: reference("capability"),
+                    workspace_ref: "workspace".to_owned(),
+                    lease_policy_ref: reference("lease"),
+                    owner_instance_id: "owner".to_owned(),
+                    material:
+                        egopulse_local_ide_control::collaboration_control::DispatchMaterial {
+                            input_bundle_sha256: "cd".repeat(32),
+                            sandbox_profile_ref: reference("sandbox"),
+                            tool_policy_ref: reference("tool"),
+                            data_egress_policy_ref: reference("egress"),
+                            approval_policy_ref: reference("approval"),
+                            session_strategy: egopulse_domain_contracts::v01::egopulse::harness::v1::NativeSessionStrategy::CreateNew,
+                            native_session_ref: None,
+                            checkpoint_ref: None,
+                            evidence_refs: vec!["evidence".to_owned()],
+                        },
+                    task_authority_principal_id: "task".to_owned(),
+                    collaboration_principal_id: "collaboration".to_owned(),
+                    attempt_supervisor_principal_id: "supervisor".to_owned(),
+                    harness_adapter_principal_id: "adapter".to_owned(),
+                },
+                lease_ttl_seconds: 30,
+                return_collector: GovernedReturnCollectorConfig {
+                    artifact_type_ref: reference("artifact-type"),
+                    transformation_contract_ref: reference("transformation"),
+                    retention_profile_ref: reference("retention"),
+                    claim_semantic_profile_ref: reference("claim-semantic"),
+                    claim_acceptance_contract_ref: reference("claim-acceptance"),
+                    evidence_profile_ref: reference("evidence-profile"),
+                    workspace_ref: "workspace".to_owned(),
+                    collector_principal_id: "collector".to_owned(),
+                    artifact_authority_principal_id: "artifact-authority".to_owned(),
+                },
+            }
+        }
+
+        assert!(native_config().validate().is_ok());
+        assert!(matches!(
+            CodexHarnessCompositionConfig {
+                native: native_config(),
+                codex_executable: PathBuf::new(),
+            }
+            .validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "Codex Harness executable"
+            ))
+        ));
+
+        let mut invalid_native = native_config();
+        invalid_native.lease_ttl_seconds = 0;
+        assert!(matches!(
+            invalid_native.validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition"
             ))
         ));
     }

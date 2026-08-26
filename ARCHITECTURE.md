@@ -121,11 +121,14 @@ Collaboration/Sego stages after technical evidence intake.
   admitted.
 - Profile-bound native composition: `agentosd` exposes one provider-neutral
   native-driver assembly boundary carrying an explicit adapter id, capability
-  profile id and protocol fingerprint. The Codex entry point is a compatibility
-  wrapper that supplies the already-reviewed Codex values. Supplying a profile
-  to this boundary does not grant admission; profile attestation and the
-  provider-specific lifecycle evidence remain prerequisites before a Kimi, DSH
-  or other Harness can be wired into production selection.
+  profile id and protocol fingerprint. Its common storage, workspace, workflow,
+  lease and return-path inputs are held by `NativeHarnessCompositionConfig`;
+  provider process configuration is kept outside that type. The Codex entry
+  point is a compatibility wrapper that adds the Codex executable while the
+  user-owned JSON shape remains stable. Supplying a profile or native config to
+  this boundary does not grant admission; profile attestation and the
+  provider-specific lifecycle evidence remain prerequisites before a Kimi,
+  DSH or other Harness can be wired into production selection.
 
 ## Repository rules
 

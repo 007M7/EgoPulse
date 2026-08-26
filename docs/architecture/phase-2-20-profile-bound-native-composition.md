@@ -66,11 +66,10 @@ single interpretation of workflow-to-capability binding.
 
 ## Cost and explicitly deferred work
 
-- `CodexHarnessCompositionConfig` still contains Codex-specific executable and
-  workflow fields because V-01 is the only production vertical. A later
-  second-provider vertical must introduce a provider-neutral process
-  composition config or an explicit provider config enum; it must not silently
-  reuse a misleading Codex type.
+- Phase 2-21 separates the provider-neutral native composition inputs from the
+  Codex executable. A later second-provider vertical may add an explicit
+  provider process config or provider config enum, but it must reuse the common
+  native composition contract instead of copying the Codex wrapper.
 - The profile constructor does not perform provider admission, model
   selection, authentication or native recovery. Those remain provider-owned
   evidence gates.
@@ -93,7 +92,7 @@ Local verification on Windows x64:
 ```text
 cargo fmt --all -- --check                  passed
 cargo clippy -p egopulse-agentosd --all-targets -- -D warnings   passed
-cargo test -p egopulse-agentosd --lib       48 passed
+cargo test -p egopulse-agentosd --lib       49 passed
 git diff --check                            passed
 pre_push_check                              passed
 ```

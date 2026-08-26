@@ -54,8 +54,9 @@ use crate::{
     ConfiguredVerificationWorker, DaemonCompositionError, DaemonProviders,
     FounderVerdictConfigurationError, GovernedReturnCollectorConfig, LocalUserPolicyResolver,
     LocalUserPolicyResolverConfig, MemoryRetrievalCompositionConfig,
-    SharedAuthorityCompositionInputs, TaskAuthorityCommitReceiptSource,
-    VerificationAuthorityArtifactSource, VerificationProjectionSource, VerificationWorkerConfig,
+    NativeHarnessCompositionConfig, SharedAuthorityCompositionInputs,
+    TaskAuthorityCommitReceiptSource, VerificationAuthorityArtifactSource,
+    VerificationProjectionSource, VerificationWorkerConfig,
 };
 
 /// Explicit scalar configuration for the local-user Policy resolver. The
@@ -732,27 +733,29 @@ impl UserOwnedBootstrapFile {
             artifact_authority_principal_id: "authority:artifact".to_owned(),
         };
         let codex = CodexHarnessCompositionConfig {
-            collaboration_database_path: collaboration_store.database_path,
-            collaboration_store_epoch: collaboration_store.store_epoch,
-            collaboration_key: collaboration_store.key,
-            adapter_database_path: adapter_store.database_path.clone(),
-            adapter_store_epoch: adapter_store.store_epoch.clone(),
-            adapter_key: adapter_store.key,
-            input_bundle_root: PathBuf::from(required(
-                self.codex.input_bundle_root,
-                "codex.input_bundle_root",
-            )?),
-            workspace_root: PathBuf::from(required(
-                self.codex.workspace_root,
-                "codex.workspace_root",
-            )?),
+            native: NativeHarnessCompositionConfig {
+                collaboration_database_path: collaboration_store.database_path,
+                collaboration_store_epoch: collaboration_store.store_epoch,
+                collaboration_key: collaboration_store.key,
+                adapter_database_path: adapter_store.database_path.clone(),
+                adapter_store_epoch: adapter_store.store_epoch.clone(),
+                adapter_key: adapter_store.key,
+                input_bundle_root: PathBuf::from(required(
+                    self.codex.input_bundle_root,
+                    "codex.input_bundle_root",
+                )?),
+                workspace_root: PathBuf::from(required(
+                    self.codex.workspace_root,
+                    "codex.workspace_root",
+                )?),
+                workflow,
+                lease_ttl_seconds: self.codex.lease_ttl_seconds,
+                return_collector,
+            },
             codex_executable: PathBuf::from(required(
                 self.codex.codex_executable,
                 "codex.codex_executable",
             )?),
-            workflow,
-            lease_ttl_seconds: self.codex.lease_ttl_seconds,
-            return_collector,
         };
 
         Ok(ProductionBootstrapConfig {
