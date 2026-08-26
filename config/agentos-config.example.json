@@ -59,9 +59,9 @@
       "local.memory.retrieve"
     ],
     "authorization_policy_ref": {
-      "contract_id": "replace-authorization-policy",
-      "version": "v1",
-      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      "contract_id": "egopulse.authorization.v1",
+      "version": "0.1.0",
+      "sha256": "c9faacd839b431263be7b24dbe1527a990399f4edfa22a41208635a5e416f8de"
     },
     "task_kind": "Founder",
     "policy_kind": "LocalUser",
@@ -155,9 +155,9 @@
   "policy": {
     "authentication_context_ref": "local-ipc:windows-named-pipe",
     "authorization_policy_ref": {
-      "contract_id": "replace-authorization-policy",
-      "version": "v1",
-      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      "contract_id": "egopulse.authorization.v1",
+      "version": "0.1.0",
+      "sha256": "c9faacd839b431263be7b24dbe1527a990399f4edfa22a41208635a5e416f8de"
     },
     "allowed_scope_refs": ["adapter-edge://codex/approval/scope"],
     "decision_ttl_seconds": 300

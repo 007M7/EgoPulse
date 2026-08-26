@@ -5,8 +5,9 @@ bootstrap. It contains paths, contract references, workflow settings and
 environment-variable names only; real secrets must not be placed in JSON or
 committed to Git.
 
-Copy the template to a user-owned data directory, replace every `replace-*`
-placeholder, and set:
+Copy the template to a user-owned data directory and replace the
+user-owned `replace-*` placeholders. The `egopulse.authorization.v1` reference
+is a frozen repository contract and must remain unchanged. Then set:
 
 ```powershell
 $env:EGOPULSE_USER_CONFIG = 'D:\EgoPulse\data\agentos-config.json'
