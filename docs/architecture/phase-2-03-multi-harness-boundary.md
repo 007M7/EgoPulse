@@ -107,6 +107,16 @@ records the ACP `initialize` result and empty `session/new` disposition, but
 does not send a prompt. A candidate is not promoted to an active Harness
 merely because its process starts or its session can be created.
 
+The model-isolation prerequisite is now executable at the Adapter Edge. The
+test `reviewed_harness_edges_are_isolated_and_cannot_cross_write` in
+`crates/harness-adapter/src/edge.rs` opens separate encrypted edge stores for
+`codex-adapter` and `dsh-adapter`, registers one dispatch and one observation
+in each, and proves that neither store can read the other Harness's dispatch.
+Each edge retains its own dispatch/observation counts and adapter-scoped raw
+evidence references. This closes the storage-isolation prerequisite for
+multi-model selection; it does not attest DSH's native Artifact/recovery
+semantics and does not promote DSH.
+
 The ACP codec is now isolated in `crates/kimi-adapter/src/acp.rs`. It keeps
 `session/update`, prompt/cancel request construction and server-side
 `session/request_permission` messages separate from provider-neutral Driver

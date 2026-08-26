@@ -1272,9 +1272,13 @@ mod tests {
     }
 
     fn open_edge(path: &Path) -> AdapterEdge {
+        open_edge_with_id(path, "adapter:test")
+    }
+
+    fn open_edge_with_id(path: &Path, adapter_id: &str) -> AdapterEdge {
         AdapterEdge::open(AdapterEdgeConfig {
             database_path: path.to_owned(),
-            adapter_id: "adapter:test".to_owned(),
+            adapter_id: adapter_id.to_owned(),
             store_epoch: "adapter-edge-test-v1".to_owned(),
             key: AdapterEdgeKey::new([0x7a; 32]),
         })
@@ -1282,9 +1286,13 @@ mod tests {
     }
 
     fn dispatch() -> DispatchEnvelope {
+        dispatch_with_id("dispatch-001", "attempt-001")
+    }
+
+    fn dispatch_with_id(dispatch_id: &str, attempt_id: &str) -> DispatchEnvelope {
         DispatchEnvelope {
-            dispatch_id: "dispatch-001".to_owned(),
-            attempt_id: "attempt-001".to_owned(),
+            dispatch_id: dispatch_id.to_owned(),
+            attempt_id: attempt_id.to_owned(),
             fencing_token: 1,
             dispatch_fingerprint: "1".repeat(64),
             input_bundle_sha256: "2".repeat(64),
@@ -1305,9 +1313,13 @@ mod tests {
     }
 
     fn observation() -> HarnessObservation {
+        observation_for("dispatch-001", "attempt-001")
+    }
+
+    fn observation_for(dispatch_id: &str, attempt_id: &str) -> HarnessObservation {
         HarnessObservation {
-            attempt_id: "attempt-001".to_owned(),
-            dispatch_id: "dispatch-001".to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            dispatch_id: dispatch_id.to_owned(),
             fencing_token: 1,
             criticality: ObservationCriticality::Control as i32,
             payload: Some(harness_observation::Payload::Diagnostic(
@@ -1319,6 +1331,70 @@ mod tests {
             )),
             ..HarnessObservation::default()
         }
+    }
+
+    #[test]
+    fn reviewed_harness_edges_are_isolated_and_cannot_cross_write() {
+        let codex_root = IsolatedEdge::new("g4-09-codex-edge");
+        let dsh_root = IsolatedEdge::new("g4-09-dsh-edge");
+        let mut codex = open_edge_with_id(&codex_root.path(), "codex-adapter");
+        let mut dsh = open_edge_with_id(&dsh_root.path(), "dsh-adapter");
+        let codex_dispatch = dispatch_with_id("dispatch-codex", "attempt-codex");
+        let dsh_dispatch = dispatch_with_id("dispatch-dsh", "attempt-dsh");
+
+        assert!(matches!(
+            codex.prepare_dispatch(&codex_dispatch, 10),
+            Ok(DispatchPreparation::Ready)
+        ));
+        assert!(matches!(
+            dsh.prepare_dispatch(&dsh_dispatch, 10),
+            Ok(DispatchPreparation::Ready)
+        ));
+        codex
+            .append_observation(
+                &codex_dispatch.dispatch_id,
+                "native:codex:terminal",
+                b"codex-terminal",
+                observation_for(&codex_dispatch.dispatch_id, &codex_dispatch.attempt_id),
+                11,
+            )
+            .expect("codex observation stays in codex edge");
+        dsh.append_observation(
+            &dsh_dispatch.dispatch_id,
+            "native:dsh:terminal",
+            b"dsh-terminal",
+            observation_for(&dsh_dispatch.dispatch_id, &dsh_dispatch.attempt_id),
+            11,
+        )
+        .expect("dsh observation stays in dsh edge");
+
+        assert!(
+            codex
+                .dispatch_envelope(&dsh_dispatch.dispatch_id)
+                .expect("read codex edge")
+                .is_none()
+        );
+        assert!(
+            dsh.dispatch_envelope(&codex_dispatch.dispatch_id)
+                .expect("read dsh edge")
+                .is_none()
+        );
+        assert_eq!(
+            codex.inspect().expect("inspect codex edge").dispatch_count,
+            1
+        );
+        assert_eq!(dsh.inspect().expect("inspect dsh edge").dispatch_count, 1);
+        assert_eq!(
+            codex
+                .inspect()
+                .expect("inspect codex edge")
+                .observation_count,
+            1
+        );
+        assert_eq!(
+            dsh.inspect().expect("inspect dsh edge").observation_count,
+            1
+        );
     }
 
     fn approval_observation() -> HarnessObservation {
