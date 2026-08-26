@@ -10,7 +10,7 @@ use egopulse_artifact_authority::{
     ArtifactAuthority, ArtifactAuthorityConfig, ArtifactAuthorityFailure, ArtifactSqlCipherKey,
 };
 use egopulse_cognition_runtime::memory_authority::{
-    MemoryAuthority, MemoryAuthorityConfig, MemoryAuthorityFailure,
+    MemoryAuthority, MemoryAuthorityConfig, MemoryAuthorityFailure, MemoryPrincipalKind,
 };
 use egopulse_cognition_runtime::task_authority::{
     PrincipalKind as TaskPrincipalKind, SqlCipherKey, TaskAuthority, TaskAuthorityConfig,
@@ -210,6 +210,7 @@ impl ProductionBootstrapConfig {
         let principal_resolver = Arc::new(ConfiguredAuthorityPrincipalResolver::new([
             self.authority_binding
         ])?);
+        let memory_principal_resolver = Arc::clone(&principal_resolver);
         let session_principal_resolver =
             Arc::new(AllowlistedPrincipalResolver::new([self.os_principal])?);
         let mut providers =
@@ -243,7 +244,7 @@ impl ProductionBootstrapConfig {
         if let Some(memory_retrieval) = self.memory_retrieval {
             providers = providers.with_memory_retrieval(Arc::clone(&memory), memory_retrieval)?;
         }
-        providers = providers.with_memory_mutation(Arc::clone(&memory));
+        providers = providers.with_memory_mutation(Arc::clone(&memory), memory_principal_resolver);
         providers = providers.with_codex_harness(self.codex, artifact, verification)?;
         Ok(providers)
     }
@@ -308,6 +309,8 @@ struct IdentityFile {
     task_kind: String,
     policy_kind: String,
     verdict_kind: String,
+    #[serde(default)]
+    memory_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -597,6 +600,11 @@ impl UserOwnedBootstrapFile {
             task: parse_task_principal(&identity.task_kind)?,
             policy: parse_policy_principal(&identity.policy_kind)?,
             verdict: parse_verdict_principal(&identity.verdict_kind)?,
+            memory: identity
+                .memory_kind
+                .as_deref()
+                .map(parse_memory_principal)
+                .transpose()?,
         };
 
         let task_guard = ConfiguredTaskCreationGuardConfig {
@@ -1355,6 +1363,21 @@ fn parse_verdict_principal(
         }
     };
     Ok(Some(kind))
+}
+
+fn parse_memory_principal(value: &str) -> Result<MemoryPrincipalKind, ProductionBootstrapError> {
+    match value {
+        "Founder" => Ok(MemoryPrincipalKind::Founder),
+        "FounderAuthority" => Ok(MemoryPrincipalKind::FounderAuthority),
+        "Agent" => Ok(MemoryPrincipalKind::Agent),
+        "Model" => Ok(MemoryPrincipalKind::Model),
+        "Harness" => Ok(MemoryPrincipalKind::Harness),
+        "GovernanceKernel" => Ok(MemoryPrincipalKind::GovernanceKernel),
+        "RecoveryCoordinator" => Ok(MemoryPrincipalKind::RecoveryCoordinator),
+        _ => Err(ProductionBootstrapError::InvalidConfiguration(
+            "identity.memory_kind",
+        )),
+    }
 }
 
 /// Production's temporary verification boundary. It prevents the daemon from

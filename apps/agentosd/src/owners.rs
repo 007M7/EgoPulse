@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::SharedFounderVerdictAuthority;
 use crate::projections::{OwnerProjectionSource, PendingOwnerProjection, ProjectionSourceFailure};
+use egopulse_cognition_runtime::memory_authority::MemoryPrincipalKind;
 use egopulse_cognition_runtime::task_authority::{
     AuthenticatedPrincipal, PrincipalKind as TaskPrincipalKind, TaskAuthority, TaskAuthorityFailure,
 };
@@ -48,6 +49,11 @@ pub trait AuthorityPrincipalResolver: Send + Sync + 'static {
         &self,
         principal: &CommandPrincipal,
     ) -> Result<VerdictPrincipalKind, CommandPortFailure>;
+
+    fn resolve_memory(
+        &self,
+        principal: &CommandPrincipal,
+    ) -> Result<MemoryPrincipalKind, CommandPortFailure>;
 }
 
 /// Explicitly denies owner principal resolution. It is used by the daemon's
@@ -75,6 +81,13 @@ impl AuthorityPrincipalResolver for DenyAllAuthorityPrincipalResolver {
         &self,
         _principal: &CommandPrincipal,
     ) -> Result<VerdictPrincipalKind, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
+
+    fn resolve_memory(
+        &self,
+        _principal: &CommandPrincipal,
+    ) -> Result<MemoryPrincipalKind, CommandPortFailure> {
         Err(CommandPortFailure::Unavailable)
     }
 }
@@ -688,6 +701,13 @@ mod tests {
             _principal: &CommandPrincipal,
         ) -> Result<VerdictPrincipalKind, CommandPortFailure> {
             Ok(VerdictPrincipalKind::FounderAuthority)
+        }
+
+        fn resolve_memory(
+            &self,
+            _principal: &CommandPrincipal,
+        ) -> Result<MemoryPrincipalKind, CommandPortFailure> {
+            Err(CommandPortFailure::Unavailable)
         }
     }
 

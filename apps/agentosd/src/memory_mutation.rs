@@ -11,17 +11,26 @@ use egopulse_local_api::command_gateway::{
     CommandPortFailure, CommandPrincipal, MemoryMutationPort,
 };
 
+use crate::AuthorityPrincipalResolver;
+
 /// The only Local API adapter that can call Memory Authority mutations. The
 /// gateway supplies authorization constraints; this adapter requires one
 /// unambiguous Memory principal kind before invoking the owner.
 pub struct MemoryMutationPortAdapter {
     authority: Arc<Mutex<MemoryAuthority>>,
+    principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
 }
 
 impl MemoryMutationPortAdapter {
     #[must_use]
-    pub fn new(authority: Arc<Mutex<MemoryAuthority>>) -> Self {
-        Self { authority }
+    pub fn new(
+        authority: Arc<Mutex<MemoryAuthority>>,
+        principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
+    ) -> Self {
+        Self {
+            authority,
+            principal_resolver,
+        }
     }
 }
 
@@ -37,6 +46,7 @@ impl MemoryMutationPort for MemoryMutationPortAdapter {
             .ok_or(CommandPortFailure::IntegrityFailure)?;
         let authority_principal = principal_for(
             resolve_kind(
+                self.principal_resolver.resolve_memory(principal)?,
                 principal,
                 match command {
                     memory_mutation_command::Command::SubmitMemoryCandidate(_) => {
@@ -103,24 +113,28 @@ impl MemoryMutationPort for MemoryMutationPortAdapter {
 }
 
 fn resolve_kind(
+    resolved: MemoryPrincipalKind,
     principal: &CommandPrincipal,
     allowed: &[&str],
 ) -> Result<MemoryPrincipalKind, CommandPortFailure> {
-    let matches = allowed
-        .iter()
-        .filter(|allowed_kind| {
-            principal
-                .required_authority_principal_kinds
-                .iter()
-                .any(|value| value == **allowed_kind)
-        })
-        .copied()
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        ["MemoryAuthority.Founder"] => Ok(MemoryPrincipalKind::Founder),
-        ["MemoryAuthority.FounderAuthority"] => Ok(MemoryPrincipalKind::FounderAuthority),
-        _ => Err(CommandPortFailure::IntegrityFailure),
+    let resolved_kind = match resolved {
+        MemoryPrincipalKind::Founder => "MemoryAuthority.Founder",
+        MemoryPrincipalKind::FounderAuthority => "MemoryAuthority.FounderAuthority",
+        MemoryPrincipalKind::Agent => "MemoryAuthority.Agent",
+        MemoryPrincipalKind::Model => "MemoryAuthority.Model",
+        MemoryPrincipalKind::Harness => "MemoryAuthority.Harness",
+        MemoryPrincipalKind::GovernanceKernel => "MemoryAuthority.GovernanceKernel",
+        MemoryPrincipalKind::RecoveryCoordinator => "MemoryAuthority.RecoveryCoordinator",
+    };
+    if !allowed.contains(&resolved_kind)
+        || !principal
+            .required_authority_principal_kinds
+            .iter()
+            .any(|value| value == resolved_kind)
+    {
+        return Err(CommandPortFailure::IntegrityFailure);
     }
+    Ok(resolved)
 }
 
 fn principal_for(
@@ -169,8 +183,12 @@ mod tests {
     use uuid::Uuid;
 
     fn principal(kind: &str) -> CommandPrincipal {
+        principal_with_id("founder-local", kind)
+    }
+
+    fn principal_with_id(principal_id: &str, kind: &str) -> CommandPrincipal {
         CommandPrincipal {
-            principal_id: "founder-local".to_owned(),
+            principal_id: principal_id.to_owned(),
             required_authority_principal_kinds: vec![kind.to_owned()],
         }
     }
@@ -190,7 +208,26 @@ mod tests {
             })
             .expect("memory authority"),
         ));
-        let adapter = MemoryMutationPortAdapter::new(Arc::clone(&authority));
+        let resolver = Arc::new(
+            crate::ConfiguredAuthorityPrincipalResolver::new([
+                crate::AuthorityPrincipalBinding {
+                    principal_id: "founder-local".to_owned(),
+                    task: None,
+                    policy: None,
+                    verdict: None,
+                    memory: Some(MemoryPrincipalKind::Founder),
+                },
+                crate::AuthorityPrincipalBinding {
+                    principal_id: "governance-local".to_owned(),
+                    task: None,
+                    policy: None,
+                    verdict: None,
+                    memory: Some(MemoryPrincipalKind::FounderAuthority),
+                },
+            ])
+            .expect("memory principal resolver"),
+        );
+        let adapter = MemoryMutationPortAdapter::new(Arc::clone(&authority), resolver);
         let candidate = MemoryMutationCommand {
             command: Some(memory_mutation_command::Command::SubmitMemoryCandidate(
                 SubmitMemoryCandidateCommand {
@@ -245,7 +282,7 @@ mod tests {
             adapter
                 .execute(
                     &stale_revoke,
-                    &principal("MemoryAuthority.FounderAuthority"),
+                    &principal_with_id("governance-local", "MemoryAuthority.FounderAuthority"),
                 )
                 .expect_err("stale revision must fail"),
             CommandPortFailure::IntegrityFailure
@@ -263,7 +300,10 @@ mod tests {
             )),
         };
         let revoked = adapter
-            .execute(&revoke, &principal("MemoryAuthority.FounderAuthority"))
+            .execute(
+                &revoke,
+                &principal_with_id("governance-local", "MemoryAuthority.FounderAuthority"),
+            )
             .expect("revoke receipt");
         assert_eq!(revoked.state, "revoked");
         assert_eq!(revoked.revision, 3);
@@ -282,7 +322,17 @@ mod tests {
             })
             .expect("memory authority"),
         ));
-        let adapter = MemoryMutationPortAdapter::new(authority);
+        let resolver = Arc::new(
+            crate::ConfiguredAuthorityPrincipalResolver::new([crate::AuthorityPrincipalBinding {
+                principal_id: "founder-local".to_owned(),
+                task: None,
+                policy: None,
+                verdict: None,
+                memory: Some(MemoryPrincipalKind::FounderAuthority),
+            }])
+            .expect("memory principal resolver"),
+        );
+        let adapter = MemoryMutationPortAdapter::new(authority, resolver);
         let command = MemoryMutationCommand {
             command: Some(memory_mutation_command::Command::SubmitMemoryCandidate(
                 SubmitMemoryCandidateCommand::default(),

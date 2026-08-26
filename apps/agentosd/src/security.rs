@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use egopulse_cognition_runtime::memory_authority::MemoryPrincipalKind;
 use egopulse_cognition_runtime::task_authority::PrincipalKind as TaskPrincipalKind;
 use egopulse_founder_verdict_authority::VerdictPrincipalKind;
 use egopulse_local_api::{
@@ -29,6 +30,7 @@ pub struct AuthorityPrincipalBinding {
     pub task: Option<TaskPrincipalKind>,
     pub policy: Option<PolicyPrincipalKind>,
     pub verdict: Option<VerdictPrincipalKind>,
+    pub memory: Option<MemoryPrincipalKind>,
 }
 
 /// Validated, immutable local identity policy used by the production
@@ -90,7 +92,11 @@ impl ConfiguredAuthorityPrincipalResolver {
         let mut bindings = BTreeMap::new();
         for entry in entries {
             validate_principal_id(&entry.principal_id)?;
-            if entry.task.is_none() && entry.policy.is_none() && entry.verdict.is_none() {
+            if entry.task.is_none()
+                && entry.policy.is_none()
+                && entry.verdict.is_none()
+                && entry.memory.is_none()
+            {
                 return Err(PrincipalPolicyError::EmptyAuthorityMapping);
             }
             let key = entry.principal_id.clone();
@@ -141,6 +147,15 @@ impl crate::AuthorityPrincipalResolver for ConfiguredAuthorityPrincipalResolver 
     ) -> Result<VerdictPrincipalKind, CommandPortFailure> {
         self.binding(principal)?
             .verdict
+            .ok_or(CommandPortFailure::Unavailable)
+    }
+
+    fn resolve_memory(
+        &self,
+        principal: &CommandPrincipal,
+    ) -> Result<MemoryPrincipalKind, CommandPortFailure> {
+        self.binding(principal)?
+            .memory
             .ok_or(CommandPortFailure::Unavailable)
     }
 }
@@ -219,6 +234,7 @@ mod tests {
             task: Some(TaskPrincipalKind::Founder),
             policy: None,
             verdict: None,
+            memory: None,
         }])
         .expect("valid explicit task-only mapping");
         let principal = CommandPrincipal {
@@ -247,6 +263,7 @@ mod tests {
                 task: None,
                 policy: None,
                 verdict: None,
+                memory: None,
             }]),
             Err(PrincipalPolicyError::EmptyAuthorityMapping)
         ));

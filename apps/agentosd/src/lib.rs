@@ -717,8 +717,15 @@ impl DaemonProviders {
     }
 
     #[must_use]
-    pub fn with_memory_mutation(mut self, authority: Arc<Mutex<MemoryAuthority>>) -> Self {
-        self.memory_mutation_port = Arc::new(MemoryMutationPortAdapter::new(authority));
+    pub fn with_memory_mutation(
+        mut self,
+        authority: Arc<Mutex<MemoryAuthority>>,
+        principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
+    ) -> Self {
+        self.memory_mutation_port = Arc::new(MemoryMutationPortAdapter::new(
+            authority,
+            principal_resolver,
+        ));
         self
     }
 

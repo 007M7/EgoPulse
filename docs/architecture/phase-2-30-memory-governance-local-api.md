@@ -37,6 +37,9 @@ or replay-conflicting governance cannot silently win.
   transition and durability behavior already implemented and tested in Rust.
 - Local API owns peer/session/profile authorization; CLI and TUI do not decide
   who may govern a memory.
+- The composition root separately resolves the authenticated session principal
+  to a configured `identity.memory_kind`. The contract's allowed kinds are only
+  an upper bound; a missing or incompatible local mapping fails closed.
 - Python RAG remains read-only and receives accepted snapshots only. No Memory
   mutation RPC invokes the worker or grants it a database handle.
 - A single command shape keeps CLI, TUI and future Desktop on the same kernel
@@ -49,6 +52,9 @@ so the contract digest, manifest and compatibility checks must move together.
 The first slice returns a durable mutation receipt rather than a projected
 Memory view; projection/read-model work is separate. Agent-originated writes
 are not simulated through a user session and remain an internal producer gate.
+An installation that does not explicitly configure `identity.memory_kind` is
+unable to mutate Memory, even if its session permission catalog contains the
+Memory RPC permission.
 
 ## Acceptance evidence
 
