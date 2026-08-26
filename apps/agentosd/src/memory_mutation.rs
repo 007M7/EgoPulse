@@ -94,6 +94,17 @@ pub trait MemoryCandidateProducerPort: Send + Sync {
     ) -> Result<AuthorityMemoryMutationReceipt, MemoryCandidateProducerFailure>;
 }
 
+/// An explicit application-level proposal from an admitted Agent/Model/Harness
+/// runtime. Scope is intentionally absent: it is supplied by the fixed
+/// producer handle created during composition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryCandidateProposal {
+    pub memory_id: String,
+    pub content: String,
+    pub source_ref: String,
+    pub idempotency_key: String,
+}
+
 /// A capability narrowed to one already-admitted producer route. Provider
 /// runtimes should receive this handle during composition instead of keeping
 /// the whole registry, so a runtime cannot switch to another producer's
@@ -101,9 +112,26 @@ pub trait MemoryCandidateProducerPort: Send + Sync {
 #[derive(Clone)]
 pub struct MemoryCandidateProducerHandle {
     producer: Arc<dyn MemoryCandidateProducerPort>,
+    scope_ref: String,
 }
 
 impl MemoryCandidateProducerHandle {
+    /// Submits an explicit proposal using the scope fixed at composition time.
+    /// The returned state is always candidate; this handle has no governance
+    /// capability.
+    pub fn submit_proposal(
+        &self,
+        proposal: &MemoryCandidateProposal,
+    ) -> Result<AuthorityMemoryMutationReceipt, MemoryCandidateProducerFailure> {
+        self.submit_candidate(&SubmitMemoryCandidate {
+            memory_id: proposal.memory_id.clone(),
+            content: proposal.content.clone(),
+            source_ref: proposal.source_ref.clone(),
+            scope_ref: self.scope_ref.clone(),
+            idempotency_key: proposal.idempotency_key.clone(),
+        })
+    }
+
     pub fn submit_candidate(
         &self,
         command: &SubmitMemoryCandidate,
@@ -160,6 +188,7 @@ impl MemoryCandidateProducerPort for ConfiguredMemoryCandidateProducer {
 #[derive(Clone, Default)]
 pub struct MemoryCandidateProducerRegistry {
     producers: Arc<BTreeMap<String, Arc<dyn MemoryCandidateProducerPort>>>,
+    scope_refs: Arc<BTreeMap<String, String>>,
 }
 
 impl MemoryCandidateProducerRegistry {
@@ -176,6 +205,7 @@ impl MemoryCandidateProducerRegistry {
         I: IntoIterator<Item = MemoryCandidateProducerBinding>,
     {
         let mut producers = BTreeMap::new();
+        let mut scope_refs = BTreeMap::new();
         for binding in bindings {
             binding.validate()?;
             if producers.contains_key(&binding.producer_id) {
@@ -188,15 +218,17 @@ impl MemoryCandidateProducerRegistry {
             let producer_id = binding.producer_id.clone();
             let producer = ConfiguredMemoryCandidateProducer::new(Arc::clone(&authority), &binding);
             producers.insert(
-                producer_id,
+                producer_id.clone(),
                 Arc::new(producer) as Arc<dyn MemoryCandidateProducerPort>,
             );
+            scope_refs.insert(producer_id, binding.scope_ref);
         }
         if producers.is_empty() {
             return Err(MemoryCandidateProducerConfigurationError::EmptyRegistration);
         }
         Ok(Self {
             producers: Arc::new(producers),
+            scope_refs: Arc::new(scope_refs),
         })
     }
 
@@ -219,6 +251,9 @@ impl MemoryCandidateProducerRegistry {
             producer: Arc::clone(self.producers.get(producer_id).ok_or_else(|| {
                 MemoryCandidateProducerFailure::UnknownProducer(producer_id.to_owned())
             })?),
+            scope_ref: self.scope_refs.get(producer_id).cloned().ok_or_else(|| {
+                MemoryCandidateProducerFailure::UnknownProducer(producer_id.to_owned())
+            })?,
         })
     }
 }
@@ -394,7 +429,8 @@ fn format_memory_state(state: egopulse_cognition_runtime::memory_authority::Memo
 mod tests {
     use super::*;
     use egopulse_cognition_runtime::{
-        memory_authority::MemoryAuthorityConfig, task_authority::SqlCipherKey,
+        memory_authority::{MemoryAuthorityConfig, MemoryState},
+        task_authority::SqlCipherKey,
     };
     use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
         AcceptMemoryCommand, SubmitMemoryCandidateCommand,
@@ -635,6 +671,18 @@ mod tests {
                 receipt
             );
         }
+
+        let proposal = MemoryCandidateProposal {
+            memory_id: "memory-fixed-scope".to_owned(),
+            content: "explicit proposal uses the bound scope".to_owned(),
+            source_ref: "source:harness-codex".to_owned(),
+            idempotency_key: "idempotency:fixed-scope".to_owned(),
+        };
+        let codex = registry
+            .bind_producer("harness:codex")
+            .expect("Codex producer handle");
+        let proposal_receipt = codex.submit_proposal(&proposal).expect("proposal receipt");
+        assert_eq!(proposal_receipt.state, MemoryState::Candidate);
 
         let wrong_scope = SubmitMemoryCandidate {
             memory_id: "memory-wrong-scope".to_owned(),

@@ -91,7 +91,7 @@ pub use bootstrap::{
 pub use memory_mutation::{
     MemoryCandidateProducerBinding, MemoryCandidateProducerConfigurationError,
     MemoryCandidateProducerFailure, MemoryCandidateProducerHandle, MemoryCandidateProducerPort,
-    MemoryCandidateProducerRegistry, MemoryMutationPortAdapter,
+    MemoryCandidateProducerRegistry, MemoryCandidateProposal, MemoryMutationPortAdapter,
 };
 pub use memory_retrieval::{
     ConfiguredMemoryRetrievalPort, FailClosedMemoryRetrievalPort, MemoryRetrievalCompositionConfig,

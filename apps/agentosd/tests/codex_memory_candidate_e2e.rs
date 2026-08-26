@@ -1,7 +1,9 @@
 #![cfg(windows)]
 #![forbid(unsafe_code)]
 
-use egopulse_agentosd::{MemoryCandidateProducerBinding, MemoryCandidateProducerRegistry};
+use egopulse_agentosd::{
+    MemoryCandidateProducerBinding, MemoryCandidateProducerRegistry, MemoryCandidateProposal,
+};
 use egopulse_codex_adapter::{
     CODEX_ADAPTER_ID, CODEX_APP_SERVER_SCHEMA_SHA256, CodexAppServerConfig, CodexAppServerDriver,
     codex_protocol_fingerprint,
@@ -9,7 +11,7 @@ use egopulse_codex_adapter::{
 use egopulse_cognition_runtime::{
     memory_authority::{
         AuthenticatedMemoryPrincipal, GovernMemory, MemoryAuthority, MemoryAuthorityConfig,
-        MemoryPrincipalKind, MemoryState, SubmitMemoryCandidate,
+        MemoryPrincipalKind, MemoryState,
     },
     task_authority::SqlCipherKey,
 };
@@ -155,11 +157,10 @@ async fn real_codex_candidate_can_only_enter_memory_as_explicit_candidate() {
     // policy. The Codex driver only returns a terminal output candidate; it
     // does not choose a Memory scope, producer identity or authority state.
     let receipt = codex_handle
-        .submit_candidate(&SubmitMemoryCandidate {
+        .submit_proposal(&MemoryCandidateProposal {
             memory_id: "memory:codex-e2e".to_owned(),
             content: String::from_utf8(terminal.content).expect("candidate is UTF-8"),
             source_ref: format!("harness:{}", terminal.native_completion_ref),
-            scope_ref: "scope:founder".to_owned(),
             idempotency_key: format!("memory-candidate:{dispatch_id}"),
         })
         .expect("Codex candidate should enter Memory Authority");

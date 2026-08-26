@@ -18,7 +18,7 @@ Governed Codex driver
         v
 TerminalOutputCandidate
         |
-        | explicit application/test policy only
+        | explicit application/test policy creates MemoryCandidateProposal
         v
 fixed harness:codex producer handle
         |
@@ -30,9 +30,11 @@ Founder acceptance -> Accepted snapshot
 ```
 
 The Codex driver does not infer a Memory scope, select a Memory principal,
-choose a memory ID, or call accept/revoke. Ordinary terminal output therefore
-does not become a Memory record. The explicit conversion in the E2E is the
-policy seam that a later product workflow must replace with a reviewed
+choose a memory ID, or call accept/revoke. The proposal object carries
+content, source provenance and idempotency only; the fixed producer handle
+injects its composition-bound `scope:founder`. Ordinary terminal output
+therefore does not become a Memory record. The explicit conversion in the E2E
+is the policy seam that a later product workflow must replace with a reviewed
 candidate-proposal interaction; it is not an automatic transcript importer.
 
 ## Real evidence
@@ -46,6 +48,7 @@ existing `EGOPULSE_CODEX_EXECUTABLE` test configuration. It verified:
 - real terminal lifecycle and terminal output candidate extraction;
 - fixed `harness:codex` binding to principal `harness:codex` and
   `scope:founder`;
+- proposal submission with no caller-selected scope or principal;
 - candidate receipt in Memory Authority;
 - separate Founder acceptance and final `Accepted` record;
 - source provenance retained as the Codex native completion reference.

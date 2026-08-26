@@ -23,7 +23,7 @@ producer_id -> fixed principal_id + fixed principal_kind
 bind_producer(producer_id) -> MemoryCandidateProducerHandle
         |
         v
-MemoryCandidateProducerHandle::submit_candidate(command)
+MemoryCandidateProducerHandle::submit_proposal(proposal)
         |
         v
 Rust Memory Authority (single writer, SQLCipher, idempotency, event receipt)
@@ -39,9 +39,13 @@ The producer handle has no producer-selection or principal argument. The
 principal is constructed once
 from the reviewed binding and cannot be selected by the model output, a worker
 payload or a Local API client. `producer_id` is an internal composition route,
-not a user-controlled authority claim. Each binding also fixes one `scope_ref`;
-a candidate for another scope is rejected before the Memory Authority is
-called.
+not a user-controlled authority claim. Each binding also fixes one `scope_ref`.
+The application-level `MemoryCandidateProposal` intentionally contains no
+scope or principal fields; `submit_proposal` supplies the scope captured by
+the handle. The lower-level `submit_candidate(command)` remains available as
+an internal compatibility seam and is still checked by the adapter, but
+producer integrations should use the proposal method so scope cannot be
+selected at the call site.
 
 The registry accepts only these producer identities:
 
@@ -68,6 +72,11 @@ and fail-closed behavior. They are preserved here by four properties:
    request data.
 4. Existing authority guarantees remain in force: durable receipt,
    idempotency, request digest, revision/state rules and source/scope fields.
+
+The proposal shape is part of the boundary: content and provenance may be
+proposed by the admitted runtime, while scope is a composition decision and
+acceptance is a Founder decision. This separates producer output from
+governance state without introducing a second writer.
 
 This is the reusable seam for multi-model collaboration. It does not pretend
 that an arbitrary model or Harness is admitted: a future runner must first be
