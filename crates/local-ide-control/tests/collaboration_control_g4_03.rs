@@ -757,10 +757,14 @@ fn open_control(path: &Path, clock: FixedClock) -> CollaborationControl<FixtureG
 }
 
 fn open_loop_adapter_edge(path: &Path) -> AdapterEdge {
+    open_loop_adapter_edge_for(path, "adapter:codex", "collaboration-loop-adapter-edge-v1")
+}
+
+fn open_loop_adapter_edge_for(path: &Path, adapter_id: &str, store_epoch: &str) -> AdapterEdge {
     AdapterEdge::open(AdapterEdgeConfig {
         database_path: path.to_owned(),
-        adapter_id: "adapter:codex".to_owned(),
-        store_epoch: "collaboration-loop-adapter-edge-v1".to_owned(),
+        adapter_id: adapter_id.to_owned(),
+        store_epoch: store_epoch.to_owned(),
         key: AdapterEdgeKey::new(ADAPTER_TEST_KEY),
     })
     .expect("open Collaboration loop Adapter edge")
@@ -1787,6 +1791,211 @@ async fn task_activation_runner_leaves_other_routes_pending_and_dispatches_its_m
     assert_eq!(
         pending[0].message_id,
         "task-outbox-activation-runner-foreign"
+    );
+}
+
+#[tokio::test]
+async fn two_profile_bound_runners_share_activation_source_without_cross_ack_or_dispatch() {
+    let make_config = |suffix: &str, profile_id: &str, digest_byte: char| {
+        let profile_ref = contract_ref(profile_id, digest_byte);
+        let mut plan = run_plan();
+        plan.steps[0].required_capability_profile_ref = Some(profile_ref.clone());
+        let bundle = format!("{{\"input\":\"{suffix}\"}}").into_bytes();
+        let mut material = dispatch_material();
+        material.input_bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+        SingleHarnessWorkConfig {
+            run_id: format!("run-profile-{suffix}"),
+            attempt_id: format!("attempt-profile-{suffix}"),
+            dispatch_id: format!("dispatch-profile-{suffix}"),
+            plan,
+            harness_id: format!("harness-{suffix}"),
+            capability_profile_ref: profile_ref,
+            workspace_ref: format!("workspace-profile-{suffix}"),
+            lease_policy_ref: contract_ref("v01-attempt-lease", 'a'),
+            owner_instance_id: format!("attempt-supervisor-{suffix}"),
+            material,
+            task_authority_principal_id: format!("task-authority:{suffix}"),
+            collaboration_principal_id: format!("collaboration-control:{suffix}"),
+            attempt_supervisor_principal_id: format!("attempt-supervisor:{suffix}"),
+            harness_adapter_principal_id: format!("adapter:{suffix}"),
+        }
+    };
+    let config_a = make_config("a", "profile:a", 'a');
+    let config_b = make_config("b", "profile:b", 'b');
+    let task_a = TaskSnapshot {
+        task_id: "task-profile-a".to_owned(),
+        revision: 2,
+        work_revision: 1,
+        status: TaskStatus::Active as i32,
+        current_run_id: Some(config_a.run_id.clone()),
+        ..Default::default()
+    };
+    let task_b = TaskSnapshot {
+        task_id: "task-profile-b".to_owned(),
+        revision: 2,
+        work_revision: 1,
+        status: TaskStatus::Active as i32,
+        current_run_id: Some(config_b.run_id.clone()),
+        ..Default::default()
+    };
+    let source = Arc::new(FixtureActivationSource {
+        pending: Mutex::new(vec![
+            TaskActivationHandoff {
+                message_id: "task-outbox-profile-a".to_owned(),
+                payload_digest_sha256: "a".repeat(64),
+                task: task_a,
+            },
+            TaskActivationHandoff {
+                message_id: "task-outbox-profile-b".to_owned(),
+                payload_digest_sha256: "b".repeat(64),
+                task: task_b,
+            },
+        ]),
+        acknowledged: Mutex::new(Vec::new()),
+    });
+
+    let make_runner = |config: SingleHarnessWorkConfig, adapter_id: &str, store_suffix: &str| {
+        let collaboration_store =
+            IsolatedStore::new(&format!("shared-activation-{store_suffix}-collaboration"));
+        let adapter_store =
+            IsolatedStore::new(&format!("shared-activation-{store_suffix}-adapter"));
+        let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+        let (guard, binding) = TaskActivationGuardSet::new(
+            AdapterBackedHarnessEvidenceResolver::new(open_loop_adapter_edge_for(
+                &adapter_database,
+                adapter_id,
+                &format!("shared-activation-{store_suffix}-edge"),
+            )),
+        );
+        let control = open_control_with_guard(
+            &collaboration_store.database_path(),
+            FixedClock::new(FIXED_TIME),
+            guard,
+        );
+        let bundle = format!("{{\"input\":\"{store_suffix}\"}}").into_bytes();
+        let adapter = GovernedHarnessAdapter::new(
+            adapter_id,
+            &config.capability_profile_ref.contract_id,
+            codex_protocol_fingerprint(),
+            open_loop_adapter_edge_for(
+                &adapter_database,
+                adapter_id,
+                &format!("shared-activation-{store_suffix}-edge"),
+            ),
+            LoopMaterialResolver {
+                bundle,
+                workspace_root: adapter_store.root.clone(),
+            },
+            FakeCodexDriver::default(),
+            FixedClock::new(FIXED_TIME),
+        );
+        let profile_ref = config.capability_profile_ref.clone();
+        let runner = GovernedTaskActivationRunner::new(
+            control,
+            adapter,
+            Arc::clone(&source),
+            FixtureWorkflowResolver(config),
+            principal(CollaborationPrincipalKind::HarnessAdapter, adapter_id),
+            binding,
+            30,
+        )
+        .with_capability_profile_ref(profile_ref);
+        (runner, adapter_database, collaboration_store, adapter_store)
+    };
+
+    let (runner_a, adapter_database_a, _collaboration_store_a, _adapter_store_a) =
+        make_runner(config_a, "adapter:profile-a", "a");
+    let cycle_a = runner_a.run_once().await.expect("profile A cycle");
+    assert_eq!(cycle_a.activations_seen, 2);
+    assert_eq!(cycle_a.activations_started, 1);
+    assert_eq!(cycle_a.activations_acknowledged, 1);
+    assert_eq!(cycle_a.dispatches_delivered, 1);
+    assert_eq!(
+        source
+            .acknowledged
+            .lock()
+            .expect("shared activation acknowledgement mutex")
+            .as_slice(),
+        ["task-outbox-profile-a"]
+    );
+    assert_eq!(
+        source
+            .pending
+            .lock()
+            .expect("shared activation source mutex")
+            .iter()
+            .map(|handoff| handoff.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["task-outbox-profile-b"]
+    );
+    drop(runner_a);
+
+    let (runner_b, adapter_database_b, _collaboration_store_b, _adapter_store_b) =
+        make_runner(config_b, "adapter:profile-b", "b");
+    let cycle_b = runner_b.run_once().await.expect("profile B cycle");
+    assert_eq!(cycle_b.activations_seen, 1);
+    assert_eq!(cycle_b.activations_started, 1);
+    assert_eq!(cycle_b.activations_acknowledged, 1);
+    assert_eq!(cycle_b.dispatches_delivered, 1);
+    drop(runner_b);
+
+    assert_eq!(
+        source
+            .acknowledged
+            .lock()
+            .expect("final activation acknowledgement mutex")
+            .as_slice(),
+        ["task-outbox-profile-a", "task-outbox-profile-b"]
+    );
+    assert!(
+        source
+            .pending
+            .lock()
+            .expect("final activation source mutex")
+            .is_empty()
+    );
+
+    let edge_a = open_loop_adapter_edge_for(
+        &adapter_database_a,
+        "adapter:profile-a",
+        "shared-activation-a-edge",
+    );
+    let envelope_a = edge_a
+        .dispatch_envelope("dispatch-profile-a")
+        .expect("inspect profile A edge")
+        .expect("profile A dispatch");
+    assert_eq!(
+        envelope_a.capability_profile_ref.expect("profile A route"),
+        contract_ref("profile:a", 'a')
+    );
+    assert_eq!(
+        edge_a
+            .inspect()
+            .expect("inspect profile A counts")
+            .dispatch_count,
+        1
+    );
+    drop(edge_a);
+
+    let edge_b = open_loop_adapter_edge_for(
+        &adapter_database_b,
+        "adapter:profile-b",
+        "shared-activation-b-edge",
+    );
+    let envelope_b = edge_b
+        .dispatch_envelope("dispatch-profile-b")
+        .expect("inspect profile B edge")
+        .expect("profile B dispatch");
+    assert_eq!(
+        envelope_b.capability_profile_ref.expect("profile B route"),
+        contract_ref("profile:b", 'b')
+    );
+    assert_eq!(
+        edge_b
+            .inspect()
+            .expect("inspect profile B counts")
+            .dispatch_count,
+        1
     );
 }
 

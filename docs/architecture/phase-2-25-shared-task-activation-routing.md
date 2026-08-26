@@ -3,10 +3,10 @@
 ## Status
 
 The provider-neutral workflow resolver now explicitly distinguishes an
-activation that belongs to another reviewed route from a resolver failure. The local
-multi-Harness scheduling seam can therefore share one Task activation outbox
-without the first runner blocking later provider runners on a normal route
-mismatch.
+activation that belongs to another reviewed route from a resolver failure. The
+local multi-Harness scheduling seam can therefore share one Task activation
+source without the first runner blocking later provider runners on a normal
+route mismatch.
 
 This is a composition prerequisite. It does not admit DSH or Kimi and does not
 make provider availability a routing decision.
@@ -55,16 +55,25 @@ silently converted into a route miss.
 
 ## Verification evidence
 
-The integration regression
+The integration regressions
 `task_activation_runner_leaves_other_routes_pending_and_dispatches_its_match`
-supplies one foreign activation followed by one matching activation through a
-shared source. It proves that the runner:
+and
+`two_profile_bound_runners_share_activation_source_without_cross_ack_or_dispatch`
+use a deterministic shared source and separate encrypted Adapter Edge stores.
+Together they prove that the runner:
 
 - observes both handoffs;
 - starts, dispatches and acknowledges only the matching handoff;
 - leaves the foreign handoff pending;
 - continues its terminal-observation cycle without converting the foreign
-  route into a resolver failure.
+  route into a resolver failure;
+- lets two independently profile-bound runners consume their own handoffs in
+  sequence, with each Adapter Edge containing only its own exact profile
+  dispatch.
+
+These fixtures do not yet replace the source with a real durable TaskAuthority
+outbox, and they do not prove simultaneous process-level polling or crash
+recovery. Those are the next persistence and lifecycle evidence slice.
 
 Local Windows x64 verification:
 
@@ -72,11 +81,12 @@ Local Windows x64 verification:
 cargo fmt --all -- --check                                      passed
 cargo clippy -p egopulse-local-ide-control -p egopulse-agentosd --all-targets -- -D warnings passed
 cargo test -p egopulse-local-ide-control --lib                 7 passed
-cargo test -p egopulse-local-ide-control --test collaboration_control_g4_03 task_activation_runner_leaves_other_routes_pending_and_dispatches_its_match -- --exact --test-threads=1 1 passed
+cargo test -p egopulse-local-ide-control --test collaboration_control_g4_03 -- --test-threads=1 23 passed
 cargo test -p egopulse-agentosd --lib                          49 passed
 ```
 
-The next multi-model composition slice must prove two independently configured
-profile runners consume their own activations from the same durable source and
-cannot cross-ack, cross-dispatch or cross-write Adapter Edge state. Provider
+The next multi-model composition slice must replace the deterministic source
+with the real durable TaskAuthority activation outbox and prove concurrent
+polling, compare-and-ack behavior, restart replay and recovery without
+cross-ack, cross-dispatch or cross-write Adapter Edge state. Provider
 admission evidence remains a separate gate.
