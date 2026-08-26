@@ -144,13 +144,15 @@ they are not silently treated as terminal success. The codec is not itself a
 production dispatch implementation.
 
 The first candidate implementation is now `crates/kimi-adapter`. It reuses
-the existing process-supervision seam and performs only an ACP `initialize`
-and empty-session probe. A reachable Kimi process is reported as `Degraded`
-until a reviewed schema digest exists; an unauthenticated `session/new` is a
-controlled `AuthenticationRequired` disposition; dispatch, observations,
-approvals, cancellation and reconciliation all return `CapabilityMismatch`.
-The crate is therefore a probe vehicle, not a second production Harness and
-is not wired into the agent daemon bootstrap.
+the existing process-supervision seam. Its candidate-only driver performs
+ACP `initialize`/`session/new`, native `session/prompt`, ordered update
+consumption, provider-neutral permission routing, native cancellation and
+one-shot terminal-output extraction. A reachable Kimi process is reported as
+`Degraded` until a reviewed schema digest exists; an unauthenticated
+`session/new` remains a controlled `AuthenticationRequired` disposition.
+The crate is still a probe vehicle, not a second production Harness: no
+authenticated lifecycle, Artifact/return or recovery matrix has been
+attested, and it is not wired into the agent daemon bootstrap.
 
 ## G4-09 evidence recorded
 

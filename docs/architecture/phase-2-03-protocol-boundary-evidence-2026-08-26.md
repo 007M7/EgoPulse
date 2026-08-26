@@ -201,6 +201,15 @@ cancellation, artifact and restart-recovery rows remain unproven. Kimi stays
 candidate-only and receives no active capability profile until an explicitly
 authorized user profile can complete the remaining contract matrix.
 
+The candidate Rust driver has since implemented the execution seam around this
+boundary: it can retain a supervised ACP session, send a native prompt,
+consume ordered updates, pause for a native permission request, send a
+governed decision, cancel the native session and expose a one-shot terminal
+output candidate. This is implementation evidence only. The isolated live
+probe was intentionally not upgraded to a prompt because `session/new`
+reported `authentication_required`; therefore no authenticated Kimi
+dispatch, approval, Artifact/return or recovery claim is added here.
+
 ## Candidate decision at this point
 
 Kimi is the next candidate for an authenticated lifecycle probe. Its current
