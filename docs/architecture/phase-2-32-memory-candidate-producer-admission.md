@@ -9,8 +9,8 @@ API method.
 
 ## Decision
 
-`agentosd` exposes a narrow `MemoryCandidateProducerPort` and a composition-time
-`MemoryCandidateProducerRegistry`:
+`agentosd` exposes a narrow `MemoryCandidateProducerPort`, a composition-time
+`MemoryCandidateProducerRegistry`, and a single-producer capability handle:
 
 ```text
 reviewed composition
@@ -20,7 +20,10 @@ producer_id -> fixed principal_id + fixed principal_kind
         |                  (Agent | Model | Harness only)
         +--> fixed scope_ref
         v
-MemoryCandidateProducerPort::submit_candidate(command)
+bind_producer(producer_id) -> MemoryCandidateProducerHandle
+        |
+        v
+MemoryCandidateProducerHandle::submit_candidate(command)
         |
         v
 Rust Memory Authority (single writer, SQLCipher, idempotency, event receipt)
@@ -32,7 +35,8 @@ candidate only
         +--> GovernanceKernel/RecoveryCoordinator revoke
 ```
 
-The producer call has no principal argument. The principal is constructed once
+The producer handle has no producer-selection or principal argument. The
+principal is constructed once
 from the reviewed binding and cannot be selected by the model output, a worker
 payload or a Local API client. `producer_id` is an internal composition route,
 not a user-controlled authority claim. Each binding also fixes one `scope_ref`;
@@ -90,7 +94,9 @@ model cannot start writing candidates merely by sending a payload. The cost is
 intentional: it prevents identity impersonation and keeps audit records
 attributable.
 
-The registry is process-local rather than a cross-process broker. That keeps
+The registry is process-local rather than a cross-process broker. Provider
+runtimes should receive a single-producer handle, not the whole registry. That
+keeps
 the first release small and avoids introducing another durable queue, but it
 means a future provider runner must be hosted in the daemon composition (or
 use a separately authenticated owner port). The boundary is ready; the

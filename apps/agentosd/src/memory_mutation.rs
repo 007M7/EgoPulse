@@ -94,6 +94,24 @@ pub trait MemoryCandidateProducerPort: Send + Sync {
     ) -> Result<AuthorityMemoryMutationReceipt, MemoryCandidateProducerFailure>;
 }
 
+/// A capability narrowed to one already-admitted producer route. Provider
+/// runtimes should receive this handle during composition instead of keeping
+/// the whole registry, so a runtime cannot switch to another producer's
+/// identity by changing a request field.
+#[derive(Clone)]
+pub struct MemoryCandidateProducerHandle {
+    producer: Arc<dyn MemoryCandidateProducerPort>,
+}
+
+impl MemoryCandidateProducerHandle {
+    pub fn submit_candidate(
+        &self,
+        command: &SubmitMemoryCandidate,
+    ) -> Result<AuthorityMemoryMutationReceipt, MemoryCandidateProducerFailure> {
+        self.producer.submit_candidate(command)
+    }
+}
+
 struct ConfiguredMemoryCandidateProducer {
     authority: Arc<Mutex<MemoryAuthority>>,
     principal: AuthenticatedMemoryPrincipal,
@@ -191,6 +209,17 @@ impl MemoryCandidateProducerRegistry {
             .get(producer_id)
             .ok_or_else(|| MemoryCandidateProducerFailure::UnknownProducer(producer_id.to_owned()))?
             .submit_candidate(command)
+    }
+
+    pub fn bind_producer(
+        &self,
+        producer_id: &str,
+    ) -> Result<MemoryCandidateProducerHandle, MemoryCandidateProducerFailure> {
+        Ok(MemoryCandidateProducerHandle {
+            producer: Arc::clone(self.producers.get(producer_id).ok_or_else(|| {
+                MemoryCandidateProducerFailure::UnknownProducer(producer_id.to_owned())
+            })?),
+        })
     }
 }
 
@@ -582,6 +611,9 @@ mod tests {
             ("model:reasoner", "memory-model"),
             ("harness:codex", "memory-harness"),
         ] {
+            let producer = registry
+                .bind_producer(producer_id)
+                .expect("producer handle");
             let command = SubmitMemoryCandidate {
                 memory_id: memory_id.to_owned(),
                 content: format!("candidate from {producer_id}"),
@@ -589,16 +621,16 @@ mod tests {
                 scope_ref: "scope:founder".to_owned(),
                 idempotency_key: format!("idempotency:{producer_id}"),
             };
-            let receipt = registry
-                .submit_candidate(producer_id, &command)
+            let receipt = producer
+                .submit_candidate(&command)
                 .expect("candidate receipt");
             assert_eq!(
                 receipt.state,
                 egopulse_cognition_runtime::memory_authority::MemoryState::Candidate
             );
             assert_eq!(
-                registry
-                    .submit_candidate(producer_id, &command)
+                producer
+                    .submit_candidate(&command)
                     .expect("idempotent producer replay"),
                 receipt
             );
@@ -618,21 +650,13 @@ mod tests {
             MemoryCandidateProducerFailure::ScopeViolation
         );
 
-        assert_eq!(
-            registry
-                .submit_candidate(
-                    "unknown:producer",
-                    &SubmitMemoryCandidate {
-                        memory_id: "memory-unknown".to_owned(),
-                        content: "candidate".to_owned(),
-                        source_ref: "source:unknown".to_owned(),
-                        scope_ref: "scope:founder".to_owned(),
-                        idempotency_key: "idempotency:unknown".to_owned(),
-                    },
-                )
-                .expect_err("unknown producer must fail closed"),
-            MemoryCandidateProducerFailure::UnknownProducer("unknown:producer".to_owned())
-        );
+        match registry.bind_producer("unknown:producer") {
+            Err(error) => assert_eq!(
+                error,
+                MemoryCandidateProducerFailure::UnknownProducer("unknown:producer".to_owned())
+            ),
+            Ok(_) => panic!("unknown producer must fail closed"),
+        }
 
         drop(authority);
         let _ = std::fs::remove_file(database_path);
