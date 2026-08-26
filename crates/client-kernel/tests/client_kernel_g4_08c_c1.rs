@@ -160,7 +160,11 @@ fn embedded_profiles_are_digest_bound_and_fail_closed_by_default() {
             .owning_authority_revalidation_required
     );
     assert!(profiles.permission_codes().contains("local.task.read"));
-    assert!(profiles.permission_codes().contains("local.memory.retrieve"));
+    assert!(
+        profiles
+            .permission_codes()
+            .contains("local.memory.retrieve")
+    );
 }
 
 #[test]

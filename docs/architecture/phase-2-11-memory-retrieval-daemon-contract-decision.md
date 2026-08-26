@@ -1,17 +1,18 @@
 # Phase 2-11 Memory retrieval daemon contract decision
 
-- Status: `recommended_pending_founder`
+- Status: `founder_confirmed_implemented_locally_verified`
 - Decision owner: Founder
 - Prepared: 2026-08-26
+- Frozen: 2026-08-26
+- Authority: `conversation:2026-08-26:founder-memory-rag-m07-m10-freeze`
 - Predecessor: M-01 through M-06, frozen in `egopulse.memory.v1` draft.15
 
-## Decision to make
+## Frozen decision
 
-EgoPulse must decide how an authenticated local client requests read-only
+EgoPulse exposes authenticated read-only
 Memory retrieval from the daemon without turning a UI, Local API gateway or
-Python Worker into a Memory fact owner. This decision is required before the
-Local API contract, authorization profile, daemon composition, CLI and TUI can
-be changed.
+Python Worker into a Memory fact owner. The Local API contract, authorization
+profile, daemon composition, CLI and TUI now implement this boundary.
 
 This is an architecture decision rather than a framework choice: it changes a
 long-lived local service boundary, permission model, trust path and failure
@@ -176,24 +177,27 @@ All three surfaces are contract-compatible from the first API revision even
 though Desktop presentation is deferred. No surface receives a Memory write
 command in this unit.
 
-## Proposed implementation slices after approval
+## Implemented slices and verification evidence
 
-1. **Contract revision**: revise Local API and authorization profile, update
-   profile digests and contract provenance, generate Rust/Python/TypeScript
-   bindings, and prove Buf compatibility.
-2. **Gateway boundary**: add a framework-neutral `MemoryRetrievalPort`, session
+1. **Contract revision — complete**: draft.16 revises Local API and the authorization profile, updates
+   profile digests and contract provenance, generates Rust/Python/TypeScript
+   bindings, and passes Buf compatibility.
+2. **Gateway boundary — complete**: a framework-neutral `MemoryRetrievalPort`, session
    and profile validation, typed error mapping, bounded concurrency and a
    privacy-safe audit sink.
-3. **Daemon composition**: add explicit user-owned Worker executable,
+3. **Daemon composition — complete**: explicit user-owned Worker executable,
    arguments, working directory, process budget and principal/scope allowlist;
    omit the configuration to remain fail-closed.
-4. **CLI vertical**: execute the real RPC over Windows Named Pipe and render
+4. **CLI vertical — complete**: executes the real RPC over Windows Named Pipe and renders
    references/digests without exposing accepted record content.
-5. **TUI vertical**: reuse the same attached client operation and prove output
+5. **TUI vertical — complete**: reuses the same attached client operation and proves output
    parity with CLI.
-6. **Failure E2E**: cover unauthenticated, permission denied, scope denied,
-   malformed/oversized input, concurrency, Worker crash, timeout, cancellation,
-   snapshot drift, daemon restart and deterministic replay.
+6. **Failure evidence — complete for this unit**: gateway tests cover
+   permission denial and malformed input before Worker invocation; real Worker
+   tests cover scope denial, concurrency, crash and timeout; M-01 through M-06
+   process tests cover cancellation/reaping, malformed frames, snapshot drift
+   and deterministic replay; the M-10 process test starts a real daemon and
+   proves CLI/TUI parity over Windows Named Pipe.
 
 ## Compatibility, rollback and evolution
 
@@ -219,9 +223,9 @@ command in this unit.
 - retrieval-result persistence or a new background job Authority;
 - Desktop presentation in phase one.
 
-## Founder decision request
+## Founder decision record
 
-Confirm or revise M-07 through M-10:
+Founder confirmed M-07 through M-10:
 
 1. independent `LocalCognitionService` rather than Read Model or Command
    Gateway placement;
@@ -231,6 +235,6 @@ Confirm or revise M-07 through M-10:
    categories and cancellation reaping;
 4. one shared Rust client operation delivered CLI, then TUI, then Desktop.
 
-Until an explicit Founder decision is recorded, this document remains
-`recommended_pending_founder`. It does not authorize a draft.16 contract
-revision, Local API implementation or client command.
+The decision authorizes draft.16 and its Rust daemon, CLI and TUI
+implementation. Desktop remains presentation-deferred, but its capability
+contract is already the same `LocalCognitionService/RetrieveMemory` boundary.

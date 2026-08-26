@@ -24,8 +24,8 @@ use egopulse_domain_contracts::v01::egopulse::{
     localapi::v1::{
         AwaitProjectionRequest, DecideHarnessApprovalRequest, ExecuteFounderVerdictRequest,
         ExecuteTaskCommandRequest, GetEvidenceGraphRequest, HarnessApprovalView, LocalApiErrorCode,
-        ProjectionAwaitToken, ProjectionHealth, SourceRevision, TaskView,
-        await_projection_response, get_evidence_graph_response,
+        ProjectionAwaitToken, ProjectionHealth, RetrieveMemoryRequest, SourceRevision, TaskView,
+        await_projection_response, get_evidence_graph_response, retrieve_memory_response,
     },
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
@@ -178,6 +178,19 @@ enum TuiCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Retrieve references from one authorized accepted Memory scope.
+    MemoryRetrieve {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long, default_value_t = 8)]
+        max_results: u32,
+        #[arg(long, default_value_t = 0.0)]
+        min_score: f64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,16 +225,18 @@ enum CommandKind {
     VerdictIssue,
     VerdictRevoke,
     EvidenceGet,
+    MemoryRetrieve,
 }
 
 impl CommandKind {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::TaskCreate,
         Self::ApprovalDecide,
         Self::Await,
         Self::VerdictIssue,
         Self::VerdictRevoke,
         Self::EvidenceGet,
+        Self::MemoryRetrieve,
     ];
 
     const fn label(self) -> &'static str {
@@ -232,6 +247,7 @@ impl CommandKind {
             Self::VerdictIssue => "Issue Founder Verdict",
             Self::VerdictRevoke => "Revoke Founder Verdict",
             Self::EvidenceGet => "Read Evidence Graph",
+            Self::MemoryRetrieve => "Retrieve accepted Memory",
         }
     }
 }
@@ -330,6 +346,12 @@ impl CommandForm {
             CommandKind::EvidenceGet => vec![
                 FormField::required("task-id"),
                 FormField::required("artifact-set-id"),
+            ],
+            CommandKind::MemoryRetrieve => vec![
+                FormField::required("query"),
+                FormField::required("scope-ref"),
+                FormField::required("max-results").with_value("8"),
+                FormField::required("min-score").with_value("0.0"),
             ],
         };
         Self {
@@ -456,6 +478,17 @@ impl CommandForm {
                 artifact_set_id: next(&mut values, "artifact-set-id")?,
                 json: false,
             }),
+            CommandKind::MemoryRetrieve => Ok(TuiCommand::MemoryRetrieve {
+                query: next(&mut values, "query")?,
+                scope: next(&mut values, "scope-ref")?,
+                max_results: next(&mut values, "max-results")?
+                    .parse()
+                    .map_err(|_| "max-results must be an integer".to_owned())?,
+                min_score: next(&mut values, "min-score")?
+                    .parse()
+                    .map_err(|_| "min-score must be a number".to_owned())?,
+                json: false,
+            }),
         }
     }
 }
@@ -541,11 +574,18 @@ enum CommandOutput {
     Quiet,
 }
 
-async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> {
-    run_command_with_output(instance, command, CommandOutput::Console).await
+enum CommandResult {
+    Completed,
+    ReadView(String),
 }
 
-async fn run_command_quiet(instance: &str, command: TuiCommand) -> Result<(), String> {
+async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> {
+    run_command_with_output(instance, command, CommandOutput::Console)
+        .await
+        .map(|_| ())
+}
+
+async fn run_command_quiet(instance: &str, command: TuiCommand) -> Result<CommandResult, String> {
     run_command_with_output(instance, command, CommandOutput::Quiet).await
 }
 
@@ -553,7 +593,7 @@ async fn run_command_with_output(
     instance: &str,
     command: TuiCommand,
     output: CommandOutput,
-) -> Result<(), String> {
+) -> Result<CommandResult, String> {
     match command {
         TuiCommand::TaskCreate {
             work_type,
@@ -657,7 +697,7 @@ async fn run_command_with_output(
                     );
                 }
             }
-            Ok(())
+            Ok(CommandResult::Completed)
         }
         TuiCommand::ApprovalDecide {
             approval_request_id,
@@ -758,7 +798,7 @@ async fn run_command_with_output(
                     );
                 }
             }
-            Ok(())
+            Ok(CommandResult::Completed)
         }
         TuiCommand::Await {
             token_json,
@@ -802,7 +842,7 @@ async fn run_command_with_output(
                             );
                         }
                     }
-                    Ok(())
+                    Ok(CommandResult::Completed)
                 }
                 Some(await_projection_response::Outcome::ApprovalView(view)) => {
                     let payload = json!({
@@ -822,7 +862,7 @@ async fn run_command_with_output(
                             );
                         }
                     }
-                    Ok(())
+                    Ok(CommandResult::Completed)
                 }
                 Some(await_projection_response::Outcome::Error(error)) => {
                     Err(local_error_message(error))
@@ -951,7 +991,7 @@ async fn run_command_with_output(
                     );
                 }
             }
-            Ok(())
+            Ok(CommandResult::Completed)
         }
         TuiCommand::VerdictRevoke {
             founder_verdict_id,
@@ -1026,7 +1066,103 @@ async fn run_command_with_output(
                     );
                 }
             }
-            Ok(())
+            Ok(CommandResult::Completed)
+        }
+        TuiCommand::MemoryRetrieve {
+            query,
+            scope,
+            max_results,
+            min_score,
+            json,
+        } => {
+            let attached = AttachedClient::open(instance).await?;
+            attached.require_rpc("LocalCognitionService/RetrieveMemory", "memory.retrieve")?;
+            let correlation_id = Uuid::now_v7().to_string();
+            let response = attached
+                .0
+                .connection
+                .cognition_service()
+                .retrieve_memory(RetrieveMemoryRequest {
+                    client: Some(attached.metadata_with_correlation(correlation_id.clone())?),
+                    query,
+                    scope_ref: scope.clone(),
+                    max_results,
+                    min_score,
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .into_inner();
+            let result = match response.outcome {
+                Some(retrieve_memory_response::Outcome::Result(result)) => result,
+                Some(retrieve_memory_response::Outcome::Error(error)) => {
+                    return Err(local_error_message(error));
+                }
+                None => return Err("Memory retrieval outcome missing".to_owned()),
+            };
+            let candidates = result
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    json!({
+                        "memoryId": candidate.memory_id,
+                        "sourceRef": candidate.source_ref,
+                        "contentSha256": candidate.content_sha256,
+                        "score": candidate.score,
+                        "matchedTerms": candidate.matched_terms,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let payload = json!({
+                "schemaVersion": "egopulse.tui-result/v0.1",
+                "ok": true,
+                "operation": "memory.retrieve",
+                "data": {
+                    "scopeRef": scope,
+                    "algorithmId": result.algorithm_id,
+                    "querySha256": result.query_sha256,
+                    "snapshotSha256": result.snapshot_sha256,
+                    "evidenceRef": result.evidence_ref,
+                    "resultCount": candidates.len(),
+                    "candidates": candidates,
+                },
+                "correlationId": correlation_id,
+            });
+            let view = if json {
+                serde_json::to_string(&payload).unwrap()
+            } else {
+                let mut lines = vec![format!(
+                    "Memory retrieval: scope={} results={} algorithm={}",
+                    payload["data"]["scopeRef"].as_str().unwrap_or(""),
+                    payload["data"]["resultCount"].as_u64().unwrap_or(0),
+                    payload["data"]["algorithmId"].as_str().unwrap_or("")
+                )];
+                lines.push(format!(
+                    "Snapshot: {}",
+                    payload["data"]["snapshotSha256"].as_str().unwrap_or("")
+                ));
+                lines.push(format!(
+                    "Evidence: {}",
+                    payload["data"]["evidenceRef"].as_str().unwrap_or("")
+                ));
+                for candidate in payload["data"]["candidates"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    lines.push(format!(
+                        "- {} score={} source={} digest={}",
+                        candidate["memoryId"].as_str().unwrap_or(""),
+                        candidate["score"].as_f64().unwrap_or(0.0),
+                        candidate["sourceRef"].as_str().unwrap_or(""),
+                        candidate["contentSha256"].as_str().unwrap_or("")
+                    ));
+                }
+                lines.join("\n")
+            };
+            if output == CommandOutput::Console {
+                println!("{view}");
+            }
+            Ok(CommandResult::ReadView(view))
         }
         TuiCommand::EvidenceGet {
             task_id,
@@ -1091,7 +1227,7 @@ async fn run_command_with_output(
                     );
                 }
             }
-            Ok(())
+            Ok(CommandResult::Completed)
         }
     }
 }
@@ -1104,6 +1240,7 @@ fn command_kind(command: &TuiCommand) -> &'static str {
         TuiCommand::VerdictIssue { .. } => "verdict.issue",
         TuiCommand::VerdictRevoke { .. } => "verdict.revoke",
         TuiCommand::EvidenceGet { .. } => "evidence.get",
+        TuiCommand::MemoryRetrieve { .. } => "memory.retrieve",
     }
 }
 
@@ -1699,9 +1836,12 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
                 app.message = format!("Executing {}…", command_kind(&command));
                 let result = run_command_quiet(&app.instance, command).await;
                 app.message = match result {
-                    Ok(()) => "Governed command committed; projection will refresh automatically"
-                        .to_owned(),
-                    Err(error) => format!("Governed command rejected: {error}"),
+                    Ok(CommandResult::Completed) => {
+                        "Governed command committed; projection will refresh automatically"
+                            .to_owned()
+                    }
+                    Ok(CommandResult::ReadView(view)) => view,
+                    Err(error) => format!("Operation rejected: {error}"),
                 };
                 app.refresh().await;
                 next_refresh = tokio::time::Instant::now() + app.refresh_interval;
@@ -1830,6 +1970,33 @@ mod tests {
                 artifact_set_id,
                 json: false,
             } if task_id == "task-1" && artifact_set_id == "artifact-set-1"
+        ));
+    }
+
+    #[test]
+    fn memory_form_maps_to_shared_cognition_operation() {
+        let mut form = CommandForm::new(CommandKind::MemoryRetrieve);
+        for (field, value) in form.fields.iter_mut().zip([
+            "governed memory".to_owned(),
+            "scope:founder".to_owned(),
+            "6".to_owned(),
+            "0.25".to_owned(),
+        ]) {
+            field.value = value;
+        }
+        let command = form.into_command().expect("valid Memory retrieval form");
+        assert_eq!(command_kind(&command), "memory.retrieve");
+        assert!(matches!(
+            command,
+            TuiCommand::MemoryRetrieve {
+                query,
+                scope,
+                max_results: 6,
+                min_score,
+                json: false,
+            } if query == "governed memory"
+                && scope == "scope:founder"
+                && (min_score - 0.25).abs() < f64::EPSILON
         ));
     }
 }

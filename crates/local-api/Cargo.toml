@@ -11,6 +11,7 @@ egopulse-domain-contracts.workspace = true
 egopulse-local-ipc-platform.workspace = true
 egopulse-local-read-model.workspace = true
 futures-util.workspace = true
+hex.workspace = true
 hyper-util.workspace = true
 hmac.workspace = true
 prost-types.workspace = true

@@ -37,9 +37,9 @@ use zeroize::Zeroizing;
 
 const SCHEMA_PROFILE_ID: &str = "egopulse/local-read-model-store/v1";
 const VIEW_CONTRACT_ID: &str = "egopulse.localapi.v1/HarnessApprovalView";
-const VIEW_CONTRACT_VERSION: &str = "0.1.0-draft.14";
+const VIEW_CONTRACT_VERSION: &str = "0.1.0-draft.16";
 const VIEW_CONTRACT_SHA256: &str =
-    "725f8cf77816f9a768a76410ac21dd7b8cffc4820ea109769395bf32ae582ccb";
+    "28d05e2533ea7650d8fedbc44abfa21d33c2845f8d105650e3287676e789e7bb";
 const DECIDE_RULE_REF: &str = "egopulse/local-read-model/approval-actionable/v1";
 
 const SCHEMA_V1: &str = r#"

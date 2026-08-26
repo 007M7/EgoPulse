@@ -114,19 +114,19 @@
     {
       "id": "M-07..M-10",
       "name": "Memory Retrieval Daemon, Authorization, CLI and TUI Boundary",
-      "status": "founder_confirmed_implementation_in_progress",
+      "status": "founder_confirmed_locally_verified",
       "founderDecisionRequired": true
     }
   ],
   "validation": {
     "localCandidateValidator": "scripts/validate-candidate.js",
     "localCandidateStatus": "passed_181_domain_fixtures_plus_1_foundation_fixture",
-    "bufLint": "passed_buf_1.72.0_draft15_with_two_documented_rpc_naming_exceptions",
-    "bufBuild": "passed_draft15_proto_descriptor_sha256_3500c3a10961173a43e4424598f481ef274f9fabdfd3c49a9ce140b2e0100378",
+    "bufLint": "passed_buf_1.72.0_draft16_with_two_documented_rpc_naming_exceptions",
+    "bufBuild": "passed_draft16_proto_descriptor",
     "bufBreaking": "passed_no_new_wire_breaks_against_draft13_and_exact_founder_authorized_two_field_breaks_against_draft11",
-    "protocCompile": "passed_libprotoc_35.1_draft15_eleven_v01_modules_plus_foundation",
-    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_draft15_eleven_v01_modules_plus_foundation",
-    "faultConformance": "passed_80_real_process_aborts_bundled_sqlcipher_encrypted_header_integrity_ok_including_policy_decision_boundary_plus_memory_rag_real_worker_roundtrip_crash_timeout_snapshot_drift",
+    "protocCompile": "passed_libprotoc_35.1_draft16_eleven_v01_modules_plus_foundation",
+    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_draft16_eleven_v01_modules_plus_foundation",
+    "faultConformance": "passed_existing_real_process_and_sqlcipher_suite_plus_memory_retrieval_permission_scope_concurrency_crash_timeout_and_real_daemon_cli_tui_parity",
     "qualityBudgetProfile": "passed_33_d03_rules_exactly_once_with_gate3_design_gate6_verification_binding",
     "clientKernelProfile": "passed_versioned_surface_neutral_rust_shared_kernel_profile_with_exact_digest_reference",
     "authorizationCapabilityProfile": "passed_exact_permission_rpc_command_oneof_catalog_with_fail_closed_defaults"
@@ -398,7 +398,7 @@
     },
     {
       "path": "fixtures/localapi/v1/invalid-client-kernel-profile-digest-mismatch.json",
-      "sha256": "c24c52daccf1ab4342507a5648d0e83df41fb3f86d9a97b6160020612b5fa9be"
+      "sha256": "d3bcd018efd5d2b4a0d78198c1d94f9672a6741351f6a2359d1f40307a02d2b6"
     },
     {
       "path": "fixtures/localapi/v1/invalid-client-supplied-authority-ref.json",
@@ -438,7 +438,7 @@
     },
     {
       "path": "fixtures/localapi/v1/invalid-unknown-permission-code.json",
-      "sha256": "b82b1fea78addea54572eaebfa0f59bcbe102d1f9b03ae931b9e70d736e73a55"
+      "sha256": "834eb0ab6eb1187076ab93535813f0b147d57d68b2ad16e1609a407be2cceb1b"
     },
     {
       "path": "fixtures/localapi/v1/recovery-disconnect-resume-within-retention.json",
@@ -526,7 +526,7 @@
     },
     {
       "path": "fixtures/localapi/v1/valid-open-desktop-session.json",
-      "sha256": "e6c523acee53404d948f4cceab9609b63463a9ea0bf2de22a9361d4643257f9e"
+      "sha256": "174649e6d6e174a4c1295df14424dfb8aaac08a4e7dca5df6bb01f949b9590d9"
     },
     {
       "path": "fixtures/localapi/v1/valid-task-command-authority-result.json",
@@ -914,11 +914,11 @@
     },
     {
       "path": "IMPLEMENTATION-SSOT.json",
-      "sha256": "1aeb05dc53e846b218a30dea045ad1b363bd189200268702b6f22fcffe67906c"
+      "sha256": "ac2199effc73c2ab859892a454cf03df2c9822aa0d2bdb081796de2ce073227c"
     },
     {
       "path": "IMPLEMENTATION-SSOT.md",
-      "sha256": "7d5b1e5b65f60d768b9dc05216f3cfe90c011c3a33847b76a7db45c0bff6492f"
+      "sha256": "ec3b65a56255a6caffa2846e24b2152e2bccbf6b3b2c36347205231ef4d105c2"
     },
     {
       "path": "json-schema/foundation-health.schema.json",

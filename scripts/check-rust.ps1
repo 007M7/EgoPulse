@@ -36,6 +36,11 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $cargo build -p egopulse-cli --bin egopulse --locked
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# Real-process E2E tests launch both user surfaces from target/debug. Rebuild
+# both against the same negotiated contract digest before starting agentosd.
+& $cargo build -p egopulse-tui --bin egopulse-tui --locked
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 & $cargo test --workspace --exclude egopulse-agentosd --locked
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

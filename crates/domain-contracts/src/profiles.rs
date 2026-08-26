@@ -12,7 +12,7 @@ use thiserror::Error;
 pub const API_CONTRACT_ID: &str = "egopulse.localapi.v1";
 pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.16";
 pub const API_CONTRACT_DIGEST_SHA256: &str =
-    "725f8cf77816f9a768a76410ac21dd7b8cffc4820ea109769395bf32ae582ccb";
+    "28d05e2533ea7650d8fedbc44abfa21d33c2845f8d105650e3287676e789e7bb";
 pub const CLIENT_KERNEL_CONTRACT_ID: &str = "egopulse.client-kernel.v1";
 pub const CLIENT_KERNEL_CONTRACT_VERSION: &str = "0.1.0";
 pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =

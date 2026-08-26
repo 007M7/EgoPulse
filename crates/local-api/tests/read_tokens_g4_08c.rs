@@ -19,9 +19,9 @@ use egopulse_local_api::{
     session::{AuthenticatedSession, SessionClock},
 };
 
-const API_DIGEST: &str = "725f8cf77816f9a768a76410ac21dd7b8cffc4820ea109769395bf32ae582ccb";
-const KERNEL_DIGEST: &str = "367ad4210c499d7501acd060f5b544255521cefefca86b8d69a2cea022166c11";
-const POLICY_DIGEST: &str = "5ae8cff8552910c780cdde9e29f1a5a3a95e40803ebcbb1de26544de5f6ac29f";
+const API_DIGEST: &str = "28d05e2533ea7650d8fedbc44abfa21d33c2845f8d105650e3287676e789e7bb";
+const KERNEL_DIGEST: &str = "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9";
+const POLICY_DIGEST: &str = "c9faacd839b431263be7b24dbe1527a990399f4edfa22a41208635a5e416f8de";
 
 #[derive(Clone)]
 struct MutableClock(Arc<Mutex<SystemTime>>);
@@ -60,7 +60,7 @@ fn session(surface: ClientSurface) -> AuthenticatedSession {
             "local.task.read".to_owned(),
         ]),
         authorization_policy_ref: contract_ref("egopulse.authorization.v1", "0.1.0", POLICY_DIGEST),
-        negotiated_contract_ref: contract_ref("egopulse.localapi.v1", "0.1.0-draft.14", API_DIGEST),
+        negotiated_contract_ref: contract_ref("egopulse.localapi.v1", "0.1.0-draft.16", API_DIGEST),
         client_kernel_contract_ref: contract_ref(
             "egopulse.client-kernel.v1",
             "0.1.0",

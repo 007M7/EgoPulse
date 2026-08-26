@@ -19,7 +19,8 @@ use egopulse_domain_contracts::v01::egopulse::{
 use egopulse_domain_contracts::{
     profiles::ContractProfiles,
     v01::egopulse::localapi::v1::{
-        ProjectionPosition, local_command_gateway_service_server::LocalCommandGatewayServiceServer,
+        ProjectionPosition, local_cognition_service_server::LocalCognitionServiceServer,
+        local_command_gateway_service_server::LocalCommandGatewayServiceServer,
         local_read_model_service_server::LocalReadModelServiceServer,
         local_session_service_server::LocalSessionServiceServer,
     },
@@ -29,6 +30,10 @@ use egopulse_harness_adapter::{
     SystemAdapterClock,
 };
 use egopulse_local_api::{
+    cognition_gateway::{
+        CognitionGatewayApplication, LocalCognitionEndpoint, MemoryRetrievalAuditSink,
+        MemoryRetrievalPort,
+    },
     command_gateway::{
         CommandGatewayApplication, CommandPortFailure, CommandPortResult, CommandPrincipal,
         LocalCommandGatewayEndpoint, PolicyCommandPort, TaskCommandPort, VerdictCommandPort,
@@ -57,6 +62,7 @@ use tonic::transport::Server;
 
 mod artifact;
 mod bootstrap;
+mod memory_retrieval;
 mod owners;
 mod policy;
 mod projections;
@@ -72,6 +78,10 @@ pub use artifact::{
 pub use bootstrap::{
     DenyVerificationReferences, LocalUserPolicyBootstrapConfig, ProductionBootstrapConfig,
     ProductionBootstrapError,
+};
+pub use memory_retrieval::{
+    ConfiguredMemoryRetrievalPort, FailClosedMemoryRetrievalPort, MemoryRetrievalCompositionConfig,
+    MemoryRetrievalConfigurationError, TracingMemoryRetrievalAuditSink,
 };
 pub use owners::{
     AuthorityCommandPorts, AuthorityPrincipalResolver, DenyAllAuthorityPrincipalResolver,
@@ -264,7 +274,8 @@ pub struct DaemonProviders {
     pub harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
     pub verification_worker: Option<Arc<dyn VerificationWorker>>,
     pub task_activation_source: Option<Arc<dyn TaskActivationSource>>,
-    pub memory_authority: Option<Arc<Mutex<MemoryAuthority>>>,
+    pub memory_retrieval_port: Arc<dyn MemoryRetrievalPort>,
+    pub memory_retrieval_audit: Arc<dyn MemoryRetrievalAuditSink>,
 }
 
 /// Explicit workflow configuration boundary for the first vertical. It does
@@ -371,7 +382,8 @@ impl DaemonProviders {
             harness_dispatch_runner: None,
             verification_worker: None,
             task_activation_source: None,
-            memory_authority: None,
+            memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
+            memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
         }
     }
 
@@ -427,7 +439,8 @@ impl DaemonProviders {
             harness_dispatch_runner: None,
             verification_worker: None,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
-            memory_authority: None,
+            memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
+            memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
         }
     }
 
@@ -459,7 +472,8 @@ impl DaemonProviders {
             harness_dispatch_runner: None,
             verification_worker: None,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
-            memory_authority: None,
+            memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
+            memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
         }
     }
 
@@ -475,10 +489,16 @@ impl DaemonProviders {
         self
     }
 
-    #[must_use]
-    pub fn with_memory_authority(mut self, authority: Arc<Mutex<MemoryAuthority>>) -> Self {
-        self.memory_authority = Some(authority);
-        self
+    pub fn with_memory_retrieval(
+        mut self,
+        authority: Arc<Mutex<MemoryAuthority>>,
+        config: MemoryRetrievalCompositionConfig,
+    ) -> Result<Self, DaemonCompositionError> {
+        self.memory_retrieval_port = Arc::new(
+            ConfiguredMemoryRetrievalPort::new(authority, config)
+                .map_err(DaemonCompositionError::MemoryRetrieval)?,
+        );
+        Ok(self)
     }
 
     /// Installs the first production Harness composition. Task Authority,
@@ -590,6 +610,8 @@ pub enum DaemonCompositionError {
     Collaboration(#[source] CollaborationControlError),
     #[error("Harness Adapter edge could not be opened")]
     AdapterEdge(#[source] AdapterEdgeError),
+    #[error("Memory retrieval composition is invalid")]
+    MemoryRetrieval(#[source] MemoryRetrievalConfigurationError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -612,12 +634,12 @@ pub struct DaemonComposition {
     session: LocalSessionEndpoint,
     read_model: LocalReadModelEndpoint,
     command: LocalCommandGatewayEndpoint,
+    cognition: LocalCognitionEndpoint,
     projection_pump: Option<ProjectionPump>,
     harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
     harness_dispatch_interval: Duration,
     verification_worker: Option<Arc<dyn VerificationWorker>>,
     verification_interval: Duration,
-    memory_authority: Option<Arc<Mutex<MemoryAuthority>>>,
 }
 
 impl DaemonComposition {
@@ -678,20 +700,26 @@ impl DaemonComposition {
         ));
         let read_model = LocalReadModelEndpoint::new(read_application);
         let command_application = Arc::new(CommandGatewayApplication::new(
-            registry,
-            profiles,
+            Arc::clone(&registry),
+            Arc::clone(&profiles),
             token_codec,
             providers.task_port,
             providers.policy_port,
             providers.verdict_port,
         ));
         let command = LocalCommandGatewayEndpoint::new(command_application);
+        let cognition_application = Arc::new(CognitionGatewayApplication::new(
+            registry,
+            profiles,
+            providers.memory_retrieval_port,
+            providers.memory_retrieval_audit,
+        ));
+        let cognition = LocalCognitionEndpoint::new(cognition_application);
         let projection_pump = providers
             .projection_source
             .map(|source| ProjectionPump::new(Arc::clone(&model), notifier, source));
         let harness_dispatch_runner = providers.harness_dispatch_runner;
         let verification_worker = providers.verification_worker;
-        let memory_authority = providers.memory_authority;
 
         Ok(Self {
             address,
@@ -699,12 +727,12 @@ impl DaemonComposition {
             session,
             read_model,
             command,
+            cognition,
             projection_pump,
             harness_dispatch_runner,
             harness_dispatch_interval: config.harness_dispatch_interval,
             verification_worker,
             verification_interval: config.verification_interval,
-            memory_authority,
         })
     }
 
@@ -722,12 +750,12 @@ impl DaemonComposition {
             session,
             read_model,
             command,
+            cognition,
             projection_pump,
             harness_dispatch_runner,
             harness_dispatch_interval,
             verification_worker,
             verification_interval,
-            memory_authority: _memory_authority,
             ..
         } = self;
         let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
@@ -743,6 +771,7 @@ impl DaemonComposition {
                 .add_service(LocalSessionServiceServer::new(session))
                 .add_service(LocalReadModelServiceServer::new(read_model))
                 .add_service(LocalCommandGatewayServiceServer::new(command))
+                .add_service(LocalCognitionServiceServer::new(cognition))
                 .serve_with_incoming_shutdown(listener.into_incoming(), server_shutdown),
         );
         let mut background = Box::pin(run_background_workers(

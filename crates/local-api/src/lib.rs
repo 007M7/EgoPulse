@@ -2,6 +2,7 @@
 
 use egopulse_domain_contracts::FoundationHealth;
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
+    local_cognition_service_client::LocalCognitionServiceClient,
     local_command_gateway_service_client::LocalCommandGatewayServiceClient,
     local_read_model_service_client::LocalReadModelServiceClient,
     local_session_service_client::LocalSessionServiceClient,
@@ -13,6 +14,7 @@ use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
+pub mod cognition_gateway;
 pub mod command_gateway;
 pub mod read_gateway;
 pub mod read_gateway_policy;
@@ -57,6 +59,11 @@ impl LocalApiConnection {
     #[must_use]
     pub fn command_gateway_service(&self) -> LocalCommandGatewayServiceClient<Channel> {
         LocalCommandGatewayServiceClient::new(self.channel.clone())
+    }
+
+    #[must_use]
+    pub fn cognition_service(&self) -> LocalCognitionServiceClient<Channel> {
+        LocalCognitionServiceClient::new(self.channel.clone())
     }
 }
 

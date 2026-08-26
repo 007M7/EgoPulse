@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -52,9 +52,9 @@ use crate::{
     ConfiguredFounderVerdictResolver, ConfiguredFounderVerdictResolverConfig,
     ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ConfiguredVerificationWorker,
     DaemonCompositionError, DaemonProviders, FounderVerdictConfigurationError,
-    LocalUserPolicyResolver, LocalUserPolicyResolverConfig, SharedAuthorityCompositionInputs,
-    TaskAuthorityCommitReceiptSource, VerificationAuthorityArtifactSource,
-    VerificationProjectionSource, VerificationWorkerConfig,
+    LocalUserPolicyResolver, LocalUserPolicyResolverConfig, MemoryRetrievalCompositionConfig,
+    SharedAuthorityCompositionInputs, TaskAuthorityCommitReceiptSource,
+    VerificationAuthorityArtifactSource, VerificationProjectionSource, VerificationWorkerConfig,
 };
 
 /// Explicit scalar configuration for the local-user Policy resolver. The
@@ -72,6 +72,7 @@ pub struct LocalUserPolicyBootstrapConfig {
 pub struct ProductionBootstrapConfig {
     pub task: TaskAuthorityConfig,
     pub memory: MemoryAuthorityConfig,
+    pub memory_retrieval: Option<MemoryRetrievalCompositionConfig>,
     pub task_guard: ConfiguredTaskCreationGuardConfig,
     pub artifact: ArtifactAuthorityConfig,
     pub artifact_guard: ConfiguredArtifactAdmissionGuardConfig,
@@ -224,7 +225,9 @@ impl ProductionBootstrapConfig {
             .map_err(ProductionBootstrapError::VerificationWorker)?;
             providers = providers.with_verification_worker(Arc::new(worker));
         }
-        providers = providers.with_memory_authority(memory);
+        if let Some(memory_retrieval) = self.memory_retrieval {
+            providers = providers.with_memory_retrieval(memory, memory_retrieval)?;
+        }
         providers = providers.with_codex_harness(self.codex)?;
         Ok(providers)
     }
@@ -242,6 +245,8 @@ struct UserOwnedBootstrapFile {
     verification: Option<VerificationFile>,
     #[serde(default)]
     verification_worker: Option<VerificationWorkerFile>,
+    #[serde(default)]
+    memory_retrieval: Option<MemoryRetrievalFile>,
     policy: PolicyFile,
     founder: FounderFile,
     codex: CodexFile,
@@ -350,6 +355,25 @@ struct VerificationWorkerFile {
     model_call_receipt_artifact_ids: Vec<String>,
     checker_timeout_ms: u64,
     checker_output_limit: u64,
+}
+
+/// Explicit user-owned execution and principal-to-scope policy for the
+/// read-only Memory retrieval Worker. Absence leaves the Local Cognition
+/// service registered but fail-closed.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryRetrievalFile {
+    worker_executable: String,
+    #[serde(default)]
+    worker_arguments: Vec<String>,
+    working_directory: String,
+    #[serde(default)]
+    inherited_environment: Vec<String>,
+    #[serde(default)]
+    environment_overrides: BTreeMap<String, String>,
+    timeout_ms: u64,
+    output_limit_bytes: u64,
+    principal_scope_allowlist: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -625,6 +649,10 @@ impl UserOwnedBootstrapFile {
             .verification_worker
             .map(VerificationWorkerFile::into_typed)
             .transpose()?;
+        let memory_retrieval = self
+            .memory_retrieval
+            .map(MemoryRetrievalFile::into_typed)
+            .transpose()?;
         if verification_worker.is_some() && verification_references.is_none() {
             return Err(ProductionBootstrapError::InvalidConfiguration(
                 "verification_worker requires verification criteria",
@@ -666,6 +694,7 @@ impl UserOwnedBootstrapFile {
                 store_epoch: memory_store.store_epoch,
                 key: SqlCipherKey::new(memory_store.key),
             },
+            memory_retrieval,
             task_guard,
             artifact: ArtifactAuthorityConfig {
                 database_path: artifact_store.database_path,
@@ -877,6 +906,40 @@ impl VerificationWorkerFile {
             checker_timeout: Duration::from_millis(self.checker_timeout_ms),
             checker_output_limit: self.checker_output_limit,
         })
+    }
+}
+
+impl MemoryRetrievalFile {
+    fn into_typed(self) -> Result<MemoryRetrievalCompositionConfig, ProductionBootstrapError> {
+        let principal_scope_allowlist = self
+            .principal_scope_allowlist
+            .into_iter()
+            .map(|(principal, scopes)| {
+                let principal = required(principal, "memory_retrieval.principal")?;
+                let scopes = non_empty_set(scopes, "memory_retrieval.scope_refs")?;
+                Ok((principal, scopes))
+            })
+            .collect::<Result<BTreeMap<_, _>, ProductionBootstrapError>>()?;
+        let config = MemoryRetrievalCompositionConfig {
+            worker_executable: PathBuf::from(required(
+                self.worker_executable,
+                "memory_retrieval.worker_executable",
+            )?),
+            worker_arguments: self.worker_arguments,
+            working_directory: PathBuf::from(required(
+                self.working_directory,
+                "memory_retrieval.working_directory",
+            )?),
+            inherited_environment: set(self.inherited_environment),
+            environment_overrides: self.environment_overrides,
+            timeout: Duration::from_millis(self.timeout_ms),
+            output_limit_bytes: self.output_limit_bytes,
+            principal_scope_allowlist,
+        };
+        config
+            .validate()
+            .map_err(|_| ProductionBootstrapError::InvalidConfiguration("memory_retrieval"))?;
+        Ok(config)
     }
 }
 

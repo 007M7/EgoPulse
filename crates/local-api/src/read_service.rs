@@ -193,7 +193,10 @@ fn local_error_status(
         | LocalApiErrorCode::ProjectionResetRequired
         | LocalApiErrorCode::ProjectionHeld
         | LocalApiErrorCode::DeadlineExceeded => tonic::Code::DeadlineExceeded,
-        LocalApiErrorCode::AuthorityUnavailable => tonic::Code::Unavailable,
+        LocalApiErrorCode::AuthorityUnavailable | LocalApiErrorCode::CognitionWorkerUnavailable => {
+            tonic::Code::Unavailable
+        }
+        LocalApiErrorCode::ResourceExhausted => tonic::Code::ResourceExhausted,
         LocalApiErrorCode::CursorInvalid
         | LocalApiErrorCode::CursorExpired
         | LocalApiErrorCode::IntegrityFailure

@@ -22,9 +22,10 @@ use egopulse_domain_contracts::v01::egopulse::{
         GetHarnessApprovalViewRequest, GetProjectionStatusRequest, GetTaskViewRequest,
         HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest, ListTaskViewsRequest,
         LocalApiError, LocalApiErrorCode, ProjectionAwaitToken, ProjectionHealth,
-        ProjectionMetadata, SourceRevision, TaskView, TaskViewStreamFrame,
+        ProjectionMetadata, RetrieveMemoryRequest, SourceRevision, TaskView, TaskViewStreamFrame,
         WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, await_projection_response,
         get_evidence_graph_response, get_harness_approval_view_response, get_task_view_response,
+        retrieve_memory_response,
     },
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, PolicyDecisionErrorCode,
@@ -89,6 +90,28 @@ enum Command {
     Verdict {
         #[command(subcommand)]
         command: VerdictCommandCli,
+    },
+    /// Retrieve references from one authorized accepted Memory scope.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MemoryCommand {
+    /// Run bounded read-only retrieval; this never writes or governs Memory.
+    Retrieve {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long, default_value_t = 8)]
+        max_results: u32,
+        #[arg(long, default_value_t = 0.0)]
+        min_score: f64,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -378,6 +401,13 @@ impl CliFailure {
                 | LocalApiErrorCode::CursorExpired
                 | LocalApiErrorCode::CursorInvalid,
             ) => (7, "projection"),
+            Some(
+                LocalApiErrorCode::AuthorityUnavailable
+                | LocalApiErrorCode::CognitionWorkerUnavailable
+                | LocalApiErrorCode::DeadlineExceeded
+                | LocalApiErrorCode::ResourceExhausted,
+            ) => (3, "unavailable"),
+            Some(LocalApiErrorCode::InvalidArgument) => (2, "invalid_request"),
             _ => (70, "internal"),
         };
         Self {
@@ -553,6 +583,7 @@ async fn main() -> ExitCode {
         Command::Evidence { command } => evidence(command).await,
         Command::Approval { command } => approval(command).await,
         Command::Verdict { command } => verdict(command).await,
+        Command::Memory { command } => memory(command).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -590,6 +621,9 @@ fn command_json(command: &Command) -> bool {
         }
         | Command::Verdict {
             command: VerdictCommandCli::Issue { json, .. } | VerdictCommandCli::Revoke { json, .. },
+        }
+        | Command::Memory {
+            command: MemoryCommand::Retrieve { json, .. },
         } => *json,
     }
 }
@@ -647,6 +681,113 @@ async fn attach(operation: &'static str) -> Result<AttachedClient, CliFailure> {
         error.operation = operation;
         error
     })
+}
+
+async fn memory(command: MemoryCommand) -> Result<(), CliFailure> {
+    match command {
+        MemoryCommand::Retrieve {
+            query,
+            scope,
+            max_results,
+            min_score,
+            json,
+        } => memory_retrieve(query, scope, max_results, min_score, json).await,
+    }
+}
+
+async fn memory_retrieve(
+    query: String,
+    scope_ref: String,
+    max_results: u32,
+    min_score: f64,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    const OPERATION: &str = "memory.retrieve";
+    let attached = attach(OPERATION).await?;
+    attached.require_rpc("LocalCognitionService/RetrieveMemory", OPERATION)?;
+    let metadata = attached.metadata(None)?;
+    let response = attached
+        .0
+        .connection
+        .cognition_service()
+        .retrieve_memory(RetrieveMemoryRequest {
+            client: Some(metadata),
+            query,
+            scope_ref: scope_ref.clone(),
+            max_results,
+            min_score,
+        })
+        .await
+        .map_err(|error| {
+            CliFailure::daemon_unavailable(error.to_string()).for_operation(OPERATION)
+        })?
+        .into_inner();
+    let result = match response.outcome {
+        Some(retrieve_memory_response::Outcome::Result(result)) => result,
+        Some(retrieve_memory_response::Outcome::Error(error)) => {
+            return Err(CliFailure::from_local_api_error(error).for_operation(OPERATION));
+        }
+        None => {
+            return Err(
+                CliFailure::protocol("Memory retrieval outcome missing").for_operation(OPERATION)
+            );
+        }
+    };
+    let candidates = result
+        .candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "memoryId": candidate.memory_id,
+                "sourceRef": candidate.source_ref,
+                "contentSha256": candidate.content_sha256,
+                "score": candidate.score,
+                "matchedTerms": candidate.matched_terms,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": OPERATION,
+        "data": {
+            "scopeRef": scope_ref,
+            "algorithmId": result.algorithm_id,
+            "querySha256": result.query_sha256,
+            "snapshotSha256": result.snapshot_sha256,
+            "evidenceRef": result.evidence_ref,
+            "resultCount": candidates.len(),
+            "candidates": candidates,
+        },
+        "projection": serde_json::Value::Null,
+        "correlationId": Uuid::now_v7().to_string(),
+    });
+    if json_output {
+        println!("{}", serde_json::to_string(&payload).unwrap());
+    } else {
+        println!(
+            "Memory retrieval: scope={} results={} algorithm={}\nSnapshot: {}\nEvidence: {}",
+            payload["data"]["scopeRef"].as_str().unwrap_or(""),
+            payload["data"]["resultCount"].as_u64().unwrap_or(0),
+            payload["data"]["algorithmId"].as_str().unwrap_or(""),
+            payload["data"]["snapshotSha256"].as_str().unwrap_or(""),
+            payload["data"]["evidenceRef"].as_str().unwrap_or("")
+        );
+        for candidate in payload["data"]["candidates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            println!(
+                "- {} score={} source={} digest={}",
+                candidate["memoryId"].as_str().unwrap_or(""),
+                candidate["score"].as_f64().unwrap_or(0.0),
+                candidate["sourceRef"].as_str().unwrap_or(""),
+                candidate["contentSha256"].as_str().unwrap_or("")
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn status(json: bool) -> Result<(), CliFailure> {

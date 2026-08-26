@@ -48,11 +48,15 @@
     "principal_id": "local-user:replace-me",
     "permission_codes": [
       "local.task.read",
-      "local.task.write",
+      "local.task.create",
+      "local.task.cancellation.request",
       "local.approval.read",
       "local.approval.decide",
       "local.founder-verdict.issue",
-      "local.evidence.read"
+      "local.evidence.read",
+      "local.projection.status.read",
+      "local.projection.await",
+      "local.memory.retrieve"
     ],
     "authorization_policy_ref": {
       "contract_id": "replace-authorization-policy",
@@ -122,6 +126,20 @@
         "sha256": "2424242424242424242424242424242424242424242424242424242424242424"
       }
     ]
+  },
+  "memory_retrieval": {
+    "worker_executable": "C:\\replace\\EgoPulse\\workers\\memory-rag\\.venv\\Scripts\\python.exe",
+    "worker_arguments": ["-m", "egopulse_memory_rag"],
+    "working_directory": "C:\\replace\\EgoPulse",
+    "inherited_environment": ["SystemRoot", "WINDIR"],
+    "environment_overrides": {
+      "PYTHONPATH": "C:\\replace\\EgoPulse\\workers\\memory-rag\\src;C:\\replace\\EgoPulse\\workers\\contract-bindings\\src"
+    },
+    "timeout_ms": 15000,
+    "output_limit_bytes": 16777216,
+    "principal_scope_allowlist": {
+      "local-user:replace-me": ["scope:founder"]
+    }
   },
   "verification": {
     "criteria": [

@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -12,12 +13,19 @@ use std::{
 
 use egopulse_agentosd::{
     AuthorityCompositionInputs, AuthorityPrincipalResolver, DaemonComposition, DaemonConfig,
-    DaemonProviders, OwnerProjectionSource, PendingOwnerProjection, ProjectionSourceFailure,
+    DaemonProviders, MemoryRetrievalCompositionConfig, OwnerProjectionSource,
+    PendingOwnerProjection, ProjectionSourceFailure,
 };
 use egopulse_client_kernel::{ClientKernel, api_contract_ref, authorization_contract_ref};
-use egopulse_cognition_runtime::task_authority::{
-    CreationAuthorization, CreationGuardRejection, PrincipalKind as TaskPrincipalKind,
-    SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCreationGuard,
+use egopulse_cognition_runtime::{
+    memory_authority::{
+        AuthenticatedMemoryPrincipal, GovernMemory, MemoryAuthority, MemoryAuthorityConfig,
+        MemoryPrincipalKind, SubmitMemoryCandidate,
+    },
+    task_authority::{
+        CreationAuthorization, CreationGuardRejection, PrincipalKind as TaskPrincipalKind,
+        SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCreationGuard,
+    },
 };
 use egopulse_domain_contracts::v01::egopulse::{
     collaboration::v1::{
@@ -500,7 +508,7 @@ where
     )
     .expect("fixture verdict authority should open");
 
-    DaemonProviders::from_authority_inputs(AuthorityCompositionInputs {
+    let providers = DaemonProviders::from_authority_inputs(AuthorityCompositionInputs {
         task,
         policy,
         verdict,
@@ -509,7 +517,75 @@ where
         session_clock: Arc::new(egopulse_local_api::session::SystemSessionClock),
         session_audit: Arc::new(NoopSessionAuditSink),
         additional_projection_sources,
+    });
+    let mut memory = MemoryAuthority::open(MemoryAuthorityConfig {
+        database_path: root.join("memory-authority.db"),
+        store_epoch: "c5-memory-epoch".to_owned(),
+        key: SqlCipherKey::new([0x14; 32]),
     })
+    .expect("fixture Memory Authority should open");
+    let founder = AuthenticatedMemoryPrincipal {
+        kind: MemoryPrincipalKind::Founder,
+        principal_id: "founder:c5-fixture".to_owned(),
+        authenticated: true,
+    };
+    memory
+        .submit_candidate(
+            &SubmitMemoryCandidate {
+                memory_id: "memory-c5-accepted".to_owned(),
+                content: "EgoPulse governed Memory is Founder accepted.".to_owned(),
+                source_ref: "source:c5-memory".to_owned(),
+                scope_ref: "scope:founder".to_owned(),
+                idempotency_key: "c5-memory-submit".to_owned(),
+            },
+            &founder,
+        )
+        .expect("fixture Memory candidate should submit or replay");
+    memory
+        .accept(
+            &GovernMemory {
+                memory_id: "memory-c5-accepted".to_owned(),
+                expected_revision: 1,
+                evidence_ref: "evidence:c5-founder-acceptance".to_owned(),
+                idempotency_key: "c5-memory-accept".to_owned(),
+            },
+            &founder,
+        )
+        .expect("fixture Memory candidate should be accepted or replayed");
+    providers
+        .with_memory_retrieval(
+            Arc::new(std::sync::Mutex::new(memory)),
+            memory_worker_config(),
+        )
+        .expect("fixture Memory retrieval should configure")
+}
+
+fn memory_worker_config() -> MemoryRetrievalCompositionConfig {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .to_owned();
+    MemoryRetrievalCompositionConfig {
+        worker_executable: root.join("workers/memory-rag/.venv/Scripts/python.exe"),
+        worker_arguments: vec!["-m".to_owned(), "egopulse_memory_rag".to_owned()],
+        working_directory: root.clone(),
+        inherited_environment: BTreeSet::from(["SystemRoot".to_owned(), "WINDIR".to_owned()]),
+        environment_overrides: BTreeMap::from([(
+            "PYTHONPATH".to_owned(),
+            format!(
+                "{};{}",
+                root.join("workers/memory-rag/src").display(),
+                root.join("workers/contract-bindings/src").display()
+            ),
+        )]),
+        timeout: Duration::from_secs(15),
+        output_limit_bytes: 16 * 1024 * 1024,
+        principal_scope_allowlist: BTreeMap::from([(
+            "os-user:c5-fixture".to_owned(),
+            BTreeSet::from(["scope:founder".to_owned()]),
+        )]),
+    }
 }
 
 async fn connect_session(
@@ -689,6 +765,90 @@ async fn c5_00_daemon_fixture_child() {
         .serve(shutdown)
         .await
         .expect("fixture daemon serve");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m10_real_cli_and_tui_share_governed_memory_retrieval_over_local_ipc() {
+    let root = std::env::temp_dir().join(format!("egopulse-m10-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create M-10 fixture root");
+    let instance = format!("m10-{}", Uuid::now_v7());
+    let mut child = spawn_fixture(&root, &instance).await;
+    wait_for_cli_status(&instance).await;
+
+    let cli = run_cli(
+        &instance,
+        &[
+            "memory",
+            "retrieve",
+            "--query",
+            "governed Founder Memory",
+            "--scope",
+            "scope:founder",
+            "--max-results",
+            "4",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        cli.status.success(),
+        "Memory CLI stdout={} stderr={}",
+        String::from_utf8_lossy(&cli.stdout),
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_json: serde_json::Value =
+        serde_json::from_slice(&cli.stdout).expect("Memory CLI JSON envelope");
+    assert_eq!(cli_json["operation"], "memory.retrieve");
+    assert_eq!(cli_json["data"]["scopeRef"], "scope:founder");
+    assert_eq!(cli_json["data"]["resultCount"], 1);
+    assert_eq!(
+        cli_json["data"]["candidates"][0]["memoryId"],
+        "memory-c5-accepted"
+    );
+    assert!(cli_json["data"]["candidates"][0].get("content").is_none());
+
+    let tui = run_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "memory-retrieve",
+            "--query",
+            "governed Founder Memory",
+            "--scope",
+            "scope:founder",
+            "--max-results",
+            "4",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        tui.status.success(),
+        "Memory TUI stdout={} stderr={}",
+        String::from_utf8_lossy(&tui.stdout),
+        String::from_utf8_lossy(&tui.stderr)
+    );
+    let tui_json: serde_json::Value =
+        serde_json::from_slice(&tui.stdout).expect("Memory TUI JSON envelope");
+    assert_eq!(tui_json["operation"], "memory.retrieve");
+    assert_eq!(
+        tui_json["data"]["snapshotSha256"],
+        cli_json["data"]["snapshotSha256"]
+    );
+    assert_eq!(
+        tui_json["data"]["candidates"],
+        cli_json["data"]["candidates"]
+    );
+
+    drop(child.stdin.take());
+    let status = child.wait().await.expect("M-10 fixture child exit");
+    assert!(status.success(), "M-10 fixture child failed: {status}");
+    fs::remove_dir_all(&root).expect("remove M-10 fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
