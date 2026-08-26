@@ -6,10 +6,11 @@ use egopulse_domain_contracts::{
         common::v1::CommandMetadata,
         localapi::v1::{
             ClientRequestMetadata, DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
-            ExecuteFounderVerdictRequest, ExecuteFounderVerdictResponse, ExecuteTaskCommandRequest,
+            ExecuteFounderVerdictRequest, ExecuteFounderVerdictResponse,
+            ExecuteMemoryMutationRequest, ExecuteMemoryMutationResponse, ExecuteTaskCommandRequest,
             ExecuteTaskCommandResponse, HarnessApprovalAuthorityResult, LocalApiError,
-            LocalApiErrorCode, ProjectionAwaitToken, SourceRevision,
-            local_command_gateway_service_server::LocalCommandGatewayService,
+            LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken,
+            SourceRevision, local_command_gateway_service_server::LocalCommandGatewayService,
         },
         policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
         task::v1::{TaskCommand, TaskCommandResult, task_command},
@@ -28,6 +29,7 @@ use crate::{
 const RPC_EXECUTE_TASK: &str = "LocalCommandGatewayService/ExecuteTaskCommand";
 const RPC_DECIDE_APPROVAL: &str = "LocalCommandGatewayService/DecideHarnessApproval";
 const RPC_EXECUTE_VERDICT: &str = "LocalCommandGatewayService/ExecuteFounderVerdict";
+const RPC_EXECUTE_MEMORY: &str = "LocalCommandGatewayService/ExecuteMemoryMutation";
 
 /// The principal boundary passed from the governed Local API session into an
 /// owning Authority adapter. The gateway never constructs an Authority
@@ -83,6 +85,29 @@ pub trait VerdictCommandPort: Send + Sync + 'static {
     ) -> Result<CommandPortResult<VerdictCommandResult>, CommandPortFailure>;
 }
 
+/// The gateway passes an explicit Memory command to its owning Authority
+/// adapter. It never chooses an Authority principal or opens a store.
+pub trait MemoryMutationPort: Send + Sync + 'static {
+    fn execute(
+        &self,
+        command: &MemoryMutationCommand,
+        principal: &CommandPrincipal,
+    ) -> Result<MemoryMutationReceipt, CommandPortFailure>;
+}
+
+#[derive(Default)]
+pub struct FailClosedMemoryMutationPort;
+
+impl MemoryMutationPort for FailClosedMemoryMutationPort {
+    fn execute(
+        &self,
+        _command: &MemoryMutationCommand,
+        _principal: &CommandPrincipal,
+    ) -> Result<MemoryMutationReceipt, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
+}
+
 pub struct CommandGatewayApplication {
     registry: Arc<SessionRegistry>,
     profiles: Arc<ContractProfiles>,
@@ -90,6 +115,7 @@ pub struct CommandGatewayApplication {
     task_port: Arc<dyn TaskCommandPort>,
     policy_port: Arc<dyn PolicyCommandPort>,
     verdict_port: Arc<dyn VerdictCommandPort>,
+    memory_port: Arc<dyn MemoryMutationPort>,
 }
 
 impl CommandGatewayApplication {
@@ -102,6 +128,27 @@ impl CommandGatewayApplication {
         policy_port: Arc<dyn PolicyCommandPort>,
         verdict_port: Arc<dyn VerdictCommandPort>,
     ) -> Self {
+        Self::new_with_memory(
+            registry,
+            profiles,
+            token_codec,
+            task_port,
+            policy_port,
+            verdict_port,
+            Arc::new(FailClosedMemoryMutationPort),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_memory(
+        registry: Arc<SessionRegistry>,
+        profiles: Arc<ContractProfiles>,
+        token_codec: Arc<ReadTokenCodec>,
+        task_port: Arc<dyn TaskCommandPort>,
+        policy_port: Arc<dyn PolicyCommandPort>,
+        verdict_port: Arc<dyn VerdictCommandPort>,
+        memory_port: Arc<dyn MemoryMutationPort>,
+    ) -> Self {
         Self {
             registry,
             profiles,
@@ -109,6 +156,7 @@ impl CommandGatewayApplication {
             task_port,
             policy_port,
             verdict_port,
+            memory_port,
         }
     }
 
@@ -270,6 +318,57 @@ impl CommandGatewayApplication {
             Err(error) => ExecuteFounderVerdictResponse {
                 authority_result: None,
                 await_token: None,
+                gateway_error: Some(port_error(error, correlation_id)),
+            },
+        }
+    }
+
+    pub fn execute_memory_mutation(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: ExecuteMemoryMutationRequest,
+    ) -> ExecuteMemoryMutationResponse {
+        let ExecuteMemoryMutationRequest { client, command } = request;
+        let correlation_id = memory_command_correlation_id(client.as_ref(), command.as_ref());
+        let context = match self.authorize(
+            peer,
+            client.as_ref(),
+            RPC_EXECUTE_MEMORY,
+            memory_oneof(command.as_ref()),
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return ExecuteMemoryMutationResponse {
+                    authority_result: None,
+                    gateway_error: Some((*error).with_correlation(correlation_id)),
+                };
+            }
+        };
+        let Some(command) = command else {
+            return ExecuteMemoryMutationResponse {
+                authority_result: None,
+                gateway_error: Some(invalid_error("command_missing", correlation_id)),
+            };
+        };
+        if memory_metadata(&command).is_none() {
+            return ExecuteMemoryMutationResponse {
+                authority_result: None,
+                gateway_error: Some(invalid_error("command_metadata_missing", correlation_id)),
+            };
+        }
+        if memory_metadata(&command) != client.as_ref() {
+            return ExecuteMemoryMutationResponse {
+                authority_result: None,
+                gateway_error: Some(invalid_error("command_metadata_mismatch", correlation_id)),
+            };
+        }
+        match self.memory_port.execute(&command, &context.principal) {
+            Ok(result) => ExecuteMemoryMutationResponse {
+                authority_result: Some(result),
+                gateway_error: None,
+            },
+            Err(error) => ExecuteMemoryMutationResponse {
+                authority_result: None,
                 gateway_error: Some(port_error(error, correlation_id)),
             },
         }
@@ -441,6 +540,17 @@ impl LocalCommandGatewayService for LocalCommandGatewayEndpoint {
             request.into_inner(),
         )))
     }
+
+    async fn execute_memory_mutation(
+        &self,
+        request: Request<ExecuteMemoryMutationRequest>,
+    ) -> Result<Response<ExecuteMemoryMutationResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(self.application.execute_memory_mutation(
+            peer.as_ref(),
+            request.into_inner(),
+        )))
+    }
 }
 
 fn validate_client_metadata(metadata: &ClientRequestMetadata) -> Result<(), ()> {
@@ -586,6 +696,37 @@ fn verdict_metadata(command: &VerdictCommand) -> Option<&CommandMetadata> {
         verdict_command::Command::RevokeFounderVerdict(value) => value.metadata.as_ref(),
         verdict_command::Command::ExpireFounderVerdict(value) => value.metadata.as_ref(),
     }
+}
+
+fn memory_oneof(command: Option<&MemoryMutationCommand>) -> Option<&'static str> {
+    Some(match command?.command.as_ref()? {
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::memory_mutation_command::Command::SubmitMemoryCandidate(_) => "submit_memory_candidate",
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::memory_mutation_command::Command::AcceptMemory(_) => "accept_memory",
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::memory_mutation_command::Command::RevokeMemory(_) => "revoke_memory",
+    })
+}
+
+fn memory_metadata(command: &MemoryMutationCommand) -> Option<&ClientRequestMetadata> {
+    match command.command.as_ref()? {
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::memory_mutation_command::Command::SubmitMemoryCandidate(value) => value.metadata.as_ref(),
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::memory_mutation_command::Command::AcceptMemory(value) => value.metadata.as_ref(),
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::memory_mutation_command::Command::RevokeMemory(value) => value.metadata.as_ref(),
+    }
+}
+
+fn memory_command_correlation_id(
+    client: Option<&ClientRequestMetadata>,
+    command: Option<&MemoryMutationCommand>,
+) -> String {
+    client
+        .and_then(|value| value.correlation_id.clone())
+        .or_else(|| {
+            command
+                .and_then(memory_metadata)
+                .and_then(|value| value.correlation_id.clone())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Uuid::now_v7().to_string())
 }
 
 fn sanitize_policy_result(result: &PolicyDecisionCommandResult) -> HarnessApprovalAuthorityResult {
@@ -788,5 +929,30 @@ mod tests {
         };
         let error = validate_command_metadata(Some(&client), Some(&metadata)).unwrap_err();
         assert_eq!(error.safe_fingerprint, "correlation_id_mismatch");
+    }
+
+    #[test]
+    fn memory_command_metadata_must_be_the_same_client_binding() {
+        let client = ClientRequestMetadata {
+            request_id: "request-1".to_owned(),
+            client_instance_id: "cli-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            correlation_id: Some("correlation-1".to_owned()),
+            ..Default::default()
+        };
+        let command = MemoryMutationCommand {
+            command: Some(
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::memory_mutation_command::Command::SubmitMemoryCandidate(
+                    egopulse_domain_contracts::v01::egopulse::localapi::v1::SubmitMemoryCandidateCommand {
+                        metadata: Some(ClientRequestMetadata {
+                            correlation_id: Some("other-correlation".to_owned()),
+                            ..client.clone()
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            ),
+        };
+        assert_ne!(memory_metadata(&command), Some(&client));
     }
 }

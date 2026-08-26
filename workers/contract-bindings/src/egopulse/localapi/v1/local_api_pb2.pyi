@@ -629,6 +629,92 @@ class ExecuteFounderVerdictResponse(_message.Message):
     gateway_error: LocalApiError
     def __init__(self, authority_result: _Optional[_Union[_verdict_pb2.VerdictCommandResult, _Mapping]] = ..., await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ..., gateway_error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
 
+class SubmitMemoryCandidateCommand(_message.Message):
+    __slots__ = ("metadata", "memory_id", "content", "source_ref", "scope_ref", "idempotency_key")
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_ID_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_REF_FIELD_NUMBER: _ClassVar[int]
+    SCOPE_REF_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    metadata: ClientRequestMetadata
+    memory_id: str
+    content: str
+    source_ref: str
+    scope_ref: str
+    idempotency_key: str
+    def __init__(self, metadata: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., memory_id: _Optional[str] = ..., content: _Optional[str] = ..., source_ref: _Optional[str] = ..., scope_ref: _Optional[str] = ..., idempotency_key: _Optional[str] = ...) -> None: ...
+
+class AcceptMemoryCommand(_message.Message):
+    __slots__ = ("metadata", "memory_id", "expected_revision", "evidence_ref", "idempotency_key")
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_REVISION_FIELD_NUMBER: _ClassVar[int]
+    EVIDENCE_REF_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    metadata: ClientRequestMetadata
+    memory_id: str
+    expected_revision: int
+    evidence_ref: str
+    idempotency_key: str
+    def __init__(self, metadata: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., memory_id: _Optional[str] = ..., expected_revision: _Optional[int] = ..., evidence_ref: _Optional[str] = ..., idempotency_key: _Optional[str] = ...) -> None: ...
+
+class RevokeMemoryCommand(_message.Message):
+    __slots__ = ("metadata", "memory_id", "expected_revision", "evidence_ref", "idempotency_key")
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_REVISION_FIELD_NUMBER: _ClassVar[int]
+    EVIDENCE_REF_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    metadata: ClientRequestMetadata
+    memory_id: str
+    expected_revision: int
+    evidence_ref: str
+    idempotency_key: str
+    def __init__(self, metadata: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., memory_id: _Optional[str] = ..., expected_revision: _Optional[int] = ..., evidence_ref: _Optional[str] = ..., idempotency_key: _Optional[str] = ...) -> None: ...
+
+class MemoryMutationCommand(_message.Message):
+    __slots__ = ("submit_memory_candidate", "accept_memory", "revoke_memory")
+    SUBMIT_MEMORY_CANDIDATE_FIELD_NUMBER: _ClassVar[int]
+    ACCEPT_MEMORY_FIELD_NUMBER: _ClassVar[int]
+    REVOKE_MEMORY_FIELD_NUMBER: _ClassVar[int]
+    submit_memory_candidate: SubmitMemoryCandidateCommand
+    accept_memory: AcceptMemoryCommand
+    revoke_memory: RevokeMemoryCommand
+    def __init__(self, submit_memory_candidate: _Optional[_Union[SubmitMemoryCandidateCommand, _Mapping]] = ..., accept_memory: _Optional[_Union[AcceptMemoryCommand, _Mapping]] = ..., revoke_memory: _Optional[_Union[RevokeMemoryCommand, _Mapping]] = ...) -> None: ...
+
+class MemoryMutationReceipt(_message.Message):
+    __slots__ = ("memory_id", "revision", "state", "event_id", "request_digest_sha256", "acknowledged_after_durability_barrier")
+    MEMORY_ID_FIELD_NUMBER: _ClassVar[int]
+    REVISION_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    EVENT_ID_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    ACKNOWLEDGED_AFTER_DURABILITY_BARRIER_FIELD_NUMBER: _ClassVar[int]
+    memory_id: str
+    revision: int
+    state: str
+    event_id: str
+    request_digest_sha256: str
+    acknowledged_after_durability_barrier: bool
+    def __init__(self, memory_id: _Optional[str] = ..., revision: _Optional[int] = ..., state: _Optional[str] = ..., event_id: _Optional[str] = ..., request_digest_sha256: _Optional[str] = ..., acknowledged_after_durability_barrier: _Optional[bool] = ...) -> None: ...
+
+class ExecuteMemoryMutationRequest(_message.Message):
+    __slots__ = ("client", "command")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    command: MemoryMutationCommand
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., command: _Optional[_Union[MemoryMutationCommand, _Mapping]] = ...) -> None: ...
+
+class ExecuteMemoryMutationResponse(_message.Message):
+    __slots__ = ("authority_result", "gateway_error")
+    AUTHORITY_RESULT_FIELD_NUMBER: _ClassVar[int]
+    GATEWAY_ERROR_FIELD_NUMBER: _ClassVar[int]
+    authority_result: MemoryMutationReceipt
+    gateway_error: LocalApiError
+    def __init__(self, authority_result: _Optional[_Union[MemoryMutationReceipt, _Mapping]] = ..., gateway_error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
 class AwaitProjectionRequest(_message.Message):
     __slots__ = ("client", "await_token", "timeout_milliseconds")
     CLIENT_FIELD_NUMBER: _ClassVar[int]

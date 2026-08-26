@@ -12,7 +12,7 @@ use thiserror::Error;
 pub const API_CONTRACT_ID: &str = "egopulse.localapi.v1";
 pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.16";
 pub const API_CONTRACT_DIGEST_SHA256: &str =
-    "f9a10bf989f8aed99ac420ceaa30eaae20ee465b45acf0bcd5c27e914d806408";
+    "ddeff9d0f3bcb860e44cddc25233cadb0e21768bbf8193589eb1f8f7aa719b07";
 pub const CLIENT_KERNEL_CONTRACT_ID: &str = "egopulse.client-kernel.v1";
 pub const CLIENT_KERNEL_CONTRACT_VERSION: &str = "0.1.0";
 pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =
@@ -20,7 +20,7 @@ pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =
 pub const AUTHORIZATION_CONTRACT_ID: &str = "egopulse.authorization.v1";
 pub const AUTHORIZATION_CONTRACT_VERSION: &str = "0.1.0";
 pub const AUTHORIZATION_PROFILE_DIGEST_SHA256: &str =
-    "0aeecf723799d915e3a3362911e349a1c3ccdd62a013c1973d9d4d99ebb9bbe0";
+    "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1";
 
 const CLIENT_KERNEL_PROFILE_BYTES: &[u8] =
     include_bytes!("../../../contracts/profiles/client-kernel/v1/v01-default.json");

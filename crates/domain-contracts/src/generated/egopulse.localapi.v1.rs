@@ -553,6 +553,96 @@ pub struct ExecuteFounderVerdictResponse {
     #[prost(message, optional, tag = "3")]
     pub gateway_error: ::core::option::Option<LocalApiError>,
 }
+/// Memory writes cross the Local API only as explicit, owner-checked commands.
+/// A candidate submission never makes a record authoritative; accept and revoke
+/// remain separate Founder-governed operations in the Memory Authority.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SubmitMemoryCandidateCommand {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub memory_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub content: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub source_ref: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub scope_ref: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AcceptMemoryCommand {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub memory_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub expected_revision: u64,
+    #[prost(string, tag = "4")]
+    pub evidence_ref: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevokeMemoryCommand {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub memory_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub expected_revision: u64,
+    #[prost(string, tag = "4")]
+    pub evidence_ref: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MemoryMutationCommand {
+    #[prost(oneof = "memory_mutation_command::Command", tags = "1, 2, 3")]
+    pub command: ::core::option::Option<memory_mutation_command::Command>,
+}
+/// Nested message and enum types in `MemoryMutationCommand`.
+pub mod memory_mutation_command {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Command {
+        #[prost(message, tag = "1")]
+        SubmitMemoryCandidate(super::SubmitMemoryCandidateCommand),
+        #[prost(message, tag = "2")]
+        AcceptMemory(super::AcceptMemoryCommand),
+        #[prost(message, tag = "3")]
+        RevokeMemory(super::RevokeMemoryCommand),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct MemoryMutationReceipt {
+    #[prost(string, tag = "1")]
+    pub memory_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub revision: u64,
+    #[prost(string, tag = "3")]
+    pub state: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub event_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub request_digest_sha256: ::prost::alloc::string::String,
+    #[prost(bool, tag = "6")]
+    pub acknowledged_after_durability_barrier: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecuteMemoryMutationRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(message, optional, tag = "2")]
+    pub command: ::core::option::Option<MemoryMutationCommand>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecuteMemoryMutationResponse {
+    #[prost(message, optional, tag = "1")]
+    pub authority_result: ::core::option::Option<MemoryMutationReceipt>,
+    #[prost(message, optional, tag = "2")]
+    pub gateway_error: ::core::option::Option<LocalApiError>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AwaitProjectionRequest {
     #[prost(message, optional, tag = "1")]
@@ -2399,6 +2489,35 @@ pub mod local_command_gateway_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn execute_memory_mutation(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ExecuteMemoryMutationRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExecuteMemoryMutationResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalCommandGatewayService/ExecuteMemoryMutation",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalCommandGatewayService",
+                        "ExecuteMemoryMutation",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -2433,6 +2552,13 @@ pub mod local_command_gateway_service_server {
             request: tonic::Request<super::ExecuteFounderVerdictRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ExecuteFounderVerdictResponse>,
+            tonic::Status,
+        >;
+        async fn execute_memory_mutation(
+            &self,
+            request: tonic::Request<super::ExecuteMemoryMutationRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExecuteMemoryMutationResponse>,
             tonic::Status,
         >;
     }
@@ -2651,6 +2777,57 @@ pub mod local_command_gateway_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ExecuteFounderVerdictSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/egopulse.localapi.v1.LocalCommandGatewayService/ExecuteMemoryMutation" => {
+                    #[allow(non_camel_case_types)]
+                    struct ExecuteMemoryMutationSvc<T: LocalCommandGatewayService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: LocalCommandGatewayService,
+                    > tonic::server::UnaryService<super::ExecuteMemoryMutationRequest>
+                    for ExecuteMemoryMutationSvc<T> {
+                        type Response = super::ExecuteMemoryMutationResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ExecuteMemoryMutationRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalCommandGatewayService>::execute_memory_mutation(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ExecuteMemoryMutationSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

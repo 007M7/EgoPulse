@@ -23,10 +23,12 @@ use egopulse_domain_contracts::v01::egopulse::{
     harness::v1::ApprovalDecision,
     harness::v1::ApprovalRequestLifecycleKind,
     localapi::v1::{
-        AwaitProjectionRequest, DecideHarnessApprovalRequest, ExecuteFounderVerdictRequest,
-        ExecuteTaskCommandRequest, GetEvidenceGraphRequest, HarnessApprovalView, LocalApiErrorCode,
-        ProjectionAwaitToken, ProjectionHealth, RetrieveMemoryRequest, SourceRevision, TaskView,
-        await_projection_response, get_evidence_graph_response, retrieve_memory_response,
+        AcceptMemoryCommand, AwaitProjectionRequest, DecideHarnessApprovalRequest,
+        ExecuteFounderVerdictRequest, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
+        GetEvidenceGraphRequest, HarnessApprovalView, LocalApiErrorCode, MemoryMutationCommand,
+        MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth, RetrieveMemoryRequest,
+        SourceRevision, SubmitMemoryCandidateCommand, TaskView, await_projection_response,
+        get_evidence_graph_response, memory_mutation_command, retrieve_memory_response,
     },
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
@@ -206,6 +208,45 @@ enum TuiCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Submit a candidate; the record remains non-authoritative until accepted.
+    MemoryCandidate {
+        #[arg(long)]
+        memory_id: String,
+        #[arg(long)]
+        content: String,
+        #[arg(long)]
+        source_ref: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Founder-govern an existing candidate into accepted state.
+    MemoryAccept {
+        memory_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        evidence_ref: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Founder-govern a memory into terminal revoked state.
+    MemoryRevoke {
+        memory_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        evidence_ref: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,10 +283,13 @@ enum CommandKind {
     VerdictRevoke,
     EvidenceGet,
     MemoryRetrieve,
+    MemoryCandidate,
+    MemoryAccept,
+    MemoryRevoke,
 }
 
 impl CommandKind {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 11] = [
         Self::TaskCreate,
         Self::TaskApplyVerdict,
         Self::ApprovalDecide,
@@ -254,6 +298,9 @@ impl CommandKind {
         Self::VerdictRevoke,
         Self::EvidenceGet,
         Self::MemoryRetrieve,
+        Self::MemoryCandidate,
+        Self::MemoryAccept,
+        Self::MemoryRevoke,
     ];
 
     const fn label(self) -> &'static str {
@@ -266,6 +313,9 @@ impl CommandKind {
             Self::VerdictRevoke => "Revoke Founder Verdict",
             Self::EvidenceGet => "Read Evidence Graph",
             Self::MemoryRetrieve => "Retrieve accepted Memory",
+            Self::MemoryCandidate => "Submit Memory candidate",
+            Self::MemoryAccept => "Accept Memory candidate",
+            Self::MemoryRevoke => "Revoke Memory",
         }
     }
 }
@@ -376,6 +426,19 @@ impl CommandForm {
                 FormField::required("scope-ref"),
                 FormField::required("max-results").with_value("8"),
                 FormField::required("min-score").with_value("0.0"),
+            ],
+            CommandKind::MemoryCandidate => vec![
+                FormField::required("memory-id"),
+                FormField::required("content"),
+                FormField::required("source-ref"),
+                FormField::required("scope-ref"),
+                FormField::required("idempotency-key"),
+            ],
+            CommandKind::MemoryAccept | CommandKind::MemoryRevoke => vec![
+                FormField::required("memory-id"),
+                FormField::required("expected-revision"),
+                FormField::required("evidence-ref"),
+                FormField::required("idempotency-key"),
             ],
         };
         Self {
@@ -522,6 +585,32 @@ impl CommandForm {
                 min_score: next(&mut values, "min-score")?
                     .parse()
                     .map_err(|_| "min-score must be a number".to_owned())?,
+                json: false,
+            }),
+            CommandKind::MemoryCandidate => Ok(TuiCommand::MemoryCandidate {
+                memory_id: next(&mut values, "memory-id")?,
+                content: next(&mut values, "content")?,
+                source_ref: next(&mut values, "source-ref")?,
+                scope: next(&mut values, "scope-ref")?,
+                idempotency_key: next(&mut values, "idempotency-key")?,
+                json: false,
+            }),
+            CommandKind::MemoryAccept => Ok(TuiCommand::MemoryAccept {
+                memory_id: next(&mut values, "memory-id")?,
+                expected_revision: next(&mut values, "expected-revision")?
+                    .parse()
+                    .map_err(|_| "expected-revision must be an integer".to_owned())?,
+                evidence_ref: next(&mut values, "evidence-ref")?,
+                idempotency_key: next(&mut values, "idempotency-key")?,
+                json: false,
+            }),
+            CommandKind::MemoryRevoke => Ok(TuiCommand::MemoryRevoke {
+                memory_id: next(&mut values, "memory-id")?,
+                expected_revision: next(&mut values, "expected-revision")?
+                    .parse()
+                    .map_err(|_| "expected-revision must be an integer".to_owned())?,
+                evidence_ref: next(&mut values, "evidence-ref")?,
+                idempotency_key: next(&mut values, "idempotency-key")?,
                 json: false,
             }),
         }
@@ -1278,6 +1367,78 @@ async fn run_command_with_output(
             }
             Ok(CommandResult::ReadView(view))
         }
+        TuiCommand::MemoryCandidate {
+            memory_id,
+            content,
+            source_ref,
+            scope,
+            idempotency_key,
+            json,
+        } => {
+            run_memory_mutation(
+                instance,
+                "memory.candidate",
+                memory_mutation_command::Command::SubmitMemoryCandidate(
+                    SubmitMemoryCandidateCommand {
+                        metadata: None,
+                        memory_id,
+                        content,
+                        source_ref,
+                        scope_ref: scope,
+                        idempotency_key,
+                    },
+                ),
+                json,
+                output,
+            )
+            .await
+        }
+        TuiCommand::MemoryAccept {
+            memory_id,
+            expected_revision,
+            evidence_ref,
+            idempotency_key,
+            json,
+        } => {
+            run_memory_mutation(
+                instance,
+                "memory.accept",
+                memory_mutation_command::Command::AcceptMemory(AcceptMemoryCommand {
+                    metadata: None,
+                    memory_id,
+                    expected_revision,
+                    evidence_ref,
+                    idempotency_key,
+                }),
+                json,
+                output,
+            )
+            .await
+        }
+        TuiCommand::MemoryRevoke {
+            memory_id,
+            expected_revision,
+            evidence_ref,
+            idempotency_key,
+            json,
+        } => {
+            run_memory_mutation(
+                instance,
+                "memory.revoke",
+                memory_mutation_command::Command::RevokeMemory(
+                    egopulse_domain_contracts::v01::egopulse::localapi::v1::RevokeMemoryCommand {
+                        metadata: None,
+                        memory_id,
+                        expected_revision,
+                        evidence_ref,
+                        idempotency_key,
+                    },
+                ),
+                json,
+                output,
+            )
+            .await
+        }
         TuiCommand::EvidenceGet {
             task_id,
             artifact_set_id,
@@ -1346,6 +1507,82 @@ async fn run_command_with_output(
     }
 }
 
+async fn run_memory_mutation(
+    instance: &str,
+    operation: &'static str,
+    mut branch: memory_mutation_command::Command,
+    json_output: bool,
+    output: CommandOutput,
+) -> Result<CommandResult, String> {
+    let attached = AttachedClient::open(instance).await?;
+    let oneof = match &branch {
+        memory_mutation_command::Command::SubmitMemoryCandidate(_) => "submit_memory_candidate",
+        memory_mutation_command::Command::AcceptMemory(_) => "accept_memory",
+        memory_mutation_command::Command::RevokeMemory(_) => "revoke_memory",
+    };
+    attached.require_command("LocalCommandGatewayService/ExecuteMemoryMutation", oneof)?;
+    let correlation_id = Uuid::now_v7().to_string();
+    let metadata = attached.metadata_with_correlation(correlation_id.clone())?;
+    match &mut branch {
+        memory_mutation_command::Command::SubmitMemoryCandidate(command) => {
+            command.metadata = Some(metadata.clone())
+        }
+        memory_mutation_command::Command::AcceptMemory(command) => {
+            command.metadata = Some(metadata.clone())
+        }
+        memory_mutation_command::Command::RevokeMemory(command) => {
+            command.metadata = Some(metadata.clone())
+        }
+    }
+    let response = attached
+        .0
+        .connection
+        .command_gateway_service()
+        .execute_memory_mutation(ExecuteMemoryMutationRequest {
+            client: Some(metadata),
+            command: Some(MemoryMutationCommand {
+                command: Some(branch),
+            }),
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .into_inner();
+    if let Some(error) = response.gateway_error {
+        return Err(local_error_message(error));
+    }
+    let result: MemoryMutationReceipt = response
+        .authority_result
+        .ok_or_else(|| "Memory mutation authority result missing".to_owned())?;
+    let payload = json!({
+        "schemaVersion": "egopulse.tui-result/v0.1",
+        "ok": true,
+        "operation": operation,
+        "data": {
+            "memoryId": result.memory_id,
+            "revision": result.revision,
+            "state": result.state,
+            "eventId": result.event_id,
+            "requestDigestSha256": result.request_digest_sha256,
+            "acknowledgedAfterDurabilityBarrier": result.acknowledged_after_durability_barrier,
+        },
+        "correlationId": correlation_id,
+    });
+    if output == CommandOutput::Console {
+        if json_output {
+            println!("{}", serde_json::to_string(&payload).unwrap());
+        } else {
+            println!(
+                "Memory mutation: operation={} id={} revision={} state={}",
+                operation,
+                payload["data"]["memoryId"].as_str().unwrap_or(""),
+                payload["data"]["revision"].as_u64().unwrap_or(0),
+                payload["data"]["state"].as_str().unwrap_or(""),
+            );
+        }
+    }
+    Ok(CommandResult::Completed)
+}
+
 fn command_kind(command: &TuiCommand) -> &'static str {
     match command {
         TuiCommand::TaskCreate { .. } => "task.create",
@@ -1356,6 +1593,9 @@ fn command_kind(command: &TuiCommand) -> &'static str {
         TuiCommand::VerdictRevoke { .. } => "verdict.revoke",
         TuiCommand::EvidenceGet { .. } => "evidence.get",
         TuiCommand::MemoryRetrieve { .. } => "memory.retrieve",
+        TuiCommand::MemoryCandidate { .. } => "memory.candidate",
+        TuiCommand::MemoryAccept { .. } => "memory.accept",
+        TuiCommand::MemoryRevoke { .. } => "memory.revoke",
     }
 }
 
@@ -2185,6 +2425,52 @@ mod tests {
                 && scope == "scope:founder"
                 && (min_score - 0.25).abs() < f64::EPSILON
         ));
+    }
+
+    #[test]
+    fn memory_governance_forms_map_to_shared_mutation_operations() {
+        let mut candidate = CommandForm::new(CommandKind::MemoryCandidate);
+        for (field, value) in candidate.fields.iter_mut().zip([
+            "memory-1".to_owned(),
+            "durable fact".to_owned(),
+            "source:session-1".to_owned(),
+            "scope:founder".to_owned(),
+            "idem-candidate-1".to_owned(),
+        ]) {
+            field.value = value;
+        }
+        assert_eq!(
+            command_kind(&candidate.into_command().expect("valid candidate form")),
+            "memory.candidate"
+        );
+
+        let mut accept = CommandForm::new(CommandKind::MemoryAccept);
+        for (field, value) in accept.fields.iter_mut().zip([
+            "memory-1".to_owned(),
+            "1".to_owned(),
+            "evidence:founder-review-1".to_owned(),
+            "idem-accept-1".to_owned(),
+        ]) {
+            field.value = value;
+        }
+        assert_eq!(
+            command_kind(&accept.into_command().expect("valid accept form")),
+            "memory.accept"
+        );
+
+        let mut revoke = CommandForm::new(CommandKind::MemoryRevoke);
+        for (field, value) in revoke.fields.iter_mut().zip([
+            "memory-1".to_owned(),
+            "2".to_owned(),
+            "evidence:founder-revoke-1".to_owned(),
+            "idem-revoke-1".to_owned(),
+        ]) {
+            field.value = value;
+        }
+        assert_eq!(
+            command_kind(&revoke.into_command().expect("valid revoke form")),
+            "memory.revoke"
+        );
     }
 
     #[test]

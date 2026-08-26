@@ -19,6 +19,8 @@
     { "code": "local.projection.status.read", "kind": "read", "description": "Read projection health and position." },
     { "code": "local.projection.await", "kind": "read", "description": "Await a principal- and scope-bound projection token." },
     { "code": "local.memory.retrieve", "kind": "read", "description": "Run bounded read-only Memory retrieval over an authorized scope." },
+    { "code": "local.memory.candidate.submit", "kind": "write", "description": "Submit a Memory candidate without making it authoritative." },
+    { "code": "local.memory.govern", "kind": "write", "description": "Accept or revoke a Memory candidate under Founder governance." },
     { "code": "local.task.create", "kind": "write", "description": "Submit the user-owned create_task command branch." },
     { "code": "local.task.cancellation.request", "kind": "write", "description": "Submit the user-owned request_task_cancellation branch." },
     { "code": "local.approval.decide", "kind": "write", "description": "Submit an issue_harness_approval_decision intent." },
@@ -40,7 +42,8 @@
     { "rpc": "LocalCognitionService/RetrieveMemory", "access": "granted_permission", "requiredPermissionCodes": ["local.memory.retrieve"], "tokenScopeEnforced": false },
     { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "access": "per_command_oneof", "requiredPermissionCodes": [] },
     { "rpc": "LocalCommandGatewayService/DecideHarnessApproval", "access": "per_command_oneof", "requiredPermissionCodes": [] },
-    { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "access": "per_command_oneof", "requiredPermissionCodes": [] }
+    { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "access": "per_command_oneof", "requiredPermissionCodes": [] },
+    { "rpc": "LocalCommandGatewayService/ExecuteMemoryMutation", "access": "per_command_oneof", "requiredPermissionCodes": [] }
   ],
   "commandRules": [
     { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "create_task", "access": "user", "requiredPermissionCodes": ["local.task.create"], "confirmationClass": "none", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.Founder"] },
@@ -60,6 +63,9 @@
     { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "oneof": "issue_founder_verdict", "access": "user", "requiredPermissionCodes": ["local.founder-verdict.issue"], "confirmationClass": "authority_contract", "writeOwner": "FounderVerdictAuthority", "requiredAuthorityPrincipalKinds": ["FounderVerdictAuthority.FounderAuthority"] },
     { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "oneof": "revoke_founder_verdict", "access": "user", "requiredPermissionCodes": ["local.founder-verdict.revoke"], "confirmationClass": "authority_contract", "writeOwner": "FounderVerdictAuthority", "requiredAuthorityPrincipalKinds": ["FounderVerdictAuthority.FounderAuthority"] },
     { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "oneof": "consume_founder_verdict", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "FounderVerdictAuthority", "requiredAuthorityPrincipalKinds": ["FounderVerdictAuthority.TaskAuthority"] },
-    { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "oneof": "expire_founder_verdict", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "FounderVerdictAuthority", "requiredAuthorityPrincipalKinds": ["FounderVerdictAuthority.PolicyAuthority"] }
+    { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "oneof": "expire_founder_verdict", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "FounderVerdictAuthority", "requiredAuthorityPrincipalKinds": ["FounderVerdictAuthority.PolicyAuthority"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteMemoryMutation", "oneof": "submit_memory_candidate", "access": "user", "requiredPermissionCodes": ["local.memory.candidate.submit"], "confirmationClass": "authority_contract", "writeOwner": "MemoryAuthority", "requiredAuthorityPrincipalKinds": ["MemoryAuthority.Founder"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteMemoryMutation", "oneof": "accept_memory", "access": "user", "requiredPermissionCodes": ["local.memory.govern"], "confirmationClass": "authority_contract", "writeOwner": "MemoryAuthority", "requiredAuthorityPrincipalKinds": ["MemoryAuthority.Founder", "MemoryAuthority.FounderAuthority"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteMemoryMutation", "oneof": "revoke_memory", "access": "user", "requiredPermissionCodes": ["local.memory.govern"], "confirmationClass": "authority_contract", "writeOwner": "MemoryAuthority", "requiredAuthorityPrincipalKinds": ["MemoryAuthority.Founder", "MemoryAuthority.FounderAuthority"] }
   ]
 }

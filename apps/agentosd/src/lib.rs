@@ -39,7 +39,8 @@ use egopulse_local_api::{
     },
     command_gateway::{
         CommandGatewayApplication, CommandPortFailure, CommandPortResult, CommandPrincipal,
-        LocalCommandGatewayEndpoint, PolicyCommandPort, TaskCommandPort, VerdictCommandPort,
+        FailClosedMemoryMutationPort, LocalCommandGatewayEndpoint, MemoryMutationPort,
+        PolicyCommandPort, TaskCommandPort, VerdictCommandPort,
     },
     read_gateway::{NoopReadGatewayAuditSink, ReadGatewayApplication},
     read_gateway_policy::ReadGatewayPolicy,
@@ -66,6 +67,7 @@ use tonic::transport::Server;
 
 mod artifact;
 mod bootstrap;
+mod memory_mutation;
 mod memory_retrieval;
 mod owners;
 mod policy;
@@ -86,6 +88,7 @@ pub use bootstrap::{
     DenyVerificationReferences, LocalUserPolicyBootstrapConfig, ProductionBootstrapConfig,
     ProductionBootstrapError,
 };
+pub use memory_mutation::MemoryMutationPortAdapter;
 pub use memory_retrieval::{
     ConfiguredMemoryRetrievalPort, FailClosedMemoryRetrievalPort, MemoryRetrievalCompositionConfig,
     MemoryRetrievalConfigurationError, TracingMemoryRetrievalAuditSink,
@@ -315,6 +318,7 @@ pub struct DaemonProviders {
     pub task_activation_source: Option<Arc<dyn TaskActivationSource>>,
     pub memory_retrieval_port: Arc<dyn MemoryRetrievalPort>,
     pub memory_retrieval_audit: Arc<dyn MemoryRetrievalAuditSink>,
+    pub memory_mutation_port: Arc<dyn MemoryMutationPort>,
 }
 
 /// Explicit workflow configuration boundary for the first vertical. It does
@@ -542,6 +546,7 @@ impl DaemonProviders {
             task_activation_source: None,
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
+            memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
         }
     }
 
@@ -611,6 +616,7 @@ impl DaemonProviders {
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
+            memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
         }
     }
 
@@ -654,6 +660,7 @@ impl DaemonProviders {
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
+            memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
         }
     }
 
@@ -707,6 +714,12 @@ impl DaemonProviders {
                 .map_err(DaemonCompositionError::MemoryRetrieval)?,
         );
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_memory_mutation(mut self, authority: Arc<Mutex<MemoryAuthority>>) -> Self {
+        self.memory_mutation_port = Arc::new(MemoryMutationPortAdapter::new(authority));
+        self
     }
 
     /// Installs the first production Harness composition. Task Authority,
@@ -1079,13 +1092,14 @@ impl DaemonComposition {
             Arc::new(NoopReadGatewayAuditSink),
         ));
         let read_model = LocalReadModelEndpoint::new(read_application);
-        let command_application = Arc::new(CommandGatewayApplication::new(
+        let command_application = Arc::new(CommandGatewayApplication::new_with_memory(
             Arc::clone(&registry),
             Arc::clone(&profiles),
             token_codec,
             providers.task_port,
             providers.policy_port,
             providers.verdict_port,
+            providers.memory_mutation_port,
         ));
         let command = LocalCommandGatewayEndpoint::new(command_application);
         let cognition_application = Arc::new(CognitionGatewayApplication::new(

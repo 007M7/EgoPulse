@@ -19,14 +19,15 @@ use egopulse_domain_contracts::v01::egopulse::{
     harness::v1::ApprovalDecision,
     localapi::v1::{
         AwaitProjectionRequest, ClientSurface, DecideHarnessApprovalRequest,
-        ExecuteFounderVerdictRequest, ExecuteTaskCommandRequest, GetEvidenceGraphRequest,
-        GetHarnessApprovalViewRequest, GetProjectionStatusRequest, GetTaskViewRequest,
-        HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest, ListTaskViewsRequest,
-        LocalApiError, LocalApiErrorCode, ProjectionAwaitToken, ProjectionHealth,
-        ProjectionMetadata, RetrieveMemoryRequest, SourceRevision, TaskView, TaskViewStreamFrame,
+        ExecuteFounderVerdictRequest, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
+        GetEvidenceGraphRequest, GetHarnessApprovalViewRequest, GetProjectionStatusRequest,
+        GetTaskViewRequest, HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest,
+        ListTaskViewsRequest, LocalApiError, LocalApiErrorCode, MemoryMutationCommand,
+        MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth, ProjectionMetadata,
+        RetrieveMemoryRequest, SourceRevision, TaskView, TaskViewStreamFrame,
         WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, await_projection_response,
         get_evidence_graph_response, get_harness_approval_view_response, get_task_view_response,
-        retrieve_memory_response,
+        memory_mutation_command, retrieve_memory_response,
     },
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, PolicyDecisionErrorCode,
@@ -111,6 +112,45 @@ enum MemoryCommand {
         max_results: u32,
         #[arg(long, default_value_t = 0.0)]
         min_score: f64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit a candidate; the record remains non-authoritative until accepted.
+    Candidate {
+        #[arg(long)]
+        memory_id: String,
+        #[arg(long)]
+        content: String,
+        #[arg(long)]
+        source_ref: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Founder-govern an existing candidate into accepted state.
+    Accept {
+        memory_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        evidence_ref: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Founder-govern a memory into terminal revoked state.
+    Revoke {
+        memory_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        evidence_ref: String,
+        #[arg(long)]
+        idempotency_key: String,
         #[arg(long)]
         json: bool,
     },
@@ -636,7 +676,11 @@ fn command_json(command: &Command) -> bool {
             command: VerdictCommandCli::Issue { json, .. } | VerdictCommandCli::Revoke { json, .. },
         }
         | Command::Memory {
-            command: MemoryCommand::Retrieve { json, .. },
+            command:
+                MemoryCommand::Retrieve { json, .. }
+                | MemoryCommand::Candidate { json, .. }
+                | MemoryCommand::Accept { json, .. }
+                | MemoryCommand::Revoke { json, .. },
         } => *json,
     }
 }
@@ -705,6 +749,68 @@ async fn memory(command: MemoryCommand) -> Result<(), CliFailure> {
             min_score,
             json,
         } => memory_retrieve(query, scope, max_results, min_score, json).await,
+        MemoryCommand::Candidate {
+            memory_id,
+            content,
+            source_ref,
+            scope,
+            idempotency_key,
+            json,
+        } => memory_mutation(
+            "memory.candidate",
+            memory_mutation_command::Command::SubmitMemoryCandidate(
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::SubmitMemoryCandidateCommand {
+                    metadata: None,
+                    memory_id,
+                    content,
+                    source_ref,
+                    scope_ref: scope,
+                    idempotency_key,
+                },
+            ),
+            json,
+        )
+        .await,
+        MemoryCommand::Accept {
+            memory_id,
+            expected_revision,
+            evidence_ref,
+            idempotency_key,
+            json,
+        } => memory_mutation(
+            "memory.accept",
+            memory_mutation_command::Command::AcceptMemory(
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::AcceptMemoryCommand {
+                    metadata: None,
+                    memory_id,
+                    expected_revision,
+                    evidence_ref,
+                    idempotency_key,
+                },
+            ),
+            json,
+        )
+        .await,
+        MemoryCommand::Revoke {
+            memory_id,
+            expected_revision,
+            evidence_ref,
+            idempotency_key,
+            json,
+        } => memory_mutation(
+            "memory.revoke",
+            memory_mutation_command::Command::RevokeMemory(
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::RevokeMemoryCommand {
+                    metadata: None,
+                    memory_id,
+                    expected_revision,
+                    evidence_ref,
+                    idempotency_key,
+                },
+            ),
+            json,
+        )
+        .await,
     }
 }
 
@@ -799,6 +905,83 @@ async fn memory_retrieve(
                 candidate["contentSha256"].as_str().unwrap_or("")
             );
         }
+    }
+    Ok(())
+}
+
+async fn memory_mutation(
+    operation: &'static str,
+    mut branch: memory_mutation_command::Command,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    let attached = attach(operation).await?;
+    attached.require_rpc(
+        "LocalCommandGatewayService/ExecuteMemoryMutation",
+        operation,
+    )?;
+    let correlation_id = Uuid::now_v7().to_string();
+    let metadata = attached.metadata(Some(correlation_id.clone()))?;
+    match &mut branch {
+        memory_mutation_command::Command::SubmitMemoryCandidate(command) => {
+            command.metadata = Some(metadata.clone())
+        }
+        memory_mutation_command::Command::AcceptMemory(command) => {
+            command.metadata = Some(metadata.clone())
+        }
+        memory_mutation_command::Command::RevokeMemory(command) => {
+            command.metadata = Some(metadata.clone())
+        }
+    }
+    let response = attached
+        .0
+        .connection
+        .command_gateway_service()
+        .execute_memory_mutation(ExecuteMemoryMutationRequest {
+            client: Some(metadata),
+            command: Some(MemoryMutationCommand {
+                command: Some(branch),
+            }),
+        })
+        .await
+        .map_err(|error| {
+            CliFailure::daemon_unavailable(error.to_string()).for_operation(operation)
+        })?
+        .into_inner();
+    let result: MemoryMutationReceipt = match (response.authority_result, response.gateway_error) {
+        (Some(result), None) => result,
+        (_, Some(error)) => {
+            return Err(CliFailure::from_local_api_error(error).for_operation(operation));
+        }
+        _ => {
+            return Err(
+                CliFailure::protocol("Memory mutation outcome missing").for_operation(operation)
+            );
+        }
+    };
+    let payload = json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": operation,
+        "data": {
+            "memoryId": result.memory_id,
+            "revision": result.revision,
+            "state": result.state,
+            "eventId": result.event_id,
+            "requestDigestSha256": result.request_digest_sha256,
+            "acknowledgedAfterDurabilityBarrier": result.acknowledged_after_durability_barrier,
+        },
+        "correlationId": correlation_id,
+    });
+    if json_output {
+        println!("{}", serde_json::to_string(&payload).unwrap());
+    } else {
+        println!(
+            "Memory mutation: operation={} id={} revision={} state={}",
+            operation,
+            payload["data"]["memoryId"].as_str().unwrap_or(""),
+            payload["data"]["revision"].as_u64().unwrap_or(0),
+            payload["data"]["state"].as_str().unwrap_or(""),
+        );
     }
     Ok(())
 }

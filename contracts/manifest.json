@@ -938,7 +938,7 @@
     },
     {
       "path": "profiles/authorization/v1/v01-default.json",
-      "sha256": "0aeecf723799d915e3a3362911e349a1c3ccdd62a013c1973d9d4d99ebb9bbe0"
+      "sha256": "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1"
     },
     {
       "path": "profiles/client-kernel/v1/v01-default.json",
@@ -970,7 +970,7 @@
     },
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
-      "sha256": "f2caf444c656d1087d2869805252f5cc02c98f4eab78a48003bb0a400717aada"
+      "sha256": "0a8247e4446d718e502cecc7c61e61d0c167f30dfbad8295f939a49fb735abd9"
     },
     {
       "path": "proto/egopulse/memory/v1/memory.proto",

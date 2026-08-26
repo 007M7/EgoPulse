@@ -241,8 +241,9 @@ impl ProductionBootstrapConfig {
             providers = providers.with_verification_worker(Arc::new(worker));
         }
         if let Some(memory_retrieval) = self.memory_retrieval {
-            providers = providers.with_memory_retrieval(memory, memory_retrieval)?;
+            providers = providers.with_memory_retrieval(Arc::clone(&memory), memory_retrieval)?;
         }
+        providers = providers.with_memory_mutation(Arc::clone(&memory));
         providers = providers.with_codex_harness(self.codex, artifact, verification)?;
         Ok(providers)
     }

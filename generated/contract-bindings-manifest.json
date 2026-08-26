@@ -1,6 +1,6 @@
 {
     "schemaVersion":  "egopulse-generated-contract-bindings/v0.1",
-    "sourceManifestSha256":  "f9a10bf989f8aed99ac420ceaa30eaae20ee465b45acf0bcd5c27e914d806408",
+    "sourceManifestSha256":  "ddeff9d0f3bcb860e44cddc25233cadb0e21768bbf8193589eb1f8f7aa719b07",
     "generators":  {
                        "buf":  "1.72.0",
                        "protocGenEs":  "2.14.0",
@@ -28,7 +28,7 @@
                   },
                   {
                       "path":  "crates/domain-contracts/src/generated/egopulse.localapi.v1.rs",
-                      "sha256":  "b261f7e1a011bcce2acb9b5972867e23380a9448ef00481c65d55b316c7db0cf"
+                      "sha256":  "ec68c198e4d8a132513b92fcbfeef3cd3eeef195a108370fb3567da794821db6"
                   },
                   {
                       "path":  "crates/domain-contracts/src/generated/egopulse.memory.v1.rs",
@@ -72,7 +72,7 @@
                   },
                   {
                       "path":  "packages/generated-client/src/generated/egopulse/localapi/v1/local_api_pb.ts",
-                      "sha256":  "e73950dcfe46139b77c38bcd2c106ea09c70db978c964572a9ebf7a2ac95e0fe"
+                      "sha256":  "c543b7bbc4cf66cb166c8b1ea785f0e3f51b6c0caa2ad830dd4e37e20d58df55"
                   },
                   {
                       "path":  "packages/generated-client/src/generated/egopulse/memory/v1/memory_pb.ts",
@@ -132,11 +132,11 @@
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/localapi/v1/local_api_pb2.py",
-                      "sha256":  "0127a6e45066b336ef0be6e7409608a6546062250f468c2ade98983d2191e378"
+                      "sha256":  "b24eade14661ad6d5b5d162b49cdce4579a4e84c2b7f3f12aeeb0f0b9cbc667e"
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/localapi/v1/local_api_pb2.pyi",
-                      "sha256":  "8ae795e2d0df97f986821822d14ba18b1ffd191de9e2593cd8195625def8b21e"
+                      "sha256":  "d76db5f448b4554d5546993d21a42e96f5f799e1efaf754ba39ca50f88ef5d3b"
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/memory/v1/memory_pb2.py",

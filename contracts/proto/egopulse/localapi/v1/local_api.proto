@@ -385,6 +385,61 @@ message ExecuteFounderVerdictResponse {
   LocalApiError gateway_error = 3;
 }
 
+// Memory writes cross the Local API only as explicit, owner-checked commands.
+// A candidate submission never makes a record authoritative; accept and revoke
+// remain separate Founder-governed operations in the Memory Authority.
+message SubmitMemoryCandidateCommand {
+  ClientRequestMetadata metadata = 1;
+  string memory_id = 2;
+  string content = 3;
+  string source_ref = 4;
+  string scope_ref = 5;
+  string idempotency_key = 6;
+}
+
+message AcceptMemoryCommand {
+  ClientRequestMetadata metadata = 1;
+  string memory_id = 2;
+  uint64 expected_revision = 3;
+  string evidence_ref = 4;
+  string idempotency_key = 5;
+}
+
+message RevokeMemoryCommand {
+  ClientRequestMetadata metadata = 1;
+  string memory_id = 2;
+  uint64 expected_revision = 3;
+  string evidence_ref = 4;
+  string idempotency_key = 5;
+}
+
+message MemoryMutationCommand {
+  oneof command {
+    SubmitMemoryCandidateCommand submit_memory_candidate = 1;
+    AcceptMemoryCommand accept_memory = 2;
+    RevokeMemoryCommand revoke_memory = 3;
+  }
+}
+
+message MemoryMutationReceipt {
+  string memory_id = 1;
+  uint64 revision = 2;
+  string state = 3;
+  string event_id = 4;
+  string request_digest_sha256 = 5;
+  bool acknowledged_after_durability_barrier = 6;
+}
+
+message ExecuteMemoryMutationRequest {
+  ClientRequestMetadata client = 1;
+  MemoryMutationCommand command = 2;
+}
+
+message ExecuteMemoryMutationResponse {
+  MemoryMutationReceipt authority_result = 1;
+  LocalApiError gateway_error = 2;
+}
+
 message AwaitProjectionRequest {
   ClientRequestMetadata client = 1;
   ProjectionAwaitToken await_token = 2;
@@ -437,6 +492,7 @@ service LocalCommandGatewayService {
   rpc ExecuteTaskCommand(ExecuteTaskCommandRequest) returns (ExecuteTaskCommandResponse);
   rpc DecideHarnessApproval(DecideHarnessApprovalRequest) returns (DecideHarnessApprovalResponse);
   rpc ExecuteFounderVerdict(ExecuteFounderVerdictRequest) returns (ExecuteFounderVerdictResponse);
+  rpc ExecuteMemoryMutation(ExecuteMemoryMutationRequest) returns (ExecuteMemoryMutationResponse);
 }
 
 service LocalCognitionService {
