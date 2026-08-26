@@ -39,7 +39,7 @@ const SCHEMA_PROFILE_ID: &str = "egopulse/local-read-model-store/v1";
 const VIEW_CONTRACT_ID: &str = "egopulse.localapi.v1/HarnessApprovalView";
 const VIEW_CONTRACT_VERSION: &str = "0.1.0-draft.14";
 const VIEW_CONTRACT_SHA256: &str =
-    "8eadb3686c8dfe76bf8b56fa48d8a76bd7fa57c177804b132eac793d33b7379e";
+    "725f8cf77816f9a768a76410ac21dd7b8cffc4820ea109769395bf32ae582ccb";
 const DECIDE_RULE_REF: &str = "egopulse/local-read-model/approval-actionable/v1";
 
 const SCHEMA_V1: &str = r#"

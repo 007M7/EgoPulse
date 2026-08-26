@@ -6,6 +6,7 @@ import "egopulse/artifact/v1/artifact.proto";
 import "egopulse/collaboration/v1/collaboration.proto";
 import "egopulse/common/v1/common.proto";
 import "egopulse/harness/v1/harness.proto";
+import "egopulse/memory/v1/memory.proto";
 import "egopulse/policy/v1/policy.proto";
 import "egopulse/task/v1/task.proto";
 import "egopulse/verdict/v1/verdict.proto";
@@ -76,6 +77,8 @@ enum LocalApiErrorCode {
   LOCAL_API_ERROR_CODE_DEADLINE_EXCEEDED = 13;
   LOCAL_API_ERROR_CODE_AUTHORITY_UNAVAILABLE = 14;
   LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS = 15;
+  LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED = 16;
+  LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE = 17;
 }
 
 message ClientRequestMetadata {
@@ -396,6 +399,24 @@ message AwaitProjectionResponse {
   }
 }
 
+// Read-only cognition-plane request. The client supplies intent and bounds;
+// the daemon binds the request to an authenticated principal, an authorized
+// scope, and one accepted Memory snapshot before invoking a Worker.
+message RetrieveMemoryRequest {
+  ClientRequestMetadata client = 1;
+  string query = 2;
+  string scope_ref = 3;
+  uint32 max_results = 4;
+  double min_score = 5;
+}
+
+message RetrieveMemoryResponse {
+  oneof outcome {
+    egopulse.memory.v1.RetrievalResponse result = 1;
+    LocalApiError error = 2;
+  }
+}
+
 service LocalSessionService {
   rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
 }
@@ -416,4 +437,8 @@ service LocalCommandGatewayService {
   rpc ExecuteTaskCommand(ExecuteTaskCommandRequest) returns (ExecuteTaskCommandResponse);
   rpc DecideHarnessApproval(DecideHarnessApprovalRequest) returns (DecideHarnessApprovalResponse);
   rpc ExecuteFounderVerdict(ExecuteFounderVerdictRequest) returns (ExecuteFounderVerdictResponse);
+}
+
+service LocalCognitionService {
+  rpc RetrieveMemory(RetrieveMemoryRequest) returns (RetrieveMemoryResponse);
 }

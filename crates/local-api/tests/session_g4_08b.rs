@@ -30,7 +30,7 @@ use tonic::{Request, transport::Endpoint};
 use tower::service_fn;
 use uuid::Uuid;
 
-const CONTRACT_DIGEST: &str = "8eadb3686c8dfe76bf8b56fa48d8a76bd7fa57c177804b132eac793d33b7379e";
+const CONTRACT_DIGEST: &str = "725f8cf77816f9a768a76410ac21dd7b8cffc4820ea109769395bf32ae582ccb";
 const KERNEL_DIGEST: &str = "367ad4210c499d7501acd060f5b544255521cefefca86b8d69a2cea022166c11";
 const POLICY_DIGEST: &str = "5ae8cff8552910c780cdde9e29f1a5a3a95e40803ebcbb1de26544de5f6ac29f";
 

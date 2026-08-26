@@ -2,7 +2,7 @@
   "schemaVersion": "egopulse.client-kernel-profile/v0.1",
   "contractId": "egopulse.client-kernel.v1",
   "contractVersion": "0.1.0",
-  "authorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
+  "authorityRef": "conversation:2026-08-26:founder-memory-rag-m07-m10-freeze",
   "localApiCompatibility": {
     "contractId": "egopulse.localapi.v1",
     "minimumVersion": "0.1.0-draft.13",
@@ -21,6 +21,7 @@
     "list",
     "watch_complete_snapshots",
     "await_projection",
+    "memory_retrieval",
     "typed_command",
     "stable_cursor",
     "reset_and_refetch",

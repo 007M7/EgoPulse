@@ -579,6 +579,37 @@ pub mod await_projection_response {
         ApprovalView(super::HarnessApprovalView),
     }
 }
+/// Read-only cognition-plane request. The client supplies intent and bounds;
+/// the daemon binds the request to an authenticated principal, an authorized
+/// scope, and one accepted Memory snapshot before invoking a Worker.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RetrieveMemoryRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub query: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub scope_ref: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "4")]
+    pub max_results: u32,
+    #[prost(double, tag = "5")]
+    pub min_score: f64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RetrieveMemoryResponse {
+    #[prost(oneof = "retrieve_memory_response::Outcome", tags = "1, 2")]
+    pub outcome: ::core::option::Option<retrieve_memory_response::Outcome>,
+}
+/// Nested message and enum types in `RetrieveMemoryResponse`.
+pub mod retrieve_memory_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Outcome {
+        #[prost(message, tag = "1")]
+        Result(super::super::super::memory::v1::RetrievalResponse),
+        #[prost(message, tag = "2")]
+        Error(super::LocalApiError),
+    }
+}
 /// Presentation/audit metadata only. It MUST NOT select capabilities or authorization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -796,6 +827,8 @@ pub enum LocalApiErrorCode {
     DeadlineExceeded = 13,
     AuthorityUnavailable = 14,
     UnknownCriticalSemantics = 15,
+    ResourceExhausted = 16,
+    CognitionWorkerUnavailable = 17,
 }
 impl LocalApiErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -823,6 +856,10 @@ impl LocalApiErrorCode {
             Self::AuthorityUnavailable => "LOCAL_API_ERROR_CODE_AUTHORITY_UNAVAILABLE",
             Self::UnknownCriticalSemantics => {
                 "LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS"
+            }
+            Self::ResourceExhausted => "LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED",
+            Self::CognitionWorkerUnavailable => {
+                "LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE"
             }
         }
     }
@@ -852,6 +889,10 @@ impl LocalApiErrorCode {
             }
             "LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS" => {
                 Some(Self::UnknownCriticalSemantics)
+            }
+            "LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED" => Some(Self::ResourceExhausted),
+            "LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE" => {
+                Some(Self::CognitionWorkerUnavailable)
             }
             _ => None,
         }
@@ -2662,6 +2703,315 @@ pub mod local_command_gateway_service_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "egopulse.localapi.v1.LocalCommandGatewayService";
     impl<T> tonic::server::NamedService for LocalCommandGatewayServiceServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
+/// Generated client implementations.
+pub mod local_cognition_service_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    #[derive(Debug, Clone)]
+    pub struct LocalCognitionServiceClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl LocalCognitionServiceClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
+    }
+    impl<T> LocalCognitionServiceClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> LocalCognitionServiceClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            LocalCognitionServiceClient::new(InterceptedService::new(inner, interceptor))
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        pub async fn retrieve_memory(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RetrieveMemoryRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RetrieveMemoryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalCognitionService/RetrieveMemory",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalCognitionService",
+                        "RetrieveMemory",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod local_cognition_service_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with LocalCognitionServiceServer.
+    #[async_trait]
+    pub trait LocalCognitionService: std::marker::Send + std::marker::Sync + 'static {
+        async fn retrieve_memory(
+            &self,
+            request: tonic::Request<super::RetrieveMemoryRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RetrieveMemoryResponse>,
+            tonic::Status,
+        >;
+    }
+    #[derive(Debug)]
+    pub struct LocalCognitionServiceServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> LocalCognitionServiceServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>>
+    for LocalCognitionServiceServer<T>
+    where
+        T: LocalCognitionService,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/egopulse.localapi.v1.LocalCognitionService/RetrieveMemory" => {
+                    #[allow(non_camel_case_types)]
+                    struct RetrieveMemorySvc<T: LocalCognitionService>(pub Arc<T>);
+                    impl<
+                        T: LocalCognitionService,
+                    > tonic::server::UnaryService<super::RetrieveMemoryRequest>
+                    for RetrieveMemorySvc<T> {
+                        type Response = super::RetrieveMemoryResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RetrieveMemoryRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalCognitionService>::retrieve_memory(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RetrieveMemorySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for LocalCognitionServiceServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "egopulse.localapi.v1.LocalCognitionService";
+    impl<T> tonic::server::NamedService for LocalCognitionServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }

@@ -2,7 +2,7 @@
   "schemaVersion": "egopulse.authorization-capability-profile/v0.1",
   "contractId": "egopulse.authorization.v1",
   "contractVersion": "0.1.0",
-  "authorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
+  "authorityRef": "conversation:2026-08-26:founder-memory-rag-m07-m10-freeze",
   "localApiContractId": "egopulse.localapi.v1",
   "defaults": {
     "unknownPermission": "fail_closed",
@@ -18,6 +18,7 @@
     { "code": "local.approval.read", "kind": "read", "description": "Read and watch Harness approval projections." },
     { "code": "local.projection.status.read", "kind": "read", "description": "Read projection health and position." },
     { "code": "local.projection.await", "kind": "read", "description": "Await a principal- and scope-bound projection token." },
+    { "code": "local.memory.retrieve", "kind": "read", "description": "Run bounded read-only Memory retrieval over an authorized scope." },
     { "code": "local.task.create", "kind": "write", "description": "Submit the user-owned create_task command branch." },
     { "code": "local.task.cancellation.request", "kind": "write", "description": "Submit the user-owned request_task_cancellation branch." },
     { "code": "local.approval.decide", "kind": "write", "description": "Submit an issue_harness_approval_decision intent." },
@@ -35,6 +36,7 @@
     { "rpc": "LocalReadModelService/WatchTaskViews", "access": "granted_permission", "requiredPermissionCodes": ["local.task.read"] },
     { "rpc": "LocalReadModelService/WatchHarnessApprovalViews", "access": "granted_permission", "requiredPermissionCodes": ["local.approval.read"] },
     { "rpc": "LocalReadModelService/AwaitProjection", "access": "granted_permission", "requiredPermissionCodes": ["local.projection.await"], "tokenScopeEnforced": true },
+    { "rpc": "LocalCognitionService/RetrieveMemory", "access": "granted_permission", "requiredPermissionCodes": ["local.memory.retrieve"], "tokenScopeEnforced": false },
     { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "access": "per_command_oneof", "requiredPermissionCodes": [] },
     { "rpc": "LocalCommandGatewayService/DecideHarnessApproval", "access": "per_command_oneof", "requiredPermissionCodes": [] },
     { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "access": "per_command_oneof", "requiredPermissionCodes": [] }

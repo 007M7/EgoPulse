@@ -1,8 +1,8 @@
 {
   "schemaVersion": "v01-gate3-contract-candidate-manifest/v0.1",
   "candidateId": "v01-gate3-contracts",
-  "candidateVersion": "0.1.0-draft.15",
-  "status": "targeted_gate3_revision_founder_confirmed_g4_08c_support_profiles_reverified_memory_rag_contract_frozen",
+  "candidateVersion": "0.1.0-draft.16",
+  "status": "targeted_gate3_revision_founder_confirmed_g4_08c_support_profiles_reverified_memory_retrieval_daemon_cli_tui_frozen",
   "ssotRole": "implementation_contract_ssot",
   "featureId": "v01-governed-single-harness-work-loop",
   "architectureAuthorityRef": "conversation:2026-08-23:founder-v01-feature-adr-a01",
@@ -24,6 +24,7 @@
   "approvalReadModelRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a",
   "g408cSupportProfilesAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
   "memoryRagAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m01-m06-freeze",
+  "memoryRetrievalAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m07-m10-freeze",
   "implementationAuthorized": true,
   "handoffRule": {
     "gate": "Gate 4",
@@ -108,6 +109,12 @@
       "id": "M-01..M-06",
       "name": "Memory/RAG Read-Only Worker Contract",
       "status": "founder_confirmed_toolchain_verified",
+      "founderDecisionRequired": true
+    },
+    {
+      "id": "M-07..M-10",
+      "name": "Memory Retrieval Daemon, Authorization, CLI and TUI Boundary",
+      "status": "founder_confirmed_implementation_in_progress",
       "founderDecisionRequired": true
     }
   ],
@@ -931,11 +938,11 @@
     },
     {
       "path": "profiles/authorization/v1/v01-default.json",
-      "sha256": "5ae8cff8552910c780cdde9e29f1a5a3a95e40803ebcbb1de26544de5f6ac29f"
+      "sha256": "c9faacd839b431263be7b24dbe1527a990399f4edfa22a41208635a5e416f8de"
     },
     {
       "path": "profiles/client-kernel/v1/v01-default.json",
-      "sha256": "367ad4210c499d7501acd060f5b544255521cefefca86b8d69a2cea022166c11"
+      "sha256": "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9"
     },
     {
       "path": "profiles/quality-budget/v1/v01-default.json",
@@ -963,7 +970,7 @@
     },
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
-      "sha256": "943bcbe3bc09734fcd9a81d1a0df2094690173b368e062ab566cc088cdecb6ce"
+      "sha256": "f2caf444c656d1087d2869805252f5cc02c98f4eab78a48003bb0a400717aada"
     },
     {
       "path": "proto/egopulse/memory/v1/memory.proto",

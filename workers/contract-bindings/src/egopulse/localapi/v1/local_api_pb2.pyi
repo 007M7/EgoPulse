@@ -4,6 +4,7 @@ from egopulse.artifact.v1 import artifact_pb2 as _artifact_pb2
 from egopulse.collaboration.v1 import collaboration_pb2 as _collaboration_pb2
 from egopulse.common.v1 import common_pb2 as _common_pb2
 from egopulse.harness.v1 import harness_pb2 as _harness_pb2
+from egopulse.memory.v1 import memory_pb2 as _memory_pb2
 from egopulse.policy.v1 import policy_pb2 as _policy_pb2
 from egopulse.task.v1 import task_pb2 as _task_pb2
 from egopulse.verdict.v1 import verdict_pb2 as _verdict_pb2
@@ -80,6 +81,8 @@ class LocalApiErrorCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     LOCAL_API_ERROR_CODE_DEADLINE_EXCEEDED: _ClassVar[LocalApiErrorCode]
     LOCAL_API_ERROR_CODE_AUTHORITY_UNAVAILABLE: _ClassVar[LocalApiErrorCode]
     LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE: _ClassVar[LocalApiErrorCode]
 CLIENT_SURFACE_UNSPECIFIED: ClientSurface
 CLIENT_SURFACE_DESKTOP: ClientSurface
 CLIENT_SURFACE_CLI: ClientSurface
@@ -125,6 +128,8 @@ LOCAL_API_ERROR_CODE_INTEGRITY_FAILURE: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_DEADLINE_EXCEEDED: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_AUTHORITY_UNAVAILABLE: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE: LocalApiErrorCode
 
 class ClientRequestMetadata(_message.Message):
     __slots__ = ("request_id", "client_instance_id", "surface", "session_id", "api_contract_ref", "correlation_id")
@@ -643,3 +648,25 @@ class AwaitProjectionResponse(_message.Message):
     error: LocalApiError
     approval_view: HarnessApprovalView
     def __init__(self, view: _Optional[_Union[TaskView, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ..., approval_view: _Optional[_Union[HarnessApprovalView, _Mapping]] = ...) -> None: ...
+
+class RetrieveMemoryRequest(_message.Message):
+    __slots__ = ("client", "query", "scope_ref", "max_results", "min_score")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    QUERY_FIELD_NUMBER: _ClassVar[int]
+    SCOPE_REF_FIELD_NUMBER: _ClassVar[int]
+    MAX_RESULTS_FIELD_NUMBER: _ClassVar[int]
+    MIN_SCORE_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    query: str
+    scope_ref: str
+    max_results: int
+    min_score: float
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., query: _Optional[str] = ..., scope_ref: _Optional[str] = ..., max_results: _Optional[int] = ..., min_score: _Optional[float] = ...) -> None: ...
+
+class RetrieveMemoryResponse(_message.Message):
+    __slots__ = ("result", "error")
+    RESULT_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    result: _memory_pb2.RetrievalResponse
+    error: LocalApiError
+    def __init__(self, result: _Optional[_Union[_memory_pb2.RetrievalResponse, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...

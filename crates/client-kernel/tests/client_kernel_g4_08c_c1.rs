@@ -139,7 +139,7 @@ fn embedded_profiles_are_digest_bound_and_fail_closed_by_default() {
     let profiles = ContractProfiles::embedded().unwrap();
     assert_eq!(
         client_kernel_contract_ref().sha256,
-        "367ad4210c499d7501acd060f5b544255521cefefca86b8d69a2cea022166c11"
+        "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9"
     );
     assert_eq!(
         authorization_contract_ref().sha256,
@@ -160,6 +160,7 @@ fn embedded_profiles_are_digest_bound_and_fail_closed_by_default() {
             .owning_authority_revalidation_required
     );
     assert!(profiles.permission_codes().contains("local.task.read"));
+    assert!(profiles.permission_codes().contains("local.memory.retrieve"));
 }
 
 #[test]

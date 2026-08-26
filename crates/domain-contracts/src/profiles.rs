@@ -10,17 +10,17 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const API_CONTRACT_ID: &str = "egopulse.localapi.v1";
-pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.14";
+pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.16";
 pub const API_CONTRACT_DIGEST_SHA256: &str =
-    "8eadb3686c8dfe76bf8b56fa48d8a76bd7fa57c177804b132eac793d33b7379e";
+    "725f8cf77816f9a768a76410ac21dd7b8cffc4820ea109769395bf32ae582ccb";
 pub const CLIENT_KERNEL_CONTRACT_ID: &str = "egopulse.client-kernel.v1";
 pub const CLIENT_KERNEL_CONTRACT_VERSION: &str = "0.1.0";
 pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =
-    "367ad4210c499d7501acd060f5b544255521cefefca86b8d69a2cea022166c11";
+    "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9";
 pub const AUTHORIZATION_CONTRACT_ID: &str = "egopulse.authorization.v1";
 pub const AUTHORIZATION_CONTRACT_VERSION: &str = "0.1.0";
 pub const AUTHORIZATION_PROFILE_DIGEST_SHA256: &str =
-    "5ae8cff8552910c780cdde9e29f1a5a3a95e40803ebcbb1de26544de5f6ac29f";
+    "c9faacd839b431263be7b24dbe1527a990399f4edfa22a41208635a5e416f8de";
 
 const CLIENT_KERNEL_PROFILE_BYTES: &[u8] =
     include_bytes!("../../../contracts/profiles/client-kernel/v1/v01-default.json");
@@ -335,6 +335,7 @@ fn validate_client_kernel_profile(
         "read_your_write",
         "typed_error",
         "frame_deduplication",
+        "memory_retrieval",
     ];
     if profile.schema_version != "egopulse.client-kernel-profile/v0.1"
         || profile.contract_id != CLIENT_KERNEL_CONTRACT_ID
