@@ -22,6 +22,9 @@ from egopulse_memory_rag.retrieval import (
 
 
 DATASET = Path(__file__).parents[1] / "evaluation" / "baseline-v0.json"
+PROJECT_DATASET = (
+    Path(__file__).parents[1] / "evaluation" / "project-boundaries-v0.json"
+)
 
 
 def test_lexical_baseline_records_the_semantic_recall_gap() -> None:
@@ -46,6 +49,20 @@ def test_dataset_and_report_are_deterministic() -> None:
 
     assert first == second
     assert first.to_json() == second.to_json()
+
+
+def test_project_boundary_corpus_has_a_digest_locked_lexical_baseline() -> None:
+    report = evaluate_lexical_dataset(PROJECT_DATASET, k=2)
+
+    assert report.dataset_id == "egopulse-project-boundaries-v0"
+    assert (
+        report.dataset_sha256
+        == "d38307e1896ad7a969078f9e2bf3dc721e8450e84ca08a46cc6653bb4a4156ff"
+    )
+    assert report.case_count == 14
+    assert report.recall_at_k == 1.0
+    assert report.mean_reciprocal_rank == 0.82142857
+    assert report.ndcg_at_k == 0.8681892
 
 
 def test_candidate_cannot_return_an_unknown_memory_reference() -> None:
