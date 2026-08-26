@@ -72,11 +72,11 @@ verification or Task completion.
   ACP session probe behind the same provider-neutral driver and process
   supervision boundary. It remains degraded and fail-closed until lifecycle,
   approval and recovery evidence is complete.
-- Memory/RAG candidate boundary: `workers/memory-rag` is a dependency-free,
-  read-only lexical retrieval candidate. Rust supplies verified, scoped,
-  already-accepted records; the worker returns ranked references and an
-  evidence digest. It has no authority database access and is not yet the
-  production Memory Authority or a frozen cross-language contract.
+- Memory/RAG boundary: `workers/memory-rag` is a dependency-free, read-only
+  lexical retrieval implementation behind the frozen `egopulse.memory.v1`
+  contract. Rust supplies verified, scoped, already-accepted records; the
+  worker returns ranked references and a snapshot-bound evidence digest. It
+  has no authority database access and is not the production Memory Authority.
 - Generic Worker process framing: `egopulse-process-supervision` provides a
   bounded, supervised one-request/one-response length-delimited stdin/stdout
   boundary for future Workers. It carries opaque bytes and does not freeze
@@ -85,8 +85,9 @@ verification or Task completion.
   the Rust single-writer for local Memory facts. Agent/Model/Harness writes
   enter as `candidate`; only Founder-controlled principals may accept, while
   governance/recovery principals may revoke with evidence. SQLCipher,
-  idempotency, optimistic revision checks and an audit event stream are
-  internal Rust behavior until the cross-language contract is approved.
+  idempotency, optimistic revision checks and an audit event stream remain
+  Rust-owned. The approved Worker contract exposes only a bounded accepted
+  snapshot; it does not expose authority storage or write operations.
 
 ## Repository rules
 

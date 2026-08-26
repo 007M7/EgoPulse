@@ -2,9 +2,11 @@
 
 ## Status
 
-Approval package only. This document does not modify `contracts/`, generated
-bindings, the V-01 manifest or any breaking baseline. It turns the existing
-Memory/RAG proposal into an explicit Founder decision record.
+Founder-approved implementation package. M-01 through M-06 and the initial
+limits are frozen in `egopulse.memory.v1` draft.15; generated Rust, Python and
+TypeScript bindings, the supervised Python adapter and Rust boundary validation
+are implemented. The document remains the decision record for the boundary;
+the public daemon workflow is still a later slice.
 
 The implementation boundary is intentionally narrow: Rust owns accepted
 Memory state and snapshot identity; the Python Worker performs bounded
@@ -41,7 +43,7 @@ ordering, evidence binding or fail-closed process behavior.
 
 ## Acceptance limits for the first contract draft
 
-These are implementation limits to be reviewed with the contract, not quality
+These are implementation limits of the first frozen contract, not quality
 claims about future retrieval:
 
 | Limit | Initial value | Purpose |
@@ -57,15 +59,14 @@ claims about future retrieval:
 Rust may lower a limit for a particular workflow. A Worker cannot raise one
 through configuration or a model/provider response.
 
-## Required evidence before daemon wiring
+## Evidence completed before daemon wiring
 
-After Founder approval, the implementation unit must produce all of the
-following locally on Windows x64:
+The implementation unit produced the following locally on Windows x64:
 
-1. Buf/protoc generation for Rust and Python from one Proto source;
+1. Buf/protoc generation for Rust, Python and TypeScript from one Proto source;
 2. request/response round trips with deterministic digest fixtures;
 3. malformed, duplicate, out-of-scope, oversized and digest-mismatch rejection;
-4. Worker crash, timeout, cancellation and truncated-frame evidence through
+4. Worker crash, timeout, snapshot-drift and truncated-frame evidence through
    the existing supervisor;
 5. replay evidence proving the same request/snapshot produces the same ordered
    candidate identity and evidence digest;
@@ -78,10 +79,11 @@ be added only after those operations have their own approved contract.
 
 ## Founder approval record
 
-Approval is required for M-01 through M-06 and the initial limits above.
-Until approval is recorded, the repository remains in proposal state and the
-next safe work is limited to test fixtures, supervisor utilities and review
-of the pure Worker algorithm. No generated Memory bindings are authorized by
-this document alone.
+Founder approval recorded on 2026-08-26: M-01 through M-06 and the initial
+limits above are accepted and frozen. The implementation authority reference
+is `conversation:2026-08-26:founder-memory-rag-m01-m06-freeze`. This authorizes
+generation, commit and push of Rust, Python and TypeScript bindings. It does
+not authorize embedding/index selection, a Python write path, or public
+daemon/API wiring without a separate contract decision.
 
 Related proposal: `phase-2-06-memory-rag-cross-language-contract-proposal.md`.

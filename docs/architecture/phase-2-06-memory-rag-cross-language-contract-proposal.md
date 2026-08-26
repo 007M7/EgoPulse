@@ -2,9 +2,10 @@
 
 ## Status
 
-Proposal only. This document does not modify `contracts/`, generated bindings,
-the V-01 manifest or any breaking baseline. Founder approval is required before
-the messages and field numbers become a machine contract.
+Historical proposal. M-01 through M-06 were subsequently approved and
+implemented as `egopulse.memory.v1` draft.15. This document is retained to
+show the alternatives and reasoning that preceded the freeze; its provisional
+field numbers are not the current source of truth.
 
 ## Required boundary
 
@@ -115,7 +116,7 @@ move persistence or governance into Python. Embeddings, vector indexes,
 rerankers, LangChain or LangGraph can be evaluated behind this adapter, but
 none can change the accepted-snapshot or response-evidence invariants.
 
-## Approval questions before contract freeze
+## Historical approval questions before contract freeze
 
 1. Approve the logical message set and the rule that Rust supplies accepted
    content while the Worker returns references only.
@@ -124,6 +125,8 @@ none can change the accepted-snapshot or response-evidence invariants.
 3. Approve the initial limits and `lexical-overlap-v0` profile as a testable
    baseline, without freezing an embedding or vector database choice.
 
-After approval, the next implementation unit is: add the Proto source,
-generate Rust/Python bindings, build the Worker protocol adapter, then execute
-real crash/timeout/cancel/digest-mismatch tests before daemon wiring.
+Those questions were resolved by the Founder approval recorded in
+`phase-2-10-memory-rag-contract-approval-package.md`. The implementation
+unit added the Proto source, generated Rust/Python/TypeScript bindings, built
+the Worker protocol adapter, and executed real Windows crash/timeout/
+snapshot-drift tests before daemon wiring.

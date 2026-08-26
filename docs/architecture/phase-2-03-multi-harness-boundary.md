@@ -176,6 +176,7 @@ does not close second-Harness admission. The authoritative evidence is:
 - DSH isolated ACP prompt/cancel evidence with native recovery explicitly held;
 - Codex remaining the sole active production Harness.
 
-The next implementation slice is Phase 2-04/2-06 Memory/RAG. Its pure Worker
-and generic framing work may proceed, while cross-language contract and daemon
-wiring remain pending Founder approval.
+The next implementation slice became Phase 2-04/2-06 Memory/RAG. Its pure
+Worker, generic framing and `egopulse.memory.v1` cross-language contract are
+now implemented under the 2026-08-26 Founder freeze; daemon wiring remains a
+separate later slice.

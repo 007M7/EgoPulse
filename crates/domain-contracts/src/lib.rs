@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod memory;
 pub mod profiles;
 
 pub const ARCHITECTURE_VERSION: &str = "1.0";
@@ -90,6 +91,14 @@ pub mod v01 {
                 include!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/src/generated/egopulse.persistence.v1.rs"
+                ));
+            }
+        }
+        pub mod memory {
+            pub mod v1 {
+                include!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/src/generated/egopulse.memory.v1.rs"
                 ));
             }
         }

@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package egopulse.memory.v1;
+
+// Read-only cognition-plane exchange. Rust remains the owner of accepted
+// Memory state and supplies one exact, scope-bound snapshot to the Worker.
+message RetrievalRequest {
+  string query = 1;
+  string scope_ref = 2;
+  string snapshot_sha256 = 3;
+  uint32 max_results = 4;
+  double min_score = 5;
+  string algorithm_profile = 6;
+}
+
+// This message is constructed only from records already accepted by the Rust
+// Memory Authority. It is not a command and has no Worker-owned state field.
+message AcceptedMemoryInput {
+  string memory_id = 1;
+  string content = 2;
+  string content_sha256 = 3;
+  string source_ref = 4;
+  string scope_ref = 5;
+  uint64 revision = 6;
+}
+
+// A Worker result identifies records; it never returns authoritative Memory
+// content. Rust resolves content again when compiling governed context.
+message RetrievalCandidate {
+  string memory_id = 1;
+  string source_ref = 2;
+  string content_sha256 = 3;
+  double score = 4;
+  repeated string matched_terms = 5;
+}
+
+message RetrievalResponse {
+  string algorithm_id = 1;
+  string query_sha256 = 2;
+  string snapshot_sha256 = 3;
+  repeated RetrievalCandidate candidates = 4;
+  string evidence_ref = 5;
+}
+
+// The single framed request exchanged over supervised stdin/stdout.
+message MemoryRetrievalRequest {
+  RetrievalRequest retrieval = 1;
+  repeated AcceptedMemoryInput accepted_records = 2;
+}

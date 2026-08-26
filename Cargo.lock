@@ -1152,6 +1152,7 @@ name = "egopulse-cognition-runtime"
 version = "0.1.0"
 dependencies = [
  "egopulse-domain-contracts",
+ "egopulse-process-supervision",
  "hex",
  "prost",
  "prost-types",
@@ -1159,6 +1160,7 @@ dependencies = [
  "rusqlite_migration",
  "sha2",
  "thiserror 2.0.20",
+ "tokio",
  "uuid",
  "zeroize",
 ]

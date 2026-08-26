@@ -6,7 +6,7 @@ The repository starts from the frozen architecture and technology baseline. It d
 
 ## Foundation status
 
-Current maturity: **Gate 4 vertical implementation in progress – V-01/C5 CLI+TUI closed, typed production bootstrap wired, Sego single-criterion verification closed, second Harness and Memory/RAG contract pending**.
+Current maturity: **Gate 4 vertical implementation in progress – V-01/C5 CLI+TUI closed, typed production bootstrap wired, Sego single-criterion verification closed, Memory/RAG M-01–M-06 contract implemented**.
 
 Available now:
 
@@ -29,11 +29,11 @@ Available now:
 
 Not implemented yet:
 
-- public Memory/RAG API and the frozen Rust/Python Worker contract (internal
-  Authority and read-only Worker slices exist, but are not wired to the daemon);
+- public Memory/RAG API and the daemon-facing command surface (the frozen
+  Rust/Python Worker contract, generated bindings and supervised adapter are
+  implemented, but are not yet wired to the public daemon workflow);
 - SQLCipher-backed Memory/RAG indexes and retrieval evaluation;
 - authenticated second Harness lifecycle and multi-model production dispatch;
-- approved Rust/Python Memory/RAG wire contract and daemon wiring;
 - production packaging or release.
 
 ## Repository map

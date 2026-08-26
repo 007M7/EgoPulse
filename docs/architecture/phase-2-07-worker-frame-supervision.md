@@ -2,10 +2,10 @@
 
 ## Status
 
-Implemented as generic infrastructure. This document does not define Memory
-messages, change `contracts/`, regenerate bindings, or modify the V-01
-manifest. The Memory/RAG cross-language message proposal remains pending
-Founder approval.
+Implemented as generic infrastructure. The generic framing remains
+schema-agnostic; the approved `egopulse.memory.v1` adapter now uses it for the
+Memory/RAG Worker. This document does not own Memory messages or the V-01
+manifest.
 
 ## Boundary
 
@@ -52,5 +52,6 @@ Memory authority or that a particular RAG algorithm is permanent.
 The crate tests cover deterministic encoding, round-trip decoding, invalid
 limits, oversized payloads, truncated headers, truncated payloads, trailing
 bytes and clean EOF. Clippy is run with warnings denied. End-to-end Worker
-crash, timeout and cancellation cases remain part of the first real Worker
-vertical slice.
+crash, timeout and snapshot-drift cases are now covered by the first real
+Worker vertical slice; cancellation remains a supervisor-level invariant to
+be reused by later Worker implementations.

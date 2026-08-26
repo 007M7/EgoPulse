@@ -2,9 +2,10 @@
 
 ## Status
 
-This is an implementation candidate for the Python cognition boundary. It is
-not a new V-01 Protobuf contract and does not change the frozen authority
-schema.
+This is the Python cognition boundary implementation behind the approved
+`egopulse.memory.v1` contract. The contract is tracked in
+`contracts/proto/egopulse/memory/v1/memory.proto`; this document still does
+not change the frozen Memory Authority schema.
 
 ## Ownership
 
@@ -39,11 +40,10 @@ and it has no database handle.
   matched terms;
 - rejects malformed, duplicated, tampered, over-sized or out-of-scope input.
 
-The current candidate enforces the initial proposed-boundary limits in code:
+The implementation enforces the approved initial-boundary limits in code:
 16 KiB UTF-8 query, 4 KiB routing fields, 2,048 supplied records, 64 returned
 candidates and 8 MiB total supplied content. These are resource and failure
-boundary limits, not retrieval-quality claims; the formal values remain
-subject to the Memory/RAG contract approval package.
+boundary limits, not retrieval-quality claims.
 
 This baseline is intentionally not called semantic retrieval and does not
 freeze an embedding model, vector database or LangChain/LangGraph runtime.
@@ -71,8 +71,8 @@ framework is admitted.
 
 LangChain and LangGraph are therefore not dependencies of this worker. They
 remain possible cognition-plane implementation tools, but selecting either
-would introduce framework lifecycle, upgrade and observability coupling before
-the Memory Authority and retrieval contract are frozen.
+would introduce framework lifecycle, upgrade and observability coupling
+without a measured retrieval-quality and index-lifecycle decision.
 
 ## Acceptance evidence
 
@@ -83,6 +83,6 @@ vector is pinned in
 `workers/memory-rag/tests/test_retrieval.py`; it fixes the ordered candidate
 identity, matched terms, query digest and evidence digest for the
 `lexical-overlap-v0` baseline. This is algorithm regression evidence only. It
-does not freeze the future cross-language Memory contract or authorize a
-particular embedding, index or reranker. The worker has no persistence
-dependency and therefore cannot silently write Memory facts during retrieval.
+does not authorize a particular embedding, index or reranker. The worker has
+no persistence dependency and therefore cannot silently write Memory facts
+during retrieval.

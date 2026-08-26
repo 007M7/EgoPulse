@@ -1,8 +1,8 @@
 {
   "schemaVersion": "v01-gate3-contract-candidate-manifest/v0.1",
   "candidateId": "v01-gate3-contracts",
-  "candidateVersion": "0.1.0-draft.14",
-  "status": "targeted_gate3_revision_founder_confirmed_g4_08c_support_profiles_reverified_g4_08a2_authorized",
+  "candidateVersion": "0.1.0-draft.15",
+  "status": "targeted_gate3_revision_founder_confirmed_g4_08c_support_profiles_reverified_memory_rag_contract_frozen",
   "ssotRole": "implementation_contract_ssot",
   "featureId": "v01-governed-single-harness-work-loop",
   "architectureAuthorityRef": "conversation:2026-08-23:founder-v01-feature-adr-a01",
@@ -23,6 +23,7 @@
   "targetedRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3",
   "approvalReadModelRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a",
   "g408cSupportProfilesAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
+  "memoryRagAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m01-m06-freeze",
   "implementationAuthorized": true,
   "handoffRule": {
     "gate": "Gate 4",
@@ -102,17 +103,23 @@
       "name": "Client Kernel and Authorization Support Profiles",
       "status": "founder_confirmed_targeted_gate3_reverified",
       "founderDecisionRequired": true
+    },
+    {
+      "id": "M-01..M-06",
+      "name": "Memory/RAG Read-Only Worker Contract",
+      "status": "founder_confirmed_toolchain_verified",
+      "founderDecisionRequired": true
     }
   ],
   "validation": {
     "localCandidateValidator": "scripts/validate-candidate.js",
     "localCandidateStatus": "passed_181_domain_fixtures_plus_1_foundation_fixture",
-    "bufLint": "passed_buf_1.72.0_draft14_with_two_documented_rpc_naming_exceptions",
-    "bufBuild": "passed_draft14_proto_descriptor_unchanged_from_draft13_sha256_fe13c937feb38a4df8f880739f4f8582d12b66f282c2f5dada7dd5886b0a0fa7",
+    "bufLint": "passed_buf_1.72.0_draft15_with_two_documented_rpc_naming_exceptions",
+    "bufBuild": "passed_draft15_proto_descriptor_sha256_3500c3a10961173a43e4424598f481ef274f9fabdfd3c49a9ce140b2e0100378",
     "bufBreaking": "passed_no_new_wire_breaks_against_draft13_and_exact_founder_authorized_two_field_breaks_against_draft11",
-    "protocCompile": "passed_libprotoc_35.1_draft14_ten_v01_modules_plus_foundation",
-    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_draft14_ten_v01_modules_plus_foundation",
-    "faultConformance": "passed_80_real_process_aborts_bundled_sqlcipher_encrypted_header_integrity_ok_including_policy_decision_boundary",
+    "protocCompile": "passed_libprotoc_35.1_draft15_eleven_v01_modules_plus_foundation",
+    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_draft15_eleven_v01_modules_plus_foundation",
+    "faultConformance": "passed_80_real_process_aborts_bundled_sqlcipher_encrypted_header_integrity_ok_including_policy_decision_boundary_plus_memory_rag_real_worker_roundtrip_crash_timeout_snapshot_drift",
     "qualityBudgetProfile": "passed_33_d03_rules_exactly_once_with_gate3_design_gate6_verification_binding",
     "clientKernelProfile": "passed_versioned_surface_neutral_rust_shared_kernel_profile_with_exact_digest_reference",
     "authorizationCapabilityProfile": "passed_exact_permission_rpc_command_oneof_catalog_with_fail_closed_defaults"
@@ -957,6 +964,10 @@
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
       "sha256": "943bcbe3bc09734fcd9a81d1a0df2094690173b368e062ab566cc088cdecb6ce"
+    },
+    {
+      "path": "proto/egopulse/memory/v1/memory.proto",
+      "sha256": "08f9fca198ae54f1d8fd0d16b8598cae35613c320079b7bd8ba8773a0b77227e"
     },
     {
       "path": "proto/egopulse/persistence/v1/persistence.proto",
