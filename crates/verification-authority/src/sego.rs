@@ -26,6 +26,11 @@ pub struct SegoMapperPolicy {
     pub expected_reviewer: String,
     pub expected_engine_version: String,
     pub expected_review_mode: String,
+    /// Allows an explicitly configured deterministic acceptance checker to
+    /// treat a structurally valid zero-finding review as positive proof. This
+    /// is false for normal Sego/model review, where absence of a finding is
+    /// deliberately only `Unverified`.
+    pub positive_acceptance: bool,
     pub failure_threshold: DiscrepancySeverity,
     pub raw_output_artifact_id: String,
     pub raw_output_address: ContentAddress,
@@ -196,6 +201,21 @@ fn map_structured(
     result_id: String,
 ) -> Result<SegoMappedResult, SegoMapError> {
     if review.findings.is_empty() {
+        if policy.positive_acceptance {
+            return Ok(SegoMappedResult {
+                criterion_result: base_result(
+                    result_id,
+                    policy,
+                    CriterionOutcome::Passed,
+                    EvidenceCoverage::Complete,
+                    vec![policy.raw_output_artifact_id.clone()],
+                    Vec::new(),
+                ),
+                discrepancies: Vec::new(),
+                unverified_items: Vec::new(),
+                review_id: review.id,
+            });
+        }
         let item = unverified_item(
             &review.id,
             &policy.criterion_id,

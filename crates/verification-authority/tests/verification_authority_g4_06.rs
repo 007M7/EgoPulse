@@ -195,6 +195,23 @@ fn sego_mapper_preserves_failed_unverified_and_parser_error_as_distinct_states()
 }
 
 #[test]
+fn explicit_positive_acceptance_mode_maps_structured_zero_findings_to_passed() {
+    let mut policy = mapper_policy();
+    policy.positive_acceptance = true;
+    let mapped = map_sego_review(&sego_review_with_zero_findings(), &policy)
+        .expect("positive acceptance output maps");
+    assert_eq!(
+        mapped.criterion_result.outcome,
+        CriterionOutcome::Passed as i32
+    );
+    assert_eq!(
+        mapped.criterion_result.evidence_coverage,
+        EvidenceCoverage::Complete as i32
+    );
+    assert!(mapped.criterion_result.unverified_item_ids.is_empty());
+}
+
+#[test]
 fn sego_mapper_rejects_unattested_version_and_stale_input_binding() {
     let policy = mapper_policy();
     let mut stale_version: serde_json::Value =
@@ -995,6 +1012,7 @@ fn mapper_policy() -> SegoMapperPolicy {
         expected_reviewer: "sego".to_owned(),
         expected_engine_version: "0.1.9".to_owned(),
         expected_review_mode: "model_code_review".to_owned(),
+        positive_acceptance: false,
         failure_threshold: DiscrepancySeverity::Major,
         raw_output_artifact_id: "raw-sego-output".to_owned(),
         raw_output_address: address(SHA_A, 512),

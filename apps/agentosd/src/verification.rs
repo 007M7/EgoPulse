@@ -12,7 +12,7 @@ use egopulse_domain_contracts::v01::egopulse::{
         task_command,
     },
     verification::v1::{
-        AttestCheckerProfileCommand, CheckerProfile, CheckerProfileStatus,
+        AttestCheckerProfileCommand, CheckerAssuranceClass, CheckerProfile, CheckerProfileStatus,
         CreateVerificationRequestCommand, VerificationBinding, VerificationCommand,
         VerificationRequest, verification_command,
     },
@@ -609,6 +609,9 @@ impl VerificationWorkerConfig {
             || self.verification_artifact_id_prefix.trim().is_empty()
             || self.execution_id_prefix.trim().is_empty()
             || self.mapper_policy.raw_output_artifact_id.trim().is_empty()
+            || (self.mapper_policy.positive_acceptance
+                && self.checker_profile.assurance_class
+                    != CheckerAssuranceClass::Deterministic as i32)
             || self.checker_timeout.is_zero()
             || self.checker_output_limit == 0
         {

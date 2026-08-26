@@ -19,10 +19,13 @@ use egopulse_cognition_runtime::task_authority::{
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::{CommandMetadata, ContractReference},
     task::v1::{
-        ActivateTaskCommand, CreateTaskCommand, TaskCommand as DomainTaskCommand, TaskSnapshot,
-        TaskStatus, task_command,
+        ActivateTaskCommand, CreateTaskCommand, SubmitTaskEvidenceCommand,
+        TaskCommand as DomainTaskCommand, TaskSnapshot, TaskStatus, task_command,
     },
+    verification::v1::{CheckerAssuranceClass, CheckerProfile},
 };
+use egopulse_local_api::command_gateway::CommandPrincipal;
+use egopulse_verification_authority::canonical_checker_profile_digest;
 use prost_types::Timestamp;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -112,6 +115,40 @@ fn contract(contract_id: &str, byte: u8) -> ContractReference {
     }
 }
 
+fn acceptance_checker_profile() -> CheckerProfile {
+    let mut profile = CheckerProfile {
+        checker_profile_id: "checker-profile:g4-04".to_owned(),
+        revision: 0,
+        status: 0,
+        checker_id: "deterministic:g4-04-acceptance".to_owned(),
+        checker_version: "v1".to_owned(),
+        input_contract_ref: Some(contract("verification-input", 0x01)),
+        output_contract_ref: Some(contract("verification-output", 0x02)),
+        supported_criterion_types: vec!["criterion:g4-04".to_owned()],
+        assurance_class: CheckerAssuranceClass::Deterministic as i32,
+        sandbox_profile_ref: Some(contract("verification-sandbox", 0x03)),
+        tool_policy_ref: Some(contract("verification-tool-policy", 0x04)),
+        data_egress_policy_ref: Some(contract("verification-egress-policy", 0x05)),
+        timeout_ms: 2_000,
+        network_allowed: false,
+        profile_digest_sha256: String::new(),
+        attestation_evidence_artifact_ids: vec![
+            "artifact:harness-output:dispatch:g4-04-production".to_owned(),
+        ],
+        attested_at: None,
+    };
+    profile.profile_digest_sha256 = canonical_checker_profile_digest(&profile);
+    profile
+}
+
+fn reference_value(reference: &ContractReference) -> Value {
+    serde_json::json!({
+        "contract_id": reference.contract_id,
+        "version": reference.version,
+        "sha256": reference.sha256,
+    })
+}
+
 fn metadata(command_id: &str, idempotency_key: &str, correlation_id: &str) -> CommandMetadata {
     CommandMetadata {
         command_id: command_id.to_owned(),
@@ -142,6 +179,13 @@ fn seal(mut command: DomainTaskCommand) -> DomainTaskCommand {
                 .meta
                 .as_mut()
                 .expect("activate metadata")
+                .request_digest_sha256 = digest;
+        }
+        Some(task_command::Command::SubmitTaskEvidence(value)) => {
+            value
+                .meta
+                .as_mut()
+                .expect("evidence metadata")
                 .request_digest_sha256 = digest;
         }
         _ => panic!("unexpected Task command in G4-04 fixture"),
@@ -300,6 +344,107 @@ fn user_config(root: &TempRoot, input_digest: &str, codex_executable: &Path) -> 
         root.path().display().to_string(),
     );
 
+    let profile = acceptance_checker_profile();
+    let review = serde_json::json!({
+        "schema_version": 1,
+        "id": "review:g4-04-acceptance",
+        "scope": "g4-04",
+        "diff_hash": "a".repeat(64),
+        "finding_count": 0,
+        "highest_severity": Value::Null,
+        "parse_status": "structured",
+        "findings": [],
+        "reviewer": "g4-04-acceptance-checker",
+        "engine_version": "g4-04-v1",
+        "review_mode": "deterministic_acceptance"
+    });
+    let review_bytes = serde_json::to_vec(&review).expect("serialize acceptance review");
+    let checker_script = root.path().join("g4-04-acceptance-checker.ps1");
+    let review_text = String::from_utf8(review_bytes.clone()).expect("review JSON UTF-8");
+    fs::write(
+        &checker_script,
+        format!(
+            "[Console]::Out.Write('{}')",
+            review_text.replace('\'', "''")
+        ),
+    )
+    .expect("write deterministic acceptance checker");
+    let raw_output_address = hex::encode(Sha256::digest(&review_bytes));
+    let checker_executable =
+        PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+    let profile_ref = ContractReference {
+        contract_id: profile.checker_profile_id.clone(),
+        version: profile.checker_version.clone(),
+        sha256: profile.profile_digest_sha256.clone(),
+    };
+    set_value(
+        &mut config,
+        "/verification/criteria/0/criterion_id",
+        Value::String("criterion:g4-04".to_owned()),
+    );
+    set_value(
+        &mut config,
+        "/verification/criteria/0/checker_profile_ids",
+        serde_json::json!([profile.checker_profile_id.clone()]),
+    );
+    config["verification_worker"] = serde_json::json!({
+        "handoff": {
+            "claim_id": "claim:harness-output-captured:dispatch:g4-04-production",
+            "claim_semantic_profile_ref": reference_value(&contract("replace-claim-semantic-profile", 0x22)),
+            "criterion_ids": ["criterion:g4-04"],
+            "checker_profile_refs": [reference_value(&profile_ref)]
+        },
+        "checker_profile": {
+            "checker_profile_id": profile.checker_profile_id,
+            "revision": 0,
+            "status": 1,
+            "checker_id": profile.checker_id,
+            "checker_version": profile.checker_version,
+            "input_contract_ref": profile.input_contract_ref.as_ref().map(reference_value),
+            "output_contract_ref": profile.output_contract_ref.as_ref().map(reference_value),
+            "supported_criterion_types": profile.supported_criterion_types,
+            "assurance_class": profile.assurance_class,
+            "sandbox_profile_ref": profile.sandbox_profile_ref.as_ref().map(reference_value),
+            "tool_policy_ref": profile.tool_policy_ref.as_ref().map(reference_value),
+            "data_egress_policy_ref": profile.data_egress_policy_ref.as_ref().map(reference_value),
+            "timeout_ms": profile.timeout_ms,
+            "network_allowed": profile.network_allowed,
+            "profile_digest_sha256": profile.profile_digest_sha256,
+            "attestation_evidence_artifact_ids": profile.attestation_evidence_artifact_ids,
+            "attested_at": Value::Null
+        },
+        "checker_executable": checker_executable.display().to_string(),
+        "checker_arguments": ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", checker_script.display().to_string()],
+        "working_directory": root.path().display().to_string(),
+        "checker_request_hex": "7b7d",
+        "mapper": {
+            "criterion_id": "criterion:g4-04",
+            "requirement": 1,
+            "checker_profile_ref": reference_value(&profile_ref),
+            "expected_scope": "g4-04",
+            "expected_diff_hash": "a".repeat(64),
+            "expected_reviewer": "g4-04-acceptance-checker",
+            "expected_engine_version": "g4-04-v1",
+            "expected_review_mode": "deterministic_acceptance",
+            "positive_acceptance": true,
+            "failure_threshold": 2,
+            "raw_output_artifact_id": "artifact:harness-output:dispatch:g4-04-production",
+            "raw_output_address": {
+                "algorithm": 1,
+                "digest": raw_output_address,
+                "byte_length": review_bytes.len()
+            },
+            "finding_evidence": {}
+        },
+        "verification_run_id_prefix": "worker-run-",
+        "verification_artifact_id_prefix": "worker-artifact-",
+        "execution_id_prefix": "worker-execution-",
+        "tool_receipt_artifact_ids": [],
+        "model_call_receipt_artifact_ids": [],
+        "checker_timeout_ms": 2_000,
+        "checker_output_limit": 64 * 1024
+    });
+
     let path = root.path().join("agentos-config.json");
     fs::write(
         &path,
@@ -309,7 +454,7 @@ fn user_config(root: &TempRoot, input_digest: &str, codex_executable: &Path) -> 
     path
 }
 
-fn seed_activation(root: &TempRoot) {
+fn seed_activation(root: &TempRoot) -> (String, u64, u64) {
     let task_db = root.path().join("data").join("task.db");
     let creation_guard = ConfiguredTaskCreationGuard::new(ConfiguredTaskCreationGuardConfig {
         allowed_work_types: BTreeSet::from(["governed_repository_change".to_owned()]),
@@ -375,7 +520,18 @@ fn seed_activation(root: &TempRoot) {
     let activated = authority
         .execute(&activate, &system)
         .expect("activate seeded Task");
+    let activated_task = match activated.outcome.expect("activated Task outcome") {
+        egopulse_domain_contracts::v01::egopulse::task::v1::task_command_result::Outcome::Task(
+            task,
+        ) => task,
+        other => panic!("unexpected activate outcome: {other:?}"),
+    };
     assert!(activated.committed_event.is_some());
+    (
+        activated_task.task_id,
+        activated_task.revision,
+        activated_task.work_revision,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -387,33 +543,102 @@ async fn user_configured_production_runner_completes_real_codex_dispatch() {
     };
     let codex_executable = PathBuf::from(codex_executable);
     let root = TempRoot::new();
+    eprintln!("g4-04: temp root created");
     let bundle = br#"{"prompt":"Reply with exactly EGO_PULSE_G4_04_OK and do not use tools."}"#;
     let input_digest = hex::encode(Sha256::digest(bundle));
     let config_path = user_config(&root, &input_digest, &codex_executable);
-    seed_activation(&root);
+    eprintln!("g4-04: user config written");
+    let (task_id, task_revision, work_revision) = seed_activation(&root);
+    eprintln!("g4-04: task activated");
 
     let mut providers = ProductionBootstrapConfig::from_user_file(&config_path)
         .expect("load user-owned production config")
         .build()
         .expect("build production providers");
+    eprintln!("g4-04: production providers built");
     let runner = providers
         .harness_dispatch_runner
         .take()
         .expect("production Codex runner");
+    let verification_worker = providers
+        .verification_worker
+        .take()
+        .expect("production Verification worker");
+    eprintln!("g4-04: runner and worker taken");
 
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut terminal_dispatch_ids = Vec::new();
+    let mut terminal_seen = false;
     while Instant::now() < deadline {
-        let report = runner.run_once().await.expect("production runner cycle");
+        eprintln!("g4-04: dispatch cycle");
+        let report = tokio::time::timeout(Duration::from_secs(20), runner.run_once())
+            .await
+            .expect("production runner cycle timed out")
+            .expect("production runner cycle");
         terminal_dispatch_ids.extend(report.terminal_dispatch_ids);
         if report.terminal_observations > 0 {
             assert_eq!(terminal_dispatch_ids, vec![DISPATCH_ID.to_owned()]);
             assert_eq!(report.terminal_output_candidates_seen, 1);
             assert_eq!(report.terminal_output_candidates_receipted, 1);
             assert_eq!(report.terminal_output_candidates_held, 0);
-            return;
+            terminal_seen = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    panic!("Codex production dispatch did not reach a terminal observation");
+    assert!(
+        terminal_seen,
+        "Codex production dispatch did not reach a terminal observation"
+    );
+    eprintln!("g4-04: terminal dispatch observed");
+
+    let evidence = seal(DomainTaskCommand {
+        command: Some(task_command::Command::SubmitTaskEvidence(
+            SubmitTaskEvidenceCommand {
+                meta: Some(metadata(
+                    "g4-04-submit-evidence",
+                    "g4-04-submit-evidence",
+                    "g4-04",
+                )),
+                task_id: task_id.clone(),
+                expected_revision: task_revision,
+                work_revision,
+                return_handoff_id: format!("return-handoff:harness:{DISPATCH_ID}"),
+                artifact_set_id: format!("artifact-set:harness-return:{DISPATCH_ID}"),
+            },
+        )),
+    });
+    let task_result = providers
+        .task_port
+        .execute(
+            &evidence,
+            &CommandPrincipal {
+                principal_id: "local-user:g4-04-test".to_owned(),
+                required_authority_principal_kinds: Vec::new(),
+            },
+        )
+        .expect("submit production Task evidence");
+    assert!(task_result.result.committed_event.is_some());
+    eprintln!("g4-04: task evidence submitted");
+
+    let verification = verification_worker
+        .run_once()
+        .await
+        .expect("run production Verification worker");
+    assert!(matches!(
+        verification,
+        egopulse_agentosd::VerificationWorkerCycleResult::Completed {
+            execution_replayed: false,
+            write_back_replayed: false,
+            ..
+        }
+    ));
+    eprintln!("g4-04: verification completed");
+
+    let settlement = tokio::time::timeout(Duration::from_secs(20), runner.run_once())
+        .await
+        .expect("production return settlement timed out")
+        .expect("production return settlement");
+    assert_eq!(settlement.terminal_observations, 0);
+    eprintln!("g4-04: return settlement completed");
 }

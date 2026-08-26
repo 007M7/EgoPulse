@@ -3,7 +3,9 @@
 - Status: technical intake, Attempt-return projection and Verification-gated
   Step completion implemented; shared CLI/TUI ReturnPending read path, real
   Windows C5, real Codex app-server turn and real production runner-to-Artifact
-  collector evidence passed; daemon Verification-gated settlement pending
+  collector evidence have historical passes; the latest user-owned Codex
+  app-server rerun currently fails at initialization with EOF, so real daemon
+  Verification-gated settlement remains open
 - Date: 2026-08-26
 - Scope: native terminal output through technical Artifact Authority receipt
 - Not in scope: Task completion and Founder Verdict consumption
@@ -61,6 +63,15 @@ facts.
 - The production Harness runner now keeps the Artifact return outbox pending when the
   Verification-gated Step return is not yet provable; it retries the same deterministic command
   and only ACKs the Artifact outbox after Step/Run return is committed or replayed.
+- Normal Sego/model review keeps the conservative meaning of zero findings: it maps to
+  `Unverified`, not `Passed`. A zero-finding `Passed` result is available only through an explicit
+  `positive_acceptance` configuration, and bootstrap validation requires the checker profile to be
+  `Deterministic`. This is an acceptance-checker mode for a bounded deterministic contract, not a
+  way for a model reviewer to self-certify its own output.
+- The acceptance checker still has to emit the same structured review contract, match scope,
+  diff-hash, reviewer, engine and review-mode, and bind its raw output to the collected Artifact
+  Authority artifact. The resulting Verification artifact remains subject to the normal canonical
+  payload, lineage, ArtifactSet and ReturnHandoff checks.
 - Once the technical Attempt return is already durable, the retry path does not issue a second
   `RecordAttemptReturn` with changed CAS revisions; it proceeds directly to the Verification-gated
   Step return. This preserves both idempotency-key digest stability and single-writer ownership.
@@ -115,13 +126,14 @@ deterministic fixtures can exercise the same production runner and collector wit
 An agentosd composition test now proves that the real daemon background worker polls
 an injected `HarnessDispatchRunner` and shuts down cleanly; this proves worker wiring,
 not provider-specific Codex protocol behavior. The ignored Windows x64
-`production_runner_g4_04` Gate was then run with the installed Codex app-server and
-eight temporary isolated Authority keys. It passed in 21.25 seconds and now asserts
-all of the following in one report: the real dispatch reached a terminal observation,
-exactly one terminal output candidate was seen, exactly one was receipted by the
-governed collector, and none was held. This is the first real production-composition
-evidence for `Harness -> Adapter Edge -> Artifact Authority` on Windows x64; it does
-not claim Verification-gated Step/Run settlement.
+`production_runner_g4_04` Gate previously passed with the installed Codex app-server and
+eight temporary isolated Authority keys in 21.25 seconds. That historical run asserted
+the real dispatch reached a terminal observation, exactly one terminal output candidate
+was seen, exactly one was receipted by the governed collector, and none was held. On the
+latest rerun, the same user-owned Codex executable exited before initialization and the
+adapter returned `CODEX_APP_SERVER_EOF`; the independent adapter E2E reproduces the same
+failure. This is an external Harness readiness failure, not evidence for or against the
+Verification settlement implementation, and no `Returned` claim is made from that run.
 
 The latest local evidence is:
 
@@ -131,25 +143,24 @@ collaboration_control_g4_03                    22 passed
 c5_00_daemon_fixture                             7 passed
   return_settlement_g4_11                          1 passed
   cargo clippy --workspace --all-targets -D warnings passed
-  real Codex app-server Rust E2E                   1 passed (configured)
-  real production runner + collector Gate          1 passed (configured)
+  real Codex app-server Rust E2E                   historical pass; latest run CODEX_APP_SERVER_EOF
+  real production runner + collector Gate          historical pass; latest run blocked at init
+  Sego default zero-findings semantics              passed (Unverified)
+  Sego deterministic acceptance mode               passed (Passed + Complete)
 ```
 
-The installed real Codex app-server was also probed on Windows x64 through
-`codex.exe app-server --stdio`. It returned successful `initialize`,
-`thread/start`, and `thread/started` messages with native version
-`0.148.0-alpha.15`, matching the adapter's frozen executable baseline. The configured
-Rust E2E additionally issued one constrained `turn/start` and received the exact
-`EGOPULSE_CODEX_E2E_OK` terminal candidate in 18.95 seconds. The environment emitted
-`codex-code-mode-host.exe` unavailable as a non-critical `warning`; the adapter now
-retains its raw evidence and SHA-256 diagnostic fingerprint without failing the
-dispatch stream. This does not claim Artifact collection, Verification retry, or
-Returned settlement, which remain separate governed boundaries.
+An earlier configured run of the installed real Codex app-server on Windows x64 returned
+successful `initialize`, `thread/start`, `thread/started` and constrained `turn/start`
+messages with native version `0.148.0-alpha.15`, and received the exact
+`EGOPULSE_CODEX_E2E_OK` terminal candidate. The current rerun instead terminates with
+`CODEX_APP_SERVER_EOF` during initialization, so the executable must be re-probed before
+this becomes current release evidence. This does not claim Artifact collection,
+Verification retry, or `Returned` settlement.
 
 Continue the next side without widening collector authority:
 
-1. drive the Verification worker from this Collaboration return boundary using
-   sealed Artifact Authority references;
-2. add the real daemon + Harness integration fixture with a committed Verification
+1. restore a healthy user-owned Codex app-server and rerun the real adapter and
+   production gates;
+2. complete the real daemon + Harness integration fixture with a committed Verification
    artifact and assert the internal retry reaches `Returned`;
 3. wire Task completion only through its separately governed write-back path.

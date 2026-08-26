@@ -387,6 +387,7 @@ async fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox(
                 expected_reviewer: "sego".to_owned(),
                 expected_engine_version: "v1".to_owned(),
                 expected_review_mode: "model_code_review".to_owned(),
+                positive_acceptance: false,
                 failure_threshold: DiscrepancySeverity::Major,
                 raw_output_artifact_id: "attestation-artifact-g4-10".to_owned(),
                 raw_output_address: ContentAddress {

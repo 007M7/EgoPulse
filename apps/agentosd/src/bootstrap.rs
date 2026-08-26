@@ -428,6 +428,8 @@ struct SegoMapperFile {
     expected_reviewer: String,
     expected_engine_version: String,
     expected_review_mode: String,
+    #[serde(default)]
+    positive_acceptance: bool,
     failure_threshold: i32,
     raw_output_artifact_id: String,
     raw_output_address: ContentAddressFile,
@@ -1091,6 +1093,7 @@ impl SegoMapperFile {
             expected_reviewer: self.expected_reviewer,
             expected_engine_version: self.expected_engine_version,
             expected_review_mode: self.expected_review_mode,
+            positive_acceptance: self.positive_acceptance,
             failure_threshold,
             raw_output_artifact_id: self.raw_output_artifact_id,
             raw_output_address: self.raw_output_address.into_typed()?,
