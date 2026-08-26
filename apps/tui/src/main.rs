@@ -18,6 +18,7 @@ use egopulse_client_operations::{
 };
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
+    collaboration::v1::RunStatus,
     common::v1::ContractReference,
     harness::v1::ApprovalDecision,
     harness::v1::ApprovalRequestLifecycleKind,
@@ -1706,6 +1707,14 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, tasks: &[TaskView]) {
                     .unwrap_or("TASK_STATUS_UNSPECIFIED"),
             ),
             Cell::from(task.map_or("-".to_owned(), |value| value.revision.to_string())),
+            Cell::from(
+                view.collaboration
+                    .as_ref()
+                    .and_then(|value| value.run.as_ref())
+                    .and_then(|value| RunStatus::try_from(value.status).ok())
+                    .map(|value| value.as_str_name())
+                    .unwrap_or("RUN_STATUS_UNSPECIFIED"),
+            ),
         ])
     });
     frame.render_widget(
@@ -1713,11 +1722,15 @@ fn render_tasks(frame: &mut Frame<'_>, area: Rect, tasks: &[TaskView]) {
             rows,
             [
                 Constraint::Percentage(48),
-                Constraint::Percentage(32),
+                Constraint::Percentage(24),
                 Constraint::Length(12),
+                Constraint::Percentage(28),
             ],
         )
-        .header(Row::new(["Task", "Status", "Revision"]).style(Style::default().fg(Color::Yellow)))
+        .header(
+            Row::new(["Task", "Status", "Revision", "Workflow"])
+                .style(Style::default().fg(Color::Yellow)),
+        )
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1998,5 +2011,32 @@ mod tests {
                 && scope == "scope:founder"
                 && (min_score - 0.25).abs() < f64::EPSILON
         ));
+    }
+
+    #[test]
+    fn task_render_reads_collaboration_status_from_the_same_task_view() {
+        let view = TaskView {
+            collaboration: Some(
+                egopulse_domain_contracts::v01::egopulse::collaboration::v1::CollaborationSnapshot {
+                    run: Some(
+                        egopulse_domain_contracts::v01::egopulse::collaboration::v1::RunSnapshot {
+                            status: RunStatus::Returned as i32,
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            view.collaboration
+                .as_ref()
+                .and_then(|value| value.run.as_ref())
+                .and_then(|value| RunStatus::try_from(value.status).ok())
+                .expect("run")
+                .as_str_name(),
+            "RUN_STATUS_RETURNED"
+        );
     }
 }

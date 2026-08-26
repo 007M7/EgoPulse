@@ -63,6 +63,12 @@ form-to-operation mapping. The real Windows C5 fixture additionally invokes
 the TUI command against a missing graph and verifies the typed `NOT_FOUND`
 failure, proving that this path reaches the daemon read model and fails closed.
 
+The shared `TaskView` presentation now also exposes the governed Collaboration
+return state on both surfaces. CLI JSON/text reports the Run status and bounded
+`ReturnPending`/`Returned` Step counts; TUI renders the same Run status in its
+task table. This is a read-only projection of the existing Local API view, not
+a client-side Collaboration writer or a surface-specific capability.
+
 ## Composition root boundary
 
 The normal `agentosd` binary now loads the reusable `ProductionBootstrapConfig`

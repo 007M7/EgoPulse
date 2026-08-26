@@ -14,6 +14,7 @@ use egopulse_client_operations::{
 };
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
+    collaboration::v1::{RunStatus, StepStatus},
     common::v1::ContractReference,
     harness::v1::ApprovalDecision,
     localapi::v1::{
@@ -2049,10 +2050,32 @@ fn projection_position_json(
 
 fn task_summary(view: &TaskView) -> serde_json::Value {
     let task = view.task.as_ref();
+    let collaboration = view.collaboration.as_ref();
+    let run = collaboration.and_then(|value| value.run.as_ref());
+    let return_pending_steps = collaboration.map_or(0, |value| {
+        value
+            .steps
+            .iter()
+            .filter(|step| step.status == StepStatus::ReturnPending as i32)
+            .count()
+    });
+    let returned_steps = collaboration.map_or(0, |value| {
+        value
+            .steps
+            .iter()
+            .filter(|step| step.status == StepStatus::Returned as i32)
+            .count()
+    });
     json!({
         "taskId": task.map(|task| task.task_id.clone()),
         "revision": task.map_or(0, |task| task.revision),
         "status": task.and_then(|task| TaskStatus::try_from(task.status).ok()).map(|status| status.as_str_name()),
+        "collaboration": {
+            "runId": run.map(|run| run.run_id.clone()),
+            "runStatus": run.and_then(|run| RunStatus::try_from(run.status).ok()).map(|status| status.as_str_name()),
+            "returnPendingSteps": return_pending_steps,
+            "returnedSteps": returned_steps,
+        },
         "projection": projection_json(view.metadata.as_ref()),
     })
 }
@@ -2073,6 +2096,21 @@ fn render_task_view(operation: &'static str, view: &TaskView, json_output: bool)
             payload["data"]["taskId"].as_str().unwrap_or(""),
             payload["data"]["revision"].as_u64().unwrap_or_default(),
             payload["data"]["status"].as_str().unwrap_or(""),
+        );
+        println!(
+            "Workflow: run={} status={} return_pending_steps={} returned_steps={}",
+            payload["data"]["collaboration"]["runId"]
+                .as_str()
+                .unwrap_or(""),
+            payload["data"]["collaboration"]["runStatus"]
+                .as_str()
+                .unwrap_or(""),
+            payload["data"]["collaboration"]["returnPendingSteps"]
+                .as_u64()
+                .unwrap_or_default(),
+            payload["data"]["collaboration"]["returnedSteps"]
+                .as_u64()
+                .unwrap_or_default(),
         );
     }
 }
@@ -2222,5 +2260,42 @@ mod tests {
                 .unwrap()
                 .contains("private pipe path")
         );
+    }
+
+    #[test]
+    fn task_summary_exposes_governed_return_state_without_adding_write_authority() {
+        let view = TaskView {
+            task: None,
+            collaboration: Some(
+                egopulse_domain_contracts::v01::egopulse::collaboration::v1::CollaborationSnapshot {
+                    run: Some(
+                        egopulse_domain_contracts::v01::egopulse::collaboration::v1::RunSnapshot {
+                            run_id: "run-1".to_owned(),
+                            status: RunStatus::ReturnPending as i32,
+                            ..Default::default()
+                        },
+                    ),
+                    steps: vec![
+                        egopulse_domain_contracts::v01::egopulse::collaboration::v1::StepSnapshot {
+                            status: StepStatus::ReturnPending as i32,
+                            ..Default::default()
+                        },
+                        egopulse_domain_contracts::v01::egopulse::collaboration::v1::StepSnapshot {
+                            status: StepStatus::Returned as i32,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        };
+        let summary = task_summary(&view);
+        assert_eq!(
+            summary["collaboration"]["runStatus"],
+            "RUN_STATUS_RETURN_PENDING"
+        );
+        assert_eq!(summary["collaboration"]["returnPendingSteps"], 1);
+        assert_eq!(summary["collaboration"]["returnedSteps"], 1);
     }
 }
