@@ -102,11 +102,10 @@ independent probe evidence and native protocol fingerprint before a `Ready`
 result can become capability-attestation input. A future Kimi or DeepSeek
 adapter cannot bypass it by returning a provider-specific success shape.
 
-The current code unit is the authenticated-session boundary for the Kimi
-candidate. It records the ACP `initialize` result and the empty `session/new`
-disposition, but it does not send a prompt. A candidate is not promoted to an
-active Harness merely because its process starts or its session can be
-created.
+The current Kimi code unit remains an authenticated-session boundary. It
+records the ACP `initialize` result and empty `session/new` disposition, but
+does not send a prompt. A candidate is not promoted to an active Harness
+merely because its process starts or its session can be created.
 
 The ACP codec is now isolated in `crates/kimi-adapter/src/acp.rs`. It keeps
 `session/update`, prompt/cancel request construction and server-side
@@ -166,6 +165,15 @@ cancellation and reconciliation surfaces all return `CapabilityMismatch` with
 `ProvenNotSent`. This is a candidate safety invariant, not evidence of
 second-Harness support.
 
+The DSH candidate now has a deliberately narrower execution slice in
+`crates/dsh-adapter`: fresh ACP `session/prompt`, supervised terminal event
+mapping and native `session/cancel`. Its local replay tests pass against the
+compiled DSH ACP demo. This does not change admission: native
+`session/load`/`session/resume` are unsupported, approval/server-request
+routing is not attested, and artifact semantics are not claimed. The driver
+is therefore still candidate-only and is not wired into daemon provider
+selection.
+
 ## Phase 2-03 exit disposition
 
 Phase 2-03 closes its provider-neutral boundary and candidate-probe slice, but
@@ -176,7 +184,9 @@ does not close second-Harness admission. The authoritative evidence is:
 - DSH isolated ACP prompt/cancel evidence with native recovery explicitly held;
 - Codex remaining the sole active production Harness.
 
-The next implementation slice became Phase 2-04/2-06 Memory/RAG. Its pure
-Worker, generic framing and `egopulse.memory.v1` cross-language contract are
-now implemented under the 2026-08-26 Founder freeze; daemon wiring remains a
-separate later slice.
+The next admission decision remains separate from the candidate execution
+slice: either complete the missing DSH approval/artifact/recovery evidence or
+run the authenticated Kimi lifecycle probe. Codex remains the only production
+Harness until one candidate satisfies the complete contract. Memory/RAG
+runtime work remains a parallel governed slice, but it does not silently
+promote a second Harness.

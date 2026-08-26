@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 #![allow(async_fn_in_trait)]
 
+mod acp;
+
+use acp::{DshAcpMessage, DshAcpResponse, DshAcpUpdate};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ApprovalDecisionEnvelope, CancelExecutionEnvelope, DispatchEnvelope, HarnessErrorCode,
-    HarnessReadiness, NativeProtocolFingerprint, ProbeHarnessRequest, ProbeHarnessResult,
+    HarnessReadiness, LifecycleKind, LifecycleObservation, NativeProtocolFingerprint,
+    ObservationCriticality, ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
 };
 use egopulse_harness_adapter::{
     DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, NativeHarnessDriver,
@@ -13,7 +17,7 @@ use egopulse_process_supervision::{SupervisedProcess, SupervisedProcessSpec};
 use prost_types::Timestamp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -79,26 +83,119 @@ impl DshAcpConfig {
     }
 }
 
+struct DshSession {
+    process: SupervisedProcess,
+    next_request_id: u64,
+    native_session_ref: String,
+}
+
+struct ActiveDispatch {
+    dispatch_id: String,
+    native_session_ref: String,
+    prompt_request_id: u64,
+    output_text: String,
+}
+
 /// Candidate-only DSH ACP driver.
 ///
-/// The native ACP session boundary is now locally observed, but prompt,
-/// approval, cancellation and reconciliation semantics are not yet promoted
-/// to an EgoPulse capability profile. All execution methods therefore remain
-/// fail closed until those rows receive independent evidence.
+/// The driver now exercises the proven fresh-session ACP path and native
+/// prompt/cancel messages. It remains candidate-only because DSH has no native
+/// session load/resume capability and its approval/artifact semantics are not
+/// yet independently attested. Those weaker rows remain explicit failures.
 pub struct DshAcpDriver {
     config: DshAcpConfig,
+    session: Option<DshSession>,
+    active: Option<ActiveDispatch>,
+    completed_dispatch_id: Option<String>,
 }
 
 impl DshAcpDriver {
     #[must_use]
     pub fn new(config: DshAcpConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            session: None,
+            active: None,
+            completed_dispatch_id: None,
+        }
     }
 
     /// Performs the ACP initialize plus session creation probe without a
     /// prompt. The native session id is returned only as opaque probe evidence.
     pub async fn probe_session(&self) -> Result<DshSessionProbeResult, DriverError> {
         probe_session(&self.config).await
+    }
+
+    async fn ensure_session(&mut self, working_directory: &Path) -> Result<(), DriverError> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+        let mut process = spawn_process(&self.config).await?;
+        let initialize = acp::initialize_request(env!("CARGO_PKG_VERSION"));
+        write_json_value(&mut process, &initialize, "DSH_ACP_INITIALIZE_WRITE_FAILED").await?;
+        let initialize_bytes = serde_json::to_vec(&initialize).unwrap_or_default();
+        let initialize_raw = read_json_line(
+            &mut process,
+            self.config.request_timeout,
+            "DSH_ACP_INITIALIZE_TIMEOUT",
+            "DSH_ACP_INITIALIZE_READ_FAILED",
+            &initialize_bytes,
+        )
+        .await?;
+        let initialize_message =
+            acp::parse_message(initialize_raw.as_bytes()).map_err(|detail| {
+                driver_error("DSH_ACP_INITIALIZE_INVALID_MESSAGE", detail.as_bytes())
+            })?;
+        if !matches!(
+            initialize_message,
+            DshAcpMessage::Response(DshAcpResponse::Result { .. })
+        ) {
+            return Err(driver_error(
+                "DSH_ACP_INITIALIZE_REJECTED",
+                initialize_raw.as_bytes(),
+            ));
+        }
+
+        let session_request = acp::session_new_request(&working_directory.display().to_string(), 2);
+        let session_bytes = serde_json::to_vec(&session_request).unwrap_or_default();
+        write_json_value(
+            &mut process,
+            &session_request,
+            "DSH_ACP_SESSION_NEW_WRITE_FAILED",
+        )
+        .await?;
+        let session_raw = read_json_line(
+            &mut process,
+            self.config.request_timeout,
+            "DSH_ACP_SESSION_NEW_TIMEOUT",
+            "DSH_ACP_SESSION_NEW_READ_FAILED",
+            &session_bytes,
+        )
+        .await?;
+        let session_id = match acp::parse_message(session_raw.as_bytes()).map_err(|detail| {
+            driver_error("DSH_ACP_SESSION_NEW_INVALID_MESSAGE", detail.as_bytes())
+        })? {
+            DshAcpMessage::Response(DshAcpResponse::Result { result, .. }) => result
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    driver_error("DSH_ACP_SESSION_ID_MISSING", session_raw.as_bytes())
+                })?,
+            _ => {
+                return Err(driver_error(
+                    "DSH_ACP_SESSION_NEW_REJECTED",
+                    session_raw.as_bytes(),
+                ));
+            }
+        };
+        self.session = Some(DshSession {
+            process,
+            next_request_id: 3,
+            native_session_ref: session_id,
+        });
+        Ok(())
     }
 }
 
@@ -112,17 +209,153 @@ impl NativeHarnessDriver for DshAcpDriver {
 
     fn send_dispatch<'a>(
         &'a mut self,
-        _envelope: &'a DispatchEnvelope,
-        _material: &'a ResolvedDispatchMaterial,
+        envelope: &'a DispatchEnvelope,
+        material: &'a ResolvedDispatchMaterial,
     ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
-        Box::pin(async { Err(unsupported("DSH_ACP_DISPATCH_NOT_ATTESTED")) })
+        Box::pin(async move {
+            if self.active.is_some()
+                && self.completed_dispatch_id.as_deref()
+                    != self.active.as_ref().map(|value| value.dispatch_id.as_str())
+            {
+                return Err(dependency_error("DSH_ACP_ACTIVE_DISPATCH_EXISTS"));
+            }
+            self.ensure_session(&material.workspace_root).await?;
+            let session = self.session.as_mut().expect("session initialized");
+            let request_id = session.next_request_id;
+            session.next_request_id = session.next_request_id.saturating_add(1);
+            let request = acp::session_prompt_request(
+                request_id,
+                &session.native_session_ref,
+                &material.prompt,
+            );
+            let raw = serde_json::to_vec(&request).unwrap_or_default();
+            write_json_value(
+                &mut session.process,
+                &request,
+                "DSH_ACP_PROMPT_WRITE_FAILED",
+            )
+            .await
+            .map_err(|mut error| {
+                error.certainty = DriverErrorCertainty::DeliveryUnknown;
+                error
+            })?;
+            let native_session_ref = session.native_session_ref.clone();
+            self.active = Some(ActiveDispatch {
+                dispatch_id: envelope.dispatch_id.clone(),
+                native_session_ref: native_session_ref.clone(),
+                prompt_request_id: request_id,
+                output_text: String::new(),
+            });
+            self.completed_dispatch_id = None;
+            Ok(DriverDelivery {
+                native_request_ref: format!("dsh-acp-jsonrpc:{request_id}"),
+                native_session_ref,
+                native_execution_ref: Some(format!("dsh-acp-prompt:{request_id}")),
+                raw_evidence: raw,
+            })
+        })
     }
 
     fn next_event<'a>(
         &'a mut self,
-        _envelope: &'a DispatchEnvelope,
+        envelope: &'a DispatchEnvelope,
     ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
-        Box::pin(async { Err(unsupported("DSH_ACP_EVENTS_NOT_ATTESTED")) })
+        Box::pin(async move {
+            if self.completed_dispatch_id.as_deref() == Some(envelope.dispatch_id.as_str()) {
+                return Ok(None);
+            }
+            let (dispatch_id, native_session_ref, prompt_request_id) = self
+                .active
+                .as_ref()
+                .filter(|value| value.dispatch_id == envelope.dispatch_id)
+                .map(|value| {
+                    (
+                        value.dispatch_id.clone(),
+                        value.native_session_ref.clone(),
+                        value.prompt_request_id,
+                    )
+                })
+                .ok_or_else(|| dependency_error("DSH_ACP_ACTIVE_DISPATCH_NOT_FOUND"))?;
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| dependency_error("DSH_ACP_SESSION_NOT_RUNNING"))?;
+            loop {
+                let line = read_json_line(
+                    &mut session.process,
+                    self.config.request_timeout,
+                    "DSH_ACP_EVENT_TIMEOUT",
+                    "DSH_ACP_EVENT_READ_FAILED",
+                    b"dsh-acp-event",
+                )
+                .await?;
+                let message = acp::parse_message(line.as_bytes()).map_err(|detail| {
+                    driver_error("DSH_ACP_EVENT_INVALID_MESSAGE", detail.as_bytes())
+                })?;
+                match message {
+                    DshAcpMessage::SessionUpdate { session_id, update } => {
+                        if session_id != native_session_ref {
+                            return Err(driver_error(
+                                "DSH_ACP_SESSION_ID_MISMATCH",
+                                line.as_bytes(),
+                            ));
+                        }
+                        if let DshAcpUpdate::AgentMessageChunk { text } = update
+                            && let Some(active) = self.active.as_mut()
+                        {
+                            active.output_text.push_str(&text);
+                        }
+                        // ACP chunks are content observations, not terminal
+                        // truth. The prompt response below closes the event.
+                    }
+                    DshAcpMessage::Response(DshAcpResponse::Result { id, result })
+                        if id.as_u64() == Some(prompt_request_id) =>
+                    {
+                        let stop_reason = result
+                            .get("stopReason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        let (kind, status) = match stop_reason {
+                            "end_turn" => (LifecycleKind::ExecutionCompleted, "end_turn"),
+                            "cancelled" | "canceled" => {
+                                (LifecycleKind::ExecutionInterrupted, "cancelled")
+                            }
+                            _ => {
+                                return Err(driver_error(
+                                    "DSH_ACP_TERMINAL_STATUS_UNKNOWN",
+                                    line.as_bytes(),
+                                ));
+                            }
+                        };
+                        self.completed_dispatch_id = Some(dispatch_id);
+                        return Ok(Some(lifecycle_event(
+                            "session/prompt",
+                            kind,
+                            status,
+                            line.into_bytes(),
+                        )));
+                    }
+                    DshAcpMessage::Response(DshAcpResponse::Error { id, .. })
+                        if id.as_ref().and_then(Value::as_u64) == Some(prompt_request_id) =>
+                    {
+                        return Ok(Some(lifecycle_event(
+                            "session/prompt",
+                            LifecycleKind::ExecutionFailed,
+                            "error",
+                            line.into_bytes(),
+                        )));
+                    }
+                    DshAcpMessage::ServerRequest { .. } => {
+                        return Err(driver_error(
+                            "DSH_ACP_APPROVAL_OR_SERVER_REQUEST_UNATTESTED",
+                            line.as_bytes(),
+                        ));
+                    }
+                    DshAcpMessage::Notification { .. } => {}
+                    DshAcpMessage::Response(_) => {}
+                }
+            }
+        })
     }
 
     fn decide_approval<'a>(
@@ -134,16 +367,44 @@ impl NativeHarnessDriver for DshAcpDriver {
 
     fn cancel<'a>(
         &'a mut self,
-        _envelope: &'a CancelExecutionEnvelope,
+        envelope: &'a CancelExecutionEnvelope,
     ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
-        Box::pin(async { Err(unsupported("DSH_ACP_CANCELLATION_NOT_ATTESTED")) })
+        Box::pin(async move {
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| dependency_error("DSH_ACP_SESSION_NOT_RUNNING"))?;
+            if envelope.native_session_ref != session.native_session_ref {
+                return Err(driver_error(
+                    "DSH_ACP_CANCEL_SESSION_MISMATCH",
+                    envelope.native_session_ref.as_bytes(),
+                ));
+            }
+            let request = acp::session_cancel_request(&session.native_session_ref);
+            let raw = serde_json::to_vec(&request).unwrap_or_default();
+            write_json_value(
+                &mut session.process,
+                &request,
+                "DSH_ACP_CANCEL_WRITE_FAILED",
+            )
+            .await
+            .map_err(|mut error| {
+                error.certainty = DriverErrorCertainty::DeliveryUnknown;
+                error
+            })?;
+            Ok(raw)
+        })
     }
 
     fn reconcile<'a>(
         &'a mut self,
         _context: &'a ReconciliationContext,
     ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
-        Box::pin(async { Err(unsupported("DSH_ACP_RECONCILIATION_NOT_ATTESTED")) })
+        Box::pin(async {
+            Ok(ReconciliationFinding::OutcomeUnknown {
+                evidence_ref: "dsh-reconcile:native-session-load-resume-unsupported".to_owned(),
+            })
+        })
     }
 }
 
@@ -266,6 +527,16 @@ async fn write_json_line(
         .map_err(|error| driver_error(detail_code, error.to_string().as_bytes()))
 }
 
+async fn write_json_value(
+    process: &mut SupervisedProcess,
+    value: &Value,
+    detail_code: &str,
+) -> Result<(), DriverError> {
+    let encoded = serde_json::to_vec(value)
+        .map_err(|error| driver_error(detail_code, error.to_string().as_bytes()))?;
+    write_json_line(process, &encoded, detail_code).await
+}
+
 async fn read_json_line(
     process: &mut SupervisedProcess,
     request_timeout: Duration,
@@ -357,6 +628,16 @@ fn unsupported(detail: &str) -> DriverError {
     driver_error(detail, &[])
 }
 
+fn dependency_error(detail: &str) -> DriverError {
+    DriverError {
+        certainty: DriverErrorCertainty::ProvenNotSent,
+        code: HarnessErrorCode::DependencyUnavailable,
+        safe_detail_code: detail.to_owned(),
+        error_fingerprint: None,
+        raw_evidence: Vec::new(),
+    }
+}
+
 fn driver_error(detail: &str, raw: &[u8]) -> DriverError {
     DriverError {
         certainty: DriverErrorCertainty::ProvenNotSent,
@@ -364,6 +645,29 @@ fn driver_error(detail: &str, raw: &[u8]) -> DriverError {
         safe_detail_code: detail.to_owned(),
         error_fingerprint: Some(sha256(raw)),
         raw_evidence: raw.to_vec(),
+    }
+}
+
+fn lifecycle_event(
+    native_method: &str,
+    kind: LifecycleKind,
+    status: &str,
+    raw: Vec<u8>,
+) -> DriverEvent {
+    DriverEvent {
+        native_key: format!("{native_method}:{}", sha256(&raw)),
+        native_event_id: None,
+        native_sequence: None,
+        native_observed_at: now(),
+        criticality: ObservationCriticality::Terminal,
+        payload: harness_observation::Payload::Lifecycle(LifecycleObservation {
+            kind: kind as i32,
+            native_item_ref: None,
+            safe_status_code: Some(status.to_owned()),
+            side_effect_certainty: 0,
+            native_will_retry: None,
+        }),
+        raw_event: raw,
     }
 }
 
@@ -464,7 +768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unverified_execution_surface_is_fail_closed_and_proven_not_sent() {
+    async fn unavailable_process_is_fail_closed_and_cancel_requires_session() {
         let mut driver = DshAcpDriver::new(DshAcpConfig::new(
             r"C:\node.exe",
             std::env::current_dir().expect("cwd"),
@@ -479,7 +783,7 @@ mod tests {
         let error = driver
             .send_dispatch(&envelope, &material)
             .await
-            .expect_err("dispatch must remain unsupported");
+            .expect_err("unavailable process must fail closed");
         assert_eq!(
             (error.code, error.certainty),
             (
@@ -491,9 +795,9 @@ mod tests {
             driver
                 .cancel(&CancelExecutionEnvelope::default())
                 .await
-                .expect_err("cancel must remain unsupported")
+                .expect_err("cancel without a session must fail closed")
                 .safe_detail_code,
-            "DSH_ACP_CANCELLATION_NOT_ATTESTED"
+            "DSH_ACP_SESSION_NOT_RUNNING"
         );
     }
 }
