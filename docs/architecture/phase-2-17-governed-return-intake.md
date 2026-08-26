@@ -109,11 +109,14 @@ replacing any Authority or Collaboration writer. A real daemon + Harness executi
 with that committed Verification artifact remains the final integration evidence still
 to be added; the injection boundary is a testability improvement, not evidence that
 this final integration has already passed.
+An agentosd composition test now proves that the real daemon background worker polls
+an injected `HarnessDispatchRunner` and shuts down cleanly; this proves worker wiring,
+not provider-specific Codex protocol behavior.
 
 The latest local evidence is:
 
 ```text
-egopulse-agentosd library tests                 44 passed
+egopulse-agentosd library tests                 45 passed
 collaboration_control_g4_03                    22 passed
 c5_00_daemon_fixture                             7 passed
 return_settlement_g4_11                          1 passed

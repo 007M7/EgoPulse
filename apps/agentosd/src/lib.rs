@@ -1120,6 +1120,40 @@ mod tests {
         assert!(runs.load(Ordering::SeqCst) > 0);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_composition_polls_the_injected_harness_runner() {
+        let instance = format!("g4-runner-worker-{}", Uuid::now_v7());
+        let (config, root) = config(&instance);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let providers = DaemonProviders::fail_closed().with_harness_dispatch_runner(Arc::new(
+            CountingDispatchRunner {
+                runs: Arc::clone(&runs),
+            },
+        ));
+        let daemon = DaemonComposition::build(config, providers).expect("daemon composition");
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            daemon
+                .serve(async {
+                    let _ = shutdown_receiver.await;
+                })
+                .await
+                .expect("daemon should stop cleanly");
+        });
+        for _ in 0..100 {
+            if runs.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        shutdown_sender
+            .send(())
+            .expect("daemon shutdown receiver should still be active");
+        server.await.expect("daemon task should join");
+        assert!(runs.load(Ordering::SeqCst) > 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn composition_rejects_missing_secret_material_before_opening_storage() {
         let (mut config, root) = config("missing-key");
