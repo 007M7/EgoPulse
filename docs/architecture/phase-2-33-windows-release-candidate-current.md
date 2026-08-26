@@ -7,7 +7,7 @@ Status: locally packaged and verified; unsigned early access
 The candidate was built from the exact clean commit:
 
 ```text
-commit: 34a3fc79d45eea2e281190d795ed7666ae8715c8
+commit: 03e4443ce8adfec651f1fd73cef2845b0dfbf668
 platform: windows-x86_64
 surfaces: cli, tui
 classification: unsigned-release-candidate
@@ -16,8 +16,8 @@ classification: unsigned-release-candidate
 Archive:
 
 ```text
-.artifacts/release-candidate/egopulse-0.1.0-34a3fc79d45e-windows-x86_64-20260826T223958Z.zip
-SHA-256: 88afb148548cd0f747339fca29a6b4461c5fd5019415ccd8287dc96982878b12
+.artifacts/release-candidate/egopulse-0.1.0-03e4443ce8ad-windows-x86_64-20260826T224951Z.zip
+SHA-256: 5f08abe35ef6974d172ecfc04c3ba7063bf8c19f96f548aa2fd92e1be7bf5778
 ```
 
 The archive contains 52 hashed files, including the `agentosd`, CLI and TUI
@@ -30,9 +30,9 @@ The packaging prerequisite was a clean local CI run for the same commit:
 
 ```text
 status: passed
-commit: 34a3fc79d45eea2e281190d795ed7666ae8715c8
+commit: 03e4443ce8adfec651f1fd73cef2845b0dfbf668
 worktree_dirty_at_start: false
-duration_ms: 52463
+duration_ms: 45591
 all 8 local CI stages: passed
 ```
 
