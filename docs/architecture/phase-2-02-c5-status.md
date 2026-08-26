@@ -199,6 +199,18 @@ execution, checker failure mapping, immutable completion, Task transition to
 revision has advanced. The separate G4-06 execution test continues to prove
 the provider-neutral coordinator in isolation.
 
+The repeatable targeted verification command is:
+
+```powershell
+cargo test -p egopulse-agentosd --test verification_intake_g4_10 -- --nocapture
+```
+
+Current Windows x64 result: `1 passed, 0 failed`. This closes the
+application-level G4-10 handoff, verification-intake and replay evidence
+represented by the fixture. It does not claim physical power-loss
+qualification or blob-at-rest security; those remain separate
+release/recovery obligations.
+
 `with_codex_harness` and `ProductionBootstrapConfig::build` remain explicit
 production composition APIs and not implicit unsafe defaults. Verification
 remains deny-by-default for unreviewed external references. The worker may be
