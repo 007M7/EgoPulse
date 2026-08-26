@@ -13,8 +13,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use egopulse_client_operations::{
-    ClientAttachment, ClientReadError, attach as attach_client, canonical_task_digest,
-    command_metadata, set_policy_digest, set_verdict_digest, timestamp_after,
+    ClientAttachment, ClientReadError, attach as attach_client, command_metadata,
+    set_policy_digest, set_task_digest, set_verdict_digest, timestamp_after,
 };
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
@@ -32,7 +32,10 @@ use egopulse_domain_contracts::v01::egopulse::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
     },
     task::v1::TaskStatus,
-    task::v1::{CreateTaskCommand, TaskCommand, task_command, task_command_result},
+    task::v1::{
+        ApplyFounderVerdictCommand, CreateTaskCommand, TaskCommand, task_command,
+        task_command_result,
+    },
     verdict::v1::{
         FounderVerdictDecision, IssueFounderVerdictCommand, RevokeFounderVerdictCommand,
         VerdictCommand, VerdictScope, verdict_command,
@@ -88,6 +91,17 @@ enum TuiCommand {
         budget_profile_version: String,
         #[arg(long)]
         budget_profile_sha256: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply an issued Founder Verdict to a VerdictPending Task.
+    TaskApplyVerdict {
+        task_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        work_revision: u64,
+        founder_verdict_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -221,6 +235,7 @@ impl Panel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandKind {
     TaskCreate,
+    TaskApplyVerdict,
     ApprovalDecide,
     Await,
     VerdictIssue,
@@ -230,8 +245,9 @@ enum CommandKind {
 }
 
 impl CommandKind {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::TaskCreate,
+        Self::TaskApplyVerdict,
         Self::ApprovalDecide,
         Self::Await,
         Self::VerdictIssue,
@@ -243,6 +259,7 @@ impl CommandKind {
     const fn label(self) -> &'static str {
         match self {
             Self::TaskCreate => "Create governed task",
+            Self::TaskApplyVerdict => "Apply Founder Verdict",
             Self::ApprovalDecide => "Decide harness approval",
             Self::Await => "Await projection",
             Self::VerdictIssue => "Issue Founder Verdict",
@@ -304,6 +321,12 @@ impl CommandForm {
                 FormField::required("budget-profile-id"),
                 FormField::required("budget-profile-version").with_value("v0.1"),
                 FormField::required("budget-profile-sha256"),
+            ],
+            CommandKind::TaskApplyVerdict => vec![
+                FormField::required("task-id"),
+                FormField::required("expected-revision"),
+                FormField::required("work-revision"),
+                FormField::required("founder-verdict-id"),
             ],
             CommandKind::ApprovalDecide => vec![
                 FormField::required("approval-request-id"),
@@ -393,6 +416,17 @@ impl CommandForm {
                 budget_profile_id: next(&mut values, "budget-profile-id")?,
                 budget_profile_version: next(&mut values, "budget-profile-version")?,
                 budget_profile_sha256: next(&mut values, "budget-profile-sha256")?,
+                json: false,
+            }),
+            CommandKind::TaskApplyVerdict => Ok(TuiCommand::TaskApplyVerdict {
+                task_id: next(&mut values, "task-id")?,
+                expected_revision: next(&mut values, "expected-revision")?
+                    .parse()
+                    .map_err(|_| "expected-revision must be an integer".to_owned())?,
+                work_revision: next(&mut values, "work-revision")?
+                    .parse()
+                    .map_err(|_| "work-revision must be an integer".to_owned())?,
+                founder_verdict_id: next(&mut values, "founder-verdict-id")?,
                 json: false,
             }),
             CommandKind::ApprovalDecide => Ok(TuiCommand::ApprovalDecide {
@@ -635,14 +669,7 @@ async fn run_command_with_output(
                     }),
                 })),
             };
-            let digest = canonical_task_digest(&command);
-            if let Some(task_command::Command::CreateTask(create)) = command.command.as_mut() {
-                create
-                    .meta
-                    .as_mut()
-                    .expect("TUI always supplies command metadata")
-                    .request_digest_sha256 = digest;
-            }
+            set_task_digest(&mut command);
             let response = attached
                 .0
                 .connection
@@ -691,6 +718,92 @@ async fn run_command_with_output(
                 } else {
                     println!(
                         "TUI task created: {} revision={} status={} replayed={}",
+                        payload["data"]["taskId"].as_str().unwrap_or(""),
+                        payload["data"]["revision"].as_u64().unwrap_or_default(),
+                        payload["data"]["status"].as_str().unwrap_or(""),
+                        payload["data"]["replayed"].as_bool().unwrap_or(false),
+                    );
+                }
+            }
+            Ok(CommandResult::Completed)
+        }
+        TuiCommand::TaskApplyVerdict {
+            task_id,
+            expected_revision,
+            work_revision,
+            founder_verdict_id,
+            json,
+        } => {
+            let attached = AttachedClient::open(instance).await?;
+            attached.require_command(
+                "LocalCommandGatewayService/ExecuteTaskCommand",
+                "apply_founder_verdict",
+            )?;
+            let correlation_id = Uuid::now_v7().to_string();
+            let mut command = TaskCommand {
+                command: Some(task_command::Command::ApplyFounderVerdict(
+                    ApplyFounderVerdictCommand {
+                        meta: Some(command_metadata(
+                            &correlation_id,
+                            "egopulse-tui/task-apply-verdict",
+                        )),
+                        task_id,
+                        expected_revision,
+                        work_revision,
+                        founder_verdict_id,
+                    },
+                )),
+            };
+            set_task_digest(&mut command);
+            let response = attached
+                .0
+                .connection
+                .command_gateway_service()
+                .execute_task_command(ExecuteTaskCommandRequest {
+                    client: Some(attached.metadata_with_correlation(correlation_id.clone())?),
+                    command: Some(command),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .into_inner();
+            if let Some(error) = response.gateway_error {
+                return Err(local_error_message(error));
+            }
+            let result = response
+                .authority_result
+                .ok_or_else(|| "task authority result missing".to_owned())?;
+            let task = match result.outcome {
+                Some(task_command_result::Outcome::Task(task)) => task,
+                Some(task_command_result::Outcome::Error(error)) => {
+                    return Err(format!(
+                        "task authority rejected: {}",
+                        error.safe_detail_code
+                    ));
+                }
+                None => return Err("task authority outcome missing".to_owned()),
+            };
+            let payload = json!({
+                "schemaVersion": "egopulse.tui-result/v0.1",
+                "ok": true,
+                "operation": "task.apply-verdict",
+                "data": {
+                    "taskId": task.task_id,
+                    "revision": task.revision,
+                    "status": TaskStatus::try_from(task.status)
+                        .map(|value| value.as_str_name())
+                        .unwrap_or("TASK_STATUS_UNSPECIFIED"),
+                    "founderVerdictId": task.founder_verdict_id,
+                    "replayed": result.replayed,
+                    "awaitToken": await_token_json(response.await_token),
+                },
+                "correlationId": correlation_id,
+            });
+            if output == CommandOutput::Console {
+                if json {
+                    println!("{}", serde_json::to_string(&payload).unwrap());
+                } else {
+                    println!(
+                        "TUI Task Founder Verdict applied: task={} revision={} status={} replayed={}",
                         payload["data"]["taskId"].as_str().unwrap_or(""),
                         payload["data"]["revision"].as_u64().unwrap_or_default(),
                         payload["data"]["status"].as_str().unwrap_or(""),
@@ -1236,6 +1349,7 @@ async fn run_command_with_output(
 fn command_kind(command: &TuiCommand) -> &'static str {
     match command {
         TuiCommand::TaskCreate { .. } => "task.create",
+        TuiCommand::TaskApplyVerdict { .. } => "task.apply-verdict",
         TuiCommand::ApprovalDecide { .. } => "approval.decide",
         TuiCommand::Await { .. } => "await",
         TuiCommand::VerdictIssue { .. } => "verdict.issue",
@@ -1986,6 +2100,8 @@ mod tests {
         assert!(matches!(app.mode, InteractiveMode::Palette { selected: 0 }));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
             .expect("palette navigation");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("palette navigation");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("open form");
         assert!(matches!(
@@ -1994,6 +2110,31 @@ mod tests {
                 kind: CommandKind::ApprovalDecide,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn task_apply_verdict_form_preserves_concurrency_and_verdict_binding() {
+        let mut form = CommandForm::new(CommandKind::TaskApplyVerdict);
+        for (field, value) in form.fields.iter_mut().zip([
+            "task-1".to_owned(),
+            "7".to_owned(),
+            "2".to_owned(),
+            "founder-verdict-1".to_owned(),
+        ]) {
+            field.value = value;
+        }
+        let command = form.into_command().expect("valid Task verdict form");
+        assert_eq!(command_kind(&command), "task.apply-verdict");
+        assert!(matches!(
+            command,
+            TuiCommand::TaskApplyVerdict {
+                task_id,
+                expected_revision: 7,
+                work_revision: 2,
+                founder_verdict_id,
+                json: false,
+            } if task_id == "task-1" && founder_verdict_id == "founder-verdict-1"
         ));
     }
 

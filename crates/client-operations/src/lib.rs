@@ -198,12 +198,20 @@ pub fn command_metadata(correlation_id: &str, scope: &str) -> CommandMetadata {
 #[must_use]
 pub fn canonical_task_digest(command: &TaskCommand) -> String {
     let mut canonical = command.clone();
-    if let Some(task_command::Command::CreateTask(create)) = canonical.command.as_mut()
-        && let Some(metadata) = create.meta.as_mut()
-    {
+    if let Some(metadata) = task_metadata_mut(&mut canonical) {
         clear_command_metadata(Some(metadata));
     }
     hex::encode(Sha256::digest(canonical.encode_to_vec()))
+}
+
+/// Seals any client-originated Task command with the same canonical digest
+/// rule used by Task Authority. CLI, TUI and Desktop can therefore submit the
+/// same governed write without maintaining separate digest implementations.
+pub fn set_task_digest(command: &mut TaskCommand) {
+    let digest = canonical_task_digest(command);
+    if let Some(metadata) = task_metadata_mut(command) {
+        metadata.request_digest_sha256 = digest;
+    }
 }
 
 pub fn set_policy_digest(command: &mut PolicyDecisionCommand) {
@@ -285,6 +293,24 @@ fn clear_command_metadata(metadata: Option<&mut CommandMetadata>) {
     }
 }
 
+fn task_metadata_mut(command: &mut TaskCommand) -> Option<&mut CommandMetadata> {
+    match command.command.as_mut()? {
+        task_command::Command::CreateTask(value) => value.meta.as_mut(),
+        task_command::Command::ActivateTask(value) => value.meta.as_mut(),
+        task_command::Command::SubmitTaskEvidence(value) => value.meta.as_mut(),
+        task_command::Command::RecordTaskVerification(value) => value.meta.as_mut(),
+        task_command::Command::ApplyFounderVerdict(value) => value.meta.as_mut(),
+        task_command::Command::ReviseTask(value) => value.meta.as_mut(),
+        task_command::Command::InterruptTask(value) => value.meta.as_mut(),
+        task_command::Command::HoldTask(value) => value.meta.as_mut(),
+        task_command::Command::ResumeTask(value) => value.meta.as_mut(),
+        task_command::Command::RequestTaskCancellation(value) => value.meta.as_mut(),
+        task_command::Command::RecordTaskCancellationOutcome(value) => value.meta.as_mut(),
+        task_command::Command::SupersedeTask(value) => value.meta.as_mut(),
+        task_command::Command::ExpireTask(value) => value.meta.as_mut(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +320,33 @@ mod tests {
         let kernel =
             ClientKernel::new("egopulse-test", ClientSurface::Tui).expect("valid client kernel");
         assert_eq!(kernel.surface(), ClientSurface::Tui);
+    }
+
+    #[test]
+    fn task_digest_covers_apply_founder_verdict_with_authority_compatible_metadata_clearing() {
+        let mut command = TaskCommand {
+            command: Some(task_command::Command::ApplyFounderVerdict(
+                egopulse_domain_contracts::v01::egopulse::task::v1::ApplyFounderVerdictCommand {
+                    meta: Some(command_metadata("correlation", "client/task-apply")),
+                    task_id: "task-1".to_owned(),
+                    expected_revision: 7,
+                    work_revision: 2,
+                    founder_verdict_id: "founder-verdict-1".to_owned(),
+                },
+            )),
+        };
+        let expected = canonical_task_digest(&command);
+        set_task_digest(&mut command);
+        let actual = match command.command.as_ref().expect("command") {
+            task_command::Command::ApplyFounderVerdict(value) => value
+                .meta
+                .as_ref()
+                .expect("metadata")
+                .request_digest_sha256
+                .clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(canonical_task_digest(&command), expected);
     }
 }

@@ -9,8 +9,8 @@ use std::{process::ExitCode, time::Duration};
 use clap::{Parser, Subcommand};
 use egopulse_client_kernel::{SnapshotStreamTracker, StreamApply};
 use egopulse_client_operations::{
-    AttachError, ClientAttachment, attach as attach_client, canonical_task_digest,
-    command_metadata, set_policy_digest, set_verdict_digest, timestamp_after,
+    AttachError, ClientAttachment, attach as attach_client, command_metadata, set_policy_digest,
+    set_task_digest, set_verdict_digest, timestamp_after,
 };
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
@@ -33,8 +33,8 @@ use egopulse_domain_contracts::v01::egopulse::{
         policy_decision_command,
     },
     task::v1::{
-        CreateTaskCommand, TaskCommand, TaskErrorCode, TaskStatus, task_command,
-        task_command_result,
+        ApplyFounderVerdictCommand, CreateTaskCommand, TaskCommand, TaskErrorCode, TaskStatus,
+        task_command, task_command_result,
     },
     verdict::v1::{
         FounderVerdictDecision, IssueFounderVerdictCommand, RevokeFounderVerdictCommand,
@@ -164,6 +164,17 @@ enum TaskCommandCli {
         budget_profile_version: String,
         #[arg(long)]
         budget_profile_sha256: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply an issued Founder Verdict to a VerdictPending Task.
+    ApplyVerdict {
+        task_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        work_revision: u64,
+        founder_verdict_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -608,7 +619,8 @@ fn command_json(command: &Command) -> bool {
                 TaskCommandCli::Get { json, .. }
                 | TaskCommandCli::List { json, .. }
                 | TaskCommandCli::Watch { json, .. }
-                | TaskCommandCli::Create { json, .. },
+                | TaskCommandCli::Create { json, .. }
+                | TaskCommandCli::ApplyVerdict { json, .. },
         }
         | Command::Evidence {
             command: EvidenceCommand::Get { json, .. },
@@ -951,6 +963,22 @@ async fn task(command: TaskCommandCli) -> Result<(), CliFailure> {
                     version: budget_profile_version,
                     sha256: budget_profile_sha256,
                 },
+                json,
+            )
+            .await
+        }
+        TaskCommandCli::ApplyVerdict {
+            task_id,
+            expected_revision,
+            work_revision,
+            founder_verdict_id,
+            json,
+        } => {
+            task_apply_verdict(
+                task_id,
+                expected_revision,
+                work_revision,
+                founder_verdict_id,
                 json,
             )
             .await
@@ -1918,14 +1946,7 @@ async fn task_create(
             budget_profile_ref: Some(budget_profile_ref),
         })),
     };
-    let digest = canonical_task_digest(&command);
-    if let Some(task_command::Command::CreateTask(create)) = command.command.as_mut() {
-        create
-            .meta
-            .as_mut()
-            .expect("CLI always supplies command metadata")
-            .request_digest_sha256 = digest;
-    }
+    set_task_digest(&mut command);
     let metadata = attached.metadata(Some(correlation_id.clone()))?;
     let response = attached
         .0
@@ -1980,6 +2001,97 @@ async fn task_create(
     } else {
         println!(
             "Task created: {} revision={} status={} replayed={}",
+            payload["data"]["taskId"].as_str().unwrap_or(""),
+            payload["data"]["revision"].as_u64().unwrap_or_default(),
+            payload["data"]["status"].as_str().unwrap_or(""),
+            payload["data"]["replayed"].as_bool().unwrap_or(false),
+        );
+    }
+    Ok(())
+}
+
+async fn task_apply_verdict(
+    task_id: String,
+    expected_revision: u64,
+    work_revision: u64,
+    founder_verdict_id: String,
+    json: bool,
+) -> Result<(), CliFailure> {
+    let attached = attach("task.apply-verdict").await?;
+    attached.require_command(
+        "LocalCommandGatewayService/ExecuteTaskCommand",
+        "apply_founder_verdict",
+        "task.apply-verdict",
+    )?;
+    let correlation_id = Uuid::now_v7().to_string();
+    let mut command = TaskCommand {
+        command: Some(task_command::Command::ApplyFounderVerdict(
+            ApplyFounderVerdictCommand {
+                meta: Some(command_metadata(
+                    &correlation_id,
+                    "egopulse-cli/task-apply-verdict",
+                )),
+                task_id,
+                expected_revision,
+                work_revision,
+                founder_verdict_id,
+            },
+        )),
+    };
+    set_task_digest(&mut command);
+    let response = attached
+        .0
+        .connection
+        .command_gateway_service()
+        .execute_task_command(ExecuteTaskCommandRequest {
+            client: Some(attached.metadata(Some(correlation_id.clone()))?),
+            command: Some(command),
+        })
+        .await
+        .map_err(|error| {
+            CliFailure::daemon_unavailable(error.to_string()).for_operation("task.apply-verdict")
+        })?
+        .into_inner();
+    if let Some(error) = response.gateway_error {
+        return Err(CliFailure::from_local_api_error(error).for_operation("task.apply-verdict"));
+    }
+    let result = response.authority_result.ok_or_else(|| {
+        CliFailure::protocol("task authority result missing").for_operation("task.apply-verdict")
+    })?;
+    let replayed = result.replayed;
+    let task = match result.outcome {
+        Some(task_command_result::Outcome::Task(task)) => task,
+        Some(task_command_result::Outcome::Error(error)) => {
+            return Err(CliFailure::task_authority(
+                error.code,
+                error.safe_detail_code,
+                "task.apply-verdict",
+            ));
+        }
+        None => {
+            return Err(CliFailure::protocol("task authority outcome missing")
+                .for_operation("task.apply-verdict"));
+        }
+    };
+    let payload = json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": "task.apply-verdict",
+        "data": {
+            "taskId": task.task_id,
+            "revision": task.revision,
+            "status": TaskStatus::try_from(task.status).map(|status| status.as_str_name()).unwrap_or("TASK_STATUS_UNSPECIFIED"),
+            "founderVerdictId": task.founder_verdict_id,
+            "replayed": replayed,
+            "awaitToken": await_token_json(response.await_token),
+        },
+        "correlationId": correlation_id,
+    });
+    if json {
+        println!("{}", serde_json::to_string(&payload).unwrap());
+    } else {
+        println!(
+            "Task Founder Verdict applied: task={} revision={} status={} replayed={}",
             payload["data"]["taskId"].as_str().unwrap_or(""),
             payload["data"]["revision"].as_u64().unwrap_or_default(),
             payload["data"]["status"].as_str().unwrap_or(""),
