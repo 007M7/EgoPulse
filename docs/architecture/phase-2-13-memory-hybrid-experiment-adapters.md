@@ -79,8 +79,11 @@ in its own algorithm digest.
 
 `workers/memory-rag/src/egopulse_memory_rag/experimental.py` provides:
 
-- `EmbeddingProfile`, requiring provider, model, immutable revision and vector
-  dimensions before an experiment can run;
+- `EmbeddingProfile`, requiring provider, model, immutable revision,
+  preprocessing identity and vector dimensions before an experiment can run;
+- separate `embed_query` and `embed_documents` provider calls, so model
+  families that require different query/passage prefixes cannot silently use
+  the wrong preprocessing;
 - `ExactVectorRetriever`, rejecting provider failure, output-count drift,
   dimension drift, non-numeric/non-finite values and zero vectors;
 - `ReciprocalRankFusionRetriever`, rejecting child algorithm/query identity

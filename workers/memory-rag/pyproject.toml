@@ -11,6 +11,9 @@ dependencies = [
 dev = [
   "pytest==9.0.2",
 ]
+evaluation = [
+  "fastembed==0.8.0",
+]
 
 [tool.pytest.ini_options]
 addopts = ["-p", "no:cacheprovider"]

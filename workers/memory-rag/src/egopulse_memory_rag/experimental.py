@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import json
 from math import isfinite, sqrt
+from typing import Protocol
 
 from .retrieval import (
     MAX_RESULTS,
@@ -19,8 +20,15 @@ from .retrieval import (
 
 
 Vector = tuple[float, ...]
-Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
 Retriever = Callable[[RetrievalRequest, Sequence[MemoryRecord]], RetrievalResult]
+
+
+class Embedder(Protocol):
+    """Keep query and document preprocessing distinct across model families."""
+
+    def embed_query(self, text: str) -> Sequence[float]: ...
+
+    def embed_documents(self, texts: Sequence[str]) -> Sequence[Sequence[float]]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +38,7 @@ class EmbeddingProfile:
     provider: str
     model: str
     revision: str
+    preprocessing: str
     dimensions: int
 
     def validate(self) -> None:
@@ -37,6 +46,7 @@ class EmbeddingProfile:
             ("provider", self.provider),
             ("model", self.model),
             ("revision", self.revision),
+            ("preprocessing", self.preprocessing),
         ):
             if not value.strip():
                 raise RetrievalWorkerError(f"embedding {field} is required")
@@ -52,6 +62,7 @@ class EmbeddingProfile:
             {
                 "dimensions": self.dimensions,
                 "model": self.model,
+                "preprocessing": self.preprocessing,
                 "provider": self.provider,
                 "revision": self.revision,
             }
@@ -78,10 +89,11 @@ class ExactVectorRetriever:
         self, request: RetrievalRequest, records: Sequence[MemoryRecord]
     ) -> RetrievalResult:
         accepted = validate_retrieval_input(request, list(records))
-        vectors = self._embed([request.query, *(record.content for record in accepted)])
-        query_vector = vectors[0]
+        query_vector, document_vectors = self._embed(
+            request.query, [record.content for record in accepted]
+        )
         scored: list[RetrievalCandidate] = []
-        for record, vector in zip(accepted, vectors[1:], strict=True):
+        for record, vector in zip(accepted, document_vectors, strict=True):
             score = min(1.0, max(0.0, _cosine_similarity(query_vector, vector)))
             if score <= 0.0 or score < request.min_score:
                 continue
@@ -116,17 +128,20 @@ class ExactVectorRetriever:
             evidence_ref=evidence_ref,
         )
 
-    def _embed(self, texts: Sequence[str]) -> tuple[Vector, ...]:
+    def _embed(
+        self, query: str, documents: Sequence[str]
+    ) -> tuple[Vector, tuple[Vector, ...]]:
         self.profile.validate()
         try:
-            raw_vectors = self.embedder(texts)
+            raw_query = self.embedder.embed_query(query)
+            raw_documents = self.embedder.embed_documents(documents)
         except Exception as error:
             raise RetrievalWorkerError("embedding provider failed") from error
-        if len(raw_vectors) != len(texts):
+        if len(raw_documents) != len(documents):
             raise RetrievalWorkerError("embedding provider returned the wrong vector count")
 
         vectors: list[Vector] = []
-        for raw_vector in raw_vectors:
+        for raw_vector in (raw_query, *raw_documents):
             if len(raw_vector) != self.profile.dimensions:
                 raise RetrievalWorkerError("embedding vector dimensions drifted")
             values: list[float] = []
@@ -141,7 +156,7 @@ class ExactVectorRetriever:
             if _magnitude(vector) == 0.0:
                 raise RetrievalWorkerError("embedding vector has zero magnitude")
             vectors.append(vector)
-        return tuple(vectors)
+        return vectors[0], tuple(vectors[1:])
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +167,8 @@ class ReciprocalRankFusionRetriever:
     left_algorithm_id: str
     right: Retriever
     right_algorithm_id: str
+    left_weight: float = 1.0
+    right_weight: float = 1.0
     rank_constant: int = 60
     candidate_pool: int = MAX_RESULTS
 
@@ -160,6 +177,13 @@ class ReciprocalRankFusionRetriever:
             raise RetrievalWorkerError("RRF child algorithm identity is required")
         if self.left_algorithm_id == self.right_algorithm_id:
             raise RetrievalWorkerError("RRF child algorithm identities must differ")
+        if (
+            not isfinite(self.left_weight)
+            or not isfinite(self.right_weight)
+            or self.left_weight <= 0.0
+            or self.right_weight <= 0.0
+        ):
+            raise RetrievalWorkerError("RRF child weights must be finite and positive")
         if not 1 <= self.rank_constant <= 10_000:
             raise RetrievalWorkerError("RRF rank constant is outside the worker limit")
         if not 1 <= self.candidate_pool <= MAX_RESULTS:
@@ -172,8 +196,10 @@ class ReciprocalRankFusionRetriever:
             {
                 "candidate_pool": self.candidate_pool,
                 "left_algorithm_id": self.left_algorithm_id,
+                "left_weight": self.left_weight,
                 "rank_constant": self.rank_constant,
                 "right_algorithm_id": self.right_algorithm_id,
+                "right_weight": self.right_weight,
             }
         )
         return f"rrf-hybrid-v0:{identity[:16]}"
@@ -201,14 +227,19 @@ class ReciprocalRankFusionRetriever:
 
         ranks: dict[str, float] = {}
         terms: dict[str, set[str]] = {}
-        for result in (left_result, right_result):
+        for result, weight in (
+            (left_result, self.left_weight),
+            (right_result, self.right_weight),
+        ):
             for rank, candidate in enumerate(result.candidates, start=1):
-                ranks[candidate.memory_id] = ranks.get(candidate.memory_id, 0.0) + 1.0 / (
-                    self.rank_constant + rank
-                )
+                ranks[candidate.memory_id] = ranks.get(
+                    candidate.memory_id, 0.0
+                ) + weight / (self.rank_constant + rank)
                 terms.setdefault(candidate.memory_id, set()).update(candidate.matched_terms)
 
-        maximum_score = 2.0 / (self.rank_constant + 1)
+        maximum_score = (self.left_weight + self.right_weight) / (
+            self.rank_constant + 1
+        )
         fused: list[RetrievalCandidate] = []
         for memory_id, raw_score in ranks.items():
             score = raw_score / maximum_score

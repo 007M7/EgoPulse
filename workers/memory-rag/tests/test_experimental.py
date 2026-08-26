@@ -41,8 +41,43 @@ class FixtureEmbedder:
     def __init__(self, vectors: dict[str, tuple[float, ...]]) -> None:
         self._vectors = vectors
 
-    def __call__(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
+    def embed_query(self, text: str) -> Sequence[float]:
+        return self._vectors[text]
+
+    def embed_documents(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
         return tuple(self._vectors[text] for text in texts)
+
+
+class StaticEmbedder:
+    def __init__(
+        self,
+        query_vector: Sequence[float],
+        document_vectors: Sequence[Sequence[float]],
+    ) -> None:
+        self._query_vector = query_vector
+        self._document_vectors = document_vectors
+
+    def embed_query(self, text: str) -> Sequence[float]:
+        del text
+        return self._query_vector
+
+    def embed_documents(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
+        del texts
+        return self._document_vectors
+
+
+class CapturingEmbedder:
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+        self.documents: list[str] = []
+
+    def embed_query(self, text: str) -> Sequence[float]:
+        self.queries.append(text)
+        return (1.0, 0.0)
+
+    def embed_documents(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
+        self.documents.extend(texts)
+        return tuple((1.0, 0.0) for _ in texts)
 
 
 def profile() -> EmbeddingProfile:
@@ -50,6 +85,7 @@ def profile() -> EmbeddingProfile:
         provider="evaluation-fixture",
         model="semantic-boundary-fixture",
         revision="sha256:fixture-v0",
+        preprocessing="fixture-query-document-split-v0",
         dimensions=2,
     )
 
@@ -81,6 +117,20 @@ def test_exact_vector_retriever_recovers_a_paraphrase_without_persistence() -> N
     assert result.candidates[0].score == 1.0
     assert result.candidates[0].matched_terms == ()
     assert result.evidence_ref.startswith("memory-rag-evidence-sha256:")
+
+
+def test_exact_vector_retriever_preserves_query_document_preprocessing_boundary() -> None:
+    capture = CapturingEmbedder()
+    memory = record("mem-authority", "Rust owns accepted Memory state.")
+    retriever = ExactVectorRetriever(profile(), capture)
+
+    retriever(
+        RetrievalRequest(query="query text", scope_ref="scope:founder"),
+        (memory,),
+    )
+
+    assert capture.queries == ["query text"]
+    assert capture.documents == [memory.content]
 
 
 def test_rrf_fuses_rankings_and_preserves_reference_integrity() -> None:
@@ -186,10 +236,10 @@ def test_rrf_accepts_an_empty_bounded_snapshot() -> None:
 @pytest.mark.parametrize(
     ("embedder", "message"),
     [
-        (lambda texts: ((1.0, 0.0),), "wrong vector count"),
-        (lambda texts: tuple((1.0,) for _ in texts), "dimensions drifted"),
-        (lambda texts: tuple((nan, 1.0) for _ in texts), "non-finite"),
-        (lambda texts: tuple((0.0, 0.0) for _ in texts), "zero magnitude"),
+        (StaticEmbedder((1.0, 0.0), ()), "wrong vector count"),
+        (StaticEmbedder((1.0,), ((1.0,),)), "dimensions drifted"),
+        (StaticEmbedder((nan, 1.0), ((1.0, 0.0),)), "non-finite"),
+        (StaticEmbedder((0.0, 0.0), ((1.0, 0.0),)), "zero magnitude"),
     ],
 )
 def test_exact_vector_retriever_fails_closed_on_embedding_drift(
