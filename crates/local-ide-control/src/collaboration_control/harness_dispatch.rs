@@ -2,8 +2,8 @@ use super::{
     ArtifactReturnSource, AuthenticatedCollaborationPrincipal, AuthorityClock,
     CollaborationControl, CollaborationControlError, CollaborationReferenceGuard,
     HarnessEvidenceResolver, HarnessFactIngestionDisposition, HarnessFactIngestionResult,
-    SingleHarnessWorkflowResolver, TaskActivationGuardSet, TaskActivationReferenceHandle,
-    TaskActivationSource, seal_request_digest,
+    SingleHarnessWorkConfig, SingleHarnessWorkflowResolver, TaskActivationGuardSet,
+    TaskActivationReferenceHandle, TaskActivationSource, seal_request_digest,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::get_collaboration_response;
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
@@ -242,6 +242,7 @@ struct GovernedTaskActivationRuntime<S, W, E, C, R, D, A> {
 pub struct GovernedTaskActivationRunner<S, W, E, C, R, D, A> {
     runtime: tokio::sync::Mutex<GovernedTaskActivationRuntime<S, W, E, C, R, D, A>>,
     principal: AuthenticatedCollaborationPrincipal,
+    capability_profile_filter: Option<CapabilityProfileFilter>,
 }
 
 impl<S, W, E, C, R, D, A> GovernedTaskActivationRunner<S, W, E, C, R, D, A>
@@ -278,7 +279,17 @@ where
                 step_return_principal: None,
             }),
             principal,
+            capability_profile_filter: None,
         }
+    }
+
+    /// Restricts activation consumption and the subsequent dispatch sweep to
+    /// one exact reviewed capability reference. This is required when more
+    /// than one provider runner observes the same Task activation outbox.
+    #[must_use]
+    pub fn with_capability_profile_ref(mut self, profile: ContractReference) -> Self {
+        self.capability_profile_filter = Some(CapabilityProfileFilter::Exact(profile));
+        self
     }
 
     #[must_use]
@@ -368,6 +379,9 @@ where
                 let config = resolver
                     .resolve(&activation)
                     .map_err(|_| HarnessDispatchCycleError::TaskActivationResolver)?;
+                if !workflow_matches_profile(&config, self.capability_profile_filter.as_ref()) {
+                    continue;
+                }
                 reference
                     .bind(activation.task.clone(), &config, *lease_ttl_seconds)
                     .map_err(|_| {
@@ -389,13 +403,35 @@ where
                 }
                 report.activations_started += 1;
                 report.activations_acknowledged += 1;
-                register_pending_envelopes(control, active_envelopes, &self.principal, None)?;
-                let dispatched = dispatch_pending(control, adapter, &self.principal).await?;
+                register_pending_envelopes(
+                    control,
+                    active_envelopes,
+                    &self.principal,
+                    self.capability_profile_filter.as_ref(),
+                )?;
+                let dispatched = dispatch_pending_for_profile(
+                    control,
+                    adapter,
+                    &self.principal,
+                    self.capability_profile_filter.as_ref(),
+                )
+                .await?;
                 merge_report(&mut report, dispatched);
                 remove_terminal_envelopes(active_envelopes, &report);
             }
-            register_pending_envelopes(control, active_envelopes, &self.principal, None)?;
-            let dispatched = dispatch_pending(control, adapter, &self.principal).await?;
+            register_pending_envelopes(
+                control,
+                active_envelopes,
+                &self.principal,
+                self.capability_profile_filter.as_ref(),
+            )?;
+            let dispatched = dispatch_pending_for_profile(
+                control,
+                adapter,
+                &self.principal,
+                self.capability_profile_filter.as_ref(),
+            )
+            .await?;
             merge_report(&mut report, dispatched);
             remove_terminal_envelopes(active_envelopes, &report);
             Ok(report)
@@ -772,6 +808,15 @@ fn envelope_matches_profile(
             .is_some_and(|reference| match filter {
                 CapabilityProfileFilter::Exact(expected) => reference == expected,
             })
+    })
+}
+
+fn workflow_matches_profile(
+    config: &SingleHarnessWorkConfig,
+    capability_profile_filter: Option<&CapabilityProfileFilter>,
+) -> bool {
+    capability_profile_filter.is_none_or(|filter| match filter {
+        CapabilityProfileFilter::Exact(expected) => &config.capability_profile_ref == expected,
     })
 }
 

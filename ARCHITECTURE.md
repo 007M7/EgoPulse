@@ -121,6 +121,10 @@ Collaboration/Sego stages after technical evidence intake.
   composite does not choose models or merge provider-owned facts. This is a
   composition prerequisite, not evidence that a second Harness has been
   admitted.
+- Task activation routing: the production native composition binds the same
+  exact profile reference at activation consumption, Collaboration dispatch
+  registration and dispatch selection. A future parallel provider runner
+  therefore leaves activations for other exact profiles untouched.
 - Profile-bound native composition: `agentosd` exposes one provider-neutral
   native-driver assembly boundary carrying an explicit adapter id, capability
   profile id and protocol fingerprint. Its common storage, workspace, workflow,

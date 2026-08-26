@@ -831,6 +831,7 @@ impl DaemonProviders {
             principal_id: config.workflow.harness_adapter_principal_id.clone(),
             authenticated: true,
         };
+        let capability_profile_ref = config.workflow.capability_profile_ref.clone();
         let resolver = ConfiguredSingleHarnessWorkflow::new(config.workflow);
         let artifact_return_principal = AuthenticatedCollaborationPrincipal {
             kind: CollaborationPrincipalKind::ArtifactAuthority,
@@ -854,6 +855,7 @@ impl DaemonProviders {
             reference,
             config.lease_ttl_seconds,
         )
+        .with_capability_profile_ref(capability_profile_ref)
         .with_artifact_return_source(artifact_return_source, artifact_return_principal)
         .with_step_return_principal(AuthenticatedCollaborationPrincipal {
             kind: CollaborationPrincipalKind::CollaborationControl,

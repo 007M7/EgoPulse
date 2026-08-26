@@ -1733,6 +1733,7 @@ async fn task_activation_runner_commits_then_dispatches_through_one_runtime() {
         clock,
     );
     let dispatch_id = config.dispatch_id.clone();
+    let capability_profile_ref = config.capability_profile_ref.clone();
     let runner = GovernedTaskActivationRunner::new(
         control,
         adapter,
@@ -1741,7 +1742,8 @@ async fn task_activation_runner_commits_then_dispatches_through_one_runtime() {
         harness_adapter(),
         binding,
         30,
-    );
+    )
+    .with_capability_profile_ref(capability_profile_ref);
     let cycle = runner.run_once().await.expect("activation runner cycle");
     assert_eq!(cycle.activations_seen, 1);
     assert_eq!(cycle.activations_started, 1);
