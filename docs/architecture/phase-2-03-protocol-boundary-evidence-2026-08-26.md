@@ -142,6 +142,16 @@ native ACP notification, and receives the original prompt response with
 `stopReason=cancelled`. The subprocess exits cleanly with empty stderr and no
 model/API call.
 
+The Rust DSH adapter now recognizes the actual ACP
+`session/request_permission` server-request shape observed in the local DSH
+source. It projects the request into the provider-neutral approval contract,
+yields the observation stream until the governance decision arrives, and
+writes back only an exact one-shot allow/reject selection or `cancelled` using
+the opaque JSON-RPC request id. Unknown server requests remain fail closed.
+This proves the adapter boundary and its local fixtures; it does not prove
+that all DSH tools exercise approval in the same way, nor does it prove
+artifact or recovery semantics.
+
 The recovery capability probe now records the opposite result explicitly:
 
 ```powershell

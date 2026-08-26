@@ -20,7 +20,10 @@ slice includes:
 - native ACP `session/cancel` delivery and cancelled terminal observation;
 - opaque native session reference and SHA-256 evidence references;
 - degraded readiness until a native schema digest is attested;
-- approval/server-request handling remains fail closed;
+- native `session/request_permission` is projected as a provider-neutral
+  approval observation, pauses the event stream, and accepts only a governed
+  one-shot allow/deny/cancel response; unknown server requests remain fail
+  closed;
 - reconciliation remains `OutcomeUnknown` because native load/resume is absent.
 
 The adapter does not promote a committed assistant message to a terminal
@@ -56,6 +59,12 @@ approval, artifact and recovery evidence.
 
 The keyless lifecycle evidence is now complete for the ACP operations DSH
 actually implements: multi-turn prompt, committed update, and cancellation.
+The adapter also has local fixture coverage for the actual DSH permission
+request shape (`session/request_permission`), opaque JSON-RPC request identity,
+governance handoff and one-shot response selection. This is an adapter
+contract result, not live proof that every DSH tool emits or honors the same
+approval semantics; the candidate remains held until approval and artifact
+behavior are independently attested.
 The recovery capability probe also confirms that DSH advertises fresh sessions
 only: `session/load` and `session/resume` are rejected. The candidate therefore
 remains held rather than being promoted; a restarted DSH process cannot be

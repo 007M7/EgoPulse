@@ -5,7 +5,8 @@ mod acp;
 
 use acp::{DshAcpMessage, DshAcpResponse, DshAcpUpdate};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    ApprovalDecisionEnvelope, CancelExecutionEnvelope, DispatchEnvelope, HarnessErrorCode,
+    ApprovalDecision, ApprovalDecisionEnvelope, ApprovalKind, ApprovalRequestLifecycleKind,
+    ApprovalRequestObservation, CancelExecutionEnvelope, DispatchEnvelope, HarnessErrorCode,
     HarnessReadiness, LifecycleKind, LifecycleObservation, NativeProtocolFingerprint,
     ObservationCriticality, ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
 };
@@ -17,6 +18,7 @@ use egopulse_process_supervision::{SupervisedProcess, SupervisedProcessSpec};
 use prost_types::Timestamp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -96,6 +98,13 @@ struct ActiveDispatch {
     output_text: String,
 }
 
+#[derive(Clone)]
+struct PendingApproval {
+    request_id: Value,
+    params: Value,
+    observation: ApprovalRequestObservation,
+}
+
 /// Candidate-only DSH ACP driver.
 ///
 /// The driver now exercises the proven fresh-session ACP path and native
@@ -107,6 +116,7 @@ pub struct DshAcpDriver {
     session: Option<DshSession>,
     active: Option<ActiveDispatch>,
     completed_dispatch_id: Option<String>,
+    pending_approvals: HashMap<String, PendingApproval>,
 }
 
 impl DshAcpDriver {
@@ -117,6 +127,7 @@ impl DshAcpDriver {
             session: None,
             active: None,
             completed_dispatch_id: None,
+            pending_approvals: HashMap::new(),
         }
     }
 
@@ -264,6 +275,12 @@ impl NativeHarnessDriver for DshAcpDriver {
             if self.completed_dispatch_id.as_deref() == Some(envelope.dispatch_id.as_str()) {
                 return Ok(None);
             }
+            // A native permission request is a governance handoff. The worker
+            // must yield so the control plane can call decide_approval instead
+            // of blocking on the ACP response indefinitely.
+            if !self.pending_approvals.is_empty() {
+                return Ok(None);
+            }
             let (dispatch_id, native_session_ref, prompt_request_id) = self
                 .active
                 .as_ref()
@@ -276,19 +293,21 @@ impl NativeHarnessDriver for DshAcpDriver {
                     )
                 })
                 .ok_or_else(|| dependency_error("DSH_ACP_ACTIVE_DISPATCH_NOT_FOUND"))?;
-            let session = self
-                .session
-                .as_mut()
-                .ok_or_else(|| dependency_error("DSH_ACP_SESSION_NOT_RUNNING"))?;
             loop {
-                let line = read_json_line(
-                    &mut session.process,
-                    self.config.request_timeout,
-                    "DSH_ACP_EVENT_TIMEOUT",
-                    "DSH_ACP_EVENT_READ_FAILED",
-                    b"dsh-acp-event",
-                )
-                .await?;
+                let line = {
+                    let session = self
+                        .session
+                        .as_mut()
+                        .ok_or_else(|| dependency_error("DSH_ACP_SESSION_NOT_RUNNING"))?;
+                    read_json_line(
+                        &mut session.process,
+                        self.config.request_timeout,
+                        "DSH_ACP_EVENT_TIMEOUT",
+                        "DSH_ACP_EVENT_READ_FAILED",
+                        b"dsh-acp-event",
+                    )
+                    .await?
+                };
                 let message = acp::parse_message(line.as_bytes()).map_err(|detail| {
                     driver_error("DSH_ACP_EVENT_INVALID_MESSAGE", detail.as_bytes())
                 })?;
@@ -345,6 +364,39 @@ impl NativeHarnessDriver for DshAcpDriver {
                             line.into_bytes(),
                         )));
                     }
+                    DshAcpMessage::ServerRequest { id, method, params }
+                        if method == "session/request_permission" =>
+                    {
+                        let routing_ref = format!("dsh-acp-routing:approval:{}", Uuid::now_v7());
+                        let observation = ApprovalRequestObservation {
+                            approval_request_id: Uuid::now_v7().to_string(),
+                            kind: ApprovalKind::Permission as i32,
+                            action_digest_sha256: sha256(params.to_string().as_bytes()),
+                            requested_scope_ref: "adapter-edge://dsh-acp/approval/scope".to_owned(),
+                            display_summary_ref: "adapter-edge://dsh-acp/approval/summary"
+                                .to_owned(),
+                            native_routing_ref: routing_ref.clone(),
+                            lifecycle: ApprovalRequestLifecycleKind::Open as i32,
+                            request_revision: 1,
+                        };
+                        self.pending_approvals.insert(
+                            routing_ref.clone(),
+                            PendingApproval {
+                                request_id: id,
+                                params,
+                                observation: observation.clone(),
+                            },
+                        );
+                        return Ok(Some(DriverEvent {
+                            native_key: format!("request:{}", observation.approval_request_id),
+                            native_event_id: None,
+                            native_sequence: None,
+                            native_observed_at: now(),
+                            criticality: ObservationCriticality::Security,
+                            payload: harness_observation::Payload::ApprovalRequest(observation),
+                            raw_event: line.into_bytes(),
+                        }));
+                    }
                     DshAcpMessage::ServerRequest { .. } => {
                         return Err(driver_error(
                             "DSH_ACP_APPROVAL_OR_SERVER_REQUEST_UNATTESTED",
@@ -360,9 +412,9 @@ impl NativeHarnessDriver for DshAcpDriver {
 
     fn decide_approval<'a>(
         &'a mut self,
-        _envelope: &'a ApprovalDecisionEnvelope,
+        envelope: &'a ApprovalDecisionEnvelope,
     ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
-        Box::pin(async { Err(unsupported("DSH_ACP_APPROVALS_NOT_ATTESTED")) })
+        Box::pin(async move { send_approval_response(self, envelope).await })
     }
 
     fn cancel<'a>(
@@ -464,6 +516,87 @@ async fn probe_session(config: &DshAcpConfig) -> Result<DshSessionProbeResult, D
         initialize: initialize_result,
         session: session_result,
     })
+}
+
+async fn send_approval_response(
+    driver: &mut DshAcpDriver,
+    envelope: &ApprovalDecisionEnvelope,
+) -> Result<Vec<u8>, DriverError> {
+    let pending = driver
+        .pending_approvals
+        .get(&envelope.native_routing_ref)
+        .cloned()
+        .ok_or_else(|| {
+            driver_error(
+                "DSH_ACP_APPROVAL_ROUTING_NOT_FOUND",
+                envelope.native_routing_ref.as_bytes(),
+            )
+        })?;
+    if envelope.approval_request_id != pending.observation.approval_request_id
+        || envelope.action_digest_sha256 != pending.observation.action_digest_sha256
+    {
+        return Err(driver_error(
+            "DSH_ACP_APPROVAL_IDENTITY_MISMATCH",
+            envelope.native_routing_ref.as_bytes(),
+        ));
+    }
+    let decision = ApprovalDecision::try_from(envelope.decision)
+        .map_err(|_| driver_error("DSH_ACP_APPROVAL_DECISION_INVALID", &[]))?;
+    let result = match decision {
+        ApprovalDecision::AllowOnce => {
+            select_permission_option(&pending.params, &["allow_once", "allow_always"])?
+        }
+        ApprovalDecision::Deny => {
+            select_permission_option(&pending.params, &["reject_once", "reject_always"])?
+        }
+        ApprovalDecision::CancelAttempt => json!({
+            "outcome": { "outcome": "cancelled" }
+        }),
+        ApprovalDecision::Unspecified => {
+            return Err(driver_error("DSH_ACP_APPROVAL_DECISION_INVALID", &[]));
+        }
+    };
+    let response = json!({ "jsonrpc": "2.0", "id": pending.request_id, "result": result });
+    let raw = serde_json::to_vec(&response).unwrap_or_default();
+    let session = driver
+        .session
+        .as_mut()
+        .ok_or_else(|| dependency_error("DSH_ACP_SESSION_NOT_RUNNING"))?;
+    write_json_value(
+        &mut session.process,
+        &response,
+        "DSH_ACP_APPROVAL_RESPONSE_WRITE_FAILED",
+    )
+    .await
+    .map_err(|mut error| {
+        error.certainty = DriverErrorCertainty::DeliveryUnknown;
+        error
+    })?;
+    driver
+        .pending_approvals
+        .remove(&envelope.native_routing_ref);
+    Ok(raw)
+}
+
+fn select_permission_option(params: &Value, accepted_kinds: &[&str]) -> Result<Value, DriverError> {
+    let option = params
+        .get("options")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options.iter().find(|option| {
+                option
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| accepted_kinds.contains(&kind))
+            })
+        })
+        .and_then(|option| option.get("optionId"))
+        .and_then(Value::as_str)
+        .filter(|option_id| !option_id.is_empty())
+        .ok_or_else(|| driver_error("DSH_ACP_PERMISSION_OPTION_UNAVAILABLE", &[]))?;
+    Ok(json!({
+        "outcome": { "outcome": "selected", "optionId": option }
+    }))
 }
 
 async fn spawn_process(config: &DshAcpConfig) -> Result<SupervisedProcess, DriverError> {
@@ -624,10 +757,6 @@ fn parse_session_new_response(raw: &[u8]) -> Result<DshSessionProbeDisposition, 
     })
 }
 
-fn unsupported(detail: &str) -> DriverError {
-    driver_error(detail, &[])
-}
-
 fn dependency_error(detail: &str) -> DriverError {
     DriverError {
         certainty: DriverErrorCertainty::ProvenNotSent,
@@ -765,6 +894,26 @@ mod tests {
         assert_eq!(initialize["method"], "initialize");
         assert_eq!(session["method"], "session/new");
         assert_eq!(session["params"]["mcpServers"], json!([]));
+    }
+
+    #[test]
+    fn permission_response_selection_is_explicit_and_fail_closed() {
+        let params = json!({
+            "options": [
+                { "optionId": "yes", "kind": "allow_once" },
+                { "optionId": "no", "kind": "reject_once" }
+            ]
+        });
+        assert_eq!(
+            select_permission_option(&params, &["allow_once"]).expect("allow option")["outcome"]["optionId"],
+            "yes"
+        );
+        assert_eq!(
+            select_permission_option(&params, &["allow_always"])
+                .expect_err("missing option must fail closed")
+                .safe_detail_code,
+            "DSH_ACP_PERMISSION_OPTION_UNAVAILABLE"
+        );
     }
 
     #[tokio::test]

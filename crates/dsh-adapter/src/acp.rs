@@ -228,6 +228,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_native_permission_request_with_opaque_jsonrpc_identity() {
+        let message = parse_message(
+            br#"{"jsonrpc":"2.0","id":41,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"call-1","title":"mock side effect"},"options":[{"optionId":"yes","kind":"allow_once"},{"optionId":"no","kind":"reject_once"}]}}"#,
+        )
+        .expect("parse permission request");
+        assert_eq!(
+            message,
+            DshAcpMessage::ServerRequest {
+                id: serde_json::json!(41),
+                method: "session/request_permission".to_owned(),
+                params: serde_json::json!({
+                    "sessionId": "s",
+                    "toolCall": { "toolCallId": "call-1", "title": "mock side effect" },
+                    "options": [
+                        { "optionId": "yes", "kind": "allow_once" },
+                        { "optionId": "no", "kind": "reject_once" }
+                    ]
+                }),
+            }
+        );
+    }
+
+    #[test]
     fn uses_native_prompt_and_cancel_methods() {
         assert_eq!(
             session_prompt_request(3, "s", "hello")["method"],
