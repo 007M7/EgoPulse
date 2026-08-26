@@ -1,6 +1,8 @@
+use crate::runtime::TerminalOutputCandidate;
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ApprovalDecisionReceipt, CancelExecutionReceipt, DeliveryDisposition, DispatchEnvelope,
-    DispatchReceipt, HarnessObservation, harness_observation,
+    DispatchReceipt, HarnessObservation, LifecycleKind, ObservationCriticality,
+    harness_observation,
 };
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -106,6 +108,42 @@ CREATE TABLE adapter_projection_outbox (
 ) STRICT;
 "#;
 
+const SCHEMA_V3: &str = r#"
+CREATE TABLE adapter_dispatch_task_lineage (
+  dispatch_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  task_revision INTEGER NOT NULL CHECK (task_revision >= 1),
+  work_revision INTEGER NOT NULL CHECK (work_revision >= 1),
+  bound_at_seconds INTEGER NOT NULL,
+  FOREIGN KEY (dispatch_id) REFERENCES adapter_dispatches(dispatch_id)
+) STRICT;
+
+CREATE TABLE adapter_terminal_output_outbox (
+  message_id TEXT PRIMARY KEY,
+  source_observation_id TEXT NOT NULL UNIQUE,
+  source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+  payload_digest_sha256 TEXT NOT NULL,
+  dispatch_id TEXT NOT NULL UNIQUE,
+  native_completion_ref TEXT NOT NULL,
+  media_type TEXT NOT NULL,
+  content_digest_sha256 TEXT NOT NULL,
+  original_content_bytes INTEGER NOT NULL CHECK (original_content_bytes >= 0),
+  captured_content BLOB NOT NULL,
+  captured_content_digest_sha256 TEXT NOT NULL,
+  content_complete INTEGER NOT NULL CHECK (content_complete IN (0, 1)),
+  delivery_state TEXT NOT NULL CHECK (delivery_state IN ('pending', 'consumed', 'held')),
+  created_at_seconds INTEGER NOT NULL,
+  FOREIGN KEY (source_observation_id) REFERENCES adapter_observations(observation_id),
+  FOREIGN KEY (dispatch_id) REFERENCES adapter_dispatches(dispatch_id)
+) STRICT;
+"#;
+
+/// QR-04 durable attempt-output budget. Oversized output keeps a bounded
+/// preview plus the digest and original byte count; it is never presented as
+/// a complete Artifact candidate.
+const TERMINAL_OUTPUT_FULL_BYTES: usize = 16 * 1024 * 1024;
+const TERMINAL_OUTPUT_PREVIEW_BYTES: usize = 64 * 1024;
+
 pub struct AdapterEdgeKey([u8; 32]);
 
 impl AdapterEdgeKey {
@@ -203,6 +241,31 @@ pub struct PendingAdapterApprovalProjection {
     pub observation: HarnessObservation,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTerminalOutputCandidate {
+    pub message_id: String,
+    pub source_observation_id: String,
+    pub source_revision: u64,
+    pub payload_digest_sha256: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub task_revision: u64,
+    pub work_revision: u64,
+    pub run_revision: u64,
+    pub step_id: String,
+    pub step_revision: u64,
+    pub attempt_id: String,
+    pub attempt_revision: u64,
+    pub dispatch_id: String,
+    pub fencing_token: u64,
+    pub native_completion_ref: String,
+    pub media_type: String,
+    pub content_digest_sha256: String,
+    pub original_content_bytes: u64,
+    pub content: Vec<u8>,
+    pub content_complete: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdapterEdgeInspection {
     pub dispatch_count: u64,
@@ -214,6 +277,8 @@ pub struct AdapterEdgeInspection {
     pub approval_count: u64,
     pub projection_outbox_count: u64,
     pub pending_projection_count: u64,
+    pub terminal_output_outbox_count: u64,
+    pub pending_terminal_output_count: u64,
     pub next_observation_sequence: u64,
 }
 
@@ -242,15 +307,23 @@ impl AdapterEdge {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "secure_delete", "ON")?;
-        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)]).to_latest(&mut connection)?;
+        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2), M::up(SCHEMA_V3)])
+            .to_latest(&mut connection)?;
 
         backfill_approval_projection_outbox(&mut connection)?;
-        let schema_digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes());
-        let prior_schema_digest = sha256(SCHEMA_V1.as_bytes());
+        let schema_digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}\n{SCHEMA_V3}").as_bytes());
+        let prior_v2_schema_digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes());
+        let prior_v1_schema_digest = sha256(SCHEMA_V1.as_bytes());
         connection.execute(
             "UPDATE adapter_edge_metadata SET schema_profile_sha256 = ?1
-             WHERE singleton = 1 AND schema_profile_id = ?2 AND schema_profile_sha256 = ?3",
-            params![schema_digest, SCHEMA_PROFILE_ID, prior_schema_digest],
+             WHERE singleton = 1 AND schema_profile_id = ?2
+               AND schema_profile_sha256 IN (?3, ?4)",
+            params![
+                schema_digest,
+                SCHEMA_PROFILE_ID,
+                prior_v2_schema_digest,
+                prior_v1_schema_digest
+            ],
         )?;
         connection.execute(
             "INSERT OR IGNORE INTO adapter_edge_metadata(
@@ -401,10 +474,82 @@ impl AdapterEdge {
         dispatch_id: &str,
         native_key: &str,
         raw_event: &[u8],
+        observation: HarnessObservation,
+        now_seconds: i64,
+    ) -> Result<ObservationAppend, AdapterEdgeError> {
+        self.append_observation_with_terminal_output(
+            dispatch_id,
+            native_key,
+            raw_event,
+            observation,
+            None,
+            now_seconds,
+        )
+    }
+
+    pub fn bind_dispatch_task_lineage(
+        &mut self,
+        dispatch_id: &str,
+        task_id: &str,
+        task_revision: u64,
+        work_revision: u64,
+        now_seconds: i64,
+    ) -> Result<(), AdapterEdgeError> {
+        if task_id.trim().is_empty() || task_revision == 0 || work_revision == 0 {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        let task_revision =
+            i64::try_from(task_revision).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+        let work_revision =
+            i64::try_from(work_revision).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+        let changed = self.connection.execute(
+            "INSERT OR IGNORE INTO adapter_dispatch_task_lineage(
+               dispatch_id, task_id, task_revision, work_revision, bound_at_seconds
+             ) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![
+                dispatch_id,
+                task_id,
+                task_revision,
+                work_revision,
+                now_seconds
+            ],
+        )?;
+        if changed == 1 {
+            return Ok(());
+        }
+        let existing: Option<(String, i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT task_id, task_revision, work_revision
+                 FROM adapter_dispatch_task_lineage WHERE dispatch_id = ?1",
+                [dispatch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if existing == Some((task_id.to_owned(), task_revision, work_revision)) {
+            Ok(())
+        } else {
+            Err(AdapterEdgeError::DispatchConflict)
+        }
+    }
+
+    pub fn append_observation_with_terminal_output(
+        &mut self,
+        dispatch_id: &str,
+        native_key: &str,
+        raw_event: &[u8],
         mut observation: HarnessObservation,
+        terminal_output: Option<&TerminalOutputCandidate>,
         now_seconds: i64,
     ) -> Result<ObservationAppend, AdapterEdgeError> {
         let digest = sha256(raw_event);
+        if terminal_output.is_some_and(|candidate| {
+            candidate.dispatch_id != dispatch_id
+                || candidate.native_completion_ref.trim().is_empty()
+                || candidate.media_type.trim().is_empty()
+        }) {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -427,6 +572,25 @@ impl AdapterEdge {
             .optional()?;
         if let Some((prior_digest, prior_observation)) = existing {
             if prior_digest == digest {
+                if let Some(candidate) = terminal_output {
+                    let prior_candidate_digest: Option<String> = transaction
+                        .query_row(
+                            "SELECT payload_digest_sha256
+                             FROM adapter_terminal_output_outbox
+                             WHERE source_observation_id = (
+                               SELECT observation_id FROM adapter_observations
+                               WHERE dispatch_id = ?1 AND native_key = ?2
+                             )",
+                            params![dispatch_id, native_key],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if prior_candidate_digest.as_deref()
+                        != Some(terminal_output_payload_digest(candidate).as_str())
+                    {
+                        return Err(AdapterEdgeError::SequenceConflict);
+                    }
+                }
                 transaction.commit()?;
                 return Ok(ObservationAppend::Replay(HarnessObservation::decode(
                     prior_observation.as_slice(),
@@ -517,6 +681,40 @@ impl AdapterEdge {
                     sequence,
                     sha256(projection_payload),
                     projection_payload,
+                    now_seconds
+                ],
+            )?;
+        }
+        if let Some(candidate) = terminal_output {
+            let original_content_bytes = i64::try_from(candidate.content.len())
+                .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            let content_complete = candidate.content.len() <= TERMINAL_OUTPUT_FULL_BYTES;
+            let captured_content = if content_complete {
+                candidate.content.as_slice()
+            } else {
+                &candidate.content[..TERMINAL_OUTPUT_PREVIEW_BYTES]
+            };
+            transaction.execute(
+                "INSERT INTO adapter_terminal_output_outbox(
+                   message_id, source_observation_id, source_revision,
+                   payload_digest_sha256, dispatch_id, native_completion_ref,
+                   media_type, content_digest_sha256, original_content_bytes,
+                   captured_content, captured_content_digest_sha256, content_complete,
+                   delivery_state, created_at_seconds
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'pending', ?13)",
+                params![
+                    format!("adapter-terminal-output-{observation_id}"),
+                    observation_id,
+                    sequence,
+                    terminal_output_payload_digest(candidate),
+                    dispatch_id,
+                    candidate.native_completion_ref,
+                    candidate.media_type,
+                    sha256(&candidate.content),
+                    original_content_bytes,
+                    captured_content,
+                    sha256(captured_content),
+                    i64::from(content_complete),
                     now_seconds
                 ],
             )?;
@@ -670,6 +868,202 @@ impl AdapterEdge {
         Ok(
             matches!(replay, Some((digest, state)) if digest == payload_digest_sha256 && state == "consumed"),
         )
+    }
+
+    pub fn pending_terminal_output_candidates(
+        &self,
+    ) -> Result<Vec<PendingTerminalOutputCandidate>, AdapterEdgeError> {
+        let mut statement = self.connection.prepare(
+            "SELECT o.message_id, o.source_observation_id, o.source_revision,
+                    o.payload_digest_sha256, o.dispatch_id, o.native_completion_ref,
+                    o.media_type, o.content_digest_sha256, o.original_content_bytes,
+                    o.captured_content, o.captured_content_digest_sha256,
+                    o.content_complete, a.observation, d.envelope,
+                    l.task_id, l.task_revision, l.work_revision
+             FROM adapter_terminal_output_outbox o
+             JOIN adapter_observations a ON a.observation_id = o.source_observation_id
+             JOIN adapter_dispatches d ON d.dispatch_id = o.dispatch_id
+             JOIN adapter_dispatch_task_lineage l ON l.dispatch_id = o.dispatch_id
+             WHERE o.delivery_state = 'pending'
+             ORDER BY o.source_revision",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Vec<u8>>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, Vec<u8>>(12)?,
+                row.get::<_, Vec<u8>>(13)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, i64>(16)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                message_id,
+                source_observation_id,
+                source_revision,
+                payload_digest_sha256,
+                dispatch_id,
+                native_completion_ref,
+                media_type,
+                content_digest_sha256,
+                original_content_bytes,
+                content,
+                captured_content_digest_sha256,
+                content_complete,
+                observation_bytes,
+                envelope_bytes,
+                task_id,
+                task_revision,
+                work_revision,
+            ) = row?;
+            let observation = HarnessObservation::decode(observation_bytes.as_slice())?;
+            let envelope = DispatchEnvelope::decode(envelope_bytes.as_slice())?;
+            let is_completed = matches!(
+                observation.payload.as_ref(),
+                Some(harness_observation::Payload::Lifecycle(lifecycle))
+                    if lifecycle.kind == LifecycleKind::ExecutionCompleted as i32
+            );
+            let original_content_bytes = u64::try_from(original_content_bytes)
+                .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            let content_complete = content_complete == 1;
+            let task_revision =
+                u64::try_from(task_revision).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            let work_revision =
+                u64::try_from(work_revision).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            if observation.observation_id != source_observation_id
+                || observation.observation_sequence != source_revision as u64
+                || observation.criticality != ObservationCriticality::Terminal as i32
+                || !is_completed
+                || observation.attempt_id != envelope.attempt_id
+                || observation.dispatch_id != envelope.dispatch_id
+                || observation.fencing_token != envelope.fencing_token
+                || dispatch_id != envelope.dispatch_id
+                || envelope.run_id.trim().is_empty()
+                || envelope.run_revision == 0
+                || envelope.step_id.trim().is_empty()
+                || envelope.step_revision == 0
+                || envelope.attempt_id.trim().is_empty()
+                || envelope.attempt_revision == 0
+                || envelope.fencing_token == 0
+                || task_id.trim().is_empty()
+                || task_revision == 0
+                || work_revision == 0
+                || native_completion_ref.trim().is_empty()
+                || media_type.trim().is_empty()
+                || !is_sha256(&content_digest_sha256)
+                || !is_sha256(&captured_content_digest_sha256)
+                || sha256(&content) != captured_content_digest_sha256
+                || (content_complete
+                    && (original_content_bytes != content.len() as u64
+                        || sha256(&content) != content_digest_sha256))
+                || (!content_complete
+                    && (content.len() != TERMINAL_OUTPUT_PREVIEW_BYTES
+                        || original_content_bytes <= TERMINAL_OUTPUT_FULL_BYTES as u64))
+                || terminal_output_payload_digest_parts(
+                    &dispatch_id,
+                    &native_completion_ref,
+                    &media_type,
+                    &content_digest_sha256,
+                    original_content_bytes,
+                ) != payload_digest_sha256
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+            Ok(PendingTerminalOutputCandidate {
+                message_id,
+                source_observation_id,
+                source_revision: source_revision as u64,
+                payload_digest_sha256,
+                run_id: envelope.run_id,
+                task_id,
+                task_revision,
+                work_revision,
+                run_revision: envelope.run_revision,
+                step_id: envelope.step_id,
+                step_revision: envelope.step_revision,
+                attempt_id: envelope.attempt_id,
+                attempt_revision: envelope.attempt_revision,
+                dispatch_id,
+                fencing_token: envelope.fencing_token,
+                native_completion_ref,
+                media_type,
+                content_digest_sha256,
+                original_content_bytes,
+                content,
+                content_complete,
+            })
+        })
+        .collect()
+    }
+
+    pub fn terminal_output_candidate_is_durable(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<bool, AdapterEdgeError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM adapter_terminal_output_outbox
+                   WHERE dispatch_id = ?1 AND delivery_state IN ('pending', 'consumed')
+                 )",
+                [dispatch_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn acknowledge_terminal_output_candidate(
+        &mut self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, AdapterEdgeError> {
+        let changed = self.connection.execute(
+            "UPDATE adapter_terminal_output_outbox SET delivery_state = 'consumed'
+             WHERE message_id = ?1 AND payload_digest_sha256 = ?2
+               AND delivery_state = 'pending'",
+            params![message_id, payload_digest_sha256],
+        )?;
+        if changed == 1 {
+            return Ok(true);
+        }
+        let replay: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT payload_digest_sha256, delivery_state
+                 FROM adapter_terminal_output_outbox WHERE message_id = ?1",
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(matches!(
+            replay,
+            Some((digest, state)) if digest == payload_digest_sha256 && state == "consumed"
+        ))
+    }
+
+    pub fn hold_terminal_output_candidate(
+        &mut self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, AdapterEdgeError> {
+        Ok(self.connection.execute(
+            "UPDATE adapter_terminal_output_outbox SET delivery_state = 'held'
+             WHERE message_id = ?1 AND payload_digest_sha256 = ?2
+               AND delivery_state = 'pending'",
+            params![message_id, payload_digest_sha256],
+        )? == 1)
     }
 
     pub fn resolve_native_execution_binding(
@@ -1064,6 +1458,12 @@ impl AdapterEdge {
             pending_projection_count: scalar(
                 "SELECT count(*) FROM adapter_projection_outbox WHERE delivery_state = 'pending'",
             )?,
+            terminal_output_outbox_count: scalar(
+                "SELECT count(*) FROM adapter_terminal_output_outbox",
+            )?,
+            pending_terminal_output_count: scalar(
+                "SELECT count(*) FROM adapter_terminal_output_outbox WHERE delivery_state = 'pending'",
+            )?,
             next_observation_sequence: next as u64,
         })
     }
@@ -1232,6 +1632,44 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn terminal_output_payload_digest(candidate: &TerminalOutputCandidate) -> String {
+    terminal_output_payload_digest_parts(
+        &candidate.dispatch_id,
+        &candidate.native_completion_ref,
+        &candidate.media_type,
+        &sha256(&candidate.content),
+        candidate.content.len() as u64,
+    )
+}
+
+fn terminal_output_payload_digest_parts(
+    dispatch_id: &str,
+    native_completion_ref: &str,
+    media_type: &str,
+    content_digest_sha256: &str,
+    original_content_bytes: u64,
+) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        dispatch_id.as_bytes(),
+        native_completion_ref.as_bytes(),
+        media_type.as_bytes(),
+        content_digest_sha256.as_bytes(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest.update(original_content_bytes.to_be_bytes());
+    hex::encode(digest.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1292,7 +1730,12 @@ mod tests {
     fn dispatch_with_id(dispatch_id: &str, attempt_id: &str) -> DispatchEnvelope {
         DispatchEnvelope {
             dispatch_id: dispatch_id.to_owned(),
+            run_id: "run-001".to_owned(),
+            run_revision: 1,
+            step_id: "step-001".to_owned(),
+            step_revision: 1,
             attempt_id: attempt_id.to_owned(),
+            attempt_revision: 1,
             fencing_token: 1,
             dispatch_fingerprint: "1".repeat(64),
             input_bundle_sha256: "2".repeat(64),
@@ -1331,6 +1774,172 @@ mod tests {
             )),
             ..HarnessObservation::default()
         }
+    }
+
+    fn terminal_observation() -> HarnessObservation {
+        HarnessObservation {
+            attempt_id: "attempt-001".to_owned(),
+            dispatch_id: "dispatch-001".to_owned(),
+            fencing_token: 1,
+            criticality: ObservationCriticality::Terminal as i32,
+            payload: Some(harness_observation::Payload::Lifecycle(
+                egopulse_domain_contracts::v01::egopulse::harness::v1::LifecycleObservation {
+                    kind: LifecycleKind::ExecutionCompleted as i32,
+                    ..Default::default()
+                },
+            )),
+            ..HarnessObservation::default()
+        }
+    }
+
+    fn terminal_candidate(content: Vec<u8>) -> TerminalOutputCandidate {
+        TerminalOutputCandidate {
+            dispatch_id: "dispatch-001".to_owned(),
+            native_completion_ref: "native-turn-001".to_owned(),
+            media_type: "text/plain; charset=utf-8".to_owned(),
+            content,
+        }
+    }
+
+    #[test]
+    fn terminal_output_handoff_is_atomic_recoverable_and_acknowledged_idempotently() {
+        let isolated = IsolatedEdge::new("terminal-output-outbox");
+        let path = isolated.path();
+        let mut edge = open_edge(&path);
+        edge.prepare_dispatch(&dispatch(), 10)
+            .expect("prepare dispatch");
+        edge.bind_dispatch_task_lineage("dispatch-001", "task-001", 2, 1, 10)
+            .expect("bind task lineage");
+        let candidate = terminal_candidate(b"governed final answer".to_vec());
+        let appended = edge
+            .append_observation_with_terminal_output(
+                "dispatch-001",
+                "native:terminal:001",
+                b"terminal-event",
+                terminal_observation(),
+                Some(&candidate),
+                11,
+            )
+            .expect("persist terminal observation and output in one transaction");
+        assert!(matches!(appended, ObservationAppend::Committed(_)));
+        assert!(
+            edge.terminal_output_candidate_is_durable("dispatch-001")
+                .expect("durable candidate lookup")
+        );
+        drop(edge);
+
+        let mut reopened = open_edge(&path);
+        let pending = reopened
+            .pending_terminal_output_candidates()
+            .expect("recover pending candidate");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content, b"governed final answer");
+        assert!(pending[0].content_complete);
+        assert_eq!(pending[0].original_content_bytes, 21);
+        assert_eq!(
+            reopened
+                .inspect()
+                .expect("inspect edge")
+                .pending_observation_count,
+            1
+        );
+        assert!(
+            reopened
+                .acknowledge_terminal_output_candidate(
+                    &pending[0].message_id,
+                    &pending[0].payload_digest_sha256,
+                )
+                .expect("ack candidate")
+        );
+        assert!(
+            reopened
+                .acknowledge_terminal_output_candidate(
+                    &pending[0].message_id,
+                    &pending[0].payload_digest_sha256,
+                )
+                .expect("replay ack candidate")
+        );
+        assert!(
+            reopened
+                .pending_terminal_output_candidates()
+                .expect("candidate is settled")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn terminal_output_replay_conflict_and_tamper_fail_closed() {
+        let isolated = IsolatedEdge::new("terminal-output-integrity");
+        let mut edge = open_edge(&isolated.path());
+        edge.prepare_dispatch(&dispatch(), 10)
+            .expect("prepare dispatch");
+        edge.bind_dispatch_task_lineage("dispatch-001", "task-001", 2, 1, 10)
+            .expect("bind task lineage");
+        let candidate = terminal_candidate(b"original".to_vec());
+        edge.append_observation_with_terminal_output(
+            "dispatch-001",
+            "native:terminal:001",
+            b"terminal-event",
+            terminal_observation(),
+            Some(&candidate),
+            11,
+        )
+        .expect("persist candidate");
+        let conflicting = terminal_candidate(b"forged".to_vec());
+        assert!(matches!(
+            edge.append_observation_with_terminal_output(
+                "dispatch-001",
+                "native:terminal:001",
+                b"terminal-event",
+                terminal_observation(),
+                Some(&conflicting),
+                12,
+            ),
+            Err(AdapterEdgeError::SequenceConflict)
+        ));
+        edge.connection
+            .execute(
+                "UPDATE adapter_terminal_output_outbox SET captured_content = ?1",
+                [b"tampered".as_slice()],
+            )
+            .expect("inject storage tamper");
+        assert!(matches!(
+            edge.pending_terminal_output_candidates(),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+    }
+
+    #[test]
+    fn oversized_terminal_output_preserves_bounded_preview_digest_and_marker() {
+        let isolated = IsolatedEdge::new("terminal-output-budget");
+        let mut edge = open_edge(&isolated.path());
+        edge.prepare_dispatch(&dispatch(), 10)
+            .expect("prepare dispatch");
+        edge.bind_dispatch_task_lineage("dispatch-001", "task-001", 2, 1, 10)
+            .expect("bind task lineage");
+        let content = vec![0x5a; TERMINAL_OUTPUT_FULL_BYTES + 1];
+        let expected_digest = sha256(&content);
+        let candidate = terminal_candidate(content);
+        edge.append_observation_with_terminal_output(
+            "dispatch-001",
+            "native:terminal:001",
+            b"terminal-event",
+            terminal_observation(),
+            Some(&candidate),
+            11,
+        )
+        .expect("persist bounded terminal preview");
+        let pending = edge
+            .pending_terminal_output_candidates()
+            .expect("read bounded terminal preview");
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].content_complete);
+        assert_eq!(pending[0].content.len(), TERMINAL_OUTPUT_PREVIEW_BYTES);
+        assert_eq!(
+            pending[0].original_content_bytes,
+            (TERMINAL_OUTPUT_FULL_BYTES + 1) as u64
+        );
+        assert_eq!(pending[0].content_digest_sha256, expected_digest);
     }
 
     #[test]

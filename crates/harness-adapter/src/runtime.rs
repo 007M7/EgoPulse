@@ -7,9 +7,10 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     CancelExecutionEnvelope, CancelExecutionReceipt, CancelExecutionResult,
     CancellationDeliveryDisposition, DeliveryDisposition, DiagnosticObservation, DispatchEnvelope,
     DispatchReceipt, DispatchResult, HarnessError, HarnessErrorCode, HarnessObservation,
-    HarnessReadiness, NativeProtocolFingerprint, ObservationCriticality, ProbeHarnessRequest,
-    ProbeHarnessResult, ResumeExecutionEnvelope, ResumeExecutionResult, approval_decision_result,
-    cancel_execution_result, dispatch_result, harness_observation, resume_execution_result,
+    HarnessReadiness, LifecycleKind, NativeProtocolFingerprint, ObservationCriticality,
+    ProbeHarnessRequest, ProbeHarnessResult, ResumeExecutionEnvelope, ResumeExecutionResult,
+    approval_decision_result, cancel_execution_result, dispatch_result, harness_observation,
+    resume_execution_result,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -202,6 +203,8 @@ pub enum GovernedAdapterError {
     DispatchNotFound,
     #[error("durable reconciliation evidence is invalid")]
     InvalidReconciliationEvidence,
+    #[error("native terminal output candidate extraction failed")]
+    TerminalOutputCandidate,
 }
 
 pub struct GovernedHarnessAdapter<R, D, C> {
@@ -355,6 +358,20 @@ where
             return Ok(None);
         };
         let received_at = self.clock.now();
+        let completed = event.criticality == ObservationCriticality::Terminal
+            && matches!(
+                &event.payload,
+                harness_observation::Payload::Lifecycle(lifecycle)
+                    if lifecycle.kind == LifecycleKind::ExecutionCompleted as i32
+            );
+        let terminal_output = if completed {
+            self.driver
+                .take_terminal_output_candidate(envelope)
+                .await
+                .map_err(|_| GovernedAdapterError::TerminalOutputCandidate)?
+        } else {
+            None
+        };
         let observation = HarnessObservation {
             observation_id: String::new(),
             adapter_id: self.adapter_id.clone(),
@@ -372,11 +389,12 @@ where
             adapter_received_at: Some(received_at),
             payload: Some(event.payload),
         };
-        let appended = self.edge.append_observation(
+        let appended = self.edge.append_observation_with_terminal_output(
             &envelope.dispatch_id,
             &event.native_key,
             &event.raw_event,
             observation,
+            terminal_output.as_ref(),
             received_at.seconds,
         )?;
         Ok(Some(match appended {
@@ -741,11 +759,66 @@ where
         self.edge.pending_observations().map_err(Into::into)
     }
 
+    pub fn bind_dispatch_task_lineage(
+        &mut self,
+        dispatch_id: &str,
+        task_id: &str,
+        task_revision: u64,
+        work_revision: u64,
+    ) -> Result<(), GovernedAdapterError> {
+        self.edge
+            .bind_dispatch_task_lineage(
+                dispatch_id,
+                task_id,
+                task_revision,
+                work_revision,
+                self.clock.now().seconds,
+            )
+            .map_err(Into::into)
+    }
+
     pub fn pending_approval_projection_messages(
         &self,
     ) -> Result<Vec<PendingAdapterApprovalProjection>, GovernedAdapterError> {
         self.edge
             .pending_approval_projection_messages()
+            .map_err(Into::into)
+    }
+
+    pub fn pending_terminal_output_candidates(
+        &self,
+    ) -> Result<Vec<crate::PendingTerminalOutputCandidate>, GovernedAdapterError> {
+        self.edge
+            .pending_terminal_output_candidates()
+            .map_err(Into::into)
+    }
+
+    pub fn terminal_output_candidate_is_durable(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<bool, GovernedAdapterError> {
+        self.edge
+            .terminal_output_candidate_is_durable(dispatch_id)
+            .map_err(Into::into)
+    }
+
+    pub fn acknowledge_terminal_output_candidate(
+        &mut self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, GovernedAdapterError> {
+        self.edge
+            .acknowledge_terminal_output_candidate(message_id, payload_digest_sha256)
+            .map_err(Into::into)
+    }
+
+    pub fn hold_terminal_output_candidate(
+        &mut self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, GovernedAdapterError> {
+        self.edge
+            .hold_terminal_output_candidate(message_id, payload_digest_sha256)
             .map_err(Into::into)
     }
 

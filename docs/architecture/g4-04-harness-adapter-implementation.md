@@ -78,6 +78,16 @@ dispatch by itself.
   require Adapter quarantine;
 - cancellation is confirmed only by a structured interruption observation while cancellation is
   pending; cancellation delivery is not treated as execution termination.
+- a terminal `ExecutionCompleted` observation and its provider-neutral output candidate are written
+  atomically to Adapter Edge; the observation is not marked consumed until the candidate has a
+  durable handoff path;
+- Collaboration binds its authoritative Task ID, Task revision and work revision after the dispatch
+  envelope is durable and before terminal observations are pumped. Adapter Edge rejects missing,
+  conflicting or corrupt lineage rather than inferring it from provider data;
+- terminal output storage is bounded: complete values up to 16 MiB are retained, while larger values
+  retain a 64 KiB preview, full-content digest, original byte count and an explicit incomplete marker;
+- output outbox acknowledgement requires the exact payload digest and occurs only after Artifact
+  Authority has emitted a technical return receipt. Empty and incomplete candidates are held;
 - reconciliation probes restore the immutable dispatch and native execution binding by
   `dispatch_id`, then persist a provider-neutral diagnostic observation and encrypted raw evidence;
 - `(dispatch_id, reconciliation_id)` is idempotent across process restart: replay resolves the same
@@ -143,6 +153,12 @@ production runner now retains the active immutable dispatch envelope across
 cycles, continues pumping it after the approval authority responds, and
 releases it only after a terminal observation. This is an execution-lifecycle
 fix, not approval authorization.
+
+The Codex driver also reconstructs one terminal `agentMessage` candidate from
+native item completion or streamed deltas. This candidate is one-shot at the
+driver boundary and durable at Adapter Edge, so runner restart cannot fabricate
+a second logical return. DSH and fake drivers implement the same provider-neutral
+candidate seam; production Harness selection remains unchanged.
 
 The user-configured production runner was then exercised on Windows x64 with
 the installed Codex native executable:

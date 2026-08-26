@@ -99,6 +99,7 @@ struct ActiveDispatch {
     native_session_ref: String,
     prompt_request_id: u64,
     output_text: String,
+    output_candidate_taken: bool,
 }
 
 #[derive(Clone)]
@@ -260,6 +261,7 @@ impl NativeHarnessDriver for DshAcpDriver {
                 native_session_ref: native_session_ref.clone(),
                 prompt_request_id: request_id,
                 output_text: String::new(),
+                output_candidate_taken: false,
             });
             self.completed_dispatch_id = None;
             Ok(DriverDelivery {
@@ -429,9 +431,10 @@ impl NativeHarnessDriver for DshAcpDriver {
             else {
                 return Ok(None);
             };
-            if active.output_text.is_empty() {
+            if active.output_candidate_taken {
                 return Ok(None);
             }
+            active.output_candidate_taken = true;
             let content = std::mem::take(&mut active.output_text).into_bytes();
             Ok(Some(TerminalOutputCandidate {
                 dispatch_id: envelope.dispatch_id.clone(),
@@ -1024,6 +1027,7 @@ mod tests {
             native_session_ref: "dsh-session-candidate".to_owned(),
             prompt_request_id: 41,
             output_text: "committed answer".to_owned(),
+            output_candidate_taken: false,
         });
         driver.completed_dispatch_id = Some("dispatch:dsh-output-candidate".to_owned());
         let envelope = DispatchEnvelope {

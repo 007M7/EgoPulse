@@ -50,6 +50,14 @@ data plane stores bytes by verified digest. Harnesses and collectors may submit 
 neither receives the Authority database handle nor may a terminal Harness event decide Artifact,
 verification or Task completion.
 
+The production return path is provider-neutral and durable. A native Harness driver emits one
+terminal output candidate; Adapter Edge atomically binds it to the terminal observation, immutable
+dispatch envelope and Collaboration-owned Task/work lineage. The governed return collector may
+then stage and seal the bytes through Artifact Authority and settle the Adapter outbox only after a
+technical `ReturnReceipt` exists. Empty or size-truncated candidates are held for review. This path
+does not record an Attempt return, perform verification or commit a Step; those remain explicit
+Collaboration/Sego stages after technical evidence intake.
+
 ## Language boundaries
 
 | Runtime | Owns | Must not own |

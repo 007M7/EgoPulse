@@ -8,6 +8,7 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
 use egopulse_harness_adapter::{
     DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, NativeHarnessDriver,
     NativeHarnessFuture, ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
+    TerminalOutputCandidate,
 };
 use egopulse_process_supervision::{SupervisedProcess, SupervisedProcessSpec};
 use prost_types::Timestamp;
@@ -81,6 +82,8 @@ pub struct CodexAppServerDriver {
     session: Option<CodexSession>,
     active: Option<ActiveDispatch>,
     completed_dispatch_id: Option<String>,
+    pending_agent_message_text: String,
+    terminal_output_candidate: Option<TerminalOutputCandidate>,
     pending_approvals: HashMap<String, PendingApproval>,
     responded_approvals: HashMap<String, ApprovalRequestObservation>,
     queued_events: VecDeque<DriverEvent>,
@@ -96,6 +99,8 @@ impl CodexAppServerDriver {
             session: None,
             active: None,
             completed_dispatch_id: None,
+            pending_agent_message_text: String::new(),
+            terminal_output_candidate: None,
             pending_approvals: HashMap::new(),
             responded_approvals: HashMap::new(),
             queued_events: VecDeque::new(),
@@ -529,14 +534,35 @@ impl CodexAppServerDriver {
                 None,
                 raw,
             ),
-            "item/completed" => lifecycle_event(
-                method,
-                LifecycleKind::ItemCompleted,
-                params.pointer("/item/id").and_then(Value::as_str),
-                "completed",
-                None,
-                raw,
-            ),
+            "item/completed" => {
+                if params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") {
+                    let text = params
+                        .pointer("/item/text")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| std::mem::take(&mut self.pending_agent_message_text));
+                    let native_completion_ref = params
+                        .pointer("/item/id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| self.active.as_ref().and_then(|value| value.turn_id.clone()))
+                        .unwrap_or_else(|| format!("codex-dispatch:{}", envelope.dispatch_id));
+                    self.terminal_output_candidate = Some(TerminalOutputCandidate {
+                        dispatch_id: envelope.dispatch_id.clone(),
+                        native_completion_ref,
+                        media_type: "text/plain; charset=utf-8".to_owned(),
+                        content: text.into_bytes(),
+                    });
+                }
+                lifecycle_event(
+                    method,
+                    LifecycleKind::ItemCompleted,
+                    params.pointer("/item/id").and_then(Value::as_str),
+                    "completed",
+                    None,
+                    raw,
+                )
+            }
             "context/compacted" => lifecycle_event(
                 method,
                 LifecycleKind::ContextCompacted,
@@ -582,6 +608,22 @@ impl CodexAppServerDriver {
                         ));
                     }
                 };
+                if kind == LifecycleKind::ExecutionCompleted
+                    && self.terminal_output_candidate.is_none()
+                {
+                    let native_completion_ref = params
+                        .pointer("/turn/id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| self.active.as_ref().and_then(|value| value.turn_id.clone()))
+                        .unwrap_or_else(|| format!("codex-dispatch:{}", envelope.dispatch_id));
+                    self.terminal_output_candidate = Some(TerminalOutputCandidate {
+                        dispatch_id: envelope.dispatch_id.clone(),
+                        native_completion_ref,
+                        media_type: "text/plain; charset=utf-8".to_owned(),
+                        content: Vec::new(),
+                    });
+                }
                 lifecycle_event(method, kind, None, status, None, raw)
             }
             "error" => lifecycle_event(
@@ -742,9 +784,14 @@ impl CodexAppServerDriver {
                     raw_event: raw,
                 }
             }
+            "item/agentMessage/delta" => {
+                if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                    self.pending_agent_message_text.push_str(delta);
+                }
+                return Ok(None);
+            }
             "turn/diff/updated"
             | "turn/plan/updated"
-            | "item/agentMessage/delta"
             | "item/plan/delta"
             | "item/commandExecution/outputDelta"
             | "item/commandExecution/terminalInteraction"
@@ -905,6 +952,8 @@ impl NativeHarnessDriver for CodexAppServerDriver {
                 turn_request_id: request_id,
             });
             self.completed_dispatch_id = None;
+            self.pending_agent_message_text.clear();
+            self.terminal_output_candidate = None;
             Ok(DriverDelivery {
                 native_request_ref: format!("codex-jsonrpc:{request_id}"),
                 native_session_ref: thread_id,
@@ -945,6 +994,21 @@ impl NativeHarnessDriver for CodexAppServerDriver {
                 .ok_or_else(|| dependency_error("CODEX_SESSION_NOT_RUNNING"))?;
             let (value, raw) = session.read_next_value(self.config.request_timeout).await?;
             self.map_value(envelope, value, raw)
+        })
+    }
+
+    fn take_terminal_output_candidate<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<TerminalOutputCandidate>, DriverError>> {
+        Box::pin(async move {
+            if self.completed_dispatch_id.as_deref() != Some(envelope.dispatch_id.as_str()) {
+                return Ok(None);
+            }
+            Ok(self
+                .terminal_output_candidate
+                .take()
+                .filter(|candidate| candidate.dispatch_id == envelope.dispatch_id))
         })
     }
 
@@ -1449,6 +1513,69 @@ mod tests {
                 .next_event(&envelope)
                 .await
                 .expect("terminal stream close")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_agent_message_becomes_one_governed_terminal_output_candidate() {
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch-output".to_owned(),
+            ..Default::default()
+        };
+        driver.active = Some(ActiveDispatch {
+            dispatch_id: envelope.dispatch_id.clone(),
+            thread_id: "thread-output".to_owned(),
+            turn_id: Some("turn-output".to_owned()),
+            turn_request_id: 1,
+        });
+        let item = json!({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "item-output",
+                    "type": "agentMessage",
+                    "text": "governed Codex answer"
+                }
+            }
+        });
+        driver
+            .map_notification(
+                &envelope,
+                "item/completed",
+                item.clone(),
+                serde_json::to_vec(&item).expect("item bytes"),
+            )
+            .expect("map completed item")
+            .expect("completed item observation");
+        let terminal = json!({
+            "method": "turn/completed",
+            "params": { "turn": { "id": "turn-output", "status": "completed" } }
+        });
+        driver
+            .map_notification(
+                &envelope,
+                "turn/completed",
+                terminal.clone(),
+                serde_json::to_vec(&terminal).expect("terminal bytes"),
+            )
+            .expect("map terminal")
+            .expect("terminal observation");
+
+        let candidate = driver
+            .take_terminal_output_candidate(&envelope)
+            .await
+            .expect("candidate extraction")
+            .expect("candidate exists");
+        assert_eq!(candidate.dispatch_id, envelope.dispatch_id);
+        assert_eq!(candidate.native_completion_ref, "item-output");
+        assert_eq!(candidate.content, b"governed Codex answer");
+        assert!(
+            driver
+                .take_terminal_output_candidate(&envelope)
+                .await
+                .expect("candidate replay")
                 .is_none()
         );
     }

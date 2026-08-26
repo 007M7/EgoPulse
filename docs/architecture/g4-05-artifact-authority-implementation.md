@@ -62,6 +62,13 @@ mutable workspace path.
 - duplicate replay, idempotency conflict and stale CAS with zero extra writes;
 - sealed-set canonical manifest validation;
 - ReturnHandoff + technical ReturnReceipt + outbox in one owner transaction;
+- production governed return collector stages bytes, seals the Artifact and ArtifactSet, records a
+  non-independent collector Evidence fact and submits the ReturnHandoff entirely through Artifact
+  Authority commands. Deterministic IDs and idempotency keys make crash/replay converge on one
+  receipt;
+- Adapter Edge settles its source candidate only after that receipt reports evidence intake=true,
+  verification=false and task-completion=false. Empty, truncated or admission-rejected candidates
+  are held without fabricating artifacts;
 - orphan-blob reuse and process-abort replay after committed return;
 - encrypted metadata-store reopen/integrity and private-store dependency boundary checks.
 
@@ -87,3 +94,11 @@ the production key/ACL and blob-at-rest encryption profile remains a G4-08 secur
 obligation. Startup-wide live-blob reconciliation, quarantine/tombstone workflows and physical
 power-loss durability qualification remain G4-10 recovery work. These deferred obligations do not
 weaken the frozen single-writer or blob-before-metadata boundaries.
+
+## Return-path boundary still open
+
+The collector closes the Harness-to-Artifact-Authority technical intake path only. Artifact
+Authority's receipt outbox is not yet projected into Collaboration's `RecordAttemptReturn`, Sego
+verification and `CommitStepReturn` transitions. Therefore a successful technical receipt is not a
+V-01 workflow completion claim. The next vertical slice must consume that outbox through a typed,
+idempotent resolver and preserve the existing single-writer/fencing checks.

@@ -52,9 +52,10 @@ use crate::{
     ConfiguredFounderVerdictResolver, ConfiguredFounderVerdictResolverConfig,
     ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ConfiguredVerificationWorker,
     DaemonCompositionError, DaemonProviders, FounderVerdictConfigurationError,
-    LocalUserPolicyResolver, LocalUserPolicyResolverConfig, MemoryRetrievalCompositionConfig,
-    SharedAuthorityCompositionInputs, TaskAuthorityCommitReceiptSource,
-    VerificationAuthorityArtifactSource, VerificationProjectionSource, VerificationWorkerConfig,
+    GovernedReturnCollectorConfig, LocalUserPolicyResolver, LocalUserPolicyResolverConfig,
+    MemoryRetrievalCompositionConfig, SharedAuthorityCompositionInputs,
+    TaskAuthorityCommitReceiptSource, VerificationAuthorityArtifactSource,
+    VerificationProjectionSource, VerificationWorkerConfig,
 };
 
 /// Explicit scalar configuration for the local-user Policy resolver. The
@@ -218,7 +219,9 @@ impl ProductionBootstrapConfig {
         if let Some(worker_config) = self.verification_worker {
             let worker = ConfiguredVerificationWorker::new(
                 task,
-                Box::new(ArtifactAuthorityReferenceSource::new_shared(artifact)),
+                Box::new(ArtifactAuthorityReferenceSource::new_shared(Arc::clone(
+                    &artifact,
+                ))),
                 Arc::clone(&verification),
                 worker_config,
             )
@@ -228,7 +231,7 @@ impl ProductionBootstrapConfig {
         if let Some(memory_retrieval) = self.memory_retrieval {
             providers = providers.with_memory_retrieval(memory, memory_retrieval)?;
         }
-        providers = providers.with_codex_harness(self.codex)?;
+        providers = providers.with_codex_harness(self.codex, artifact)?;
         Ok(providers)
     }
 }
@@ -660,6 +663,61 @@ impl UserOwnedBootstrapFile {
         }
 
         let workflow = self.codex.workflow.into_typed()?;
+        if !artifact_guard
+            .allowed_workspace_refs
+            .contains(&workflow.workspace_ref)
+        {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "artifact.allowed_workspace_refs must include codex.workflow.workspace_ref",
+            ));
+        }
+        let return_collector = GovernedReturnCollectorConfig {
+            artifact_type_ref: artifact_guard
+                .allowed_artifact_type_refs
+                .first()
+                .cloned()
+                .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                    "artifact.allowed_artifact_type_refs",
+                ))?,
+            transformation_contract_ref: artifact_guard
+                .allowed_transformation_contract_refs
+                .first()
+                .cloned()
+                .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                    "artifact.allowed_transformation_contract_refs",
+                ))?,
+            retention_profile_ref: artifact_guard
+                .allowed_retention_profile_refs
+                .first()
+                .cloned()
+                .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                    "artifact.allowed_retention_profile_refs",
+                ))?,
+            claim_semantic_profile_ref: artifact_guard
+                .allowed_claim_semantic_profile_refs
+                .first()
+                .cloned()
+                .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                    "artifact.allowed_claim_semantic_profile_refs",
+                ))?,
+            claim_acceptance_contract_ref: artifact_guard
+                .allowed_claim_acceptance_contract_refs
+                .first()
+                .cloned()
+                .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                    "artifact.allowed_claim_acceptance_contract_refs",
+                ))?,
+            evidence_profile_ref: artifact_guard
+                .allowed_evidence_profile_refs
+                .first()
+                .cloned()
+                .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                    "artifact.allowed_evidence_profile_refs",
+                ))?,
+            workspace_ref: workflow.workspace_ref.clone(),
+            collector_principal_id: "collector:terminal-output".to_owned(),
+            artifact_authority_principal_id: "authority:artifact".to_owned(),
+        };
         let codex = CodexHarnessCompositionConfig {
             collaboration_database_path: collaboration_store.database_path,
             collaboration_store_epoch: collaboration_store.store_epoch,
@@ -681,6 +739,7 @@ impl UserOwnedBootstrapFile {
             )?),
             workflow,
             lease_ttl_seconds: self.codex.lease_ttl_seconds,
+            return_collector,
         };
 
         Ok(ProductionBootstrapConfig {

@@ -4,9 +4,10 @@ use super::{
     HarnessFactIngestionDisposition, HarnessFactIngestionResult, SingleHarnessWorkflowResolver,
     TaskActivationGuardSet, TaskActivationReferenceHandle, TaskActivationSource,
 };
+use egopulse_domain_contracts::v01::egopulse::collaboration::v1::get_collaboration_response;
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    DeliveryDisposition, DispatchEnvelope, HarnessObservation, ObservationCriticality,
-    dispatch_result,
+    DeliveryDisposition, DispatchEnvelope, HarnessObservation, LifecycleKind,
+    ObservationCriticality, dispatch_result, harness_observation,
 };
 use egopulse_harness_adapter::{
     AdapterClock, DispatchMaterialResolver, GovernedAdapterError, GovernedHarnessAdapter,
@@ -26,6 +27,9 @@ pub struct HarnessDispatchCycleReport {
     pub observations_retained: u64,
     pub observations_quarantined: u64,
     pub terminal_observations: u64,
+    pub terminal_output_candidates_seen: u64,
+    pub terminal_output_candidates_receipted: u64,
+    pub terminal_output_candidates_held: u64,
     pub activations_seen: u64,
     pub activations_started: u64,
     pub activations_acknowledged: u64,
@@ -44,6 +48,8 @@ pub enum HarnessDispatchCycleError {
     TaskActivationResolver,
     #[error("task activation workflow failed: {0}")]
     TaskActivationWorkflow(String),
+    #[error("governed return collector failed: {0}")]
+    ReturnCollector(String),
 }
 
 pub trait HarnessDispatchRunner: Send + Sync {
@@ -301,6 +307,16 @@ where
         ..HarnessDispatchCycleReport::default()
     };
     for dispatch in pending {
+        let collaboration = control.get_collaboration(&dispatch.envelope.run_id)?;
+        let snapshot = match collaboration.outcome {
+            Some(get_collaboration_response::Outcome::Snapshot(snapshot)) => snapshot,
+            _ => return Err(CollaborationControlError::Persistence.into()),
+        };
+        let run = snapshot
+            .run
+            .as_ref()
+            .filter(|run| run.run_id == dispatch.envelope.run_id)
+            .ok_or(CollaborationControlError::Persistence)?;
         let result = adapter.dispatch(&dispatch.envelope).await?;
         let Some(outcome) = result.outcome else {
             report.dispatches_rejected += 1;
@@ -310,6 +326,15 @@ where
             report.dispatches_rejected += 1;
             continue;
         };
+        // Adapter dispatch durably creates the envelope row. Bind the
+        // Collaboration-owned task lineage immediately afterwards and before
+        // any terminal observation can be pumped into the return outbox.
+        adapter.bind_dispatch_task_lineage(
+            &dispatch.envelope.dispatch_id,
+            &run.task_id,
+            run.task_revision_at_creation,
+            run.work_revision,
+        )?;
         let ingested = control.ingest_dispatch_receipt(&receipt, principal)?;
         if receipt.disposition == DeliveryDisposition::Delivered as i32 {
             report.dispatches_delivered += 1;
@@ -412,6 +437,9 @@ fn merge_report(target: &mut HarnessDispatchCycleReport, source: HarnessDispatch
     target.observations_retained += source.observations_retained;
     target.observations_quarantined += source.observations_quarantined;
     target.terminal_observations += source.terminal_observations;
+    target.terminal_output_candidates_seen += source.terminal_output_candidates_seen;
+    target.terminal_output_candidates_receipted += source.terminal_output_candidates_receipted;
+    target.terminal_output_candidates_held += source.terminal_output_candidates_held;
     for dispatch_id in source.terminal_dispatch_ids {
         if !target
             .terminal_dispatch_ids
@@ -465,15 +493,36 @@ where
     }
     match result.disposition {
         HarnessFactIngestionDisposition::Consumed
-        | HarnessFactIngestionDisposition::IgnoredInformational
-        | HarnessFactIngestionDisposition::DeferredToArtifactAuthority => {
+        | HarnessFactIngestionDisposition::IgnoredInformational => {
             if let Some(observation) = observation {
                 adapter.mark_observation_consumed(&observation.observation_id)?;
             }
-            if result.disposition == HarnessFactIngestionDisposition::DeferredToArtifactAuthority {
-                report.observations_deferred += 1;
+            report.observations_consumed += 1;
+        }
+        HarnessFactIngestionDisposition::DeferredToArtifactAuthority => {
+            report.observations_deferred += 1;
+            let is_completed = observation.is_some_and(|observation| {
+                matches!(
+                    observation.payload.as_ref(),
+                    Some(harness_observation::Payload::Lifecycle(lifecycle))
+                        if lifecycle.kind == LifecycleKind::ExecutionCompleted as i32
+                )
+            });
+            let durable_terminal_handoff = if is_completed {
+                adapter.terminal_output_candidate_is_durable(
+                    &observation
+                        .expect("completed observation exists")
+                        .dispatch_id,
+                )?
             } else {
-                report.observations_consumed += 1;
+                false
+            };
+            if durable_terminal_handoff {
+                if let Some(observation) = observation {
+                    adapter.mark_observation_consumed(&observation.observation_id)?;
+                }
+            } else {
+                report.observations_retained += 1;
             }
         }
         HarnessFactIngestionDisposition::RetainedForDependency => {

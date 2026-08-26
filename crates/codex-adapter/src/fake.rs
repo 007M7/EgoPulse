@@ -7,6 +7,7 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
 use egopulse_harness_adapter::{
     DriverDelivery, DriverError, DriverEvent, NativeHarnessDriver, NativeHarnessFuture,
     ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
+    TerminalOutputCandidate,
 };
 use prost_types::Timestamp;
 use std::collections::VecDeque;
@@ -22,6 +23,7 @@ pub struct FakeCodexDriver {
     reconcile_count: u64,
     defer_terminal_once: bool,
     terminal_deferred: bool,
+    terminal_output_candidate: Option<TerminalOutputCandidate>,
     reconciliation_finding: Option<ReconciliationFinding>,
 }
 
@@ -112,6 +114,12 @@ impl NativeHarnessDriver for FakeCodexDriver {
                     native_will_retry: None,
                 }),
             ));
+            self.terminal_output_candidate = Some(TerminalOutputCandidate {
+                dispatch_id: envelope.dispatch_id.clone(),
+                native_completion_ref: turn_id.clone(),
+                media_type: "text/plain; charset=utf-8".to_owned(),
+                content: b"fake governed terminal output".to_vec(),
+            });
             Ok(DriverDelivery {
                 native_request_ref: format!("fake-request-{}", envelope.dispatch_id),
                 native_session_ref: thread_id,
@@ -131,6 +139,18 @@ impl NativeHarnessDriver for FakeCodexDriver {
                 return Ok(None);
             }
             Ok(self.events.pop_front())
+        })
+    }
+
+    fn take_terminal_output_candidate<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<TerminalOutputCandidate>, DriverError>> {
+        Box::pin(async move {
+            Ok(self
+                .terminal_output_candidate
+                .take()
+                .filter(|candidate| candidate.dispatch_id == envelope.dispatch_id))
         })
     }
 

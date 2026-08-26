@@ -66,6 +66,7 @@ mod memory_retrieval;
 mod owners;
 mod policy;
 mod projections;
+mod return_collector;
 mod security;
 mod task;
 mod verdict;
@@ -94,6 +95,7 @@ pub use projections::{
     CompositeOwnerProjectionSource, OwnerProjectionSource, PendingOwnerProjection, ProjectionPump,
     ProjectionPumpFailure, ProjectionSourceFailure, VerificationProjectionSource,
 };
+pub use return_collector::{GovernedReturnCollectorConfig, GovernedReturnCollectorRunner};
 pub use security::{
     AllowlistedPrincipal, AllowlistedPrincipalResolver, AuthorityPrincipalBinding,
     ConfiguredAuthorityPrincipalResolver, PrincipalPolicyError,
@@ -321,6 +323,7 @@ pub struct CodexHarnessCompositionConfig {
     pub codex_executable: PathBuf,
     pub workflow: SingleHarnessWorkConfig,
     pub lease_ttl_seconds: u64,
+    pub return_collector: GovernedReturnCollectorConfig,
 }
 
 impl CodexHarnessCompositionConfig {
@@ -336,6 +339,9 @@ impl CodexHarnessCompositionConfig {
                 "Codex Harness composition",
             ));
         }
+        self.return_collector
+            .validate()
+            .map_err(DaemonCompositionError::InvalidConfiguration)?;
         Ok(())
     }
 }
@@ -508,6 +514,9 @@ impl DaemonProviders {
     pub fn with_codex_harness(
         mut self,
         config: CodexHarnessCompositionConfig,
+        artifact_authority: Arc<
+            Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
+        >,
     ) -> Result<Self, DaemonCompositionError> {
         config.validate()?;
         if self.harness_dispatch_runner.is_some() {
@@ -521,6 +530,13 @@ impl DaemonProviders {
         let adapter_id = CODEX_ADAPTER_ID.to_owned();
         let capability_profile_id = CODEX_CAPABILITY_PROFILE_ID.to_owned();
         let reader_edge = AdapterEdge::open(AdapterEdgeConfig {
+            database_path: config.adapter_database_path.clone(),
+            adapter_id: adapter_id.clone(),
+            store_epoch: config.adapter_store_epoch.clone(),
+            key: AdapterEdgeKey::new(config.adapter_key),
+        })
+        .map_err(DaemonCompositionError::AdapterEdge)?;
+        let collector_edge = AdapterEdge::open(AdapterEdgeConfig {
             database_path: config.adapter_database_path.clone(),
             adapter_id: adapter_id.clone(),
             store_epoch: config.adapter_store_epoch.clone(),
@@ -573,7 +589,15 @@ impl DaemonProviders {
             reference,
             config.lease_ttl_seconds,
         );
-        self.harness_dispatch_runner = Some(Arc::new(runner));
+        let harness: Arc<dyn HarnessDispatchRunner> = Arc::new(runner);
+        let collector = GovernedReturnCollectorRunner::new(
+            harness,
+            collector_edge,
+            artifact_authority,
+            config.return_collector,
+        )
+        .map_err(DaemonCompositionError::InvalidConfiguration)?;
+        self.harness_dispatch_runner = Some(Arc::new(collector));
         Ok(self)
     }
 }

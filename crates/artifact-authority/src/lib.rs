@@ -1446,7 +1446,8 @@ fn artifact_structure_is_valid(value: &ArtifactDescriptor) -> bool {
 
 fn claim_structure_is_valid(value: &Claim) -> bool {
     !value.claim_id.trim().is_empty()
-        && value.source_type == ClaimSourceType::CodeChange as i32
+        && ClaimSourceType::try_from(value.source_type)
+            .is_ok_and(|source| source != ClaimSourceType::Unspecified)
         && value
             .semantic_profile_ref
             .as_ref()
