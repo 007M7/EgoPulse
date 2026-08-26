@@ -803,6 +803,21 @@ impl CodexAppServerDriver {
             | "item/reasoning/textDelta"
             | "turn/moderationMetadata"
             | "remoteControl/status/changed" => return Ok(None),
+            "warning" => DriverEvent {
+                native_key: native_key(method, &raw),
+                native_event_id: None,
+                native_sequence: None,
+                native_observed_at: now(),
+                criticality: ObservationCriticality::Informational,
+                payload: harness_observation::Payload::Diagnostic(
+                    egopulse_domain_contracts::v01::egopulse::harness::v1::DiagnosticObservation {
+                        safe_diagnostic_code: "CODEX_WARNING".to_owned(),
+                        error_fingerprint: Some(sha256(&raw)),
+                        recovery_required: false,
+                    },
+                ),
+                raw_event: raw,
+            },
             _ => {
                 self.last_protocol_diagnostic = Some(method.to_owned());
                 return Err(driver_error(
@@ -1639,6 +1654,33 @@ mod tests {
                 );
                 assert!(!value.recovery_required);
                 assert!(value.error_fingerprint.is_none());
+            }
+            _ => panic!("expected diagnostic payload"),
+        }
+    }
+
+    #[test]
+    fn codex_warning_is_audited_as_non_critical_diagnostic() {
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch-warning".to_owned(),
+            ..Default::default()
+        };
+        let notification = json!({
+            "method": "warning",
+            "params": { "message": "optional host unavailable" }
+        });
+        let raw = serde_json::to_vec(&notification).expect("notification bytes");
+        let event = driver
+            .map_notification(&envelope, "warning", notification, raw)
+            .expect("map warning")
+            .expect("warning event");
+        assert_eq!(event.criticality, ObservationCriticality::Informational);
+        match event.payload {
+            harness_observation::Payload::Diagnostic(value) => {
+                assert_eq!(value.safe_diagnostic_code, "CODEX_WARNING");
+                assert!(!value.recovery_required);
+                assert!(value.error_fingerprint.is_some());
             }
             _ => panic!("expected diagnostic payload"),
         }

@@ -2,7 +2,7 @@
 
 - Status: technical intake, Attempt-return projection and Verification-gated
   Step completion implemented; shared CLI/TUI ReturnPending read path and real
-  Windows C5 evidence passed
+  Windows C5 plus real Codex app-server turn evidence passed
 - Date: 2026-08-26
 - Scope: native terminal output through technical Artifact Authority receipt
 - Not in scope: Task completion and Founder Verdict consumption
@@ -105,10 +105,12 @@ and proves that the production resolver joins those authorities against the type
 Collaboration lineage. The daemon composition now exposes an explicit
 `NativeHarnessDriver` injection boundary: Codex remains the default driver, while
 deterministic fixtures can exercise the same production runner and collector without
-replacing any Authority or Collaboration writer. A real daemon + Harness execution
-with that committed Verification artifact remains the final integration evidence still
-to be added; the injection boundary is a testability improvement, not evidence that
-this final integration has already passed.
+  replacing any Authority or Collaboration writer. A real Rust Codex adapter E2E now
+  probes the installed app-server, starts a real thread/turn, accepts Codex's optional
+  startup warning as an informational diagnostic, and proves the terminal output
+  candidate reaches `EGOPULSE_CODEX_E2E_OK`. This is provider/adapter evidence only;
+  the daemon + Harness execution with a committed Verification artifact remains the
+  final integration evidence still to be added.
 An agentosd composition test now proves that the real daemon background worker polls
 an injected `HarnessDispatchRunner` and shuts down cleanly; this proves worker wiring,
 not provider-specific Codex protocol behavior.
@@ -119,17 +121,21 @@ The latest local evidence is:
 egopulse-agentosd library tests                 45 passed
 collaboration_control_g4_03                    22 passed
 c5_00_daemon_fixture                             7 passed
-return_settlement_g4_11                          1 passed
-cargo clippy --workspace --all-targets -D warnings passed
+  return_settlement_g4_11                          1 passed
+  cargo clippy --workspace --all-targets -D warnings passed
+  real Codex app-server Rust E2E                   1 passed (configured)
 ```
 
 The installed real Codex app-server was also probed on Windows x64 through
 `codex.exe app-server --stdio`. It returned successful `initialize`,
 `thread/start`, and `thread/started` messages with native version
-`0.148.0-alpha.15`, matching the adapter's frozen executable baseline. This is
-protocol-entry evidence only: no model `turn/start` was issued by the probe, so
-it does not claim a real model output, Artifact collection, Verification retry,
-or Returned settlement.
+`0.148.0-alpha.15`, matching the adapter's frozen executable baseline. The configured
+Rust E2E additionally issued one constrained `turn/start` and received the exact
+`EGOPULSE_CODEX_E2E_OK` terminal candidate in 18.95 seconds. The environment emitted
+`codex-code-mode-host.exe` unavailable as a non-critical `warning`; the adapter now
+retains its raw evidence and SHA-256 diagnostic fingerprint without failing the
+dispatch stream. This does not claim Artifact collection, Verification retry, or
+Returned settlement, which remain separate governed boundaries.
 
 Continue the next side without widening collector authority:
 
