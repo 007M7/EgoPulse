@@ -114,6 +114,23 @@ itself close G4-04:
   path, which is the remaining evidence needed for the complete production
   composition audit.
 
+The authenticated live adapter contract probe was run locally on Windows x64
+on 2026-08-26 with Codex CLI `0.148.0-alpha.15`:
+
+```powershell
+$env:EGOPULSE_CODEX_NATIVE_EXE =
+  'C:\Users\Administrator\AppData\Roaming\npm\codex.cmd'
+cargo test -p egopulse-codex-adapter --test provider_neutral_contract live_codex_app_server_emits_contract_valid_ack_running_and_terminal_observations -- --ignored --nocapture
+```
+
+The test passed and observed native session/turn lifecycle, accepted ACK,
+running and terminal observations, approval requests, control acknowledgements
+and cancellation/recovery-related lifecycle evidence. It used an isolated
+adapter edge and did not alter the repository. This closes the missing live
+Codex protocol evidence for the adapter runtime; it does not claim that the
+full user-owned production bootstrap and background runner have been exercised
+by the same test.
+
 Therefore G4-04 remains open for one specific reason: the implemented
 composition boundary still needs a real authenticated Codex lifecycle result
 through the production runner, plus the corresponding provider-boundary
