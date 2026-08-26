@@ -53,6 +53,18 @@ an uploaded public release asset.
   all exited successfully.
 - The archive SHA-256 matched the build output exactly.
 
+The checks are now repeatable with the repository verifier (the previous run
+was performed against the candidate directory above):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File scripts/verify-windows-package.ps1 `
+  -PackageRoot .artifacts/release-candidate/<candidate> `
+  -ArchivePath .artifacts/release-candidate/<candidate>.zip `
+  -ExpectedArchiveSha256 <sha256> `
+  -VerifyMemoryWorker
+```
+
 ## Release boundary
 
 This evidence closes the local Windows CLI/TUI candidate build loop. It does
