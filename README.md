@@ -20,6 +20,7 @@ Available now:
 - isolated CPython 3.14 Worker projects managed by uv;
 - internal Rust Memory Authority with SQLCipher persistence, candidate-only agent writes, Founder promotion/revocation and accepted retrieval snapshots;
 - governed `LocalCognitionService/RetrieveMemory` exposed consistently through CLI and TUI, with daemon-owned scope authorization, supervised Python retrieval, typed failure semantics and reference-only output;
+- offline Memory retrieval evaluation with dataset-digest evidence, Recall/MRR/nDCG metrics, injected exact-vector scoring and validated RRF experiment adapters;
 - explicit Sego/checker verification composition with owner-backed Artifact reads, supervised execution, immutable verification artifacts and Task write-back;
 - Protobuf/Buf and JSON Schema contract roots;
 - local CI, repository-boundary checks and commit-bound unsigned Windows early-access packaging for the CLI/TUI shared kernel;
@@ -30,7 +31,7 @@ For the current Windows x64 package path, see [Windows early access](WINDOWS-EAR
 Not implemented yet:
 
 - Desktop product surface and Tauri distribution (the desktop shell exists, but phase one ships CLI/TUI capabilities first);
-- semantic/vector retrieval, reranking and large-corpus evaluation; the first release deliberately ships the deterministic lexical Worker baseline;
+- production semantic/vector retrieval, reranking and representative-corpus evaluation; exact-vector and RRF plumbing exists only behind the offline experiment gate, while the first release still defaults to the deterministic lexical Worker baseline;
 - authenticated second Harness lifecycle and multi-model production dispatch;
 - signed production release and SmartScreen reputation.
 

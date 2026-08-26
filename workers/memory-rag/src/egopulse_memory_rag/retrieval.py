@@ -104,30 +104,10 @@ def retrieve(
     cost, model identity and evaluation evidence are separately reviewed.
     """
 
-    request.validate()
-    if len(records) > MAX_RECORDS:
-        raise RetrievalWorkerError("record count exceeds the worker limit")
-
+    accepted = validate_retrieval_input(request, records)
     query_terms = _tokens(request.query)
     if not query_terms:
         raise RetrievalWorkerError("query contains no searchable terms")
-
-    seen_ids: set[str] = set()
-    accepted: list[MemoryRecord] = []
-    total_content_bytes = 0
-    for record in records:
-        record.validate()
-        total_content_bytes += len(record.content.encode("utf-8"))
-        if total_content_bytes > MAX_TOTAL_CONTENT_BYTES:
-            raise RetrievalWorkerError("total content exceeds the worker limit")
-        if record.memory_id in seen_ids:
-            raise RetrievalWorkerError("duplicate memory_id in input")
-        seen_ids.add(record.memory_id)
-        if record.state != "accepted":
-            raise RetrievalWorkerError("memory state is not accepted")
-        if record.scope_ref != request.scope_ref:
-            raise RetrievalWorkerError("memory scope does not match the request")
-        accepted.append(record)
 
     document_terms = [_tokens(record.content) for record in accepted]
     document_frequency: dict[str, int] = {}
@@ -190,6 +170,40 @@ def retrieve(
         candidates=candidates,
         evidence_ref=evidence_ref,
     )
+
+
+def validate_retrieval_input(
+    request: RetrievalRequest,
+    records: tuple[MemoryRecord, ...] | list[MemoryRecord],
+) -> tuple[MemoryRecord, ...]:
+    """Validate the frozen read-only snapshot boundary for any retriever.
+
+    Retrieval algorithms may change behind the Worker boundary, but every
+    implementation must enforce the same scope, state, digest and resource
+    invariants before it ranks a record.
+    """
+
+    request.validate()
+    if len(records) > MAX_RECORDS:
+        raise RetrievalWorkerError("record count exceeds the worker limit")
+
+    seen_ids: set[str] = set()
+    accepted: list[MemoryRecord] = []
+    total_content_bytes = 0
+    for record in records:
+        record.validate()
+        total_content_bytes += len(record.content.encode("utf-8"))
+        if total_content_bytes > MAX_TOTAL_CONTENT_BYTES:
+            raise RetrievalWorkerError("total content exceeds the worker limit")
+        if record.memory_id in seen_ids:
+            raise RetrievalWorkerError("duplicate memory_id in input")
+        seen_ids.add(record.memory_id)
+        if record.state != "accepted":
+            raise RetrievalWorkerError("memory state is not accepted")
+        if record.scope_ref != request.scope_ref:
+            raise RetrievalWorkerError("memory scope does not match the request")
+        accepted.append(record)
+    return tuple(accepted)
 
 
 def digest_text(value: str) -> str:
