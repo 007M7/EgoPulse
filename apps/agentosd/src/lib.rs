@@ -55,9 +55,9 @@ use egopulse_local_ide_control::collaboration_control::{
     AuthenticatedCollaborationPrincipal, CollaborationControl, CollaborationControlConfig,
     CollaborationControlError, CollaborationPrincipalKind, CollaborationSqlCipherKey,
     CompositeHarnessDispatchRunner, GovernedTaskActivationRunner, HarnessDispatchCycleError,
-    HarnessDispatchRunner, SingleHarnessWorkConfig, SingleHarnessWorkflowResolver,
-    SingleHarnessWorkflowResolverError, SystemAuthorityClock, TaskActivationGuardSet,
-    TaskActivationSource,
+    HarnessDispatchRunner, SingleHarnessWorkConfig, SingleHarnessWorkflowResolution,
+    SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError, SystemAuthorityClock,
+    TaskActivationGuardSet, TaskActivationSource,
 };
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
@@ -336,11 +336,13 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
     fn resolve(
         &self,
         activation: &egopulse_local_ide_control::collaboration_control::TaskActivationHandoff,
-    ) -> Result<SingleHarnessWorkConfig, SingleHarnessWorkflowResolverError> {
+    ) -> Result<SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolverError> {
         if activation.task.current_run_id.as_deref() != Some(self.config.run_id.as_str()) {
-            return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+            return Ok(SingleHarnessWorkflowResolution::NotApplicable);
         }
-        Ok(self.config.clone())
+        Ok(SingleHarnessWorkflowResolution::Resolved(Box::new(
+            self.config.clone(),
+        )))
     }
 }
 

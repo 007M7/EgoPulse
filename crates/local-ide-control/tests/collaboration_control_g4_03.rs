@@ -32,10 +32,11 @@ use egopulse_local_ide_control::collaboration_control::{
     HarnessFactIngestionDisposition, LeaseAuthorization, PendingArtifactReturn,
     ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
     ResolvedHarnessEvidence, ResolvedStepReturn, SingleHarnessWorkConfig,
-    SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError, TaskActivationGuardSet,
-    TaskActivationHandoff, TaskActivationReferenceGuard, TaskActivationSource,
-    TaskActivationSourceError, canonical_dispatch_fingerprint, canonical_request_digest,
-    dispatch_pending, pump_observations, start_single_harness_workflow,
+    SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
+    SingleHarnessWorkflowResolverError, TaskActivationGuardSet, TaskActivationHandoff,
+    TaskActivationReferenceGuard, TaskActivationSource, TaskActivationSourceError,
+    canonical_dispatch_fingerprint, canonical_request_digest, dispatch_pending, pump_observations,
+    start_single_harness_workflow,
 };
 use prost_types::Timestamp;
 use rusqlite::Connection;
@@ -235,11 +236,13 @@ impl SingleHarnessWorkflowResolver for FixtureWorkflowResolver {
     fn resolve(
         &self,
         activation: &TaskActivationHandoff,
-    ) -> Result<SingleHarnessWorkConfig, SingleHarnessWorkflowResolverError> {
+    ) -> Result<SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolverError> {
         if activation.task.current_run_id.as_deref() != Some(self.0.run_id.as_str()) {
-            return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+            return Ok(SingleHarnessWorkflowResolution::NotApplicable);
         }
-        Ok(self.0.clone())
+        Ok(SingleHarnessWorkflowResolution::Resolved(Box::new(
+            self.0.clone(),
+        )))
     }
 }
 
@@ -1675,7 +1678,7 @@ fn single_harness_workflow_accepts_only_task_activation_guard_evidence() {
 }
 
 #[tokio::test]
-async fn task_activation_runner_commits_then_dispatches_through_one_runtime() {
+async fn task_activation_runner_leaves_other_routes_pending_and_dispatches_its_match() {
     let collaboration_store = IsolatedStore::new("task-activation-runner-collaboration");
     let adapter_store = IsolatedStore::new("task-activation-runner-adapter");
     let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
@@ -1706,12 +1709,27 @@ async fn task_activation_runner_commits_then_dispatches_through_one_runtime() {
         current_run_id: Some(config.run_id.clone()),
         ..Default::default()
     };
+    let foreign_task = TaskSnapshot {
+        task_id: "task-activation-runner-foreign".to_owned(),
+        revision: 2,
+        work_revision: 1,
+        status: TaskStatus::Active as i32,
+        current_run_id: Some("run-activation-runner-foreign".to_owned()),
+        ..Default::default()
+    };
     let source = Arc::new(FixtureActivationSource {
-        pending: Mutex::new(vec![TaskActivationHandoff {
-            message_id: "task-outbox-activation-runner-001".to_owned(),
-            payload_digest_sha256: "d".repeat(64),
-            task: task.clone(),
-        }]),
+        pending: Mutex::new(vec![
+            TaskActivationHandoff {
+                message_id: "task-outbox-activation-runner-foreign".to_owned(),
+                payload_digest_sha256: "e".repeat(64),
+                task: foreign_task,
+            },
+            TaskActivationHandoff {
+                message_id: "task-outbox-activation-runner-001".to_owned(),
+                payload_digest_sha256: "d".repeat(64),
+                task: task.clone(),
+            },
+        ]),
         acknowledged: Mutex::new(Vec::new()),
     });
     let (guard, binding) = TaskActivationGuardSet::new(AdapterBackedHarnessEvidenceResolver::new(
@@ -1745,7 +1763,7 @@ async fn task_activation_runner_commits_then_dispatches_through_one_runtime() {
     )
     .with_capability_profile_ref(capability_profile_ref);
     let cycle = runner.run_once().await.expect("activation runner cycle");
-    assert_eq!(cycle.activations_seen, 1);
+    assert_eq!(cycle.activations_seen, 2);
     assert_eq!(cycle.activations_started, 1);
     assert_eq!(cycle.activations_acknowledged, 1);
     assert_eq!(cycle.dispatches_delivered, 1);
@@ -1763,6 +1781,12 @@ async fn task_activation_runner_commits_then_dispatches_through_one_runtime() {
             .expect("activation acknowledgement mutex")
             .as_slice(),
         ["task-outbox-activation-runner-001"]
+    );
+    let pending = source.pending.lock().expect("activation source mutex");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].message_id,
+        "task-outbox-activation-runner-foreign"
     );
 }
 

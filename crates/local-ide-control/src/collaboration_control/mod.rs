@@ -348,11 +348,17 @@ pub enum SingleHarnessWorkflowResolverError {
     InvalidConfiguration,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum SingleHarnessWorkflowResolution {
+    NotApplicable,
+    Resolved(Box<SingleHarnessWorkConfig>),
+}
+
 pub trait SingleHarnessWorkflowResolver: Send + Sync {
     fn resolve(
         &self,
         activation: &TaskActivationHandoff,
-    ) -> Result<SingleHarnessWorkConfig, SingleHarnessWorkflowResolverError>;
+    ) -> Result<SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolverError>;
 }
 
 #[derive(Clone, Debug, PartialEq)]

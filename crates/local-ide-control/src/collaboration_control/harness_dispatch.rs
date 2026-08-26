@@ -2,8 +2,9 @@ use super::{
     ArtifactReturnSource, AuthenticatedCollaborationPrincipal, AuthorityClock,
     CollaborationControl, CollaborationControlError, CollaborationReferenceGuard,
     HarnessEvidenceResolver, HarnessFactIngestionDisposition, HarnessFactIngestionResult,
-    SingleHarnessWorkConfig, SingleHarnessWorkflowResolver, TaskActivationGuardSet,
-    TaskActivationReferenceHandle, TaskActivationSource, seal_request_digest,
+    SingleHarnessWorkConfig, SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
+    TaskActivationGuardSet, TaskActivationReferenceHandle, TaskActivationSource,
+    seal_request_digest,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::get_collaboration_response;
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
@@ -376,9 +377,13 @@ where
             )
             .await?;
             for activation in activations {
-                let config = resolver
+                let config = match resolver
                     .resolve(&activation)
-                    .map_err(|_| HarnessDispatchCycleError::TaskActivationResolver)?;
+                    .map_err(|_| HarnessDispatchCycleError::TaskActivationResolver)?
+                {
+                    SingleHarnessWorkflowResolution::NotApplicable => continue,
+                    SingleHarnessWorkflowResolution::Resolved(config) => *config,
+                };
                 if !workflow_matches_profile(&config, self.capability_profile_filter.as_ref()) {
                     continue;
                 }
