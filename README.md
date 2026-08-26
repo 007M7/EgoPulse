@@ -86,4 +86,4 @@ uv sync --project workers/foundation-probe --frozen
 uv run --project workers/foundation-probe --frozen pytest workers/foundation-probe --rootdir workers/foundation-probe
 ```
 
-For the current delivery controls, install the tracked fast pre-push hook with `scripts/install-git-hooks.ps1`. Pull requests and release tags use the GitHub Actions CI/CD workflow; use `pnpm run ci:local` or `pnpm run cd:local` only for offline reproduction. See [Local CI/CD](docs/engineering/local-ci-cd.md), [Foundation Gate](docs/foundation-gate.md) and [Architecture](ARCHITECTURE.md).
+For the current delivery controls, install the tracked fast pre-push hook with `scripts/install-git-hooks.ps1`. GitHub Actions CI/CD remains configured for pull requests and release tags, but the current development gate uses local CI/CD because the Actions usage quota is exhausted; remote failures are non-blocking until capacity returns. See [Local CI/CD](docs/engineering/local-ci-cd.md), [Foundation Gate](docs/foundation-gate.md) and [Architecture](ARCHITECTURE.md).

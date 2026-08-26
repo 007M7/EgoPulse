@@ -2,7 +2,14 @@
 
 ## Decision
 
-The authoritative engineering gate runs in GitHub Actions for pull requests, `main` pushes and release tags. The workflow owns the reproducible Windows runner, exact-SHA CI evidence and the release dependency chain. Local checks remain useful for fast feedback and offline reproduction, but are not repeated as a mandatory full Rust gate before every push. Release operations produce an unsigned, commit-bound Windows early-access candidate; they do not imply code signing or a production release.
+The repository keeps a complete GitHub Actions CI/CD workflow for pull requests,
+`main` pushes and release tags. During the current development period, the
+GitHub Actions usage quota is exhausted, so the local Windows x64 CI/CD path is
+the operationally authoritative gate and remote workflow failures are
+non-blocking. The workflow remains the intended reproducible remote path when
+capacity is available. Release operations produce an unsigned, commit-bound
+Windows early-access candidate; they do not imply code signing or a production
+release.
 
 The two repositories have different classifications:
 
@@ -26,7 +33,7 @@ The tracked hook runs the fast, non-release check:
 - `git diff --check`;
 - repository boundaries, contracts, generated bindings and TypeScript checks.
 
-This deliberately does not compile and test the complete Rust workspace on every push; that expensive authoritative gate runs once in GitHub Actions.
+This deliberately does not compile and test the complete Rust workspace on every push; that expensive full gate runs once locally for a development or release-candidate boundary. When Actions capacity is available, the same gate is reproduced remotely.
 
 Run the fast check directly with:
 
@@ -44,7 +51,7 @@ pnpm run ci:local
 
 Bootstrap a new checkout once with `pnpm install --frozen-lockfile`. The recurring gate verifies Git diff integrity, Node manifest/lock consistency without reinstalling an already materialized dependency tree, repository boundaries, contracts, generated code, TypeScript, the Desktop frontend, the complete Rust workspace, and all three Python projects, including the Memory/RAG Worker. Missing or stale installed packages fail closed in the TypeScript or Desktop steps. Machine-readable evidence is written beneath `.local-ci/evidence/` and is intentionally ignored by Git.
 
-Why keep a tracked fast hook: it catches contract and boundary failures before a push without duplicating the long remote Rust job. Git hooks can still be bypassed with `--no-verify`; GitHub required checks remain the authoritative control.
+Why keep a tracked fast hook: it catches contract and boundary failures before a push without duplicating the long full Rust job. Git hooks can still be bypassed with `--no-verify`; the local full-CI evidence is the current development authority, while remote required checks become authoritative again when Actions capacity is restored.
 
 ## Local CD
 
@@ -60,13 +67,17 @@ The candidate is explicitly classified as `unsigned-release-candidate`. It must 
 
 ## GitHub CI/CD
 
-`.github/workflows/ci.yml` runs three parallel CI jobs—Rust, TypeScript/contracts and Python—on pull requests, `main` pushes and `v*` tags. The `windows-cd` job is conditional: it requires those same three jobs from the current workflow run, then runs only the optimized Windows release build and packaging step. It does not rerun `local-ci.ps1` or the full test suite.
+`.github/workflows/ci.yml` runs three parallel CI jobs—Rust, TypeScript/contracts and Python—on pull requests, `main` pushes and `v*` tags. The `windows-cd` job is conditional: it requires those same three jobs from the current workflow run, then runs only the optimized Windows release build and packaging step. It does not rerun `local-ci.ps1` or the full test suite. While the Actions quota is exhausted, a failed or unavailable remote run is recorded as informational; it does not replace the successful local evidence used for development and candidate packaging.
 
 For a candidate without creating a release tag, use the workflow-dispatch input `publish_candidate=true`; the package is uploaded as a workflow artifact. Pushing a `v*` tag additionally creates a GitHub prerelease with the ZIP and `.sha256` file. Until a code-signing certificate exists, the release remains explicitly unsigned and must document SmartScreen risk.
 
 This gives the normal path:
 
 ```text
+local fast check -> local full CI -> local Windows CD candidate
+
+When GitHub Actions capacity is available, the equivalent remote path is:
+
 local fast check -> one remote CI run -> dependent remote Windows CD
 ```
 
