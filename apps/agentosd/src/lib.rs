@@ -606,7 +606,12 @@ impl DaemonProviders {
             reference,
             config.lease_ttl_seconds,
         )
-        .with_artifact_return_source(artifact_return_source, artifact_return_principal);
+        .with_artifact_return_source(artifact_return_source, artifact_return_principal)
+        .with_step_return_principal(AuthenticatedCollaborationPrincipal {
+            kind: CollaborationPrincipalKind::CollaborationControl,
+            principal_id: "collaboration-control:return-settlement".to_owned(),
+            authenticated: true,
+        });
         let harness: Arc<dyn HarnessDispatchRunner> = Arc::new(runner);
         let collector = GovernedReturnCollectorRunner::new(
             harness,

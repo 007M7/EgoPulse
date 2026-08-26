@@ -7,7 +7,8 @@ use super::{
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::get_collaboration_response;
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
-    AttemptCommandBase, CollaborationCommand, RecordAttemptReturnCommand, collaboration_command,
+    AttemptCommandBase, CollaborationCommand, CommitStepReturnCommand, RecordAttemptReturnCommand,
+    RunCommandBase, collaboration_command, collaboration_command_result,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::CommandMetadata;
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
@@ -159,6 +160,7 @@ struct GovernedTaskActivationRuntime<S, W, E, C, R, D, A> {
     active_envelopes: Vec<DispatchEnvelope>,
     artifact_return_source: Option<std::sync::Arc<dyn ArtifactReturnSource>>,
     artifact_return_principal: Option<AuthenticatedCollaborationPrincipal>,
+    step_return_principal: Option<AuthenticatedCollaborationPrincipal>,
 }
 
 /// The production single-writer worker for the first vertical. It consumes
@@ -202,6 +204,7 @@ where
                 active_envelopes: Vec::new(),
                 artifact_return_source: None,
                 artifact_return_principal: None,
+                step_return_principal: None,
             }),
             principal,
         }
@@ -216,6 +219,19 @@ where
         let runtime = self.runtime.get_mut();
         runtime.artifact_return_source = Some(source);
         runtime.artifact_return_principal = Some(principal);
+        self
+    }
+
+    /// Adds the internal Collaboration writer used after the technical
+    /// Artifact return has been proven by the configured Verification guard.
+    /// This is deliberately separate from the Artifact Authority principal:
+    /// the two writes have different owners and cannot be collapsed.
+    #[must_use]
+    pub fn with_step_return_principal(
+        mut self,
+        principal: AuthenticatedCollaborationPrincipal,
+    ) -> Self {
+        self.runtime.get_mut().step_return_principal = Some(principal);
         self
     }
 }
@@ -252,12 +268,14 @@ where
                 active_envelopes,
                 artifact_return_source,
                 artifact_return_principal,
+                step_return_principal,
             } = &mut *runtime;
             consume_artifact_returns(
                 control,
                 adapter,
                 artifact_return_source.as_ref(),
                 artifact_return_principal.as_ref(),
+                step_return_principal.as_ref(),
             )?;
             let activations = source
                 .pending_task_activations()
@@ -318,6 +336,7 @@ fn consume_artifact_returns<G, C, R, D, A>(
     adapter: &mut GovernedHarnessAdapter<R, D, A>,
     source: Option<&std::sync::Arc<dyn ArtifactReturnSource>>,
     principal: Option<&AuthenticatedCollaborationPrincipal>,
+    step_return_principal: Option<&AuthenticatedCollaborationPrincipal>,
 ) -> Result<(), HarnessDispatchCycleError>
 where
     G: CollaborationReferenceGuard + HarnessEvidenceResolver,
@@ -414,6 +433,85 @@ where
         if result.committed_event.is_none() && !result.replayed {
             return Err(HarnessDispatchCycleError::ReturnCollector(
                 "Collaboration rejected Artifact return".to_owned(),
+            ));
+        }
+
+        let Some(step_return_principal) = step_return_principal else {
+            if !source
+                .acknowledge_return(&pending.message_id, &pending.payload_digest_sha256)
+                .map_err(HarnessDispatchCycleError::ReturnCollector)?
+            {
+                return Err(HarnessDispatchCycleError::ReturnCollector(
+                    "Artifact return outbox acknowledgement was not persisted".to_owned(),
+                ));
+            }
+            continue;
+        };
+
+        let snapshot = match control.get_collaboration(&lineage.run_id)?.outcome {
+            Some(get_collaboration_response::Outcome::Snapshot(snapshot)) => snapshot,
+            _ => {
+                return Err(HarnessDispatchCycleError::ReturnCollector(
+                    "Collaboration snapshot after Artifact return is unavailable".to_owned(),
+                ));
+            }
+        };
+        let run = snapshot.run.as_ref().ok_or_else(|| {
+            HarnessDispatchCycleError::ReturnCollector(
+                "Collaboration run after Artifact return is unavailable".to_owned(),
+            )
+        })?;
+        let step = snapshot
+            .steps
+            .iter()
+            .find(|step| step.step_id == lineage.step_id)
+            .ok_or_else(|| {
+                HarnessDispatchCycleError::ReturnCollector(
+                    "Collaboration step after Artifact return is unavailable".to_owned(),
+                )
+            })?;
+        let mut step_command = CollaborationCommand {
+            command: Some(collaboration_command::Command::CommitStepReturn(
+                CommitStepReturnCommand {
+                    base: Some(RunCommandBase {
+                        meta: Some(CommandMetadata {
+                            command_id: format!("step-return:{}", pending.receipt.receipt_id),
+                            idempotency_key: format!("{}:step-return", pending.receipt.receipt_id),
+                            idempotency_scope: run.run_id.clone(),
+                            request_digest_sha256: String::new(),
+                            issued_at: pending.receipt.committed_at,
+                            correlation_id: pending.receipt.return_handoff_id.clone(),
+                            causation_id: Some(pending.receipt.receipt_id.clone()),
+                        }),
+                        run_id: run.run_id.clone(),
+                        expected_run_revision: run.revision,
+                    }),
+                    step_id: step.step_id.clone(),
+                    expected_step_revision: step.revision,
+                    attempt_id: lineage.attempt_id.clone(),
+                    artifact_set_id: pending.receipt.artifact_set_id.clone(),
+                    return_handoff_id: pending.receipt.return_handoff_id.clone(),
+                },
+            )),
+        };
+        seal_request_digest(&mut step_command).ok_or_else(|| {
+            HarnessDispatchCycleError::ReturnCollector(
+                "Collaboration Step return command could not be sealed".to_owned(),
+            )
+        })?;
+        let step_result = control.execute(&step_command, step_return_principal)?;
+        if step_result.committed_event.is_none() && !step_result.replayed {
+            let verification_pending = matches!(
+                step_result.outcome.as_ref(),
+                Some(collaboration_command_result::Outcome::Error(error))
+                    if error.code
+                        == egopulse_domain_contracts::v01::egopulse::collaboration::v1::CollaborationErrorCode::RecoveryRequired as i32
+            );
+            if verification_pending {
+                continue;
+            }
+            return Err(HarnessDispatchCycleError::ReturnCollector(
+                "Collaboration rejected Verification-gated Step return".to_owned(),
             ));
         }
         if !source

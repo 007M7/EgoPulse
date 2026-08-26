@@ -30,7 +30,9 @@ native Harness driver
   -> Collaboration runner
        receipt digest + consumed terminal sequence + current fence/revisions
        -> Attempt RETURNED; Run/Step RETURN_PENDING
-  -> Verification Authority / Sego result resolver
+       -> when Verification proof is available, internal Collaboration writer
+          retries CommitStepReturn with a separate principal
+       -> Verification Authority / Sego result resolver
        exact sealed ArtifactSet + Receipted ReturnHandoff
        + exactly one matching accepted Verification artifact
        -> guarded CommitStepReturn
@@ -55,6 +57,9 @@ facts.
 - Reuse of a source identity with another digest and direct storage tampering fail closed.
 - Verification-gated return additionally recomputes the Verification Authority canonical payload
   digest; a merely well-formed or stale SHA-256 field is not accepted.
+- The production Harness runner now keeps the Artifact return outbox pending when the
+  Verification-gated Step return is not yet provable; it retries the same deterministic command
+  and only ACKs the Artifact outbox after Step/Run return is committed or replayed.
 - Empty output, output over 16 MiB and policy rejection enter `held`; they do not create a fake
   artifact or silently disappear.
 - The oversized record retains a 64 KiB preview for diagnosis plus full digest and original size.
@@ -87,13 +92,15 @@ not occur at technical intake.
 The shared CLI/TUI kernel now exposes the projected `ReturnPending`/`Returned`
 counts. The real Windows C5 fixture proves that a daemon-backed TaskView with
 `RUN_STATUS_RETURN_PENDING` is visible consistently through both processes.
-This is read-side evidence; it does not simulate or claim a successful
-Verification-gated transition to `Returned`.
+The production runner now also invokes the Verification-gated Step return internally;
+the local durable G4-03 suite proves the Collaboration write contract, while a
+real daemon + Harness execution with a committed Verification artifact remains
+the final integration evidence still to be added.
 
 Continue the next side without widening collector authority:
 
 1. drive the Verification worker from this Collaboration return boundary using
    sealed Artifact Authority references;
-2. add a real write-side return test that submits the exact technical receipt
-   and accepted Verification proof before `CommitStepReturn`;
+2. add the real daemon + Harness integration fixture with a committed Verification
+   artifact and assert the internal retry reaches `Returned`;
 3. wire Task completion only through its separately governed write-back path.
