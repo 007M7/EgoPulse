@@ -42,11 +42,15 @@ provider adapter and never selects a model from a UI request.
 
 - `NativeHarnessCompositionProfile`, whose fields are private to prevent
   callers from constructing an apparently admitted profile from arbitrary
-  strings;
+  strings; it retains the complete capability `ContractReference`, not only
+  the profile ID;
 - `from_attested_capability`, which invokes the shared capability-binding
   validator and requires an active, probe-attested, workflow-bound profile;
 - an exact equality check between the admitted declaration protocol
   fingerprint and the current observed fingerprint;
+- an exact equality check between the profile reference carried by composition
+  and the workflow's required profile reference before any Authority storage
+  is opened;
 - `with_profiled_native_harness_driver`, which binds the resulting identity to
   `GovernedHarnessAdapter` and the existing durable return path;
 - `with_native_harness_driver` as the compatibility wrapper for the current

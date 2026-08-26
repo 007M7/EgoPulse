@@ -378,6 +378,7 @@ pub struct CodexHarnessCompositionConfig {
 pub struct NativeHarnessCompositionProfile {
     adapter_id: String,
     capability_profile_id: String,
+    capability_profile_ref: ContractReference,
     observed_protocol: NativeProtocolFingerprint,
 }
 
@@ -422,6 +423,7 @@ impl NativeHarnessCompositionProfile {
         let profile = Self {
             adapter_id: declaration.adapter_id.clone(),
             capability_profile_id: capability_profile.profile_id.clone(),
+            capability_profile_ref: required_profile_ref.clone(),
             observed_protocol,
         };
         profile.validate()?;
@@ -431,6 +433,9 @@ impl NativeHarnessCompositionProfile {
     fn validate(&self) -> Result<(), DaemonCompositionError> {
         if self.adapter_id.trim().is_empty()
             || self.capability_profile_id.trim().is_empty()
+            || self.capability_profile_ref.contract_id.trim().is_empty()
+            || self.capability_profile_ref.version.trim().is_empty()
+            || self.capability_profile_ref.sha256.trim().is_empty()
             || self.observed_protocol.protocol_name.trim().is_empty()
             || self.observed_protocol.protocol_version.trim().is_empty()
             || self.observed_protocol.schema_sha256.trim().is_empty()
@@ -733,6 +738,7 @@ impl DaemonProviders {
     where
         D: NativeHarnessDriver + Send + 'static,
     {
+        let capability_profile_ref = config.workflow.capability_profile_ref.clone();
         self.with_profiled_native_harness_driver(
             config,
             artifact_authority,
@@ -740,6 +746,7 @@ impl DaemonProviders {
             NativeHarnessCompositionProfile {
                 adapter_id: CODEX_ADAPTER_ID.to_owned(),
                 capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
+                capability_profile_ref,
                 observed_protocol: codex_protocol_fingerprint(),
             },
             driver,
@@ -772,12 +779,18 @@ impl DaemonProviders {
                 "Harness runner already configured",
             ));
         }
+        if profile.capability_profile_ref != config.workflow.capability_profile_ref {
+            return Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness workflow/profile reference mismatch",
+            ));
+        }
         let source = self.task_activation_source.take().ok_or(
             DaemonCompositionError::InvalidConfiguration("Task activation source"),
         )?;
         let NativeHarnessCompositionProfile {
             adapter_id,
             capability_profile_id,
+            capability_profile_ref: _,
             observed_protocol,
         } = profile;
         let reader_edge = AdapterEdge::open(AdapterEdgeConfig {
@@ -1514,6 +1527,14 @@ mod tests {
         .expect("attested capability should produce a composition profile");
         assert_eq!(bound.adapter_id, "adapter");
         assert_eq!(bound.capability_profile_id, "profile");
+        assert_eq!(
+            bound.capability_profile_ref,
+            ContractReference {
+                contract_id: "profile".to_owned(),
+                version: "v1".to_owned(),
+                sha256: "ab".repeat(32),
+            }
+        );
 
         let mut drifted_protocol = bound.observed_protocol.clone();
         drifted_protocol.protocol_version.push_str("-drift");
@@ -1537,6 +1558,11 @@ mod tests {
         let mut profile = NativeHarnessCompositionProfile {
             adapter_id: "adapter".to_owned(),
             capability_profile_id: "profile".to_owned(),
+            capability_profile_ref: ContractReference {
+                contract_id: "profile".to_owned(),
+                version: "v1".to_owned(),
+                sha256: "ab".repeat(32),
+            },
             observed_protocol: NativeProtocolFingerprint {
                 protocol_name: "acp".to_owned(),
                 protocol_version: "1".to_owned(),
@@ -1557,6 +1583,14 @@ mod tests {
         ));
         profile.adapter_id = "adapter".to_owned();
         profile.observed_protocol.schema_sha256.clear();
+        assert!(matches!(
+            profile.validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition profile"
+            ))
+        ));
+        profile.observed_protocol.schema_sha256 = "schema".to_owned();
+        profile.capability_profile_ref.sha256.clear();
         assert!(matches!(
             profile.validate(),
             Err(DaemonCompositionError::InvalidConfiguration(

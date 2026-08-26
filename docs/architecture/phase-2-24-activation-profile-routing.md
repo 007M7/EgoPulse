@@ -34,8 +34,9 @@ reference is then used when registering and dispatching the resulting
 Collaboration envelopes.
 
 The production native composition binds this filter from its frozen workflow
-configuration. It cannot be inferred from a prompt, UI selection, model
-availability or a provider response.
+configuration and first verifies that the composition profile carries the
+same complete reference. It cannot be inferred from a prompt, UI selection,
+model availability or a provider response.
 
 ## Invariants and costs
 
