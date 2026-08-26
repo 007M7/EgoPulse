@@ -98,9 +98,12 @@ counts. The real Windows C5 fixture proves that a daemon-backed TaskView with
 The production runner now also invokes the Verification-gated Step return internally.
 The local durable G4-03 suite proves the Collaboration write contract and the
 `TaskActivationGuardSet` Verification delegation, while the C5 daemon fixture
-proves the real Windows daemon/read path. A real daemon + Harness execution with
-a committed Verification artifact remains the final integration evidence still
-to be added.
+proves the real Windows daemon/read path. The new G4-11 fixture additionally opens
+the real Artifact Authority and Verification Authority stores, submits a sealed
+ArtifactSet/receipted ReturnHandoff, completes an accepted VerificationArtifact,
+and proves that the production resolver joins those authorities against the typed
+Collaboration lineage. A real daemon + Harness execution with that committed
+Verification artifact remains the final integration evidence still to be added.
 
 The latest local evidence is:
 
@@ -108,6 +111,7 @@ The latest local evidence is:
 egopulse-agentosd library tests                 44 passed
 collaboration_control_g4_03                    22 passed
 c5_00_daemon_fixture                             7 passed
+return_settlement_g4_11                          1 passed
 cargo clippy --workspace --all-targets -D warnings passed
 ```
 
