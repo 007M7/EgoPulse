@@ -449,7 +449,7 @@ impl AuthorityPrincipalResolver for FixtureAuthorityPrincipalResolver {
         &self,
         _principal: &CommandPrincipal,
     ) -> Result<MemoryPrincipalKind, CommandPortFailure> {
-        Err(CommandPortFailure::Unavailable)
+        Ok(MemoryPrincipalKind::Founder)
     }
 }
 
@@ -604,12 +604,11 @@ where
             &founder,
         )
         .expect("fixture Memory candidate should be accepted or replayed");
+    let memory = Arc::new(std::sync::Mutex::new(memory));
     providers
-        .with_memory_retrieval(
-            Arc::new(std::sync::Mutex::new(memory)),
-            memory_worker_config(),
-        )
+        .with_memory_retrieval(Arc::clone(&memory), memory_worker_config())
         .expect("fixture Memory retrieval should configure")
+        .with_memory_mutation(memory, Arc::new(FixtureAuthorityPrincipalResolver))
 }
 
 fn memory_worker_config() -> MemoryRetrievalCompositionConfig {
@@ -901,6 +900,178 @@ async fn m10_real_cli_and_tui_share_governed_memory_retrieval_over_local_ipc() {
     let status = child.wait().await.expect("M-10 fixture child exit");
     assert!(status.success(), "M-10 fixture child failed: {status}");
     fs::remove_dir_all(&root).expect("remove M-10 fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m11_real_cli_and_tui_share_governed_memory_mutations_over_local_ipc() {
+    let root = std::env::temp_dir().join(format!("egopulse-m11-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create M-11 fixture root");
+    let instance = format!("m11-{}", Uuid::now_v7());
+    let mut child = spawn_fixture(&root, &instance).await;
+    wait_for_cli_status(&instance).await;
+
+    let candidate = run_cli(
+        &instance,
+        &[
+            "memory",
+            "candidate",
+            "--memory-id",
+            "memory-m11-cross-ipc",
+            "--content",
+            "m11 unique governed mutation sentinel",
+            "--source-ref",
+            "source:m11-cross-ipc",
+            "--scope",
+            "scope:founder",
+            "--idempotency-key",
+            "m11-candidate",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        candidate.status.success(),
+        "Memory candidate CLI stdout={} stderr={}",
+        String::from_utf8_lossy(&candidate.stdout),
+        String::from_utf8_lossy(&candidate.stderr)
+    );
+    let candidate_json: serde_json::Value =
+        serde_json::from_slice(&candidate.stdout).expect("M-11 candidate JSON envelope");
+    assert_eq!(candidate_json["operation"], "memory.candidate");
+    assert_eq!(candidate_json["data"]["memoryId"], "memory-m11-cross-ipc");
+    assert_eq!(candidate_json["data"]["revision"], 1);
+    assert_eq!(candidate_json["data"]["state"], "candidate");
+
+    let accepted = run_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "memory-accept",
+            "memory-m11-cross-ipc",
+            "--expected-revision",
+            "1",
+            "--evidence-ref",
+            "evidence:m11-founder-acceptance",
+            "--idempotency-key",
+            "m11-accept",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        accepted.status.success(),
+        "Memory accept TUI stdout={} stderr={}",
+        String::from_utf8_lossy(&accepted.stdout),
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let accepted_json: serde_json::Value =
+        serde_json::from_slice(&accepted.stdout).expect("M-11 accept JSON envelope");
+    assert_eq!(accepted_json["operation"], "memory.accept");
+    assert_eq!(accepted_json["data"]["revision"], 2);
+    assert_eq!(accepted_json["data"]["state"], "accepted");
+
+    let retrieved = run_cli(
+        &instance,
+        &[
+            "memory",
+            "retrieve",
+            "--query",
+            "m11 unique governed mutation sentinel",
+            "--scope",
+            "scope:founder",
+            "--max-results",
+            "4",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        retrieved.status.success(),
+        "Memory retrieve CLI stdout={} stderr={}",
+        String::from_utf8_lossy(&retrieved.stdout),
+        String::from_utf8_lossy(&retrieved.stderr)
+    );
+    let retrieved_json: serde_json::Value =
+        serde_json::from_slice(&retrieved.stdout).expect("M-11 retrieve JSON envelope");
+    let retrieved_candidates = retrieved_json["data"]["candidates"]
+        .as_array()
+        .expect("M-11 retrieve candidates");
+    let retrieved_target = retrieved_candidates
+        .iter()
+        .find(|candidate| candidate["memoryId"] == "memory-m11-cross-ipc")
+        .expect("M-11 accepted memory must be retrievable");
+    assert!(retrieved_target.get("content").is_none());
+
+    let revoked = run_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "memory-revoke",
+            "memory-m11-cross-ipc",
+            "--expected-revision",
+            "2",
+            "--evidence-ref",
+            "evidence:m11-founder-revocation",
+            "--idempotency-key",
+            "m11-revoke",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        revoked.status.success(),
+        "Memory revoke TUI stdout={} stderr={}",
+        String::from_utf8_lossy(&revoked.stdout),
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    let revoked_json: serde_json::Value =
+        serde_json::from_slice(&revoked.stdout).expect("M-11 revoke JSON envelope");
+    assert_eq!(revoked_json["operation"], "memory.revoke");
+    assert_eq!(revoked_json["data"]["revision"], 3);
+    assert_eq!(revoked_json["data"]["state"], "revoked");
+
+    let after_revoke = run_cli(
+        &instance,
+        &[
+            "memory",
+            "retrieve",
+            "--query",
+            "m11 unique governed mutation sentinel",
+            "--scope",
+            "scope:founder",
+            "--max-results",
+            "4",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        after_revoke.status.success(),
+        "Memory post-revoke retrieve CLI stdout={} stderr={}",
+        String::from_utf8_lossy(&after_revoke.stdout),
+        String::from_utf8_lossy(&after_revoke.stderr)
+    );
+    let after_revoke_json: serde_json::Value =
+        serde_json::from_slice(&after_revoke.stdout).expect("M-11 post-revoke JSON envelope");
+    let post_revoke_candidates = after_revoke_json["data"]["candidates"]
+        .as_array()
+        .expect("M-11 post-revoke candidates");
+    assert!(
+        !post_revoke_candidates
+            .iter()
+            .any(|candidate| candidate["memoryId"] == "memory-m11-cross-ipc")
+    );
+
+    drop(child.stdin.take());
+    let status = child.wait().await.expect("M-11 fixture child exit");
+    assert!(status.success(), "M-11 fixture child failed: {status}");
+    fs::remove_dir_all(&root).expect("remove M-11 fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

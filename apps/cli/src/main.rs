@@ -915,8 +915,14 @@ async fn memory_mutation(
     json_output: bool,
 ) -> Result<(), CliFailure> {
     let attached = attach(operation).await?;
-    attached.require_rpc(
+    let oneof = match &branch {
+        memory_mutation_command::Command::SubmitMemoryCandidate(_) => "submit_memory_candidate",
+        memory_mutation_command::Command::AcceptMemory(_) => "accept_memory",
+        memory_mutation_command::Command::RevokeMemory(_) => "revoke_memory",
+    };
+    attached.require_command(
         "LocalCommandGatewayService/ExecuteMemoryMutation",
+        oneof,
         operation,
     )?;
     let correlation_id = Uuid::now_v7().to_string();
