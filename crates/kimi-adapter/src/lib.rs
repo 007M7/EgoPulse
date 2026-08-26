@@ -4,18 +4,22 @@
 mod acp;
 
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    ApprovalDecisionEnvelope, CancelExecutionEnvelope, DispatchEnvelope, HarnessErrorCode,
-    HarnessReadiness, NativeProtocolFingerprint, ProbeHarnessRequest, ProbeHarnessResult,
+    ApprovalDecision, ApprovalDecisionEnvelope, ApprovalKind, ApprovalRequestLifecycleKind,
+    ApprovalRequestObservation, CancelExecutionEnvelope, DispatchEnvelope, HarnessErrorCode,
+    HarnessReadiness, LifecycleKind, LifecycleObservation, NativeProtocolFingerprint,
+    ObservationCriticality, ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
 };
 use egopulse_harness_adapter::{
     DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, NativeHarnessDriver,
     NativeHarnessFuture, ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
+    TerminalOutputCandidate,
 };
 use egopulse_process_supervision::{SupervisedProcess, SupervisedProcessSpec};
 use prost_types::Timestamp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -24,6 +28,8 @@ use uuid::Uuid;
 pub const KIMI_ADAPTER_ID: &str = "kimi-adapter";
 pub const KIMI_ACP_PROTOCOL: &str = "agent-client-protocol";
 pub const KIMI_ACP_PROTOCOL_VERSION: &str = "v1";
+pub const KIMI_NATIVE_RECOVERY_UNSUPPORTED_EVIDENCE_REF: &str =
+    "kimi-reconcile:native-session-recovery-not-attested";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KimiSessionProbeDisposition {
@@ -73,21 +79,52 @@ impl KimiAcpConfig {
     }
 }
 
+struct KimiSession {
+    process: SupervisedProcess,
+    next_request_id: u64,
+    native_session_ref: String,
+}
+
+struct ActiveDispatch {
+    dispatch_id: String,
+    native_session_ref: String,
+    prompt_request_id: u64,
+    output_text: String,
+    output_candidate_taken: bool,
+}
+
+#[derive(Clone)]
+struct PendingApproval {
+    request_id: Value,
+    params: Value,
+    observation: ApprovalRequestObservation,
+}
+
 /// Candidate-only Kimi ACP driver.
 ///
-/// This driver intentionally implements only the no-prompt ACP initialize
-/// probe. Until session, lifecycle, approval and recovery semantics are
-/// independently attested, every execution method fails closed as a
-/// capability mismatch and this crate must not be installed as an active
-/// Harness profile.
+/// The driver supports the native fresh-session ACP lifecycle and keeps all
+/// resulting execution, approval and output evidence behind the same
+/// provider-neutral `NativeHarnessDriver` boundary as the other candidates.
+/// It remains candidate-only until an authenticated lifecycle, schema,
+/// artifact and recovery matrix is independently attested.
 pub struct KimiAcpDriver {
     config: KimiAcpConfig,
+    session: Option<KimiSession>,
+    active: Option<ActiveDispatch>,
+    completed_dispatch_id: Option<String>,
+    pending_approvals: HashMap<String, PendingApproval>,
 }
 
 impl KimiAcpDriver {
     #[must_use]
     pub fn new(config: KimiAcpConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            session: None,
+            active: None,
+            completed_dispatch_id: None,
+            pending_approvals: HashMap::new(),
+        }
     }
 
     /// Performs the ACP initialize plus empty-session setup probe. It does not
@@ -96,6 +133,89 @@ impl KimiAcpDriver {
     /// capability profile.
     pub async fn probe_session(&self) -> Result<KimiSessionProbeResult, DriverError> {
         probe_session(&self.config).await
+    }
+
+    async fn ensure_session(&mut self, working_directory: &Path) -> Result<(), DriverError> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+        let mut process = spawn_process(&self.config).await?;
+        let initialize = initialize_request();
+        write_json_line(
+            &mut process,
+            &initialize,
+            "KIMI_ACP_INITIALIZE_WRITE_FAILED",
+        )
+        .await?;
+        let initialize_raw = read_json_line(
+            &mut process,
+            self.config.request_timeout,
+            "KIMI_ACP_INITIALIZE_TIMEOUT",
+            "KIMI_ACP_INITIALIZE_READ_FAILED",
+            "KIMI_ACP_INITIALIZE_EOF",
+            &initialize,
+        )
+        .await?;
+        let initialize_message =
+            acp::parse_message(initialize_raw.as_bytes()).map_err(|detail| {
+                driver_error("KIMI_ACP_INITIALIZE_INVALID_MESSAGE", detail.as_bytes())
+            })?;
+        if !matches!(
+            initialize_message,
+            acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Result { .. })
+        ) {
+            return Err(driver_error(
+                "KIMI_ACP_INITIALIZE_REJECTED",
+                initialize_raw.as_bytes(),
+            ));
+        }
+
+        let session_request = session_new_request(working_directory);
+        write_json_line(
+            &mut process,
+            &session_request,
+            "KIMI_ACP_SESSION_NEW_WRITE_FAILED",
+        )
+        .await?;
+        let session_raw = read_json_line(
+            &mut process,
+            self.config.request_timeout,
+            "KIMI_ACP_SESSION_NEW_TIMEOUT",
+            "KIMI_ACP_SESSION_NEW_READ_FAILED",
+            "KIMI_ACP_SESSION_NEW_EOF",
+            &session_request,
+        )
+        .await?;
+        let session_id = match acp::parse_message(session_raw.as_bytes()).map_err(|detail| {
+            driver_error("KIMI_ACP_SESSION_NEW_INVALID_MESSAGE", detail.as_bytes())
+        })? {
+            acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Result { result, .. }) => result
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    driver_error("KIMI_ACP_SESSION_ID_MISSING", session_raw.as_bytes())
+                })?,
+            acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Error { .. }) => {
+                return Err(driver_error(
+                    "KIMI_ACP_SESSION_NEW_REJECTED",
+                    session_raw.as_bytes(),
+                ));
+            }
+            _ => {
+                return Err(driver_error(
+                    "KIMI_ACP_SESSION_NEW_INVALID_MESSAGE",
+                    session_raw.as_bytes(),
+                ));
+            }
+        };
+        self.session = Some(KimiSession {
+            process,
+            next_request_id: 3,
+            native_session_ref: session_id,
+        });
+        Ok(())
     }
 }
 
@@ -109,38 +229,275 @@ impl NativeHarnessDriver for KimiAcpDriver {
 
     fn send_dispatch<'a>(
         &'a mut self,
-        _envelope: &'a DispatchEnvelope,
-        _material: &'a ResolvedDispatchMaterial,
+        envelope: &'a DispatchEnvelope,
+        material: &'a ResolvedDispatchMaterial,
     ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
-        Box::pin(async { Err(unsupported("KIMI_NATIVE_DISPATCH_NOT_ATTESTED")) })
+        Box::pin(async move {
+            if self.active.is_some()
+                && self.completed_dispatch_id.as_deref()
+                    != self.active.as_ref().map(|value| value.dispatch_id.as_str())
+            {
+                return Err(dependency_error("KIMI_ACP_ACTIVE_DISPATCH_EXISTS"));
+            }
+            self.ensure_session(&material.workspace_root).await?;
+            let session = self.session.as_mut().expect("session initialized");
+            let request_id = session.next_request_id;
+            session.next_request_id = session.next_request_id.saturating_add(1);
+            let request = acp::session_prompt_request(
+                request_id,
+                &session.native_session_ref,
+                &material.prompt,
+            );
+            let raw = serde_json::to_vec(&request).unwrap_or_default();
+            write_json_value(
+                &mut session.process,
+                &request,
+                "KIMI_ACP_PROMPT_WRITE_FAILED",
+            )
+            .await
+            .map_err(|mut error| {
+                error.certainty = DriverErrorCertainty::DeliveryUnknown;
+                error
+            })?;
+            let native_session_ref = session.native_session_ref.clone();
+            self.active = Some(ActiveDispatch {
+                dispatch_id: envelope.dispatch_id.clone(),
+                native_session_ref: native_session_ref.clone(),
+                prompt_request_id: request_id,
+                output_text: String::new(),
+                output_candidate_taken: false,
+            });
+            self.completed_dispatch_id = None;
+            Ok(DriverDelivery {
+                native_request_ref: format!("kimi-acp-jsonrpc:{request_id}"),
+                native_session_ref,
+                native_execution_ref: Some(format!("kimi-acp-prompt:{request_id}")),
+                raw_evidence: raw,
+            })
+        })
     }
 
     fn next_event<'a>(
         &'a mut self,
-        _envelope: &'a DispatchEnvelope,
+        envelope: &'a DispatchEnvelope,
     ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
-        Box::pin(async { Err(unsupported("KIMI_NATIVE_EVENTS_NOT_ATTESTED")) })
+        Box::pin(async move {
+            if self.completed_dispatch_id.as_deref() == Some(envelope.dispatch_id.as_str()) {
+                return Ok(None);
+            }
+            if !self.pending_approvals.is_empty() {
+                return Ok(None);
+            }
+            let (dispatch_id, native_session_ref, prompt_request_id) = self
+                .active
+                .as_ref()
+                .filter(|value| value.dispatch_id == envelope.dispatch_id)
+                .map(|value| {
+                    (
+                        value.dispatch_id.clone(),
+                        value.native_session_ref.clone(),
+                        value.prompt_request_id,
+                    )
+                })
+                .ok_or_else(|| dependency_error("KIMI_ACP_ACTIVE_DISPATCH_NOT_FOUND"))?;
+            loop {
+                let line = {
+                    let session = self
+                        .session
+                        .as_mut()
+                        .ok_or_else(|| dependency_error("KIMI_ACP_SESSION_NOT_RUNNING"))?;
+                    read_json_line(
+                        &mut session.process,
+                        self.config.request_timeout,
+                        "KIMI_ACP_EVENT_TIMEOUT",
+                        "KIMI_ACP_EVENT_READ_FAILED",
+                        "KIMI_ACP_EVENT_EOF",
+                        b"kimi-acp-event",
+                    )
+                    .await?
+                };
+                let message = acp::parse_message(line.as_bytes()).map_err(|detail| {
+                    driver_error("KIMI_ACP_EVENT_INVALID_MESSAGE", detail.as_bytes())
+                })?;
+                match message {
+                    acp::KimiAcpMessage::Notification(
+                        acp::KimiAcpNotification::SessionUpdate { session_id, update },
+                    ) => {
+                        if session_id != native_session_ref {
+                            return Err(driver_error(
+                                "KIMI_ACP_SESSION_ID_MISMATCH",
+                                line.as_bytes(),
+                            ));
+                        }
+                        if let acp::KimiAcpUpdate::AgentMessageChunk { text } = update
+                            && let Some(active) = self.active.as_mut()
+                        {
+                            active.output_text.push_str(&text);
+                        }
+                    }
+                    acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Result { id, result })
+                        if id.as_u64() == Some(prompt_request_id) =>
+                    {
+                        let stop_reason = result
+                            .get("stopReason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        let (kind, status) = match stop_reason {
+                            "end_turn" => (LifecycleKind::ExecutionCompleted, "end_turn"),
+                            "cancelled" | "canceled" => {
+                                (LifecycleKind::ExecutionInterrupted, "cancelled")
+                            }
+                            _ => {
+                                return Err(driver_error(
+                                    "KIMI_ACP_TERMINAL_STATUS_UNKNOWN",
+                                    line.as_bytes(),
+                                ));
+                            }
+                        };
+                        self.completed_dispatch_id = Some(dispatch_id);
+                        return Ok(Some(lifecycle_event(
+                            "session/prompt",
+                            kind,
+                            status,
+                            line.into_bytes(),
+                        )));
+                    }
+                    acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Error { id, .. })
+                        if id.as_ref().and_then(Value::as_u64) == Some(prompt_request_id) =>
+                    {
+                        self.completed_dispatch_id = Some(dispatch_id);
+                        return Ok(Some(lifecycle_event(
+                            "session/prompt",
+                            LifecycleKind::ExecutionFailed,
+                            "error",
+                            line.into_bytes(),
+                        )));
+                    }
+                    acp::KimiAcpMessage::ServerRequest(request)
+                        if request.method == "session/request_permission" =>
+                    {
+                        let routing_ref = format!("kimi-acp-routing:approval:{}", Uuid::now_v7());
+                        let observation = ApprovalRequestObservation {
+                            approval_request_id: Uuid::now_v7().to_string(),
+                            kind: ApprovalKind::Permission as i32,
+                            action_digest_sha256: sha256(request.params.to_string().as_bytes()),
+                            requested_scope_ref: "adapter-edge://kimi-acp/approval/scope"
+                                .to_owned(),
+                            display_summary_ref: "adapter-edge://kimi-acp/approval/summary"
+                                .to_owned(),
+                            native_routing_ref: routing_ref.clone(),
+                            lifecycle: ApprovalRequestLifecycleKind::Open as i32,
+                            request_revision: 1,
+                        };
+                        self.pending_approvals.insert(
+                            routing_ref,
+                            PendingApproval {
+                                request_id: request.id,
+                                params: request.params,
+                                observation: observation.clone(),
+                            },
+                        );
+                        return Ok(Some(DriverEvent {
+                            native_key: format!("request:{}", observation.approval_request_id),
+                            native_event_id: None,
+                            native_sequence: None,
+                            native_observed_at: now(),
+                            criticality: ObservationCriticality::Security,
+                            payload: harness_observation::Payload::ApprovalRequest(observation),
+                            raw_event: line.into_bytes(),
+                        }));
+                    }
+                    acp::KimiAcpMessage::ServerRequest(_) => {
+                        return Err(driver_error(
+                            "KIMI_ACP_APPROVAL_OR_SERVER_REQUEST_UNATTESTED",
+                            line.as_bytes(),
+                        ));
+                    }
+                    acp::KimiAcpMessage::Notification(_) => {}
+                    acp::KimiAcpMessage::Response(_) => {}
+                }
+            }
+        })
     }
 
     fn decide_approval<'a>(
         &'a mut self,
-        _envelope: &'a ApprovalDecisionEnvelope,
+        envelope: &'a ApprovalDecisionEnvelope,
     ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
-        Box::pin(async { Err(unsupported("KIMI_NATIVE_APPROVALS_NOT_ATTESTED")) })
+        Box::pin(async move { send_approval_response(self, envelope).await })
     }
 
     fn cancel<'a>(
         &'a mut self,
-        _envelope: &'a CancelExecutionEnvelope,
+        envelope: &'a CancelExecutionEnvelope,
     ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
-        Box::pin(async { Err(unsupported("KIMI_NATIVE_CANCELLATION_NOT_ATTESTED")) })
+        Box::pin(async move {
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| dependency_error("KIMI_ACP_SESSION_NOT_RUNNING"))?;
+            if envelope.native_session_ref != session.native_session_ref {
+                return Err(driver_error(
+                    "KIMI_ACP_CANCEL_SESSION_MISMATCH",
+                    envelope.native_session_ref.as_bytes(),
+                ));
+            }
+            let request_id = session.next_request_id;
+            session.next_request_id = session.next_request_id.saturating_add(1);
+            let request = acp::session_cancel_request(request_id, &session.native_session_ref);
+            let raw = serde_json::to_vec(&request).unwrap_or_default();
+            write_json_value(
+                &mut session.process,
+                &request,
+                "KIMI_ACP_CANCEL_WRITE_FAILED",
+            )
+            .await
+            .map_err(|mut error| {
+                error.certainty = DriverErrorCertainty::DeliveryUnknown;
+                error
+            })?;
+            Ok(raw)
+        })
     }
 
     fn reconcile<'a>(
         &'a mut self,
         _context: &'a ReconciliationContext,
     ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
-        Box::pin(async { Err(unsupported("KIMI_NATIVE_RECONCILIATION_NOT_ATTESTED")) })
+        Box::pin(async {
+            Ok(ReconciliationFinding::OutcomeUnknown {
+                evidence_ref: KIMI_NATIVE_RECOVERY_UNSUPPORTED_EVIDENCE_REF.to_owned(),
+            })
+        })
+    }
+
+    fn take_terminal_output_candidate<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<TerminalOutputCandidate>, DriverError>> {
+        Box::pin(async move {
+            if self.completed_dispatch_id.as_deref() != Some(envelope.dispatch_id.as_str()) {
+                return Ok(None);
+            }
+            let Some(active) = self
+                .active
+                .as_mut()
+                .filter(|value| value.dispatch_id == envelope.dispatch_id)
+            else {
+                return Ok(None);
+            };
+            if active.output_candidate_taken {
+                return Ok(None);
+            }
+            active.output_candidate_taken = true;
+            let content = std::mem::take(&mut active.output_text).into_bytes();
+            Ok(Some(TerminalOutputCandidate {
+                dispatch_id: envelope.dispatch_id.clone(),
+                native_completion_ref: format!("kimi-acp-prompt:{}", active.prompt_request_id),
+                media_type: "text/plain; charset=utf-8".to_owned(),
+                content,
+            }))
+        })
     }
 }
 
@@ -210,6 +567,87 @@ async fn probe_session(config: &KimiAcpConfig) -> Result<KimiSessionProbeResult,
     })
 }
 
+async fn send_approval_response(
+    driver: &mut KimiAcpDriver,
+    envelope: &ApprovalDecisionEnvelope,
+) -> Result<Vec<u8>, DriverError> {
+    let pending = driver
+        .pending_approvals
+        .get(&envelope.native_routing_ref)
+        .cloned()
+        .ok_or_else(|| {
+            driver_error(
+                "KIMI_ACP_APPROVAL_ROUTING_NOT_FOUND",
+                envelope.native_routing_ref.as_bytes(),
+            )
+        })?;
+    if envelope.approval_request_id != pending.observation.approval_request_id
+        || envelope.action_digest_sha256 != pending.observation.action_digest_sha256
+    {
+        return Err(driver_error(
+            "KIMI_ACP_APPROVAL_IDENTITY_MISMATCH",
+            envelope.native_routing_ref.as_bytes(),
+        ));
+    }
+    let decision = ApprovalDecision::try_from(envelope.decision)
+        .map_err(|_| driver_error("KIMI_ACP_APPROVAL_DECISION_INVALID", &[]))?;
+    let result = match decision {
+        ApprovalDecision::AllowOnce => {
+            select_permission_option(&pending.params, &["allow_once", "allow_always"])?
+        }
+        ApprovalDecision::Deny => {
+            select_permission_option(&pending.params, &["reject_once", "reject_always"])?
+        }
+        ApprovalDecision::CancelAttempt => json!({
+            "outcome": { "outcome": "cancelled" }
+        }),
+        ApprovalDecision::Unspecified => {
+            return Err(driver_error("KIMI_ACP_APPROVAL_DECISION_INVALID", &[]));
+        }
+    };
+    let response = json!({ "jsonrpc": "2.0", "id": pending.request_id, "result": result });
+    let raw = serde_json::to_vec(&response).unwrap_or_default();
+    let session = driver
+        .session
+        .as_mut()
+        .ok_or_else(|| dependency_error("KIMI_ACP_SESSION_NOT_RUNNING"))?;
+    write_json_value(
+        &mut session.process,
+        &response,
+        "KIMI_ACP_APPROVAL_RESPONSE_WRITE_FAILED",
+    )
+    .await
+    .map_err(|mut error| {
+        error.certainty = DriverErrorCertainty::DeliveryUnknown;
+        error
+    })?;
+    driver
+        .pending_approvals
+        .remove(&envelope.native_routing_ref);
+    Ok(raw)
+}
+
+fn select_permission_option(params: &Value, accepted_kinds: &[&str]) -> Result<Value, DriverError> {
+    let option = params
+        .get("options")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options.iter().find(|option| {
+                option
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| accepted_kinds.contains(&kind))
+            })
+        })
+        .and_then(|option| option.get("optionId"))
+        .and_then(Value::as_str)
+        .filter(|option_id| !option_id.is_empty())
+        .ok_or_else(|| driver_error("KIMI_ACP_PERMISSION_OPTION_UNAVAILABLE", &[]))?;
+    Ok(json!({
+        "outcome": { "outcome": "selected", "optionId": option }
+    }))
+}
+
 async fn spawn_process(config: &KimiAcpConfig) -> Result<SupervisedProcess, DriverError> {
     let mut spec = SupervisedProcessSpec::new(&config.executable, &config.working_directory);
     spec.arguments = vec!["acp".to_owned()];
@@ -238,7 +676,7 @@ fn initialize_request() -> Vec<u8> {
     .unwrap_or_default()
 }
 
-fn session_new_request(working_directory: &PathBuf) -> Vec<u8> {
+fn session_new_request(working_directory: &Path) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
         "id": 2,
@@ -250,6 +688,16 @@ fn session_new_request(working_directory: &PathBuf) -> Vec<u8> {
         }
     }))
     .unwrap_or_default()
+}
+
+async fn write_json_value(
+    process: &mut SupervisedProcess,
+    value: &Value,
+    detail_code: &str,
+) -> Result<(), DriverError> {
+    let encoded = serde_json::to_vec(value)
+        .map_err(|error| driver_error(detail_code, error.to_string().as_bytes()))?;
+    write_json_line(process, &encoded, detail_code).await
 }
 
 async fn write_json_line(
@@ -419,8 +867,14 @@ fn parse_session_new_response(raw: &[u8]) -> Result<KimiSessionProbeDisposition,
     })
 }
 
-fn unsupported(detail: &str) -> DriverError {
-    driver_error(detail, &[])
+fn dependency_error(detail: &str) -> DriverError {
+    DriverError {
+        certainty: DriverErrorCertainty::ProvenNotSent,
+        code: HarnessErrorCode::DependencyUnavailable,
+        safe_detail_code: detail.to_owned(),
+        error_fingerprint: None,
+        raw_evidence: Vec::new(),
+    }
 }
 
 fn driver_error(detail: &str, raw: &[u8]) -> DriverError {
@@ -445,6 +899,29 @@ fn now() -> Timestamp {
 
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn lifecycle_event(
+    native_method: &str,
+    kind: LifecycleKind,
+    status: &str,
+    raw: Vec<u8>,
+) -> DriverEvent {
+    DriverEvent {
+        native_key: format!("{native_method}:{}", sha256(&raw)),
+        native_event_id: None,
+        native_sequence: None,
+        native_observed_at: now(),
+        criticality: ObservationCriticality::Terminal,
+        payload: harness_observation::Payload::Lifecycle(LifecycleObservation {
+            kind: kind as i32,
+            native_item_ref: None,
+            safe_status_code: Some(status.to_owned()),
+            side_effect_certainty: 0,
+            native_will_retry: None,
+        }),
+        raw_event: raw,
+    }
 }
 
 #[cfg(test)]
@@ -521,6 +998,26 @@ mod tests {
                 ..
             } if native_session_ref == "kimi-session-001"
         ));
+    }
+
+    #[test]
+    fn permission_option_selection_requires_an_explicit_compatible_option() {
+        let params = json!({
+            "options": [
+                { "optionId": "allow", "kind": "allow_once" },
+                { "optionId": "reject", "kind": "reject_once" }
+            ]
+        });
+        assert_eq!(
+            select_permission_option(&params, &["allow_once"]).expect("allow option")["outcome"]["optionId"],
+            "allow"
+        );
+        assert_eq!(
+            select_permission_option(&params, &["unsupported"])
+                .expect_err("missing option")
+                .safe_detail_code,
+            "KIMI_ACP_PERMISSION_OPTION_UNAVAILABLE"
+        );
     }
 
     #[tokio::test]
@@ -601,7 +1098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unverified_execution_surface_is_fail_closed_and_proven_not_sent() {
+    async fn unstarted_execution_surface_is_fail_closed_and_proven_not_sent() {
         let mut driver = KimiAcpDriver::new(KimiAcpConfig::new(
             r"C:\kimi.exe",
             std::env::current_dir().expect("cwd"),
@@ -628,38 +1125,35 @@ mod tests {
             driver
                 .next_event(&envelope)
                 .await
-                .expect_err("events must remain unsupported")
+                .expect_err("events require an active dispatch")
                 .safe_detail_code,
-            "KIMI_NATIVE_EVENTS_NOT_ATTESTED"
+            "KIMI_ACP_ACTIVE_DISPATCH_NOT_FOUND"
         );
         assert_eq!(
             driver
                 .decide_approval(&ApprovalDecisionEnvelope::default())
                 .await
-                .expect_err("approvals must remain unsupported")
+                .expect_err("approvals require a pending native request")
                 .safe_detail_code,
-            "KIMI_NATIVE_APPROVALS_NOT_ATTESTED"
+            "KIMI_ACP_APPROVAL_ROUTING_NOT_FOUND"
         );
         assert_eq!(
             driver
                 .cancel(&CancelExecutionEnvelope::default())
                 .await
-                .expect_err("cancellation must remain unsupported")
+                .expect_err("cancellation requires an active native session")
                 .safe_detail_code,
-            "KIMI_NATIVE_CANCELLATION_NOT_ATTESTED"
+            "KIMI_ACP_SESSION_NOT_RUNNING"
         );
         let context = ReconciliationContext {
             envelope,
             delivery_receipt: None,
             material,
         };
-        assert_eq!(
-            driver
-                .reconcile(&context)
-                .await
-                .expect_err("reconciliation must remain unsupported")
-                .safe_detail_code,
-            "KIMI_NATIVE_RECONCILIATION_NOT_ATTESTED"
-        );
+        assert!(matches!(
+            driver.reconcile(&context).await.expect("reconciliation hold"),
+            ReconciliationFinding::OutcomeUnknown { evidence_ref }
+                if evidence_ref == KIMI_NATIVE_RECOVERY_UNSUPPORTED_EVIDENCE_REF
+        ));
     }
 }

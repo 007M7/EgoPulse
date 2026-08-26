@@ -53,15 +53,17 @@ This is a default-profile startup/protocol failure observation, not evidence
 that the user's authentication is absent or invalid, and it does not promote
 or demote Kimi by itself.
 
-The Rust candidate adapter now records this boundary through
+The Rust candidate adapter records this boundary through
 `KimiAcpDriver::probe_session`. It preserves the `initialize` probe result and
 classifies `session/new` as one of three controlled dispositions:
 `Created` with an opaque native session reference,
 `AuthenticationRequired` with non-secret auth method identifiers, or
 `Rejected` with a safe detail code. Each session response is represented by a
-SHA-256 evidence reference. This is probe evidence only: no prompt is sent,
-no session is installed into a capability profile, and all execution,
-approval, cancellation and reconciliation methods remain fail-closed.
+SHA-256 evidence reference. The driver now also implements the candidate
+fresh-session prompt, lifecycle, approval, cancellation and one-shot terminal
+output seams. This is still candidate implementation evidence only: no
+authenticated live lifecycle has been admitted into a capability profile, and
+native recovery remains an explicit unknown/hold.
 
 The installed Kimi 1.49.0 package's local ACP integration notes further
 record the native lifecycle names `session/prompt`, `session/update` and

@@ -117,10 +117,14 @@ scheduling and isolation contract only; it does not promote DSH or Kimi and
 does not claim that either candidate has completed Artifact or recovery
 admission.
 
-The current Kimi code unit remains an authenticated-session boundary. It
-records the ACP `initialize` result and empty `session/new` disposition, but
-does not send a prompt. A candidate is not promoted to an active Harness
-merely because its process starts or its session can be created.
+The current Kimi code unit now has a candidate execution boundary as well as
+the authenticated-session probe: it can keep a fresh ACP session, send a
+native `session/prompt`, consume ordered updates, route a native permission
+request through the provider-neutral approval surface, cancel the session and
+expose a one-shot terminal output candidate. These methods are still
+candidate-only until an authenticated real-process lifecycle and recovery
+matrix is recorded. A candidate is not promoted merely because its process
+starts, its session can be created or its driver compiles.
 
 The model-isolation prerequisite is now executable at the Adapter Edge. The
 test `reviewed_harness_edges_are_isolated_and_cannot_cross_write` in
