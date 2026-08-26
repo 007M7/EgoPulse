@@ -99,8 +99,9 @@ weaken the frozen single-writer or blob-before-metadata boundaries.
 
 ## Return-path boundary still open
 
-The collector plus typed outbox projector now close the Artifact Authority-to-Collaboration
-`RecordAttemptReturn` boundary. A successful technical receipt still is not a V-01 workflow
-completion claim: Sego verification and `CommitStepReturn` remain open. The next vertical slice
-must consume the returned ArtifactSet through the Verification Authority and commit the Step only
-from a governed verification result.
+The collector plus typed outbox projector close the Artifact Authority-to-Collaboration
+`RecordAttemptReturn` boundary. Collaboration now exposes a guarded `CommitStepReturn` mutation,
+but its default verification resolver remains fail-closed. A successful technical receipt still
+is not a V-01 workflow completion claim: the next vertical slice must consume the returned
+ArtifactSet through the Verification Authority/Sego path and provide the production resolver
+that can authorize this final transition.

@@ -3,7 +3,7 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCancellationDisposition,
     AttemptCommandBase, AttemptSnapshot, AttemptStatus, BeginAttemptReconciliationCommand,
     CollaborationCommand, CollaborationCommandResult, CollaborationErrorCode,
-    CollaborationSnapshot, CreateAttemptCommand, CreateRunCommand,
+    CollaborationSnapshot, CommitStepReturnCommand, CreateAttemptCommand, CreateRunCommand,
     MarkAttemptOutcomeUnknownCommand, ReconciliationDisposition,
     RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
     RecordAttemptReturnCommand, RecordDeliveryReceiptCommand, RecordDispatchIntentCommand,
@@ -29,11 +29,11 @@ use egopulse_local_ide_control::collaboration_control::{
     CompositeCollaborationGuard, DispatchMaterial, GovernedTaskActivationRunner,
     HarnessDispatchRunner, HarnessEvidenceResolver, HarnessFactIngestionDisposition,
     LeaseAuthorization, ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
-    ResolvedHarnessEvidence, SingleHarnessWorkConfig, SingleHarnessWorkflowResolver,
-    SingleHarnessWorkflowResolverError, TaskActivationGuardSet, TaskActivationHandoff,
-    TaskActivationReferenceGuard, TaskActivationSource, TaskActivationSourceError,
-    canonical_dispatch_fingerprint, canonical_request_digest, dispatch_pending, pump_observations,
-    start_single_harness_workflow,
+    ResolvedHarnessEvidence, ResolvedStepReturn, SingleHarnessWorkConfig,
+    SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError, TaskActivationGuardSet,
+    TaskActivationHandoff, TaskActivationReferenceGuard, TaskActivationSource,
+    TaskActivationSourceError, canonical_dispatch_fingerprint, canonical_request_digest,
+    dispatch_pending, pump_observations, start_single_harness_workflow,
 };
 use prost_types::Timestamp;
 use rusqlite::Connection;
@@ -312,6 +312,26 @@ impl HarnessEvidenceResolver for FixtureGuard {
             evidence_refs: vec![
                 "artifact-return-receipt:return-receipt-001@durable".to_owned(),
                 "adapter-terminal-observation:terminal-001@durable".to_owned(),
+            ],
+        })
+    }
+
+    fn resolve_step_return(
+        &self,
+        command: &CommitStepReturnCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedStepReturn, ReferenceGuardRejection> {
+        if command.artifact_set_id != "artifact-set-001"
+            || command.return_handoff_id != "return-handoff-001"
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ResolvedStepReturn {
+            artifact_set_id: command.artifact_set_id.clone(),
+            return_handoff_id: command.return_handoff_id.clone(),
+            verification_artifact_id: "verification-artifact-001".to_owned(),
+            evidence_refs: vec![
+                "verification-artifact:verification-artifact-001@durable".to_owned(),
             ],
         })
     }
@@ -864,6 +884,16 @@ fn set_digest(command: &mut CollaborationCommand) {
                 .expect("metadata")
                 .request_digest_sha256 = digest;
         }
+        collaboration_command::Command::CommitStepReturn(value) => {
+            value
+                .base
+                .as_mut()
+                .expect("base")
+                .meta
+                .as_mut()
+                .expect("metadata")
+                .request_digest_sha256 = digest;
+        }
         _ => panic!("test helper does not support command"),
     }
 }
@@ -1182,6 +1212,33 @@ fn attempt_return_command(
                 harness_sequence,
                 artifact_return_receipt_id: "return-receipt-001".to_owned(),
                 receipt_digest_sha256: "a".repeat(64),
+            },
+        )),
+    };
+    set_digest(&mut command);
+    command
+}
+
+fn commit_step_return_command(snapshot: &CollaborationSnapshot) -> CollaborationCommand {
+    let run = snapshot.run.as_ref().expect("run snapshot");
+    let step = &snapshot.steps[0];
+    let mut command = CollaborationCommand {
+        command: Some(collaboration_command::Command::CommitStepReturn(
+            CommitStepReturnCommand {
+                base: Some(RunCommandBase {
+                    meta: Some(metadata(
+                        "cmd-step-return-commit-001",
+                        "step-return-commit-001",
+                        "run-001",
+                    )),
+                    run_id: run.run_id.clone(),
+                    expected_run_revision: run.revision,
+                }),
+                step_id: step.step_id.clone(),
+                expected_step_revision: step.revision,
+                attempt_id: step.current_attempt_id.clone().expect("current attempt"),
+                artifact_set_id: step.artifact_set_id.clone().expect("artifact set"),
+                return_handoff_id: step.return_handoff_id.clone().expect("return handoff"),
             },
         )),
     };
@@ -2173,6 +2230,8 @@ fn governed_artifact_return_records_attempt_once_and_not_step_completion() {
         returned.run.as_ref().expect("run").status,
         RunStatus::ReturnPending as i32
     );
+    let durable_returned = load_snapshot(&control);
+    assert_eq!(durable_returned, returned);
 
     let replayed = control
         .execute(
@@ -2182,6 +2241,27 @@ fn governed_artifact_return_records_attempt_once_and_not_step_completion() {
         .expect("replay governed Artifact return");
     assert!(replayed.replayed);
     assert_eq!(committed_snapshot(&replayed), returned);
+
+    let committed_step = control
+        .execute(
+            &commit_step_return_command(&durable_returned),
+            &collaboration_control(),
+        )
+        .expect("commit verified Step return");
+    let completed = committed_snapshot(&committed_step);
+    assert_eq!(completed.steps[0].status, StepStatus::Returned as i32);
+    assert_eq!(
+        completed.run.as_ref().expect("run").status,
+        RunStatus::Returned as i32
+    );
+    let commit_replay = control
+        .execute(
+            &commit_step_return_command(&durable_returned),
+            &collaboration_control(),
+        )
+        .expect("replay verified Step return");
+    assert!(commit_replay.replayed);
+    assert_eq!(committed_snapshot(&commit_replay), completed);
 }
 
 #[test]

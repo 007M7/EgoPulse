@@ -25,13 +25,13 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCancellationDisposition,
     AttemptSnapshot, AttemptStatus, BeginAttemptReconciliationCommand, CollaborationCommand,
     CollaborationCommandResult, CollaborationError, CollaborationErrorCode, CollaborationEvent,
-    CollaborationEventKind, CollaborationSnapshot, CreateAttemptCommand, CreateRunCommand,
-    GetCollaborationResponse, Lease, MarkAttemptOutcomeUnknownCommand, ReconciliationDisposition,
-    RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
-    RecordAttemptReturnCommand, RecordDeliveryReceiptCommand, RecordDispatchIntentCommand,
-    RecordHarnessAckCommand, RecordRunningObservationCommand, RecoveryClass,
-    RequestAttemptCancellationCommand, RunSnapshot, RunStatus, StepSnapshot, StepStatus,
-    collaboration_command, collaboration_command_result, get_collaboration_response,
+    CollaborationEventKind, CollaborationSnapshot, CommitStepReturnCommand, CreateAttemptCommand,
+    CreateRunCommand, GetCollaborationResponse, Lease, MarkAttemptOutcomeUnknownCommand,
+    ReconciliationDisposition, RecordAttemptCancellationOutcomeCommand,
+    RecordAttemptReconciliationCommand, RecordAttemptReturnCommand, RecordDeliveryReceiptCommand,
+    RecordDispatchIntentCommand, RecordHarnessAckCommand, RecordRunningObservationCommand,
+    RecoveryClass, RequestAttemptCancellationCommand, RunSnapshot, RunStatus, StepSnapshot,
+    StepStatus, collaboration_command, collaboration_command_result, get_collaboration_response,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
@@ -177,6 +177,18 @@ pub trait HarnessEvidenceResolver {
         let _ = (command, snapshot);
         Err(ReferenceGuardRejection::UnverifiedReference)
     }
+
+    /// Proves that a sealed technical return has an accepted Verification
+    /// result. The default is fail-closed so technical intake cannot be
+    /// mistaken for workflow completion.
+    fn resolve_step_return(
+        &self,
+        command: &CommitStepReturnCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedStepReturn, ReferenceGuardRejection> {
+        let _ = (command, snapshot);
+        Err(ReferenceGuardRejection::UnverifiedReference)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,6 +196,14 @@ pub struct ResolvedArtifactReturn {
     pub artifact_set_id: String,
     pub return_handoff_id: String,
     pub dispatch_id: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedStepReturn {
+    pub artifact_set_id: String,
+    pub return_handoff_id: String,
+    pub verification_artifact_id: String,
     pub evidence_refs: Vec<String>,
 }
 
@@ -498,6 +518,9 @@ where
             }
             collaboration_command::Command::RecordAttemptReturn(value) => {
                 self.record_attempt_return(value, command, principal)
+            }
+            collaboration_command::Command::CommitStepReturn(value) => {
+                self.commit_step_return(value, command, principal)
             }
             collaboration_command::Command::RequestAttemptCancellation(value) => {
                 self.request_attempt_cancellation(value, command, principal)
@@ -1381,6 +1404,8 @@ where
         let step = &mut snapshot.steps[step_index];
         step.revision += 1;
         step.status = StepStatus::ReturnPending as i32;
+        step.artifact_set_id = Some(resolved.artifact_set_id.clone());
+        step.return_handoff_id = Some(resolved.return_handoff_id.clone());
         step.updated_at = Some(now);
         let attempt = &mut snapshot.attempts[attempt_index];
         attempt.revision += 1;
@@ -1407,6 +1432,106 @@ where
             Some(step_previous),
             Some(attempt_previous),
             CollaborationEventKind::ReturnRecorded,
+            evidence,
+            None,
+            now,
+        )
+    }
+
+    fn commit_step_return(
+        &mut self,
+        value: &CommitStepReturnCommand,
+        command: &CollaborationCommand,
+        principal: &AuthenticatedCollaborationPrincipal,
+    ) -> Result<CollaborationCommandResult, CollaborationControlError> {
+        let Some(base) = value.base.as_ref() else {
+            return Ok(invalid("STEP_RETURN_COMMIT_BASE_REQUIRED"));
+        };
+        let Some(mut snapshot) = self.load_snapshot(&base.run_id)? else {
+            return Ok(not_found("COLLABORATION_RUN_NOT_FOUND"));
+        };
+        let run = snapshot.run.as_ref().expect("stored run");
+        if run.revision != base.expected_run_revision {
+            return Ok(run_revision_conflict(run.revision));
+        }
+        let Some(step_index) = snapshot
+            .steps
+            .iter()
+            .position(|step| step.step_id == value.step_id)
+        else {
+            return Ok(not_found("COLLABORATION_STEP_NOT_FOUND"));
+        };
+        let step = &snapshot.steps[step_index];
+        if step.revision != value.expected_step_revision {
+            return Ok(entity_revision_conflict(run.revision, step.revision));
+        }
+        let Some(attempt_index) = snapshot.attempts.iter().position(|attempt| {
+            attempt.attempt_id == value.attempt_id && attempt.step_id == value.step_id
+        }) else {
+            return Ok(not_found("COLLABORATION_ATTEMPT_NOT_FOUND"));
+        };
+        let attempt = &snapshot.attempts[attempt_index];
+        if run.status != RunStatus::ReturnPending as i32
+            || step.status != StepStatus::ReturnPending as i32
+            || attempt.status != AttemptStatus::Returned as i32
+        {
+            return Ok(state_conflict("STEP_RETURN_COMMIT_NOT_PENDING"));
+        }
+        if step.current_attempt_id.as_deref() != Some(value.attempt_id.as_str())
+            || step.artifact_set_id.as_deref() != Some(value.artifact_set_id.as_str())
+            || step.return_handoff_id.as_deref() != Some(value.return_handoff_id.as_str())
+            || value.artifact_set_id.trim().is_empty()
+            || value.return_handoff_id.trim().is_empty()
+        {
+            return Ok(error_result(
+                CollaborationErrorCode::ContractMismatch,
+                "STEP_RETURN_COMMIT_REFERENCE_MISMATCH",
+                Some(run.revision),
+                Some(step.revision),
+            ));
+        }
+        let resolved = match self.guard.resolve_step_return(value, &snapshot) {
+            Ok(value) => value,
+            Err(rejection) => return Ok(guard_error(rejection)),
+        };
+        if resolved.artifact_set_id != value.artifact_set_id
+            || resolved.return_handoff_id != value.return_handoff_id
+            || resolved.verification_artifact_id.trim().is_empty()
+            || resolved.evidence_refs.is_empty()
+            || resolved
+                .evidence_refs
+                .iter()
+                .any(|reference| reference.trim().is_empty())
+        {
+            return Ok(invalid("STEP_RETURN_VERIFICATION_PROOF_INVALID"));
+        }
+
+        let now = self.clock.now();
+        let previous_run_revision = run.revision;
+        let previous_step_revision = step.revision;
+        let run = snapshot.run.as_mut().expect("stored run");
+        run.revision += 1;
+        run.status = RunStatus::Returned as i32;
+        run.updated_at = Some(now);
+        let step = &mut snapshot.steps[step_index];
+        step.revision += 1;
+        step.status = StepStatus::Returned as i32;
+        step.updated_at = Some(now);
+        let mut evidence = resolved.evidence_refs;
+        evidence.push(format!(
+            "verification-artifact:{}",
+            resolved.verification_artifact_id
+        ));
+        evidence.push(format!("artifact-set:{}", value.artifact_set_id));
+        evidence.push(format!("return-handoff:{}", value.return_handoff_id));
+        self.persist(
+            command,
+            principal,
+            snapshot,
+            Some(previous_run_revision),
+            Some(previous_step_revision),
+            None,
+            CollaborationEventKind::StepReturnCommitted,
             evidence,
             None,
             now,
@@ -2504,6 +2629,9 @@ fn changed_step_id(command: &CollaborationCommand) -> Option<&str> {
         collaboration_command::Command::RecordRunningObservation(value) => {
             Some(&value.base.as_ref()?.step_id)
         }
+        collaboration_command::Command::RecordAttemptReturn(value) => {
+            Some(&value.base.as_ref()?.step_id)
+        }
         collaboration_command::Command::RequestAttemptCancellation(value) => {
             Some(&value.base.as_ref()?.step_id)
         }
@@ -2519,6 +2647,7 @@ fn changed_step_id(command: &CollaborationCommand) -> Option<&str> {
         collaboration_command::Command::MarkAttemptOutcomeUnknown(value) => {
             Some(&value.base.as_ref()?.step_id)
         }
+        collaboration_command::Command::CommitStepReturn(value) => Some(&value.step_id),
         _ => None,
     }
 }
@@ -2539,6 +2668,9 @@ fn changed_attempt_id(command: &CollaborationCommand) -> Option<&str> {
             Some(&value.base.as_ref()?.attempt_id)
         }
         collaboration_command::Command::RecordRunningObservation(value) => {
+            Some(&value.base.as_ref()?.attempt_id)
+        }
+        collaboration_command::Command::RecordAttemptReturn(value) => {
             Some(&value.base.as_ref()?.attempt_id)
         }
         collaboration_command::Command::RequestAttemptCancellation(value) => {

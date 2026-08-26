@@ -3,7 +3,7 @@
 - Status: technical intake and Attempt-return projection implemented; local focused gate passed
 - Date: 2026-08-26
 - Scope: native terminal output through technical Artifact Authority receipt
-- Not in scope: verification verdict, Attempt return decision, Step commit or Task completion
+- Not in scope: production Sego/Verification resolver composition and Task completion
 
 ## Ownership-preserving flow
 
@@ -28,6 +28,10 @@ native Harness driver
   -> Collaboration runner
        receipt digest + consumed terminal sequence + current fence/revisions
        -> Attempt RETURNED; Run/Step RETURN_PENDING
+  -> Verification Authority / Sego result resolver
+       exact ArtifactSet + ReturnHandoff + accepted Verification artifact
+       -> guarded CommitStepReturn
+       -> Step/Run RETURNED
 ```
 
 No component gains a second fact store writer. Collaboration supplies authoritative Task/work
@@ -78,5 +82,5 @@ not occur at technical intake.
 Continue the next side without widening collector authority:
 
 1. request Sego verification using sealed Artifact Authority references;
-2. commit the Step only from the governed verification result;
+2. provide the production resolver for the guarded Step commit;
 3. expose the resulting state through the shared CLI/TUI kernel.

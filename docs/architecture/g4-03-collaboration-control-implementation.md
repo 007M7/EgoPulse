@@ -1,7 +1,7 @@
 # G4-03 Collaboration Control implementation profile
 
-- Status: implemented dispatch/control subset and Gate 4 evidence verified
-  locally; later mutations remain deferred
+- Status: dispatch, technical return projection and guarded Step-return commit
+  implemented; production Verification/Sego resolver remains fail-closed
 - Date: 2026-08-23
 - Frozen inputs: C-02 Collaboration Contract, C-08 Persistence/Recovery Contract, Feature ADR A
 - Scope: durable Run/Step/Attempt authority through `dispatch_pending`, plus fail-closed unknown-outcome recovery
@@ -68,7 +68,7 @@ The dispatch envelope is assembled by the Authority from committed Run/Step/Atte
 
 ## G4-03 implemented mutation subset
 
-G4-03 implements `CreateRun`, `ActivateRun`, `CreateAttempt`, `AcquireAttemptLease`, `RecordDispatchIntent` and `MarkAttemptOutcomeUnknown`. Later delivery, ACK, lifecycle, cancellation, reconciliation, checkpoint and return mutations remain fail closed until their owning work packages provide C-03/C-04 evidence. This keeps G4-03 from pretending that the adapter path already exists.
+G4-03 implements `CreateRun`, `ActivateRun`, `CreateAttempt`, `AcquireAttemptLease`, `RecordDispatchIntent`, `MarkAttemptOutcomeUnknown`, the provider-neutral Harness fact path, technical `RecordAttemptReturn`, and the guarded `CommitStepReturn` state transition. `RecordAttemptReturn` persists Run/Step/Attempt together and leaves the workflow in `ReturnPending`; `CommitStepReturn` requires a resolver to prove an accepted Verification result and otherwise fails closed. Production composition must still provide the Verification Authority/Sego resolver before this final transition is enabled.
 
 ## Exit tests
 
@@ -77,6 +77,8 @@ G4-03 implements `CreateRun`, `ActivateRun`, `CreateAttempt`, `AcquireAttemptLea
 - Authority-clock lease acquisition and stale/expired fence rejection;
 - dispatch intent committed before a provider-neutral envelope becomes pollable;
 - duplicate dispatch intent replay with zero additional state/event/outbox writes;
+- technical return persists Run/Step/Attempt together and survives owner read-back;
+- Step return commit rejects missing Verification proof and replays only after a governed proof is accepted;
 - process abort after dispatch commit/before delivery, followed by pending outbox recovery;
 - lease-expired ambiguous execution to `outcome_unknown`/held with no retry message;
 - encrypted close/reopen integrity and dependency boundary checks.
