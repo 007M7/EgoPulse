@@ -92,10 +92,21 @@ not occur at technical intake.
 The shared CLI/TUI kernel now exposes the projected `ReturnPending`/`Returned`
 counts. The real Windows C5 fixture proves that a daemon-backed TaskView with
 `RUN_STATUS_RETURN_PENDING` is visible consistently through both processes.
-The production runner now also invokes the Verification-gated Step return internally;
-the local durable G4-03 suite proves the Collaboration write contract, while a
-real daemon + Harness execution with a committed Verification artifact remains
-the final integration evidence still to be added.
+The production runner now also invokes the Verification-gated Step return internally.
+The local durable G4-03 suite proves the Collaboration write contract and the
+`TaskActivationGuardSet` Verification delegation, while the C5 daemon fixture
+proves the real Windows daemon/read path. A real daemon + Harness execution with
+a committed Verification artifact remains the final integration evidence still
+to be added.
+
+The latest local evidence is:
+
+```text
+egopulse-agentosd library tests                 44 passed
+collaboration_control_g4_03                    21 passed
+c5_00_daemon_fixture                             7 passed
+cargo clippy --workspace --all-targets -D warnings passed
+```
 
 Continue the next side without widening collector authority:
 
