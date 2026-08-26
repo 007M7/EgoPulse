@@ -74,4 +74,6 @@ The multi-unit builder reuses the existing exact profile validation and
 provider-neutral runner contracts. The local test matrix now includes two
 admitted test profiles sharing one `TaskActivationSource`, each with isolated
 Collaboration/Adapter stores, and a duplicate-store-path rejection before edge
-opening. Provider admission remains a separate gate.
+opening. One child uses the real `DshAcpDriver` type without starting a DSH
+process; this verifies heterogeneous type erasure only. Provider admission
+remains a separate gate.

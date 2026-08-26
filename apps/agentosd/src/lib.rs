@@ -1842,15 +1842,16 @@ mod tests {
         }
     }
 
-    fn multi_native_profile(
+    fn multi_native_profile_with_protocol(
         config: &NativeHarnessCompositionConfig,
+        protocol_name: &str,
     ) -> NativeHarnessCompositionProfile {
         NativeHarnessCompositionProfile {
             adapter_id: config.workflow.harness_adapter_principal_id.clone(),
             capability_profile_id: config.workflow.capability_profile_ref.contract_id.clone(),
             capability_profile_ref: config.workflow.capability_profile_ref.clone(),
             observed_protocol: NativeProtocolFingerprint {
-                protocol_name: "test-native".to_owned(),
+                protocol_name: protocol_name.to_owned(),
                 protocol_version: "v1".to_owned(),
                 schema_sha256: "schema".to_owned(),
                 adapter_version: "adapter-v1".to_owned(),
@@ -1858,6 +1859,12 @@ mod tests {
                 native_binary_sha256: None,
             },
         }
+    }
+
+    fn multi_native_profile(
+        config: &NativeHarnessCompositionConfig,
+    ) -> NativeHarnessCompositionProfile {
+        multi_native_profile_with_protocol(config, "test-native")
     }
 
     fn multi_native_authorities(
@@ -1936,11 +1943,17 @@ mod tests {
                         ))),
                     },
                     ProfiledNativeHarnessComposition {
-                        profile: multi_native_profile(&config_b),
+                        profile: multi_native_profile_with_protocol(
+                            &config_b,
+                            "agent-client-protocol",
+                        ),
                         config: config_b,
-                        driver: Box::new(CodexAppServerDriver::new(CodexAppServerConfig::new(
-                            PathBuf::from("codex"),
-                        ))),
+                        driver: Box::new(egopulse_dsh_adapter::DshAcpDriver::new(
+                            egopulse_dsh_adapter::DshAcpConfig::new(
+                                PathBuf::from("dsh"),
+                                PathBuf::from("workspace-dsh-candidate"),
+                            ),
+                        )),
                     },
                 ],
                 artifact,
