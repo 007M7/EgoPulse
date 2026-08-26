@@ -2,10 +2,10 @@
 
 ## Status
 
-Implemented as an internal cognition-runtime slice and opened by the
-production daemon composition root. This is not a new V-01 Proto contract,
-does not add public API methods and does not claim that the Python Worker is
-wired to the daemon.
+Implemented first as an internal cognition-runtime slice and opened by the
+production daemon composition root. The follow-on M-07 through M-10 decision
+now adds the separate read-only retrieval RPC and wires the supervised Python
+Worker to CLI/TUI; this document remains the Memory Authority ownership record.
 
 ## Governance boundary
 
@@ -69,11 +69,12 @@ The cost is native build/link complexity and key lifecycle responsibility;
 those remain explicit deployment concerns rather than being hidden in the
 Python Worker.
 
-## Not yet frozen
+## Superseded or still not frozen
 
-- the public Memory API and cross-language Protobuf messages;
+- the public Memory API and cross-language Protobuf messages (superseded by
+  `phase-2-11-memory-retrieval-daemon-contract-decision.md` and draft.16);
 - embedding model, vector index, reranker or LangChain/LangGraph dependency;
-- Memory commands and read projections for CLI/TUI;
+- Memory write commands and authoritative content projections for CLI/TUI;
 - compaction, retention and user-facing export/import policy.
 
 Each item requires its own contract/evaluation record rather than being

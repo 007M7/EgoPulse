@@ -6,35 +6,33 @@ The repository starts from the frozen architecture and technology baseline. It d
 
 ## Foundation status
 
-Current maturity: **Gate 4 vertical implementation in progress – V-01/C5 CLI+TUI closed, typed production bootstrap wired, Sego single-criterion verification closed, Memory/RAG M-01–M-06 contract implemented**.
+Current maturity: **Gate 4 vertical implementation in progress — V-01/C5 CLI+TUI closed, typed production bootstrap wired, Sego single-criterion verification closed, Memory/RAG M-01–M-10 locally verified**.
 
 Available now:
 
 - Rust workspace for deterministic authorities, collaboration control, daemon, CLI and TUI;
 - V-01 governed single-Harness control path: Task activation → Collaboration commit → Adapter dispatch → activation acknowledgement;
 - Codex App Server adapter with durable Adapter Edge and an explicit `CodexHarnessCompositionConfig` composition root;
-- C5 real Windows local-IPC E2E coverage for daemon, CLI and TUI (serial fixture run: 6/6 passed);
+- C5 real Windows local-IPC E2E coverage for daemon, CLI and TUI;
 - user-owned production bootstrap JSON with environment-resolved secret keys and fail-closed validation;
 - Tauri 2 + React + TypeScript desktop shell;
 - TypeScript packages for generated clients, Agent SDK and the bounded native Harness;
-- isolated CPython 3.14 Worker project managed by uv;
-- internal Rust Memory Authority with SQLCipher persistence, candidate-only
-  agent writes, Founder promotion/revocation and accepted retrieval snapshots;
-- explicit Sego/checker verification composition with owner-backed Artifact
-  reads, supervised execution, immutable verification artifacts and Task
-  write-back; the real G4-10 handoff/replay fixture passes;
+- isolated CPython 3.14 Worker projects managed by uv;
+- internal Rust Memory Authority with SQLCipher persistence, candidate-only agent writes, Founder promotion/revocation and accepted retrieval snapshots;
+- governed `LocalCognitionService/RetrieveMemory` exposed consistently through CLI and TUI, with daemon-owned scope authorization, supervised Python retrieval, typed failure semantics and reference-only output;
+- explicit Sego/checker verification composition with owner-backed Artifact reads, supervised execution, immutable verification artifacts and Task write-back;
 - Protobuf/Buf and JSON Schema contract roots;
-- local CI, repository-boundary checks and commit-bound release-candidate packaging.
+- local CI, repository-boundary checks and commit-bound unsigned Windows early-access packaging for the CLI/TUI shared kernel;
 - account-authenticated Windows Named Pipe / Unix Domain Socket transport and an ephemeral, policy-resolved local session service.
+
+For the current Windows x64 package path, see [Windows early access](WINDOWS-EARLY-ACCESS.md).
 
 Not implemented yet:
 
-- public Memory/RAG API and the daemon-facing command surface (the frozen
-  Rust/Python Worker contract, generated bindings and supervised adapter are
-  implemented, but are not yet wired to the public daemon workflow);
-- SQLCipher-backed Memory/RAG indexes and retrieval evaluation;
+- Desktop product surface and Tauri distribution (the desktop shell exists, but phase one ships CLI/TUI capabilities first);
+- semantic/vector retrieval, reranking and large-corpus evaluation; the first release deliberately ships the deterministic lexical Worker baseline;
 - authenticated second Harness lifecycle and multi-model production dispatch;
-- production packaging or release.
+- signed production release and SmartScreen reputation.
 
 ## Repository map
 
@@ -48,16 +46,16 @@ crates/
   domain-contracts/  domain-facing Rust types only
   cognition-runtime/ authority boundary skeletons
   local-ide-control/ deterministic collaboration control skeletons
-  local-api/          local API client/server gateway boundary
+  local-api/         local API client/server gateway boundary
   local-ipc-platform/ OS peer identity and owner-only local transport
-  process-supervision/process and Attempt supervision primitives
+  process-supervision/ process and Attempt supervision primitives
 packages/
   generated-client/  generated TypeScript contract target
-  agent-sdk/          AgentOS-native SDK boundary
-  native-harness/     bounded Layer 4 LangGraph.js Harness
+  agent-sdk/         AgentOS-native SDK boundary
+  native-harness/    bounded Layer 4 LangGraph.js Harness
 workers/
-  foundation-probe/  isolated Python Worker pattern
-  memory-rag/        read-only deterministic retrieval candidate
+  foundation-probe/ isolated Python Worker pattern
+  memory-rag/        supervised read-only deterministic retrieval Worker
 contracts/
   proto/             internal Protobuf source
   json-schema/       Artifact and tool schemas
@@ -85,8 +83,4 @@ uv sync --project workers/foundation-probe --frozen
 uv run --project workers/foundation-probe --frozen pytest workers/foundation-probe --rootdir workers/foundation-probe
 ```
 
-For the current delivery controls, install the tracked fast pre-push hook with
-`scripts/install-git-hooks.ps1`. Pull requests and release tags use the
-GitHub Actions CI/CD workflow; use `pnpm run ci:local` or `pnpm run cd:local`
-only for offline reproduction. See [Local CI/CD](docs/engineering/local-ci-cd.md),
-[Foundation Gate](docs/foundation-gate.md) and [Architecture](ARCHITECTURE.md).
+For the current delivery controls, install the tracked fast pre-push hook with `scripts/install-git-hooks.ps1`. Pull requests and release tags use the GitHub Actions CI/CD workflow; use `pnpm run ci:local` or `pnpm run cd:local` only for offline reproduction. See [Local CI/CD](docs/engineering/local-ci-cd.md), [Foundation Gate](docs/foundation-gate.md) and [Architecture](ARCHITECTURE.md).

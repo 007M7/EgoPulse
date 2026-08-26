@@ -3,10 +3,11 @@
 ## Status
 
 Founder-approved implementation package. M-01 through M-06 and the initial
-limits are frozen in `egopulse.memory.v1` draft.15; generated Rust, Python and
-TypeScript bindings, the supervised Python adapter and Rust boundary validation
-are implemented. The document remains the decision record for the boundary;
-the public daemon workflow is still a later slice.
+limits were frozen in `egopulse.memory.v1` draft.15. The generated Rust,
+Python and TypeScript bindings, supervised Python adapter and Rust boundary
+validation are implemented. M-07 through M-10 subsequently froze the daemon
+retrieval boundary and shared CLI/TUI delivery; their implementation record is
+`phase-2-11-memory-retrieval-daemon-contract-decision.md`.
 
 The implementation boundary is intentionally narrow: Rust owns accepted
 Memory state and snapshot identity; the Python Worker performs bounded
@@ -81,10 +82,11 @@ be added only after those operations have their own approved contract.
 
 Founder approval recorded on 2026-08-26: M-01 through M-06 and the initial
 limits above are accepted and frozen. The implementation authority reference
-is `conversation:2026-08-26:founder-memory-rag-m01-m06-freeze`. This authorizes
-generation, commit and push of Rust, Python and TypeScript bindings. It does
-not authorize embedding/index selection, a Python write path, or public
-daemon/API wiring without a separate contract decision.
+is `conversation:2026-08-26:founder-memory-rag-m01-m06-freeze`. This authorized
+generation, commit and push of Rust, Python and TypeScript bindings. It did not
+authorize embedding/index selection, a Python write path, or public daemon/API
+wiring without a separate contract decision. That separate decision is now
+recorded and implemented in phase 2-11.
 
 Related proposal: `phase-2-06-memory-rag-cross-language-contract-proposal.md`.
 Next decision package:

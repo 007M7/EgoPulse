@@ -11,12 +11,15 @@ The production bootstrap schema is `egopulse.production-bootstrap/v2`.
 }
 ```
 
-The memory database has a separate key and store epoch from Task, Artifact,
+The Memory database has a separate key and store epoch from Task, Artifact,
 Policy, Verdict, Adapter and Collaboration. Reusing another Authority's key
 or database path is not an accepted configuration. The daemon opens the
-Memory Authority once during the production composition build and keeps the
+Memory Authority once during production composition and keeps the
 single-writer handle alive for the daemon lifetime.
 
-This configuration only enables the Rust Authority lifecycle. It does not
-expose a Memory API, enable Python retrieval, or grant any client direct
-database access.
+The retrieval boundary is `LocalCognitionService/RetrieveMemory`. The daemon
+authorizes the principal and scope, supervises the Python Worker, validates
+the typed response, and returns references plus bounded snippets. The Worker
+does not receive a database handle or an Authority key. It reads the request
+payload supplied by the daemon and cannot promote, revoke, or directly write
+accepted memory.

@@ -44,6 +44,24 @@ function Get-Sha256Hex {
     }
 }
 
+function Copy-PublicTree {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceRoot,
+        [Parameter(Mandatory = $true)][string]$DestinationRoot
+    )
+
+    $resolvedSource = (Resolve-Path -LiteralPath $SourceRoot).Path
+    New-Item -ItemType Directory -Force -Path $DestinationRoot | Out-Null
+    Get-ChildItem -LiteralPath $resolvedSource -Recurse -File |
+        Where-Object { $_.FullName -notmatch '\\.venv\\|\\__pycache__\\|\\.pytest_cache\\' } |
+        ForEach-Object {
+            $relative = $_.FullName.Substring($resolvedSource.Length + 1)
+            $destination = Join-Path $DestinationRoot $relative
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+            Copy-Item -LiteralPath $_.FullName -Destination $destination
+        }
+}
+
 $cargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
 $cargo = if ($cargoCommand) { $cargoCommand.Path } else { $null }
 if (-not $cargo) {
@@ -128,6 +146,7 @@ foreach ($binary in $binaries) {
 }
 
 Copy-Item -LiteralPath 'README.md', 'SECURITY.md' -Destination $candidateRoot
+Copy-Item -LiteralPath 'WINDOWS-EARLY-ACCESS.md', 'setup-memory-worker.ps1' -Destination $candidateRoot
 $configRoot = Join-Path $candidateRoot 'config'
 New-Item -ItemType Directory -Force -Path $configRoot | Out-Null
 Copy-Item -LiteralPath @(
@@ -140,6 +159,16 @@ Copy-Item -LiteralPath @(
 Copy-Item -LiteralPath 'Cargo.lock', 'pnpm-lock.yaml' -Destination $manifestRoot
 Copy-Item -LiteralPath 'workers/foundation-probe/uv.lock' -Destination (Join-Path $manifestRoot 'foundation-probe.uv.lock')
 Copy-Item -LiteralPath 'workers/contract-bindings/uv.lock' -Destination (Join-Path $manifestRoot 'contract-bindings.uv.lock')
+
+# Memory retrieval is part of the first CLI/TUI release. Ship the locked,
+# read-only Worker source and generated Python contract consumer beside the
+# binaries; the end user's CPython/uv installation creates the isolated .venv.
+foreach ($workerName in @('memory-rag', 'contract-bindings')) {
+    $workerRoot = Join-Path $candidateRoot "workers/$workerName"
+    New-Item -ItemType Directory -Force -Path $workerRoot | Out-Null
+    Copy-Item -LiteralPath "workers/$workerName/pyproject.toml", "workers/$workerName/uv.lock" -Destination $workerRoot
+    Copy-PublicTree -SourceRoot "workers/$workerName/src" -DestinationRoot (Join-Path $workerRoot 'src')
+}
 if ($resolvedEvidencePath) {
     Copy-Item -LiteralPath $resolvedEvidencePath -Destination (Join-Path $manifestRoot 'local-ci-evidence.json')
 }
@@ -156,6 +185,8 @@ $metadata = [ordered]@{
     ci_provider = $CiProvider
     ci_run = $CiRun
     ci_evidence = if ($resolvedEvidencePath) { 'manifests/local-ci-evidence.json' } else { 'external-workflow' }
+    memory_worker = 'packaged-source-locked-python'
+    python_runtime = 'external-cpython-3.14-and-uv'
 }
 $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $candidateRoot 'BUILD-METADATA.json') -Encoding utf8
 
