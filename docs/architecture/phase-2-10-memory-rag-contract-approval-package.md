@@ -87,3 +87,5 @@ not authorize embedding/index selection, a Python write path, or public
 daemon/API wiring without a separate contract decision.
 
 Related proposal: `phase-2-06-memory-rag-cross-language-contract-proposal.md`.
+Next decision package:
+`phase-2-11-memory-retrieval-daemon-contract-decision.md`.
