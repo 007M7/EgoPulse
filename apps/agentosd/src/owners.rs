@@ -993,6 +993,46 @@ mod tests {
         assert_eq!(recovered_pending.len(), 1);
         assert_eq!(recovered_pending[0].message_id, message_id);
         assert_eq!(recovered_pending[0].payload_digest_sha256, payload_digest);
+
+        let competing_task = TaskAuthority::open_with_transition_guard(
+            TaskAuthorityConfig {
+                database_path: root.join("task.db"),
+                store_epoch: "c4-task-source".to_owned(),
+                key: SqlCipherKey::new([1; 32]),
+            },
+            AllowCreation,
+            AllowTransition,
+        )
+        .expect("open competing task owner");
+        let competing_policy = PolicyDecisionAuthority::open(
+            PolicyAuthorityConfig {
+                database_path: root.join("policy.db"),
+                store_epoch: "c4-policy-source".to_owned(),
+                key: PolicySqlCipherKey::new([2; 32]),
+            },
+            DenyPolicy,
+        )
+        .expect("open competing policy owner");
+        let competing_verdict = FounderVerdictAuthority::open(
+            VerdictAuthorityConfig {
+                database_path: root.join("verdict.db"),
+                store_epoch: "c4-verdict-source".to_owned(),
+                key: VerdictSqlCipherKey::new([3; 32]),
+            },
+            DenyVerdict,
+        )
+        .expect("open competing verdict owner");
+        let competing_ports = AuthorityCommandPorts::new(
+            competing_task,
+            competing_policy,
+            competing_verdict,
+            Arc::new(StaticPrincipalResolver),
+        );
+        let competing_pending = TaskActivationSource::pending_task_activations(&competing_ports)
+            .expect("read source through competing port");
+        assert_eq!(competing_pending.len(), 1);
+        assert_eq!(competing_pending[0].message_id, message_id);
+        assert_eq!(competing_pending[0].payload_digest_sha256, payload_digest);
         assert!(
             TaskActivationSource::acknowledge_task_activation(
                 &recovered_ports,
@@ -1003,18 +1043,24 @@ mod tests {
         );
         assert!(
             !TaskActivationSource::acknowledge_task_activation(
-                &recovered_ports,
+                &competing_ports,
                 &message_id,
                 &payload_digest,
             )
-            .expect("repeat source ACK is idempotently rejected")
+            .expect("competing source ACK is rejected after first consumer")
         );
         assert!(
             TaskActivationSource::pending_task_activations(&recovered_ports)
                 .expect("read source after ACK")
                 .is_empty()
         );
+        assert!(
+            TaskActivationSource::pending_task_activations(&competing_ports)
+                .expect("read competing source after ACK")
+                .is_empty()
+        );
 
+        drop(competing_ports);
         drop(recovered_ports);
         let _ = fs::remove_dir_all(root);
     }

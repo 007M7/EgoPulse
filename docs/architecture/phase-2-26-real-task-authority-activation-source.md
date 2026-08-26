@@ -57,11 +57,15 @@ surface or Harness adapter.
 4. Drop the composed ports before acknowledgement, reopen the encrypted
    TaskAuthority and compose fresh ports.
 5. Read the same message ID and digest again.
-6. Acknowledge it once, reject the repeated acknowledgement, and verify the
-   source is empty.
+6. Open a second independent Authority/port handle and verify it sees the same
+   pending message before the first handle confirms it.
+7. Acknowledge it through the first handle; the second handle's matching ACK is
+   rejected by the storage compare-and-ack, and both readers then observe an
+   empty source.
 
 This proves durable replay after a consumer interruption, exact digest binding
-and the actual owner-to-source composition boundary. The test runs with the
+single-consumer settlement and the actual owner-to-source composition boundary.
+The test runs with the
 real TaskAuthority transition commit and real SQLCipher-backed store; only the
 policy/verdict authorities are deny fixtures because this slice concerns Task
 activation source ownership.
