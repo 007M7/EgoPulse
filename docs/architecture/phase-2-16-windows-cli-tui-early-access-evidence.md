@@ -1,7 +1,7 @@
 # Phase 2-16 Windows CLI/TUI early-access evidence
 
-- Status: `candidate_built_and_smoke_verified`
-- Date: 2026-08-26
+- Status: `candidate_built_and_package_verified`
+- Date: 2026-08-27
 - Scope: Windows x64, CLI + TUI first release surface
 - Desktop/Tauri: not included in this phase
 - Signing: unsigned; SmartScreen unknown-publisher risk remains accepted for
@@ -9,7 +9,7 @@
 
 ## Build evidence
 
-The candidate was built from clean commit `b489cf7a29cb67f929f6a11e883b5c6a08b36494`,
+The candidate was built from clean commit `6a6e764d9faa8bb09cfcd6d9e3445c370781dfdf`,
 which is pushed to the EgoPulse remote branch. The authoritative local CI
 completed all eight steps with `status=passed` and
 `worktree_dirty_at_start=false`:
@@ -28,8 +28,8 @@ The package command reused the clean local-CI evidence and produced:
 ```text
 classification=unsigned-release-candidate
 platform=windows-x86_64
-archive=egopulse-0.1.0-b489cf7a29cb-windows-x86_64-20260826T100139Z.zip
-archive_sha256=e8d1286356d982e54b35248311f87b95dcfbd851671068559efbd0b386c4163f
+archive=egopulse-0.1.0-6a6e764d9faa-windows-x86_64-20260826T175654Z.zip
+archive_sha256=df6856594ea97b99158bfb632813f489ad5614b0330649b7d219204ae3f21b08
 ```
 
 The local candidate directory is under `.artifacts/release-candidate/` and is
@@ -44,13 +44,16 @@ an uploaded public release asset.
 - `SHA256SUMS` contains hashes for all executables, configs, locks, generated
   bindings and Worker sources.
 - `setup-memory-worker.ps1` created the package-local Python 3.14 environment
-  with the frozen production dependency set.
+  with the frozen production dependency set; the package-local executable was
+  verified at `workers/memory-rag/.venv/Scripts/python.exe`.
 - The packaged retrieval module imported successfully.
 - `fastembed` was absent from the package-local production environment. The
   FastEmbed model experiments therefore remain evaluation-only and do not
   silently increase the first-release install size or memory footprint.
 - `egopulse.exe --help`, `egopulse-tui.exe --help` and `agentosd.exe --help`
   all exited successfully.
+- The verifier checked all 52 entries in `SHA256SUMS`, including the packaged
+  binaries, configuration, locks, generated bindings and Worker sources.
 - The archive SHA-256 matched the build output exactly.
 
 The checks are now repeatable with the repository verifier (the previous run
