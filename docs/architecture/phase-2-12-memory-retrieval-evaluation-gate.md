@@ -1,6 +1,6 @@
 # Phase 2-12 Memory retrieval evaluation gate
 
-- Status: `experiment_gate_implemented_baseline_recorded`
+- Status: `experiment_gate_implemented_candidate_measured_not_admitted`
 - Date: 2026-08-26
 - Production impact: none; `lexical-overlap-v0` remains the only admitted profile
 - Predecessors: M-01 through M-10
@@ -99,6 +99,49 @@ Dataset:
 This is a smoke baseline, not a product-quality corpus claim. It proves the
 known semantic recall gap and validates the evaluator mechanics. It cannot
 rank embedding models or justify production admission by itself.
+
+## First embedding candidate evidence
+
+The first locally reproducible candidate run used the already declared
+evaluation-only FastEmbed group and local model cache:
+
+```powershell
+$env:PYTHONPATH = "workers/memory-rag/src;workers/contract-bindings/src"
+& ".\workers\memory-rag\.venv\Scripts\python.exe" `
+  -m egopulse_memory_rag.model_evaluation `
+  --dataset workers/memory-rag/evaluation/baseline-v0.json `
+  --model paraphrase-multilingual-minilm-v0 `
+  --cache-dir .cache/fastembed --threads 2 --k 2 --local-files-only
+```
+
+Candidate identity:
+
+- model: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+- provider/runtime: `fastembed==0.8.0;onnxruntime==1.29.0`
+- dimensions: `384`
+- ONNX artifact SHA-256: `634d0f66c29dc934c8fa72b8a4fe91dd4d420a22f1d82a241058d4316e659a99`
+- license: Apache-2.0
+- snapshot artifact size: `252,138,706` bytes
+
+On the same two-case smoke dataset, the candidate produced:
+
+| Profile | Recall@2 | MRR | nDCG@2 |
+|---|---:|---:|---:|
+| exact-cosine-v0 | 1.0 | 0.75 | 0.81546487 |
+| RRF lexical + semantic | 1.0 | 0.75 | 0.81546487 |
+
+The semantic paraphrase case moved from lexical Recall@2 `0.0` to `1.0`.
+The run took approximately `2.21 s` for model initialization/digest and
+`0.35 s` for semantic evaluation, with approximately `620 MiB` working-set
+memory on Windows x64. These are engineering measurements for this machine,
+not product-wide performance guarantees.
+
+This result is deliberately not a production admission: the dataset has only
+two synthetic cases, and the RRF result did not improve over exact semantic
+retrieval on this fixture. The candidate remains replaceable, does not persist
+vectors, and cannot write Memory facts. Promotion requires the representative
+Chinese/English corpus, hard negatives, packaging decision and an explicit
+Founder admission of a new algorithm profile.
 
 ## Candidate admission sequence
 
