@@ -5,7 +5,8 @@ use super::{
     TaskActivationGuardSet, TaskActivationReferenceHandle, TaskActivationSource,
 };
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    DeliveryDisposition, DispatchEnvelope, HarnessObservation, dispatch_result,
+    DeliveryDisposition, DispatchEnvelope, HarnessObservation, ObservationCriticality,
+    dispatch_result,
 };
 use egopulse_harness_adapter::{
     AdapterClock, DispatchMaterialResolver, GovernedAdapterError, GovernedHarnessAdapter,
@@ -24,9 +25,11 @@ pub struct HarnessDispatchCycleReport {
     pub observations_deferred: u64,
     pub observations_retained: u64,
     pub observations_quarantined: u64,
+    pub terminal_observations: u64,
     pub activations_seen: u64,
     pub activations_started: u64,
     pub activations_acknowledged: u64,
+    pub terminal_dispatch_ids: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -58,6 +61,7 @@ pub trait HarnessDispatchRunner: Send + Sync {
 struct GovernedDispatchRuntime<G, C, R, D, A> {
     control: CollaborationControl<G, C>,
     adapter: GovernedHarnessAdapter<R, D, A>,
+    active_envelopes: Vec<DispatchEnvelope>,
 }
 
 pub struct GovernedHarnessDispatchRunner<G, C, R, D, A> {
@@ -80,7 +84,11 @@ where
         principal: AuthenticatedCollaborationPrincipal,
     ) -> Self {
         Self {
-            runtime: tokio::sync::Mutex::new(GovernedDispatchRuntime { control, adapter }),
+            runtime: tokio::sync::Mutex::new(GovernedDispatchRuntime {
+                control,
+                adapter,
+                active_envelopes: Vec::new(),
+            }),
             principal,
         }
     }
@@ -105,8 +113,23 @@ where
     > {
         Box::pin(async move {
             let mut runtime = self.runtime.lock().await;
-            let GovernedDispatchRuntime { control, adapter } = &mut *runtime;
-            dispatch_pending(control, adapter, &self.principal).await
+            let GovernedDispatchRuntime {
+                control,
+                adapter,
+                active_envelopes,
+            } = &mut *runtime;
+            register_pending_envelopes(control, active_envelopes, &self.principal)?;
+            let mut report = dispatch_pending(control, adapter, &self.principal).await?;
+            remove_terminal_envelopes(active_envelopes, &report);
+            pump_active_envelopes(
+                control,
+                adapter,
+                active_envelopes,
+                &self.principal,
+                &mut report,
+            )
+            .await?;
+            Ok(report)
         })
     }
 }
@@ -118,6 +141,7 @@ struct GovernedTaskActivationRuntime<S, W, E, C, R, D, A> {
     resolver: W,
     reference: TaskActivationReferenceHandle,
     lease_ttl_seconds: u64,
+    active_envelopes: Vec<DispatchEnvelope>,
 }
 
 /// The production single-writer worker for the first vertical. It consumes
@@ -158,6 +182,7 @@ where
                 resolver,
                 reference,
                 lease_ttl_seconds,
+                active_envelopes: Vec::new(),
             }),
             principal,
         }
@@ -193,6 +218,7 @@ where
                 resolver,
                 reference,
                 lease_ttl_seconds,
+                active_envelopes,
             } = &mut *runtime;
             let activations = source
                 .pending_task_activations()
@@ -221,25 +247,23 @@ where
                 }
                 report.activations_started += 1;
                 report.activations_acknowledged += 1;
+                register_pending_envelopes(control, active_envelopes, &self.principal)?;
                 let dispatched = dispatch_pending(control, adapter, &self.principal).await?;
-                report.dispatches_seen += dispatched.dispatches_seen;
-                report.dispatches_delivered += dispatched.dispatches_delivered;
-                report.dispatches_rejected += dispatched.dispatches_rejected;
-                report.observations_seen += dispatched.observations_seen;
-                report.observations_consumed += dispatched.observations_consumed;
-                report.observations_deferred += dispatched.observations_deferred;
-                report.observations_retained += dispatched.observations_retained;
-                report.observations_quarantined += dispatched.observations_quarantined;
+                merge_report(&mut report, dispatched);
+                remove_terminal_envelopes(active_envelopes, &report);
             }
+            register_pending_envelopes(control, active_envelopes, &self.principal)?;
             let dispatched = dispatch_pending(control, adapter, &self.principal).await?;
-            report.dispatches_seen += dispatched.dispatches_seen;
-            report.dispatches_delivered += dispatched.dispatches_delivered;
-            report.dispatches_rejected += dispatched.dispatches_rejected;
-            report.observations_seen += dispatched.observations_seen;
-            report.observations_consumed += dispatched.observations_consumed;
-            report.observations_deferred += dispatched.observations_deferred;
-            report.observations_retained += dispatched.observations_retained;
-            report.observations_quarantined += dispatched.observations_quarantined;
+            merge_report(&mut report, dispatched);
+            remove_terminal_envelopes(active_envelopes, &report);
+            pump_active_envelopes(
+                control,
+                adapter,
+                active_envelopes,
+                &self.principal,
+                &mut report,
+            )
+            .await?;
             Ok(report)
         })
     }
@@ -322,6 +346,88 @@ where
     Ok(report)
 }
 
+fn register_pending_envelopes<G, C>(
+    control: &CollaborationControl<G, C>,
+    active_envelopes: &mut Vec<DispatchEnvelope>,
+    principal: &AuthenticatedCollaborationPrincipal,
+) -> Result<(), CollaborationControlError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+{
+    for pending in control.pending_dispatches(principal)? {
+        if !active_envelopes
+            .iter()
+            .any(|item| item.dispatch_id == pending.envelope.dispatch_id)
+        {
+            active_envelopes.push(pending.envelope);
+        }
+    }
+    Ok(())
+}
+
+async fn pump_active_envelopes<G, C, R, D, A>(
+    control: &mut CollaborationControl<G, C>,
+    adapter: &mut GovernedHarnessAdapter<R, D, A>,
+    active_envelopes: &mut Vec<DispatchEnvelope>,
+    principal: &AuthenticatedCollaborationPrincipal,
+    report: &mut HarnessDispatchCycleReport,
+) -> Result<(), HarnessDispatchCycleError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+    R: DispatchMaterialResolver,
+    D: NativeHarnessDriver,
+    A: AdapterClock,
+{
+    let envelopes = std::mem::take(active_envelopes);
+    for envelope in envelopes {
+        let pumped = pump_observations(control, adapter, &envelope, principal).await?;
+        merge_report(report, pumped);
+        if !report
+            .terminal_dispatch_ids
+            .iter()
+            .any(|dispatch_id| dispatch_id == &envelope.dispatch_id)
+        {
+            active_envelopes.push(envelope);
+        }
+    }
+    Ok(())
+}
+
+fn merge_report(target: &mut HarnessDispatchCycleReport, source: HarnessDispatchCycleReport) {
+    target.dispatches_seen += source.dispatches_seen;
+    target.dispatches_delivered += source.dispatches_delivered;
+    target.dispatches_rejected += source.dispatches_rejected;
+    target.observations_seen += source.observations_seen;
+    target.observations_consumed += source.observations_consumed;
+    target.observations_deferred += source.observations_deferred;
+    target.observations_retained += source.observations_retained;
+    target.observations_quarantined += source.observations_quarantined;
+    target.terminal_observations += source.terminal_observations;
+    for dispatch_id in source.terminal_dispatch_ids {
+        if !target
+            .terminal_dispatch_ids
+            .iter()
+            .any(|existing| existing == &dispatch_id)
+        {
+            target.terminal_dispatch_ids.push(dispatch_id);
+        }
+    }
+}
+
+fn remove_terminal_envelopes(
+    active_envelopes: &mut Vec<DispatchEnvelope>,
+    report: &HarnessDispatchCycleReport,
+) {
+    active_envelopes.retain(|envelope| {
+        !report
+            .terminal_dispatch_ids
+            .iter()
+            .any(|dispatch_id| dispatch_id == &envelope.dispatch_id)
+    });
+}
+
 fn record_ingestion<R, D, A>(
     report: &mut HarnessDispatchCycleReport,
     adapter: &mut GovernedHarnessAdapter<R, D, A>,
@@ -335,6 +441,20 @@ where
 {
     if observation.is_none() {
         return Ok(());
+    }
+    if observation.is_some_and(|value| value.criticality == ObservationCriticality::Terminal as i32)
+    {
+        report.terminal_observations += 1;
+        if let Some(observation) = observation
+            && !report
+                .terminal_dispatch_ids
+                .iter()
+                .any(|dispatch_id| dispatch_id == &observation.dispatch_id)
+        {
+            report
+                .terminal_dispatch_ids
+                .push(observation.dispatch_id.clone());
+        }
     }
     match result.disposition {
         HarnessFactIngestionDisposition::Consumed

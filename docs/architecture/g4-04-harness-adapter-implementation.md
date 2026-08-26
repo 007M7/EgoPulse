@@ -1,7 +1,7 @@
 # G4-04 Harness Adapter implementation profile
 
 - Status: production composition implemented; Gate 4 provider-boundary evidence pending
-- Date: 2026-08-23
+- Date: 2026-08-26
 - Frozen inputs: C-03 Harness Adapter Contract, D-01 first Harness decision, ADR 0003
 - First native Harness: Codex app-server v2
 
@@ -114,8 +114,9 @@ itself close G4-04:
   path, which is the remaining evidence needed for the complete production
   composition audit.
 
-The authenticated live adapter contract probe was run locally on Windows x64
-on 2026-08-26 with Codex CLI `0.148.0-alpha.15`:
+The authenticated live adapter contract probe was re-run locally on Windows x64
+on 2026-08-26 with Codex CLI `0.148.0-alpha.15` after correcting one adapter
+classification defect:
 
 ```powershell
 $env:EGOPULSE_CODEX_NATIVE_EXE =
@@ -126,17 +127,22 @@ cargo test -p egopulse-codex-adapter --test provider_neutral_contract live_codex
 The test passed and observed native session/turn lifecycle, accepted ACK,
 running and terminal observations, approval requests, control acknowledgements
 and cancellation/recovery-related lifecycle evidence. It used an isolated
-adapter edge and did not alter the repository. This closes the missing live
-Codex protocol evidence for the adapter runtime; it does not claim that the
-full user-owned production bootstrap and background runner have been exercised
-by the same test.
+adapter edge and did not alter the repository. The native
+`mcpServer/startupStatus/updated` status `cancelled` is now recorded as an
+informational diagnostic rather than a dispatch recovery signal; actual
+`failed` startup remains recovery-required. This closes the missing live Codex
+protocol evidence for the adapter runtime; it does not claim that the full
+user-owned production bootstrap and background runner have been exercised by
+the same test.
 
 The Codex driver now treats an unresolved native approval request as a clean
 observation-stream handoff: the dispatch worker returns control instead of
-blocking on a response that requires a separate `decide_approval` call. This
-is covered by `unresolved_approval_pauses_dispatch_observation_stream` and is
-an execution-safety fix, not approval authorization. The approval authority
-and the full production runner path remain outside this evidence.
+blocking on a response that requires a separate `decide_approval` call. The
+production runner now retains the active immutable dispatch envelope across
+cycles, continues pumping it after the approval authority responds, and
+releases it only after a terminal observation. This is an execution-lifecycle
+fix, not approval authorization. The approval authority and the full
+production runner path remain outside this evidence.
 
 Therefore G4-04 remains open for one specific reason: the implemented
 composition boundary still needs a real authenticated Codex lifecycle result

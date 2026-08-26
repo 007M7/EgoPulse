@@ -623,8 +623,8 @@ impl CodexAppServerDriver {
                     ),
                     "cancelled" => (
                         "CODEX_MCP_SERVER_STARTUP_CANCELLED",
-                        true,
-                        ObservationCriticality::Control,
+                        false,
+                        ObservationCriticality::Informational,
                     ),
                     _ => {
                         self.last_protocol_diagnostic =
@@ -1480,5 +1480,40 @@ mod tests {
                 .expect("approval pause must be a clean boundary")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cancelled_mcp_startup_is_not_a_dispatch_recovery_signal() {
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch-mcp-cancelled".to_owned(),
+            ..Default::default()
+        };
+        let notification = json!({
+            "method": "mcpServer/startupStatus/updated",
+            "params": { "status": "cancelled" }
+        });
+        let raw = serde_json::to_vec(&notification).expect("notification bytes");
+        let event = driver
+            .map_notification(
+                &envelope,
+                "mcpServer/startupStatus/updated",
+                notification,
+                raw,
+            )
+            .expect("map cancelled MCP startup")
+            .expect("cancelled MCP startup event");
+        assert_eq!(event.criticality, ObservationCriticality::Informational);
+        match event.payload {
+            harness_observation::Payload::Diagnostic(value) => {
+                assert_eq!(
+                    value.safe_diagnostic_code,
+                    "CODEX_MCP_SERVER_STARTUP_CANCELLED"
+                );
+                assert!(!value.recovery_required);
+                assert!(value.error_fingerprint.is_none());
+            }
+            _ => panic!("expected diagnostic payload"),
+        }
     }
 }
