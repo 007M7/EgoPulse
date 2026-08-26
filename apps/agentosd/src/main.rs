@@ -11,6 +11,7 @@ Usage: agentosd [OPTIONS]
 Options:
   -h, --help       Print this help message
   -V, --version    Print the daemon version
+      --check-config  Validate local configuration without opening stores
 
 The daemon accepts no positional arguments. Without an option it starts only
 when the local configuration and all required authority keys are valid.
@@ -36,6 +37,14 @@ async fn main() {
             }
             "-V" | "--version" => {
                 println!("{}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            "--check-config" => {
+                if let Err(error) = check_configuration() {
+                    eprintln!("agentosd configuration check refused: {error}");
+                    std::process::exit(78);
+                }
+                println!("agentosd configuration=passed stores_opened=false");
                 return;
             }
             _ => {}
@@ -88,4 +97,14 @@ async fn main() {
         eprintln!("agentosd stopped with error: {error}");
         std::process::exit(1);
     }
+}
+
+fn check_configuration() -> Result<(), String> {
+    DaemonConfig::from_environment()
+        .map_err(|error| error.to_string())
+        .and_then(|_| {
+            ProductionBootstrapConfig::from_environment()
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
 }

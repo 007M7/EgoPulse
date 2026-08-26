@@ -30,6 +30,16 @@ root, and keep its `PYTHONPATH` entries pointing at the packaged `src`
 directories. The daemon owns the retrieval scope allowlist; clients cannot
 broaden it.
 
+Before opening any Authority store, validate the assembled configuration:
+
+```powershell
+& .\bin\agentosd.exe --check-config
+```
+
+Success reports `stores_opened=false`. A failure exits with code `78` and
+reports the first missing or invalid configuration fact; no daemon or business
+database is started by this check.
+
 ## Start the local product
 
 ```powershell

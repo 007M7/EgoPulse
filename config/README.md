@@ -42,6 +42,12 @@ directory to the package root, and preserve the two packaged `src` paths in
 `PYTHONPATH`. The daemon, not the client or Worker, owns the principal-to-scope
 allowlist.
 
+Before starting the daemon, run `agentosd.exe --check-config`. This parses the
+daemon environment and the user-owned JSON but does not call the composition
+root, open Authority stores, create business databases or listen on IPC. A
+successful check prints `stores_opened=false`; an invalid check exits with
+code `78`.
+
 To enable candidate proposals from an admitted runtime, configure
 `memory_candidate_producers` with one entry per fixed route. Each entry binds
 `producer_id`, `principal_id`, `principal_kind` (`Agent`, `Model` or `Harness`)
