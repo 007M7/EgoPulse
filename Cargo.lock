@@ -1048,6 +1048,7 @@ dependencies = [
  "egopulse-codex-adapter",
  "egopulse-cognition-runtime",
  "egopulse-domain-contracts",
+ "egopulse-dsh-adapter",
  "egopulse-founder-verdict-authority",
  "egopulse-harness-adapter",
  "egopulse-local-api",

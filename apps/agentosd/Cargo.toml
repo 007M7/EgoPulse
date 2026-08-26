@@ -34,6 +34,9 @@ tower.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+egopulse-dsh-adapter.workspace = true
+
 [[bin]]
 name = "agentosd"
 path = "src/main.rs"

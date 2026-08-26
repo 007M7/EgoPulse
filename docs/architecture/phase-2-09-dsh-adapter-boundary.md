@@ -96,3 +96,10 @@ asserts that the native reconciliation result is exactly `OutcomeUnknown`; it
 cannot be interpreted as a recovered terminal result or as permission to
 automatically redispatch. This makes the unsupported-native-recovery boundary
 executable and reviewable while keeping DSH candidate-only.
+
+The follow-up integration evidence is recorded in
+`phase-2-22-dsh-governed-return-settlement.md`: the real DSH replay output now
+passes through `GovernedHarnessAdapter`, Adapter Edge and the governed return
+collector to create the technical Artifact/Claim/Evidence/Return Handoff
+receipt. This closes the candidate return-settlement path only; native
+restart recovery remains unsupported and DSH remains candidate-only.
