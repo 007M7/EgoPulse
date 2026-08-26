@@ -337,6 +337,24 @@ impl HarnessEvidenceResolver for FixtureGuard {
     }
 }
 
+#[test]
+fn task_activation_guard_set_delegates_verification_step_evidence() {
+    let (guard, _reference) = TaskActivationGuardSet::new(FixtureGuard);
+    let command = CommitStepReturnCommand {
+        artifact_set_id: "artifact-set-001".to_owned(),
+        return_handoff_id: "return-handoff-001".to_owned(),
+        ..CommitStepReturnCommand::default()
+    };
+
+    let resolved = guard
+        .resolve_step_return(&command, &CollaborationSnapshot::default())
+        .expect("Verification evidence must cross the activation guard boundary");
+    assert_eq!(
+        resolved.verification_artifact_id,
+        "verification-artifact-001"
+    );
+}
+
 struct AdapterBackedFixtureGuard {
     edge: AdapterEdge,
     input_bundle_sha256: String,
