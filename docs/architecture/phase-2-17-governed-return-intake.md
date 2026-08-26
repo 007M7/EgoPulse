@@ -123,6 +123,14 @@ return_settlement_g4_11                          1 passed
 cargo clippy --workspace --all-targets -D warnings passed
 ```
 
+The installed real Codex app-server was also probed on Windows x64 through
+`codex.exe app-server --stdio`. It returned successful `initialize`,
+`thread/start`, and `thread/started` messages with native version
+`0.148.0-alpha.15`, matching the adapter's frozen executable baseline. This is
+protocol-entry evidence only: no model `turn/start` was issued by the probe, so
+it does not claim a real model output, Artifact collection, Verification retry,
+or Returned settlement.
+
 Continue the next side without widening collector authority:
 
 1. drive the Verification worker from this Collaboration return boundary using
