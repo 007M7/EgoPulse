@@ -44,6 +44,19 @@ building the test binary, but the process exited successfully and the test
 result was unaffected. These are diagnostic-symbol warnings, not a runtime
 or contract failure.
 
+The application-level recovery-hold fixture also passed:
+
+```text
+cargo test -p egopulse-agentosd --test dsh_recovery_hold -- --test-threads=1 --nocapture
+test dsh_unknown_recovery_is_durable_and_never_auto_redispatched ... ok
+test result: ok. 1 passed; 0 failed
+```
+
+It starts no DSH process. It seeds an Adapter Edge delivery-unknown state,
+invokes the real DSH driver's explicit unsupported-recovery finding, reopens
+the Edge through a fresh governed adapter, and verifies that the same
+`OutcomeUnknown` evidence is replayed. No second dispatch is created.
+
 ## Admission boundary remains open
 
 This re-run does not provide any of the following missing evidence:
