@@ -1792,13 +1792,46 @@ fn local_error_message(
 async fn run_once(mut app: App) -> Result<(), String> {
     app.refresh().await;
     if let Some(snapshot) = app.snapshot {
+        let return_pending_steps = snapshot
+            .tasks
+            .iter()
+            .filter_map(|view| view.collaboration.as_ref())
+            .flat_map(|collaboration| collaboration.steps.iter())
+            .filter(|step| {
+                step.status
+                    == egopulse_domain_contracts::v01::egopulse::collaboration::v1::StepStatus::ReturnPending
+                        as i32
+            })
+            .count();
+        let returned_steps = snapshot
+            .tasks
+            .iter()
+            .filter_map(|view| view.collaboration.as_ref())
+            .flat_map(|collaboration| collaboration.steps.iter())
+            .filter(|step| {
+                step.status
+                    == egopulse_domain_contracts::v01::egopulse::collaboration::v1::StepStatus::Returned
+                        as i32
+            })
+            .count();
+        let workflow = snapshot
+            .tasks
+            .iter()
+            .filter_map(|view| view.collaboration.as_ref())
+            .filter_map(|collaboration| collaboration.run.as_ref())
+            .find_map(|run| RunStatus::try_from(run.status).ok())
+            .map(|status| status.as_str_name())
+            .unwrap_or("RUN_STATUS_UNSPECIFIED");
         println!(
-            "EgoPulse TUI: connected health={} stale={} position={} tasks={} approvals={}",
+            "EgoPulse TUI: connected health={} stale={} position={} tasks={} approvals={} workflow={} return_pending_steps={} returned_steps={}",
             snapshot.health,
             snapshot.stale,
             snapshot.position,
             snapshot.tasks.len(),
-            snapshot.approvals.len()
+            snapshot.approvals.len(),
+            workflow,
+            return_pending_steps,
+            returned_steps,
         );
         Ok(())
     } else {

@@ -1,7 +1,8 @@
 # Phase 2-17 governed Harness return intake
 
 - Status: technical intake, Attempt-return projection and Verification-gated
-  Step completion implemented; local focused gate passed
+  Step completion implemented; shared CLI/TUI ReturnPending read path and real
+  Windows C5 evidence passed
 - Date: 2026-08-26
 - Scope: native terminal output through technical Artifact Authority receipt
 - Not in scope: Task completion and Founder Verdict consumption
@@ -79,13 +80,18 @@ lineage. Collaboration tests also prove unauthorized Harness return writes, Arti
 return ownership, fence/sequence checks, Attempt idempotency and that Step/Task completion does
 not occur at technical intake.
 
-## Next boundary
+## Current boundary and next boundary
+
+The shared CLI/TUI kernel now exposes the projected `ReturnPending`/`Returned`
+counts. The real Windows C5 fixture proves that a daemon-backed TaskView with
+`RUN_STATUS_RETURN_PENDING` is visible consistently through both processes.
+This is read-side evidence; it does not simulate or claim a successful
+Verification-gated transition to `Returned`.
 
 Continue the next side without widening collector authority:
 
 1. drive the Verification worker from this Collaboration return boundary using
    sealed Artifact Authority references;
-2. expose `ReturnPending`/`Returned` and verification evidence through the
-   shared CLI/TUI kernel;
-3. add the CLI/TUI E2E proof and then wire Task completion only through its
-   separately governed write-back path.
+2. add a real write-side return test that submits the exact technical receipt
+   and accepted Verification proof before `CommitStepReturn`;
+3. wire Task completion only through its separately governed write-back path.

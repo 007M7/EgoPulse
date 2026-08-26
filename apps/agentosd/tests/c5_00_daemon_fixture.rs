@@ -24,13 +24,13 @@ use egopulse_cognition_runtime::{
     },
     task_authority::{
         CreationAuthorization, CreationGuardRejection, PrincipalKind as TaskPrincipalKind,
-        SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCreationGuard,
+        SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCreationGuard, TaskProjectionMessage,
     },
 };
 use egopulse_domain_contracts::v01::egopulse::{
     collaboration::v1::{
-        AttemptSnapshot, CollaborationEvent, CollaborationSnapshot, Lease, RunSnapshot,
-        collaboration_command_result,
+        AttemptSnapshot, CollaborationEvent, CollaborationSnapshot, Lease, RunSnapshot, RunStatus,
+        StepSnapshot, StepStatus, collaboration_command_result,
     },
     harness::v1::{
         ApprovalKind, ApprovalRequestLifecycleKind, ApprovalRequestObservation, HarnessObservation,
@@ -43,6 +43,7 @@ use egopulse_domain_contracts::v01::egopulse::{
         ConsumeHarnessApprovalDecisionCommand, HarnessApprovalDecisionRecord,
         IssueHarnessApprovalDecisionCommand,
     },
+    task::v1::{TaskEvent, TaskSnapshot, TaskStatus},
     verdict::v1::{ConsumeFounderVerdictCommand, IssueFounderVerdictCommand},
 };
 use egopulse_founder_verdict_authority::{
@@ -281,8 +282,17 @@ impl StaticApprovalProjectionSource {
                 run_id: "c5-run".to_owned(),
                 revision: 1,
                 task_id: "task-c5-03".to_owned(),
+                work_revision: 1,
+                status: RunStatus::ReturnPending as i32,
                 ..Default::default()
             }),
+            steps: vec![StepSnapshot {
+                step_id: "c5-step".to_owned(),
+                run_id: "c5-run".to_owned(),
+                revision: 1,
+                status: StepStatus::ReturnPending as i32,
+                ..Default::default()
+            }],
             attempts: vec![AttemptSnapshot {
                 attempt_id: "c5-attempt".to_owned(),
                 run_id: "c5-run".to_owned(),
@@ -295,7 +305,6 @@ impl StaticApprovalProjectionSource {
                 }),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let collaboration_event = CollaborationEvent {
             event_id: "collaboration-event-c5-03".to_owned(),
@@ -313,8 +322,41 @@ impl StaticApprovalProjectionSource {
         let collaboration_payload_digest =
             hex::encode(Sha256::digest(collaboration_result.encode_to_vec()));
         let adapter_payload_digest = hex::encode(Sha256::digest(observation.encode_to_vec()));
+        let task_event = TaskEvent {
+            event_id: "task-event-c5-03".to_owned(),
+            task_id: "task-c5-03".to_owned(),
+            resulting_revision: 1,
+            work_revision: 1,
+            snapshot: Some(TaskSnapshot {
+                task_id: "task-c5-03".to_owned(),
+                revision: 1,
+                work_revision: 1,
+                status: TaskStatus::Active as i32,
+                work_type: "c5-03-real-return-view".to_owned(),
+                input_snapshot_id: "input-c5-03".to_owned(),
+                target_scope_ref: "scope-c5-03".to_owned(),
+                current_run_id: Some("c5-run".to_owned()),
+                created_at: Some(prost_types::Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 0,
+                }),
+                updated_at: Some(prost_types::Timestamp {
+                    seconds: 1_700_000_001,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         Self {
             messages: std::sync::Mutex::new(vec![
+                PendingOwnerProjection::Task(Box::new(TaskProjectionMessage {
+                    message_id: "c5-task-projection".to_owned(),
+                    source_event_id: task_event.event_id.clone(),
+                    source_revision: 1,
+                    payload_digest_sha256: hex::encode(Sha256::digest(task_event.encode_to_vec())),
+                    event: task_event,
+                })),
                 PendingOwnerProjection::Collaboration(Box::new(
                     egopulse_local_ide_control::collaboration_control::PendingCollaborationProjection {
                         message_id: "c5-collaboration-projection".to_owned(),
@@ -358,6 +400,7 @@ impl OwnerProjectionSource for StaticApprovalProjectionSource {
         message: &PendingOwnerProjection,
     ) -> Result<bool, ProjectionSourceFailure> {
         let message_id = match message {
+            PendingOwnerProjection::Task(value) => &value.message_id,
             PendingOwnerProjection::Collaboration(value) => &value.message_id,
             PendingOwnerProjection::AdapterApproval(value) => &value.message_id,
             _ => return Ok(false),
@@ -368,6 +411,7 @@ impl OwnerProjectionSource for StaticApprovalProjectionSource {
             .map_err(|_| ProjectionSourceFailure::Acknowledgement)?;
         let before = messages.len();
         messages.retain(|candidate| match candidate {
+            PendingOwnerProjection::Task(value) => value.message_id != *message_id,
             PendingOwnerProjection::Collaboration(value) => value.message_id != *message_id,
             PendingOwnerProjection::AdapterApproval(value) => value.message_id != *message_id,
             _ => true,
@@ -1118,6 +1162,32 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
     );
     let tui_stdout = String::from_utf8_lossy(&tui_output.stdout);
     assert!(tui_stdout.contains("EgoPulse TUI: connected"));
+    assert!(
+        tui_stdout.contains("workflow=RUN_STATUS_RETURN_PENDING"),
+        "TUI must render the governed workflow state from TaskView: {tui_stdout}"
+    );
+    assert!(
+        tui_stdout.contains("return_pending_steps=1"),
+        "TUI must render the pending return count from TaskView: {tui_stdout}"
+    );
+
+    let cli_task_output = run_cli(&instance, &["task", "get", "task-c5-03", "--json"]).await;
+    assert!(
+        cli_task_output.status.success(),
+        "CLI must read the seeded governed TaskView: stdout={} stderr={}",
+        String::from_utf8_lossy(&cli_task_output.stdout),
+        String::from_utf8_lossy(&cli_task_output.stderr)
+    );
+    let cli_task_json: serde_json::Value =
+        serde_json::from_slice(&cli_task_output.stdout).expect("CLI TaskView JSON envelope");
+    assert_eq!(
+        cli_task_json["data"]["collaboration"]["runStatus"],
+        "RUN_STATUS_RETURN_PENDING"
+    );
+    assert_eq!(
+        cli_task_json["data"]["collaboration"]["returnPendingSteps"],
+        1
+    );
 
     let tui_acceptance_sha = "44".repeat(32);
     let tui_budget_sha = "55".repeat(32);

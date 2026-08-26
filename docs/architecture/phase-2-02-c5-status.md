@@ -35,13 +35,15 @@ local invocation is:
 cargo test -p egopulse-agentosd --test c5_00_daemon_fixture -- --test-threads=1 --nocapture
 ```
 
-The serial run passed all six tests:
+The serial run passed all seven tests:
 
 - daemon opens a session over real local IPC;
 - CLI attaches and preserves authority rejection;
 - CLI owner writes and projection await complete;
 - CLI fails closed across daemon restart and reconnects;
 - malformed await/stale approval do not partially commit;
+- the real CLI/TUI path reads the same TaskView and renders a governed
+  `RUN_STATUS_RETURN_PENDING` workflow with one pending return step;
 - the child daemon fixture lifecycle exits cleanly.
 
 The `--test-threads=1` constraint is required because each test starts a child daemon and owns a
@@ -65,9 +67,13 @@ failure, proving that this path reaches the daemon read model and fails closed.
 
 The shared `TaskView` presentation now also exposes the governed Collaboration
 return state on both surfaces. CLI JSON/text reports the Run status and bounded
-`ReturnPending`/`Returned` Step counts; TUI renders the same Run status in its
-task table. This is a read-only projection of the existing Local API view, not
-a client-side Collaboration writer or a surface-specific capability.
+`ReturnPending`/`Returned` Step counts; TUI renders the same Run status and
+counts in its one-shot task summary. The real Windows C5 fixture verifies that
+both processes read the same projected `TaskView`, including
+`RUN_STATUS_RETURN_PENDING` and one pending return step. This is a read-only
+projection of the existing Local API view, not a client-side Collaboration
+writer or a surface-specific capability. The fixture does not claim that a
+technical return has already passed Verification and reached `Returned`.
 
 ## Composition root boundary
 

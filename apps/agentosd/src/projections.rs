@@ -523,7 +523,13 @@ fn now_timestamp() -> prost_types::Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egopulse_domain_contracts::v01::egopulse::task::v1::{TaskEvent, TaskSnapshot, TaskStatus};
+    use egopulse_domain_contracts::v01::egopulse::{
+        collaboration::v1::{
+            CollaborationEvent, CollaborationSnapshot, RunSnapshot, RunStatus, StepSnapshot,
+            StepStatus, collaboration_command_result,
+        },
+        task::v1::{TaskEvent, TaskSnapshot, TaskStatus},
+    };
     use prost::Message;
     use sha2::{Digest, Sha256};
     use std::{
@@ -602,6 +608,101 @@ mod tests {
             payload_digest_sha256: hex::encode(Sha256::digest(event.encode_to_vec())),
             event,
         }
+    }
+
+    #[test]
+    fn task_and_collaboration_projection_bind_into_one_task_view() {
+        let (model, root) = open_model();
+        let mut task_message = valid_task_message();
+        let task = task_message.event.snapshot.as_mut().expect("task snapshot");
+        task.task_id = "task-collaboration-bind".to_owned();
+        task.current_run_id = Some("run-collaboration-bind".to_owned());
+        task_message.event.task_id = task.task_id.clone();
+        task_message.event.event_id = "task-event-collaboration-bind".to_owned();
+        task_message.source_event_id = task_message.event.event_id.clone();
+        task_message.message_id = "task-projection-collaboration-bind".to_owned();
+        task_message.payload_digest_sha256 =
+            hex::encode(Sha256::digest(task_message.event.encode_to_vec()));
+
+        let snapshot = CollaborationSnapshot {
+            run: Some(RunSnapshot {
+                run_id: "run-collaboration-bind".to_owned(),
+                revision: 1,
+                task_id: "task-collaboration-bind".to_owned(),
+                work_revision: 1,
+                status: RunStatus::ReturnPending as i32,
+                ..Default::default()
+            }),
+            steps: vec![StepSnapshot {
+                step_id: "step-collaboration-bind".to_owned(),
+                run_id: "run-collaboration-bind".to_owned(),
+                revision: 1,
+                status: StepStatus::ReturnPending as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let event = CollaborationEvent {
+            event_id: "collaboration-event-bind".to_owned(),
+            run_id: "run-collaboration-bind".to_owned(),
+            resulting_run_revision: 1,
+            ..Default::default()
+        };
+        let result = egopulse_domain_contracts::v01::egopulse::collaboration::v1::CollaborationCommandResult {
+            outcome: Some(collaboration_command_result::Outcome::Snapshot(snapshot.clone())),
+            committed_event: Some(event.clone()),
+            ..Default::default()
+        };
+        let collaboration = PendingCollaborationProjection {
+            message_id: "collaboration-projection-bind".to_owned(),
+            source_event_id: event.event_id.clone(),
+            source_revision: 1,
+            canonical_payload_digest_sha256: hex::encode(Sha256::digest(result.encode_to_vec())),
+            rebuild_baseline: false,
+            snapshot,
+            event,
+        };
+        let source = Arc::new(FixtureSource {
+            messages: vec![
+                PendingOwnerProjection::Task(Box::new(task_message)),
+                PendingOwnerProjection::Collaboration(Box::new(collaboration)),
+            ],
+            acknowledgements: AtomicUsize::new(0),
+            accepted_prefix: None,
+        });
+        let initial = model
+            .lock()
+            .expect("model lock")
+            .position()
+            .expect("position");
+        let notifier = ProjectionCommitNotifier::new(initial);
+        let pump = ProjectionPump::new(model.clone(), notifier, source.clone());
+        assert_eq!(
+            pump.pump_once()
+                .expect("task and collaboration projections"),
+            2
+        );
+        let view = model
+            .lock()
+            .expect("model lock")
+            .get_task_view(
+                "task-collaboration-bind",
+                egopulse_local_read_model::TaskViewAccess {
+                    can_read: true,
+                    ..Default::default()
+                },
+            )
+            .expect("get task view")
+            .expect("task view");
+        assert_eq!(
+            view.collaboration
+                .expect("collaboration")
+                .run
+                .expect("run")
+                .status,
+            RunStatus::ReturnPending as i32
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

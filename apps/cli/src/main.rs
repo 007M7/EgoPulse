@@ -2070,6 +2070,7 @@ fn task_summary(view: &TaskView) -> serde_json::Value {
         "taskId": task.map(|task| task.task_id.clone()),
         "revision": task.map_or(0, |task| task.revision),
         "status": task.and_then(|task| TaskStatus::try_from(task.status).ok()).map(|status| status.as_str_name()),
+        "currentRunId": task.and_then(|task| task.current_run_id.clone()),
         "collaboration": {
             "runId": run.map(|run| run.run_id.clone()),
             "runStatus": run.and_then(|run| RunStatus::try_from(run.status).ok()).map(|status| status.as_str_name()),
