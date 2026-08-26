@@ -323,6 +323,9 @@ pub struct DaemonProviders {
     pub memory_retrieval_port: Arc<dyn MemoryRetrievalPort>,
     pub memory_retrieval_audit: Arc<dyn MemoryRetrievalAuditSink>,
     pub memory_mutation_port: Arc<dyn MemoryMutationPort>,
+    /// Internal candidate-only producer capabilities. This is deliberately
+    /// separate from the public Local API mutation port.
+    pub memory_candidate_producers: Arc<MemoryCandidateProducerRegistry>,
 }
 
 /// Explicit workflow configuration boundary for the first vertical. It does
@@ -551,6 +554,7 @@ impl DaemonProviders {
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
+            memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
         }
     }
 
@@ -621,6 +625,7 @@ impl DaemonProviders {
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
+            memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
         }
     }
 
@@ -665,6 +670,7 @@ impl DaemonProviders {
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
+            memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
         }
     }
 
@@ -731,6 +737,24 @@ impl DaemonProviders {
             principal_resolver,
         ));
         self
+    }
+
+    /// Installs the process-local, candidate-only producer registry used by
+    /// explicitly admitted Agent/Model/Harness runtimes. The registry is not
+    /// reachable through the public protobuf Local API.
+    pub fn with_memory_candidate_producers<I>(
+        mut self,
+        authority: Arc<Mutex<MemoryAuthority>>,
+        bindings: I,
+    ) -> Result<Self, DaemonCompositionError>
+    where
+        I: IntoIterator<Item = MemoryCandidateProducerBinding>,
+    {
+        self.memory_candidate_producers = Arc::new(
+            MemoryCandidateProducerRegistry::new(authority, bindings)
+                .map_err(DaemonCompositionError::MemoryCandidateProducers)?,
+        );
+        Ok(self)
     }
 
     /// Installs the first production Harness composition. Task Authority,
@@ -1012,6 +1036,8 @@ pub enum DaemonCompositionError {
     AdapterEdge(#[source] AdapterEdgeError),
     #[error("Memory retrieval composition is invalid")]
     MemoryRetrieval(#[source] MemoryRetrievalConfigurationError),
+    #[error("Memory candidate producer composition is invalid")]
+    MemoryCandidateProducers(#[source] MemoryCandidateProducerConfigurationError),
 }
 
 #[derive(Debug, thiserror::Error)]
