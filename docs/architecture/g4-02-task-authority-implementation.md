@@ -1,6 +1,7 @@
 # G4-02 Task Authority implementation profile
 
-- Status: active Gate 4 work package
+- Status: implemented mutation subset and Gate 4 evidence verified locally;
+  later Task transitions remain deferred
 - Date: 2026-08-23
 - Frozen inputs: C-01 Task Contract, C-08 Persistence/Recovery Contract, Feature ADR A
 - Scope: one durable `CreateTask` write path plus fail-closed duplicate, stale, unauthorized and recovery behavior
@@ -66,3 +67,15 @@ Caller bodies never provide trusted actor or authority values. Duplicate same-ke
 - close/reopen recovery and encrypted file-header proof;
 - child-process abort after commit/before response, followed by replay with no second revision/event/outbox row;
 - dependency boundary check proving UI/Harness/Worker code cannot import private Task storage.
+
+The dedicated Windows x64 evidence is
+`crates/cognition-runtime/tests/task_authority_g4_02.rs`:
+
+```powershell
+cargo test -p egopulse-cognition-runtime `
+  --test task_authority_g4_02 -- --nocapture
+```
+
+Result: `8 passed, 0 failed`. This closes the evidence for the implemented
+Create/activation and projection subset; it does not authorize later Task
+transitions that are explicitly outside this work package.

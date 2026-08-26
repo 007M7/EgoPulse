@@ -1,6 +1,7 @@
 # G4-03 Collaboration Control implementation profile
 
-- Status: active Gate 4 work package
+- Status: implemented dispatch/control subset and Gate 4 evidence verified
+  locally; later mutations remain deferred
 - Date: 2026-08-23
 - Frozen inputs: C-02 Collaboration Contract, C-08 Persistence/Recovery Contract, Feature ADR A
 - Scope: durable Run/Step/Attempt authority through `dispatch_pending`, plus fail-closed unknown-outcome recovery
@@ -79,3 +80,17 @@ G4-03 implements `CreateRun`, `ActivateRun`, `CreateAttempt`, `AcquireAttemptLea
 - process abort after dispatch commit/before delivery, followed by pending outbox recovery;
 - lease-expired ambiguous execution to `outcome_unknown`/held with no retry message;
 - encrypted close/reopen integrity and dependency boundary checks.
+
+The dedicated Windows x64 evidence is
+`crates/local-ide-control/tests/collaboration_control_g4_03.rs`:
+
+```powershell
+cargo test -p egopulse-local-ide-control `
+  --test collaboration_control_g4_03 -- --nocapture
+```
+
+Result: `19 passed, 0 failed`. The suite covers the implemented dispatch,
+lease, candidate-fact, cancellation and reconciliation paths. Windows emitted
+the SQLCipher `VirtualLock` quota warning during the run; this did not change
+the pass result or database-integrity assertions, but it means this evidence
+must not be read as proof of OS memory-page pinning.
