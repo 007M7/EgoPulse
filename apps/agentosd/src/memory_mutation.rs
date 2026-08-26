@@ -1,8 +1,12 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use egopulse_cognition_runtime::memory_authority::{
     AuthenticatedMemoryPrincipal, GovernMemory, MemoryAuthority, MemoryAuthorityFailure,
-    MemoryPrincipalKind, SubmitMemoryCandidate,
+    MemoryMutationReceipt as AuthorityMemoryMutationReceipt, MemoryPrincipalKind,
+    SubmitMemoryCandidate,
 };
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
     MemoryMutationCommand, MemoryMutationReceipt, memory_mutation_command,
@@ -12,6 +16,182 @@ use egopulse_local_api::command_gateway::{
 };
 
 use crate::AuthorityPrincipalResolver;
+
+/// Fixed identity binding for an internal candidate producer.
+///
+/// `producer_id` is an application-owned route, not a field supplied by a
+/// model or a Local API client. The binding is resolved during composition and
+/// the resulting port never accepts a caller-selected principal. This keeps
+/// Agent/Model/Harness proposals inside the Memory Authority boundary while
+/// leaving acceptance and revocation to the governance path below.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryCandidateProducerBinding {
+    pub producer_id: String,
+    pub principal_id: String,
+    pub principal_kind: MemoryPrincipalKind,
+}
+
+impl MemoryCandidateProducerBinding {
+    pub fn new(
+        producer_id: impl Into<String>,
+        principal_id: impl Into<String>,
+        principal_kind: MemoryPrincipalKind,
+    ) -> Result<Self, MemoryCandidateProducerConfigurationError> {
+        let binding = Self {
+            producer_id: producer_id.into(),
+            principal_id: principal_id.into(),
+            principal_kind,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<(), MemoryCandidateProducerConfigurationError> {
+        validate_identifier(&self.producer_id, "producer_id")?;
+        validate_identifier(&self.principal_id, "principal_id")?;
+        if !matches!(
+            self.principal_kind,
+            MemoryPrincipalKind::Agent | MemoryPrincipalKind::Model | MemoryPrincipalKind::Harness
+        ) {
+            return Err(MemoryCandidateProducerConfigurationError::UnsupportedPrincipalKind);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum MemoryCandidateProducerConfigurationError {
+    #[error("memory candidate producer {0} is empty or exceeds 128 bytes")]
+    InvalidIdentifier(&'static str),
+    #[error("memory candidate producer must use Agent, Model, or Harness identity")]
+    UnsupportedPrincipalKind,
+    #[error("memory candidate producer id is registered more than once: {0}")]
+    DuplicateProducer(String),
+    #[error("at least one memory candidate producer binding is required")]
+    EmptyRegistration,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum MemoryCandidateProducerFailure {
+    #[error("memory candidate producer is not configured: {0}")]
+    UnknownProducer(String),
+    #[error(transparent)]
+    Authority(#[from] MemoryAuthorityFailure),
+}
+
+/// Narrow internal write capability granted to a candidate producer. There is
+/// intentionally no accept/revoke method and no principal argument.
+pub trait MemoryCandidateProducerPort: Send + Sync {
+    fn submit_candidate(
+        &self,
+        command: &SubmitMemoryCandidate,
+    ) -> Result<AuthorityMemoryMutationReceipt, MemoryCandidateProducerFailure>;
+}
+
+struct ConfiguredMemoryCandidateProducer {
+    authority: Arc<Mutex<MemoryAuthority>>,
+    principal: AuthenticatedMemoryPrincipal,
+}
+
+impl ConfiguredMemoryCandidateProducer {
+    fn new(
+        authority: Arc<Mutex<MemoryAuthority>>,
+        binding: &MemoryCandidateProducerBinding,
+    ) -> Self {
+        Self {
+            authority,
+            principal: AuthenticatedMemoryPrincipal {
+                kind: binding.principal_kind,
+                principal_id: binding.principal_id.clone(),
+                authenticated: true,
+            },
+        }
+    }
+}
+
+impl MemoryCandidateProducerPort for ConfiguredMemoryCandidateProducer {
+    fn submit_candidate(
+        &self,
+        command: &SubmitMemoryCandidate,
+    ) -> Result<AuthorityMemoryMutationReceipt, MemoryCandidateProducerFailure> {
+        let mut authority = self.authority.lock().map_err(|_| {
+            MemoryCandidateProducerFailure::Authority(MemoryAuthorityFailure::Storage)
+        })?;
+        authority
+            .submit_candidate(command, &self.principal)
+            .map_err(MemoryCandidateProducerFailure::Authority)
+    }
+}
+
+/// Composition-time registry for future Agent/Model/Harness runtimes.
+///
+/// This is deliberately not exposed through the protobuf Local API. A runtime
+/// receives a registry handle only after its producer identity has been
+/// explicitly admitted and bound to one fixed Memory principal.
+#[derive(Clone, Default)]
+pub struct MemoryCandidateProducerRegistry {
+    producers: Arc<BTreeMap<String, Arc<dyn MemoryCandidateProducerPort>>>,
+}
+
+impl MemoryCandidateProducerRegistry {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn new<I>(
+        authority: Arc<Mutex<MemoryAuthority>>,
+        bindings: I,
+    ) -> Result<Self, MemoryCandidateProducerConfigurationError>
+    where
+        I: IntoIterator<Item = MemoryCandidateProducerBinding>,
+    {
+        let mut producers = BTreeMap::new();
+        for binding in bindings {
+            binding.validate()?;
+            if producers.contains_key(&binding.producer_id) {
+                return Err(
+                    MemoryCandidateProducerConfigurationError::DuplicateProducer(
+                        binding.producer_id,
+                    ),
+                );
+            }
+            let producer_id = binding.producer_id.clone();
+            let producer = ConfiguredMemoryCandidateProducer::new(Arc::clone(&authority), &binding);
+            producers.insert(
+                producer_id,
+                Arc::new(producer) as Arc<dyn MemoryCandidateProducerPort>,
+            );
+        }
+        if producers.is_empty() {
+            return Err(MemoryCandidateProducerConfigurationError::EmptyRegistration);
+        }
+        Ok(Self {
+            producers: Arc::new(producers),
+        })
+    }
+
+    pub fn submit_candidate(
+        &self,
+        producer_id: &str,
+        command: &SubmitMemoryCandidate,
+    ) -> Result<AuthorityMemoryMutationReceipt, MemoryCandidateProducerFailure> {
+        self.producers
+            .get(producer_id)
+            .ok_or_else(|| MemoryCandidateProducerFailure::UnknownProducer(producer_id.to_owned()))?
+            .submit_candidate(command)
+    }
+}
+
+fn validate_identifier(
+    value: &str,
+    field: &'static str,
+) -> Result<(), MemoryCandidateProducerConfigurationError> {
+    if value.trim().is_empty() || value.len() > 128 {
+        return Err(MemoryCandidateProducerConfigurationError::InvalidIdentifier(field));
+    }
+    Ok(())
+}
 
 /// The only Local API adapter that can call Memory Authority mutations. The
 /// gateway supplies authorization constraints; this adapter requires one
@@ -344,6 +524,135 @@ mod tests {
                 .expect_err("candidate must require Founder"),
             CommandPortFailure::IntegrityFailure
         );
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn producer_registry_routes_candidates_with_fixed_agent_model_and_harness_identities() {
+        let database_path = database_path();
+        let authority = Arc::new(Mutex::new(
+            MemoryAuthority::open(MemoryAuthorityConfig {
+                database_path: database_path.clone(),
+                store_epoch: "memory-producer-registry-test".to_owned(),
+                key: SqlCipherKey::new([0x73; 32]),
+            })
+            .expect("memory authority"),
+        ));
+        let registry = MemoryCandidateProducerRegistry::new(
+            Arc::clone(&authority),
+            [
+                MemoryCandidateProducerBinding::new(
+                    "agent:planner",
+                    "agent-planner-v1",
+                    MemoryPrincipalKind::Agent,
+                )
+                .expect("agent binding"),
+                MemoryCandidateProducerBinding::new(
+                    "model:reasoner",
+                    "model-reasoner-v1",
+                    MemoryPrincipalKind::Model,
+                )
+                .expect("model binding"),
+                MemoryCandidateProducerBinding::new(
+                    "harness:codex",
+                    "harness-codex-v1",
+                    MemoryPrincipalKind::Harness,
+                )
+                .expect("harness binding"),
+            ],
+        )
+        .expect("producer registry");
+
+        for (producer_id, memory_id) in [
+            ("agent:planner", "memory-agent"),
+            ("model:reasoner", "memory-model"),
+            ("harness:codex", "memory-harness"),
+        ] {
+            let receipt = registry
+                .submit_candidate(
+                    producer_id,
+                    &SubmitMemoryCandidate {
+                        memory_id: memory_id.to_owned(),
+                        content: format!("candidate from {producer_id}"),
+                        source_ref: format!("source:{producer_id}"),
+                        scope_ref: "scope:founder".to_owned(),
+                        idempotency_key: format!("idempotency:{producer_id}"),
+                    },
+                )
+                .expect("candidate receipt");
+            assert_eq!(
+                receipt.state,
+                egopulse_cognition_runtime::memory_authority::MemoryState::Candidate
+            );
+        }
+
+        assert_eq!(
+            registry
+                .submit_candidate(
+                    "unknown:producer",
+                    &SubmitMemoryCandidate {
+                        memory_id: "memory-unknown".to_owned(),
+                        content: "candidate".to_owned(),
+                        source_ref: "source:unknown".to_owned(),
+                        scope_ref: "scope:founder".to_owned(),
+                        idempotency_key: "idempotency:unknown".to_owned(),
+                    },
+                )
+                .expect_err("unknown producer must fail closed"),
+            MemoryCandidateProducerFailure::UnknownProducer("unknown:producer".to_owned())
+        );
+
+        drop(authority);
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn producer_binding_rejects_governance_identities_and_duplicate_routes() {
+        assert_eq!(
+            MemoryCandidateProducerBinding::new(
+                "founder:local",
+                "founder-local",
+                MemoryPrincipalKind::Founder,
+            )
+            .expect_err("Founder cannot be registered as a producer"),
+            MemoryCandidateProducerConfigurationError::UnsupportedPrincipalKind
+        );
+        assert_eq!(
+            MemoryCandidateProducerBinding::new(" ", "agent-1", MemoryPrincipalKind::Agent)
+                .expect_err("empty producer route must fail"),
+            MemoryCandidateProducerConfigurationError::InvalidIdentifier("producer_id")
+        );
+
+        let database_path = database_path();
+        let authority = Arc::new(Mutex::new(
+            MemoryAuthority::open(MemoryAuthorityConfig {
+                database_path: database_path.clone(),
+                store_epoch: "memory-producer-duplicate-test".to_owned(),
+                key: SqlCipherKey::new([0x74; 32]),
+            })
+            .expect("memory authority"),
+        ));
+        let first = MemoryCandidateProducerBinding::new(
+            "agent:planner",
+            "agent-planner-v1",
+            MemoryPrincipalKind::Agent,
+        )
+        .expect("first binding");
+        let second = MemoryCandidateProducerBinding::new(
+            "agent:planner",
+            "agent-planner-v2",
+            MemoryPrincipalKind::Agent,
+        )
+        .expect("second binding");
+        match MemoryCandidateProducerRegistry::new(authority, [first, second]) {
+            Err(error) => assert_eq!(
+                error,
+                MemoryCandidateProducerConfigurationError::DuplicateProducer(
+                    "agent:planner".to_owned(),
+                )
+            ),
+            Ok(_) => panic!("duplicate route must fail"),
+        }
         let _ = std::fs::remove_file(database_path);
     }
 }

@@ -6,7 +6,7 @@ The repository starts from the frozen architecture and technology baseline. It d
 
 ## Foundation status
 
-Current maturity: **Gate 4 vertical implementation in progress — V-01/C5 CLI+TUI closed, typed production bootstrap wired, Sego single-criterion verification closed, Memory/RAG M-01–M-10 locally verified**.
+Current maturity: **Gate 4 vertical implementation in progress — V-01/C5 CLI+TUI closed, typed production bootstrap wired, Sego single-criterion verification closed, Memory/RAG M-01–M-11 locally verified**.
 
 Available now:
 

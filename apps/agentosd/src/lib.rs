@@ -88,7 +88,11 @@ pub use bootstrap::{
     DenyVerificationReferences, LocalUserPolicyBootstrapConfig, ProductionBootstrapConfig,
     ProductionBootstrapError,
 };
-pub use memory_mutation::MemoryMutationPortAdapter;
+pub use memory_mutation::{
+    MemoryCandidateProducerBinding, MemoryCandidateProducerConfigurationError,
+    MemoryCandidateProducerFailure, MemoryCandidateProducerPort, MemoryCandidateProducerRegistry,
+    MemoryMutationPortAdapter,
+};
 pub use memory_retrieval::{
     ConfiguredMemoryRetrievalPort, FailClosedMemoryRetrievalPort, MemoryRetrievalCompositionConfig,
     MemoryRetrievalConfigurationError, TracingMemoryRetrievalAuditSink,
