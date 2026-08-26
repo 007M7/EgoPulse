@@ -1,5 +1,6 @@
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    CancelExecutionEnvelope, DispatchEnvelope, LifecycleKind, harness_observation,
+    ApprovalDecision, ApprovalDecisionEnvelope, CancelExecutionEnvelope, DispatchEnvelope,
+    LifecycleKind, harness_observation,
 };
 use egopulse_dsh_adapter::{DshAcpConfig, DshAcpDriver};
 use egopulse_harness_adapter::{NativeHarnessDriver, ResolvedDispatchMaterial};
@@ -143,6 +144,69 @@ async fn dsh_replay_driver_sends_native_cancel_and_observes_interruption() {
         event.payload,
         harness_observation::Payload::Lifecycle(value)
             if value.kind == LifecycleKind::ExecutionInterrupted as i32
+    ));
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly configured local DSH replay workspace"]
+async fn dsh_replay_driver_routes_native_permission_through_governed_decision() {
+    let root = required_env("EGOPULSE_DSH_REPLAY_ROOT");
+    let node = required_env("EGOPULSE_DSH_NODE");
+    let home =
+        std::env::temp_dir().join(format!("egopulse-dsh-rust-approval-{}", std::process::id()));
+    let workspace = home.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("replay workspace");
+    let mut config = replay_config(&root, node, "escalation-approved", &home, &workspace);
+    // DSH derives `approval: ask` from any non-danger sandbox mode; `ask`
+    // itself is not a valid sandbox mode and makes the native process fail
+    // during initialization.
+    config = config.with_environment_override("DSH_PERMISSION_MODE", "workspace-write");
+    let mut driver = DshAcpDriver::new(config);
+    let (envelope, material) = dispatch("dispatch:dsh-approval", &workspace);
+
+    driver
+        .send_dispatch(&envelope, &material)
+        .await
+        .expect("fresh DSH dispatch");
+    let approval = driver
+        .next_event(&envelope)
+        .await
+        .expect("approval observation")
+        .expect("approval event exists");
+    let request = match approval.payload {
+        harness_observation::Payload::ApprovalRequest(request) => request,
+        other => panic!("expected approval request, got {other:?}"),
+    };
+    assert_eq!(request.kind, 5);
+    assert_eq!(request.lifecycle, 1);
+    assert!(!request.native_routing_ref.is_empty());
+
+    let response = driver
+        .decide_approval(&ApprovalDecisionEnvelope {
+            attempt_id: envelope.attempt_id.clone(),
+            dispatch_id: envelope.dispatch_id.clone(),
+            fencing_token: 1,
+            approval_request_id: request.approval_request_id,
+            action_digest_sha256: request.action_digest_sha256,
+            decision: ApprovalDecision::AllowOnce as i32,
+            authority_decision_ref: "policy-receipt:dsh-approval-001".to_owned(),
+            native_routing_ref: request.native_routing_ref,
+            ..ApprovalDecisionEnvelope::default()
+        })
+        .await
+        .expect("governed approval response");
+    assert!(String::from_utf8_lossy(&response).contains("allow-once"));
+
+    let terminal = driver
+        .next_event(&envelope)
+        .await
+        .expect("terminal event after approval")
+        .expect("terminal lifecycle exists");
+    assert!(matches!(
+        terminal.payload,
+        harness_observation::Payload::Lifecycle(value)
+            if value.kind == LifecycleKind::ExecutionCompleted as i32
     ));
     let _ = std::fs::remove_dir_all(home);
 }

@@ -53,18 +53,28 @@ approval, artifact and recovery evidence.
 - Keyless `cancel` replay accepted native `session/cancel` and returned
   `stopReason=cancelled` before clean process exit.
 - Rust candidate replay tests passed locally on Windows x64 against the real
-  compiled ACP demo: fresh terminal lifecycle and native cancellation, both
-  without a model/API call.
+  compiled ACP demo: fresh terminal lifecycle, native cancellation, and a
+  governed native permission round-trip, all without a model/API call.
 - DSH adapter Clippy with warnings denied: passed.
 
 The keyless lifecycle evidence is now complete for the ACP operations DSH
 actually implements: multi-turn prompt, committed update, and cancellation.
-The adapter also has local fixture coverage for the actual DSH permission
-request shape (`session/request_permission`), opaque JSON-RPC request identity,
-governance handoff and one-shot response selection. This is an adapter
-contract result, not live proof that every DSH tool emits or honors the same
-approval semantics; the candidate remains held until approval and artifact
-behavior are independently attested.
+The real compiled replay also exercised `session/request_permission`: the Rust
+adapter projected the request into the provider-neutral approval contract,
+accepted an EgoPulse `AllowOnce` decision with an authority receipt, sent the
+native ACP response, and observed the completed terminal lifecycle. The exact
+local command was:
+
+```powershell
+$env:EGOPULSE_DSH_REPLAY_ROOT = 'D:\deepseek harness\deepseek-harness-git'
+$env:EGOPULSE_DSH_NODE = 'C:\Program Files\nodejs\node.exe'
+cargo test -p egopulse-dsh-adapter --test replay -- --ignored --nocapture
+```
+
+Result: `3 passed, 0 failed` (multi-turn, cancellation, governed permission).
+This proves the current DSH fixture's permission round-trip; it does not prove
+that every DSH tool emits or honors identical approval semantics. Artifact
+behavior is still independently unattested, so the candidate remains held.
 The recovery capability probe also confirms that DSH advertises fresh sessions
 only: `session/load` and `session/resume` are rejected. The candidate therefore
 remains held rather than being promoted; a restarted DSH process cannot be
