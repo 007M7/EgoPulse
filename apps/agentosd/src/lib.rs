@@ -436,6 +436,7 @@ impl NativeHarnessCompositionProfile {
             || self.capability_profile_ref.contract_id.trim().is_empty()
             || self.capability_profile_ref.version.trim().is_empty()
             || self.capability_profile_ref.sha256.trim().is_empty()
+            || self.capability_profile_id != self.capability_profile_ref.contract_id
             || self.observed_protocol.protocol_name.trim().is_empty()
             || self.observed_protocol.protocol_version.trim().is_empty()
             || self.observed_protocol.schema_sha256.trim().is_empty()
@@ -1573,6 +1574,15 @@ mod tests {
             },
         };
         assert!(profile.validate().is_ok());
+
+        profile.capability_profile_ref.contract_id = "different-profile".to_owned();
+        assert!(matches!(
+            profile.validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition profile"
+            ))
+        ));
+        profile.capability_profile_ref.contract_id = "profile".to_owned();
 
         profile.adapter_id.clear();
         assert!(matches!(
