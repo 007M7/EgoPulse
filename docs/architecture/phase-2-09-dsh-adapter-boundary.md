@@ -71,3 +71,11 @@ remains held rather than being promoted; a restarted DSH process cannot be
 treated as recovery of a prior native session. Any future adapter would need
 EgoPulse-owned dispatch receipts and an explicit uncertain-outcome policy, not a
 synthetic native recovery claim.
+
+The Rust adapter now exposes the recovery hold as the stable evidence reference
+`dsh-reconcile:native-session-load-resume-unsupported`. Its regression test
+`native_recovery_is_explicitly_outcome_unknown_without_synthetic_resume`
+asserts that the native reconciliation result is exactly `OutcomeUnknown`; it
+cannot be interpreted as a recovered terminal result or as permission to
+automatically redispatch. This makes the unsupported-native-recovery boundary
+executable and reviewable while keeping DSH candidate-only.

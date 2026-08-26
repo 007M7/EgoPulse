@@ -28,6 +28,8 @@ use uuid::Uuid;
 pub const DSH_ADAPTER_ID: &str = "dsh-adapter";
 pub const DSH_ACP_PROTOCOL: &str = "agent-client-protocol";
 pub const DSH_ACP_PROTOCOL_VERSION: &str = "v1";
+pub const DSH_NATIVE_RECOVERY_UNSUPPORTED_EVIDENCE_REF: &str =
+    "dsh-reconcile:native-session-load-resume-unsupported";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DshSessionProbeDisposition {
@@ -454,7 +456,7 @@ impl NativeHarnessDriver for DshAcpDriver {
     ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
         Box::pin(async {
             Ok(ReconciliationFinding::OutcomeUnknown {
-                evidence_ref: "dsh-reconcile:native-session-load-resume-unsupported".to_owned(),
+                evidence_ref: DSH_NATIVE_RECOVERY_UNSUPPORTED_EVIDENCE_REF.to_owned(),
             })
         })
     }
@@ -947,6 +949,37 @@ mod tests {
                 .expect_err("cancel without a session must fail closed")
                 .safe_detail_code,
             "DSH_ACP_SESSION_NOT_RUNNING"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_recovery_is_explicitly_outcome_unknown_without_synthetic_resume() {
+        let mut driver = DshAcpDriver::new(DshAcpConfig::new(
+            r"C:\dsh.exe",
+            std::env::current_dir().expect("cwd"),
+        ));
+        let context = ReconciliationContext {
+            envelope: DispatchEnvelope {
+                dispatch_id: "dispatch:dsh-recovery-hold".to_owned(),
+                ..DispatchEnvelope::default()
+            },
+            delivery_receipt: None,
+            material: ResolvedDispatchMaterial {
+                canonical_input_bundle: Vec::new(),
+                prompt: "reconcile without native resume".to_owned(),
+                workspace_root: std::env::current_dir().expect("cwd"),
+                model: None,
+            },
+        };
+        let finding = driver
+            .reconcile(&context)
+            .await
+            .expect("unsupported native recovery is a controlled finding");
+        assert_eq!(
+            finding,
+            ReconciliationFinding::OutcomeUnknown {
+                evidence_ref: DSH_NATIVE_RECOVERY_UNSUPPORTED_EVIDENCE_REF.to_owned(),
+            }
         );
     }
 }
