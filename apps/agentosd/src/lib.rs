@@ -383,6 +383,7 @@ impl NativeHarnessCompositionProfile {
         required_profile_ref: &ContractReference,
         model_family_selector: &str,
         capability_profile: &CapabilityProfile,
+        observed_protocol: NativeProtocolFingerprint,
         now: &prost_types::Timestamp,
     ) -> Result<Self, DaemonCompositionError> {
         validate_capability_binding(
@@ -401,11 +402,16 @@ impl NativeHarnessCompositionProfile {
                 "native Harness capability profile declaration",
             ),
         )?;
-        let observed_protocol = declaration.native_protocol.clone().ok_or(
+        let declared_protocol = declaration.native_protocol.as_ref().ok_or(
             DaemonCompositionError::InvalidConfiguration(
                 "native Harness capability profile protocol",
             ),
         )?;
+        if declared_protocol != &observed_protocol {
+            return Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness capability profile protocol drift",
+            ));
+        }
         let profile = Self {
             adapter_id: declaration.adapter_id.clone(),
             capability_profile_id: capability_profile.profile_id.clone(),
@@ -1475,11 +1481,35 @@ mod tests {
             },
             "family",
             &capability,
+            capability
+                .declaration
+                .as_ref()
+                .and_then(|declaration| declaration.native_protocol.clone())
+                .expect("test capability protocol"),
             &prost_types::Timestamp::default(),
         )
         .expect("attested capability should produce a composition profile");
         assert_eq!(bound.adapter_id, "adapter");
         assert_eq!(bound.capability_profile_id, "profile");
+
+        let mut drifted_protocol = bound.observed_protocol.clone();
+        drifted_protocol.protocol_version.push_str("-drift");
+        assert!(matches!(
+            NativeHarnessCompositionProfile::from_attested_capability(
+                &ContractReference {
+                    contract_id: "profile".to_owned(),
+                    version: "v1".to_owned(),
+                    sha256: "ab".repeat(32),
+                },
+                "family",
+                &capability,
+                drifted_protocol,
+                &prost_types::Timestamp::default(),
+            ),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness capability profile protocol drift"
+            ))
+        ));
 
         let mut profile = NativeHarnessCompositionProfile {
             adapter_id: "adapter".to_owned(),
