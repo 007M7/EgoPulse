@@ -1509,6 +1509,29 @@ mod tests {
         }
     }
 
+    struct CountingFounderVerdictConsumeWorker {
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl FounderVerdictConsumeWorker for CountingFounderVerdictConsumeWorker {
+        fn run_once<'a>(
+            &'a self,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            FounderVerdictConsumeCycleResult,
+                            FounderVerdictConsumeCycleError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(FounderVerdictConsumeCycleResult::Idle) })
+        }
+    }
+
     #[tokio::test]
     async fn harness_dispatch_worker_polls_and_stops_with_daemon_signal() {
         let runs = Arc::new(AtomicUsize::new(0));
@@ -1545,6 +1568,40 @@ mod tests {
                 runs: Arc::clone(&runs),
             },
         ));
+        let daemon = DaemonComposition::build(config, providers).expect("daemon composition");
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            daemon
+                .serve(async {
+                    let _ = shutdown_receiver.await;
+                })
+                .await
+                .expect("daemon should stop cleanly");
+        });
+        for _ in 0..100 {
+            if runs.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        shutdown_sender
+            .send(())
+            .expect("daemon shutdown receiver should still be active");
+        server.await.expect("daemon task should join");
+        assert!(runs.load(Ordering::SeqCst) > 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_composition_polls_the_injected_founder_verdict_consumer() {
+        let instance = format!("g4-verdict-consumer-worker-{}", Uuid::now_v7());
+        let (config, root) = config(&instance);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let providers = DaemonProviders::fail_closed().with_founder_verdict_consume_worker(
+            Arc::new(CountingFounderVerdictConsumeWorker {
+                runs: Arc::clone(&runs),
+            }),
+        );
         let daemon = DaemonComposition::build(config, providers).expect("daemon composition");
         let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {

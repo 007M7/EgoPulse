@@ -112,12 +112,14 @@ provider is therefore selected by production configuration.
    selected profile's packaging/configuration/evidence path.
 2. Keep Codex as the sole admitted production Harness while running any Kimi or
    DSH probes as isolated candidate evidence.
-3. Complete the production Memory candidate bridge as an explicit,
+3. Keep the production Memory candidate bridge as an explicit,
    user-reviewed proposal operation. It must not turn every terminal transcript
    into a memory, must preserve the Artifact return path, and must use the
    fixed producer binding already implemented. The current real Codex E2E is
-   the cross-component proof; the product-facing proposal interaction is still
-   open.
+   the cross-component proof; CLI/TUI already expose the corresponding
+   user-reviewed `memory candidate` operation through the Local API. A future
+   terminal-output inbox may improve ergonomics, but it is not required for the
+   first release and must not bypass Founder acceptance.
 4. After the chosen Memory profile and product-facing candidate bridge are
    evidenced, refresh the CLI/TUI early-access package. The current package was
    refreshed for the fixed producer-proposal boundary; Desktop remains a later
