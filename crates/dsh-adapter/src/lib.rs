@@ -13,6 +13,7 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
 use egopulse_harness_adapter::{
     DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, NativeHarnessDriver,
     NativeHarnessFuture, ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
+    TerminalOutputCandidate,
 };
 use egopulse_process_supervision::{SupervisedProcess, SupervisedProcessSpec};
 use prost_types::Timestamp;
@@ -410,6 +411,34 @@ impl NativeHarnessDriver for DshAcpDriver {
                     DshAcpMessage::Response(_) => {}
                 }
             }
+        })
+    }
+
+    fn take_terminal_output_candidate<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<TerminalOutputCandidate>, DriverError>> {
+        Box::pin(async move {
+            if self.completed_dispatch_id.as_deref() != Some(envelope.dispatch_id.as_str()) {
+                return Ok(None);
+            }
+            let Some(active) = self
+                .active
+                .as_mut()
+                .filter(|value| value.dispatch_id == envelope.dispatch_id)
+            else {
+                return Ok(None);
+            };
+            if active.output_text.is_empty() {
+                return Ok(None);
+            }
+            let content = std::mem::take(&mut active.output_text).into_bytes();
+            Ok(Some(TerminalOutputCandidate {
+                dispatch_id: envelope.dispatch_id.clone(),
+                native_completion_ref: format!("dsh-acp-prompt:{}", active.prompt_request_id),
+                media_type: "text/plain; charset=utf-8".to_owned(),
+                content,
+            }))
         })
     }
 
@@ -981,6 +1010,42 @@ mod tests {
             ReconciliationFinding::OutcomeUnknown {
                 evidence_ref: DSH_NATIVE_RECOVERY_UNSUPPORTED_EVIDENCE_REF.to_owned(),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_terminal_text_is_exposed_only_as_a_one_shot_candidate() {
+        let mut driver = DshAcpDriver::new(DshAcpConfig::new(
+            r"C:\dsh.exe",
+            std::env::current_dir().expect("cwd"),
+        ));
+        driver.active = Some(ActiveDispatch {
+            dispatch_id: "dispatch:dsh-output-candidate".to_owned(),
+            native_session_ref: "dsh-session-candidate".to_owned(),
+            prompt_request_id: 41,
+            output_text: "committed answer".to_owned(),
+        });
+        driver.completed_dispatch_id = Some("dispatch:dsh-output-candidate".to_owned());
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch:dsh-output-candidate".to_owned(),
+            ..DispatchEnvelope::default()
+        };
+
+        let candidate = driver
+            .take_terminal_output_candidate(&envelope)
+            .await
+            .expect("candidate extraction must not fail")
+            .expect("completed text must be available to the collector");
+        assert_eq!(candidate.dispatch_id, envelope.dispatch_id);
+        assert_eq!(candidate.native_completion_ref, "dsh-acp-prompt:41");
+        assert_eq!(candidate.media_type, "text/plain; charset=utf-8");
+        assert_eq!(candidate.content, b"committed answer");
+        assert!(
+            driver
+                .take_terminal_output_candidate(&envelope)
+                .await
+                .expect("replay candidate extraction")
+                .is_none()
         );
     }
 }

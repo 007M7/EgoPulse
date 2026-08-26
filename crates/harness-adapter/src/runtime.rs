@@ -76,6 +76,19 @@ pub struct DriverDelivery {
     pub raw_evidence: Vec<u8>,
 }
 
+/// Provider-neutral output bytes that are still only a collector candidate.
+///
+/// This boundary deliberately stops before Artifact Authority. The bytes and
+/// native completion reference can be handed to a governed collector, but
+/// they are not an ArtifactReturnObservation, a Claim, or a completion fact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalOutputCandidate {
+    pub dispatch_id: String,
+    pub native_completion_ref: String,
+    pub media_type: String,
+    pub content: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DriverEvent {
     pub native_key: String,
@@ -130,6 +143,16 @@ pub trait NativeHarnessDriver {
         &'a mut self,
         envelope: &'a DispatchEnvelope,
     ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>>;
+
+    /// Returns committed native output only as a candidate for a separate
+    /// governed collector. Drivers that cannot expose committed output keep
+    /// the default `None` and remain lifecycle-only at this boundary.
+    fn take_terminal_output_candidate<'a>(
+        &'a mut self,
+        _envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<TerminalOutputCandidate>, DriverError>> {
+        Box::pin(async { Ok(None) })
+    }
 
     fn decide_approval<'a>(
         &'a mut self,
@@ -360,6 +383,16 @@ where
             crate::ObservationAppend::Committed(value)
             | crate::ObservationAppend::Replay(value) => value,
         }))
+    }
+
+    /// Reads a driver-owned terminal output candidate without persisting it.
+    /// A caller must pass the candidate to a governed collector; this method
+    /// cannot create an Artifact Authority fact by itself.
+    pub async fn take_terminal_output_candidate(
+        &mut self,
+        envelope: &DispatchEnvelope,
+    ) -> Result<Option<TerminalOutputCandidate>, DriverError> {
+        self.driver.take_terminal_output_candidate(envelope).await
     }
 
     pub async fn decide_approval(

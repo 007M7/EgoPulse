@@ -27,11 +27,15 @@ slice includes:
 - reconciliation remains `OutcomeUnknown` because native load/resume is absent.
 
 The adapter does not promote a committed assistant message to a terminal
-Verdict or Artifact. ACP content chunks are retained only as in-process
-observations; the candidate currently emits terminal lifecycle evidence from
-the native prompt response and does not claim artifact semantics. Those
-transformations require the provider-neutral contract and independent
-approval, artifact and recovery evidence.
+Verdict or Artifact. It now exposes the committed text through the
+provider-neutral `TerminalOutputCandidate` handoff, but that handoff is
+one-shot, in-memory candidate data only. It is not persisted as an
+`ArtifactReturnObservation`, and it cannot write Artifact Authority. A
+separate governed collector must still perform blob publication, digest
+verification, Artifact/Claim/Evidence/ArtifactSet construction and
+ReturnHandoff submission before any technical return receipt exists. The
+candidate test `committed_terminal_text_is_exposed_only_as_a_one_shot_candidate`
+proves the extraction and replay boundary.
 
 ## Why this integration shape
 
@@ -56,6 +60,9 @@ approval, artifact and recovery evidence.
   compiled ACP demo: fresh terminal lifecycle, native cancellation, and a
   governed native permission round-trip, all without a model/API call.
 - DSH adapter Clippy with warnings denied: passed.
+- The provider-neutral terminal candidate extraction unit test passed; it
+  proves committed ACP text is available to a future collector exactly once,
+  without treating it as an Artifact or terminal completion fact.
 
 The keyless lifecycle evidence is now complete for the ACP operations DSH
 actually implements: multi-turn prompt, committed update, and cancellation.
