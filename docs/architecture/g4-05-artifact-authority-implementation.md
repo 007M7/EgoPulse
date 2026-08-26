@@ -1,6 +1,6 @@
 # G4-05 Artifact Authority implementation profile
 
-- Status: implementation verified; Gate 4 governance evidence pending
+- Status: implementation and Gate 4 governance evidence verified locally
 - Date: 2026-08-24
 - Frozen inputs: C-04 Artifact/Claim/Evidence/ReturnHandoff, C-08 Persistence/Recovery, D-02
 - Scope: immutable Artifact, Claim, Evidence, ArtifactSet and technical ReturnReceipt intake
@@ -64,6 +64,20 @@ mutable workspace path.
 - ReturnHandoff + technical ReturnReceipt + outbox in one owner transaction;
 - orphan-blob reuse and process-abort replay after committed return;
 - encrypted metadata-store reopen/integrity and private-store dependency boundary checks.
+
+The dedicated Windows x64 evidence is the Rust integration test
+`crates/artifact-authority/tests/artifact_authority_g4_05.rs`:
+
+```powershell
+cargo test -p egopulse-artifact-authority `
+  --test artifact_authority_g4_05 -- --nocapture
+```
+
+Result: `9 passed, 0 failed`. The suite includes an isolated child-process
+crash probe and verifies the complete exit-evidence list above. The result
+closes the G4-05 governance-evidence gap; it does not silently close the
+separate G4-08 blob-at-rest security composition or G4-10 power-loss/recovery
+qualification obligations.
 
 ## Explicitly deferred production obligations
 
