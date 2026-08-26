@@ -102,8 +102,13 @@ proves the real Windows daemon/read path. The new G4-11 fixture additionally ope
 the real Artifact Authority and Verification Authority stores, submits a sealed
 ArtifactSet/receipted ReturnHandoff, completes an accepted VerificationArtifact,
 and proves that the production resolver joins those authorities against the typed
-Collaboration lineage. A real daemon + Harness execution with that committed
-Verification artifact remains the final integration evidence still to be added.
+Collaboration lineage. The daemon composition now exposes an explicit
+`NativeHarnessDriver` injection boundary: Codex remains the default driver, while
+deterministic fixtures can exercise the same production runner and collector without
+replacing any Authority or Collaboration writer. A real daemon + Harness execution
+with that committed Verification artifact remains the final integration evidence still
+to be added; the injection boundary is a testability improvement, not evidence that
+this final integration has already passed.
 
 The latest local evidence is:
 

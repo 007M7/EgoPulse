@@ -27,7 +27,7 @@ use egopulse_domain_contracts::{
 };
 use egopulse_harness_adapter::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeKey, GovernedHarnessAdapter,
-    SystemAdapterClock,
+    NativeHarnessDriver, SystemAdapterClock,
 };
 use egopulse_local_api::{
     cognition_gateway::{
@@ -514,13 +514,39 @@ impl DaemonProviders {
     /// the returned runner is the only process-local writer that sequences
     /// activation consumption and dispatch for this vertical.
     pub fn with_codex_harness(
-        mut self,
+        self,
         config: CodexHarnessCompositionConfig,
         artifact_authority: Arc<
             Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
         >,
         verification: Arc<Mutex<egopulse_verification_authority::VerificationAuthority>>,
     ) -> Result<Self, DaemonCompositionError> {
+        let executable = config.codex_executable.clone();
+        self.with_native_harness_driver(
+            config,
+            artifact_authority,
+            verification,
+            CodexAppServerDriver::new(CodexAppServerConfig::new(executable)),
+        )
+    }
+
+    /// Installs the production Harness composition around an explicit native
+    /// driver. Codex is the normal caller, while deterministic integration
+    /// fixtures can provide the same `NativeHarnessDriver` contract without
+    /// bypassing Collaboration Control, Adapter Edge, Artifact Authority, or
+    /// Verification Authority.
+    pub fn with_native_harness_driver<D>(
+        mut self,
+        config: CodexHarnessCompositionConfig,
+        artifact_authority: Arc<
+            Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
+        >,
+        verification: Arc<Mutex<egopulse_verification_authority::VerificationAuthority>>,
+        driver: D,
+    ) -> Result<Self, DaemonCompositionError>
+    where
+        D: NativeHarnessDriver + Send + 'static,
+    {
         config.validate()?;
         if self.harness_dispatch_runner.is_some() {
             return Err(DaemonCompositionError::InvalidConfiguration(
@@ -575,7 +601,7 @@ impl DaemonProviders {
             codex_protocol_fingerprint(),
             writer_edge,
             FileDispatchMaterialResolver::new(config.input_bundle_root, config.workspace_root),
-            CodexAppServerDriver::new(CodexAppServerConfig::new(config.codex_executable)),
+            driver,
             SystemAdapterClock,
         );
         let principal = AuthenticatedCollaborationPrincipal {
