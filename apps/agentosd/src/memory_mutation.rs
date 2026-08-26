@@ -155,3 +155,145 @@ fn format_memory_state(state: egopulse_cognition_runtime::memory_authority::Memo
     }
     .to_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egopulse_cognition_runtime::{
+        memory_authority::MemoryAuthorityConfig, task_authority::SqlCipherKey,
+    };
+    use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
+        AcceptMemoryCommand, SubmitMemoryCandidateCommand,
+    };
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn principal(kind: &str) -> CommandPrincipal {
+        CommandPrincipal {
+            principal_id: "founder-local".to_owned(),
+            required_authority_principal_kinds: vec![kind.to_owned()],
+        }
+    }
+
+    fn database_path() -> PathBuf {
+        std::env::temp_dir().join(format!("egopulse-memory-gateway-{}.db", Uuid::now_v7()))
+    }
+
+    #[test]
+    fn adapter_preserves_candidate_governance_cas_and_idempotency() {
+        let database_path = database_path();
+        let authority = Arc::new(Mutex::new(
+            MemoryAuthority::open(MemoryAuthorityConfig {
+                database_path: database_path.clone(),
+                store_epoch: "memory-gateway-test".to_owned(),
+                key: SqlCipherKey::new([0x71; 32]),
+            })
+            .expect("memory authority"),
+        ));
+        let adapter = MemoryMutationPortAdapter::new(Arc::clone(&authority));
+        let candidate = MemoryMutationCommand {
+            command: Some(memory_mutation_command::Command::SubmitMemoryCandidate(
+                SubmitMemoryCandidateCommand {
+                    memory_id: "memory-1".to_owned(),
+                    content: "durable fact".to_owned(),
+                    source_ref: "source:session-1".to_owned(),
+                    scope_ref: "scope:founder".to_owned(),
+                    idempotency_key: "candidate-1".to_owned(),
+                    ..Default::default()
+                },
+            )),
+        };
+        let candidate_receipt = adapter
+            .execute(&candidate, &principal("MemoryAuthority.Founder"))
+            .expect("candidate receipt");
+        assert_eq!(candidate_receipt.state, "candidate");
+        assert_eq!(candidate_receipt.revision, 1);
+
+        let accept = MemoryMutationCommand {
+            command: Some(memory_mutation_command::Command::AcceptMemory(
+                AcceptMemoryCommand {
+                    memory_id: "memory-1".to_owned(),
+                    expected_revision: 1,
+                    evidence_ref: "evidence:founder-review-1".to_owned(),
+                    idempotency_key: "accept-1".to_owned(),
+                    ..Default::default()
+                },
+            )),
+        };
+        let accepted = adapter
+            .execute(&accept, &principal("MemoryAuthority.Founder"))
+            .expect("accept receipt");
+        assert_eq!(accepted.state, "accepted");
+        assert_eq!(accepted.revision, 2);
+        let replay = adapter
+            .execute(&accept, &principal("MemoryAuthority.Founder"))
+            .expect("idempotent replay");
+        assert_eq!(replay, accepted);
+
+        let stale_revoke = MemoryMutationCommand {
+            command: Some(memory_mutation_command::Command::RevokeMemory(
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::RevokeMemoryCommand {
+                    memory_id: "memory-1".to_owned(),
+                    expected_revision: 1,
+                    evidence_ref: "evidence:founder-revoke-stale".to_owned(),
+                    idempotency_key: "revoke-stale-1".to_owned(),
+                    ..Default::default()
+                },
+            )),
+        };
+        assert_eq!(
+            adapter
+                .execute(
+                    &stale_revoke,
+                    &principal("MemoryAuthority.FounderAuthority"),
+                )
+                .expect_err("stale revision must fail"),
+            CommandPortFailure::IntegrityFailure
+        );
+
+        let revoke = MemoryMutationCommand {
+            command: Some(memory_mutation_command::Command::RevokeMemory(
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::RevokeMemoryCommand {
+                    memory_id: "memory-1".to_owned(),
+                    expected_revision: 2,
+                    evidence_ref: "evidence:founder-revoke-1".to_owned(),
+                    idempotency_key: "revoke-1".to_owned(),
+                    ..Default::default()
+                },
+            )),
+        };
+        let revoked = adapter
+            .execute(&revoke, &principal("MemoryAuthority.FounderAuthority"))
+            .expect("revoke receipt");
+        assert_eq!(revoked.state, "revoked");
+        assert_eq!(revoked.revision, 3);
+        drop(authority);
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn candidate_adapter_rejects_a_governance_only_principal_constraint() {
+        let database_path = database_path();
+        let authority = Arc::new(Mutex::new(
+            MemoryAuthority::open(MemoryAuthorityConfig {
+                database_path: database_path.clone(),
+                store_epoch: "memory-gateway-test-reject".to_owned(),
+                key: SqlCipherKey::new([0x72; 32]),
+            })
+            .expect("memory authority"),
+        ));
+        let adapter = MemoryMutationPortAdapter::new(authority);
+        let command = MemoryMutationCommand {
+            command: Some(memory_mutation_command::Command::SubmitMemoryCandidate(
+                SubmitMemoryCandidateCommand::default(),
+            )),
+        };
+        assert_eq!(
+            adapter
+                .execute(&command, &principal("MemoryAuthority.FounderAuthority"),)
+                .expect_err("candidate must require Founder"),
+            CommandPortFailure::IntegrityFailure
+        );
+        let _ = std::fs::remove_file(database_path);
+    }
+}
