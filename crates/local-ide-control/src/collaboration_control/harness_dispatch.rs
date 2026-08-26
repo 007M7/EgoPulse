@@ -7,8 +7,9 @@ use super::{
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::get_collaboration_response;
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
-    AttemptCommandBase, CollaborationCommand, CommitStepReturnCommand, RecordAttemptReturnCommand,
-    RunCommandBase, collaboration_command, collaboration_command_result,
+    AttemptCommandBase, AttemptStatus, CollaborationCommand, CommitStepReturnCommand,
+    RecordAttemptReturnCommand, RunCommandBase, RunStatus, StepStatus, collaboration_command,
+    collaboration_command_result,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::CommandMetadata;
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
@@ -395,45 +396,59 @@ where
                     "Collaboration attempt is unavailable".to_owned(),
                 )
             })?;
-        let mut command = CollaborationCommand {
-            command: Some(collaboration_command::Command::RecordAttemptReturn(
-                RecordAttemptReturnCommand {
-                    base: Some(AttemptCommandBase {
-                        meta: Some(CommandMetadata {
-                            command_id: format!("artifact-return:{}", pending.receipt.receipt_id),
-                            idempotency_key: pending.receipt.receipt_id.clone(),
-                            idempotency_scope: attempt.attempt_id.clone(),
-                            request_digest_sha256: String::new(),
-                            issued_at: pending.receipt.committed_at,
-                            correlation_id: pending.receipt.return_handoff_id.clone(),
-                            causation_id: None,
+        let technical_return_already_recorded = attempt.status == AttemptStatus::Returned as i32
+            && step.status == StepStatus::ReturnPending as i32
+            && run.status == RunStatus::ReturnPending as i32;
+        if !technical_return_already_recorded {
+            let mut command = CollaborationCommand {
+                command: Some(collaboration_command::Command::RecordAttemptReturn(
+                    RecordAttemptReturnCommand {
+                        base: Some(AttemptCommandBase {
+                            meta: Some(CommandMetadata {
+                                command_id: format!(
+                                    "artifact-return:{}",
+                                    pending.receipt.receipt_id
+                                ),
+                                idempotency_key: pending.receipt.receipt_id.clone(),
+                                idempotency_scope: attempt.attempt_id.clone(),
+                                request_digest_sha256: String::new(),
+                                issued_at: pending.receipt.committed_at,
+                                correlation_id: pending.receipt.return_handoff_id.clone(),
+                                causation_id: None,
+                            }),
+                            run_id: run.run_id.clone(),
+                            expected_run_revision: run.revision,
+                            step_id: step.step_id.clone(),
+                            expected_step_revision: step.revision,
+                            attempt_id: attempt.attempt_id.clone(),
+                            expected_attempt_revision: attempt.revision,
                         }),
-                        run_id: run.run_id.clone(),
-                        expected_run_revision: run.revision,
-                        step_id: step.step_id.clone(),
-                        expected_step_revision: step.revision,
-                        attempt_id: attempt.attempt_id.clone(),
-                        expected_attempt_revision: attempt.revision,
-                    }),
-                    fencing_token: lineage.fencing_token,
-                    harness_sequence: candidate.source_revision,
-                    artifact_return_receipt_id: pending.receipt.receipt_id.clone(),
-                    receipt_digest_sha256: hex::encode(sha2::Sha256::digest(
-                        pending.receipt.encode_to_vec(),
-                    )),
-                },
-            )),
-        };
-        seal_request_digest(&mut command).ok_or_else(|| {
-            HarnessDispatchCycleError::ReturnCollector(
-                "Artifact return command could not be sealed".to_owned(),
-            )
-        })?;
-        let result = control.execute(&command, principal)?;
-        if result.committed_event.is_none() && !result.replayed {
-            return Err(HarnessDispatchCycleError::ReturnCollector(
-                "Collaboration rejected Artifact return".to_owned(),
-            ));
+                        fencing_token: lineage.fencing_token,
+                        harness_sequence: candidate.source_revision,
+                        artifact_return_receipt_id: pending.receipt.receipt_id.clone(),
+                        receipt_digest_sha256: hex::encode(sha2::Sha256::digest(
+                            pending.receipt.encode_to_vec(),
+                        )),
+                    },
+                )),
+            };
+            seal_request_digest(&mut command).ok_or_else(|| {
+                HarnessDispatchCycleError::ReturnCollector(
+                    "Artifact return command could not be sealed".to_owned(),
+                )
+            })?;
+            let result = control.execute(&command, principal)?;
+            if result.committed_event.is_none() && !result.replayed {
+                let detail = match result.outcome.as_ref() {
+                    Some(collaboration_command_result::Outcome::Error(error)) => {
+                        format!("{}:{}", error.code, error.safe_detail_code)
+                    }
+                    _ => "missing collaboration error outcome".to_owned(),
+                };
+                return Err(HarnessDispatchCycleError::ReturnCollector(format!(
+                    "Collaboration rejected Artifact return ({detail})"
+                )));
+            }
         }
 
         let Some(step_return_principal) = step_return_principal else {
@@ -510,9 +525,15 @@ where
             if verification_pending {
                 continue;
             }
-            return Err(HarnessDispatchCycleError::ReturnCollector(
-                "Collaboration rejected Verification-gated Step return".to_owned(),
-            ));
+            return Err(HarnessDispatchCycleError::ReturnCollector(format!(
+                "Collaboration rejected Verification-gated Step return ({})",
+                match step_result.outcome.as_ref() {
+                    Some(collaboration_command_result::Outcome::Error(error)) => {
+                        format!("{}:{}", error.code, error.safe_detail_code)
+                    }
+                    _ => "missing collaboration error outcome".to_owned(),
+                }
+            )));
         }
         if !source
             .acknowledge_return(&pending.message_id, &pending.payload_digest_sha256)

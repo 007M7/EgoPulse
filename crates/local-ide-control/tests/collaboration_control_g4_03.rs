@@ -1,4 +1,5 @@
 use egopulse_codex_adapter::{FakeCodexDriver, codex_protocol_fingerprint};
+use egopulse_domain_contracts::v01::egopulse::artifact::v1::{LineageBinding, ReturnReceipt};
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCancellationDisposition,
     AttemptCommandBase, AttemptSnapshot, AttemptStatus, BeginAttemptReconciliationCommand,
@@ -23,12 +24,13 @@ use egopulse_harness_adapter::{
     GovernedHarnessAdapter, ReconciliationFinding, ResolvedDispatchMaterial,
 };
 use egopulse_local_ide_control::collaboration_control::{
-    AdapterBackedHarnessEvidenceResolver, AuthenticatedCollaborationPrincipal, AuthorityClock,
-    CollaborationControl, CollaborationControlConfig, CollaborationControlError,
-    CollaborationPrincipalKind, CollaborationReferenceGuard, CollaborationSqlCipherKey,
-    CompositeCollaborationGuard, DispatchMaterial, GovernedTaskActivationRunner,
-    HarnessDispatchRunner, HarnessEvidenceResolver, HarnessFactIngestionDisposition,
-    LeaseAuthorization, ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
+    AdapterBackedHarnessEvidenceResolver, ArtifactReturnSource,
+    AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
+    CollaborationControlConfig, CollaborationControlError, CollaborationPrincipalKind,
+    CollaborationReferenceGuard, CollaborationSqlCipherKey, CompositeCollaborationGuard,
+    DispatchMaterial, GovernedTaskActivationRunner, HarnessDispatchRunner, HarnessEvidenceResolver,
+    HarnessFactIngestionDisposition, LeaseAuthorization, PendingArtifactReturn,
+    ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
     ResolvedHarnessEvidence, ResolvedStepReturn, SingleHarnessWorkConfig,
     SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError, TaskActivationGuardSet,
     TaskActivationHandoff, TaskActivationReferenceGuard, TaskActivationSource,
@@ -106,6 +108,123 @@ impl TaskActivationSource for FixtureActivationSource {
             .expect("activation source mutex")
             .retain(|value| value.message_id != message_id);
         Ok(true)
+    }
+}
+
+struct FixtureArtifactReturnSource {
+    pending: Mutex<Vec<PendingArtifactReturn>>,
+    acknowledged: Mutex<Vec<String>>,
+}
+
+impl ArtifactReturnSource for FixtureArtifactReturnSource {
+    fn pending_returns(&self) -> Result<Vec<PendingArtifactReturn>, String> {
+        Ok(self.pending.lock().expect("return source mutex").clone())
+    }
+
+    fn acknowledge_return(
+        &self,
+        message_id: &str,
+        _payload_digest_sha256: &str,
+    ) -> Result<bool, String> {
+        self.acknowledged
+            .lock()
+            .expect("return acknowledgement mutex")
+            .push(message_id.to_owned());
+        self.pending
+            .lock()
+            .expect("return source mutex")
+            .retain(|value| value.message_id != message_id);
+        Ok(true)
+    }
+}
+
+struct FixtureReturnEvidence {
+    adapter: AdapterBackedHarnessEvidenceResolver,
+    verification_available: Arc<Mutex<bool>>,
+}
+
+impl HarnessEvidenceResolver for FixtureReturnEvidence {
+    fn resolve_delivery_receipt(
+        &self,
+        command: &RecordDeliveryReceiptCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+        self.adapter.resolve_delivery_receipt(command, snapshot)
+    }
+
+    fn resolve_harness_ack(
+        &self,
+        command: &RecordHarnessAckCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+        self.adapter.resolve_harness_ack(command, snapshot)
+    }
+
+    fn validate_running_observation(
+        &self,
+        command: &RecordRunningObservationCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.adapter.validate_running_observation(command, snapshot)
+    }
+
+    fn validate_cancellation_outcome(
+        &self,
+        command: &RecordAttemptCancellationOutcomeCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.adapter
+            .validate_cancellation_outcome(command, snapshot)
+    }
+
+    fn validate_reconciliation(
+        &self,
+        command: &RecordAttemptReconciliationCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.adapter.validate_reconciliation(command, snapshot)
+    }
+
+    fn resolve_attempt_return(
+        &self,
+        command: &RecordAttemptReturnCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
+        if command.artifact_return_receipt_id != "return-receipt-runner-001" {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ResolvedArtifactReturn {
+            artifact_set_id: "artifact-set-runner-001".to_owned(),
+            return_handoff_id: "return-handoff-runner-001".to_owned(),
+            dispatch_id: snapshot
+                .attempts
+                .iter()
+                .find_map(|attempt| attempt.dispatch_id.clone())
+                .ok_or(ReferenceGuardRejection::UnverifiedReference)?,
+            evidence_refs: vec!["fixture:artifact-return@durable".to_owned()],
+        })
+    }
+
+    fn resolve_step_return(
+        &self,
+        command: &CommitStepReturnCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedStepReturn, ReferenceGuardRejection> {
+        if !*self
+            .verification_available
+            .lock()
+            .expect("Verification availability mutex")
+            || command.artifact_set_id != "artifact-set-runner-001"
+            || command.return_handoff_id != "return-handoff-runner-001"
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ResolvedStepReturn {
+            artifact_set_id: command.artifact_set_id.clone(),
+            return_handoff_id: command.return_handoff_id.clone(),
+            verification_artifact_id: "verification-artifact-runner-001".to_owned(),
+            evidence_refs: vec!["fixture:verification@durable".to_owned()],
+        })
     }
 }
 
@@ -1642,6 +1761,159 @@ async fn task_activation_runner_commits_then_dispatches_through_one_runtime() {
             .expect("activation acknowledgement mutex")
             .as_slice(),
         ["task-outbox-activation-runner-001"]
+    );
+}
+
+#[tokio::test]
+async fn task_activation_runner_retries_verification_gated_return_before_ack() {
+    let collaboration_store = IsolatedStore::new("task-activation-return-retry-collaboration");
+    let adapter_store = IsolatedStore::new("task-activation-return-retry-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let bundle = br#"{"input":"return-retry"}"#.to_vec();
+    let mut material = dispatch_material();
+    material.input_bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+    let config = SingleHarnessWorkConfig {
+        run_id: "run-return-retry-001".to_owned(),
+        attempt_id: "attempt-return-retry-001".to_owned(),
+        dispatch_id: "dispatch-return-retry-001".to_owned(),
+        plan: run_plan(),
+        harness_id: "codex".to_owned(),
+        capability_profile_ref: contract_ref("single-harness-capability", '3'),
+        workspace_ref: "workspace-001".to_owned(),
+        lease_policy_ref: contract_ref("v01-attempt-lease", 'a'),
+        owner_instance_id: "attempt-supervisor:return-retry".to_owned(),
+        material,
+        task_authority_principal_id: "task-authority:return-retry".to_owned(),
+        collaboration_principal_id: "collaboration-control:return-retry".to_owned(),
+        attempt_supervisor_principal_id: "attempt-supervisor:return-retry".to_owned(),
+        harness_adapter_principal_id: "adapter:codex".to_owned(),
+    };
+    let task = TaskSnapshot {
+        task_id: "task-return-retry-001".to_owned(),
+        revision: 2,
+        work_revision: 1,
+        status: TaskStatus::Active as i32,
+        current_run_id: Some(config.run_id.clone()),
+        ..Default::default()
+    };
+    let activation_source = Arc::new(FixtureActivationSource {
+        pending: Mutex::new(vec![TaskActivationHandoff {
+            message_id: "task-outbox-return-retry-001".to_owned(),
+            payload_digest_sha256: "d".repeat(64),
+            task: task.clone(),
+        }]),
+        acknowledged: Mutex::new(Vec::new()),
+    });
+    let artifact_source = Arc::new(FixtureArtifactReturnSource {
+        pending: Mutex::new(Vec::new()),
+        acknowledged: Mutex::new(Vec::new()),
+    });
+    let verification_available = Arc::new(Mutex::new(false));
+    let (guard, binding) = TaskActivationGuardSet::new(FixtureReturnEvidence {
+        adapter: AdapterBackedHarnessEvidenceResolver::new(open_loop_adapter_edge(
+            &adapter_database,
+        )),
+        verification_available: Arc::clone(&verification_available),
+    });
+    let clock = FixedClock::new(FIXED_TIME);
+    let control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        FakeCodexDriver::default().with_deferred_terminal(),
+        clock,
+    );
+    let runner = GovernedTaskActivationRunner::new(
+        control,
+        adapter,
+        Arc::clone(&activation_source),
+        FixtureWorkflowResolver(config.clone()),
+        harness_adapter(),
+        binding,
+        30,
+    )
+    .with_artifact_return_source(
+        artifact_source.clone() as Arc<dyn ArtifactReturnSource>,
+        artifact_authority(),
+    )
+    .with_step_return_principal(collaboration_control());
+
+    runner
+        .run_once()
+        .await
+        .expect("start governed return retry run");
+    runner
+        .run_once()
+        .await
+        .expect("produce durable terminal Harness candidate");
+    artifact_source
+        .pending
+        .lock()
+        .expect("return source mutex")
+        .push(PendingArtifactReturn {
+            message_id: "artifact-outbox-return-retry-001".to_owned(),
+            payload_digest_sha256: "e".repeat(64),
+            receipt: ReturnReceipt {
+                receipt_id: "return-receipt-runner-001".to_owned(),
+                artifact_set_id: "artifact-set-runner-001".to_owned(),
+                return_handoff_id: "return-handoff-runner-001".to_owned(),
+                accepted_for_evidence_intake: true,
+                verification_performed: false,
+                task_completion_decided: false,
+                committed_at: Some(Timestamp {
+                    seconds: FIXED_TIME,
+                    nanos: 0,
+                }),
+                lineage: Some(LineageBinding {
+                    task_id: task.task_id,
+                    task_revision: task.revision,
+                    work_revision: task.work_revision,
+                    run_id: config.run_id,
+                    run_revision: 5,
+                    step_id: "step-001".to_owned(),
+                    step_revision: 4,
+                    attempt_id: config.attempt_id,
+                    attempt_revision: 3,
+                    dispatch_id: config.dispatch_id,
+                    fencing_token: 1,
+                }),
+                ..ReturnReceipt::default()
+            },
+        });
+
+    runner
+        .run_once()
+        .await
+        .expect("hold return while Verification proof is unavailable");
+    assert!(
+        artifact_source
+            .acknowledged
+            .lock()
+            .expect("return acknowledgement mutex")
+            .is_empty()
+    );
+
+    *verification_available
+        .lock()
+        .expect("Verification availability mutex") = true;
+    runner
+        .run_once()
+        .await
+        .expect("retry and commit Verification-gated Step return");
+    assert_eq!(
+        artifact_source
+            .acknowledged
+            .lock()
+            .expect("return acknowledgement mutex")
+            .as_slice(),
+        ["artifact-outbox-return-retry-001"]
     );
 }
 
