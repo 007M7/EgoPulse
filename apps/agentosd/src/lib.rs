@@ -519,6 +519,7 @@ impl DaemonProviders {
         artifact_authority: Arc<
             Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
         >,
+        verification: Arc<Mutex<egopulse_verification_authority::VerificationAuthority>>,
     ) -> Result<Self, DaemonCompositionError> {
         config.validate()?;
         if self.harness_dispatch_runner.is_some() {
@@ -552,8 +553,11 @@ impl DaemonProviders {
             key: AdapterEdgeKey::new(config.adapter_key),
         })
         .map_err(DaemonCompositionError::AdapterEdge)?;
-        let evidence =
-            GovernedReturnEvidenceResolver::new(reader_edge, Arc::clone(&artifact_authority));
+        let evidence = GovernedReturnEvidenceResolver::new(
+            reader_edge,
+            Arc::clone(&artifact_authority),
+            Arc::clone(&verification),
+        );
         let (guard, reference) = TaskActivationGuardSet::new(evidence);
         let control = CollaborationControl::open(
             CollaborationControlConfig {

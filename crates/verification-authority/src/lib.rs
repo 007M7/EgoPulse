@@ -354,6 +354,19 @@ where
             .transpose()
     }
 
+    /// Lists committed Verification artifacts through the owner boundary.
+    /// Consumers must filter the decoded snapshots by their own exact
+    /// binding and acceptance policy; the Authority never exposes its store.
+    pub fn verification_artifacts(
+        &self,
+    ) -> Result<Vec<VerificationArtifact>, VerificationAuthorityFailure> {
+        self.store
+            .artifacts()?
+            .into_iter()
+            .map(|bytes| VerificationArtifact::decode(bytes.as_slice()).map_err(Into::into))
+            .collect()
+    }
+
     /// Reads a committed checker profile through the owner boundary. A
     /// system worker may use this only to recognize an already active,
     /// digest-identical attestation; it never replaces the profile.

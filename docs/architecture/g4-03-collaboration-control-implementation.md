@@ -1,7 +1,7 @@
 # G4-03 Collaboration Control implementation profile
 
-- Status: dispatch, technical return projection and guarded Step-return commit
-  implemented; production Verification/Sego resolver remains fail-closed
+- Status: dispatch, technical return projection and production Verification/Sego
+  guarded Step-return commit implemented
 - Date: 2026-08-23
 - Frozen inputs: C-02 Collaboration Contract, C-08 Persistence/Recovery Contract, Feature ADR A
 - Scope: durable Run/Step/Attempt authority through `dispatch_pending`, plus fail-closed unknown-outcome recovery
@@ -68,7 +68,7 @@ The dispatch envelope is assembled by the Authority from committed Run/Step/Atte
 
 ## G4-03 implemented mutation subset
 
-G4-03 implements `CreateRun`, `ActivateRun`, `CreateAttempt`, `AcquireAttemptLease`, `RecordDispatchIntent`, `MarkAttemptOutcomeUnknown`, the provider-neutral Harness fact path, technical `RecordAttemptReturn`, and the guarded `CommitStepReturn` state transition. `RecordAttemptReturn` persists Run/Step/Attempt together and leaves the workflow in `ReturnPending`; `CommitStepReturn` requires a resolver to prove an accepted Verification result and otherwise fails closed. Production composition must still provide the Verification Authority/Sego resolver before this final transition is enabled.
+G4-03 implements `CreateRun`, `ActivateRun`, `CreateAttempt`, `AcquireAttemptLease`, `RecordDispatchIntent`, `MarkAttemptOutcomeUnknown`, the provider-neutral Harness fact path, technical `RecordAttemptReturn`, and the guarded `CommitStepReturn` state transition. `RecordAttemptReturn` persists Run/Step/Attempt together and leaves the workflow in `ReturnPending`; `CommitStepReturn` requires a resolver to prove an accepted Verification result and otherwise fails closed. The production `agentosd` composition now supplies a read-only resolver that joins sealed ArtifactSet/Receipted ReturnHandoff facts with exactly one matching, complete, passed Verification artifact; ambiguous or stale proofs remain rejected.
 
 ## Exit tests
 
@@ -78,7 +78,7 @@ G4-03 implements `CreateRun`, `ActivateRun`, `CreateAttempt`, `AcquireAttemptLea
 - dispatch intent committed before a provider-neutral envelope becomes pollable;
 - duplicate dispatch intent replay with zero additional state/event/outbox writes;
 - technical return persists Run/Step/Attempt together and survives owner read-back;
-- Step return commit rejects missing Verification proof and replays only after a governed proof is accepted;
+- Step return commit rejects missing, stale, incomplete, failed or ambiguous Verification proof and replays only after a governed proof is accepted;
 - process abort after dispatch commit/before delivery, followed by pending outbox recovery;
 - lease-expired ambiguous execution to `outcome_unknown`/held with no retry message;
 - encrypted close/reopen integrity and dependency boundary checks.
@@ -91,7 +91,7 @@ cargo test -p egopulse-local-ide-control `
   --test collaboration_control_g4_03 -- --nocapture
 ```
 
-Result: `19 passed, 0 failed`. The suite covers the implemented dispatch,
+Result: `20 passed, 0 failed`. The suite covers the implemented dispatch,
 lease, candidate-fact, cancellation and reconciliation paths. Windows emitted
 the SQLCipher `VirtualLock` quota warning during the run; this did not change
 the pass result or database-integrity assertions, but it means this evidence

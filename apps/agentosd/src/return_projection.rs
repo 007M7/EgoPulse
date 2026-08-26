@@ -1,22 +1,73 @@
 use std::sync::{Arc, Mutex};
 
 use egopulse_artifact_authority::{ArtifactAdmissionGuard, ArtifactAuthority, ArtifactClock};
+use egopulse_domain_contracts::v01::egopulse::artifact::v1::{
+    ArtifactSetStatus, ContentAddress, HashAlgorithm, LineageBinding, ReturnHandoffStatus,
+};
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     CollaborationSnapshot, RecordAttemptCancellationOutcomeCommand,
     RecordAttemptReconciliationCommand, RecordAttemptReturnCommand, RecordDeliveryReceiptCommand,
     RecordHarnessAckCommand, RecordRunningObservationCommand,
 };
+use egopulse_domain_contracts::v01::egopulse::verification::v1::{
+    CriterionOutcome, CriterionRequirement, EvidenceCoverage, VerificationArtifact,
+    VerificationConclusion,
+};
 use egopulse_harness_adapter::AdapterEdge;
 use egopulse_local_ide_control::collaboration_control::{
     AdapterBackedHarnessEvidenceResolver, ArtifactReturnSource, HarnessEvidenceResolver,
     PendingArtifactReturn, ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
-    ResolvedHarnessEvidence,
+    ResolvedHarnessEvidence, ResolvedStepReturn,
 };
+use egopulse_verification_authority::VerificationAuthority;
 use prost::Message;
 use sha2::{Digest, Sha256};
 
 pub struct ArtifactAuthorityReturnSource<G, C> {
     authority: Arc<Mutex<ArtifactAuthority<G, C>>>,
+}
+
+fn complete_sha256(value: Option<&ContentAddress>) -> bool {
+    value.is_some_and(|value| {
+        value.algorithm == HashAlgorithm::Sha256 as i32
+            && value.byte_length > 0
+            && value.digest.len() == 64
+            && value
+                .digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn select_accepted_verification_artifact(
+    artifacts: Vec<VerificationArtifact>,
+    artifact_set: &egopulse_domain_contracts::v01::egopulse::artifact::v1::ArtifactSet,
+    lineage: &LineageBinding,
+) -> Option<VerificationArtifact> {
+    let mut candidates = artifacts
+        .into_iter()
+        .filter(|artifact| {
+            let Some(binding) = artifact.binding.as_ref() else {
+                return false;
+            };
+            let Some(artifact_lineage) = binding.lineage.as_ref() else {
+                return false;
+            };
+            binding.artifact_set_id == artifact_set.artifact_set_id
+                && binding.artifact_set_manifest == artifact_set.canonical_manifest
+                && artifact_lineage == lineage
+                && artifact.version == 1
+                && artifact.conclusion == VerificationConclusion::Passed as i32
+                && artifact.overall_evidence_coverage == EvidenceCoverage::Complete as i32
+                && complete_sha256(artifact.canonical_payload.as_ref())
+                && artifact.completed_at.is_some()
+                && artifact.criterion_results.iter().all(|result| {
+                    result.requirement != CriterionRequirement::MustPass as i32
+                        || result.outcome == CriterionOutcome::Passed as i32
+                })
+        })
+        .collect::<Vec<_>>();
+    (candidates.len() == 1).then(|| candidates.pop().expect("one candidate"))
 }
 
 impl<G, C> ArtifactAuthorityReturnSource<G, C> {
@@ -78,14 +129,20 @@ where
 pub struct GovernedReturnEvidenceResolver<G, C> {
     harness: AdapterBackedHarnessEvidenceResolver,
     authority: Arc<Mutex<ArtifactAuthority<G, C>>>,
+    verification: Arc<Mutex<VerificationAuthority>>,
 }
 
 impl<G, C> GovernedReturnEvidenceResolver<G, C> {
     #[must_use]
-    pub fn new(edge: AdapterEdge, authority: Arc<Mutex<ArtifactAuthority<G, C>>>) -> Self {
+    pub fn new(
+        edge: AdapterEdge,
+        authority: Arc<Mutex<ArtifactAuthority<G, C>>>,
+        verification: Arc<Mutex<VerificationAuthority>>,
+    ) -> Self {
         Self {
             harness: AdapterBackedHarnessEvidenceResolver::new(edge),
             authority,
+            verification,
         }
     }
 }
@@ -220,5 +277,184 @@ where
                 ),
             ],
         })
+    }
+
+    fn resolve_step_return(
+        &self,
+        command: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::CommitStepReturnCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedStepReturn, ReferenceGuardRejection> {
+        let (handoff, artifact_set) = {
+            let authority = self
+                .authority
+                .lock()
+                .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?;
+            let handoff = authority
+                .read_return_handoff(&command.return_handoff_id)
+                .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+                .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+            let artifact_set = authority
+                .read_artifact_set(&command.artifact_set_id)
+                .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+                .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+            (handoff, artifact_set)
+        };
+        let run = snapshot
+            .run
+            .as_ref()
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let step = snapshot
+            .steps
+            .iter()
+            .find(|step| step.step_id == command.step_id)
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let attempt = snapshot
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == command.attempt_id)
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let Some(set_lineage) = artifact_set.lineage.as_ref() else {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        };
+        let Some(handoff_lineage) = handoff.lineage.as_ref() else {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        };
+        if artifact_set.status != ArtifactSetStatus::Sealed as i32
+            || handoff.status != ReturnHandoffStatus::Receipted as i32
+            || artifact_set.artifact_set_id != command.artifact_set_id
+            || handoff.return_handoff_id != command.return_handoff_id
+            || handoff.artifact_set_id != command.artifact_set_id
+            || handoff.artifact_set_manifest != artifact_set.canonical_manifest
+            || handoff_lineage != set_lineage
+            || set_lineage.task_id != run.task_id
+            || set_lineage.task_revision != run.task_revision_at_creation
+            || set_lineage.work_revision != run.work_revision
+            || set_lineage.run_id != run.run_id
+            || set_lineage.run_revision == 0
+            || set_lineage.run_revision > run.revision
+            || set_lineage.step_id != step.step_id
+            || set_lineage.step_revision == 0
+            || set_lineage.step_revision > step.revision
+            || set_lineage.attempt_id != attempt.attempt_id
+            || set_lineage.attempt_revision == 0
+            || set_lineage.attempt_revision > attempt.revision
+            || attempt.dispatch_id.as_deref() != Some(set_lineage.dispatch_id.as_str())
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+
+        let artifacts = self
+            .verification
+            .lock()
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+            .verification_artifacts()
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?;
+        let Some(verification_artifact) =
+            select_accepted_verification_artifact(artifacts, &artifact_set, set_lineage)
+        else {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        };
+        Ok(ResolvedStepReturn {
+            artifact_set_id: command.artifact_set_id.clone(),
+            return_handoff_id: command.return_handoff_id.clone(),
+            verification_artifact_id: verification_artifact.verification_artifact_id,
+            evidence_refs: vec![format!(
+                "return-handoff:{}@durable",
+                handoff.return_handoff_id
+            )],
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egopulse_domain_contracts::v01::egopulse::{
+        artifact::v1::ArtifactSet,
+        verification::v1::{CriterionResult, VerificationBinding},
+    };
+    use prost_types::Timestamp;
+
+    fn fixture() -> (ArtifactSet, LineageBinding, VerificationArtifact) {
+        let manifest = ContentAddress {
+            algorithm: HashAlgorithm::Sha256 as i32,
+            digest: "a".repeat(64),
+            byte_length: 1,
+        };
+        let lineage = LineageBinding {
+            task_id: "task-1".to_owned(),
+            task_revision: 1,
+            work_revision: 1,
+            run_id: "run-1".to_owned(),
+            run_revision: 1,
+            step_id: "step-1".to_owned(),
+            step_revision: 1,
+            attempt_id: "attempt-1".to_owned(),
+            attempt_revision: 1,
+            dispatch_id: "dispatch-1".to_owned(),
+            fencing_token: 1,
+        };
+        let artifact_set = ArtifactSet {
+            artifact_set_id: "set-1".to_owned(),
+            canonical_manifest: Some(manifest.clone()),
+            ..ArtifactSet::default()
+        };
+        let artifact = VerificationArtifact {
+            verification_artifact_id: "verification-1".to_owned(),
+            version: 1,
+            binding: Some(VerificationBinding {
+                lineage: Some(lineage.clone()),
+                artifact_set_id: artifact_set.artifact_set_id.clone(),
+                artifact_set_manifest: Some(manifest),
+                ..VerificationBinding::default()
+            }),
+            conclusion: VerificationConclusion::Passed as i32,
+            overall_evidence_coverage: EvidenceCoverage::Complete as i32,
+            criterion_results: vec![CriterionResult {
+                requirement: CriterionRequirement::MustPass as i32,
+                outcome: CriterionOutcome::Passed as i32,
+                ..CriterionResult::default()
+            }],
+            canonical_payload: Some(ContentAddress {
+                algorithm: HashAlgorithm::Sha256 as i32,
+                digest: "b".repeat(64),
+                byte_length: 1,
+            }),
+            completed_at: Some(Timestamp {
+                seconds: 1,
+                nanos: 0,
+            }),
+            ..VerificationArtifact::default()
+        };
+        (artifact_set, lineage, artifact)
+    }
+
+    #[test]
+    fn accepted_verification_selection_is_binding_and_ambiguity_safe() {
+        let (artifact_set, lineage, accepted) = fixture();
+        assert_eq!(
+            select_accepted_verification_artifact(vec![accepted.clone()], &artifact_set, &lineage,)
+                .expect("accepted artifact")
+                .verification_artifact_id,
+            "verification-1"
+        );
+
+        let mut failed = accepted.clone();
+        failed.verification_artifact_id = "verification-failed".to_owned();
+        failed.conclusion = VerificationConclusion::Failed as i32;
+        assert!(
+            select_accepted_verification_artifact(vec![failed], &artifact_set, &lineage,).is_none()
+        );
+
+        let mut duplicate = accepted.clone();
+        duplicate.verification_artifact_id = "verification-duplicate".to_owned();
+        assert!(
+            select_accepted_verification_artifact(
+                vec![accepted, duplicate],
+                &artifact_set,
+                &lineage,
+            )
+            .is_none()
+        );
     }
 }

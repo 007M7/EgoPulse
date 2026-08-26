@@ -1,9 +1,10 @@
 # Phase 2-17 governed Harness return intake
 
-- Status: technical intake and Attempt-return projection implemented; local focused gate passed
+- Status: technical intake, Attempt-return projection and Verification-gated
+  Step completion implemented; local focused gate passed
 - Date: 2026-08-26
 - Scope: native terminal output through technical Artifact Authority receipt
-- Not in scope: production Sego/Verification resolver composition and Task completion
+- Not in scope: Task completion and Founder Verdict consumption
 
 ## Ownership-preserving flow
 
@@ -29,7 +30,8 @@ native Harness driver
        receipt digest + consumed terminal sequence + current fence/revisions
        -> Attempt RETURNED; Run/Step RETURN_PENDING
   -> Verification Authority / Sego result resolver
-       exact ArtifactSet + ReturnHandoff + accepted Verification artifact
+       exact sealed ArtifactSet + Receipted ReturnHandoff
+       + exactly one matching accepted Verification artifact
        -> guarded CommitStepReturn
        -> Step/Run RETURNED
 ```
@@ -81,6 +83,9 @@ not occur at technical intake.
 
 Continue the next side without widening collector authority:
 
-1. request Sego verification using sealed Artifact Authority references;
-2. provide the production resolver for the guarded Step commit;
-3. expose the resulting state through the shared CLI/TUI kernel.
+1. drive the Verification worker from this Collaboration return boundary using
+   sealed Artifact Authority references;
+2. expose `ReturnPending`/`Returned` and verification evidence through the
+   shared CLI/TUI kernel;
+3. add the CLI/TUI E2E proof and then wire Task completion only through its
+   separately governed write-back path.

@@ -97,11 +97,12 @@ obligation. Startup-wide live-blob reconciliation, quarantine/tombstone workflow
 power-loss durability qualification remain G4-10 recovery work. These deferred obligations do not
 weaken the frozen single-writer or blob-before-metadata boundaries.
 
-## Return-path boundary still open
+## Return-path boundary
 
 The collector plus typed outbox projector close the Artifact Authority-to-Collaboration
-`RecordAttemptReturn` boundary. Collaboration now exposes a guarded `CommitStepReturn` mutation,
-but its default verification resolver remains fail-closed. A successful technical receipt still
-is not a V-01 workflow completion claim: the next vertical slice must consume the returned
-ArtifactSet through the Verification Authority/Sego path and provide the production resolver
-that can authorize this final transition.
+`RecordAttemptReturn` boundary. Collaboration also exposes a guarded `CommitStepReturn` mutation,
+and the production `agentosd` composition now supplies a read-only Verification Authority/Sego
+resolver. It accepts only a sealed ArtifactSet, a Receipted ReturnHandoff with matching lineage
+and manifest, and exactly one complete, passed Verification artifact with complete canonical proof.
+A successful technical receipt still is not a V-01 workflow completion claim; Task completion and
+Founder Verdict remain separate governed transitions.

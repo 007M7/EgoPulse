@@ -231,7 +231,7 @@ impl ProductionBootstrapConfig {
         if let Some(memory_retrieval) = self.memory_retrieval {
             providers = providers.with_memory_retrieval(memory, memory_retrieval)?;
         }
-        providers = providers.with_codex_harness(self.codex, artifact)?;
+        providers = providers.with_codex_harness(self.codex, artifact, verification)?;
         Ok(providers)
     }
 }

@@ -378,6 +378,16 @@ impl VerificationStore {
         self.snapshot("verification_artifacts", "verification_artifact_id", id)
     }
 
+    pub fn artifacts(&self) -> Result<Vec<Vec<u8>>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT snapshot FROM verification_artifacts
+             ORDER BY version DESC, verification_artifact_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn criterion_results(&self, run_id: &str) -> Result<Vec<Vec<u8>>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT snapshot FROM criterion_results
