@@ -201,14 +201,19 @@ prove authenticated production access, `session/load` or `session/resume`,
 provider-native Artifact semantics, or the full daemon Verification/return
 settlement path; those rows remain explicit admission blockers.
 
-The explicitly configured local Kimi probe was also run against Kimi CLI
-1.49.0. The process exited with code `1` before returning an ACP initialize
-response. Its bounded stderr evidence identified
-`ModuleNotFoundError: No module named 'typer'` in the local Python installation.
-This is a reproducible installation-level failure, not authentication evidence
-and not a protocol compatibility result; no prompt or model call was sent.
-The Kimi candidate therefore remains `ProvenNotSent` and requires a repaired,
-isolated installation followed by a rerun of the same probe.
+The explicitly configured local Kimi probe was run against Kimi CLI 1.49.0
+with an isolated Windows user directory. It produced the expected no-prompt
+candidate evidence: initialize passed and `session/new` returned
+`authentication_required`; no prompt or model call was sent. This proves only
+that the ACP entry point and unauthenticated session boundary are reachable.
+
+A second Python314 script entry was also tested and exited with code `1` before
+returning an ACP initialize response. Its bounded stderr evidence identified
+`ModuleNotFoundError: No module named 'typer'`. That is a reproducible
+installation-level failure, not authentication evidence or a protocol result.
+Both observations remain candidate evidence only; the Kimi candidate is not
+promoted until the authenticated prompt, Artifact, Verification/return and
+recovery matrix is complete.
 
 ## Phase 2-03 exit disposition
 
