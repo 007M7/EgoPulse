@@ -167,7 +167,9 @@ The provider-neutral unit evidence is in
 The candidate-only Kimi evidence is in
 `crates/kimi-adapter/src/lib.rs` under `tests`, including an ignored live
 Windows probe that requires an explicitly configured executable and isolated
-share directory. It must not be promoted until the authenticated
+share directory. The probe now retains a bounded process exit/stderr
+diagnostic when stdout reaches EOF, so a launcher failure is not confused with
+an ACP or authentication result. It must not be promoted until the authenticated
 `session/new`/prompt lifecycle and recovery matrix is complete.
 
 The same test module now proves that the unverified dispatch, event, approval,
@@ -199,13 +201,23 @@ prove authenticated production access, `session/load` or `session/resume`,
 provider-native Artifact semantics, or the full daemon Verification/return
 settlement path; those rows remain explicit admission blockers.
 
+The explicitly configured local Kimi probe was also run against Kimi CLI
+1.49.0. The process exited with code `1` before returning an ACP initialize
+response. Its bounded stderr evidence identified
+`ModuleNotFoundError: No module named 'typer'` in the local Python installation.
+This is a reproducible installation-level failure, not authentication evidence
+and not a protocol compatibility result; no prompt or model call was sent.
+The Kimi candidate therefore remains `ProvenNotSent` and requires a repaired,
+isolated installation followed by a rerun of the same probe.
+
 ## Phase 2-03 exit disposition
 
 Phase 2-03 closes its provider-neutral boundary and candidate-probe slice, but
 does not close second-Harness admission. The authoritative evidence is:
 
 - G4-09 capability-binding and shared Probe Gate tests;
-- the Kimi no-prompt ACP probe recorded as `authentication_required`;
+- the Kimi no-prompt ACP probe recording a pre-ACP process failure
+  (`exit_code=1`, missing Python `typer` dependency);
 - DSH isolated ACP prompt/cancel/permission evidence with Artifact and native
   recovery explicitly held;
 - Codex remaining the sole active production Harness.

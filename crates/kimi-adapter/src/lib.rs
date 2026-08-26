@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -288,9 +288,45 @@ async fn read_json_line(
         .map_err(|_| driver_error(timeout_code, request))?
         .map_err(|error| driver_error(read_code, error.to_string().as_bytes()))?;
     if bytes_read == 0 {
-        return Err(driver_error(eof_code, request));
+        let evidence = collect_process_failure_evidence(process, request).await;
+        return Err(driver_error(eof_code, &evidence));
     }
     Ok(line)
+}
+
+const MAX_PROCESS_FAILURE_STDERR_BYTES: u64 = 16 * 1024;
+
+async fn collect_process_failure_evidence(
+    process: &mut SupervisedProcess,
+    request: &[u8],
+) -> Vec<u8> {
+    let status = match process.try_wait() {
+        Ok(Some(status)) => format!("exit_status={status:?}"),
+        Ok(None) => {
+            let terminate_result = process.terminate().await;
+            let wait_result = process.wait().await;
+            format!("exit_status_after_terminate={wait_result:?};terminate={terminate_result:?}")
+        }
+        Err(error) => format!("exit_status_probe_failed={error:?}"),
+    };
+    let stderr = if let Some(stderr) = process.take_stderr() {
+        let mut bounded_stderr = Vec::new();
+        let _ = stderr
+            .take(MAX_PROCESS_FAILURE_STDERR_BYTES)
+            .read_to_end(&mut bounded_stderr)
+            .await;
+        bounded_stderr
+    } else {
+        Vec::new()
+    };
+
+    let mut evidence = Vec::with_capacity(request.len() + status.len() + stderr.len() + 32);
+    evidence.extend_from_slice(request);
+    evidence.extend_from_slice(b"\n");
+    evidence.extend_from_slice(status.as_bytes());
+    evidence.extend_from_slice(b"\nstderr=");
+    evidence.extend_from_slice(&stderr);
+    evidence
 }
 
 fn parse_initialize_response(raw: &[u8]) -> Result<ProbeHarnessResult, DriverError> {
