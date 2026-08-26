@@ -208,7 +208,12 @@ fn map_structured(
                     policy,
                     CriterionOutcome::Passed,
                     EvidenceCoverage::Complete,
-                    vec![policy.raw_output_artifact_id.clone()],
+                    // The raw checker output is an Artifact, not an
+                    // Evidence aggregate. It is carried through
+                    // `safe_detail_artifact_id`; putting it in evidence_ids
+                    // would make Verification Authority reject the result
+                    // as an evidence/artifact type confusion.
+                    Vec::new(),
                     Vec::new(),
                 ),
                 discrepancies: Vec::new(),

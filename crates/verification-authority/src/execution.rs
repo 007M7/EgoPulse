@@ -55,6 +55,8 @@ pub enum GovernedVerificationExecutionError {
     Runner(#[from] GovernedSegoRunError),
     #[error("verification request was not found")]
     RequestNotFound,
+    #[error("attested checker profile was not found")]
+    CheckerProfileNotFound,
     #[error("verification run was not found after start")]
     RunNotFound,
     #[error("verification run is not executable: {0}")]
@@ -100,6 +102,19 @@ where
             .verification_request(&plan.verification_request_id)?
             .ok_or(GovernedVerificationExecutionError::RequestNotFound)?;
         validate_request(&request, &plan)?;
+        let checker_profile = self
+            .authority
+            .lock()
+            .map_err(|_| GovernedVerificationExecutionError::AuthorityLock)?
+            .checker_profile(&plan.mapper_policy.checker_profile_ref.contract_id)?
+            .ok_or(GovernedVerificationExecutionError::CheckerProfileNotFound)?;
+        if checker_profile.checker_profile_id != plan.mapper_policy.checker_profile_ref.contract_id
+            || checker_profile.checker_version != plan.mapper_policy.checker_profile_ref.version
+            || checker_profile.profile_digest_sha256
+                != plan.mapper_policy.checker_profile_ref.sha256
+        {
+            return Err(GovernedVerificationExecutionError::InvalidPlan);
+        }
 
         let mut run = self
             .authority
@@ -163,6 +178,10 @@ where
             )
             .await?;
         let elapsed_ms = elapsed_millis(started);
+        // The mapper supplies outcome/evidence semantics, but assurance is a
+        // property of the attested checker profile. Never let the mapper's
+        // historical default rewrite that authority-owned policy field.
+        mapped.mapped.criterion_result.assurance_class = checker_profile.assurance_class;
         mapped.mapped.criterion_result.duration_ms = elapsed_ms;
 
         let recovered_existing_result = if let Some(stored) = run

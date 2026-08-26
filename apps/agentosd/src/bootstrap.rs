@@ -50,12 +50,12 @@ use crate::{
     CodexHarnessCompositionConfig, ConfiguredArtifactAdmissionGuard,
     ConfiguredArtifactAdmissionGuardConfig, ConfiguredAuthorityPrincipalResolver,
     ConfiguredFounderVerdictResolver, ConfiguredFounderVerdictResolverConfig,
-    ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ConfiguredVerificationWorker,
-    DaemonCompositionError, DaemonProviders, FounderVerdictConfigurationError,
-    GovernedReturnCollectorConfig, LocalUserPolicyResolver, LocalUserPolicyResolverConfig,
-    MemoryRetrievalCompositionConfig, SharedAuthorityCompositionInputs,
-    TaskAuthorityCommitReceiptSource, VerificationAuthorityArtifactSource,
-    VerificationProjectionSource, VerificationWorkerConfig,
+    ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ConfiguredTaskTransitionGuard,
+    ConfiguredVerificationWorker, DaemonCompositionError, DaemonProviders,
+    FounderVerdictConfigurationError, GovernedReturnCollectorConfig, LocalUserPolicyResolver,
+    LocalUserPolicyResolverConfig, MemoryRetrievalCompositionConfig,
+    SharedAuthorityCompositionInputs, TaskAuthorityCommitReceiptSource,
+    VerificationAuthorityArtifactSource, VerificationProjectionSource, VerificationWorkerConfig,
 };
 
 /// Explicit scalar configuration for the local-user Policy resolver. The
@@ -133,7 +133,11 @@ impl ProductionBootstrapConfig {
     /// built; no test resolver is used as a production fallback.
     pub fn build(self) -> Result<DaemonProviders, ProductionBootstrapError> {
         let task_guard = ConfiguredTaskCreationGuard::new(self.task_guard)?;
-        let task = Arc::new(Mutex::new(TaskAuthority::open(self.task, task_guard)?));
+        let task = Arc::new(Mutex::new(TaskAuthority::open_with_transition_guard(
+            self.task,
+            task_guard,
+            ConfiguredTaskTransitionGuard::new(),
+        )?));
         let memory = Arc::new(Mutex::new(MemoryAuthority::open(self.memory)?));
 
         let artifact_guard = ConfiguredArtifactAdmissionGuard::new(self.artifact_guard)?;

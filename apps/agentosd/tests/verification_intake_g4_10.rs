@@ -174,7 +174,9 @@ async fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox(
     );
     let lineage = LineageBinding {
         task_id: created.task_id.clone(),
-        task_revision: 3,
+        // The artifact set is created from the active run at revision 2;
+        // submitting Task evidence advances the Task handoff to revision 3.
+        task_revision: 2,
         work_revision: 1,
         run_id: "run-g4-10".to_owned(),
         run_revision: 1,

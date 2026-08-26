@@ -103,7 +103,7 @@ pub use security::{
     ConfiguredAuthorityPrincipalResolver, PrincipalPolicyError,
 };
 pub use task::{
-    ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig,
+    ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ConfiguredTaskTransitionGuard,
     TaskCreationGuardConfigurationError,
 };
 pub use verdict::{

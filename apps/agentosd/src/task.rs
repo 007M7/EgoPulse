@@ -1,10 +1,12 @@
 use std::collections::BTreeSet;
 
 use egopulse_cognition_runtime::task_authority::{
-    CreationAuthorization, CreationGuardRejection, TaskCreationGuard,
+    CreationAuthorization, CreationGuardRejection, TaskCreationGuard, TaskTransitionGuard,
+    TransitionAuthorization, TransitionGuardRejection,
 };
 use egopulse_domain_contracts::v01::egopulse::{
-    common::v1::ContractReference, task::v1::CreateTaskCommand,
+    common::v1::ContractReference,
+    task::v1::{CreateTaskCommand, TaskCommand, TaskSnapshot, TaskStatus, task_command},
 };
 use thiserror::Error;
 
@@ -106,6 +108,83 @@ impl TaskCreationGuard for ConfiguredTaskCreationGuard {
     }
 }
 
+/// Production transition guard for the non-terminal Task handoff path.
+///
+/// Collaboration submits Artifact/ReturnHandoff references, and the
+/// Verification worker submits a Verification artifact reference after its
+/// own cross-authority proof. Founder Verdict transitions remain denied until
+/// a Founder-verdict-aware guard is composed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConfiguredTaskTransitionGuard;
+
+impl ConfiguredTaskTransitionGuard {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl TaskTransitionGuard for ConfiguredTaskTransitionGuard {
+    fn validate(
+        &self,
+        command: &TaskCommand,
+        current: &TaskSnapshot,
+    ) -> Result<TransitionAuthorization, TransitionGuardRejection> {
+        match command.command.as_ref() {
+            Some(task_command::Command::ActivateTask(value))
+                if current.status == TaskStatus::Ready as i32
+                    && value.work_revision == current.work_revision
+                    && !value.run_id.trim().is_empty() =>
+            {
+                Ok(TransitionAuthorization {
+                    evidence_refs: vec![format!(
+                        "task-activation:{}@collaboration-control",
+                        value.run_id
+                    )],
+                    founder_decision: None,
+                    founder_verdict_state_revision: None,
+                })
+            }
+            Some(task_command::Command::SubmitTaskEvidence(value))
+                if current.status == TaskStatus::Active as i32
+                    && value.work_revision == current.work_revision
+                    && !value.return_handoff_id.trim().is_empty()
+                    && !value.artifact_set_id.trim().is_empty() =>
+            {
+                Ok(TransitionAuthorization {
+                    evidence_refs: vec![
+                        format!(
+                            "return-handoff:{}@artifact-authority-intake",
+                            value.return_handoff_id
+                        ),
+                        format!(
+                            "artifact-set:{}@artifact-authority-intake",
+                            value.artifact_set_id
+                        ),
+                    ],
+                    founder_decision: None,
+                    founder_verdict_state_revision: None,
+                })
+            }
+            Some(task_command::Command::RecordTaskVerification(value))
+                if current.status == TaskStatus::VerificationPending as i32
+                    && value.work_revision == current.work_revision
+                    && !value.verification_artifact_id.trim().is_empty() =>
+            {
+                Ok(TransitionAuthorization {
+                    evidence_refs: vec![format!(
+                        "verification-artifact:{}@verification-authority",
+                        value.verification_artifact_id
+                    )],
+                    founder_decision: None,
+                    founder_verdict_state_revision: None,
+                })
+            }
+            _ => Err(TransitionGuardRejection::UnverifiedReference),
+        }
+    }
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum TaskCreationGuardConfigurationError {
     #[error("configured Task creation guard is invalid")]
@@ -123,7 +202,10 @@ fn contract_reference_is_complete(reference: &ContractReference) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
+    use egopulse_domain_contracts::v01::egopulse::{
+        common::v1::ContractReference,
+        task::v1::{ActivateTaskCommand, RecordTaskVerificationCommand, SubmitTaskEvidenceCommand},
+    };
 
     fn contract(id: &str, version: &str, byte: u8) -> ContractReference {
         ContractReference {
@@ -191,5 +273,58 @@ mod tests {
             ConfiguredTaskCreationGuard::new(invalid),
             Err(TaskCreationGuardConfigurationError::InvalidConfiguration)
         ));
+    }
+
+    #[test]
+    fn production_transition_guard_accepts_only_reviewed_non_terminal_handoffs() {
+        let guard = ConfiguredTaskTransitionGuard::new();
+        let active = TaskSnapshot {
+            task_id: "task-1".to_owned(),
+            revision: 2,
+            work_revision: 1,
+            status: TaskStatus::Active as i32,
+            ..TaskSnapshot::default()
+        };
+        let submit = TaskCommand {
+            command: Some(task_command::Command::SubmitTaskEvidence(
+                SubmitTaskEvidenceCommand {
+                    task_id: "task-1".to_owned(),
+                    work_revision: 1,
+                    return_handoff_id: "handoff-1".to_owned(),
+                    artifact_set_id: "set-1".to_owned(),
+                    ..Default::default()
+                },
+            )),
+        };
+        assert!(guard.validate(&submit, &active).is_ok());
+
+        let verification_pending = TaskSnapshot {
+            status: TaskStatus::VerificationPending as i32,
+            ..active.clone()
+        };
+        let record = TaskCommand {
+            command: Some(task_command::Command::RecordTaskVerification(
+                RecordTaskVerificationCommand {
+                    task_id: "task-1".to_owned(),
+                    work_revision: 1,
+                    verification_artifact_id: "verification-1".to_owned(),
+                    ..Default::default()
+                },
+            )),
+        };
+        assert!(guard.validate(&record, &verification_pending).is_ok());
+
+        let denied = TaskCommand {
+            command: Some(task_command::Command::ActivateTask(ActivateTaskCommand {
+                task_id: "task-1".to_owned(),
+                work_revision: 1,
+                run_id: "run-1".to_owned(),
+                ..Default::default()
+            })),
+        };
+        assert_eq!(
+            guard.validate(&denied, &active),
+            Err(TransitionGuardRejection::UnverifiedReference)
+        );
     }
 }

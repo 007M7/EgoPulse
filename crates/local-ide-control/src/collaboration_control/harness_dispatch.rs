@@ -39,6 +39,9 @@ pub struct HarnessDispatchCycleReport {
     pub terminal_output_candidates_seen: u64,
     pub terminal_output_candidates_receipted: u64,
     pub terminal_output_candidates_held: u64,
+    /// Number of Artifact returns whose Verification-gated Step return was
+    /// durably committed or replayed in this cycle.
+    pub return_settlements: u64,
     pub activations_seen: u64,
     pub activations_started: u64,
     pub activations_acknowledged: u64,
@@ -271,7 +274,7 @@ where
                 artifact_return_principal,
                 step_return_principal,
             } = &mut *runtime;
-            consume_artifact_returns(
+            let return_settlements = consume_artifact_returns(
                 control,
                 adapter,
                 artifact_return_source.as_ref(),
@@ -283,6 +286,7 @@ where
                 .map_err(|_| HarnessDispatchCycleError::TaskActivationSource)?;
             let mut report = HarnessDispatchCycleReport {
                 activations_seen: activations.len() as u64,
+                return_settlements,
                 ..HarnessDispatchCycleReport::default()
             };
             pump_active_envelopes(
@@ -338,7 +342,7 @@ fn consume_artifact_returns<G, C, R, D, A>(
     source: Option<&std::sync::Arc<dyn ArtifactReturnSource>>,
     principal: Option<&AuthenticatedCollaborationPrincipal>,
     step_return_principal: Option<&AuthenticatedCollaborationPrincipal>,
-) -> Result<(), HarnessDispatchCycleError>
+) -> Result<u64, HarnessDispatchCycleError>
 where
     G: CollaborationReferenceGuard + HarnessEvidenceResolver,
     C: AuthorityClock,
@@ -347,8 +351,9 @@ where
     A: AdapterClock,
 {
     let (Some(source), Some(principal)) = (source, principal) else {
-        return Ok(());
+        return Ok(0);
     };
+    let mut settlements = 0;
     for pending in source
         .pending_returns()
         .map_err(HarnessDispatchCycleError::ReturnCollector)?
@@ -543,8 +548,9 @@ where
                 "Artifact return outbox acknowledgement was not persisted".to_owned(),
             ));
         }
+        settlements += 1;
     }
-    Ok(())
+    Ok(settlements)
 }
 
 /// Delivers all currently pending Collaboration dispatch intents to one

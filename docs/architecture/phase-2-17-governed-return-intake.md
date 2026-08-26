@@ -1,12 +1,10 @@
 # Phase 2-17 governed Harness return intake
 
 - Status: technical intake, Attempt-return projection and Verification-gated
-  Step completion implemented; shared CLI/TUI ReturnPending read path, real
-  Windows C5, real Codex app-server turn and real production runner-to-Artifact
-  collector evidence have historical passes; the latest user-owned Codex
-  app-server rerun currently fails at initialization with EOF, so real daemon
-  Verification-gated settlement remains open
-- Date: 2026-08-26
+  Step completion implemented and re-proven through the real Windows x64
+  user-owned Codex production runner; Task completion and Founder Verdict
+  consumption remain outside this phase
+- Date: 2026-08-27
 - Scope: native terminal output through technical Artifact Authority receipt
 - Not in scope: Task completion and Founder Verdict consumption
 
@@ -125,42 +123,40 @@ deterministic fixtures can exercise the same production runner and collector wit
   separate settlement gate.
 An agentosd composition test now proves that the real daemon background worker polls
 an injected `HarnessDispatchRunner` and shuts down cleanly; this proves worker wiring,
-not provider-specific Codex protocol behavior. The ignored Windows x64
-`production_runner_g4_04` Gate previously passed with the installed Codex app-server and
-eight temporary isolated Authority keys in 21.25 seconds. That historical run asserted
-the real dispatch reached a terminal observation, exactly one terminal output candidate
-was seen, exactly one was receipted by the governed collector, and none was held. On the
-latest rerun, the same user-owned Codex executable exited before initialization and the
-adapter returned `CODEX_APP_SERVER_EOF`; the independent adapter E2E reproduces the same
-failure. This is an external Harness readiness failure, not evidence for or against the
-Verification settlement implementation, and no `Returned` claim is made from that run.
+not provider-specific Codex protocol behavior. The authenticated Windows x64 adapter
+probe was re-run with the user-owned Codex executable and passed the real app-server
+initialize/thread/turn lifecycle. The ignored `production_runner_g4_04` Gate then
+passed on 2026-08-27 in 30.94 seconds with eight isolated Authority keys. It proved
+Task activation, real Codex dispatch, terminal output collection, Task evidence
+submission, Verification request intake, deterministic checker execution, Verification
+write-back, and one Verification-gated Collaboration Step/Run return settlement.
+The test now asserts `return_settlements == 1`; it does not infer `Returned` from a
+quiet cycle or from a technical Artifact receipt.
 
 The latest local evidence is:
 
 ```text
-egopulse-agentosd library tests                 45 passed
+egopulse-agentosd library tests                 46 passed
 collaboration_control_g4_03                    22 passed
 c5_00_daemon_fixture                             7 passed
   return_settlement_g4_11                          1 passed
   cargo clippy --workspace --all-targets -D warnings passed
-  real Codex app-server Rust E2E                   historical pass; latest run CODEX_APP_SERVER_EOF
-  real production runner + collector Gate          historical pass; latest run blocked at init
+  real Codex app-server Rust E2E                   passed (user-owned Windows x64 Codex)
+  real production runner + collector Gate          passed (30.94s; return_settlements=1)
   Sego default zero-findings semantics              passed (Unverified)
   Sego deterministic acceptance mode               passed (Passed + Complete)
 ```
 
-An earlier configured run of the installed real Codex app-server on Windows x64 returned
-successful `initialize`, `thread/start`, `thread/started` and constrained `turn/start`
-messages with native version `0.148.0-alpha.15`, and received the exact
-`EGOPULSE_CODEX_E2E_OK` terminal candidate. The current rerun instead terminates with
-`CODEX_APP_SERVER_EOF` during initialization, so the executable must be re-probed before
-this becomes current release evidence. This does not claim Artifact collection,
-Verification retry, or `Returned` settlement.
+The earlier unprivileged sandbox run that returned `CODEX_APP_SERVER_EOF` is retained as
+environment-diagnostic evidence only. Re-running the same user-owned executable with the
+required Windows process access passed; the EOF was not a Codex protocol defect. The
+production fixture also exposed and fixed three real contract defects before acceptance:
+Task handoff lineage advances one revision after evidence submission, checker assurance is
+bound to the attested profile, and an Artifact output must not be mislabeled as Evidence.
 
 Continue the next side without widening collector authority:
 
-1. restore a healthy user-owned Codex app-server and rerun the real adapter and
-   production gates;
-2. complete the real daemon + Harness integration fixture with a committed Verification
-   artifact and assert the internal retry reaches `Returned`;
-3. wire Task completion only through its separately governed write-back path.
+1. close the separately governed Task verification-to-Verdict path;
+2. add the Founder Verdict acceptance/rejection vertical and its CLI/TUI projections;
+3. keep the second Harness candidate outside production until it meets the same provider,
+   recovery, Artifact, Verification and Return gates.

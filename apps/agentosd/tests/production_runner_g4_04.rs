@@ -274,6 +274,19 @@ fn user_config(root: &TempRoot, input_digest: &str, codex_executable: &Path) -> 
         "/artifact/allowed_workspace_refs/0",
         WORKSPACE_REF,
     );
+    // The collector's claim acceptance contract must be the same reviewed
+    // contract carried by the Task; the Verification resolver rejects any
+    // cross-authority drift here.
+    set_string(
+        &mut config,
+        "/artifact/allowed_claim_acceptance_contract_refs/0/contract_id",
+        "replace-acceptance-contract",
+    );
+    set_string(
+        &mut config,
+        "/artifact/allowed_claim_acceptance_contract_refs/0/sha256",
+        "cc".repeat(32),
+    );
     set_string(
         &mut config,
         "/codex/input_bundle_root",
@@ -323,6 +336,7 @@ fn user_config(root: &TempRoot, input_digest: &str, codex_executable: &Path) -> 
         "/identity/principal_id",
         "local-user:g4-04-test",
     );
+    set_string(&mut config, "/identity/task_kind", "CollaborationControl");
     set_string(
         &mut config,
         "/founder/allowed_founder_principal_ids/0",
@@ -571,7 +585,7 @@ async fn user_configured_production_runner_completes_real_codex_dispatch() {
     let mut terminal_seen = false;
     while Instant::now() < deadline {
         eprintln!("g4-04: dispatch cycle");
-        let report = tokio::time::timeout(Duration::from_secs(20), runner.run_once())
+        let report = tokio::time::timeout(Duration::from_secs(45), runner.run_once())
             .await
             .expect("production runner cycle timed out")
             .expect("production runner cycle");
@@ -614,11 +628,17 @@ async fn user_configured_production_runner_completes_real_codex_dispatch() {
             &evidence,
             &CommandPrincipal {
                 principal_id: "local-user:g4-04-test".to_owned(),
-                required_authority_principal_kinds: Vec::new(),
+                required_authority_principal_kinds: vec![
+                    "TaskAuthority.CollaborationControl".to_owned(),
+                ],
             },
         )
         .expect("submit production Task evidence");
-    assert!(task_result.result.committed_event.is_some());
+    assert!(
+        task_result.result.committed_event.is_some(),
+        "Task evidence result was not committed: {:?}",
+        task_result.result
+    );
     eprintln!("g4-04: task evidence submitted");
 
     let verification = verification_worker
@@ -640,5 +660,6 @@ async fn user_configured_production_runner_completes_real_codex_dispatch() {
         .expect("production return settlement timed out")
         .expect("production return settlement");
     assert_eq!(settlement.terminal_observations, 0);
+    assert_eq!(settlement.return_settlements, 1);
     eprintln!("g4-04: return settlement completed");
 }

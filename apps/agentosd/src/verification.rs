@@ -233,7 +233,7 @@ impl SystemTaskVerificationWriteBack {
                 .and_then(|binding| binding.lineage.as_ref())
                 .ok_or(TaskVerificationWriteBackError::ArtifactBindingMismatch)?;
             if lineage.task_id != task_id
-                || lineage.task_revision != expected_revision
+                || lineage.task_revision.checked_add(1) != Some(expected_revision)
                 || lineage.work_revision != work_revision
             {
                 return Err(TaskVerificationWriteBackError::ArtifactBindingMismatch);
@@ -458,7 +458,12 @@ impl VerificationHandoffPlan {
             .ok_or(VerificationHandoffPlanError::ArtifactSetInvalid)?;
         if !lineage_valid(&lineage)
             || lineage.task_id != snapshot.task_id
-            || lineage.task_revision != snapshot.revision
+            // The Artifact Set is produced while the run is active. The
+            // Task evidence handoff is the next Task revision, so the
+            // handoff snapshot must be exactly one revision newer than the
+            // execution lineage. Requiring equality would reject every
+            // real runner-produced return.
+            || lineage.task_revision.checked_add(1) != Some(snapshot.revision)
             || lineage.work_revision != snapshot.work_revision
         {
             return Err(VerificationHandoffPlanError::LineageMismatch);
@@ -558,6 +563,8 @@ pub struct VerificationHandoffConsumeResult {
     pub committed: bool,
     pub replayed: bool,
     pub task_outbox_acknowledged: bool,
+    pub error_code: i32,
+    pub safe_error_fingerprint: Option<String>,
 }
 
 /// Explicit reviewed composition for the first single-checker Verification
@@ -641,8 +648,13 @@ pub enum VerificationWorkerCycleError {
     Attestation(#[from] CheckerProfileAttestationError),
     #[error("verification handoff intake failed: {0}")]
     Intake(#[from] VerificationHandoffIntakeError),
-    #[error("verification handoff was rejected by the Authority")]
-    HandoffRejected,
+    #[error(
+        "verification handoff was rejected by the Authority (error_code={error_code}, fingerprint={safe_error_fingerprint:?})"
+    )]
+    HandoffRejected {
+        error_code: i32,
+        safe_error_fingerprint: Option<String>,
+    },
     #[error("Verification Authority read failed: {0}")]
     Authority(#[from] VerificationAuthorityFailure),
     #[error("Verification Authority lock is poisoned")]
@@ -733,7 +745,10 @@ impl ConfiguredVerificationWorker {
             && !handoff.committed
             && !handoff.replayed
         {
-            return Err(VerificationWorkerCycleError::HandoffRejected);
+            return Err(VerificationWorkerCycleError::HandoffRejected {
+                error_code: handoff.error_code,
+                safe_error_fingerprint: handoff.safe_error_fingerprint,
+            });
         }
         let request = {
             let verification = self
@@ -795,7 +810,10 @@ impl ConfiguredVerificationWorker {
             .await?;
         let write_back = self.write_back.record_one(
             &lineage.task_id,
-            lineage.task_revision,
+            lineage
+                .task_revision
+                .checked_add(1)
+                .ok_or(VerificationWorkerCycleError::RequestLineage)?,
             lineage.work_revision,
             &verification_artifact_id,
             issued_at,
@@ -899,6 +917,8 @@ impl VerificationHandoffIntake {
                 committed: false,
                 replayed: false,
                 task_outbox_acknowledged: false,
+                error_code: result.error_code,
+                safe_error_fingerprint: result.safe_error_fingerprint,
             }));
         }
         let acknowledged = {
@@ -918,6 +938,8 @@ impl VerificationHandoffIntake {
             committed: result.committed,
             replayed: result.replayed,
             task_outbox_acknowledged: acknowledged,
+            error_code: result.error_code,
+            safe_error_fingerprint: result.safe_error_fingerprint,
         }))
     }
 }
@@ -1045,7 +1067,9 @@ mod tests {
             status: ArtifactSetStatus::Sealed as i32,
             lineage: Some(LineageBinding {
                 task_id: "task-1".to_owned(),
-                task_revision: 4,
+                // Artifact production precedes the Task evidence handoff
+                // by one Task revision.
+                task_revision: 3,
                 work_revision: 2,
                 run_id: "run-1".to_owned(),
                 run_revision: 1,

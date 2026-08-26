@@ -1,7 +1,7 @@
 # G4-02 Task Authority implementation profile
 
-- Status: implemented mutation subset and Gate 4 evidence verified locally;
-  later Task transitions remain deferred
+- Status: G4-02 create-path scope remains verified locally; later Task
+  transitions are admitted only by their separate governed verticals
 - Date: 2026-08-23
 - Frozen inputs: C-01 Task Contract, C-08 Persistence/Recovery Contract, Feature ADR A
 - Scope: one durable `CreateTask` write path plus fail-closed duplicate, stale, unauthorized and recovery behavior
@@ -10,7 +10,12 @@
 
 `cognition-runtime::task_authority` owns the V-01 Task store and is the only module allowed to mutate it. The SQL connection and schema module remain private. `agentosd` may host the module, but the deployment host, Local API, UI, Harness, Sego and Python workers receive no database handle or repository write API.
 
-G4-02 does not claim the later Task transitions are implemented. Recognized commands outside the completed `CreateTask` path may be rejected by authentication, authorization, revision or dependency-validation gates, but cannot mutate Task state until their owning work package supplies the required cross-domain proof.
+G4-02 itself does not claim the later Task transitions. The separate Phase 2-17
+production return vertical now supplies a narrow configured guard for internal
+non-terminal `ActivateTask`, `SubmitTaskEvidence` and `RecordTaskVerification`
+handoffs, with local regression and real Windows production evidence. Unsupported
+or terminal Founder transitions remain fail-closed until their own work package
+supplies the required cross-domain proof.
 
 ## Persistence choice
 
@@ -77,5 +82,6 @@ cargo test -p egopulse-cognition-runtime `
 ```
 
 Result: `8 passed, 0 failed`. This closes the evidence for the implemented
-Create/activation and projection subset; it does not authorize later Task
-transitions that are explicitly outside this work package.
+Create path and its original activation/projection subset. It does not itself
+authorize later Task transitions; those are tracked and gated by their owning
+vertical documents.

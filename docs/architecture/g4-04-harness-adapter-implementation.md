@@ -1,7 +1,8 @@
 # G4-04 Harness Adapter implementation profile
 
-- Status: G4-04 accepted; production composition and authenticated provider-boundary evidence complete
-- Date: 2026-08-26
+- Status: G4-04 accepted; production composition, authenticated provider-boundary and
+  Verification-gated Return settlement evidence complete
+- Date: 2026-08-27
 - Frozen inputs: C-03 Harness Adapter Contract, D-01 first Harness decision, ADR 0003
 - First native Harness: Codex app-server v2
 
@@ -164,7 +165,8 @@ a second logical return. DSH and fake drivers implement the same provider-neutra
 candidate seam; production Harness selection remains unchanged.
 
 The user-configured production runner was then exercised on Windows x64 with
-the installed Codex native executable:
+the installed Codex native executable. The fixture now covers the complete
+non-terminal production return slice:
 
 ```powershell
 $env:EGOPULSE_CODEX_NATIVE_EXE =
@@ -174,14 +176,23 @@ cargo test -p egopulse-agentosd --test production_runner_g4_04 `
   -- --ignored --nocapture
 ```
 
-The test passed in 10.06 seconds and observed Task activation, the governed
+The test passed in 30.94 seconds and observed Task activation, the governed
 Collaboration workflow, Adapter durable dispatch and receipt, Codex
-`initialize`, `thread/start`, a real authenticated request, and a terminal
-observation. The fixture derives the user configuration from the published
-template but binds the capability profile to the exact Codex contract
+`initialize`, `thread/start`, a real authenticated request, terminal output
+collection, Task evidence submission, Verification request intake, deterministic
+checker execution, Verification write-back, and one Verification-gated
+Step/Run return settlement. The report asserts `return_settlements == 1`.
+The fixture derives the user configuration from the published template but binds
+the capability profile to the exact Codex contract
 `codex-app-server-v2-0.148.0-alpha.15`; the template's `replace-*` values must
 never be used as production authorization references. The test-only activation
 transition guard is a fixture seam and is not a public activation bypass.
+
+The production path uses a narrow configured Task transition guard for internal
+Collaboration and Verification handoffs. It accepts only reviewed non-terminal
+Activate, SubmitTaskEvidence and RecordTaskVerification transitions; unsupported
+or terminal Founder transitions remain fail-closed until their own authority
+vertical is admitted.
 
 This closes the Codex production slice of G4-04. DSH ACP remains a candidate
 execution slice documented in Phase 2-09 and cannot be selected by production
