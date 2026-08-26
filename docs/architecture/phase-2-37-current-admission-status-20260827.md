@@ -39,11 +39,11 @@ The packaged binaries are bound to the exact code commit below. Later commits
 that change documentation only do not change this binary candidate.
 
 ```text
-code commit: 03e4443ce8adfec651f1fd73cef2845b0dfbf668
+code commit: 7a2f96d49d124a0eec7b07b5cc7d88bdedeed14b
 platform: windows-x86_64
 surfaces: cli, tui
-archive: .artifacts/release-candidate/egopulse-0.1.0-03e4443ce8ad-windows-x86_64-20260826T224951Z.zip
-archive SHA-256: 5f08abe35ef6974d172ecfc04c3ba7063bf8c19f96f548aa2fd92e1be7bf5778
+archive: .artifacts/release-candidate/egopulse-0.1.0-7a2f96d49d12-windows-x86_64-20260826T231231Z.zip
+archive SHA-256: 6a555239bbc3bebf13a679d062ba82445730a2b3a69e40a7fe00a834cb53b735
 ```
 
 The matching local CI evidence passed all eight stages with a clean worktree.
@@ -112,12 +112,16 @@ provider is therefore selected by production configuration.
    selected profile's packaging/configuration/evidence path.
 2. Keep Codex as the sole admitted production Harness while running any Kimi or
    DSH probes as isolated candidate evidence.
-3. Add a production Memory candidate bridge only as an explicit, user-reviewed
-   proposal operation. It must not turn every terminal transcript into a
-   memory, must preserve the Artifact return path, and must use the fixed
-   producer binding already implemented.
-4. After the chosen Memory profile and candidate bridge are evidenced, refresh
-   the CLI/TUI early-access package. Desktop remains a later vertical.
+3. Complete the production Memory candidate bridge as an explicit,
+   user-reviewed proposal operation. It must not turn every terminal transcript
+   into a memory, must preserve the Artifact return path, and must use the
+   fixed producer binding already implemented. The current real Codex E2E is
+   the cross-component proof; the product-facing proposal interaction is still
+   open.
+4. After the chosen Memory profile and product-facing candidate bridge are
+   evidenced, refresh the CLI/TUI early-access package. The current package was
+   refreshed for the fixed producer-proposal boundary; Desktop remains a later
+   vertical.
 
 ## Non-claims
 
