@@ -31,8 +31,8 @@ and [multilingual-E5-small model card](https://huggingface.co/intfloat/multiling
 
 | Candidate | Role | Artifact / snapshot | Quality result | Cost / decision |
 |---|---|---:|---|---|
-| `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | Multilingual ONNX baseline, 384 dimensions, Apache-2.0 | ONNX 235,052,644 bytes; snapshot 252,138,706 bytes; SHA-256 `634d0f...659a99` | Semantic Recall@2 `0.92857143`, MRR `0.78571429`, nDCG@2 `0.82312279`; equal RRF Recall@2 `0.85714286` | Reject: below lexical recall and rank quality; smaller artifact does not compensate for regression |
-| `intfloat/multilingual-e5-small` | Multilingual ONNX quality candidate, 384 dimensions, MIT | ONNX 470,268,510 bytes; snapshot 487,352,505 bytes; SHA-256 `ca456c...c8665` | Semantic Recall@2 `1.00000000`, MRR `0.89285714`, nDCG@2 `0.92091352`; weighted RRF (lexical:semantic `1:2`) matches those scores | Hold for Founder packaging decision: quality passes the small-corpus gate, but peak working set was ~956 MB and private usage ~1.47 GB |
+| `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | Multilingual ONNX baseline, 384 dimensions, Apache-2.0 | ONNX 235,052,644 bytes; snapshot 252,138,706 bytes; peak working set ~626 MB; SHA-256 `634d0f...659a99` | Semantic Recall@2 `0.92857143`, MRR `0.78571429`, nDCG@2 `0.82312279`; equal RRF Recall@2 `0.85714286` | Reject: below lexical recall and rank quality; smaller artifact does not compensate for regression |
+| `intfloat/multilingual-e5-small` | Multilingual ONNX quality candidate, 384 dimensions, MIT | ONNX 470,268,510 bytes; snapshot 487,352,505 bytes; peak working set ~956 MB; private usage ~1.47 GB; SHA-256 `ca456c...c8665` | Semantic Recall@2 `1.00000000`, MRR `0.89285714`, nDCG@2 `0.92091352`; weighted RRF (lexical:semantic `1:2`) matches those scores | Hold for Founder packaging decision: quality passes the small-corpus gate, but memory cost is high |
 
 The full digests and timing records are emitted by
 `scripts/evaluate-memory-model.ps1`. The abbreviated hashes in the table are
