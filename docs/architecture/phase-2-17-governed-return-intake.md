@@ -1,8 +1,9 @@
 # Phase 2-17 governed Harness return intake
 
 - Status: technical intake, Attempt-return projection and Verification-gated
-  Step completion implemented; shared CLI/TUI ReturnPending read path and real
-  Windows C5 plus real Codex app-server turn evidence passed
+  Step completion implemented; shared CLI/TUI ReturnPending read path, real
+  Windows C5, real Codex app-server turn and real production runner-to-Artifact
+  collector evidence passed; daemon Verification-gated settlement pending
 - Date: 2026-08-26
 - Scope: native terminal output through technical Artifact Authority receipt
 - Not in scope: Task completion and Founder Verdict consumption
@@ -109,11 +110,18 @@ deterministic fixtures can exercise the same production runner and collector wit
   probes the installed app-server, starts a real thread/turn, accepts Codex's optional
   startup warning as an informational diagnostic, and proves the terminal output
   candidate reaches `EGOPULSE_CODEX_E2E_OK`. This is provider/adapter evidence only;
-  the daemon + Harness execution with a committed Verification artifact remains the
-  final integration evidence still to be added.
+  the daemon + Harness execution with a committed Verification artifact remains a
+  separate settlement gate.
 An agentosd composition test now proves that the real daemon background worker polls
 an injected `HarnessDispatchRunner` and shuts down cleanly; this proves worker wiring,
-not provider-specific Codex protocol behavior.
+not provider-specific Codex protocol behavior. The ignored Windows x64
+`production_runner_g4_04` Gate was then run with the installed Codex app-server and
+eight temporary isolated Authority keys. It passed in 21.25 seconds and now asserts
+all of the following in one report: the real dispatch reached a terminal observation,
+exactly one terminal output candidate was seen, exactly one was receipted by the
+governed collector, and none was held. This is the first real production-composition
+evidence for `Harness -> Adapter Edge -> Artifact Authority` on Windows x64; it does
+not claim Verification-gated Step/Run settlement.
 
 The latest local evidence is:
 
@@ -124,6 +132,7 @@ c5_00_daemon_fixture                             7 passed
   return_settlement_g4_11                          1 passed
   cargo clippy --workspace --all-targets -D warnings passed
   real Codex app-server Rust E2E                   1 passed (configured)
+  real production runner + collector Gate          1 passed (configured)
 ```
 
 The installed real Codex app-server was also probed on Windows x64 through

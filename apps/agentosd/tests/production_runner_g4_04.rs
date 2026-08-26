@@ -408,6 +408,9 @@ async fn user_configured_production_runner_completes_real_codex_dispatch() {
         terminal_dispatch_ids.extend(report.terminal_dispatch_ids);
         if report.terminal_observations > 0 {
             assert_eq!(terminal_dispatch_ids, vec![DISPATCH_ID.to_owned()]);
+            assert_eq!(report.terminal_output_candidates_seen, 1);
+            assert_eq!(report.terminal_output_candidates_receipted, 1);
+            assert_eq!(report.terminal_output_candidates_held, 0);
             return;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
