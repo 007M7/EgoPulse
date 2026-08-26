@@ -1,12 +1,13 @@
 use super::{
     AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptSnapshot, CollaborationReferenceGuard,
-    CollaborationSnapshot, CreateAttemptCommand, CreateRunCommand, DispatchMaterial,
-    HarnessEvidenceResolver, LeaseAuthorization, MarkAttemptOutcomeUnknownCommand,
-    RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
-    RecordAttemptReturnCommand, RecordDeliveryReceiptCommand, RecordDispatchIntentCommand,
-    RecordHarnessAckCommand, RecordRunningObservationCommand, ReferenceAuthorization,
-    ReferenceGuardRejection, RequestAttemptCancellationCommand, ResolvedArtifactReturn,
-    ResolvedHarnessEvidence, RunSnapshot, SingleHarnessWorkConfig, StepSnapshot,
+    CollaborationSnapshot, CommitStepReturnCommand, CreateAttemptCommand, CreateRunCommand,
+    DispatchMaterial, HarnessEvidenceResolver, LeaseAuthorization,
+    MarkAttemptOutcomeUnknownCommand, RecordAttemptCancellationOutcomeCommand,
+    RecordAttemptReconciliationCommand, RecordAttemptReturnCommand, RecordDeliveryReceiptCommand,
+    RecordDispatchIntentCommand, RecordHarnessAckCommand, RecordRunningObservationCommand,
+    ReferenceAuthorization, ReferenceGuardRejection, RequestAttemptCancellationCommand,
+    ResolvedArtifactReturn, ResolvedHarnessEvidence, ResolvedStepReturn, RunSnapshot,
+    SingleHarnessWorkConfig, StepSnapshot,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::RunPlan;
 use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
@@ -213,6 +214,14 @@ where
         snapshot: &CollaborationSnapshot,
     ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
         self.evidence.resolve_attempt_return(command, snapshot)
+    }
+
+    fn resolve_step_return(
+        &self,
+        command: &CommitStepReturnCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedStepReturn, ReferenceGuardRejection> {
+        self.evidence.resolve_step_return(command, snapshot)
     }
 }
 
