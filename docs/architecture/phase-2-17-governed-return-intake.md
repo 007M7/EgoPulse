@@ -53,6 +53,8 @@ facts.
 - A crash after `ReturnRecorded` but before Authority outbox acknowledgement replays the same
   idempotency key; the outbox is acknowledged only after the Collaboration event is durable.
 - Reuse of a source identity with another digest and direct storage tampering fail closed.
+- Verification-gated return additionally recomputes the Verification Authority canonical payload
+  digest; a merely well-formed or stale SHA-256 field is not accepted.
 - Empty output, output over 16 MiB and policy rejection enter `held`; they do not create a fake
   artifact or silently disappear.
 - The oversized record retains a 64 KiB preview for diagnosis plus full digest and original size.

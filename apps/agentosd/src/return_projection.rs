@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use egopulse_artifact_authority::{ArtifactAdmissionGuard, ArtifactAuthority, ArtifactClock};
 use egopulse_domain_contracts::v01::egopulse::artifact::v1::{
-    ArtifactSetStatus, ContentAddress, HashAlgorithm, LineageBinding, ReturnHandoffStatus,
+    ArtifactSetStatus, HashAlgorithm, LineageBinding, ReturnHandoffStatus,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     CollaborationSnapshot, RecordAttemptCancellationOutcomeCommand,
@@ -19,7 +19,7 @@ use egopulse_local_ide_control::collaboration_control::{
     PendingArtifactReturn, ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
     ResolvedHarnessEvidence, ResolvedStepReturn,
 };
-use egopulse_verification_authority::VerificationAuthority;
+use egopulse_verification_authority::{VerificationAuthority, canonical_verification_payload};
 use prost::Message;
 use sha2::{Digest, Sha256};
 
@@ -27,16 +27,18 @@ pub struct ArtifactAuthorityReturnSource<G, C> {
     authority: Arc<Mutex<ArtifactAuthority<G, C>>>,
 }
 
-fn complete_sha256(value: Option<&ContentAddress>) -> bool {
-    value.is_some_and(|value| {
-        value.algorithm == HashAlgorithm::Sha256 as i32
-            && value.byte_length > 0
-            && value.digest.len() == 64
-            && value
-                .digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
+fn canonical_payload_is_valid(artifact: &VerificationArtifact) -> bool {
+    let Some(payload) = artifact.canonical_payload.as_ref() else {
+        return false;
+    };
+    payload.algorithm == HashAlgorithm::Sha256 as i32
+        && payload.byte_length > 0
+        && payload.digest.len() == 64
+        && payload
+            .digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && payload == &canonical_verification_payload(artifact)
 }
 
 fn select_accepted_verification_artifact(
@@ -59,7 +61,7 @@ fn select_accepted_verification_artifact(
                 && artifact.version == 1
                 && artifact.conclusion == VerificationConclusion::Passed as i32
                 && artifact.overall_evidence_coverage == EvidenceCoverage::Complete as i32
-                && complete_sha256(artifact.canonical_payload.as_ref())
+                && canonical_payload_is_valid(artifact)
                 && artifact.completed_at.is_some()
                 && artifact.criterion_results.iter().all(|result| {
                     result.requirement != CriterionRequirement::MustPass as i32
@@ -370,7 +372,7 @@ where
 mod tests {
     use super::*;
     use egopulse_domain_contracts::v01::egopulse::{
-        artifact::v1::ArtifactSet,
+        artifact::v1::{ArtifactSet, ContentAddress},
         verification::v1::{CriterionResult, VerificationBinding},
     };
     use prost_types::Timestamp;
@@ -399,7 +401,7 @@ mod tests {
             canonical_manifest: Some(manifest.clone()),
             ..ArtifactSet::default()
         };
-        let artifact = VerificationArtifact {
+        let mut artifact = VerificationArtifact {
             verification_artifact_id: "verification-1".to_owned(),
             version: 1,
             binding: Some(VerificationBinding {
@@ -415,17 +417,14 @@ mod tests {
                 outcome: CriterionOutcome::Passed as i32,
                 ..CriterionResult::default()
             }],
-            canonical_payload: Some(ContentAddress {
-                algorithm: HashAlgorithm::Sha256 as i32,
-                digest: "b".repeat(64),
-                byte_length: 1,
-            }),
+            canonical_payload: None,
             completed_at: Some(Timestamp {
                 seconds: 1,
                 nanos: 0,
             }),
             ..VerificationArtifact::default()
         };
+        artifact.canonical_payload = Some(canonical_verification_payload(&artifact));
         (artifact_set, lineage, artifact)
     }
 
@@ -448,6 +447,7 @@ mod tests {
 
         let mut duplicate = accepted.clone();
         duplicate.verification_artifact_id = "verification-duplicate".to_owned();
+        duplicate.canonical_payload = Some(canonical_verification_payload(&duplicate));
         assert!(
             select_accepted_verification_artifact(
                 vec![accepted, duplicate],
@@ -455,6 +455,16 @@ mod tests {
                 &lineage,
             )
             .is_none()
+        );
+
+        let (artifact_set, lineage, mut tampered) = fixture();
+        tampered.completed_at = Some(Timestamp {
+            seconds: 2,
+            nanos: 0,
+        });
+        assert!(
+            select_accepted_verification_artifact(vec![tampered], &artifact_set, &lineage)
+                .is_none()
         );
     }
 }
