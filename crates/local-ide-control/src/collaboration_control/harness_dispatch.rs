@@ -42,8 +42,8 @@ pub enum HarnessDispatchCycleError {
     TaskActivationSource,
     #[error("task activation resolver rejected the explicit workflow configuration")]
     TaskActivationResolver,
-    #[error("task activation workflow failed")]
-    TaskActivationWorkflow,
+    #[error("task activation workflow failed: {0}")]
+    TaskActivationWorkflow(String),
 }
 
 pub trait HarnessDispatchRunner: Send + Sync {
@@ -243,9 +243,14 @@ where
                     .map_err(|_| HarnessDispatchCycleError::TaskActivationResolver)?;
                 reference
                     .bind(activation.task.clone(), &config, *lease_ttl_seconds)
-                    .map_err(|_| HarnessDispatchCycleError::TaskActivationWorkflow)?;
-                super::start_single_harness_workflow(control, &activation.task, &config)
-                    .map_err(|_| HarnessDispatchCycleError::TaskActivationWorkflow)?;
+                    .map_err(|_| {
+                        HarnessDispatchCycleError::TaskActivationWorkflow(
+                            "activation reference binding failed".to_owned(),
+                        )
+                    })?;
+                super::start_single_harness_workflow(control, &activation.task, &config).map_err(
+                    |error| HarnessDispatchCycleError::TaskActivationWorkflow(error.to_string()),
+                )?;
                 if !source
                     .acknowledge_task_activation(
                         &activation.message_id,

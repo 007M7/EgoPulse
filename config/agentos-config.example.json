@@ -209,9 +209,17 @@
           "step_kind": "governed_repository_change",
           "depends_on_step_ids": [],
           "input_bundle_ref": "input-bundle:replace-me",
-          "expected_output_contract_ref": null,
-          "required_capability_profile_ref": null,
-          "max_attempts": 1
+          "expected_output_contract_ref": {
+            "contract_id": "replace-output-contract",
+            "version": "v1",
+            "sha256": "abababababababababababababababababababababababababababababababab"
+          },
+          "required_capability_profile_ref": {
+            "contract_id": "replace-capability-profile",
+            "version": "v1",
+            "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "max_attempts": 2
         },
         "budget_profile_ref": {
           "contract_id": "replace-budget-profile",

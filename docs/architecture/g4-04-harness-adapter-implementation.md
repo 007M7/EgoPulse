@@ -1,6 +1,6 @@
 # G4-04 Harness Adapter implementation profile
 
-- Status: production composition implemented; Gate 4 provider-boundary evidence pending
+- Status: G4-04 accepted; production composition and authenticated provider-boundary evidence complete
 - Date: 2026-08-26
 - Frozen inputs: C-03 Harness Adapter Contract, D-01 first Harness decision, ADR 0003
 - First native Harness: Codex app-server v2
@@ -95,8 +95,8 @@ dispatch by itself.
 
 ## Production composition audit
 
-The production composition root is now implemented, but this does not by
-itself close G4-04:
+The production composition root and its authenticated Codex provider-boundary
+evidence are complete for the first production Harness:
 
 - `apps/agentosd/src/bootstrap.rs::ProductionBootstrapConfig::build` opens
   the owner Authorities, installs optional Verification and Memory/RAG
@@ -108,11 +108,12 @@ itself close G4-04:
 - Kimi and DSH crates are not referenced by the production bootstrap and
   cannot become a production provider through a candidate-only constructor;
 - the C5 real-process fixture proves local IPC, CLI/TUI shared operations and
-  Memory retrieval, but it does not exercise a user-configured Codex runner
-  through a native model call;
-- the provider-neutral Codex contract test has an ignored authenticated live
-  path, which is the remaining evidence needed for the complete production
-  composition audit.
+  Memory retrieval;
+- the provider-neutral Codex contract test proves the native app-server
+  lifecycle and protocol observations;
+- the user-configured production runner test proves that the same composition
+  boundary can activate a Task, consume the Collaboration workflow, durably
+  dispatch through Adapter Edge and complete a real Codex request.
 
 The authenticated live adapter contract probe was re-run locally on Windows x64
 on 2026-08-26 with Codex CLI `0.148.0-alpha.15` after correcting one adapter
@@ -141,15 +142,29 @@ blocking on a response that requires a separate `decide_approval` call. The
 production runner now retains the active immutable dispatch envelope across
 cycles, continues pumping it after the approval authority responds, and
 releases it only after a terminal observation. This is an execution-lifecycle
-fix, not approval authorization. The approval authority and the full
-production runner path remain outside this evidence.
+fix, not approval authorization.
 
-Therefore G4-04 remains open for one specific reason: the implemented
-composition boundary still needs a real authenticated Codex lifecycle result
-through the production runner, plus the corresponding provider-boundary
-review. A diagnostic attempt to run that full path with the local authenticated
-Codex CLI did not converge within the bounded test command and is explicitly
-not accepted as evidence. The existence of the composition code is recorded as
-implementation evidence, not promoted to runtime acceptance. The candidate
-DSH ACP slice is separately documented in Phase 2-09 and does not alter this
-disposition.
+The user-configured production runner was then exercised on Windows x64 with
+the installed Codex native executable:
+
+```powershell
+$env:EGOPULSE_CODEX_NATIVE_EXE =
+  'C:\Users\Administrator\AppData\Local\OpenAI\Codex\bin\<installed>\codex.exe'
+cargo test -p egopulse-agentosd --test production_runner_g4_04 `
+  user_configured_production_runner_completes_real_codex_dispatch `
+  -- --ignored --nocapture
+```
+
+The test passed in 10.06 seconds and observed Task activation, the governed
+Collaboration workflow, Adapter durable dispatch and receipt, Codex
+`initialize`, `thread/start`, a real authenticated request, and a terminal
+observation. The fixture derives the user configuration from the published
+template but binds the capability profile to the exact Codex contract
+`codex-app-server-v2-0.148.0-alpha.15`; the template's `replace-*` values must
+never be used as production authorization references. The test-only activation
+transition guard is a fixture seam and is not a public activation bypass.
+
+This closes the Codex production slice of G4-04. DSH ACP remains a candidate
+execution slice documented in Phase 2-09 and cannot be selected by production
+configuration until its own authentication, recovery and provider-boundary
+evidence is accepted.

@@ -234,6 +234,7 @@ fn map_edge_error(error: AdapterEdgeError) -> PolicyReferenceRejection {
         | AdapterEdgeError::IntegrityFailure
         | AdapterEdgeError::DispatchConflict
         | AdapterEdgeError::DispatchStateConflict
+        | AdapterEdgeError::DispatchNotFound(_)
         | AdapterEdgeError::SequenceConflict
         | AdapterEdgeError::Decode(_) => PolicyReferenceRejection::IntegrityFailure,
     }

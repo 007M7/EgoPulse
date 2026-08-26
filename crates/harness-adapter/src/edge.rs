@@ -146,6 +146,8 @@ pub enum AdapterEdgeError {
     DispatchConflict,
     #[error("dispatch is not in a state that permits this transition")]
     DispatchStateConflict,
+    #[error("observation references a dispatch that is not durably registered: {0}")]
+    DispatchNotFound(String),
     #[error("native event key or observation sequence conflicts with durable evidence")]
     SequenceConflict,
     #[error("durable adapter record could not be decoded")]
@@ -406,6 +408,14 @@ impl AdapterEdge {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let dispatch_registered: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM adapter_dispatches WHERE dispatch_id = ?1)",
+            [dispatch_id],
+            |row| row.get(0),
+        )?;
+        if !dispatch_registered {
+            return Err(AdapterEdgeError::DispatchNotFound(dispatch_id.to_owned()));
+        }
         let existing: Option<(String, Vec<u8>)> = transaction
             .query_row(
                 "SELECT native_event_digest_sha256, observation
