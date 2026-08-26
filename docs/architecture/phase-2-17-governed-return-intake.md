@@ -60,6 +60,9 @@ facts.
 - The production Harness runner now keeps the Artifact return outbox pending when the
   Verification-gated Step return is not yet provable; it retries the same deterministic command
   and only ACKs the Artifact outbox after Step/Run return is committed or replayed.
+- Once the technical Attempt return is already durable, the retry path does not issue a second
+  `RecordAttemptReturn` with changed CAS revisions; it proceeds directly to the Verification-gated
+  Step return. This preserves both idempotency-key digest stability and single-writer ownership.
 - Empty output, output over 16 MiB and policy rejection enter `held`; they do not create a fake
   artifact or silently disappear.
 - The oversized record retains a 64 KiB preview for diagnosis plus full digest and original size.
@@ -103,7 +106,7 @@ The latest local evidence is:
 
 ```text
 egopulse-agentosd library tests                 44 passed
-collaboration_control_g4_03                    21 passed
+collaboration_control_g4_03                    22 passed
 c5_00_daemon_fixture                             7 passed
 cargo clippy --workspace --all-targets -D warnings passed
 ```
