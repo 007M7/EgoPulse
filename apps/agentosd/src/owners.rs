@@ -514,7 +514,11 @@ mod tests {
     use super::*;
     use egopulse_cognition_runtime::task_authority::{
         CreationAuthorization, CreationGuardRejection, SqlCipherKey, TaskAuthorityConfig,
-        TaskCreationGuard,
+        TaskCreationGuard, TaskTransitionGuard, TransitionAuthorization, TransitionGuardRejection,
+        canonical_request_digest,
+    };
+    use egopulse_domain_contracts::v01::egopulse::common::v1::{
+        CommandMetadata, ContractReference,
     };
     use egopulse_domain_contracts::v01::egopulse::{
         policy::v1::{
@@ -522,7 +526,10 @@ mod tests {
             HarnessApprovalDecisionRecord, IssueHarnessApprovalDecisionCommand,
             RevokeHarnessApprovalDecisionCommand,
         },
-        task::v1::TaskCommand,
+        task::v1::{
+            ActivateTaskCommand, CreateTaskCommand, TaskCommand, TaskEventKind, TaskSnapshot,
+            TaskStatus, task_command, task_command_result,
+        },
         verdict::v1::{
             ConsumeFounderVerdictCommand, ExpireFounderVerdictCommand, IssueFounderVerdictCommand,
             RevokeFounderVerdictCommand, VerdictCommand,
@@ -536,6 +543,7 @@ mod tests {
         PolicyAuthorityConfig, PolicyReferenceRejection, PolicyReferenceResolver,
         PolicySqlCipherKey, ResolvedApprovalAuthorization,
     };
+    use prost_types::Timestamp;
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
 
@@ -547,6 +555,35 @@ mod tests {
             _command: &egopulse_domain_contracts::v01::egopulse::task::v1::CreateTaskCommand,
         ) -> Result<CreationAuthorization, CreationGuardRejection> {
             Err(CreationGuardRejection::UnverifiedReference)
+        }
+    }
+
+    struct AllowCreation;
+
+    impl TaskCreationGuard for AllowCreation {
+        fn validate(
+            &self,
+            _command: &CreateTaskCommand,
+        ) -> Result<CreationAuthorization, CreationGuardRejection> {
+            Ok(CreationAuthorization {
+                evidence_refs: vec!["fixture:create-authorized".to_owned()],
+            })
+        }
+    }
+
+    struct AllowTransition;
+
+    impl TaskTransitionGuard for AllowTransition {
+        fn validate(
+            &self,
+            _command: &TaskCommand,
+            _current: &TaskSnapshot,
+        ) -> Result<TransitionAuthorization, TransitionGuardRejection> {
+            Ok(TransitionAuthorization {
+                evidence_refs: vec!["fixture:transition-authorized".to_owned()],
+                founder_decision: None,
+                founder_verdict_state_revision: None,
+            })
         }
     }
 
@@ -670,6 +707,61 @@ mod tests {
         }
     }
 
+    fn task_metadata(command_id: &str, idempotency_key: &str) -> CommandMetadata {
+        CommandMetadata {
+            command_id: command_id.to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
+            idempotency_scope: "agentosd-owner-test".to_owned(),
+            request_digest_sha256: String::new(),
+            issued_at: Some(Timestamp {
+                seconds: 1_777_073_600,
+                nanos: 0,
+            }),
+            correlation_id: format!("correlation-{command_id}"),
+            causation_id: None,
+        }
+    }
+
+    fn task_contract_ref(contract_id: &str, version: &str, sha256: &str) -> ContractReference {
+        ContractReference {
+            contract_id: contract_id.to_owned(),
+            version: version.to_owned(),
+            sha256: sha256.to_owned(),
+        }
+    }
+
+    fn set_task_digest(command: &mut TaskCommand) {
+        let digest = canonical_request_digest(command).expect("canonical Task request digest");
+        match command.command.as_mut().expect("Task command variant") {
+            task_command::Command::CreateTask(value) => {
+                value
+                    .meta
+                    .as_mut()
+                    .expect("create metadata")
+                    .request_digest_sha256 = digest;
+            }
+            task_command::Command::ActivateTask(value) => {
+                value
+                    .meta
+                    .as_mut()
+                    .expect("activate metadata")
+                    .request_digest_sha256 = digest;
+            }
+            _ => panic!("owner test helper only supports create and activate"),
+        }
+    }
+
+    fn task_snapshot(
+        result: &egopulse_domain_contracts::v01::egopulse::task::v1::TaskCommandResult,
+    ) -> TaskSnapshot {
+        match result.outcome.clone().expect("Task command outcome") {
+            task_command_result::Outcome::Task(snapshot) => snapshot,
+            task_command_result::Outcome::Error(error) => {
+                panic!("expected Task snapshot, got {}", error.safe_detail_code)
+            }
+        }
+    }
+
     #[test]
     fn each_command_port_calls_its_owner_and_preserves_owner_failure() {
         let root = root();
@@ -736,6 +828,194 @@ mod tests {
         assert!(!verdict_result.result.committed);
         assert!(verdict_result.source_revision.is_none());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn activation_source_port_reads_and_acknowledges_real_task_authority_outbox() {
+        let root = root();
+        let task = TaskAuthority::open_with_transition_guard(
+            TaskAuthorityConfig {
+                database_path: root.join("task.db"),
+                store_epoch: "c4-task-source".to_owned(),
+                key: SqlCipherKey::new([1; 32]),
+            },
+            AllowCreation,
+            AllowTransition,
+        )
+        .expect("task owner");
+        let policy = PolicyDecisionAuthority::open(
+            PolicyAuthorityConfig {
+                database_path: root.join("policy.db"),
+                store_epoch: "c4-policy-source".to_owned(),
+                key: PolicySqlCipherKey::new([2; 32]),
+            },
+            DenyPolicy,
+        )
+        .expect("policy owner");
+        let verdict = FounderVerdictAuthority::open(
+            VerdictAuthorityConfig {
+                database_path: root.join("verdict.db"),
+                store_epoch: "c4-verdict-source".to_owned(),
+                key: VerdictSqlCipherKey::new([3; 32]),
+            },
+            DenyVerdict,
+        )
+        .expect("verdict owner");
+        let task_handle = Arc::new(Mutex::new(task));
+
+        {
+            let mut authority = task_handle.lock().expect("Task owner lock");
+            let mut create = TaskCommand {
+                command: Some(task_command::Command::CreateTask(CreateTaskCommand {
+                    meta: Some(task_metadata("source-create", "source-create")),
+                    work_type: "governed_repository_change".to_owned(),
+                    input_snapshot_id: "input-source".to_owned(),
+                    target_scope_ref: "scope-source".to_owned(),
+                    acceptance_contract_ref: Some(task_contract_ref(
+                        "acceptance-source",
+                        "1",
+                        &"a".repeat(64),
+                    )),
+                    budget_profile_ref: Some(task_contract_ref(
+                        "budget-source",
+                        "1",
+                        &"b".repeat(64),
+                    )),
+                })),
+            };
+            set_task_digest(&mut create);
+            let created = authority
+                .execute(
+                    &create,
+                    &AuthenticatedPrincipal {
+                        kind: TaskPrincipalKind::Founder,
+                        principal_id: "founder:source-test".to_owned(),
+                        authenticated: true,
+                    },
+                )
+                .expect("create source fixture Task");
+            let snapshot = task_snapshot(&created);
+
+            let mut activate = TaskCommand {
+                command: Some(task_command::Command::ActivateTask(ActivateTaskCommand {
+                    meta: Some(task_metadata("source-activate", "source-activate")),
+                    task_id: snapshot.task_id,
+                    expected_revision: snapshot.revision,
+                    work_revision: snapshot.work_revision,
+                    run_id: "run-source-001".to_owned(),
+                })),
+            };
+            set_task_digest(&mut activate);
+            let activated = authority
+                .execute(
+                    &activate,
+                    &AuthenticatedPrincipal {
+                        kind: TaskPrincipalKind::CollaborationControl,
+                        principal_id: "collaboration-control:source-test".to_owned(),
+                        authenticated: true,
+                    },
+                )
+                .expect("activate source fixture Task");
+            assert_eq!(
+                activated
+                    .committed_event
+                    .as_ref()
+                    .expect("activation event")
+                    .kind,
+                TaskEventKind::Activated as i32
+            );
+        }
+
+        let ports = AuthorityCommandPorts::new_shared(
+            task_handle,
+            policy,
+            verdict,
+            Arc::new(StaticPrincipalResolver),
+        );
+        let pending = TaskActivationSource::pending_task_activations(&ports)
+            .expect("read real TaskAuthority activation source");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].task.status, TaskStatus::Active as i32);
+        assert_eq!(
+            pending[0].task.current_run_id.as_deref(),
+            Some("run-source-001")
+        );
+        assert!(
+            !TaskActivationSource::acknowledge_task_activation(
+                &ports,
+                &pending[0].message_id,
+                &"0".repeat(64),
+            )
+            .expect("reject wrong source digest")
+        );
+        let message_id = pending[0].message_id.clone();
+        let payload_digest = pending[0].payload_digest_sha256.clone();
+
+        drop(ports);
+
+        let reopened_task = TaskAuthority::open_with_transition_guard(
+            TaskAuthorityConfig {
+                database_path: root.join("task.db"),
+                store_epoch: "c4-task-source".to_owned(),
+                key: SqlCipherKey::new([1; 32]),
+            },
+            AllowCreation,
+            AllowTransition,
+        )
+        .expect("reopen task owner after source interruption");
+        let policy = PolicyDecisionAuthority::open(
+            PolicyAuthorityConfig {
+                database_path: root.join("policy.db"),
+                store_epoch: "c4-policy-source".to_owned(),
+                key: PolicySqlCipherKey::new([2; 32]),
+            },
+            DenyPolicy,
+        )
+        .expect("reopen policy owner");
+        let verdict = FounderVerdictAuthority::open(
+            VerdictAuthorityConfig {
+                database_path: root.join("verdict.db"),
+                store_epoch: "c4-verdict-source".to_owned(),
+                key: VerdictSqlCipherKey::new([3; 32]),
+            },
+            DenyVerdict,
+        )
+        .expect("reopen verdict owner");
+        let recovered_ports = AuthorityCommandPorts::new(
+            reopened_task,
+            policy,
+            verdict,
+            Arc::new(StaticPrincipalResolver),
+        );
+        let recovered_pending = TaskActivationSource::pending_task_activations(&recovered_ports)
+            .expect("read durable source after interruption");
+        assert_eq!(recovered_pending.len(), 1);
+        assert_eq!(recovered_pending[0].message_id, message_id);
+        assert_eq!(recovered_pending[0].payload_digest_sha256, payload_digest);
+        assert!(
+            TaskActivationSource::acknowledge_task_activation(
+                &recovered_ports,
+                &message_id,
+                &payload_digest,
+            )
+            .expect("acknowledge recovered source handoff")
+        );
+        assert!(
+            !TaskActivationSource::acknowledge_task_activation(
+                &recovered_ports,
+                &message_id,
+                &payload_digest,
+            )
+            .expect("repeat source ACK is idempotently rejected")
+        );
+        assert!(
+            TaskActivationSource::pending_task_activations(&recovered_ports)
+                .expect("read source after ACK")
+                .is_empty()
+        );
+
+        drop(recovered_ports);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -82,11 +82,10 @@ cargo fmt --all -- --check                                      passed
 cargo clippy -p egopulse-local-ide-control -p egopulse-agentosd --all-targets -- -D warnings passed
 cargo test -p egopulse-local-ide-control --lib                 7 passed
 cargo test -p egopulse-local-ide-control --test collaboration_control_g4_03 -- --test-threads=1 23 passed
-cargo test -p egopulse-agentosd --lib                          49 passed
+cargo test -p egopulse-agentosd --lib                          50 passed
 ```
 
-The next multi-model composition slice must replace the deterministic source
-with the real durable TaskAuthority activation outbox and prove concurrent
-polling, compare-and-ack behavior, restart replay and recovery without
-cross-ack, cross-dispatch or cross-write Adapter Edge state. Provider
-admission evidence remains a separate gate.
+The real durable source wiring is now recorded in Phase 2-26. Simultaneous
+multi-process polling remains a separate evidence item; the current port uses
+the TaskAuthority process-local single-writer mutex and the storage ACK is
+compare-and-ack.
