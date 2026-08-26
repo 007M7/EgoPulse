@@ -39,11 +39,11 @@ The packaged binaries are bound to the exact code commit below. Later commits
 that change documentation only do not change this binary candidate.
 
 ```text
-code commit: ffb699477f3aac3de8cf04778480274bdccf23e2
+code commit: 46c54d4fb3626139172a4a8f1b59eeb78ef88813
 platform: windows-x86_64
 surfaces: cli, tui
-archive: .artifacts/release-candidate/egopulse-0.1.0-ffb699477f3a-windows-x86_64-20260826T232149Z.zip
-archive SHA-256: 6352735659755b5fdc8cc202a3fef8909fd002fe110da9bbbad6d0da9013e3d1
+archive: .artifacts/release-candidate/egopulse-0.1.0-46c54d4fb362-windows-x86_64-20260826T234621Z.zip
+archive SHA-256: 828e9accf80c333d4fc7793efcac9d0763c962e30fdf499dda696361629d9a29
 ```
 
 The matching local CI evidence passed all eight stages with a clean worktree.
