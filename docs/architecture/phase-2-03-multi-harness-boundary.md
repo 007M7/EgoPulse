@@ -242,8 +242,10 @@ Phase 2-03 closes its provider-neutral boundary and candidate-probe slice, but
 does not close second-Harness admission. The authoritative evidence is:
 
 - G4-09 capability-binding and shared Probe Gate tests;
-- the Kimi no-prompt ACP probe recording a pre-ACP process failure
-  (`exit_code=1`, missing Python `typer` dependency);
+- the Kimi isolated no-prompt ACP probe reaching `initialize` and recording
+  `session_disposition=authentication_required`; the separate default-profile
+  probe recorded a pre-ACP process failure (`exit_code=1`, missing Python
+  `typer` dependency);
 - DSH isolated ACP prompt/cancel/permission evidence with Artifact and native
   recovery explicitly held;
 - Codex remaining the sole active production Harness.
