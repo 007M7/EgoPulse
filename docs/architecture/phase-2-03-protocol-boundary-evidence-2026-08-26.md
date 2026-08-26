@@ -169,6 +169,33 @@ as probe behavior rather than hidden as a clean shutdown. EgoPulse must
 therefore retain the dispatch/attempt outcome in its own Authority and cannot
 promote DSH to a production Harness on ACP lifecycle evidence alone.
 
+## Kimi isolated ACP probe
+
+The locally installed Kimi CLI was re-probed on Windows x64 with an isolated
+share directory. The probe intentionally performs only ACP `initialize` and
+empty `session/new`; it does not send a prompt or invoke model inference:
+
+```powershell
+$probeDir = 'C:\Users\Administrator\AppData\Local\Temp\egopulse-kimi-probe-20260826'
+$env:EGOPULSE_KIMI_NATIVE_EXE = 'C:\Users\Administrator\AppData\Roaming\npm\kimi.cmd'
+$env:EGOPULSE_KIMI_PROBE_DIR = $probeDir
+cargo test -p egopulse-kimi-adapter `
+  live_kimi_initialize_probe_is_reachable_without_promoting_capability `
+  -- --ignored --nocapture
+```
+
+The local result was:
+
+```json
+{"candidate":"kimi-cli","protocol":"agent-client-protocol","prompt_sent":false,"model_call":false,"initialize":"passed","session_disposition":"authentication_required"}
+```
+
+This is positive evidence for a reachable and controlled authentication
+boundary, not evidence of an authenticated lifecycle. Prompt, approval,
+cancellation, artifact and restart-recovery rows remain unproven. Kimi stays
+candidate-only and receives no active capability profile until an explicitly
+authorized user profile can complete the remaining contract matrix.
+
 ## Candidate decision at this point
 
 Kimi is the next candidate for an authenticated lifecycle probe. Its current
