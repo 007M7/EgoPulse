@@ -71,6 +71,7 @@ mod return_projection;
 mod security;
 mod task;
 mod verdict;
+mod verdict_consumer;
 mod verification;
 
 pub use artifact::{
@@ -113,6 +114,11 @@ pub use verdict::{
     FounderVerificationEvidenceSource, TaskAuthorityCommitReceiptSource,
     VerificationAuthorityArtifactSource,
 };
+pub use verdict_consumer::{
+    ConfiguredFounderVerdictConsumeWorker, FounderVerdictConsumeCycleError,
+    FounderVerdictConsumeCycleResult, FounderVerdictConsumeWorker,
+    FounderVerdictConsumeWorkerConfigurationError,
+};
 pub use verification::{
     CheckerProfileAttestationError, CheckerProfileAttestationResult, ConfiguredVerificationWorker,
     SystemCheckerProfileAttestation, SystemTaskVerificationWriteBack,
@@ -133,6 +139,7 @@ pub struct DaemonConfig {
     pub session_ttl: Duration,
     pub harness_dispatch_interval: Duration,
     pub verification_interval: Duration,
+    pub verdict_consumption_interval: Duration,
 }
 
 impl DaemonConfig {
@@ -182,6 +189,21 @@ impl DaemonConfig {
                 ));
             }
         };
+        let verdict_consumption_interval =
+            match std::env::var("EGOPULSE_VERDICT_CONSUMPTION_INTERVAL_MS") {
+                Ok(value) => value
+                    .parse::<u64>()
+                    .map(Duration::from_millis)
+                    .map_err(|_| {
+                        DaemonBootstrapError::InvalidSetting("Verdict consumption interval")
+                    })?,
+                Err(std::env::VarError::NotPresent) => Duration::from_millis(250),
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(DaemonBootstrapError::InvalidSetting(
+                        "Verdict consumption interval",
+                    ));
+                }
+            };
 
         Ok(Self {
             instance: std::env::var("EGOPULSE_IPC_INSTANCE")
@@ -196,6 +218,7 @@ impl DaemonConfig {
             session_ttl,
             harness_dispatch_interval,
             verification_interval,
+            verdict_consumption_interval,
         })
     }
 
@@ -240,6 +263,13 @@ impl DaemonConfig {
                 "Verification interval",
             ));
         }
+        if self.verdict_consumption_interval < Duration::from_millis(10)
+            || self.verdict_consumption_interval > Duration::from_secs(60)
+        {
+            return Err(DaemonCompositionError::InvalidConfiguration(
+                "Verdict consumption interval",
+            ));
+        }
         Ok(())
     }
 }
@@ -277,6 +307,7 @@ pub struct DaemonProviders {
     pub projection_source: Option<Arc<dyn OwnerProjectionSource>>,
     pub harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
     pub verification_worker: Option<Arc<dyn VerificationWorker>>,
+    pub founder_verdict_consume_worker: Option<Arc<dyn FounderVerdictConsumeWorker>>,
     pub task_activation_source: Option<Arc<dyn TaskActivationSource>>,
     pub memory_retrieval_port: Arc<dyn MemoryRetrievalPort>,
     pub memory_retrieval_audit: Arc<dyn MemoryRetrievalAuditSink>,
@@ -389,6 +420,7 @@ impl DaemonProviders {
             projection_source: None,
             harness_dispatch_runner: None,
             verification_worker: None,
+            founder_verdict_consume_worker: None,
             task_activation_source: None,
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
@@ -424,12 +456,23 @@ impl DaemonProviders {
     /// owned; this method only gives the daemon a polling/ack boundary.
     #[must_use]
     pub fn from_authority_inputs(inputs: AuthorityCompositionInputs) -> Self {
-        let ports = Arc::new(AuthorityCommandPorts::new(
-            inputs.task,
+        let task = Arc::new(Mutex::new(inputs.task));
+        let verdict = Arc::new(Mutex::new(Some(inputs.verdict)));
+        let ports = Arc::new(AuthorityCommandPorts::new_shared_handles(
+            Arc::clone(&task),
             inputs.policy,
-            inputs.verdict,
+            Arc::clone(&verdict),
             inputs.principal_resolver,
         ));
+        let founder_verdict_consume_worker = Some(Arc::new(
+            ConfiguredFounderVerdictConsumeWorker::new(
+                task,
+                verdict,
+                "task-authority:founder-verdict-consumer",
+            )
+            .expect("static Founder Verdict consume worker principal"),
+        )
+            as Arc<dyn FounderVerdictConsumeWorker>);
         let mut projection_sources =
             Vec::with_capacity(1 + inputs.additional_projection_sources.len());
         projection_sources.push(Arc::clone(&ports) as Arc<dyn OwnerProjectionSource>);
@@ -446,6 +489,7 @@ impl DaemonProviders {
             ))),
             harness_dispatch_runner: None,
             verification_worker: None,
+            founder_verdict_consume_worker,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
@@ -457,6 +501,15 @@ impl DaemonProviders {
     /// command handling must observe the same owner instance.
     #[must_use]
     pub fn from_shared_authority_inputs(inputs: SharedAuthorityCompositionInputs) -> Self {
+        let founder_verdict_consume_worker = Some(Arc::new(
+            ConfiguredFounderVerdictConsumeWorker::new(
+                Arc::clone(&inputs.task),
+                Arc::clone(&inputs.verdict),
+                "task-authority:founder-verdict-consumer",
+            )
+            .expect("static Founder Verdict consume worker principal"),
+        )
+            as Arc<dyn FounderVerdictConsumeWorker>);
         let ports = Arc::new(AuthorityCommandPorts::new_shared_handles(
             inputs.task,
             inputs.policy,
@@ -479,6 +532,7 @@ impl DaemonProviders {
             ))),
             harness_dispatch_runner: None,
             verification_worker: None,
+            founder_verdict_consume_worker,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
@@ -494,6 +548,15 @@ impl DaemonProviders {
     #[must_use]
     pub fn with_verification_worker(mut self, worker: Arc<dyn VerificationWorker>) -> Self {
         self.verification_worker = Some(worker);
+        self
+    }
+
+    #[must_use]
+    pub fn with_founder_verdict_consume_worker(
+        mut self,
+        worker: Arc<dyn FounderVerdictConsumeWorker>,
+    ) -> Self {
+        self.founder_verdict_consume_worker = Some(worker);
         self
     }
 
@@ -697,6 +760,8 @@ pub enum DaemonServeError {
     Dispatch(#[from] HarnessDispatchCycleError),
     #[error("verification worker failed")]
     Verification(#[from] VerificationWorkerCycleError),
+    #[error("Founder Verdict consume worker failed")]
+    FounderVerdictConsume(#[from] FounderVerdictConsumeCycleError),
     #[error("daemon background worker stopped unexpectedly")]
     BackgroundStopped,
 }
@@ -713,6 +778,8 @@ pub struct DaemonComposition {
     harness_dispatch_interval: Duration,
     verification_worker: Option<Arc<dyn VerificationWorker>>,
     verification_interval: Duration,
+    founder_verdict_consume_worker: Option<Arc<dyn FounderVerdictConsumeWorker>>,
+    verdict_consumption_interval: Duration,
 }
 
 impl DaemonComposition {
@@ -793,6 +860,7 @@ impl DaemonComposition {
             .map(|source| ProjectionPump::new(Arc::clone(&model), notifier, source));
         let harness_dispatch_runner = providers.harness_dispatch_runner;
         let verification_worker = providers.verification_worker;
+        let founder_verdict_consume_worker = providers.founder_verdict_consume_worker;
 
         Ok(Self {
             address,
@@ -806,6 +874,8 @@ impl DaemonComposition {
             harness_dispatch_interval: config.harness_dispatch_interval,
             verification_worker,
             verification_interval: config.verification_interval,
+            founder_verdict_consume_worker,
+            verdict_consumption_interval: config.verdict_consumption_interval,
         })
     }
 
@@ -829,6 +899,8 @@ impl DaemonComposition {
             harness_dispatch_interval,
             verification_worker,
             verification_interval,
+            founder_verdict_consume_worker,
+            verdict_consumption_interval,
             ..
         } = self;
         let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
@@ -847,14 +919,16 @@ impl DaemonComposition {
                 .add_service(LocalCognitionServiceServer::new(cognition))
                 .serve_with_incoming_shutdown(listener.into_incoming(), server_shutdown),
         );
-        let mut background = Box::pin(run_background_workers(
+        let mut background = Box::pin(run_background_workers(BackgroundWorkerInputs {
             projection_pump,
             harness_dispatch_runner,
             harness_dispatch_interval,
             verification_worker,
             verification_interval,
-            stop_receiver,
-        ));
+            founder_verdict_consume_worker,
+            verdict_consumption_interval,
+            stop: stop_receiver,
+        }));
         tokio::select! {
             result = &mut server => {
                 let _ = stop_sender.send(true);
@@ -873,14 +947,28 @@ impl DaemonComposition {
     }
 }
 
-async fn run_background_workers(
+struct BackgroundWorkerInputs {
     projection_pump: Option<ProjectionPump>,
     harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
     harness_dispatch_interval: Duration,
     verification_worker: Option<Arc<dyn VerificationWorker>>,
     verification_interval: Duration,
+    founder_verdict_consume_worker: Option<Arc<dyn FounderVerdictConsumeWorker>>,
+    verdict_consumption_interval: Duration,
     stop: tokio::sync::watch::Receiver<bool>,
-) -> Result<(), DaemonServeError> {
+}
+
+async fn run_background_workers(inputs: BackgroundWorkerInputs) -> Result<(), DaemonServeError> {
+    let BackgroundWorkerInputs {
+        projection_pump,
+        harness_dispatch_runner,
+        harness_dispatch_interval,
+        verification_worker,
+        verification_interval,
+        founder_verdict_consume_worker,
+        verdict_consumption_interval,
+        stop,
+    } = inputs;
     let mut workers = tokio::task::JoinSet::new();
     if let Some(projection_pump) = projection_pump {
         let stop = stop.clone();
@@ -905,6 +993,18 @@ async fn run_background_workers(
             run_verification_worker(worker, verification_interval, stop_for_worker)
                 .await
                 .map_err(DaemonServeError::Verification)
+        });
+    }
+    if let Some(worker) = founder_verdict_consume_worker {
+        let stop_for_worker = stop.clone();
+        workers.spawn(async move {
+            run_founder_verdict_consume_worker(
+                worker,
+                verdict_consumption_interval,
+                stop_for_worker,
+            )
+            .await
+            .map_err(DaemonServeError::FounderVerdictConsume)
         });
     }
     if workers.is_empty() {
@@ -958,6 +1058,29 @@ async fn run_verification_worker(
     interval: Duration,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), VerificationWorkerCycleError> {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
+    loop {
+        if *stop.borrow() {
+            return Ok(());
+        }
+        worker.run_once().await?;
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = ticker.tick() => {}
+        }
+    }
+}
+
+async fn run_founder_verdict_consume_worker(
+    worker: Arc<dyn FounderVerdictConsumeWorker>,
+    interval: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), FounderVerdictConsumeCycleError> {
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
     loop {
@@ -1070,6 +1193,7 @@ mod tests {
                 session_ttl: Duration::from_secs(60),
                 harness_dispatch_interval: Duration::from_millis(25),
                 verification_interval: Duration::from_millis(25),
+                verdict_consumption_interval: Duration::from_millis(25),
             },
             root,
         )

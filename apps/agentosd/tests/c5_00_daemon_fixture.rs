@@ -489,6 +489,7 @@ fn fixture_config(root: &Path, instance: &str) -> DaemonConfig {
         session_ttl: Duration::from_secs(60),
         harness_dispatch_interval: Duration::from_millis(25),
         verification_interval: Duration::from_millis(25),
+        verdict_consumption_interval: Duration::from_millis(25),
     }
 }
 

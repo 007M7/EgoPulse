@@ -8,7 +8,10 @@
 //! issued Verdict, applies the exact decision to Task, and creates the
 //! durable consume outbox without giving Task a Verdict write path.
 
-use egopulse_agentosd::{ConfiguredTaskTransitionGuard, SharedFounderVerdictAuthority};
+use egopulse_agentosd::{
+    ConfiguredFounderVerdictConsumeWorker, ConfiguredTaskTransitionGuard,
+    FounderVerdictConsumeCycleResult, FounderVerdictConsumeWorker, SharedFounderVerdictAuthority,
+};
 use egopulse_cognition_runtime::task_authority::{
     AuthenticatedPrincipal, CreationAuthorization, CreationGuardRejection, PrincipalKind,
     SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCreationGuard,
@@ -118,8 +121,8 @@ impl Drop for TempRoot {
     }
 }
 
-#[test]
-fn issued_founder_verdict_applies_to_task_and_emits_consume_outbox() {
+#[tokio::test]
+async fn issued_founder_verdict_applies_to_task_and_daemon_consumes_outbox() {
     let root = TempRoot::new();
     let verdict_handle: SharedFounderVerdictAuthority = Arc::new(Mutex::new(None));
     let mut task = TaskAuthority::open_with_transition_guard(
@@ -210,7 +213,7 @@ fn issued_founder_verdict_applies_to_task_and_emits_consume_outbox() {
                     task_id: pending.task_id.clone(),
                     expected_revision: pending.revision,
                     work_revision: pending.work_revision,
-                    founder_verdict_id: verdict_id,
+                    founder_verdict_id: verdict_id.clone(),
                 },
             )),
         }),
@@ -228,6 +231,43 @@ fn issued_founder_verdict_applies_to_task_and_emits_consume_outbox() {
             .filter(|message| message.destination_domain == "founder-verdict-authority")
             .count(),
         1
+    );
+
+    let task = Arc::new(Mutex::new(task));
+    let worker = ConfiguredFounderVerdictConsumeWorker::new(
+        Arc::clone(&task),
+        Arc::clone(&verdict_handle),
+        "task-authority:founder-verdict-consumer",
+    )
+    .expect("configure consume worker");
+    let consumed = worker.run_once().await.expect("consume Founder Verdict");
+    assert!(matches!(
+        consumed,
+        FounderVerdictConsumeCycleResult::Consumed {
+            replayed: false,
+            ..
+        }
+    ));
+    assert!(
+        task.lock()
+            .expect("Task Authority lock")
+            .pending_cross_authority_outbox()
+            .expect("pending Task outbox")
+            .into_iter()
+            .all(|message| message.destination_domain != "founder-verdict-authority")
+    );
+    let (_, state) = verdict_handle
+        .lock()
+        .expect("Verdict Authority lock")
+        .as_ref()
+        .expect("Founder Verdict Authority")
+        .get(&verdict_id)
+        .expect("read consumed Founder Verdict")
+        .expect("stored Founder Verdict");
+    assert_eq!(
+        state.state,
+        egopulse_domain_contracts::v01::egopulse::verdict::v1::FounderVerdictStateKind::Consumed
+            as i32
     );
 }
 
