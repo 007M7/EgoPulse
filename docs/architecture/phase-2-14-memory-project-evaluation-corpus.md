@@ -1,6 +1,6 @@
 # Phase 2-14 Memory project evaluation corpus
 
-- Status: `representative_small_corpus_recorded_model_runs_pending`
+- Status: `representative_small_corpus_two_candidates_measured_not_admitted`
 - Date: 2026-08-26
 - Production impact: none
 - Predecessors: Phase 2-12 evaluation gate and Phase 2-13 experiment adapters
@@ -63,6 +63,60 @@ The result shows that lexical retrieval finds the labelled fact within two
 positions on this small corpus but misorders five high-overlap cases. The next
 model comparison therefore needs to preserve first-stage recall and improve
 ordering, rather than merely returning more candidates.
+
+## Two-candidate local comparison
+
+Both candidates were run through the same offline adapter, unchanged dataset
+digest and `K=2` evaluation. The runs were local-only on Windows x64; no
+network request, Memory write or persistent vector index was used.
+
+| Candidate profile | Semantic Recall@2 | Semantic MRR | Semantic nDCG@2 | Hybrid Recall@2 | Hybrid MRR | Hybrid nDCG@2 | Peak working set | Snapshot |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `paraphrase-multilingual-minilm-v0` | 0.92857143 | 0.78571429 | 0.82312279 | 0.85714286 | 0.78571429 | 0.80441854 | 597 MiB | 252,138,706 B |
+| `multilingual-e5-small-v0` | 1.00000000 | 0.89285714 | 0.92091352 | 0.92857143 | 0.82142857 | 0.84948495 | 911 MiB | 487,352,505 B |
+| lexical baseline | — | — | — | 1.00000000 | 0.82142857 | 0.86818920 | negligible | — |
+
+The E5 semantic profile is the strongest measured retrieval candidate: it
+retains lexical Recall@2 and improves MRR and nDCG. Its fixed equal-weight RRF
+fusion is not admissible because Recall@2 falls to `0.92857143` and nDCG also
+falls below the lexical baseline. MiniLM is not admissible on this corpus:
+both its semantic and hybrid profiles regress Recall@2, with the hybrid losing
+the `en-memory-truth-owner` and `en-worker-write-boundary` cases.
+
+Candidate identities and measured costs:
+
+- `paraphrase-multilingual-minilm-v0`: model
+  `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, dimensions
+  `384`, Apache-2.0, ONNX SHA-256
+  `634d0f66c29dc934c8fa72b8a4fe91dd4d420a22f1d82a241058d4316e659a99`;
+  model artifact `235,052,644` B; snapshot revision
+  `faf4aa4225822f3bc6376869cb1164e8e3feedd0`.
+- `multilingual-e5-small-v0`: model `intfloat/multilingual-e5-small`,
+  dimensions `384`, MIT, ONNX SHA-256
+  `ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665`;
+  model artifact `470,268,510` B; snapshot revision
+  `614241f622f53c4eeff9890bdc4f31cfecc418b3`.
+- Both used `fastembed==0.8.0;onnxruntime==1.29.0` with CPU execution. E5's
+  measured peak working set is materially higher, so its quality lead carries
+  a real Windows packaging and runtime cost.
+
+The exact run command for either candidate is:
+
+```powershell
+$env:PYTHONPATH = "workers/memory-rag/src;workers/contract-bindings/src"
+& ".\workers\memory-rag\.venv\Scripts\python.exe" `
+  -m egopulse_memory_rag.model_evaluation `
+  --dataset workers/memory-rag/evaluation/project-boundaries-v0.json `
+  --model <candidate-alias> --cache-dir .cache/fastembed `
+  --threads 2 --k 2 --local-files-only
+```
+
+The experiment therefore closes the “two candidates measured” evidence row,
+not the production technology decision. No embedding model, RRF weighting,
+vector store or reranker is frozen. The current production fallback remains
+`lexical-overlap-v0`; E5 is the candidate for a later Founder review because
+its semantic-only profile meets the measured quality threshold but still needs
+an explicit product cost decision and a production-profile contract.
 
 ## Admission use
 
