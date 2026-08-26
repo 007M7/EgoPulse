@@ -167,11 +167,12 @@ second-Harness support.
 
 The DSH candidate now has a deliberately narrower execution slice in
 `crates/dsh-adapter`: fresh ACP `session/prompt`, supervised terminal event
-mapping and native `session/cancel`. Its local replay tests pass against the
-compiled DSH ACP demo. This does not change admission: native
-`session/load`/`session/resume` are unsupported, approval/server-request
-routing is not attested, and artifact semantics are not claimed. The driver
-is therefore still candidate-only and is not wired into daemon provider
+mapping, native `session/cancel`, and a governed native
+`session/request_permission` round-trip. Its local replay tests pass against
+the compiled DSH ACP demo. This does not change admission: native
+`session/load`/`session/resume` are unsupported and the DSH ACP surface does
+not expose an independently hashable EgoPulse Artifact return. The driver is
+therefore still candidate-only and is not wired into daemon provider
 selection.
 
 ## Phase 2-03 exit disposition
@@ -181,12 +182,13 @@ does not close second-Harness admission. The authoritative evidence is:
 
 - G4-09 capability-binding and shared Probe Gate tests;
 - the Kimi no-prompt ACP probe recorded as `authentication_required`;
-- DSH isolated ACP prompt/cancel evidence with native recovery explicitly held;
+- DSH isolated ACP prompt/cancel/permission evidence with Artifact and native
+  recovery explicitly held;
 - Codex remaining the sole active production Harness.
 
 The next admission decision remains separate from the candidate execution
-slice: either complete the missing DSH approval/artifact/recovery evidence or
-run the authenticated Kimi lifecycle probe. Codex remains the only production
-Harness until one candidate satisfies the complete contract. Memory/RAG
-runtime work remains a parallel governed slice, but it does not silently
-promote a second Harness.
+slice: either complete the missing DSH Artifact/recovery evidence or run the
+authenticated Kimi lifecycle probe. Codex remains the only production Harness
+until one candidate satisfies the complete contract. Memory/RAG runtime work
+remains a parallel governed slice, but it does not silently promote a second
+Harness.

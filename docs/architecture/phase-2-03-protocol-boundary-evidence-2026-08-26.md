@@ -148,9 +148,12 @@ source. It projects the request into the provider-neutral approval contract,
 yields the observation stream until the governance decision arrives, and
 writes back only an exact one-shot allow/reject selection or `cancelled` using
 the opaque JSON-RPC request id. Unknown server requests remain fail closed.
-This proves the adapter boundary and its local fixtures; it does not prove
-that all DSH tools exercise approval in the same way, nor does it prove
-artifact or recovery semantics.
+The real compiled DSH replay now covers this path end to end: multi-turn,
+native cancellation, and governed permission all pass in the same local Rust
+replay suite (`3 passed, 0 failed`) without a model/API call. This proves the
+current DSH fixture's approval round-trip; it does not prove that all DSH tools
+exercise approval in the same way, nor does it prove Artifact or recovery
+semantics.
 
 The recovery capability probe now records the opposite result explicitly:
 

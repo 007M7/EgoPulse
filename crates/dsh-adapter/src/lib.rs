@@ -109,10 +109,11 @@ struct PendingApproval {
 
 /// Candidate-only DSH ACP driver.
 ///
-/// The driver now exercises the proven fresh-session ACP path and native
-/// prompt/cancel messages. It remains candidate-only because DSH has no native
-/// session load/resume capability and its approval/artifact semantics are not
-/// yet independently attested. Those weaker rows remain explicit failures.
+/// The driver now exercises the proven fresh-session ACP path, native
+/// prompt/cancel messages, and a governed native permission round-trip. It
+/// remains candidate-only because DSH has no native session load/resume
+/// capability and its ACP surface does not expose EgoPulse Artifact semantics.
+/// Those weaker rows remain explicit failures.
 pub struct DshAcpDriver {
     config: DshAcpConfig,
     session: Option<DshSession>,
