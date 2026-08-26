@@ -1170,6 +1170,10 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
         tui_stdout.contains("return_pending_steps=1"),
         "TUI must render the pending return count from TaskView: {tui_stdout}"
     );
+    assert!(
+        tui_stdout.contains("returned_steps=0"),
+        "TUI must render the returned-step count from TaskView: {tui_stdout}"
+    );
 
     let cli_task_output = run_cli(&instance, &["task", "get", "task-c5-03", "--json"]).await;
     assert!(
@@ -1188,6 +1192,8 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
         cli_task_json["data"]["collaboration"]["returnPendingSteps"],
         1
     );
+    assert_eq!(cli_task_json["data"]["collaboration"]["returnedSteps"], 0);
+    assert_eq!(cli_task_json["data"]["currentRunId"], "c5-run");
 
     let tui_acceptance_sha = "44".repeat(32);
     let tui_budget_sha = "55".repeat(32);
