@@ -29,6 +29,7 @@ pub struct MemoryCandidateProducerBinding {
     pub producer_id: String,
     pub principal_id: String,
     pub principal_kind: MemoryPrincipalKind,
+    pub scope_ref: String,
 }
 
 impl MemoryCandidateProducerBinding {
@@ -36,11 +37,13 @@ impl MemoryCandidateProducerBinding {
         producer_id: impl Into<String>,
         principal_id: impl Into<String>,
         principal_kind: MemoryPrincipalKind,
+        scope_ref: impl Into<String>,
     ) -> Result<Self, MemoryCandidateProducerConfigurationError> {
         let binding = Self {
             producer_id: producer_id.into(),
             principal_id: principal_id.into(),
             principal_kind,
+            scope_ref: scope_ref.into(),
         };
         binding.validate()?;
         Ok(binding)
@@ -49,6 +52,7 @@ impl MemoryCandidateProducerBinding {
     fn validate(&self) -> Result<(), MemoryCandidateProducerConfigurationError> {
         validate_identifier(&self.producer_id, "producer_id")?;
         validate_identifier(&self.principal_id, "principal_id")?;
+        validate_identifier(&self.scope_ref, "scope_ref")?;
         if !matches!(
             self.principal_kind,
             MemoryPrincipalKind::Agent | MemoryPrincipalKind::Model | MemoryPrincipalKind::Harness
@@ -77,6 +81,8 @@ pub enum MemoryCandidateProducerFailure {
     UnknownProducer(String),
     #[error(transparent)]
     Authority(#[from] MemoryAuthorityFailure),
+    #[error("memory candidate producer is not authorized for the requested scope")]
+    ScopeViolation,
 }
 
 /// Narrow internal write capability granted to a candidate producer. There is
@@ -91,6 +97,7 @@ pub trait MemoryCandidateProducerPort: Send + Sync {
 struct ConfiguredMemoryCandidateProducer {
     authority: Arc<Mutex<MemoryAuthority>>,
     principal: AuthenticatedMemoryPrincipal,
+    scope_ref: String,
 }
 
 impl ConfiguredMemoryCandidateProducer {
@@ -105,6 +112,7 @@ impl ConfiguredMemoryCandidateProducer {
                 principal_id: binding.principal_id.clone(),
                 authenticated: true,
             },
+            scope_ref: binding.scope_ref.clone(),
         }
     }
 }
@@ -114,6 +122,9 @@ impl MemoryCandidateProducerPort for ConfiguredMemoryCandidateProducer {
         &self,
         command: &SubmitMemoryCandidate,
     ) -> Result<AuthorityMemoryMutationReceipt, MemoryCandidateProducerFailure> {
+        if command.scope_ref != self.scope_ref {
+            return Err(MemoryCandidateProducerFailure::ScopeViolation);
+        }
         let mut authority = self.authority.lock().map_err(|_| {
             MemoryCandidateProducerFailure::Authority(MemoryAuthorityFailure::Storage)
         })?;
@@ -545,18 +556,21 @@ mod tests {
                     "agent:planner",
                     "agent-planner-v1",
                     MemoryPrincipalKind::Agent,
+                    "scope:founder",
                 )
                 .expect("agent binding"),
                 MemoryCandidateProducerBinding::new(
                     "model:reasoner",
                     "model-reasoner-v1",
                     MemoryPrincipalKind::Model,
+                    "scope:founder",
                 )
                 .expect("model binding"),
                 MemoryCandidateProducerBinding::new(
                     "harness:codex",
                     "harness-codex-v1",
                     MemoryPrincipalKind::Harness,
+                    "scope:founder",
                 )
                 .expect("harness binding"),
             ],
@@ -568,23 +582,41 @@ mod tests {
             ("model:reasoner", "memory-model"),
             ("harness:codex", "memory-harness"),
         ] {
+            let command = SubmitMemoryCandidate {
+                memory_id: memory_id.to_owned(),
+                content: format!("candidate from {producer_id}"),
+                source_ref: format!("source:{producer_id}"),
+                scope_ref: "scope:founder".to_owned(),
+                idempotency_key: format!("idempotency:{producer_id}"),
+            };
             let receipt = registry
-                .submit_candidate(
-                    producer_id,
-                    &SubmitMemoryCandidate {
-                        memory_id: memory_id.to_owned(),
-                        content: format!("candidate from {producer_id}"),
-                        source_ref: format!("source:{producer_id}"),
-                        scope_ref: "scope:founder".to_owned(),
-                        idempotency_key: format!("idempotency:{producer_id}"),
-                    },
-                )
+                .submit_candidate(producer_id, &command)
                 .expect("candidate receipt");
             assert_eq!(
                 receipt.state,
                 egopulse_cognition_runtime::memory_authority::MemoryState::Candidate
             );
+            assert_eq!(
+                registry
+                    .submit_candidate(producer_id, &command)
+                    .expect("idempotent producer replay"),
+                receipt
+            );
         }
+
+        let wrong_scope = SubmitMemoryCandidate {
+            memory_id: "memory-wrong-scope".to_owned(),
+            content: "candidate".to_owned(),
+            source_ref: "source:agent".to_owned(),
+            scope_ref: "scope:other".to_owned(),
+            idempotency_key: "idempotency:wrong-scope".to_owned(),
+        };
+        assert_eq!(
+            registry
+                .submit_candidate("agent:planner", &wrong_scope)
+                .expect_err("producer scope must be fixed"),
+            MemoryCandidateProducerFailure::ScopeViolation
+        );
 
         assert_eq!(
             registry
@@ -613,13 +645,19 @@ mod tests {
                 "founder:local",
                 "founder-local",
                 MemoryPrincipalKind::Founder,
+                "scope:founder",
             )
             .expect_err("Founder cannot be registered as a producer"),
             MemoryCandidateProducerConfigurationError::UnsupportedPrincipalKind
         );
         assert_eq!(
-            MemoryCandidateProducerBinding::new(" ", "agent-1", MemoryPrincipalKind::Agent)
-                .expect_err("empty producer route must fail"),
+            MemoryCandidateProducerBinding::new(
+                " ",
+                "agent-1",
+                MemoryPrincipalKind::Agent,
+                "scope:founder",
+            )
+            .expect_err("empty producer route must fail"),
             MemoryCandidateProducerConfigurationError::InvalidIdentifier("producer_id")
         );
 
@@ -636,12 +674,14 @@ mod tests {
             "agent:planner",
             "agent-planner-v1",
             MemoryPrincipalKind::Agent,
+            "scope:founder",
         )
         .expect("first binding");
         let second = MemoryCandidateProducerBinding::new(
             "agent:planner",
             "agent-planner-v2",
             MemoryPrincipalKind::Agent,
+            "scope:founder",
         )
         .expect("second binding");
         match MemoryCandidateProducerRegistry::new(authority, [first, second]) {

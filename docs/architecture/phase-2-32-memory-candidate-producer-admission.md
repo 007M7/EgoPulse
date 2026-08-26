@@ -18,6 +18,7 @@ reviewed composition
         v
 producer_id -> fixed principal_id + fixed principal_kind
         |                  (Agent | Model | Harness only)
+        +--> fixed scope_ref
         v
 MemoryCandidateProducerPort::submit_candidate(command)
         |
@@ -34,7 +35,9 @@ candidate only
 The producer call has no principal argument. The principal is constructed once
 from the reviewed binding and cannot be selected by the model output, a worker
 payload or a Local API client. `producer_id` is an internal composition route,
-not a user-controlled authority claim.
+not a user-controlled authority claim. Each binding also fixes one `scope_ref`;
+a candidate for another scope is rejected before the Memory Authority is
+called.
 
 The registry accepts only these producer identities:
 
@@ -100,6 +103,8 @@ Unit coverage in `apps/agentosd/src/memory_mutation.rs` verifies:
 - Agent, Model and Harness bindings can submit candidates through distinct
   fixed routes;
 - unknown routes fail closed;
+- a producer cannot submit outside its bound scope;
+- exact candidate replay preserves the Memory Authority receipt;
 - governance identities cannot be registered as producers;
 - empty and duplicate registrations are rejected.
 
