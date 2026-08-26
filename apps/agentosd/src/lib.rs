@@ -52,9 +52,10 @@ use egopulse_local_api::{
 use egopulse_local_ide_control::collaboration_control::{
     AuthenticatedCollaborationPrincipal, CollaborationControl, CollaborationControlConfig,
     CollaborationControlError, CollaborationPrincipalKind, CollaborationSqlCipherKey,
-    GovernedTaskActivationRunner, HarnessDispatchCycleError, HarnessDispatchRunner,
-    SingleHarnessWorkConfig, SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError,
-    SystemAuthorityClock, TaskActivationGuardSet, TaskActivationSource,
+    CompositeHarnessDispatchRunner, GovernedTaskActivationRunner, HarnessDispatchCycleError,
+    HarnessDispatchRunner, SingleHarnessWorkConfig, SingleHarnessWorkflowResolver,
+    SingleHarnessWorkflowResolverError, SystemAuthorityClock, TaskActivationGuardSet,
+    TaskActivationSource,
 };
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
@@ -543,6 +544,25 @@ impl DaemonProviders {
     pub fn with_harness_dispatch_runner(mut self, runner: Arc<dyn HarnessDispatchRunner>) -> Self {
         self.harness_dispatch_runner = Some(runner);
         self
+    }
+
+    /// Installs a deterministic multi-Harness dispatch composition. Each
+    /// runner is responsible for filtering to its own capability profile and
+    /// owning its own Adapter Edge; the daemon only invokes the composite as
+    /// one scheduling unit.
+    pub fn with_harness_dispatch_runners(
+        mut self,
+        runners: Vec<Arc<dyn HarnessDispatchRunner>>,
+    ) -> Result<Self, DaemonCompositionError> {
+        if self.harness_dispatch_runner.is_some() {
+            return Err(DaemonCompositionError::InvalidConfiguration(
+                "Harness runner already configured",
+            ));
+        }
+        let composite = CompositeHarnessDispatchRunner::new(runners)
+            .map_err(DaemonCompositionError::InvalidConfiguration)?;
+        self.harness_dispatch_runner = Some(Arc::new(composite));
+        Ok(self)
     }
 
     #[must_use]

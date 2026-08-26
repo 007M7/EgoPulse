@@ -76,6 +76,46 @@ pub trait HarnessDispatchRunner: Send + Sync {
     >;
 }
 
+/// Runs multiple provider-specific dispatch workers through one daemon
+/// scheduling hook. Each child runner must be configured with its own
+/// capability-profile filter and Adapter Edge. The composite only sequences
+/// the child cycles; it does not select a model or merge provider-owned facts.
+pub struct CompositeHarnessDispatchRunner {
+    runners: Vec<std::sync::Arc<dyn HarnessDispatchRunner>>,
+}
+
+impl CompositeHarnessDispatchRunner {
+    pub fn new(
+        runners: Vec<std::sync::Arc<dyn HarnessDispatchRunner>>,
+    ) -> Result<Self, &'static str> {
+        if runners.is_empty() {
+            return Err("at least one Harness dispatch runner is required");
+        }
+        Ok(Self { runners })
+    }
+}
+
+impl HarnessDispatchRunner for CompositeHarnessDispatchRunner {
+    fn run_once(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let mut report = HarnessDispatchCycleReport::default();
+            for runner in &self.runners {
+                let child = runner.run_once().await?;
+                merge_report(&mut report, child);
+            }
+            Ok(report)
+        })
+    }
+}
+
 struct GovernedDispatchRuntime<G, C, R, D, A> {
     control: CollaborationControl<G, C>,
     adapter: GovernedHarnessAdapter<R, D, A>,
@@ -85,6 +125,7 @@ struct GovernedDispatchRuntime<G, C, R, D, A> {
 pub struct GovernedHarnessDispatchRunner<G, C, R, D, A> {
     runtime: tokio::sync::Mutex<GovernedDispatchRuntime<G, C, R, D, A>>,
     principal: AuthenticatedCollaborationPrincipal,
+    capability_profile_id: Option<String>,
 }
 
 impl<G, C, R, D, A> GovernedHarnessDispatchRunner<G, C, R, D, A>
@@ -108,7 +149,17 @@ where
                 active_envelopes: Vec::new(),
             }),
             principal,
+            capability_profile_id: None,
         }
+    }
+
+    /// Restricts this runner to dispatch envelopes bound to one reviewed
+    /// capability profile. This is required when multiple provider runners
+    /// share one Collaboration Control database.
+    #[must_use]
+    pub fn with_capability_profile_id(mut self, profile_id: impl Into<String>) -> Self {
+        self.capability_profile_id = Some(profile_id.into());
+        self
     }
 }
 
@@ -136,7 +187,12 @@ where
                 adapter,
                 active_envelopes,
             } = &mut *runtime;
-            register_pending_envelopes(control, active_envelopes, &self.principal)?;
+            register_pending_envelopes(
+                control,
+                active_envelopes,
+                &self.principal,
+                self.capability_profile_id.as_deref(),
+            )?;
             let mut report = HarnessDispatchCycleReport::default();
             pump_active_envelopes(
                 control,
@@ -146,7 +202,13 @@ where
                 &mut report,
             )
             .await?;
-            let dispatched = dispatch_pending(control, adapter, &self.principal).await?;
+            let dispatched = dispatch_pending_for_profile(
+                control,
+                adapter,
+                &self.principal,
+                self.capability_profile_id.as_deref(),
+            )
+            .await?;
             merge_report(&mut report, dispatched);
             remove_terminal_envelopes(active_envelopes, &report);
             Ok(report)
@@ -322,12 +384,12 @@ where
                 }
                 report.activations_started += 1;
                 report.activations_acknowledged += 1;
-                register_pending_envelopes(control, active_envelopes, &self.principal)?;
+                register_pending_envelopes(control, active_envelopes, &self.principal, None)?;
                 let dispatched = dispatch_pending(control, adapter, &self.principal).await?;
                 merge_report(&mut report, dispatched);
                 remove_terminal_envelopes(active_envelopes, &report);
             }
-            register_pending_envelopes(control, active_envelopes, &self.principal)?;
+            register_pending_envelopes(control, active_envelopes, &self.principal, None)?;
             let dispatched = dispatch_pending(control, adapter, &self.principal).await?;
             merge_report(&mut report, dispatched);
             remove_terminal_envelopes(active_envelopes, &report);
@@ -572,7 +634,27 @@ where
     D: NativeHarnessDriver,
     A: AdapterClock,
 {
-    let pending = control.pending_dispatches(principal)?;
+    dispatch_pending_for_profile(control, adapter, principal, None).await
+}
+
+async fn dispatch_pending_for_profile<G, C, R, D, A>(
+    control: &mut CollaborationControl<G, C>,
+    adapter: &mut GovernedHarnessAdapter<R, D, A>,
+    principal: &AuthenticatedCollaborationPrincipal,
+    capability_profile_id: Option<&str>,
+) -> Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+    R: DispatchMaterialResolver,
+    D: NativeHarnessDriver,
+    A: AdapterClock,
+{
+    let pending = control
+        .pending_dispatches(principal)?
+        .into_iter()
+        .filter(|dispatch| envelope_matches_profile(&dispatch.envelope, capability_profile_id))
+        .collect::<Vec<_>>();
     let mut report = HarnessDispatchCycleReport {
         dispatches_seen: pending.len() as u64,
         ..HarnessDispatchCycleReport::default()
@@ -653,12 +735,17 @@ fn register_pending_envelopes<G, C>(
     control: &CollaborationControl<G, C>,
     active_envelopes: &mut Vec<DispatchEnvelope>,
     principal: &AuthenticatedCollaborationPrincipal,
+    capability_profile_id: Option<&str>,
 ) -> Result<(), CollaborationControlError>
 where
     G: CollaborationReferenceGuard + HarnessEvidenceResolver,
     C: AuthorityClock,
 {
-    for pending in control.pending_dispatches(principal)? {
+    for pending in control
+        .pending_dispatches(principal)?
+        .into_iter()
+        .filter(|dispatch| envelope_matches_profile(&dispatch.envelope, capability_profile_id))
+    {
         if !active_envelopes
             .iter()
             .any(|item| item.dispatch_id == pending.envelope.dispatch_id)
@@ -667,6 +754,18 @@ where
         }
     }
     Ok(())
+}
+
+fn envelope_matches_profile(
+    envelope: &DispatchEnvelope,
+    capability_profile_id: Option<&str>,
+) -> bool {
+    capability_profile_id.is_none_or(|expected| {
+        envelope
+            .capability_profile_ref
+            .as_ref()
+            .is_some_and(|reference| reference.contract_id == expected)
+    })
 }
 
 async fn pump_active_envelopes<G, C, R, D, A>(
@@ -807,4 +906,92 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
+    use std::sync::Arc;
+
+    struct FixedRunner {
+        report: HarnessDispatchCycleReport,
+    }
+
+    impl HarnessDispatchRunner for FixedRunner {
+        fn run_once(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let report = self.report.clone();
+            Box::pin(async move { Ok(report) })
+        }
+    }
+
+    #[tokio::test]
+    async fn composite_sequences_runners_and_merges_terminal_identity() {
+        let composite = CompositeHarnessDispatchRunner::new(vec![
+            Arc::new(FixedRunner {
+                report: HarnessDispatchCycleReport {
+                    dispatches_seen: 1,
+                    dispatches_delivered: 1,
+                    terminal_dispatch_ids: vec!["dispatch:one".to_owned()],
+                    ..Default::default()
+                },
+            }),
+            Arc::new(FixedRunner {
+                report: HarnessDispatchCycleReport {
+                    dispatches_seen: 2,
+                    dispatches_rejected: 1,
+                    terminal_dispatch_ids: vec![
+                        "dispatch:one".to_owned(),
+                        "dispatch:two".to_owned(),
+                    ],
+                    ..Default::default()
+                },
+            }),
+        ])
+        .expect("compose two Harness runners");
+
+        let report = composite.run_once().await.expect("composite cycle");
+        assert_eq!(report.dispatches_seen, 3);
+        assert_eq!(report.dispatches_delivered, 1);
+        assert_eq!(report.dispatches_rejected, 1);
+        assert_eq!(
+            report.terminal_dispatch_ids,
+            vec!["dispatch:one", "dispatch:two"]
+        );
+    }
+
+    #[test]
+    fn profile_filter_keeps_dispatches_on_their_bound_runner() {
+        let envelope = DispatchEnvelope {
+            capability_profile_ref: Some(ContractReference {
+                contract_id: "profile:codex".to_owned(),
+                version: "v1".to_owned(),
+                sha256: "a".repeat(64),
+            }),
+            ..Default::default()
+        };
+        assert!(envelope_matches_profile(&envelope, None));
+        assert!(envelope_matches_profile(&envelope, Some("profile:codex")));
+        assert!(!envelope_matches_profile(&envelope, Some("profile:dsh")));
+        assert!(!envelope_matches_profile(
+            &DispatchEnvelope::default(),
+            Some("profile:codex")
+        ));
+    }
+
+    #[test]
+    fn empty_composite_is_rejected_before_daemon_configuration() {
+        assert!(matches!(
+            CompositeHarnessDispatchRunner::new(Vec::new()),
+            Err("at least one Harness dispatch runner is required")
+        ));
+    }
 }

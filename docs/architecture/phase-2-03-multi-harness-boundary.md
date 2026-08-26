@@ -56,6 +56,13 @@ it.
 - The first multi-model implementation may reuse the same local client kernel
   and command surfaces. It must not introduce a UI-specific routing path.
 
+The daemon now has a composition seam for that future multi-Harness runtime:
+`CompositeHarnessDispatchRunner` invokes provider-specific runners through one
+daemon scheduling hook. Each child runner may be bound to one reviewed
+capability-profile ID and must own its own Adapter Edge. The composite only
+sequences cycles and merges their public cycle reports; it does not select a
+model, merge provider-owned facts or weaken Collaboration/Authority rules.
+
 ## What is deliberately not frozen yet
 
 The second official Harness is not selected by popularity or by the amount of
@@ -101,6 +108,14 @@ are closed. The shared Probe Gate is also implemented in
 independent probe evidence and native protocol fingerprint before a `Ready`
 result can become capability-attestation input. A future Kimi or DeepSeek
 adapter cannot bypass it by returning a provider-specific success shape.
+
+The first composition seam is locally verified: an empty composite is rejected
+before daemon configuration, child cycle reports are merged deterministically
+with terminal dispatch IDs de-duplicated, and a profile-bound runner ignores
+dispatches whose capability binding is different or missing. This proves the
+scheduling and isolation contract only; it does not promote DSH or Kimi and
+does not claim that either candidate has completed Artifact or recovery
+admission.
 
 The current Kimi code unit remains an authenticated-session boundary. It
 records the ACP `initialize` result and empty `session/new` disposition, but

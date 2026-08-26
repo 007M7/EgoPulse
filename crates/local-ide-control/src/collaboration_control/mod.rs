@@ -9,8 +9,9 @@ mod task_activation_guard;
 pub use adapter_evidence::AdapterBackedHarnessEvidenceResolver;
 pub use composite_guard::CompositeCollaborationGuard;
 pub use harness_dispatch::{
-    GovernedHarnessDispatchRunner, GovernedTaskActivationRunner, HarnessDispatchCycleError,
-    HarnessDispatchCycleReport, HarnessDispatchRunner, dispatch_pending, pump_observations,
+    CompositeHarnessDispatchRunner, GovernedHarnessDispatchRunner, GovernedTaskActivationRunner,
+    HarnessDispatchCycleError, HarnessDispatchCycleReport, HarnessDispatchRunner, dispatch_pending,
+    pump_observations,
 };
 pub use ingestion::{HarnessFactIngestionDisposition, HarnessFactIngestionResult};
 pub use single_harness_workflow::{
