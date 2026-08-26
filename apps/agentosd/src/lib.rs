@@ -104,7 +104,7 @@ pub use security::{
 };
 pub use task::{
     ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ConfiguredTaskTransitionGuard,
-    TaskCreationGuardConfigurationError,
+    SharedFounderVerdictAuthority, TaskCreationGuardConfigurationError,
 };
 pub use verdict::{
     ConfiguredFounderVerdictResolver, ConfiguredFounderVerdictResolverConfig,
@@ -364,7 +364,7 @@ pub struct AuthorityCompositionInputs {
 pub struct SharedAuthorityCompositionInputs {
     pub task: Arc<Mutex<egopulse_cognition_runtime::task_authority::TaskAuthority>>,
     pub policy: egopulse_policy_decision_authority::PolicyDecisionAuthority,
-    pub verdict: egopulse_founder_verdict_authority::FounderVerdictAuthority,
+    pub verdict: SharedFounderVerdictAuthority,
     pub principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
     pub session_principal_resolver: Arc<dyn TrustedPrincipalResolver>,
     pub session_clock: Arc<dyn SessionClock>,
@@ -457,7 +457,7 @@ impl DaemonProviders {
     /// command handling must observe the same owner instance.
     #[must_use]
     pub fn from_shared_authority_inputs(inputs: SharedAuthorityCompositionInputs) -> Self {
-        let ports = Arc::new(AuthorityCommandPorts::new_shared(
+        let ports = Arc::new(AuthorityCommandPorts::new_shared_handles(
             inputs.task,
             inputs.policy,
             inputs.verdict,

@@ -133,10 +133,13 @@ impl ProductionBootstrapConfig {
     /// built; no test resolver is used as a production fallback.
     pub fn build(self) -> Result<DaemonProviders, ProductionBootstrapError> {
         let task_guard = ConfiguredTaskCreationGuard::new(self.task_guard)?;
+        let founder_verdict_handle = Arc::new(Mutex::new(None));
         let task = Arc::new(Mutex::new(TaskAuthority::open_with_transition_guard(
             self.task,
             task_guard,
-            ConfiguredTaskTransitionGuard::new(),
+            ConfiguredTaskTransitionGuard::with_founder_verdict(Arc::clone(
+                &founder_verdict_handle,
+            )),
         )?));
         let memory = Arc::new(Mutex::new(MemoryAuthority::open(self.memory)?));
 
@@ -198,6 +201,10 @@ impl ProductionBootstrapConfig {
                 confirmation_ttl: self.founder_confirmation_ttl,
             })?;
         let verdict = FounderVerdictAuthority::open(self.verdict, founder_resolver)?;
+        *founder_verdict_handle
+            .lock()
+            .map_err(|_| ProductionBootstrapError::InvalidConfiguration("verdict handle"))? =
+            Some(verdict);
 
         let principal_resolver = Arc::new(ConfiguredAuthorityPrincipalResolver::new([
             self.authority_binding
@@ -208,7 +215,7 @@ impl ProductionBootstrapConfig {
             DaemonProviders::from_shared_authority_inputs(SharedAuthorityCompositionInputs {
                 task: Arc::clone(&task),
                 policy,
-                verdict,
+                verdict: founder_verdict_handle,
                 principal_resolver,
                 session_principal_resolver,
                 session_clock: Arc::new(SystemSessionClock),

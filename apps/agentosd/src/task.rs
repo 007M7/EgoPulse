@@ -8,6 +8,8 @@ use egopulse_domain_contracts::v01::egopulse::{
     common::v1::ContractReference,
     task::v1::{CreateTaskCommand, TaskCommand, TaskSnapshot, TaskStatus, task_command},
 };
+use egopulse_founder_verdict_authority::FounderVerdictAuthority;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 /// Reviewed creation policy for the first local vertical.
@@ -108,19 +110,40 @@ impl TaskCreationGuard for ConfiguredTaskCreationGuard {
     }
 }
 
-/// Production transition guard for the non-terminal Task handoff path.
+/// Shared late-bound Founder Verdict handle used only by the composition root
+/// while the Task and Verdict Authorities are being assembled. Once bootstrap
+/// completes, it contains exactly one Verdict Authority instance; an empty
+/// handle remains fail-closed.
+pub type SharedFounderVerdictAuthority = Arc<Mutex<Option<FounderVerdictAuthority>>>;
+
+/// Production transition guard for the Task handoff path.
 ///
 /// Collaboration submits Artifact/ReturnHandoff references, and the
 /// Verification worker submits a Verification artifact reference after its
 /// own cross-authority proof. Founder Verdict transitions remain denied until
-/// a Founder-verdict-aware guard is composed.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ConfiguredTaskTransitionGuard;
+/// Founder Verdict application is accepted only when the exact issued
+/// verdict is read from the owning Verdict Authority and its scope is bound
+/// to the current Task snapshot. The guard returns the decision and state
+/// revision needed by Task Authority to create the durable cross-authority
+/// consume outbox; it never writes Verdict state.
+#[derive(Clone, Default)]
+pub struct ConfiguredTaskTransitionGuard {
+    founder_verdict: Option<SharedFounderVerdictAuthority>,
+}
 
 impl ConfiguredTaskTransitionGuard {
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self {
+            founder_verdict: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_founder_verdict(founder_verdict: SharedFounderVerdictAuthority) -> Self {
+        Self {
+            founder_verdict: Some(founder_verdict),
+        }
     }
 }
 
@@ -178,6 +201,86 @@ impl TaskTransitionGuard for ConfiguredTaskTransitionGuard {
                     )],
                     founder_decision: None,
                     founder_verdict_state_revision: None,
+                })
+            }
+            Some(task_command::Command::ApplyFounderVerdict(value)) => {
+                let Some(founder_verdict) = self.founder_verdict.as_ref() else {
+                    return Err(TransitionGuardRejection::UnverifiedReference);
+                };
+                if current.status != TaskStatus::VerdictPending as i32
+                    || value.task_id != current.task_id
+                    || value.expected_revision != current.revision
+                    || value.work_revision != current.work_revision
+                    || value.founder_verdict_id.trim().is_empty()
+                    || current.artifact_set_id.is_none()
+                    || current.verification_artifact_id.is_none()
+                {
+                    return Err(TransitionGuardRejection::StateConflict);
+                }
+                let authority = founder_verdict
+                    .lock()
+                    .map_err(|_| TransitionGuardRejection::IntegrityFailure)?;
+                let Some(authority) = authority.as_ref() else {
+                    return Err(TransitionGuardRejection::UnverifiedReference);
+                };
+                let Some((verdict, state)) = authority
+                    .get(&value.founder_verdict_id)
+                    .map_err(|_| TransitionGuardRejection::IntegrityFailure)?
+                else {
+                    return Err(TransitionGuardRejection::StaleReference);
+                };
+                if state.state
+                    != egopulse_domain_contracts::v01::egopulse::verdict::v1::FounderVerdictStateKind::Issued
+                        as i32
+                    || state.revision == 0
+                    || state.founder_verdict_id != value.founder_verdict_id
+                {
+                    return Err(TransitionGuardRejection::StaleReference);
+                }
+                let Some(scope) = verdict.scope.as_ref() else {
+                    return Err(TransitionGuardRejection::IntegrityFailure);
+                };
+                if scope.task_id != current.task_id
+                    || scope.task_revision != current.revision
+                    || scope.work_revision != current.work_revision
+                    || scope.artifact_set_id
+                        != current.artifact_set_id.as_deref().unwrap_or_default()
+                    || scope.verification_artifact_id
+                        != current
+                            .verification_artifact_id
+                            .as_deref()
+                            .unwrap_or_default()
+                    || scope.acceptance_contract_ref.as_ref()
+                        != current.acceptance_contract_ref.as_ref()
+                {
+                    return Err(TransitionGuardRejection::StaleReference);
+                }
+                let decision = egopulse_domain_contracts::v01::egopulse::verdict::v1::FounderVerdictDecision::try_from(verdict.decision)
+                    .map_err(|_| TransitionGuardRejection::IntegrityFailure)?;
+                let founder_decision = match decision {
+                    egopulse_domain_contracts::v01::egopulse::verdict::v1::FounderVerdictDecision::Accept => {
+                        egopulse_domain_contracts::v01::egopulse::task::v1::FounderDecision::Accept
+                    }
+                    egopulse_domain_contracts::v01::egopulse::verdict::v1::FounderVerdictDecision::Rework => {
+                        egopulse_domain_contracts::v01::egopulse::task::v1::FounderDecision::Rework
+                    }
+                    egopulse_domain_contracts::v01::egopulse::verdict::v1::FounderVerdictDecision::Reject => {
+                        egopulse_domain_contracts::v01::egopulse::task::v1::FounderDecision::Reject
+                    }
+                    egopulse_domain_contracts::v01::egopulse::verdict::v1::FounderVerdictDecision::Unspecified => {
+                        return Err(TransitionGuardRejection::TerminalGateUnsatisfied);
+                    }
+                };
+                Ok(TransitionAuthorization {
+                    evidence_refs: vec![
+                        format!("founder-verdict:{}@issued", value.founder_verdict_id),
+                        format!(
+                            "founder-verdict-state:{}@{}",
+                            value.founder_verdict_id, state.revision
+                        ),
+                    ],
+                    founder_decision: Some(founder_decision),
+                    founder_verdict_state_revision: Some(state.revision),
                 })
             }
             _ => Err(TransitionGuardRejection::UnverifiedReference),

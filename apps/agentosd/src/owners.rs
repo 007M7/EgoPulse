@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use crate::SharedFounderVerdictAuthority;
 use crate::projections::{OwnerProjectionSource, PendingOwnerProjection, ProjectionSourceFailure};
 use egopulse_cognition_runtime::task_authority::{
     AuthenticatedPrincipal, PrincipalKind as TaskPrincipalKind, TaskAuthority, TaskAuthorityFailure,
@@ -85,7 +86,7 @@ impl AuthorityPrincipalResolver for DenyAllAuthorityPrincipalResolver {
 pub struct AuthorityCommandPorts {
     task: Arc<Mutex<TaskAuthority>>,
     policy: Mutex<PolicyDecisionAuthority>,
-    verdict: Mutex<FounderVerdictAuthority>,
+    verdict: SharedFounderVerdictAuthority,
     principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
 }
 
@@ -115,10 +116,28 @@ impl AuthorityCommandPorts {
         verdict: FounderVerdictAuthority,
         principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
     ) -> Self {
+        Self::new_shared_handles(
+            task,
+            policy,
+            Arc::new(Mutex::new(Some(verdict))),
+            principal_resolver,
+        )
+    }
+
+    /// Composes a shared, late-bound Verdict Authority handle. The handle is
+    /// populated by the production composition root only after the Task
+    /// Authority has been constructed with the matching transition guard.
+    #[must_use]
+    pub fn new_shared_handles(
+        task: Arc<Mutex<TaskAuthority>>,
+        policy: PolicyDecisionAuthority,
+        verdict: SharedFounderVerdictAuthority,
+        principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
+    ) -> Self {
         Self {
             task,
             policy: Mutex::new(policy),
-            verdict: Mutex::new(verdict),
+            verdict,
             principal_resolver,
         }
     }
@@ -312,10 +331,13 @@ impl VerdictCommandPort for AuthorityCommandPorts {
         principal: &CommandPrincipal,
     ) -> Result<CommandPortResult<VerdictCommandResult>, CommandPortFailure> {
         let owner_principal = self.verdict_principal(principal)?;
-        let mut authority = self
+        let mut verdict_handle = self
             .verdict
             .lock()
             .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+        let authority = verdict_handle
+            .as_mut()
+            .ok_or(CommandPortFailure::Unavailable)?;
         let result = authority
             .execute(command, &owner_principal)
             .map_err(verdict_failure)?;
@@ -350,7 +372,9 @@ impl OwnerProjectionSource for AuthorityCommandPorts {
         let verdict = self
             .verdict
             .lock()
-            .map_err(|_| ProjectionSourceFailure::Verdict)?
+            .map_err(|_| ProjectionSourceFailure::Verdict)?;
+        let verdict = verdict.as_ref().ok_or(ProjectionSourceFailure::Verdict)?;
+        let verdict = verdict
             .drain_projection_outbox()
             .map_err(|_| ProjectionSourceFailure::Verdict)?
             .into_iter()
@@ -383,6 +407,8 @@ impl OwnerProjectionSource for AuthorityCommandPorts {
                 .verdict
                 .lock()
                 .map_err(|_| ProjectionSourceFailure::Verdict)?
+                .as_mut()
+                .ok_or(ProjectionSourceFailure::Verdict)?
                 .acknowledge_projection(&message.message_id, &message.payload_digest_sha256)
                 .map_err(|_| ProjectionSourceFailure::Verdict)?,
         };
