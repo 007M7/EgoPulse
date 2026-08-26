@@ -1,7 +1,7 @@
 # EgoPulse implementation architecture
 
-- Status: Gate 4 vertical implementation in progress
-- Date: 2026-08-24
+- Status: Gate 4 vertical implementation in progress; Phase 2-03 candidate admission held
+- Date: 2026-08-27
 - Decision owner: Founder
 
 ## Source and responsibility
@@ -82,10 +82,21 @@ Collaboration/Sego stages after technical evidence intake.
 - Shared profile interpretation: G4-08C C2 moves digest verification, profile parsing and fail-closed RPC/oneof authorization lookup into the framework-neutral `domain-contracts::profiles` boundary. Client and server consume that one interpreter; framework types still cannot enter `domain-contracts`.
 - Local API gateway: G4-08C C2/C3 is exercised by the real CLI/TUI C5 fixtures over Windows Named Pipe; the default production provider bootstrap remains open.
 - Supervised Worker/Harness transport: the Codex App Server official native protocol adapter and durable Adapter Edge are implemented for V-01; additional Harness protocols remain separate adapter units.
+- Codex production adapter: `crates/codex-adapter` is the only active
+  production Harness. It is selected through the reviewed capability profile
+  and the governed Collaboration/Adapter/Artifact/Verification path.
+- Kimi candidate adapter: `crates/kimi-adapter` isolates the Kimi CLI ACP
+  session and candidate execution lifecycle behind the same provider-neutral
+  driver and process-supervision boundary. It supports candidate prompt,
+  update, permission, cancellation and one-shot output extraction, but the
+  authenticated lifecycle has not been attested; it is not wired into daemon
+  provider selection.
 - DSH candidate adapter: `crates/dsh-adapter` isolates the DeepSeek Harness
-  ACP session probe behind the same provider-neutral driver and process
-  supervision boundary. It remains degraded and fail-closed until lifecycle,
-  approval and recovery evidence is complete.
+  ACP lifecycle behind the same provider-neutral driver and process
+  supervision boundary. Fresh-session prompt, cancellation and a governed
+  permission replay are locally verified. Native `session/load`/
+  `session/resume` are unsupported and native Artifact semantics are not
+  independently attested, so DSH remains degraded and fail-closed.
 - Memory/RAG boundary: `workers/memory-rag` is a dependency-free, read-only
   lexical retrieval implementation behind the frozen `egopulse.memory.v1`
   contract. Rust supplies verified, scoped, already-accepted records; the
@@ -102,6 +113,12 @@ Collaboration/Sego stages after technical evidence intake.
   idempotency, optimistic revision checks and an audit event stream remain
   Rust-owned. The approved Worker contract exposes only a bounded accepted
   snapshot; it does not expose authority storage or write operations.
+- Multi-Harness composition: `CompositeHarnessDispatchRunner` sequences
+  provider-specific runners through one daemon scheduling hook. Each runner
+  must be bound to its own reviewed capability profile and Adapter Edge; the
+  composite does not choose models or merge provider-owned facts. This is a
+  composition prerequisite, not evidence that a second Harness has been
+  admitted.
 
 ## Repository rules
 
