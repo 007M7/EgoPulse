@@ -1,6 +1,6 @@
 # G4-04 Harness Adapter implementation profile
 
-- Status: active Gate 4 work package
+- Status: production composition implemented; Gate 4 provider-boundary evidence pending
 - Date: 2026-08-23
 - Frozen inputs: C-03 Harness Adapter Contract, D-01 first Harness decision, ADR 0003
 - First native Harness: Codex app-server v2
@@ -93,7 +93,30 @@ dispatch by itself.
   active-execution and outcome-unknown findings require the appropriate Artifact, checkpoint,
   side-effect or human authority before C-02 may advance.
 
-The concrete resolver composition currently lives in the G4-04 integration harness. The production
-daemon composition root is deliberately deferred to G4-08; the production ports and durable Adapter
-read APIs are already present. G4-04 remains open only until the complete fake/real contract and
-provider-boundary audit is closed.
+## Production composition audit
+
+The production composition root is now implemented, but this does not by
+itself close G4-04:
+
+- `apps/agentosd/src/bootstrap.rs::ProductionBootstrapConfig::build` opens
+  the owner Authorities, installs optional Verification and Memory/RAG
+  workers, and then calls `DaemonProviders::with_codex_harness`;
+- `apps/agentosd/src/lib.rs::DaemonProviders::with_codex_harness` opens the
+  reader and writer Adapter Edge handles, constructs Collaboration Control,
+  the Codex native driver and the `GovernedTaskActivationRunner`, then exposes
+  exactly that runner to the daemon background worker;
+- Kimi and DSH crates are not referenced by the production bootstrap and
+  cannot become a production provider through a candidate-only constructor;
+- the C5 real-process fixture proves local IPC, CLI/TUI shared operations and
+  Memory retrieval, but it does not exercise a user-configured Codex runner
+  through a native model call;
+- the provider-neutral Codex contract test has an ignored authenticated live
+  path, which is the remaining evidence needed for the complete production
+  composition audit.
+
+Therefore G4-04 remains open for one specific reason: the implemented
+composition boundary still needs a real authenticated Codex lifecycle result
+through the production runner, plus the corresponding provider-boundary
+review. The existence of the composition code is recorded as implementation
+evidence, not promoted to runtime acceptance. The candidate DSH ACP slice is
+separately documented in Phase 2-09 and does not alter this disposition.
