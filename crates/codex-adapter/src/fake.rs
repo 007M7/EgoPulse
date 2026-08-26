@@ -20,6 +20,8 @@ pub struct FakeCodexDriver {
     dispatch_count: u64,
     cancel_count: u64,
     reconcile_count: u64,
+    defer_terminal_once: bool,
+    terminal_deferred: bool,
     reconciliation_finding: Option<ReconciliationFinding>,
 }
 
@@ -42,6 +44,12 @@ impl FakeCodexDriver {
     #[must_use]
     pub fn with_reconciliation_finding(mut self, finding: ReconciliationFinding) -> Self {
         self.reconciliation_finding = Some(finding);
+        self
+    }
+
+    #[must_use]
+    pub fn with_deferred_terminal(mut self) -> Self {
+        self.defer_terminal_once = true;
         self
     }
 }
@@ -117,7 +125,13 @@ impl NativeHarnessDriver for FakeCodexDriver {
         &'a mut self,
         _envelope: &'a DispatchEnvelope,
     ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
-        Box::pin(async move { Ok(self.events.pop_front()) })
+        Box::pin(async move {
+            if self.defer_terminal_once && !self.terminal_deferred && self.events.len() == 1 {
+                self.terminal_deferred = true;
+                return Ok(None);
+            }
+            Ok(self.events.pop_front())
+        })
     }
 
     fn decide_approval<'a>(

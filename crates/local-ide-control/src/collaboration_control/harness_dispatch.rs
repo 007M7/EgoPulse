@@ -119,8 +119,7 @@ where
                 active_envelopes,
             } = &mut *runtime;
             register_pending_envelopes(control, active_envelopes, &self.principal)?;
-            let mut report = dispatch_pending(control, adapter, &self.principal).await?;
-            remove_terminal_envelopes(active_envelopes, &report);
+            let mut report = HarnessDispatchCycleReport::default();
             pump_active_envelopes(
                 control,
                 adapter,
@@ -129,6 +128,9 @@ where
                 &mut report,
             )
             .await?;
+            let dispatched = dispatch_pending(control, adapter, &self.principal).await?;
+            merge_report(&mut report, dispatched);
+            remove_terminal_envelopes(active_envelopes, &report);
             Ok(report)
         })
     }
@@ -227,6 +229,14 @@ where
                 activations_seen: activations.len() as u64,
                 ..HarnessDispatchCycleReport::default()
             };
+            pump_active_envelopes(
+                control,
+                adapter,
+                active_envelopes,
+                &self.principal,
+                &mut report,
+            )
+            .await?;
             for activation in activations {
                 let config = resolver
                     .resolve(&activation)
@@ -256,14 +266,6 @@ where
             let dispatched = dispatch_pending(control, adapter, &self.principal).await?;
             merge_report(&mut report, dispatched);
             remove_terminal_envelopes(active_envelopes, &report);
-            pump_active_envelopes(
-                control,
-                adapter,
-                active_envelopes,
-                &self.principal,
-                &mut report,
-            )
-            .await?;
             Ok(report)
         })
     }

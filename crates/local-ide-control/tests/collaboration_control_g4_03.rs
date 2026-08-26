@@ -1475,9 +1475,10 @@ async fn task_activation_runner_commits_then_dispatches_through_one_runtime() {
             bundle,
             workspace_root: adapter_store.root.clone(),
         },
-        FakeCodexDriver::default(),
+        FakeCodexDriver::default().with_deferred_terminal(),
         clock,
     );
+    let dispatch_id = config.dispatch_id.clone();
     let runner = GovernedTaskActivationRunner::new(
         control,
         adapter,
@@ -1492,6 +1493,13 @@ async fn task_activation_runner_commits_then_dispatches_through_one_runtime() {
     assert_eq!(cycle.activations_started, 1);
     assert_eq!(cycle.activations_acknowledged, 1);
     assert_eq!(cycle.dispatches_delivered, 1);
+    assert_eq!(cycle.terminal_observations, 0);
+    let resumed = runner
+        .run_once()
+        .await
+        .expect("resume activation runner cycle");
+    assert_eq!(resumed.terminal_observations, 1);
+    assert_eq!(resumed.terminal_dispatch_ids, [dispatch_id]);
     assert_eq!(
         source
             .acknowledged
