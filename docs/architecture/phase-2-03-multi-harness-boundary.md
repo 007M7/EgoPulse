@@ -185,6 +185,20 @@ not expose an independently hashable EgoPulse Artifact return. The driver is
 therefore still candidate-only and is not wired into daemon provider
 selection.
 
+The configured Windows x64 replay evidence was rerun against the local DSH
+workspace with the Rust driver and passed all three scenarios:
+
+```text
+dsh_replay_driver_emits_terminal_lifecycle                         passed
+dsh_replay_driver_sends_native_cancel_and_observes_interruption    passed
+dsh_replay_driver_routes_native_permission_through_governed_decision passed
+```
+
+This raises confidence in the ACP process/lifecycle seam only. It does not
+prove authenticated production access, `session/load` or `session/resume`,
+provider-native Artifact semantics, or the full daemon Verification/return
+settlement path; those rows remain explicit admission blockers.
+
 ## Phase 2-03 exit disposition
 
 Phase 2-03 closes its provider-neutral boundary and candidate-probe slice, but
