@@ -12,7 +12,8 @@ use egopulse_codex_adapter::{
 };
 use egopulse_cognition_runtime::memory_authority::MemoryAuthority;
 use egopulse_domain_contracts::v01::egopulse::{
-    harness::v1::NativeProtocolFingerprint,
+    common::v1::ContractReference,
+    harness::v1::{CapabilityProfile, NativeProtocolFingerprint},
     policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
     task::v1::{TaskCommand, TaskCommandResult},
     verdict::v1::{VerdictCommand, VerdictCommandResult},
@@ -28,7 +29,7 @@ use egopulse_domain_contracts::{
 };
 use egopulse_harness_adapter::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeKey, GovernedHarnessAdapter,
-    NativeHarnessDriver, SystemAdapterClock,
+    NativeHarnessDriver, SystemAdapterClock, validate_capability_binding,
 };
 use egopulse_local_api::{
     cognition_gateway::{
@@ -368,12 +369,52 @@ pub struct CodexHarnessCompositionConfig {
 /// composition boundary itself must not hard-code a provider identity.
 #[derive(Clone, Debug)]
 pub struct NativeHarnessCompositionProfile {
-    pub adapter_id: String,
-    pub capability_profile_id: String,
-    pub observed_protocol: NativeProtocolFingerprint,
+    adapter_id: String,
+    capability_profile_id: String,
+    observed_protocol: NativeProtocolFingerprint,
 }
 
 impl NativeHarnessCompositionProfile {
+    /// Creates a composition identity only from a currently active,
+    /// probe-attested and workflow-bound capability profile. Composition does
+    /// not perform admission, but it cannot be called with an unbound or
+    /// merely declared profile by accident.
+    pub fn from_attested_capability(
+        required_profile_ref: &ContractReference,
+        model_family_selector: &str,
+        capability_profile: &CapabilityProfile,
+        now: &prost_types::Timestamp,
+    ) -> Result<Self, DaemonCompositionError> {
+        validate_capability_binding(
+            required_profile_ref,
+            model_family_selector,
+            capability_profile,
+            now,
+        )
+        .map_err(|_| {
+            DaemonCompositionError::InvalidConfiguration(
+                "native Harness capability profile admission",
+            )
+        })?;
+        let declaration = capability_profile.declaration.as_ref().ok_or(
+            DaemonCompositionError::InvalidConfiguration(
+                "native Harness capability profile declaration",
+            ),
+        )?;
+        let observed_protocol = declaration.native_protocol.clone().ok_or(
+            DaemonCompositionError::InvalidConfiguration(
+                "native Harness capability profile protocol",
+            ),
+        )?;
+        let profile = Self {
+            adapter_id: declaration.adapter_id.clone(),
+            capability_profile_id: capability_profile.profile_id.clone(),
+            observed_protocol,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
     fn validate(&self) -> Result<(), DaemonCompositionError> {
         if self.adapter_id.trim().is_empty()
             || self.capability_profile_id.trim().is_empty()
@@ -1398,6 +1439,48 @@ mod tests {
 
     #[test]
     fn native_harness_profile_requires_explicit_identity_and_protocol_evidence() {
+        let capability = CapabilityProfile {
+            profile_id: "profile".to_owned(),
+            revision: 1,
+            digest_sha256: "ab".repeat(32),
+            status: egopulse_domain_contracts::v01::egopulse::harness::v1::CapabilityProfileStatus::Active
+                as i32,
+            declaration: Some(
+                egopulse_domain_contracts::v01::egopulse::harness::v1::CapabilityDeclaration {
+                    adapter_id: "adapter".to_owned(),
+                    harness_id: "harness".to_owned(),
+                    model_family_selectors: vec!["family".to_owned()],
+                    native_protocol: Some(NativeProtocolFingerprint {
+                        protocol_name: "acp".to_owned(),
+                        protocol_version: "1".to_owned(),
+                        schema_sha256: "schema".to_owned(),
+                        adapter_version: "adapter-version".to_owned(),
+                        native_executable_version: "native-version".to_owned(),
+                        native_binary_sha256: None,
+                    }),
+                    ..Default::default()
+                },
+            ),
+            attestation_level:
+                egopulse_domain_contracts::v01::egopulse::harness::v1::AttestationLevel::ProbeVerified
+                    as i32,
+            attestation_evidence_refs: vec!["probe://harness/1".to_owned()],
+            ..Default::default()
+        };
+        let bound = NativeHarnessCompositionProfile::from_attested_capability(
+            &ContractReference {
+                contract_id: "profile".to_owned(),
+                version: "v1".to_owned(),
+                sha256: "ab".repeat(32),
+            },
+            "family",
+            &capability,
+            &prost_types::Timestamp::default(),
+        )
+        .expect("attested capability should produce a composition profile");
+        assert_eq!(bound.adapter_id, "adapter");
+        assert_eq!(bound.capability_profile_id, "profile");
+
         let mut profile = NativeHarnessCompositionProfile {
             adapter_id: "adapter".to_owned(),
             capability_profile_id: "profile".to_owned(),
