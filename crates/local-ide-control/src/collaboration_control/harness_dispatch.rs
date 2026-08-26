@@ -11,7 +11,7 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     RecordAttemptReturnCommand, RunCommandBase, RunStatus, StepStatus, collaboration_command,
     collaboration_command_result,
 };
-use egopulse_domain_contracts::v01::egopulse::common::v1::CommandMetadata;
+use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     DeliveryDisposition, DispatchEnvelope, HarnessObservation, LifecycleKind,
     ObservationCriticality, dispatch_result, harness_observation,
@@ -125,7 +125,13 @@ struct GovernedDispatchRuntime<G, C, R, D, A> {
 pub struct GovernedHarnessDispatchRunner<G, C, R, D, A> {
     runtime: tokio::sync::Mutex<GovernedDispatchRuntime<G, C, R, D, A>>,
     principal: AuthenticatedCollaborationPrincipal,
-    capability_profile_id: Option<String>,
+    capability_profile_filter: Option<CapabilityProfileFilter>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CapabilityProfileFilter {
+    ContractId(String),
+    Exact(ContractReference),
 }
 
 impl<G, C, R, D, A> GovernedHarnessDispatchRunner<G, C, R, D, A>
@@ -149,7 +155,7 @@ where
                 active_envelopes: Vec::new(),
             }),
             principal,
-            capability_profile_id: None,
+            capability_profile_filter: None,
         }
     }
 
@@ -158,7 +164,17 @@ where
     /// share one Collaboration Control database.
     #[must_use]
     pub fn with_capability_profile_id(mut self, profile_id: impl Into<String>) -> Self {
-        self.capability_profile_id = Some(profile_id.into());
+        self.capability_profile_filter =
+            Some(CapabilityProfileFilter::ContractId(profile_id.into()));
+        self
+    }
+
+    /// Restricts this runner to one exact reviewed capability reference. The
+    /// contract id, version and digest must all match; this prevents two
+    /// revisions of the same profile from sharing a dispatch path.
+    #[must_use]
+    pub fn with_capability_profile_ref(mut self, profile: ContractReference) -> Self {
+        self.capability_profile_filter = Some(CapabilityProfileFilter::Exact(profile));
         self
     }
 }
@@ -191,7 +207,7 @@ where
                 control,
                 active_envelopes,
                 &self.principal,
-                self.capability_profile_id.as_deref(),
+                self.capability_profile_filter.as_ref(),
             )?;
             let mut report = HarnessDispatchCycleReport::default();
             pump_active_envelopes(
@@ -206,7 +222,7 @@ where
                 control,
                 adapter,
                 &self.principal,
-                self.capability_profile_id.as_deref(),
+                self.capability_profile_filter.as_ref(),
             )
             .await?;
             merge_report(&mut report, dispatched);
@@ -641,7 +657,7 @@ async fn dispatch_pending_for_profile<G, C, R, D, A>(
     control: &mut CollaborationControl<G, C>,
     adapter: &mut GovernedHarnessAdapter<R, D, A>,
     principal: &AuthenticatedCollaborationPrincipal,
-    capability_profile_id: Option<&str>,
+    capability_profile_filter: Option<&CapabilityProfileFilter>,
 ) -> Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>
 where
     G: CollaborationReferenceGuard + HarnessEvidenceResolver,
@@ -653,7 +669,7 @@ where
     let pending = control
         .pending_dispatches(principal)?
         .into_iter()
-        .filter(|dispatch| envelope_matches_profile(&dispatch.envelope, capability_profile_id))
+        .filter(|dispatch| envelope_matches_profile(&dispatch.envelope, capability_profile_filter))
         .collect::<Vec<_>>();
     let mut report = HarnessDispatchCycleReport {
         dispatches_seen: pending.len() as u64,
@@ -735,7 +751,7 @@ fn register_pending_envelopes<G, C>(
     control: &CollaborationControl<G, C>,
     active_envelopes: &mut Vec<DispatchEnvelope>,
     principal: &AuthenticatedCollaborationPrincipal,
-    capability_profile_id: Option<&str>,
+    capability_profile_filter: Option<&CapabilityProfileFilter>,
 ) -> Result<(), CollaborationControlError>
 where
     G: CollaborationReferenceGuard + HarnessEvidenceResolver,
@@ -744,7 +760,7 @@ where
     for pending in control
         .pending_dispatches(principal)?
         .into_iter()
-        .filter(|dispatch| envelope_matches_profile(&dispatch.envelope, capability_profile_id))
+        .filter(|dispatch| envelope_matches_profile(&dispatch.envelope, capability_profile_filter))
     {
         if !active_envelopes
             .iter()
@@ -758,13 +774,16 @@ where
 
 fn envelope_matches_profile(
     envelope: &DispatchEnvelope,
-    capability_profile_id: Option<&str>,
+    capability_profile_filter: Option<&CapabilityProfileFilter>,
 ) -> bool {
-    capability_profile_id.is_none_or(|expected| {
+    capability_profile_filter.is_none_or(|filter| {
         envelope
             .capability_profile_ref
             .as_ref()
-            .is_some_and(|reference| reference.contract_id == expected)
+            .is_some_and(|reference| match filter {
+                CapabilityProfileFilter::ContractId(expected) => reference.contract_id == *expected,
+                CapabilityProfileFilter::Exact(expected) => reference == expected,
+            })
     })
 }
 
@@ -978,13 +997,47 @@ mod tests {
             }),
             ..Default::default()
         };
+        let codex_id = CapabilityProfileFilter::ContractId("profile:codex".to_owned());
+        let dsh_id = CapabilityProfileFilter::ContractId("profile:dsh".to_owned());
         assert!(envelope_matches_profile(&envelope, None));
-        assert!(envelope_matches_profile(&envelope, Some("profile:codex")));
-        assert!(!envelope_matches_profile(&envelope, Some("profile:dsh")));
+        assert!(envelope_matches_profile(&envelope, Some(&codex_id)));
+        assert!(!envelope_matches_profile(&envelope, Some(&dsh_id)));
         assert!(!envelope_matches_profile(
             &DispatchEnvelope::default(),
-            Some("profile:codex")
+            Some(&codex_id)
         ));
+    }
+
+    #[test]
+    fn exact_profile_filter_rejects_version_and_digest_drift() {
+        let envelope = DispatchEnvelope {
+            capability_profile_ref: Some(ContractReference {
+                contract_id: "profile:codex".to_owned(),
+                version: "v1".to_owned(),
+                sha256: "a".repeat(64),
+            }),
+            ..Default::default()
+        };
+        let exact = CapabilityProfileFilter::Exact(ContractReference {
+            contract_id: "profile:codex".to_owned(),
+            version: "v1".to_owned(),
+            sha256: "a".repeat(64),
+        });
+        assert!(envelope_matches_profile(&envelope, Some(&exact)));
+
+        let version_drift = CapabilityProfileFilter::Exact(ContractReference {
+            contract_id: "profile:codex".to_owned(),
+            version: "v2".to_owned(),
+            sha256: "a".repeat(64),
+        });
+        assert!(!envelope_matches_profile(&envelope, Some(&version_drift)));
+
+        let digest_drift = CapabilityProfileFilter::Exact(ContractReference {
+            contract_id: "profile:codex".to_owned(),
+            version: "v1".to_owned(),
+            sha256: "b".repeat(64),
+        });
+        assert!(!envelope_matches_profile(&envelope, Some(&digest_drift)));
     }
 
     #[test]
