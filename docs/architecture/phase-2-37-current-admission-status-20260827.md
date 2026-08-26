@@ -50,6 +50,27 @@ The matching local CI evidence passed all eight stages with a clean worktree.
 The package verifier passed all 52 file hashes, CLI/TUI/agentosd help probes,
 Memory Worker setup and the production-profile no-`fastembed` check.
 
+The current implementation was rechecked on Windows x64 after this status
+record was prepared:
+
+```text
+cargo test -p egopulse-agentosd --test c5_00_daemon_fixture -- --test-threads=1 --nocapture
+8 passed, 0 failed
+
+EGOPULSE_CODEX_EXECUTABLE=<installed Codex app-server>
+cargo test -p egopulse-agentosd --test codex_memory_candidate_e2e -- --nocapture
+1 passed, 0 failed
+```
+
+The first command covers real local IPC, shared CLI/TUI operations, governed
+Memory retrieval and governed Memory mutation. The second covers a real
+authenticated Codex app-server response entering the Rust Memory Authority
+only through the explicit fixed Harness producer handle, followed by Founder
+acceptance. Running the second command inside the restricted tool sandbox
+produced `CODEX_APP_SERVER_EOF` because the child could not access the user
+Codex runtime directory; the complete-permission rerun passed and is the
+authoritative result.
+
 ## Explicitly remaining admission work
 
 ### 1. Semantic RAG decision
