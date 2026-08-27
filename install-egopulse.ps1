@@ -181,6 +181,24 @@ if ($LASTEXITCODE -ne 0) {
     throw "EgoPulse configuration check failed with exit code $LASTEXITCODE"
 }
 
+# Print safe Provider preflight facts after the configuration has passed.
+# The daemon emits only executable existence and credential-source status;
+# this never starts a Harness or serializes an API-key value.
+$providerReportLines = @(& $daemon --check-config --json)
+if ($LASTEXITCODE -ne 0) {
+    throw "EgoPulse Provider preflight failed with exit code $LASTEXITCODE"
+}
+$providerReport = ($providerReportLines -join [Environment]::NewLine) | ConvertFrom-Json
+foreach ($profile in @($providerReport.provider_profiles)) {
+    Write-Output (
+        'provider_preflight=profile:{0} executable_available:{1} credential_status:{2} admission:{3}' -f
+        $profile.profile_id,
+        $profile.executable_available,
+        $profile.credential_status,
+        $profile.admission
+    )
+}
+
 if ($Launch) {
     Start-Process -FilePath $daemon -WorkingDirectory $root
     Write-Output 'agentosd=launched'

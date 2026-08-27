@@ -26,6 +26,12 @@ Provider API keys to the package or configuration. A pre-existing
 configuration is preserved unless `-Force` is explicitly supplied; forced
 replacement creates a timestamped backup.
 
+After configuration validation, the installer prints one redacted preflight
+line per configured Provider. `executable_available` checks only the configured
+path/PATH entry, while `credential_status` reports API-key environment presence
+or Harness-owned delegated login. These are local readiness hints, not
+authenticated lifecycle or production-admission evidence.
+
 The installer requires Windows x64, Python/uv-compatible Memory Worker setup,
 and an installed `uv` command. If `uv` is absent, install it from
 `https://docs.astral.sh/uv/` first.
