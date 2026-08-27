@@ -468,6 +468,14 @@ fn current_timestamp() -> Result<i64, MemoryAuthorityFailure> {
 }
 
 fn to_record(stored: StoredMemory) -> Result<MemoryRecord, MemoryAuthorityFailure> {
+    // SQLCipher's structural integrity check does not prove that denormalized
+    // semantic fields still agree. Recompute the content digest at the
+    // authority read boundary so `get` and accepted snapshots cannot attest to
+    // a record whose content and digest have drifted apart.
+    if digest_text(&stored.content) != stored.content_sha256 {
+        return Err(MemoryAuthorityFailure::Storage);
+    }
+
     Ok(MemoryRecord {
         memory_id: stored.memory_id,
         revision: stored.revision,
@@ -479,6 +487,43 @@ fn to_record(stored: StoredMemory) -> Result<MemoryRecord, MemoryAuthorityFailur
         created_at_seconds: stored.created_at_seconds,
         updated_at_seconds: stored.updated_at_seconds,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored(content: &str, content_sha256: &str) -> StoredMemory {
+        StoredMemory {
+            memory_id: "memory-test".to_owned(),
+            revision: 1,
+            content: content.to_owned(),
+            content_sha256: content_sha256.to_owned(),
+            source_ref: "source:test".to_owned(),
+            scope_ref: "scope:test".to_owned(),
+            state: StoredState::from("accepted"),
+            created_at_seconds: 1,
+            updated_at_seconds: 1,
+        }
+    }
+
+    #[test]
+    fn authority_rejects_semantic_content_digest_drift() {
+        let content = "accepted content";
+        let drifted = stored(content, &digest_text("different content"));
+
+        assert_eq!(to_record(drifted), Err(MemoryAuthorityFailure::Storage));
+    }
+
+    #[test]
+    fn authority_accepts_matching_content_digest() {
+        let content = "accepted content";
+        let record = to_record(stored(content, &digest_text(content)))
+            .expect("matching content digest should be readable");
+
+        assert_eq!(record.content, content);
+        assert_eq!(record.state, MemoryState::Accepted);
+    }
 }
 
 fn receipt(
