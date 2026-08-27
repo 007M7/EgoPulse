@@ -24,6 +24,7 @@ Available now:
 - explicit Sego/checker verification composition with owner-backed Artifact reads, supervised execution, immutable verification artifacts and Task write-back;
 - Protobuf/Buf and JSON Schema contract roots;
 - local CI, repository-boundary checks and commit-bound unsigned Windows early-access packaging for the CLI/TUI shared kernel;
+- a verified Windows x64 unsigned early-access candidate at commit `3d9c42c`;
 - account-authenticated Windows Named Pipe / Unix Domain Socket transport and an ephemeral, policy-resolved local session service.
 
 For the current Windows x64 package path, see [Windows early access](WINDOWS-EARLY-ACCESS.md).
@@ -35,7 +36,8 @@ Not implemented yet:
 - authenticated second Harness lifecycle and provider admission (the
   provider-neutral multi-model composition boundary exists, but DSH/Kimi are
   still candidate-only);
-- signed production release and SmartScreen reputation.
+- signed production release and SmartScreen reputation; the current package is
+  explicitly unsigned and must be treated as early access.
 
 ## Repository map
 

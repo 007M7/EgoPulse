@@ -231,8 +231,10 @@ Exit evidence:
   an explicit governed activation;
 - the release can return to the last accepted profile without data loss.
 
-Current disposition: **unsigned CLI/TUI early-access path exists; final
-release and governed evolution loop remain pending**.
+Current disposition: **unsigned CLI/TUI early-access candidate verified at
+commit `3d9c42c`; final release and governed evolution loop remain pending**.
+The reproducible evidence is recorded in
+`docs/release/windows-candidate-20260827.md`.
 
 ## Current next actions
 
