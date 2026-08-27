@@ -81,7 +81,8 @@ foreach ($executable in @('egopulse.exe', 'egopulse-tui.exe', 'agentosd.exe')) {
 }
 
 if ($VerifyMemoryWorker) {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'setup-memory-worker.ps1') -PackageRoot $root
+    $uvCacheDir = Join-Path $root '.cache/uv'
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'setup-memory-worker.ps1') -PackageRoot $root -UvCacheDir $uvCacheDir
     if ($LASTEXITCODE -ne 0) {
         throw "Packaged Memory Worker setup failed with exit code $LASTEXITCODE"
     }
