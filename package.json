@@ -20,7 +20,8 @@
     "desktop:build": "pnpm --filter @egopulse/desktop tauri build",
     "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1",
     "ci:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/local-ci.ps1",
-    "cd:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/local-cd.ps1"
+    "cd:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/local-cd.ps1",
+    "push:github": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/push-github.ps1"
   },
   "devDependencies": {
     "@bufbuild/buf": "1.72.0",
