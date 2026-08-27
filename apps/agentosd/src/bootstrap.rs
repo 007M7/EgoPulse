@@ -41,7 +41,7 @@ use egopulse_verification_authority::{
     VerificationSqlCipherKey,
 };
 use prost_types::Timestamp;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{AllowlistedPrincipal, AllowlistedPrincipalResolver, PrincipalPolicyError};
@@ -140,6 +140,94 @@ pub struct ProviderBootstrapProfile {
     pub hold_reason: Option<String>,
 }
 
+/// Redacted configuration projection for setup and diagnostics. It contains
+/// provider/model identities and environment-variable names only; it never
+/// resolves or serializes credential values.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderCatalogProfileView {
+    pub profile_id: String,
+    pub provider: String,
+    pub harness: String,
+    pub admission: String,
+    pub models: Vec<ProviderCatalogModelView>,
+    pub selected_model: String,
+    pub executable: String,
+    pub credential_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_source_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderCatalogModelView {
+    pub harness_model_id: String,
+    pub provider_model_id: String,
+}
+
+impl ProviderBootstrapProfile {
+    #[must_use]
+    pub fn redacted_catalog_view(&self) -> ProviderCatalogProfileView {
+        let (credential_mode, credential_source_env) = match &self.credential {
+            ProviderCredentialReference::HarnessAccount => ("harness_account", None),
+            ProviderCredentialReference::ApiKeyEnvironment { source_env, .. } => {
+                ("api_key_environment", Some(source_env.clone()))
+            }
+        };
+        ProviderCatalogProfileView {
+            profile_id: self.profile_id.clone(),
+            provider: self.provider.as_str().to_owned(),
+            harness: self.harness.as_str().to_owned(),
+            admission: self.admission.as_str().to_owned(),
+            models: self
+                .models
+                .iter()
+                .map(|model| ProviderCatalogModelView {
+                    harness_model_id: model.harness_model_id.clone(),
+                    provider_model_id: model.provider_model_id.clone(),
+                })
+                .collect(),
+            selected_model: self.exact_model.clone(),
+            executable: self.executable.display().to_string(),
+            credential_mode: credential_mode.to_owned(),
+            credential_source_env,
+            hold_reason: self.hold_reason.clone(),
+        }
+    }
+}
+
+impl ProviderId {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Gpt => "gpt",
+            Self::DeepSeek => "deepseek",
+            Self::Kimi => "kimi",
+            Self::Glm => "glm",
+        }
+    }
+}
+
+impl ProviderHarnessKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "codex_app_server",
+            Self::DshAcp => "dsh_acp",
+            Self::KimiCliAcp => "kimi_cli_acp",
+            Self::OpenCodeAcp => "opencode_acp",
+        }
+    }
+}
+
+impl ProviderAdmission {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Candidate => "candidate",
+            Self::Held => "held",
+        }
+    }
+}
+
 /// Inputs owned by the local installation, not inferred from a client request.
 pub struct ProductionBootstrapConfig {
     pub task: TaskAuthorityConfig,
@@ -206,6 +294,16 @@ impl ProductionBootstrapConfig {
     #[must_use]
     pub fn provider_profiles(&self) -> &[ProviderBootstrapProfile] {
         &self.provider_profiles
+    }
+
+    /// Returns the provider/model catalog for setup and diagnostics without
+    /// exposing credential values or authority state.
+    #[must_use]
+    pub fn provider_catalog_views(&self) -> Vec<ProviderCatalogProfileView> {
+        self.provider_profiles
+            .iter()
+            .map(ProviderBootstrapProfile::redacted_catalog_view)
+            .collect()
     }
 
     /// Opens every Authority exactly once and composes the first production

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use egopulse_agentosd::{DaemonComposition, DaemonConfig, ProductionBootstrapConfig};
+use serde_json::json;
 
 fn print_help() {
     println!(
@@ -11,7 +12,9 @@ Usage: agentosd [OPTIONS]
 Options:
   -h, --help       Print this help message
   -V, --version    Print the daemon version
-      --check-config  Validate local configuration without opening stores
+  --check-config  Validate local configuration without opening stores
+  --check-config --json
+                  Emit the redacted Provider/Model catalog for diagnostics
 
 The daemon accepts no positional arguments. Without an option it starts only
 when the local configuration and all required authority keys are valid.
@@ -29,7 +32,10 @@ first-run configuration template."#
 #[tokio::main]
 async fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() == 1 {
+    let check_config_json = args.len() == 2
+        && args[0].to_string_lossy() == "--check-config"
+        && args[1].to_string_lossy() == "--json";
+    if args.len() == 1 || check_config_json {
         match args[0].to_string_lossy().as_ref() {
             "-h" | "--help" => {
                 print_help();
@@ -40,11 +46,25 @@ async fn main() {
                 return;
             }
             "--check-config" => {
-                if let Err(error) = check_configuration() {
-                    eprintln!("agentosd configuration check refused: {error}");
-                    std::process::exit(78);
+                match check_configuration() {
+                    Ok(config) if check_config_json => {
+                        let report = json!({
+                            "configuration": "passed",
+                            "stores_opened": false,
+                            "provider_profiles": config.provider_catalog_views(),
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report)
+                                .expect("provider config report serializes")
+                        );
+                    }
+                    Ok(_) => println!("agentosd configuration=passed stores_opened=false"),
+                    Err(error) => {
+                        eprintln!("agentosd configuration check refused: {error}");
+                        std::process::exit(78);
+                    }
                 }
-                println!("agentosd configuration=passed stores_opened=false");
                 return;
             }
             _ => {}
@@ -99,10 +119,8 @@ async fn main() {
     }
 }
 
-fn check_configuration() -> Result<(), String> {
+fn check_configuration() -> Result<ProductionBootstrapConfig, String> {
     let daemon = DaemonConfig::from_environment().map_err(|error| error.to_string())?;
     daemon.validate().map_err(|error| error.to_string())?;
-    ProductionBootstrapConfig::from_environment()
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    ProductionBootstrapConfig::from_environment().map_err(|error| error.to_string())
 }
