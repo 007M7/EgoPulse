@@ -42,6 +42,18 @@ unit tests: 5 passed
 Memory Authority integration tests: 7 passed
 ```
 
+The full local CI also passed from a clean worktree for the exact
+implementation commit:
+
+```text
+pnpm run ci:local
+status: passed
+commit: aec012afeff944f01c191d290ad614a64c46ef37
+dirty_at_start: false
+stages: 8/8
+duration_ms: 72428
+```
+
 The tests cover matching and drifted content digests, encrypted-store
 reopen, candidate-only writes and the read-only candidate projection,
 idempotency, terminal revocation, unauthenticated writes, oversized candidate
