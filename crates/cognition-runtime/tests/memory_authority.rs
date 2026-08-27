@@ -82,6 +82,17 @@ fn agent_write_is_candidate_only_and_founder_acceptance_exposes_snapshot() {
     assert_eq!(submitted.state, MemoryState::Candidate);
     assert_eq!(submitted.revision, 1);
 
+    let candidates = authority
+        .candidate_records("scope:founder")
+        .expect("read candidate records");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].memory_id, "memory-1");
+    assert_eq!(candidates[0].state, MemoryState::Candidate);
+    assert_eq!(
+        candidates[0].content,
+        "Founder prefers deterministic local execution."
+    );
+
     let snapshot = authority
         .accepted_snapshot("scope:founder")
         .expect("read empty accepted snapshot");
@@ -102,6 +113,12 @@ fn agent_write_is_candidate_only_and_founder_acceptance_exposes_snapshot() {
     assert_eq!(
         records[0].content,
         "Founder prefers deterministic local execution."
+    );
+    assert!(
+        authority
+            .candidate_records("scope:founder")
+            .expect("read empty candidate projection")
+            .is_empty()
     );
     assert!(authority.integrity_is_ok().expect("check memory integrity"));
 }

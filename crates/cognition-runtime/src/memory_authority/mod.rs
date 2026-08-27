@@ -349,6 +349,22 @@ impl MemoryAuthority {
         })
     }
 
+    /// Returns bounded candidate records available for Founder review.
+    ///
+    /// This is a read-only Authority projection. It does not grant a
+    /// producer any acceptance or revocation capability.
+    pub fn candidate_records(
+        &self,
+        scope_ref: &str,
+    ) -> Result<Vec<MemoryRecord>, MemoryAuthorityFailure> {
+        validate_text(scope_ref, "scope_ref")?;
+        self.store
+            .candidate_memories(scope_ref)?
+            .into_iter()
+            .map(to_record)
+            .collect()
+    }
+
     pub fn inspect_store(&self) -> Result<MemoryStoreInspection, MemoryAuthorityFailure> {
         self.store.inspect().map_err(MemoryAuthorityFailure::from)
     }

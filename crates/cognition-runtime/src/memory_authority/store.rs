@@ -349,14 +349,29 @@ impl MemoryStore {
         &self,
         scope_ref: &str,
     ) -> Result<Vec<StoredMemory>, StoreError> {
+        self.memories_in_state(scope_ref, "accepted")
+    }
+
+    pub(super) fn candidate_memories(
+        &self,
+        scope_ref: &str,
+    ) -> Result<Vec<StoredMemory>, StoreError> {
+        self.memories_in_state(scope_ref, "candidate")
+    }
+
+    fn memories_in_state(
+        &self,
+        scope_ref: &str,
+        state: &str,
+    ) -> Result<Vec<StoredMemory>, StoreError> {
         let bounds: (i64, i64, i64, i64, i64) = self.connection.query_row(
             "SELECT count(*),
                     COALESCE(sum(length(CAST(content AS BLOB))), 0),
                     COALESCE(max(length(CAST(memory_id AS BLOB))), 0),
                     COALESCE(max(length(CAST(source_ref AS BLOB))), 0),
                     COALESCE(max(length(CAST(scope_ref AS BLOB))), 0)
-             FROM memories WHERE scope_ref=?1 AND state='accepted'",
-            [scope_ref],
+             FROM memories WHERE scope_ref=?1 AND state=?2",
+            params![scope_ref, state],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -384,10 +399,10 @@ impl MemoryStore {
         let mut statement = self.connection.prepare(
             "SELECT memory_id,revision,content,content_sha256,source_ref,scope_ref,state,
                     created_at_seconds,updated_at_seconds
-             FROM memories WHERE scope_ref=?1 AND state='accepted'
+             FROM memories WHERE scope_ref=?1 AND state=?2
              ORDER BY memory_id",
         )?;
-        let rows = statement.query_map([scope_ref], memory_from_row)?;
+        let rows = statement.query_map(params![scope_ref, state], memory_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }

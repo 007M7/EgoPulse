@@ -27,6 +27,9 @@ oversized or semantically inconsistent store row.
    storage failure; no partial snapshot is returned.
 4. The existing Worker boundary remains unchanged and repeats digest, state,
    scope and resource validation before inference.
+5. `MemoryAuthority::candidate_records` exposes a bounded, read-only candidate
+   projection for the future Founder review surface. It does not add a public
+   Local API contract or grant candidates any acceptance/revocation authority.
 
 ## Evidence
 
@@ -40,9 +43,10 @@ Memory Authority integration tests: 7 passed
 ```
 
 The tests cover matching and drifted content digests, encrypted-store
-reopen, candidate-only writes, idempotency, terminal revocation,
-unauthenticated writes, oversized candidate content/routing fields, and the
-SQL-side snapshot-bound rejection before row contents are loaded.
+reopen, candidate-only writes and the read-only candidate projection,
+idempotency, terminal revocation, unauthenticated writes, oversized candidate
+content/routing fields, and the SQL-side snapshot-bound rejection before row
+contents are loaded.
 
 ## Non-claims
 
