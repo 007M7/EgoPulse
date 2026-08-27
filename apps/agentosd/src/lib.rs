@@ -101,7 +101,8 @@ pub use owners::{
     AuthorityCommandPorts, AuthorityPrincipalResolver, DenyAllAuthorityPrincipalResolver,
 };
 pub use policy::{
-    LocalUserPolicyConfigurationError, LocalUserPolicyResolver, LocalUserPolicyResolverConfig,
+    LocalUserPolicyAdapterConfig, LocalUserPolicyConfigurationError, LocalUserPolicyResolver,
+    LocalUserPolicyResolverConfig, LocalUserPolicyResolverMultiConfig,
 };
 pub use projections::{
     AdapterApprovalProjectionSource, ArtifactProjectionSource, CollaborationProjectionSource,

@@ -56,6 +56,10 @@ pub struct DshAcpConfig {
     pub arguments: Vec<String>,
     pub working_directory: PathBuf,
     pub environment_overrides: Vec<(String, String)>,
+    /// Exact provider/model route expected from the ACP session model option.
+    /// This is optional for Harnesses that do not expose model selection, but
+    /// must be set when one ACP executable can route to multiple providers.
+    pub required_model: Option<String>,
     pub request_timeout: Duration,
 }
 
@@ -67,6 +71,7 @@ impl DshAcpConfig {
             arguments: Vec::new(),
             working_directory: working_directory.into(),
             environment_overrides: Vec::new(),
+            required_model: None,
             request_timeout: Duration::from_secs(10),
         }
     }
@@ -84,6 +89,12 @@ impl DshAcpConfig {
         value: impl Into<String>,
     ) -> Self {
         self.environment_overrides.push((name.into(), value.into()));
+        self
+    }
+
+    #[must_use]
+    pub fn with_required_model(mut self, model: impl Into<String>) -> Self {
+        self.required_model = Some(model.into());
         self
     }
 }
@@ -191,14 +202,18 @@ impl DshAcpDriver {
         let session_id = match acp::parse_message(session_raw.as_bytes()).map_err(|detail| {
             driver_error("DSH_ACP_SESSION_NEW_INVALID_MESSAGE", detail.as_bytes())
         })? {
-            DshAcpMessage::Response(DshAcpResponse::Result { result, .. }) => result
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    driver_error("DSH_ACP_SESSION_ID_MISSING", session_raw.as_bytes())
-                })?,
+            DshAcpMessage::Response(DshAcpResponse::Result { result, .. }) => {
+                validate_required_session_model(&result, self.config.required_model.as_deref())
+                    .map_err(|code| driver_error(code, session_raw.as_bytes()))?;
+                result
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        driver_error("DSH_ACP_SESSION_ID_MISSING", session_raw.as_bytes())
+                    })?
+            }
             _ => {
                 return Err(driver_error(
                     "DSH_ACP_SESSION_NEW_REJECTED",
@@ -544,7 +559,8 @@ async fn probe_session(config: &DshAcpConfig) -> Result<DshSessionProbeResult, D
         &session_request,
     )
     .await?;
-    let session_result = parse_session_new_response(session_line.as_bytes())?;
+    let session_result =
+        parse_session_new_response(session_line.as_bytes(), config.required_model.as_deref())?;
     let _ = process.terminate().await;
     let _ = process.wait().await;
     Ok(DshSessionProbeResult {
@@ -767,7 +783,10 @@ fn parse_initialize_response(raw: &[u8]) -> Result<ProbeHarnessResult, DriverErr
     })
 }
 
-fn parse_session_new_response(raw: &[u8]) -> Result<DshSessionProbeDisposition, DriverError> {
+fn parse_session_new_response(
+    raw: &[u8],
+    required_model: Option<&str>,
+) -> Result<DshSessionProbeDisposition, DriverError> {
     let value: Value = serde_json::from_slice(raw).map_err(|error| {
         driver_error(
             "DSH_ACP_SESSION_NEW_INVALID_JSON",
@@ -781,8 +800,13 @@ fn parse_session_new_response(raw: &[u8]) -> Result<DshSessionProbeDisposition, 
             evidence_ref,
         });
     }
-    let session_id = value
-        .pointer("/result/sessionId")
+    let result = value
+        .get("result")
+        .ok_or_else(|| driver_error("DSH_ACP_SESSION_RESULT_MISSING", raw))?;
+    validate_required_session_model(result, required_model)
+        .map_err(|code| driver_error(code, raw))?;
+    let session_id = result
+        .get("sessionId")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| driver_error("DSH_ACP_SESSION_ID_MISSING", raw))?;
@@ -790,6 +814,33 @@ fn parse_session_new_response(raw: &[u8]) -> Result<DshSessionProbeDisposition, 
         native_session_ref: session_id.to_owned(),
         evidence_ref,
     })
+}
+
+fn validate_required_session_model(
+    result: &Value,
+    required_model: Option<&str>,
+) -> Result<(), &'static str> {
+    let Some(required_model) = required_model else {
+        return Ok(());
+    };
+    if required_model.trim().is_empty() {
+        return Err("DSH_ACP_REQUIRED_MODEL_INVALID");
+    }
+    let current_model = result
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options
+                .iter()
+                .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))
+        })
+        .and_then(|option| option.get("currentValue"))
+        .and_then(Value::as_str);
+    match current_model {
+        Some(current_model) if current_model == required_model => Ok(()),
+        Some(_) => Err("DSH_ACP_SESSION_MODEL_MISMATCH"),
+        None => Err("DSH_ACP_SESSION_MODEL_UNATTESTED"),
+    }
 }
 
 fn dependency_error(detail: &str) -> DriverError {
@@ -894,6 +945,7 @@ mod tests {
     fn session_creation_keeps_native_session_reference_opaque() {
         let result = parse_session_new_response(
             br#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"dsh-session-001"}}"#,
+            None,
         )
         .expect("parse session response");
         assert!(matches!(
@@ -909,6 +961,7 @@ mod tests {
     fn rejected_session_is_a_controlled_probe_disposition() {
         let result = parse_session_new_response(
             br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"invalid cwd"}}"#,
+            None,
         )
         .expect("parse rejected session");
         assert!(matches!(
@@ -929,6 +982,31 @@ mod tests {
         assert_eq!(initialize["method"], "initialize");
         assert_eq!(session["method"], "session/new");
         assert_eq!(session["params"]["mcpServers"], json!([]));
+    }
+
+    #[test]
+    fn provider_routing_requires_the_exact_acp_session_model() {
+        let raw = br#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session-001","configOptions":[{"id":"model","currentValue":"zai/glm-4.7"}]}}"#;
+        let accepted = parse_session_new_response(raw, Some("zai/glm-4.7"))
+            .expect("exact model route must be accepted");
+        assert!(matches!(
+            accepted,
+            DshSessionProbeDisposition::Created { .. }
+        ));
+
+        let mismatch = parse_session_new_response(raw, Some("opencode/big-pickle"))
+            .expect_err("model fallback must fail closed");
+        assert_eq!(mismatch.safe_detail_code, "DSH_ACP_SESSION_MODEL_MISMATCH");
+
+        let unattested = parse_session_new_response(
+            br#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session-001"}}"#,
+            Some("zai/glm-4.7"),
+        )
+        .expect_err("missing model option must fail closed");
+        assert_eq!(
+            unattested.safe_detail_code,
+            "DSH_ACP_SESSION_MODEL_UNATTESTED"
+        );
     }
 
     #[test]

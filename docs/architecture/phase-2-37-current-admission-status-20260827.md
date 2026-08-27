@@ -27,6 +27,8 @@ The second fact never implies the third without provider-specific evidence.
 | Memory retrieval | Python Worker reads only accepted, scoped snapshots and returns reference-only lexical-overlap-v0 results | Production baseline |
 | Semantic RAG | Exact-vector/RRF experiment adapters exist; E5-small is the measured candidate, but package and runtime costs require an explicit Founder admission decision | Not admitted by default |
 | Multi-model composition | Exact profile routing and isolated per-provider Collaboration/Adapter stores support heterogeneous drivers under one scheduler | Boundary closed; provider admission remains independent |
+| Multi-provider Policy routing | Approval requests resolve across isolated provider Adapter stores; zero or ambiguous matches fail closed | Boundary closed; production bootstrap wiring remains pending |
+| GLM / OpenCode ACP | OpenCode 1.18.23 initialize/session boundary probed; exact ACP model route rejects silent fallback | Candidate held pending authenticated lifecycle, schema, recovery and Artifact evidence |
 | Codex | Real authenticated app-server lifecycle, governed approval/recovery/return path and current candidate package are verified locally | Active production Harness |
 | Kimi | ACP initialize probe reaches authentication-required in an isolated process; authenticated prompt/approval/recovery/return evidence is absent | Candidate-only / held |
 | DSH | Fresh-session replay, cancellation and permission path are locally evidenced; native load/resume and independently attested Artifact semantics are absent | Candidate-only / held |

@@ -24,8 +24,7 @@ use thiserror::Error;
 /// Approval routing is resolved from the Adapter's durable request projection;
 /// the client never supplies adapter, fencing, routing, or observation facts.
 pub struct LocalUserPolicyResolver {
-    edge: Mutex<AdapterEdge>,
-    adapter_id: String,
+    adapters: Vec<LocalUserPolicyAdapterEdge>,
     authorization_policy_ref: ContractReference,
     authentication_context_ref: String,
     allowed_scope_refs: BTreeSet<String>,
@@ -36,13 +35,38 @@ impl LocalUserPolicyResolver {
     pub fn new(
         config: LocalUserPolicyResolverConfig,
     ) -> Result<Self, LocalUserPolicyConfigurationError> {
-        if config.adapter_id.trim().is_empty()
+        Self::new_multi(LocalUserPolicyResolverMultiConfig {
+            adapters: vec![LocalUserPolicyAdapterConfig {
+                edge: config.edge,
+                adapter_id: config.adapter_id,
+            }],
+            authorization_policy_ref: config.authorization_policy_ref,
+            authentication_context_ref: config.authentication_context_ref,
+            allowed_scope_refs: config.allowed_scope_refs,
+            decision_ttl: config.decision_ttl,
+        })
+    }
+
+    /// Builds one policy resolver over independently owned provider Adapter
+    /// stores. Approval request ids must resolve to exactly one provider; a
+    /// cross-provider collision is treated as an integrity failure rather
+    /// than being resolved by registration order.
+    pub fn new_multi(
+        config: LocalUserPolicyResolverMultiConfig,
+    ) -> Result<Self, LocalUserPolicyConfigurationError> {
+        if config.adapters.is_empty()
             || config.authentication_context_ref.trim().is_empty()
             || config.allowed_scope_refs.is_empty()
             || config.decision_ttl.is_zero()
             || config.decision_ttl > Duration::from_secs(24 * 60 * 60)
             || config.authorization_policy_ref != authorization_contract_ref()
         {
+            return Err(LocalUserPolicyConfigurationError::InvalidConfiguration);
+        }
+        let mut adapter_ids = BTreeSet::new();
+        if config.adapters.iter().any(|adapter| {
+            adapter.adapter_id.trim().is_empty() || !adapter_ids.insert(adapter.adapter_id.clone())
+        }) {
             return Err(LocalUserPolicyConfigurationError::InvalidConfiguration);
         }
         if config
@@ -53,8 +77,14 @@ impl LocalUserPolicyResolver {
             return Err(LocalUserPolicyConfigurationError::InvalidConfiguration);
         }
         Ok(Self {
-            edge: Mutex::new(config.edge),
-            adapter_id: config.adapter_id,
+            adapters: config
+                .adapters
+                .into_iter()
+                .map(|adapter| LocalUserPolicyAdapterEdge {
+                    edge: Mutex::new(adapter.edge),
+                    adapter_id: adapter.adapter_id,
+                })
+                .collect(),
             authorization_policy_ref: config.authorization_policy_ref,
             authentication_context_ref: config.authentication_context_ref,
             allowed_scope_refs: config.allowed_scope_refs,
@@ -72,6 +102,24 @@ pub struct LocalUserPolicyResolverConfig {
     pub decision_ttl: Duration,
 }
 
+pub struct LocalUserPolicyAdapterConfig {
+    pub edge: AdapterEdge,
+    pub adapter_id: String,
+}
+
+pub struct LocalUserPolicyResolverMultiConfig {
+    pub adapters: Vec<LocalUserPolicyAdapterConfig>,
+    pub authorization_policy_ref: ContractReference,
+    pub authentication_context_ref: String,
+    pub allowed_scope_refs: BTreeSet<String>,
+    pub decision_ttl: Duration,
+}
+
+struct LocalUserPolicyAdapterEdge {
+    edge: Mutex<AdapterEdge>,
+    adapter_id: String,
+}
+
 impl PolicyReferenceResolver for LocalUserPolicyResolver {
     fn resolve_issue(
         &self,
@@ -83,15 +131,15 @@ impl PolicyReferenceResolver for LocalUserPolicyResolver {
         }
         let now = current_timestamp()?;
         let expires_at = timestamp_after(&now, self.decision_ttl)?;
-        let projections = self
-            .edge
-            .lock()
-            .map_err(|_| PolicyReferenceRejection::IntegrityFailure)?
-            .pending_approval_projection_messages()
-            .map_err(map_edge_error)?;
-        let projection = projections
-            .into_iter()
-            .find(|value| {
+        let mut matched = None;
+        for adapter in &self.adapters {
+            let projections = adapter
+                .edge
+                .lock()
+                .map_err(|_| PolicyReferenceRejection::IntegrityFailure)?
+                .pending_approval_projection_messages()
+                .map_err(map_edge_error)?;
+            for projection in projections.into_iter().filter(|value| {
                 value.observation.payload.as_ref().is_some_and(|payload| {
                     matches!(
                         payload,
@@ -99,8 +147,14 @@ impl PolicyReferenceResolver for LocalUserPolicyResolver {
                             if request.approval_request_id == command.approval_request_id
                     )
                 })
-            })
-            .ok_or(PolicyReferenceRejection::NotFound)?;
+            }) {
+                if matched.is_some() {
+                    return Err(PolicyReferenceRejection::IntegrityFailure);
+                }
+                matched = Some((adapter.adapter_id.clone(), projection));
+            }
+        }
+        let (adapter_id, projection) = matched.ok_or(PolicyReferenceRejection::NotFound)?;
         let request = match projection.observation.payload {
             Some(harness_observation::Payload::ApprovalRequest(request)) => request,
             _ => return Err(PolicyReferenceRejection::IntegrityFailure),
@@ -119,7 +173,7 @@ impl PolicyReferenceResolver for LocalUserPolicyResolver {
             return Err(PolicyReferenceRejection::RequestMismatch);
         }
         let binding = HarnessApprovalRequestBinding {
-            adapter_id: self.adapter_id.clone(),
+            adapter_id,
             attempt_id: projection.attempt_id,
             dispatch_id: projection.dispatch_id,
             fencing_token: projection.fencing_token,
@@ -170,7 +224,12 @@ impl PolicyReferenceResolver for LocalUserPolicyResolver {
             .adapter_receipt
             .as_ref()
             .ok_or(PolicyReferenceRejection::DeliveryReceiptInvalid)?;
-        let stored = self
+        let adapter = self
+            .adapters
+            .iter()
+            .find(|adapter| adapter.adapter_id == request.adapter_id)
+            .ok_or(PolicyReferenceRejection::NotFound)?;
+        let stored = adapter
             .edge
             .lock()
             .map_err(|_| PolicyReferenceRejection::IntegrityFailure)?
@@ -285,6 +344,64 @@ mod tests {
         .expect("valid local user policy")
     }
 
+    fn edge_with_pending_approval(
+        root: &Path,
+        file_name: &str,
+        adapter_id: &str,
+        approval_request_id: &str,
+        key_byte: u8,
+    ) -> AdapterEdge {
+        let mut edge = AdapterEdge::open(AdapterEdgeConfig {
+            database_path: root.join(file_name),
+            adapter_id: adapter_id.to_owned(),
+            store_epoch: format!("{adapter_id}-policy-test-epoch"),
+            key: AdapterEdgeKey::new([key_byte; 32]),
+        })
+        .expect("open adapter edge");
+        edge.prepare_dispatch(
+            &DispatchEnvelope {
+                run_id: format!("run-{adapter_id}"),
+                run_revision: 1,
+                step_id: format!("step-{adapter_id}"),
+                step_revision: 1,
+                attempt_id: format!("attempt-{adapter_id}"),
+                attempt_revision: 1,
+                dispatch_id: format!("dispatch-{adapter_id}"),
+                dispatch_fingerprint: "f".repeat(64),
+                fencing_token: 7,
+                ..Default::default()
+            },
+            1,
+        )
+        .expect("prepare dispatch");
+        edge.append_observation(
+            &format!("dispatch-{adapter_id}"),
+            &format!("native-{approval_request_id}"),
+            b"approval-request-raw",
+            HarnessObservation {
+                attempt_id: format!("attempt-{adapter_id}"),
+                dispatch_id: format!("dispatch-{adapter_id}"),
+                fencing_token: 7,
+                payload: Some(harness_observation::Payload::ApprovalRequest(
+                    ApprovalRequestObservation {
+                        approval_request_id: approval_request_id.to_owned(),
+                        kind: ApprovalKind::Command as i32,
+                        action_digest_sha256: "a".repeat(64),
+                        requested_scope_ref: "scope://safe".to_owned(),
+                        display_summary_ref: format!("summary://{approval_request_id}"),
+                        native_routing_ref: format!("native://{approval_request_id}"),
+                        lifecycle: ApprovalRequestLifecycleKind::Open as i32,
+                        request_revision: 1,
+                    },
+                )),
+                ..Default::default()
+            },
+            2,
+        )
+        .expect("append approval observation");
+        edge
+    }
+
     #[test]
     fn policy_resolver_requires_the_embedded_authorization_contract() {
         let root = edge_root();
@@ -342,6 +459,104 @@ mod tests {
             )
             .expect_err("missing durable request must be rejected");
         assert_eq!(error, PolicyReferenceRejection::NotFound);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn multi_provider_policy_routes_exactly_one_adapter_and_rejects_collisions() {
+        let root = edge_root();
+        let codex = edge_with_pending_approval(&root, "codex.db", "codex", "approval-codex", 0x51);
+        let opencode =
+            edge_with_pending_approval(&root, "opencode.db", "opencode", "approval-glm", 0x52);
+        let resolver = LocalUserPolicyResolver::new_multi(LocalUserPolicyResolverMultiConfig {
+            adapters: vec![
+                LocalUserPolicyAdapterConfig {
+                    edge: codex,
+                    adapter_id: "codex".to_owned(),
+                },
+                LocalUserPolicyAdapterConfig {
+                    edge: opencode,
+                    adapter_id: "opencode".to_owned(),
+                },
+            ],
+            authorization_policy_ref: authorization_contract_ref(),
+            authentication_context_ref: "local-ipc:test".to_owned(),
+            allowed_scope_refs: BTreeSet::from(["scope://safe".to_owned()]),
+            decision_ttl: Duration::from_secs(300),
+        })
+        .expect("valid multi-provider policy");
+        let principal = AuthenticatedPolicyPrincipal {
+            kind: egopulse_policy_decision_authority::PolicyPrincipalKind::LocalUser,
+            principal_id: "os-user:test".to_owned(),
+            authenticated: true,
+        };
+        let (expected_request_observation_id, expected_request_observation_sequence) = {
+            let edge = resolver.adapters[1].edge.lock().expect("opencode edge");
+            let projection = edge
+                .pending_approval_projection_messages()
+                .expect("pending projection")[0]
+                .clone();
+            (projection.source_observation_id, projection.source_revision)
+        };
+        let resolved = resolver
+            .resolve_issue(
+                &IssueHarnessApprovalDecisionCommand {
+                    approval_request_id: "approval-glm".to_owned(),
+                    expected_action_digest_sha256: "a".repeat(64),
+                    expected_request_observation_id,
+                    expected_request_observation_sequence,
+                    expected_request_revision: 1,
+                    reason_code: "multi-provider-test".to_owned(),
+                    ..Default::default()
+                },
+                &principal,
+            )
+            .expect("approval must route to OpenCode");
+        assert_eq!(resolved.request.adapter_id, "opencode");
+
+        drop(resolver);
+        let duplicate_a = edge_with_pending_approval(
+            &root,
+            "duplicate-a.db",
+            "duplicate-a",
+            "approval-collision",
+            0x53,
+        );
+        let duplicate_b = edge_with_pending_approval(
+            &root,
+            "duplicate-b.db",
+            "duplicate-b",
+            "approval-collision",
+            0x54,
+        );
+        let collision = LocalUserPolicyResolver::new_multi(LocalUserPolicyResolverMultiConfig {
+            adapters: vec![
+                LocalUserPolicyAdapterConfig {
+                    edge: duplicate_a,
+                    adapter_id: "duplicate-a".to_owned(),
+                },
+                LocalUserPolicyAdapterConfig {
+                    edge: duplicate_b,
+                    adapter_id: "duplicate-b".to_owned(),
+                },
+            ],
+            authorization_policy_ref: authorization_contract_ref(),
+            authentication_context_ref: "local-ipc:test".to_owned(),
+            allowed_scope_refs: BTreeSet::from(["scope://safe".to_owned()]),
+            decision_ttl: Duration::from_secs(300),
+        })
+        .expect("valid collision fixture");
+        let error = collision
+            .resolve_issue(
+                &IssueHarnessApprovalDecisionCommand {
+                    approval_request_id: "approval-collision".to_owned(),
+                    ..Default::default()
+                },
+                &principal,
+            )
+            .expect_err("cross-provider approval collision must fail closed");
+        assert_eq!(error, PolicyReferenceRejection::IntegrityFailure);
+        drop(collision);
         let _ = fs::remove_dir_all(root);
     }
 

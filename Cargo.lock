@@ -1339,6 +1339,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "egopulse-opencode-adapter"
+version = "0.1.0"
+dependencies = [
+ "egopulse-domain-contracts",
+ "egopulse-dsh-adapter",
+ "egopulse-harness-adapter",
+]
+
+[[package]]
 name = "egopulse-policy-decision-authority"
 version = "0.1.0"
 dependencies = [

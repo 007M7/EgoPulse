@@ -18,6 +18,7 @@ members = [
   "crates/codex-adapter",
   "crates/kimi-adapter",
   "crates/dsh-adapter",
+  "crates/opencode-adapter",
   "crates/artifact-authority",
   "crates/verification-authority",
   "crates/founder-verdict-authority",
@@ -73,6 +74,7 @@ egopulse-harness-adapter = { path = "crates/harness-adapter" }
 egopulse-codex-adapter = { path = "crates/codex-adapter" }
 egopulse-kimi-adapter = { path = "crates/kimi-adapter" }
 egopulse-dsh-adapter = { path = "crates/dsh-adapter" }
+egopulse-opencode-adapter = { path = "crates/opencode-adapter" }
 egopulse-artifact-authority = { path = "crates/artifact-authority" }
 egopulse-verification-authority = { path = "crates/verification-authority" }
 egopulse-founder-verdict-authority = { path = "crates/founder-verdict-authority" }
