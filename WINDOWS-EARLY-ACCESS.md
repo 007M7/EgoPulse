@@ -19,6 +19,11 @@ run this script from the extracted package directory:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-memory-worker.ps1
 ```
 
+The setup script uses a package-local `.cache/uv` directory by default, so it
+does not depend on permissions for the user's global `uv` cache. Use
+`-UvCacheDir` only when an installation policy requires a different writable
+cache location.
+
 The script creates the locked Memory/RAG Worker environment under
 `workers\memory-rag\.venv`. It does not receive or store an API key.
 
