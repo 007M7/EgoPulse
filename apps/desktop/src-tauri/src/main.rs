@@ -4,8 +4,14 @@
 use egopulse_client_operations::{ClientReadError, attach};
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::ContractReference,
-    harness::v1::ApprovalRequestLifecycleKind,
-    localapi::v1::{ClientSurface, ExecuteTaskCommandRequest, LocalApiError},
+    harness::v1::{ApprovalDecision, ApprovalRequestLifecycleKind},
+    localapi::v1::{
+        AvailableActionKind, ClientSurface, DecideHarnessApprovalRequest,
+        ExecuteTaskCommandRequest, LocalApiError,
+    },
+    policy::v1::{
+        IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
+    },
     task::v1::{CreateTaskCommand, TaskCommand, TaskStatus, task_command, task_command_result},
 };
 use egopulse_local_api::{LocalApiClient, LocalTransport};
@@ -41,6 +47,10 @@ struct DesktopApproval {
     request_revision: u64,
     display_summary_ref: String,
     requested_scope_ref: String,
+    action_digest_sha256: String,
+    request_observation_id: String,
+    request_observation_sequence: u64,
+    available_action_codes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -77,6 +87,32 @@ struct DesktopTaskCreateRequest {
     budget_profile_id: String,
     budget_profile_version: String,
     budget_profile_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopApprovalDecisionRequest {
+    instance: String,
+    approval_request_id: String,
+    expected_action_digest_sha256: String,
+    expected_request_observation_id: String,
+    expected_request_observation_sequence: u64,
+    expected_request_revision: u64,
+    decision: String,
+    reason_code: String,
+    confirmation_proof_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopApprovalDecisionResult {
+    authority_decision_ref: String,
+    committed: bool,
+    replayed: bool,
+    decision: String,
+    state: String,
+    state_revision: u64,
+    await_token_present: bool,
 }
 
 fn transport_name(transport: LocalTransport) -> &'static str {
@@ -175,6 +211,15 @@ async fn dashboard_snapshot(instance: String) -> Result<DesktopSnapshot, String>
             request_revision: approval.request_revision,
             display_summary_ref: approval.display_summary_ref,
             requested_scope_ref: approval.requested_scope_ref,
+            action_digest_sha256: approval.action_digest_sha256,
+            request_observation_id: approval.request_observation_id,
+            request_observation_sequence: approval.request_observation_sequence,
+            available_action_codes: approval
+                .available_actions
+                .into_iter()
+                .filter_map(|action| AvailableActionKind::try_from(action.kind).ok())
+                .map(|action| action.as_str_name().to_owned())
+                .collect(),
         })
         .collect();
     Ok(DesktopSnapshot {
@@ -184,6 +229,128 @@ async fn dashboard_snapshot(instance: String) -> Result<DesktopSnapshot, String>
         position,
         tasks,
         approvals,
+    })
+}
+
+fn parse_approval_decision(value: &str) -> Result<i32, String> {
+    match value {
+        "allow-once" => Ok(ApprovalDecision::AllowOnce as i32),
+        "deny" => Ok(ApprovalDecision::Deny as i32),
+        "cancel-attempt" => Ok(ApprovalDecision::CancelAttempt as i32),
+        _ => Err("decision must be allow-once, deny, or cancel-attempt".to_owned()),
+    }
+}
+
+#[tauri::command]
+async fn decide_approval(
+    request: DesktopApprovalDecisionRequest,
+) -> Result<DesktopApprovalDecisionResult, String> {
+    let DesktopApprovalDecisionRequest {
+        instance,
+        approval_request_id,
+        expected_action_digest_sha256,
+        expected_request_observation_id,
+        expected_request_observation_sequence,
+        expected_request_revision,
+        decision,
+        reason_code,
+        confirmation_proof_ref,
+    } = request;
+    require_non_empty(&approval_request_id, "approval_request_id")?;
+    require_non_empty(
+        &expected_action_digest_sha256,
+        "expected_action_digest_sha256",
+    )?;
+    require_non_empty(
+        &expected_request_observation_id,
+        "expected_request_observation_id",
+    )?;
+    require_non_empty(&reason_code, "reason_code")?;
+    let decision = parse_approval_decision(&decision)?;
+    let instance = if instance.trim().is_empty() {
+        "default".to_owned()
+    } else {
+        instance
+    };
+    let attachment = attach(
+        &instance,
+        ClientSurface::Desktop,
+        format!("egopulse-desktop-{}", Uuid::now_v7()),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    attachment
+        .require_command(
+            "LocalCommandGatewayService/DecideHarnessApproval",
+            "issue_harness_approval_decision",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let correlation_id = Uuid::now_v7().to_string();
+    let mut command = PolicyDecisionCommand {
+        command: Some(
+            policy_decision_command::Command::IssueHarnessApprovalDecision(
+                IssueHarnessApprovalDecisionCommand {
+                    metadata: Some(egopulse_client_operations::command_metadata(
+                        &correlation_id,
+                        "egopulse-desktop/approval-decide",
+                    )),
+                    approval_request_id,
+                    expected_action_digest_sha256,
+                    expected_request_observation_id,
+                    expected_request_observation_sequence,
+                    decision,
+                    reason_code,
+                    confirmation_proof_ref,
+                    expected_request_revision,
+                },
+            ),
+        ),
+    };
+    egopulse_client_operations::set_policy_digest(&mut command);
+    let issue = match command.command {
+        Some(policy_decision_command::Command::IssueHarnessApprovalDecision(issue)) => issue,
+        _ => unreachable!("Desktop always constructs issue approval decision"),
+    };
+    let response = attachment
+        .connection
+        .command_gateway_service()
+        .decide_harness_approval(DecideHarnessApprovalRequest {
+            client: Some(
+                attachment
+                    .metadata(Some(correlation_id))
+                    .map_err(|error| error.to_string())?,
+            ),
+            command: Some(issue),
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .into_inner();
+    if let Some(error) = response.gateway_error.as_ref() {
+        return Err(safe_local_api_error(error));
+    }
+    let result = response
+        .sanitized_authority_result
+        .ok_or_else(|| "sanitized approval result missing".to_owned())?;
+    if result.error_code != 0 {
+        return Err(format!(
+            "approval authority rejected the command: code={} fingerprint={}",
+            result.error_code,
+            result.safe_error_fingerprint.as_deref().unwrap_or("none")
+        ));
+    }
+    Ok(DesktopApprovalDecisionResult {
+        authority_decision_ref: result.authority_decision_ref,
+        committed: result.committed,
+        replayed: result.replayed,
+        decision: ApprovalDecision::try_from(result.decision)
+            .map(|value| value.as_str_name().to_owned())
+            .unwrap_or_else(|_| "APPROVAL_DECISION_UNKNOWN".to_owned()),
+        state: egopulse_domain_contracts::v01::egopulse::policy::v1::HarnessApprovalDecisionStateKind::try_from(result.state)
+            .map(|value| value.as_str_name().to_owned())
+            .unwrap_or_else(|_| "HARNESS_APPROVAL_DECISION_STATE_KIND_UNKNOWN".to_owned()),
+        state_revision: result.state_revision,
+        await_token_present: response.await_token.is_some(),
     })
 }
 
@@ -298,7 +465,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             foundation_status,
             dashboard_snapshot,
-            create_task
+            create_task,
+            decide_approval
         ])
         .run(tauri::generate_context!())
         .expect("failed to run EgoPulse desktop foundation shell");

@@ -24,6 +24,10 @@ type DesktopApproval = {
   requestRevision: number;
   displaySummaryRef: string;
   requestedScopeRef: string;
+  actionDigestSha256: string;
+  requestObservationId: string;
+  requestObservationSequence: number;
+  availableActionCodes: string[];
 };
 
 type DesktopSnapshot = {
@@ -60,6 +64,8 @@ export function App() {
   const [instance, setInstance] = useState("default");
   const [busy, setBusy] = useState(false);
   const [taskBusy, setTaskBusy] = useState(false);
+  const [approvalBusy, setApprovalBusy] = useState<string | null>(null);
+  const [approvalReason, setApprovalReason] = useState("desktop-user-decision");
   const [taskDraft, setTaskDraft] = useState<TaskDraft>({
     workType: "",
     inputSnapshotId: "",
@@ -119,6 +125,38 @@ export function App() {
       setNote(`Task creation rejected: ${String(error)}`);
     } finally {
       setTaskBusy(false);
+    }
+  }
+
+  async function decideApproval(approval: DesktopApproval, decision: "allow-once" | "deny") {
+    setApprovalBusy(approval.approvalRequestId);
+    try {
+      const result = await invoke<{
+        authorityDecisionRef: string;
+        committed: boolean;
+        replayed: boolean;
+        decision: string;
+        state: string;
+        stateRevision: number;
+        awaitTokenPresent: boolean;
+      }>("decide_approval", {
+        request: {
+          instance,
+          approvalRequestId: approval.approvalRequestId,
+          expectedActionDigestSha256: approval.actionDigestSha256,
+          expectedRequestObservationId: approval.requestObservationId,
+          expectedRequestObservationSequence: approval.requestObservationSequence,
+          expectedRequestRevision: approval.requestRevision,
+          decision,
+          reasonCode: approvalReason,
+        },
+      });
+      setNote(`Approval ${result.decision} at authority revision ${result.stateRevision}; refreshing projection.`);
+      await connectToDaemon();
+    } catch (error) {
+      setNote(`Approval decision rejected: ${String(error)}`);
+    } finally {
+      setApprovalBusy(null);
     }
   }
 
@@ -213,11 +251,27 @@ export function App() {
             </section>
             <section className="panel">
               <h3>Approval queue</h3>
+              <label className="approval-reason">Decision reason code<input value={approvalReason} onChange={(event) => setApprovalReason(event.target.value)} /></label>
               {snapshot.approvals.length === 0 ? <p className="muted">No approval requests are projected.</p> : (
                 <ul>{snapshot.approvals.map((approval) => (
                   <li key={approval.approvalRequestId}>
-                    <div><strong>{approval.displaySummaryRef || "Approval request"}</strong><small>{approval.approvalRequestId}</small></div>
-                    <span>{approval.requestLifecycle.replace("APPROVAL_REQUEST_LIFECYCLE_", "")}</span>
+                    <div>
+                      <strong>{approval.displaySummaryRef || "Approval request"}</strong>
+                      <small>{approval.approvalRequestId}</small>
+                      <small>scope: {approval.requestedScopeRef || "not disclosed"}</small>
+                      <small>action: {approval.actionDigestSha256 || "not disclosed"}</small>
+                    </div>
+                    <div className="approval-actions">
+                      <span>{approval.requestLifecycle.replace("APPROVAL_REQUEST_LIFECYCLE_", "")}</span>
+                      {approval.availableActionCodes.includes("AVAILABLE_ACTION_KIND_DECIDE_HARNESS_APPROVAL") ? (
+                        <div className="button-row">
+                          <button type="button" onClick={() => decideApproval(approval, "allow-once")} disabled={approvalBusy !== null}>
+                            {approvalBusy === approval.approvalRequestId ? "Saving…" : "Allow once"}
+                          </button>
+                          <button className="secondary" type="button" onClick={() => decideApproval(approval, "deny")} disabled={approvalBusy !== null}>Deny</button>
+                        </div>
+                      ) : <small className="muted">Decision unavailable</small>}
+                    </div>
                   </li>
                 ))}</ul>
               )}

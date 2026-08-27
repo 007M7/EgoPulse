@@ -202,8 +202,8 @@ Exit evidence:
 - a clean Windows x64 package can be installed and used by a new user.
 
 Current disposition: **CLI/TUI first-release slice is substantially usable;
-Desktop shared-kernel read surface and explicit TaskCreate command are
-implemented and locally verified; Desktop write E2E, remaining write
+Desktop shared-kernel read surface, TaskCreate and Approval decision commands
+are implemented and locally verified; Desktop write E2E, remaining write
 workflows and distribution remain pending**. The authoritative slice evidence
 is `phase-2-53-desktop-read-surface-20260827.md`.
 

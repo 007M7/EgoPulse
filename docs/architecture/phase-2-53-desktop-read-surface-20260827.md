@@ -1,9 +1,10 @@
-# Phase 2-53: Desktop shared-kernel read surface
+# Phase 2-53: Desktop shared-kernel read and approval surface
 
 - Date: 2026-08-27
 - Scope: Tauri 2 + React + TypeScript Desktop surface
-- Status: shared-kernel read slice and TaskCreate command implemented; local
-  build verified, Desktop write E2E remains a separate acceptance item
+- Status: shared-kernel read slice, TaskCreate, and Approval decision commands
+  implemented; local build verified, Desktop write E2E remains a separate
+  acceptance item
 
 ## Boundary
 
@@ -28,7 +29,10 @@ the structured architecture and local transport facts; `dashboard_snapshot`
 reports projection health, staleness, position, tasks and approval requests.
 `create_task` requires all frozen contract references and cannot invent default
 contract or budget identities; Authority and Local API remain responsible for
-authorization, digest validation, idempotency and persistence.
+authorization, digest validation, idempotency and persistence. `decide_approval`
+accepts only the decision facts copied from the current projection and routes
+them through `DecideHarnessApproval`; it does not reconstruct approval context
+or bypass the Policy Authority.
 
 ## User-facing behavior
 
@@ -40,6 +44,11 @@ authorization, digest validation, idempotency and persistence.
   secret or provider credential is displayed;
 - TaskCreate is explicit and contract-complete; a rejected command is surfaced
   without local fallback or direct WebView persistence;
+- Approval decision is explicit: the UI displays the action digest and bounded
+  request references, requires a reason code, and offers only `allow-once` or
+  `deny` when the projection exposes `DECIDE_HARNESS_APPROVAL`;
+- stale approval facts are rejected by the existing observation, revision and
+  digest fences, with the safe Local API error surfaced to the user;
 - CLI, TUI and Desktop continue to share the same Rust client kernel and Local
   API contracts.
 

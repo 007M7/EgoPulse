@@ -218,6 +218,10 @@ h3 {
   padding: 1.2rem;
 }
 
+.approval-reason {
+  margin-bottom: 1rem;
+}
+
 ul {
   display: grid;
   gap: 0.75rem;
@@ -239,6 +243,22 @@ li div {
   display: grid;
   gap: 0.25rem;
   min-width: 0;
+}
+
+.approval-actions {
+  display: grid;
+  justify-items: end;
+  gap: 0.55rem;
+}
+
+.button-row {
+  display: flex;
+  gap: 0.45rem;
+}
+
+.button-row button {
+  padding: 0.55rem 0.75rem;
+  font-size: 0.8rem;
 }
 
 li strong,
