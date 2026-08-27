@@ -73,6 +73,19 @@ root, open Authority stores, create business databases or listen on IPC. A
 successful check prints `stores_opened=false`; an invalid check exits with
 code `78`.
 
+For setup tools and scripts, append `--json` to emit a redacted Provider/Model
+catalog:
+
+```powershell
+agentosd.exe --check-config --json
+```
+
+The JSON reports each configured Provider, Harness, admission state, model
+catalog, exact selected model and credential mode. API-key profiles expose
+only the source environment-variable name; credential values are never
+serialized. This is a configuration preflight, not a live capability probe:
+`candidate` and `held` profiles remain unavailable for production dispatch.
+
 To enable candidate proposals from an admitted runtime, configure
 `memory_candidate_producers` with one entry per fixed route. Each entry binds
 `producer_id`, `principal_id`, `principal_kind` (`Agent`, `Model` or `Harness`)
