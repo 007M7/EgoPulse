@@ -2,20 +2,23 @@
 
 - Date: 2026-08-27
 - Scope: Tauri 2 + React + TypeScript Desktop surface
-- Status: first shared-kernel read slice implemented and locally verified
+- Status: shared-kernel read slice and TaskCreate command implemented; local
+  build verified, Desktop write E2E remains a separate acceptance item
 
 ## Boundary
 
 Desktop now uses the same `egopulse-client-operations::attach` path as the
 other client surfaces. It opens a session with `ClientSurface::Desktop`, then
 reads the bounded `ProjectionSnapshot` through the Local API. The Tauri layer
-projects only safe display fields for the frontend:
+projects only safe display fields for the frontend. Its explicit TaskCreate
+command uses the same typed command metadata and digest helpers as the other
+surfaces and sends the command through `LocalCommandGatewayService`:
 
 ```text
 Tauri command
   -> shared ClientAttachment
   -> authenticated Local API session
-  -> read-model projection
+  -> read-model projection or typed command gateway
   -> Desktop-only display DTO
 ```
 
@@ -23,6 +26,9 @@ The Desktop process has no database handle, Memory writer, Provider selector,
 Harness authority, or alternate session protocol. `foundation_status` reports
 the structured architecture and local transport facts; `dashboard_snapshot`
 reports projection health, staleness, position, tasks and approval requests.
+`create_task` requires all frozen contract references and cannot invent default
+contract or budget identities; Authority and Local API remain responsible for
+authorization, digest validation, idempotency and persistence.
 
 ## User-facing behavior
 
@@ -32,6 +38,8 @@ reports projection health, staleness, position, tasks and approval requests.
 - stale projections are marked `STALE` rather than presented as current;
 - task and approval identifiers remain available for correlation, while no
   secret or provider credential is displayed;
+- TaskCreate is explicit and contract-complete; a rejected command is surfaced
+  without local fallback or direct WebView persistence;
 - CLI, TUI and Desktop continue to share the same Rust client kernel and Local
   API contracts.
 
@@ -45,6 +53,7 @@ cargo clippy -p egopulse-desktop --all-targets -- -D warnings  passed
 pnpm --filter @egopulse/desktop build           passed
 ```
 
-The full local CI gate remains the release-level check. This slice is a
-read-model completion step; it does not claim Desktop write workflows,
-Provider/model selection, signed distribution, or final six-stage closure.
+The full local CI gate remains the release-level check. A real Desktop command
+round-trip against a running daemon is still required before Stage 5 can be
+closed; this slice does not claim Provider/model selection, signed
+distribution, or final six-stage closure.

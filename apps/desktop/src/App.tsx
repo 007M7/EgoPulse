@@ -35,6 +35,18 @@ type DesktopSnapshot = {
   approvals: DesktopApproval[];
 };
 
+type TaskDraft = {
+  workType: string;
+  inputSnapshotId: string;
+  targetScopeRef: string;
+  acceptanceContractId: string;
+  acceptanceContractVersion: string;
+  acceptanceContractSha256: string;
+  budgetProfileId: string;
+  budgetProfileVersion: string;
+  budgetProfileSha256: string;
+};
+
 const staticHealth: FoundationStatus = {
   product: "EgoPulse",
   architectureVersion: "1.0",
@@ -47,6 +59,18 @@ export function App() {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
   const [instance, setInstance] = useState("default");
   const [busy, setBusy] = useState(false);
+  const [taskBusy, setTaskBusy] = useState(false);
+  const [taskDraft, setTaskDraft] = useState<TaskDraft>({
+    workType: "",
+    inputSnapshotId: "",
+    targetScopeRef: "",
+    acceptanceContractId: "",
+    acceptanceContractVersion: "",
+    acceptanceContractSha256: "",
+    budgetProfileId: "",
+    budgetProfileVersion: "",
+    budgetProfileSha256: "",
+  });
   const [note, setNote] = useState("Desktop is ready; connect to the local governed daemon to load a projection.");
 
   async function inspectNativeBoundary() {
@@ -71,6 +95,30 @@ export function App() {
       setNote(`Local daemon unavailable or projection rejected: ${String(error)}`);
     } finally {
       setBusy(false);
+    }
+  }
+
+  function updateTaskDraft(field: keyof TaskDraft, value: string) {
+    setTaskDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  async function submitTask(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setTaskBusy(true);
+    try {
+      const result = await invoke<{
+        taskId: string;
+        revision: number;
+        status: string;
+        replayed: boolean;
+        awaitTokenPresent: boolean;
+      }>("create_task", { request: { instance, ...taskDraft } });
+      setNote(`Task ${result.taskId} created at revision ${result.revision}; refresh the projection to observe it.`);
+      await connectToDaemon();
+    } catch (error) {
+      setNote(`Task creation rejected: ${String(error)}`);
+    } finally {
+      setTaskBusy(false);
     }
   }
 
@@ -107,6 +155,31 @@ export function App() {
       </section>
 
       <p className="note" role="status">{note}</p>
+
+      <section className="write-panel" aria-label="Create task">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">EXPLICIT WRITE</p>
+            <h2>Create governed task</h2>
+          </div>
+          <span className="badge">TASK AUTHORITY</span>
+        </div>
+        <p className="muted">All contract references are required. The form submits through the authenticated Local API and never writes locally from the WebView.</p>
+        <form onSubmit={submitTask}>
+          <div className="form-grid">
+            <label>Work type<input required value={taskDraft.workType} onChange={(event) => updateTaskDraft("workType", event.target.value)} /></label>
+            <label>Input snapshot ID<input required value={taskDraft.inputSnapshotId} onChange={(event) => updateTaskDraft("inputSnapshotId", event.target.value)} /></label>
+            <label>Target scope ref<input required value={taskDraft.targetScopeRef} onChange={(event) => updateTaskDraft("targetScopeRef", event.target.value)} /></label>
+            <label>Acceptance contract ID<input required value={taskDraft.acceptanceContractId} onChange={(event) => updateTaskDraft("acceptanceContractId", event.target.value)} /></label>
+            <label>Acceptance version<input required value={taskDraft.acceptanceContractVersion} onChange={(event) => updateTaskDraft("acceptanceContractVersion", event.target.value)} /></label>
+            <label>Acceptance SHA-256<input required value={taskDraft.acceptanceContractSha256} onChange={(event) => updateTaskDraft("acceptanceContractSha256", event.target.value)} /></label>
+            <label>Budget profile ID<input required value={taskDraft.budgetProfileId} onChange={(event) => updateTaskDraft("budgetProfileId", event.target.value)} /></label>
+            <label>Budget version<input required value={taskDraft.budgetProfileVersion} onChange={(event) => updateTaskDraft("budgetProfileVersion", event.target.value)} /></label>
+            <label>Budget SHA-256<input required value={taskDraft.budgetProfileSha256} onChange={(event) => updateTaskDraft("budgetProfileSha256", event.target.value)} /></label>
+          </div>
+          <button type="submit" disabled={taskBusy}>{taskBusy ? "Submitting…" : "Create task"}</button>
+        </form>
+      </section>
 
       {snapshot ? (
         <section className="dashboard" aria-label="Governed projection">

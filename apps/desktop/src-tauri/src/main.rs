@@ -3,10 +3,14 @@
 
 use egopulse_client_operations::{ClientReadError, attach};
 use egopulse_domain_contracts::v01::egopulse::{
-    harness::v1::ApprovalRequestLifecycleKind, localapi::v1::ClientSurface, task::v1::TaskStatus,
+    common::v1::ContractReference,
+    harness::v1::ApprovalRequestLifecycleKind,
+    localapi::v1::{ClientSurface, ExecuteTaskCommandRequest, LocalApiError},
+    task::v1::{CreateTaskCommand, TaskCommand, TaskStatus, task_command, task_command_result},
 };
 use egopulse_local_api::{LocalApiClient, LocalTransport};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,10 +54,52 @@ struct DesktopSnapshot {
     approvals: Vec<DesktopApproval>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopTaskCreateResult {
+    task_id: String,
+    revision: u64,
+    status: String,
+    replayed: bool,
+    await_token_present: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopTaskCreateRequest {
+    instance: String,
+    work_type: String,
+    input_snapshot_id: String,
+    target_scope_ref: String,
+    acceptance_contract_id: String,
+    acceptance_contract_version: String,
+    acceptance_contract_sha256: String,
+    budget_profile_id: String,
+    budget_profile_version: String,
+    budget_profile_sha256: String,
+}
+
 fn transport_name(transport: LocalTransport) -> &'static str {
     match transport {
         LocalTransport::WindowsNamedPipe => "windows-named-pipe",
         LocalTransport::UnixDomainSocket => "unix-domain-socket",
+    }
+}
+
+fn safe_local_api_error(error: &LocalApiError) -> String {
+    format!(
+        "local API rejected the command: code={} retryable={} required_action={}",
+        error.code,
+        error.retryable,
+        error.required_action_code.as_deref().unwrap_or("none")
+    )
+}
+
+fn require_non_empty(value: &str, field: &'static str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!("{field} is required"))
+    } else {
+        Ok(())
     }
 }
 
@@ -141,11 +187,118 @@ async fn dashboard_snapshot(instance: String) -> Result<DesktopSnapshot, String>
     })
 }
 
+#[tauri::command]
+async fn create_task(request: DesktopTaskCreateRequest) -> Result<DesktopTaskCreateResult, String> {
+    let DesktopTaskCreateRequest {
+        instance,
+        work_type,
+        input_snapshot_id,
+        target_scope_ref,
+        acceptance_contract_id,
+        acceptance_contract_version,
+        acceptance_contract_sha256,
+        budget_profile_id,
+        budget_profile_version,
+        budget_profile_sha256,
+    } = request;
+    require_non_empty(&work_type, "work_type")?;
+    require_non_empty(&input_snapshot_id, "input_snapshot_id")?;
+    require_non_empty(&target_scope_ref, "target_scope_ref")?;
+    require_non_empty(&acceptance_contract_id, "acceptance_contract_id")?;
+    require_non_empty(&acceptance_contract_version, "acceptance_contract_version")?;
+    require_non_empty(&acceptance_contract_sha256, "acceptance_contract_sha256")?;
+    require_non_empty(&budget_profile_id, "budget_profile_id")?;
+    require_non_empty(&budget_profile_version, "budget_profile_version")?;
+    require_non_empty(&budget_profile_sha256, "budget_profile_sha256")?;
+
+    let instance = if instance.trim().is_empty() {
+        "default".to_owned()
+    } else {
+        instance
+    };
+    let attachment = attach(
+        &instance,
+        ClientSurface::Desktop,
+        format!("egopulse-desktop-{}", Uuid::now_v7()),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    attachment
+        .require_command(
+            "LocalCommandGatewayService/ExecuteTaskCommand",
+            "create_task",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let correlation_id = Uuid::now_v7().to_string();
+    let mut command = TaskCommand {
+        command: Some(task_command::Command::CreateTask(CreateTaskCommand {
+            meta: Some(egopulse_client_operations::command_metadata(
+                &correlation_id,
+                "egopulse-desktop/task-create",
+            )),
+            work_type,
+            input_snapshot_id,
+            target_scope_ref,
+            acceptance_contract_ref: Some(ContractReference {
+                contract_id: acceptance_contract_id,
+                version: acceptance_contract_version,
+                sha256: acceptance_contract_sha256,
+            }),
+            budget_profile_ref: Some(ContractReference {
+                contract_id: budget_profile_id,
+                version: budget_profile_version,
+                sha256: budget_profile_sha256,
+            }),
+        })),
+    };
+    egopulse_client_operations::set_task_digest(&mut command);
+    let response = attachment
+        .connection
+        .command_gateway_service()
+        .execute_task_command(ExecuteTaskCommandRequest {
+            client: Some(
+                attachment
+                    .metadata(Some(correlation_id))
+                    .map_err(|error| error.to_string())?,
+            ),
+            command: Some(command),
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .into_inner();
+    if let Some(error) = response.gateway_error.as_ref() {
+        return Err(safe_local_api_error(error));
+    }
+    let authority_result = response
+        .authority_result
+        .ok_or_else(|| "task authority result missing".to_owned())?;
+    let replayed = authority_result.replayed;
+    let task = match authority_result.outcome {
+        Some(task_command_result::Outcome::Task(task)) => Ok(task),
+        Some(task_command_result::Outcome::Error(error)) => Err(format!(
+            "task authority rejected the command: code={} detail={}",
+            error.code, error.safe_detail_code
+        )),
+        None => Err("task authority outcome missing".to_owned()),
+    }?;
+    Ok(DesktopTaskCreateResult {
+        task_id: task.task_id,
+        revision: task.revision,
+        status: TaskStatus::try_from(task.status)
+            .map(|value| value.as_str_name().to_owned())
+            .unwrap_or_else(|_| "TASK_STATUS_UNKNOWN".to_owned()),
+        replayed,
+        await_token_present: response.await_token.is_some(),
+    })
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             foundation_status,
-            dashboard_snapshot
+            dashboard_snapshot,
+            create_task
         ])
         .run(tauri::generate_context!())
         .expect("failed to run EgoPulse desktop foundation shell");
