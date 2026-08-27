@@ -60,6 +60,7 @@ pub struct KimiAcpConfig {
     pub executable: PathBuf,
     pub working_directory: PathBuf,
     pub share_directory: Option<PathBuf>,
+    pub environment_overrides: Vec<(String, String)>,
     /// Exact ACP model id expected from `session/new` and `session/resume`.
     /// Production composition must set this so a configured Kimi profile
     /// cannot silently route to a different model.
@@ -74,6 +75,7 @@ impl KimiAcpConfig {
             executable: executable.into(),
             working_directory: working_directory.into(),
             share_directory: None,
+            environment_overrides: Vec::new(),
             required_model: None,
             request_timeout: Duration::from_secs(10),
         }
@@ -82,6 +84,16 @@ impl KimiAcpConfig {
     #[must_use]
     pub fn with_share_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.share_directory = Some(directory.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_environment_override(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.environment_overrides.push((name.into(), value.into()));
         self
     }
 
@@ -749,6 +761,9 @@ async fn spawn_process(config: &KimiAcpConfig) -> Result<SupervisedProcess, Driv
     spec.arguments = vec!["acp".to_owned()];
     if let Some(directory) = &config.share_directory {
         spec = spec.with_environment_override("KIMI_SHARE_DIR", directory.display().to_string());
+    }
+    for (name, value) in &config.environment_overrides {
+        spec = spec.with_environment_override(name.clone(), value.clone());
     }
     SupervisedProcess::spawn(&spec)
         .await

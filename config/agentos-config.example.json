@@ -182,10 +182,80 @@
     "non_overridable_gate_ids": ["G0", "G1", "G2", "G3"],
     "confirmation_ttl_seconds": 300
   },
+  "provider_profiles": [
+    {
+      "profile_id": "gpt-codex-default",
+      "provider": "gpt",
+      "harness": "codex_app_server",
+      "admission": "production",
+      "models": [
+        { "harness_model_id": "gpt-5.6", "provider_model_id": "gpt-5.6-sol" },
+        { "harness_model_id": "gpt-5.6-sol", "provider_model_id": "gpt-5.6-sol" },
+        { "harness_model_id": "gpt-5.6-terra", "provider_model_id": "gpt-5.6-terra" },
+        { "harness_model_id": "gpt-5.6-luna", "provider_model_id": "gpt-5.6-luna" },
+        { "harness_model_id": "gpt-5.3-codex", "provider_model_id": "gpt-5.3-codex" }
+      ],
+      "selected_model": "gpt-5.6-sol",
+      "executable": "codex",
+      "credential": { "mode": "harness_account" }
+    },
+    {
+      "profile_id": "deepseek-dsh-candidate",
+      "provider": "deepseek",
+      "harness": "dsh_acp",
+      "admission": "held",
+      "models": [
+        { "harness_model_id": "deepseek-v4-pro", "provider_model_id": "deepseek-v4-pro" },
+        { "harness_model_id": "deepseek-v4-flash", "provider_model_id": "deepseek-v4-flash" },
+        { "harness_model_id": "deepseek-v4-flash-vision-exp", "provider_model_id": "deepseek-v4-flash-vision-exp" }
+      ],
+      "selected_model": "deepseek-v4-pro",
+      "executable": "dsh",
+      "credential": {
+        "mode": "api_key_environment",
+        "source_env": "DEEPSEEK_API_KEY",
+        "target_env": "DEEPSEEK_API_KEY"
+      },
+      "hold_reason": "DSH ACP native load/resume and independent artifact admission are not yet attested"
+    },
+    {
+      "profile_id": "kimi-cli-candidate",
+      "provider": "kimi",
+      "harness": "kimi_cli_acp",
+      "admission": "held",
+      "models": [
+        { "harness_model_id": "kimi-code/k3", "provider_model_id": "k3" },
+        { "harness_model_id": "kimi-k2.5", "provider_model_id": "kimi-k2.5" }
+      ],
+      "selected_model": "kimi-code/k3",
+      "executable": "kimi",
+      "credential": {
+        "mode": "api_key_environment",
+        "source_env": "KIMI_MODEL_API_KEY",
+        "target_env": "KIMI_MODEL_API_KEY"
+      },
+      "hold_reason": "Current Kimi Code documents a BYOK KIMI_MODEL_* route; the pinned executable still needs authenticated ACP lifecycle and exact-model evidence"
+    },
+    {
+      "profile_id": "glm-opencode-candidate",
+      "provider": "glm",
+      "harness": "opencode_acp",
+      "admission": "held",
+      "models": [
+        { "harness_model_id": "zai/glm-5.3", "provider_model_id": "glm-5.3" },
+        { "harness_model_id": "zai/glm-5.3-flash", "provider_model_id": "glm-5.3-flash" }
+      ],
+      "selected_model": "zai/glm-5.3",
+      "executable": "opencode",
+      "credential": { "mode": "harness_account" },
+      "hold_reason": "OpenCode Z.AI /connect credential storage, GLM-5.3 lifecycle, schema and recovery evidence are pending"
+    }
+  ],
   "codex": {
     "input_bundle_root": "egopulse-data/input-bundles",
     "workspace_root": "egopulse-workspaces",
     "codex_executable": "codex",
+    "default_model": "gpt-5.6-sol",
     "lease_ttl_seconds": 300,
     "workflow": {
       "run_id": "run:replace-me",

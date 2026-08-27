@@ -372,6 +372,10 @@ pub struct NativeHarnessCompositionConfig {
     pub adapter_key: [u8; 32],
     pub input_bundle_root: PathBuf,
     pub workspace_root: PathBuf,
+    /// Reviewed exact model route used when an input bundle does not name a
+    /// model. Multi-provider production profiles must set this so dispatch
+    /// cannot fall through to a Harness-owned default provider.
+    pub default_model: Option<String>,
     pub workflow: SingleHarnessWorkConfig,
     pub lease_ttl_seconds: u64,
     pub return_collector: GovernedReturnCollectorConfig,
@@ -383,6 +387,7 @@ pub struct NativeHarnessCompositionConfig {
 pub struct CodexHarnessCompositionConfig {
     pub native: NativeHarnessCompositionConfig,
     pub codex_executable: PathBuf,
+    pub environment_overrides: Vec<(String, String)>,
 }
 
 /// One provider-specific native Harness unit for the multi-model composition
@@ -486,6 +491,10 @@ impl NativeHarnessCompositionConfig {
             || self.collaboration_key.iter().all(|byte| *byte == 0)
             || self.adapter_key.iter().all(|byte| *byte == 0)
             || self.lease_ttl_seconds == 0
+            || self
+                .default_model
+                .as_ref()
+                .is_some_and(|model| model.trim().is_empty())
         {
             return Err(DaemonCompositionError::InvalidConfiguration(
                 "native Harness composition",
@@ -774,12 +783,17 @@ impl DaemonProviders {
         let CodexHarnessCompositionConfig {
             native,
             codex_executable,
+            environment_overrides,
         } = config;
+        let mut process = CodexAppServerConfig::new(codex_executable);
+        for (name, value) in environment_overrides {
+            process = process.with_environment_override(name, value);
+        }
         self.with_native_harness_driver(
             native,
             artifact_authority,
             verification,
-            CodexAppServerDriver::new(CodexAppServerConfig::new(codex_executable)),
+            CodexAppServerDriver::new(process),
         )
     }
 
@@ -946,7 +960,17 @@ impl DaemonProviders {
                 capability_profile_id,
                 observed_protocol,
                 writer_edge,
-                FileDispatchMaterialResolver::new(config.input_bundle_root, config.workspace_root),
+                match config.default_model {
+                    Some(model) => FileDispatchMaterialResolver::new(
+                        config.input_bundle_root,
+                        config.workspace_root,
+                    )
+                    .with_default_model(model),
+                    None => FileDispatchMaterialResolver::new(
+                        config.input_bundle_root,
+                        config.workspace_root,
+                    ),
+                },
                 driver,
                 SystemAdapterClock,
             );
@@ -1803,6 +1827,7 @@ mod tests {
                 adapter_key: [2; 32],
                 input_bundle_root: PathBuf::from("input"),
                 workspace_root: PathBuf::from("workspace"),
+                default_model: Some("provider/model".to_owned()),
                 workflow: SingleHarnessWorkConfig {
                     run_id: "run".to_owned(),
                     attempt_id: "attempt".to_owned(),
@@ -1850,6 +1875,7 @@ mod tests {
             CodexHarnessCompositionConfig {
                 native: native_config(),
                 codex_executable: PathBuf::new(),
+                environment_overrides: Vec::new(),
             }
             .validate(),
             Err(DaemonCompositionError::InvalidConfiguration(
@@ -1909,6 +1935,7 @@ mod tests {
             adapter_key: [0x32; 32],
             input_bundle_root: root.join(format!("{suffix}-input")),
             workspace_root: root.join(format!("{suffix}-workspace")),
+            default_model: Some(format!("{suffix}/model")),
             workflow: SingleHarnessWorkConfig {
                 run_id: format!("{suffix}-run"),
                 attempt_id: format!("{suffix}-attempt"),

@@ -70,6 +70,76 @@ pub struct LocalUserPolicyBootstrapConfig {
     pub decision_ttl: Duration,
 }
 
+/// Stable provider identity shown by every client surface. This names the
+/// model provider, not the executable used to reach it.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ProviderId {
+    Gpt,
+    DeepSeek,
+    Kimi,
+    Glm,
+}
+
+/// Replaceable open-source Harness selected for one provider profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderHarnessKind {
+    CodexAppServer,
+    DshAcp,
+    KimiCliAcp,
+    OpenCodeAcp,
+}
+
+/// Admission is independent from configuration presence. Candidate and held
+/// profiles are visible to operators but cannot enter production dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderAdmission {
+    Production,
+    Candidate,
+    Held,
+}
+
+/// A secret remains in its source environment variable. Only the variable
+/// names cross this boundary; status and diagnostics never expose the value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderCredentialReference {
+    HarnessAccount,
+    ApiKeyEnvironment {
+        source_env: String,
+        target_env: String,
+    },
+}
+
+/// One model route carries both identities because Harness aliases and vendor
+/// API model identifiers are not necessarily the same string.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderModelBinding {
+    /// Exact identifier accepted by the selected Harness. This is the value
+    /// bound into dispatch and verified in the native receipt.
+    pub harness_model_id: String,
+    /// Vendor-native model identifier. For example, OpenCode may route
+    /// `zai/glm-5.3` while Z.AI names the upstream model `glm-5.3`.
+    pub provider_model_id: String,
+}
+
+/// Redaction-safe provider bootstrap profile shared by daemon startup and the
+/// future CLI/TUI provider status projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderBootstrapProfile {
+    pub profile_id: String,
+    pub provider: ProviderId,
+    pub harness: ProviderHarnessKind,
+    pub admission: ProviderAdmission,
+    /// User/provider supplied model catalog. It is configuration data, not a
+    /// claim that every model is currently reachable.
+    pub models: Vec<ProviderModelBinding>,
+    /// The exact Harness model identifier sent when a work input does not
+    /// override the profile.
+    pub exact_model: String,
+    pub executable: PathBuf,
+    pub credential: ProviderCredentialReference,
+    pub hold_reason: Option<String>,
+}
+
 /// Inputs owned by the local installation, not inferred from a client request.
 pub struct ProductionBootstrapConfig {
     pub task: TaskAuthorityConfig,
@@ -99,6 +169,7 @@ pub struct ProductionBootstrapConfig {
     pub founder_confirmation_ttl: Duration,
     pub os_principal: AllowlistedPrincipal,
     pub authority_binding: AuthorityPrincipalBinding,
+    pub provider_profiles: Vec<ProviderBootstrapProfile>,
     pub codex: CodexHarnessCompositionConfig,
 }
 
@@ -128,6 +199,13 @@ impl ProductionBootstrapConfig {
             }
         })?;
         file.into_typed()
+    }
+
+    /// Returns the redaction-safe Provider catalog. It intentionally does not
+    /// return resolved secret values.
+    #[must_use]
+    pub fn provider_profiles(&self) -> &[ProviderBootstrapProfile] {
+        &self.provider_profiles
     }
 
     /// Opens every Authority exactly once and composes the first production
@@ -275,7 +353,47 @@ struct UserOwnedBootstrapFile {
     memory_candidate_producers: Vec<MemoryCandidateProducerFile>,
     policy: PolicyFile,
     founder: FounderFile,
+    #[serde(default)]
+    provider_profiles: Vec<ProviderProfileFile>,
     codex: CodexFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderProfileFile {
+    profile_id: String,
+    provider: String,
+    harness: String,
+    admission: String,
+    #[serde(default)]
+    exact_model: Option<String>,
+    #[serde(default)]
+    model_ids: Vec<String>,
+    #[serde(default)]
+    models: Vec<ProviderModelFile>,
+    #[serde(default)]
+    selected_model: Option<String>,
+    executable: String,
+    credential: ProviderCredentialFile,
+    #[serde(default)]
+    hold_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderModelFile {
+    harness_model_id: String,
+    provider_model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum ProviderCredentialFile {
+    HarnessAccount,
+    ApiKeyEnvironment {
+        source_env: String,
+        target_env: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -513,6 +631,8 @@ struct CodexFile {
     input_bundle_root: String,
     workspace_root: String,
     codex_executable: String,
+    #[serde(default)]
+    default_model: Option<String>,
     lease_ttl_seconds: u64,
     workflow: WorkflowFile,
 }
@@ -580,6 +700,254 @@ struct ReferenceFile {
     sha256: String,
 }
 
+impl ProviderProfileFile {
+    fn into_typed(self) -> Result<ProviderBootstrapProfile, ProductionBootstrapError> {
+        let profile_id = required(self.profile_id, "provider_profiles.profile_id")?;
+        let provider = match self.provider.as_str() {
+            "gpt" => ProviderId::Gpt,
+            "deepseek" => ProviderId::DeepSeek,
+            "kimi" => ProviderId::Kimi,
+            "glm" => ProviderId::Glm,
+            _ => {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "provider_profiles.provider",
+                ));
+            }
+        };
+        let harness = match self.harness.as_str() {
+            "codex_app_server" => ProviderHarnessKind::CodexAppServer,
+            "dsh_acp" => ProviderHarnessKind::DshAcp,
+            "kimi_cli_acp" => ProviderHarnessKind::KimiCliAcp,
+            "opencode_acp" => ProviderHarnessKind::OpenCodeAcp,
+            _ => {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "provider_profiles.harness",
+                ));
+            }
+        };
+        let admission = match self.admission.as_str() {
+            "production" => ProviderAdmission::Production,
+            "candidate" => ProviderAdmission::Candidate,
+            "held" => ProviderAdmission::Held,
+            _ => {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "provider_profiles.admission",
+                ));
+            }
+        };
+        if !self.model_ids.is_empty() && !self.models.is_empty() {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.models_and_legacy_model_ids",
+            ));
+        }
+        let mut models = if self.models.is_empty() {
+            self.model_ids
+                .into_iter()
+                .map(|model| {
+                    let model = required(model, "provider_profiles.model_ids")?;
+                    Ok(ProviderModelBinding {
+                        harness_model_id: model.clone(),
+                        provider_model_id: model,
+                    })
+                })
+                .collect::<Result<Vec<_>, ProductionBootstrapError>>()?
+        } else {
+            self.models
+                .into_iter()
+                .map(|model| {
+                    Ok(ProviderModelBinding {
+                        harness_model_id: required(
+                            model.harness_model_id,
+                            "provider_profiles.models.harness_model_id",
+                        )?,
+                        provider_model_id: required(
+                            model.provider_model_id,
+                            "provider_profiles.models.provider_model_id",
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ProductionBootstrapError>>()?
+        };
+        if let Some(legacy_model) = self.exact_model.as_ref() {
+            let legacy_model = required(legacy_model.clone(), "provider_profiles.exact_model")?;
+            if models.is_empty() {
+                models.push(ProviderModelBinding {
+                    harness_model_id: legacy_model.clone(),
+                    provider_model_id: legacy_model,
+                });
+            } else if !models
+                .iter()
+                .any(|model| model.harness_model_id == legacy_model)
+            {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "provider_profiles.exact_model_not_in_model_ids",
+                ));
+            }
+        }
+        models.sort_by(|left, right| left.harness_model_id.cmp(&right.harness_model_id));
+        if models.is_empty() {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.models",
+            ));
+        }
+        if models
+            .windows(2)
+            .any(|pair| pair[0].harness_model_id == pair[1].harness_model_id)
+        {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.models.duplicate_harness_model_id",
+            ));
+        }
+        let exact_model = self
+            .selected_model
+            .or_else(|| self.exact_model)
+            .unwrap_or_else(|| models[0].harness_model_id.clone());
+        let exact_model = required(exact_model, "provider_profiles.selected_model")?;
+        if !models
+            .iter()
+            .any(|model| model.harness_model_id == exact_model)
+        {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.selected_model_not_in_model_ids",
+            ));
+        }
+        let executable = PathBuf::from(required(self.executable, "provider_profiles.executable")?);
+        let credential = match self.credential {
+            ProviderCredentialFile::HarnessAccount => ProviderCredentialReference::HarnessAccount,
+            ProviderCredentialFile::ApiKeyEnvironment {
+                source_env,
+                target_env,
+            } => ProviderCredentialReference::ApiKeyEnvironment {
+                source_env: environment_name(
+                    source_env,
+                    "provider_profiles.credential.source_env",
+                )?,
+                target_env: environment_name(
+                    target_env,
+                    "provider_profiles.credential.target_env",
+                )?,
+            },
+        };
+        if matches!(admission, ProviderAdmission::Held)
+            && self
+                .hold_reason
+                .as_deref()
+                .is_none_or(|reason| reason.trim().is_empty())
+        {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.hold_reason",
+            ));
+        }
+        validate_provider_harness(provider, harness)?;
+        Ok(ProviderBootstrapProfile {
+            profile_id,
+            provider,
+            harness,
+            admission,
+            models,
+            exact_model,
+            executable,
+            credential,
+            hold_reason: self.hold_reason,
+        })
+    }
+}
+
+fn validate_provider_harness(
+    provider: ProviderId,
+    harness: ProviderHarnessKind,
+) -> Result<(), ProductionBootstrapError> {
+    let valid = matches!(
+        (provider, harness),
+        (ProviderId::Gpt, ProviderHarnessKind::CodexAppServer)
+            | (ProviderId::DeepSeek, ProviderHarnessKind::DshAcp)
+            | (ProviderId::Kimi, ProviderHarnessKind::KimiCliAcp)
+            | (ProviderId::Glm, ProviderHarnessKind::OpenCodeAcp)
+    );
+    if valid {
+        Ok(())
+    } else {
+        Err(ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.provider_harness_mapping",
+        ))
+    }
+}
+
+fn environment_name(
+    value: String,
+    field: &'static str,
+) -> Result<String, ProductionBootstrapError> {
+    let value = required(value, field)?;
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        Ok(value)
+    } else {
+        Err(ProductionBootstrapError::InvalidConfiguration(field))
+    }
+}
+
+fn resolve_provider_credential(
+    credential: &ProviderCredentialReference,
+) -> Result<Vec<(String, String)>, ProductionBootstrapError> {
+    match credential {
+        ProviderCredentialReference::HarnessAccount => Ok(Vec::new()),
+        ProviderCredentialReference::ApiKeyEnvironment {
+            source_env,
+            target_env,
+        } => {
+            let value = std::env::var(source_env)
+                .map_err(|_| ProductionBootstrapError::MissingSecret(source_env.clone()))?;
+            if value.trim().is_empty() {
+                return Err(ProductionBootstrapError::MissingSecret(source_env.clone()));
+            }
+            Ok(vec![(target_env.clone(), value)])
+        }
+    }
+}
+
+fn validate_provider_profiles(
+    profiles: &[ProviderBootstrapProfile],
+) -> Result<(), ProductionBootstrapError> {
+    let mut profile_ids = BTreeSet::new();
+    let mut production_count = 0;
+    for profile in profiles {
+        if !profile_ids.insert(profile.profile_id.clone()) {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.profile_id",
+            ));
+        }
+        if profile.exact_model.trim().is_empty()
+            || profile.models.is_empty()
+            || !profile
+                .models
+                .iter()
+                .any(|model| model.harness_model_id == profile.exact_model)
+        {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.exact_model",
+            ));
+        }
+        if profile.admission == ProviderAdmission::Production {
+            production_count += 1;
+            if profile.provider != ProviderId::Gpt
+                || profile.harness != ProviderHarnessKind::CodexAppServer
+            {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "provider_profiles.production_admission_pending",
+                ));
+            }
+        }
+    }
+    if production_count > 1 {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.only_one_production_profile_supported",
+        ));
+    }
+    Ok(())
+}
+
 impl UserOwnedBootstrapFile {
     fn into_typed(self) -> Result<ProductionBootstrapConfig, ProductionBootstrapError> {
         if self.schema_version != "egopulse.production-bootstrap/v2" {
@@ -587,6 +955,21 @@ impl UserOwnedBootstrapFile {
                 "schema_version",
             ));
         }
+        let provider_profiles = self
+            .provider_profiles
+            .into_iter()
+            .map(ProviderProfileFile::into_typed)
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_provider_profiles(&provider_profiles)?;
+        let gpt_environment_overrides = provider_profiles
+            .iter()
+            .find(|profile| {
+                profile.provider == ProviderId::Gpt
+                    && profile.admission == ProviderAdmission::Production
+            })
+            .map(|profile| resolve_provider_credential(&profile.credential))
+            .transpose()?
+            .unwrap_or_default();
         let task_store = typed_store(self.stores.task, "task authority")?;
         let memory_store = typed_store(self.stores.memory, "memory authority")?;
         let artifact_store = typed_artifact_store(self.stores.artifact)?;
@@ -780,6 +1163,11 @@ impl UserOwnedBootstrapFile {
                     self.codex.workspace_root,
                     "codex.workspace_root",
                 )?),
+                default_model: self
+                    .codex
+                    .default_model
+                    .map(|model| required(model, "codex.default_model"))
+                    .transpose()?,
                 workflow,
                 lease_ttl_seconds: self.codex.lease_ttl_seconds,
                 return_collector,
@@ -788,7 +1176,18 @@ impl UserOwnedBootstrapFile {
                 self.codex.codex_executable,
                 "codex.codex_executable",
             )?),
+            environment_overrides: gpt_environment_overrides,
         };
+        if let Some(profile) = provider_profiles.iter().find(|profile| {
+            profile.provider == ProviderId::Gpt
+                && profile.admission == ProviderAdmission::Production
+        }) && (codex.native.default_model.as_deref() != Some(profile.exact_model.as_str())
+            || codex.codex_executable != profile.executable)
+        {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_codex_binding",
+            ));
+        }
 
         Ok(ProductionBootstrapConfig {
             task: TaskAuthorityConfig {
@@ -872,6 +1271,7 @@ impl UserOwnedBootstrapFile {
                 grant,
             },
             authority_binding,
+            provider_profiles,
             codex,
         })
     }
@@ -1658,6 +2058,69 @@ mod tests {
             result,
             Err(ProductionBootstrapError::InvalidConfiguration(
                 "memory_candidate_producers"
+            ))
+        ));
+    }
+
+    #[test]
+    fn provider_profile_keeps_catalog_and_exact_selected_model_separate() {
+        let profile = ProviderProfileFile {
+            profile_id: "glm".to_owned(),
+            provider: "glm".to_owned(),
+            harness: "opencode_acp".to_owned(),
+            admission: "held".to_owned(),
+            exact_model: None,
+            model_ids: Vec::new(),
+            models: vec![ProviderModelFile {
+                harness_model_id: "zai/glm-5.3".to_owned(),
+                provider_model_id: "glm-5.3".to_owned(),
+            }],
+            selected_model: Some("zai/glm-5.3".to_owned()),
+            executable: "opencode".to_owned(),
+            credential: ProviderCredentialFile::HarnessAccount,
+            hold_reason: Some("pending authenticated lifecycle".to_owned()),
+        }
+        .into_typed()
+        .expect("model catalog should decode");
+
+        assert_eq!(profile.exact_model, "zai/glm-5.3");
+        assert_eq!(
+            profile.models,
+            [ProviderModelBinding {
+                harness_model_id: "zai/glm-5.3".to_owned(),
+                provider_model_id: "glm-5.3".to_owned(),
+            }]
+        );
+        assert!(matches!(
+            profile.credential,
+            ProviderCredentialReference::HarnessAccount
+        ));
+    }
+
+    #[test]
+    fn provider_profile_rejects_selected_model_outside_catalog() {
+        let result = ProviderProfileFile {
+            profile_id: "deepseek".to_owned(),
+            provider: "deepseek".to_owned(),
+            harness: "dsh_acp".to_owned(),
+            admission: "held".to_owned(),
+            exact_model: None,
+            model_ids: vec!["deepseek-chat".to_owned()],
+            models: Vec::new(),
+            selected_model: Some("deepseek-reasoner".to_owned()),
+            executable: "dsh".to_owned(),
+            credential: ProviderCredentialFile::ApiKeyEnvironment {
+                source_env: "DEEPSEEK_API_KEY".to_owned(),
+                target_env: "DEEPSEEK_API_KEY".to_owned(),
+            },
+            hold_reason: Some("pending".to_owned()),
+        }
+        .into_typed();
+
+        assert!(matches!(
+            result,
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.selected_model_not_in_model_ids"
             ))
         ));
     }

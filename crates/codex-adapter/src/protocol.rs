@@ -44,6 +44,7 @@ pub fn codex_protocol_fingerprint() -> NativeProtocolFingerprint {
 #[derive(Clone, Debug)]
 pub struct CodexAppServerConfig {
     pub executable: PathBuf,
+    pub environment_overrides: Vec<(String, String)>,
     pub request_timeout: Duration,
 }
 
@@ -52,9 +53,30 @@ impl CodexAppServerConfig {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             executable: executable.into(),
+            environment_overrides: Vec::new(),
             request_timeout: Duration::from_secs(30),
         }
     }
+
+    #[must_use]
+    pub fn with_environment_override(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.environment_overrides.push((name.into(), value.into()));
+        self
+    }
+}
+
+fn apply_environment_overrides(
+    mut spec: SupervisedProcessSpec,
+    overrides: &[(String, String)],
+) -> SupervisedProcessSpec {
+    for (name, value) in overrides {
+        spec = spec.with_environment_override(name.clone(), value.clone());
+    }
+    spec
 }
 
 struct ActiveDispatch {
@@ -118,7 +140,10 @@ impl CodexAppServerDriver {
         if self.session.is_some() {
             return Ok(());
         }
-        let mut spec = SupervisedProcessSpec::new(&self.config.executable, working_directory);
+        let mut spec = apply_environment_overrides(
+            SupervisedProcessSpec::new(&self.config.executable, working_directory),
+            &self.config.environment_overrides,
+        );
         spec.arguments = vec!["app-server".to_owned(), "--stdio".to_owned()];
         let mut process = SupervisedProcess::spawn(&spec).await.map_err(|error| {
             driver_error(
@@ -1258,7 +1283,10 @@ async fn probe_version(config: &CodexAppServerConfig) -> Result<String, DriverEr
             format!("{error:?}").as_bytes(),
         )
     })?;
-    let mut spec = SupervisedProcessSpec::new(&config.executable, working_directory);
+    let mut spec = apply_environment_overrides(
+        SupervisedProcessSpec::new(&config.executable, working_directory),
+        &config.environment_overrides,
+    );
     spec.arguments = vec!["--version".to_owned()];
     let mut process = SupervisedProcess::spawn(&spec)
         .await
@@ -1289,7 +1317,10 @@ async fn probe_schema(config: &CodexAppServerConfig) -> Result<String, DriverErr
         .map_err(|error| dependency_error(&format!("CODEX_SCHEMA_TEMP_CREATE_FAILED:{error:?}")))?;
     let working_directory = std::env::current_dir()
         .map_err(|error| dependency_error(&format!("CURRENT_DIRECTORY_UNAVAILABLE:{error:?}")))?;
-    let mut spec = SupervisedProcessSpec::new(&config.executable, working_directory);
+    let mut spec = apply_environment_overrides(
+        SupervisedProcessSpec::new(&config.executable, working_directory),
+        &config.environment_overrides,
+    );
     spec.arguments = vec![
         "app-server".to_owned(),
         "generate-json-schema".to_owned(),
