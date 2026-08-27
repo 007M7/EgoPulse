@@ -37,13 +37,15 @@ use egopulse_domain_contracts::v01::egopulse::{
         harness_observation,
     },
     localapi::v1::{
-        ClientSurface, OpenSessionRequest, local_session_service_client::LocalSessionServiceClient,
+        ClientSurface, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
+        MemoryMutationCommand, OpenSessionRequest,
+        local_session_service_client::LocalSessionServiceClient, memory_mutation_command,
     },
     policy::v1::{
         ConsumeHarnessApprovalDecisionCommand, HarnessApprovalDecisionRecord,
         IssueHarnessApprovalDecisionCommand,
     },
-    task::v1::{TaskEvent, TaskSnapshot, TaskStatus},
+    task::v1::{CreateTaskCommand, TaskCommand, TaskEvent, TaskSnapshot, TaskStatus, task_command},
     verdict::v1::{ConsumeFounderVerdictCommand, IssueFounderVerdictCommand},
 };
 use egopulse_founder_verdict_authority::{
@@ -1072,6 +1074,146 @@ async fn m11_real_cli_and_tui_share_governed_memory_mutations_over_local_ipc() {
     let status = child.wait().await.expect("M-11 fixture child exit");
     assert!(status.success(), "M-11 fixture child failed: {status}");
     fs::remove_dir_all(&root).expect("remove M-11 fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c5_05_real_desktop_surface_uses_shared_kernel_for_read_and_writes() {
+    let root = std::env::temp_dir().join(format!("egopulse-c5-05-desktop-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create C5 Desktop fixture root");
+    let instance = format!("c5-05-desktop-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, "allow").await;
+    wait_for_cli_status(&instance).await;
+
+    let attachment = loop {
+        match egopulse_client_operations::attach(
+            &instance,
+            ClientSurface::Desktop,
+            format!("egopulse-desktop-test-{}", Uuid::now_v7()),
+        )
+        .await
+        {
+            Ok(attachment) => break attachment,
+            Err(error) => {
+                assert!(
+                    !error.to_string().contains("permission"),
+                    "Desktop session must not fail because of surface-specific permissions: {error}"
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    let projection = attachment
+        .read_projection_snapshot()
+        .await
+        .expect("Desktop must read the same authenticated projection as CLI/TUI");
+    assert_eq!(
+        projection.metadata.health, 1,
+        "Desktop projection must be ready"
+    );
+    assert!(
+        projection
+            .tasks
+            .iter()
+            .filter_map(|view| view.task.as_ref())
+            .any(|task| task.task_id == "task-c5-03"),
+        "Desktop projection must include the seeded governed task"
+    );
+
+    let desktop_task_id = format!("c5-05-desktop-task-{}", Uuid::now_v7());
+    let correlation_id = Uuid::now_v7().to_string();
+    let mut task_command = TaskCommand {
+        command: Some(task_command::Command::CreateTask(CreateTaskCommand {
+            meta: Some(egopulse_client_operations::command_metadata(
+                &correlation_id,
+                "egopulse-desktop-test/task-create",
+            )),
+            work_type: desktop_task_id.clone(),
+            input_snapshot_id: "input-c5-05-desktop".to_owned(),
+            target_scope_ref: "scope-c5-05-desktop".to_owned(),
+            acceptance_contract_ref: Some(
+                egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference {
+                    contract_id: "acceptance-c5-05-desktop".to_owned(),
+                    version: "v0.1".to_owned(),
+                    sha256: "44".repeat(32),
+                },
+            ),
+            budget_profile_ref: Some(
+                egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference {
+                    contract_id: "budget-c5-05-desktop".to_owned(),
+                    version: "v0.1".to_owned(),
+                    sha256: "55".repeat(32),
+                },
+            ),
+        })),
+    };
+    egopulse_client_operations::set_task_digest(&mut task_command);
+    let task_metadata = attachment
+        .metadata(Some(correlation_id))
+        .expect("Desktop task metadata");
+    let task_response = attachment
+        .connection
+        .command_gateway_service()
+        .execute_task_command(ExecuteTaskCommandRequest {
+            client: Some(task_metadata),
+            command: Some(task_command),
+        })
+        .await
+        .expect("Desktop TaskCreate RPC")
+        .into_inner();
+    assert!(task_response.gateway_error.is_none());
+    let task_result = task_response
+        .authority_result
+        .expect("Desktop TaskCreate authority result");
+    assert!(matches!(
+        task_result.outcome,
+        Some(
+            egopulse_domain_contracts::v01::egopulse::task::v1::task_command_result::Outcome::Task(
+                _
+            )
+        )
+    ));
+
+    let memory_id = format!("c5-05-desktop-memory-{}", Uuid::now_v7());
+    let memory_metadata = attachment
+        .metadata(Some(Uuid::now_v7().to_string()))
+        .expect("Desktop Memory metadata");
+    let memory_response = attachment
+        .connection
+        .command_gateway_service()
+        .execute_memory_mutation(ExecuteMemoryMutationRequest {
+            client: Some(memory_metadata.clone()),
+            command: Some(MemoryMutationCommand {
+                command: Some(memory_mutation_command::Command::SubmitMemoryCandidate(
+                    egopulse_domain_contracts::v01::egopulse::localapi::v1::SubmitMemoryCandidateCommand {
+                        metadata: Some(memory_metadata),
+                        memory_id: memory_id.clone(),
+                        content: "Desktop shared-kernel memory candidate".to_owned(),
+                        source_ref: "source:c5-05-desktop".to_owned(),
+                        scope_ref: "scope:founder".to_owned(),
+                        idempotency_key: "c5-05-desktop-memory-candidate".to_owned(),
+                    },
+                )),
+            }),
+        })
+        .await
+        .expect("Desktop Memory candidate RPC")
+        .into_inner();
+    assert!(memory_response.gateway_error.is_none());
+    let memory_receipt = memory_response
+        .authority_result
+        .expect("Desktop Memory candidate receipt");
+    assert_eq!(memory_receipt.memory_id, memory_id);
+    assert_eq!(memory_receipt.revision, 1);
+    assert_eq!(memory_receipt.state, "candidate");
+    assert!(memory_receipt.acknowledged_after_durability_barrier);
+
+    drop(child.stdin.take());
+    let status = child.wait().await.expect("C5 Desktop fixture child exit");
+    assert!(
+        status.success(),
+        "C5 Desktop fixture child failed: {status}"
+    );
+    fs::remove_dir_all(&root).expect("remove C5 Desktop fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

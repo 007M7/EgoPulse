@@ -3,8 +3,8 @@
 - Date: 2026-08-27
 - Scope: Tauri 2 + React + TypeScript Desktop surface
 - Status: shared-kernel read slice, TaskCreate, Approval decision, and Memory
-  mutation commands implemented; local build verified, Desktop write E2E
-  remains a separate acceptance item
+  mutation commands implemented; shared-kernel Windows IPC loopback verified,
+  native Tauri GUI automation remains a separate acceptance item
 
 ## Boundary
 
@@ -67,7 +67,15 @@ cargo clippy -p egopulse-desktop --all-targets -- -D warnings  passed
 pnpm --filter @egopulse/desktop build           passed
 ```
 
-The full local CI gate remains the release-level check. A real Desktop command
-round-trip against a running daemon is still required before Stage 5 can be
-closed; this slice does not claim Provider/model selection, signed
-distribution, or final six-stage closure.
+The shared-kernel loopback acceptance also passed:
+
+```text
+cargo test -p egopulse-agentosd --test c5_00_daemon_fixture \
+  c5_05_real_desktop_surface_uses_shared_kernel_for_read_and_writes \
+  -- --exact --nocapture --test-threads=1                 passed
+```
+
+It proves a Desktop-bound Client Kernel can read the real projection and send
+TaskCreate plus Memory candidate commands over Windows named-pipe IPC. It does
+not claim that the native Tauri window has been automated, nor does it claim
+Provider/model selection, signed distribution, or final six-stage closure.

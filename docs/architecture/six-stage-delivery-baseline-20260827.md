@@ -203,8 +203,9 @@ Exit evidence:
 
 Current disposition: **CLI/TUI first-release slice is substantially usable;
 Desktop shared-kernel read surface, TaskCreate, Approval decision and Memory
-mutation commands are implemented and locally verified; Desktop write E2E,
-remaining write workflows and distribution remain pending**. The authoritative slice evidence
+mutation commands are implemented and locally verified, including a real
+Windows IPC loopback; native Tauri GUI automation, remaining workflows and
+distribution remain pending**. The authoritative slice evidence
 is `phase-2-53-desktop-read-surface-20260827.md`.
 
 ### Stage 6 — release, maintenance and governed evolution

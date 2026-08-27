@@ -1045,6 +1045,7 @@ version = "0.1.0"
 dependencies = [
  "egopulse-artifact-authority",
  "egopulse-client-kernel",
+ "egopulse-client-operations",
  "egopulse-codex-adapter",
  "egopulse-cognition-runtime",
  "egopulse-domain-contracts",

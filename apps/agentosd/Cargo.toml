@@ -35,6 +35,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+egopulse-client-operations.workspace = true
 egopulse-dsh-adapter.workspace = true
 
 [[bin]]
