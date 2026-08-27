@@ -63,3 +63,10 @@ hybrid reports, enforce deterministic replay, and emit a fail-closed decision
 when the pinned model artifact or local cache is unavailable. Only after that
 evidence is complete should a semantic Worker be considered for opt-in use.
 
+This gate is implemented in
+`egopulse_memory_rag.admission.evaluate_candidate_gate` and exposed by
+`scripts/evaluate-memory-gate.ps1`. Every decision includes the fixed
+`lexical-overlap-v0` rollback target and explicitly reports that the default
+route did not change. Passing the gate means opt-in eligibility only; it does
+not alter the Rust Authority, the Python Worker protocol, or the default
+retrieval route.

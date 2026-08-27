@@ -78,3 +78,9 @@ but it still lacks native recovery. Kimi and GLM lack authenticated lifecycle
 evidence. No provider admission state is changed by this note; Codex remains
 the only production Harness.
 
+The next probe is now executable through
+`scripts/probe-provider-authenticated-windows.ps1`. It requires explicit
+inference authorization, an isolated provider executable, and an exact model;
+see phase 2-49 for the evidence interpretation. A passing fresh prompt is not
+by itself sufficient to promote approval, Artifact/Verification settlement, or
+restart recovery.

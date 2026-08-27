@@ -25,6 +25,13 @@ from .protocol import (
     handle_request,
     serve,
 )
+from .admission import (
+    EvaluationAdmissionError,
+    EvaluationGateDecision,
+    EvaluationGateLimits,
+    ROLLBACK_ALGORITHM_ID,
+    evaluate_candidate_gate,
+)
 
 __all__ = [
     "MAX_QUERY_BYTES",
@@ -44,4 +51,9 @@ __all__ = [
     "retrieve",
     "handle_request",
     "serve",
+    "EvaluationAdmissionError",
+    "EvaluationGateDecision",
+    "EvaluationGateLimits",
+    "ROLLBACK_ALGORITHM_ID",
+    "evaluate_candidate_gate",
 ]
