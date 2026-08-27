@@ -92,7 +92,10 @@ try {
     }
 
     Invoke-GateStep 'locked-node-manifest' {
-        Invoke-External pnpm install --frozen-lockfile --lockfile-only --ignore-scripts
+        # Local CI must not tear down/recreate node_modules on every run. The
+        # frozen dry-run validates lockfile consistency; a clean checkout can
+        # perform the explicit one-time `pnpm install --frozen-lockfile`.
+        Invoke-External pnpm install --frozen-lockfile --lockfile-only --ignore-scripts --dry-run --reporter=append-only
     }
 
     Invoke-GateStep 'contracts-boundaries-typescript' {
