@@ -5,6 +5,10 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+use egopulse_domain_contracts::memory::{
+    MEMORY_MAX_RECORDS, MEMORY_MAX_ROUTING_FIELD_BYTES, MEMORY_MAX_TOTAL_CONTENT_BYTES,
+};
+
 const SCHEMA_PROFILE_ID: &str = "egopulse/memory-authority-store/v1";
 const SCHEMA: &str = r#"
 CREATE TABLE memory_store_metadata (
@@ -70,6 +74,8 @@ pub(super) enum StoreError {
     StoreGenerationMismatch,
     #[error("memory authority store integrity check failed")]
     IntegrityFailure,
+    #[error("accepted memory snapshot exceeds the retrieval boundary")]
+    SnapshotBounds,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -343,6 +349,38 @@ impl MemoryStore {
         &self,
         scope_ref: &str,
     ) -> Result<Vec<StoredMemory>, StoreError> {
+        let bounds: (i64, i64, i64, i64, i64) = self.connection.query_row(
+            "SELECT count(*),
+                    COALESCE(sum(length(CAST(content AS BLOB))), 0),
+                    COALESCE(max(length(CAST(memory_id AS BLOB))), 0),
+                    COALESCE(max(length(CAST(source_ref AS BLOB))), 0),
+                    COALESCE(max(length(CAST(scope_ref AS BLOB))), 0)
+             FROM memories WHERE scope_ref=?1 AND state='accepted'",
+            [scope_ref],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        if bounds.0 < 0
+            || bounds.0 as usize > MEMORY_MAX_RECORDS
+            || bounds.1 < 0
+            || bounds.1 as usize > MEMORY_MAX_TOTAL_CONTENT_BYTES
+            || bounds.2 < 0
+            || bounds.2 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
+            || bounds.3 < 0
+            || bounds.3 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
+            || bounds.4 < 0
+            || bounds.4 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
+        {
+            return Err(StoreError::SnapshotBounds);
+        }
+
         let mut statement = self.connection.prepare(
             "SELECT memory_id,revision,content,content_sha256,source_ref,scope_ref,state,
                     created_at_seconds,updated_at_seconds

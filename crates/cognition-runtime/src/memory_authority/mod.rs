@@ -9,6 +9,9 @@
 mod store;
 
 use crate::task_authority::SqlCipherKey;
+use egopulse_domain_contracts::memory::{
+    MEMORY_MAX_ROUTING_FIELD_BYTES, MEMORY_MAX_TOTAL_CONTENT_BYTES,
+};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -183,10 +186,10 @@ impl MemoryAuthority {
         ) {
             return Err(MemoryAuthorityFailure::Unauthorized);
         }
-        validate_text(&command.memory_id, "memory_id")?;
-        validate_text(&command.content, "content")?;
-        validate_text(&command.source_ref, "source_ref")?;
-        validate_text(&command.scope_ref, "scope_ref")?;
+        validate_routing_text(&command.memory_id, "memory_id")?;
+        validate_content(&command.content)?;
+        validate_routing_text(&command.source_ref, "source_ref")?;
+        validate_routing_text(&command.scope_ref, "scope_ref")?;
         validate_text(&command.idempotency_key, "idempotency_key")?;
 
         let request_digest = digest_parts(&[
@@ -409,6 +412,22 @@ fn validate_text(value: &str, field: &'static str) -> Result<(), MemoryAuthority
     Ok(())
 }
 
+fn validate_routing_text(value: &str, field: &'static str) -> Result<(), MemoryAuthorityFailure> {
+    validate_text(value, field)?;
+    if value.len() > MEMORY_MAX_ROUTING_FIELD_BYTES {
+        return Err(MemoryAuthorityFailure::InvalidArgument(field));
+    }
+    Ok(())
+}
+
+fn validate_content(value: &str) -> Result<(), MemoryAuthorityFailure> {
+    validate_text(value, "content")?;
+    if value.len() > MEMORY_MAX_TOTAL_CONTENT_BYTES {
+        return Err(MemoryAuthorityFailure::InvalidArgument("content"));
+    }
+    Ok(())
+}
+
 fn validate_governance_command(command: &GovernMemory) -> Result<(), MemoryAuthorityFailure> {
     validate_text(&command.memory_id, "memory_id")?;
     validate_text(&command.evidence_ref, "evidence_ref")?;
@@ -489,6 +508,39 @@ fn to_record(stored: StoredMemory) -> Result<MemoryRecord, MemoryAuthorityFailur
     })
 }
 
+fn receipt(
+    memory_id: &str,
+    revision: u64,
+    state: MemoryState,
+    event_id: String,
+    request_digest_sha256: String,
+) -> MemoryMutationReceipt {
+    MemoryMutationReceipt {
+        memory_id: memory_id.to_owned(),
+        revision,
+        state,
+        event_id,
+        request_digest_sha256,
+        acknowledged_after_durability_barrier: true,
+    }
+}
+
+fn replay_or_conflict(
+    existing: store::IdempotencyRecord,
+    request_digest: &str,
+) -> Result<MemoryMutationReceipt, MemoryAuthorityFailure> {
+    if existing.request_digest_sha256 != request_digest {
+        return Err(MemoryAuthorityFailure::IdempotencyConflict);
+    }
+    Ok(receipt(
+        &existing.memory_id,
+        existing.revision,
+        MemoryState::parse(existing.state)?,
+        existing.event_id,
+        existing.request_digest_sha256,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,37 +576,4 @@ mod tests {
         assert_eq!(record.content, content);
         assert_eq!(record.state, MemoryState::Accepted);
     }
-}
-
-fn receipt(
-    memory_id: &str,
-    revision: u64,
-    state: MemoryState,
-    event_id: String,
-    request_digest_sha256: String,
-) -> MemoryMutationReceipt {
-    MemoryMutationReceipt {
-        memory_id: memory_id.to_owned(),
-        revision,
-        state,
-        event_id,
-        request_digest_sha256,
-        acknowledged_after_durability_barrier: true,
-    }
-}
-
-fn replay_or_conflict(
-    existing: store::IdempotencyRecord,
-    request_digest: &str,
-) -> Result<MemoryMutationReceipt, MemoryAuthorityFailure> {
-    if existing.request_digest_sha256 != request_digest {
-        return Err(MemoryAuthorityFailure::IdempotencyConflict);
-    }
-    Ok(receipt(
-        &existing.memory_id,
-        existing.revision,
-        MemoryState::parse(existing.state)?,
-        existing.event_id,
-        existing.request_digest_sha256,
-    ))
 }

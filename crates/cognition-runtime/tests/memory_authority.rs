@@ -4,6 +4,9 @@ use egopulse_cognition_runtime::memory_authority::{
     SubmitMemoryCandidate,
 };
 use egopulse_cognition_runtime::task_authority::SqlCipherKey;
+use egopulse_domain_contracts::memory::{
+    MEMORY_MAX_ROUTING_FIELD_BYTES, MEMORY_MAX_TOTAL_CONTENT_BYTES,
+};
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -230,5 +233,32 @@ fn unauthenticated_principal_cannot_write() {
     assert_eq!(
         authority.submit_candidate(&candidate("submit-1"), &unauthenticated),
         Err(MemoryAuthorityFailure::Unauthorized)
+    );
+}
+
+#[test]
+fn candidate_rejects_content_and_routing_fields_above_worker_limits() {
+    let root = TempRoot::new("bounds");
+    let mut authority = authority(&root);
+    let agent = principal(MemoryPrincipalKind::Agent, "agent:local");
+
+    let oversized_content = SubmitMemoryCandidate {
+        content: "x".repeat(MEMORY_MAX_TOTAL_CONTENT_BYTES + 1),
+        idempotency_key: "oversized-content".to_owned(),
+        ..candidate("oversized-content")
+    };
+    assert_eq!(
+        authority.submit_candidate(&oversized_content, &agent),
+        Err(MemoryAuthorityFailure::InvalidArgument("content"))
+    );
+
+    let oversized_scope = SubmitMemoryCandidate {
+        scope_ref: "s".repeat(MEMORY_MAX_ROUTING_FIELD_BYTES + 1),
+        idempotency_key: "oversized-scope".to_owned(),
+        ..candidate("oversized-scope")
+    };
+    assert_eq!(
+        authority.submit_candidate(&oversized_scope, &agent),
+        Err(MemoryAuthorityFailure::InvalidArgument("scope_ref"))
     );
 }
