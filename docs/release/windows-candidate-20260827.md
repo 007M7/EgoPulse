@@ -2,7 +2,7 @@
 
 - Date: 2026-08-27
 - Repository: `007M7/EgoPulse`
-- Commit: `a5c4e5befceec6376cd054bd6e303ba02dc34ff9`
+- Commit: `aa0bf0b33244947e97c43ee96bb241a022c1affd`
 - Classification: `unsigned-release-candidate`
 - Included surfaces: CLI and TUI over the shared Rust client kernel
 - Desktop: intentionally excluded from this first candidate
@@ -10,7 +10,7 @@
 ## Local CI evidence
 
 The full local CI gate passed from a clean worktree at the exact candidate
-commit. All eight stages passed in `51,262 ms`:
+commit. All eight stages passed in `52,084 ms`:
 
 1. Git diff integrity
 2. Locked Node manifest
@@ -27,9 +27,9 @@ ignored by Git; the candidate package contains a copy at
 
 ## Package evidence
 
-- Archive: `egopulse-0.1.0-a5c4e5befcee-windows-x86_64-20260827T103641Z.zip`
+- Archive: `egopulse-0.1.0-aa0bf0b33244-windows-x86_64-20260827T104825Z.zip`
 - Archive SHA-256:
-  `9e5918749cf57f88d2d9cce443642910eaca0ab986c6c21194b34432ed2260fa`
+  `031c2c3730dfe88a690909bee63547987fe1a9a67cb0654c007feb9c3669c419`
 - Package verification: passed, `files=55`
 - `egopulse.exe --help`: passed
 - `egopulse-tui.exe --help`: passed

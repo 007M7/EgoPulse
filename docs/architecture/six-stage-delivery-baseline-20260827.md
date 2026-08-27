@@ -235,7 +235,7 @@ Exit evidence:
 - the release can return to the last accepted profile without data loss.
 
 Current disposition: **unsigned CLI/TUI early-access candidate verified at
-commit `a5c4e5b`; isolated installation smoke also passed. Final release and
+commit `aa0bf0b`; isolated installation smoke also passed. Final release and
 governed evolution loop remain pending**.
 The reproducible evidence is recorded in
 `docs/release/windows-candidate-20260827.md`.

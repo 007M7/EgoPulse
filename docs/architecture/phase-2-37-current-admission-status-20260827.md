@@ -32,8 +32,8 @@ The second fact never implies the third without provider-specific evidence.
 | Codex | Real authenticated app-server lifecycle, governed approval/recovery/return path and current candidate package are verified locally | Active production Harness |
 | Kimi | Kimi 1.49.0 ACP declares load/resume and now passes strict capability checks; exact-model binding is implemented; BYOK authentication and dispatch-outcome recovery evidence remain absent | Candidate-only / held |
 | DSH | Fresh-session replay, cancellation and permission path are locally evidenced; native load/resume and independently attested Artifact semantics are absent | Candidate-only / held |
-| Desktop | Tauri 2 + TypeScript shell exists and shares the intended kernel boundary, but Desktop product capability/distribution is explicitly deferred | Phase four, not first release |
-| Windows package | CLI/TUI/agentosd package contains 52 hashed files and passes local package verification; no signing certificate exists | Unsigned early-access candidate |
+| Desktop | Tauri 2 + TypeScript shell now attaches through the shared Client Kernel and reads the authenticated bounded projection; Desktop writes/distribution remain deferred | Phase four read slice verified; write surface pending |
+| Windows package | CLI/TUI/agentosd package contains 55 hashed files and passes local package verification; no signing certificate exists | Unsigned early-access candidate |
 
 ## Current release candidate
 
@@ -41,16 +41,16 @@ The packaged binaries are bound to the exact code commit below. Later commits
 that change documentation only do not change this binary candidate.
 
 ```text
-code commit: d3258b320d9d6ed7682ea5a684b87c4916b69adf
+code commit: aa0bf0b33244947e97c43ee96bb241a022c1affd
 platform: windows-x86_64
 surfaces: cli, tui
-archive: .artifacts/release-candidate/egopulse-0.1.0-d3258b320d9d-windows-x86_64-20260827T005933Z.zip
-archive SHA-256: 03af4b679270d865b940cb267ab96301f3ede80457314bded76efa9b51ebda56
+archive: .artifacts/release-candidate/egopulse-0.1.0-aa0bf0b33244-windows-x86_64-20260827T104825Z.zip
+archive SHA-256: 031c2c3730dfe88a690909bee63547987fe1a9a67cb0654c007feb9c3669c419
 ```
 
 The matching local CI evidence passed all eight stages with a clean worktree.
 The local CD now invokes the package verifier automatically, and that verifier
-passed all 52 file hashes, CLI/TUI/agentosd help probes, the TUI foundation
+passed all 55 file hashes, CLI/TUI/agentosd help probes, the TUI foundation
 probe, the daemon missing-configuration fail-closed probe, Memory Worker setup
 and the production-profile no-`fastembed` check. The packaged setup script now
 uses an isolated package-local `uv` cache by default, so verification does not
@@ -139,7 +139,8 @@ provider is therefore selected by production configuration.
    `phase-2-38-production-memory-producer-composition-20260827.md`.
 4. After the chosen Memory profile and product-facing candidate bridge are
    evidenced, refresh the CLI/TUI early-access package. The current package was
-   refreshed for the fixed producer-proposal boundary; Desktop remains a later
+   refreshed for the fixed producer-proposal boundary; Desktop's shared-kernel
+   read slice is now verified, while its write surface remains a later
    vertical.
 
 ## Non-claims
