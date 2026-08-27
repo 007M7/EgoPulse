@@ -38,8 +38,9 @@ use egopulse_domain_contracts::v01::egopulse::{
     },
     localapi::v1::{
         ClientSurface, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
-        MemoryMutationCommand, OpenSessionRequest,
+        MemoryMutationCommand, OpenSessionRequest, RetrieveMemoryRequest,
         local_session_service_client::LocalSessionServiceClient, memory_mutation_command,
+        retrieve_memory_response,
     },
     policy::v1::{
         ConsumeHarnessApprovalDecisionCommand, HarnessApprovalDecisionRecord,
@@ -1244,6 +1245,46 @@ async fn c5_05_real_desktop_surface_uses_shared_kernel_for_read_and_writes() {
     assert_eq!(
         cancellation_task.status,
         TaskStatus::CancellationPending as i32
+    );
+
+    let retrieval_response = attachment
+        .connection
+        .cognition_service()
+        .retrieve_memory(RetrieveMemoryRequest {
+            client: Some(
+                attachment
+                    .metadata(Some(Uuid::now_v7().to_string()))
+                    .expect("Desktop Memory retrieval metadata"),
+            ),
+            query: "Founder accepted governed Memory".to_owned(),
+            scope_ref: "scope:founder".to_owned(),
+            max_results: 8,
+            min_score: 0.0,
+        })
+        .await
+        .expect("Desktop Memory retrieval RPC")
+        .into_inner();
+    let retrieval_result = match retrieval_response.outcome {
+        Some(retrieve_memory_response::Outcome::Result(result)) => result,
+        Some(retrieve_memory_response::Outcome::Error(error)) => {
+            panic!(
+                "Desktop Memory retrieval was rejected: {}",
+                error.safe_fingerprint
+            )
+        }
+        None => panic!("Desktop Memory retrieval outcome is missing"),
+    };
+    assert_eq!(retrieval_result.algorithm_id, "lexical-overlap-v0");
+    assert!(
+        retrieval_result
+            .candidates
+            .iter()
+            .any(|candidate| candidate.memory_id == "memory-c5-accepted")
+    );
+    assert!(
+        retrieval_result
+            .evidence_ref
+            .starts_with("memory-rag-evidence-sha256:")
     );
 
     let memory_id = format!("c5-05-desktop-memory-{}", Uuid::now_v7());

@@ -8,7 +8,8 @@ use egopulse_domain_contracts::v01::egopulse::{
     localapi::v1::{
         AvailableActionKind, ClientSurface, DecideHarnessApprovalRequest,
         ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest, LocalApiError,
-        MemoryMutationCommand, MemoryMutationReceipt, memory_mutation_command,
+        MemoryMutationCommand, MemoryMutationReceipt, RetrieveMemoryRequest,
+        memory_mutation_command, retrieve_memory_response,
     },
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
@@ -158,6 +159,36 @@ struct DesktopMemoryMutationResult {
     event_id: String,
     request_digest_sha256: String,
     acknowledged_after_durability_barrier: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopMemoryRetrievalCandidate {
+    memory_id: String,
+    source_ref: String,
+    content_sha256: String,
+    score: f64,
+    matched_terms: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopMemoryRetrievalResult {
+    algorithm_id: String,
+    query_sha256: String,
+    snapshot_sha256: String,
+    evidence_ref: String,
+    candidates: Vec<DesktopMemoryRetrievalCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopMemoryRetrievalRequest {
+    instance: String,
+    query: String,
+    scope_ref: String,
+    max_results: u32,
+    min_score: f64,
 }
 
 fn transport_name(transport: LocalTransport) -> &'static str {
@@ -557,6 +588,83 @@ async fn revoke_memory(
 }
 
 #[tauri::command]
+async fn retrieve_memory(
+    request: DesktopMemoryRetrievalRequest,
+) -> Result<DesktopMemoryRetrievalResult, String> {
+    let DesktopMemoryRetrievalRequest {
+        instance,
+        query,
+        scope_ref,
+        max_results,
+        min_score,
+    } = request;
+    require_non_empty(&query, "query")?;
+    require_non_empty(&scope_ref, "scope_ref")?;
+    if max_results == 0 {
+        return Err("max_results must be positive".to_owned());
+    }
+    if !(0.0..=1.0).contains(&min_score) {
+        return Err("min_score must be between 0 and 1".to_owned());
+    }
+    let instance = if instance.trim().is_empty() {
+        "default".to_owned()
+    } else {
+        instance
+    };
+    let attachment = attach(
+        &instance,
+        ClientSurface::Desktop,
+        format!("egopulse-desktop-{}", Uuid::now_v7()),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    attachment
+        .require_rpc("LocalCognitionService/RetrieveMemory")
+        .map_err(|error| error.to_string())?;
+    let response = attachment
+        .connection
+        .cognition_service()
+        .retrieve_memory(RetrieveMemoryRequest {
+            client: Some(
+                attachment
+                    .metadata(None)
+                    .map_err(|error| error.to_string())?,
+            ),
+            query,
+            scope_ref,
+            max_results,
+            min_score,
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .into_inner();
+    let result = match response.outcome {
+        Some(retrieve_memory_response::Outcome::Result(result)) => result,
+        Some(retrieve_memory_response::Outcome::Error(error)) => {
+            return Err(safe_local_api_error(&error));
+        }
+        None => return Err("memory retrieval outcome missing".to_owned()),
+    };
+    Ok(DesktopMemoryRetrievalResult {
+        algorithm_id: result.algorithm_id,
+        query_sha256: result.query_sha256,
+        snapshot_sha256: result.snapshot_sha256,
+        evidence_ref: result.evidence_ref,
+        candidates: result
+            .candidates
+            .into_iter()
+            .map(|candidate| DesktopMemoryRetrievalCandidate {
+                memory_id: candidate.memory_id,
+                source_ref: candidate.source_ref,
+                content_sha256: candidate.content_sha256,
+                score: candidate.score,
+                matched_terms: candidate.matched_terms,
+            })
+            .collect(),
+    })
+}
+
+#[tauri::command]
 async fn create_task(request: DesktopTaskCreateRequest) -> Result<DesktopTaskCreateResult, String> {
     let DesktopTaskCreateRequest {
         instance,
@@ -758,7 +866,8 @@ fn main() {
             decide_approval,
             submit_memory_candidate,
             accept_memory,
-            revoke_memory
+            revoke_memory,
+            retrieve_memory
         ])
         .run(tauri::generate_context!())
         .expect("failed to run EgoPulse desktop foundation shell");

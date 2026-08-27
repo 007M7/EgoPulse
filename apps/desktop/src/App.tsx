@@ -66,6 +66,27 @@ type MemoryReviewDraft = {
   idempotencyKey: string;
 };
 
+type MemoryRetrievalDraft = {
+  query: string;
+  scopeRef: string;
+  maxResults: string;
+  minScore: string;
+};
+
+type MemoryRetrievalResult = {
+  algorithmId: string;
+  querySha256: string;
+  snapshotSha256: string;
+  evidenceRef: string;
+  candidates: Array<{
+    memoryId: string;
+    sourceRef: string;
+    contentSha256: string;
+    score: number;
+    matchedTerms: string[];
+  }>;
+};
+
 const staticHealth: FoundationStatus = {
   product: "EgoPulse",
   architectureVersion: "1.0",
@@ -106,6 +127,13 @@ export function App() {
     evidenceRef: "",
     idempotencyKey: "desktop-memory-review-1",
   });
+  const [memoryRetrieval, setMemoryRetrieval] = useState<MemoryRetrievalDraft>({
+    query: "",
+    scopeRef: "",
+    maxResults: "8",
+    minScore: "0",
+  });
+  const [retrievalResult, setRetrievalResult] = useState<MemoryRetrievalResult | null>(null);
   const [note, setNote] = useState("Desktop is ready; connect to the local governed daemon to load a projection.");
 
   async function inspectNativeBoundary() {
@@ -257,6 +285,29 @@ export function App() {
     }
   }
 
+  async function retrieveMemory(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setMemoryBusy(true);
+    setRetrievalResult(null);
+    try {
+      const result = await invoke<MemoryRetrievalResult>("retrieve_memory", {
+        request: {
+          instance,
+          query: memoryRetrieval.query,
+          scopeRef: memoryRetrieval.scopeRef,
+          maxResults: Number(memoryRetrieval.maxResults),
+          minScore: Number(memoryRetrieval.minScore),
+        },
+      });
+      setRetrievalResult(result);
+      setNote(`Memory retrieval returned ${result.candidates.length} reference(s) from the accepted snapshot.`);
+    } catch (error) {
+      setNote(`Memory retrieval rejected: ${String(error)}`);
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
   return (
     <main className="shell">
       <header className="hero">
@@ -350,6 +401,35 @@ export function App() {
               <button className="secondary" type="button" onClick={() => reviewMemory("revoke_memory")} disabled={memoryBusy}>Revoke</button>
             </div>
           </div>
+        </div>
+        <div className="retrieval-panel">
+          <h3>Retrieve accepted Memory</h3>
+          <p className="muted">Results are reference-only and bound to one accepted snapshot. Candidate or revoked records never enter retrieval.</p>
+          <form onSubmit={retrieveMemory}>
+            <div className="form-grid">
+              <label>Query<input required value={memoryRetrieval.query} onChange={(event) => setMemoryRetrieval((current) => ({ ...current, query: event.target.value }))} /></label>
+              <label>Scope ref<input required value={memoryRetrieval.scopeRef} onChange={(event) => setMemoryRetrieval((current) => ({ ...current, scopeRef: event.target.value }))} /></label>
+              <label>Max results<input required type="number" min="1" max="64" value={memoryRetrieval.maxResults} onChange={(event) => setMemoryRetrieval((current) => ({ ...current, maxResults: event.target.value }))} /></label>
+              <label>Minimum score<input required type="number" min="0" max="1" step="0.01" value={memoryRetrieval.minScore} onChange={(event) => setMemoryRetrieval((current) => ({ ...current, minScore: event.target.value }))} /></label>
+            </div>
+            <button type="submit" disabled={memoryBusy}>{memoryBusy ? "Retrieving..." : "Retrieve memory"}</button>
+          </form>
+          {retrievalResult ? (
+            <div className="retrieval-result" aria-label="Memory retrieval result">
+              <small>Algorithm: {retrievalResult.algorithmId}</small>
+              <small>Snapshot: {retrievalResult.snapshotSha256}</small>
+              <small>Evidence: {retrievalResult.evidenceRef}</small>
+              {retrievalResult.candidates.length === 0 ? <p className="muted">No accepted Memory matched this query.</p> : (
+                <ul>{retrievalResult.candidates.map((candidate) => (
+                  <li key={candidate.memoryId}>
+                    <strong>{candidate.memoryId}</strong>
+                    <span>score {candidate.score}</span>
+                    <small>{candidate.sourceRef}</small>
+                  </li>
+                ))}</ul>
+              )}
+            </div>
+          ) : null}
         </div>
       </section>
 
