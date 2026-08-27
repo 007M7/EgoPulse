@@ -4,6 +4,20 @@
 - Evidence date: 2026-08-27
 - Scope: GPT, DeepSeek, Kimi and GLM
 
+## Local CI evidence
+
+The provider catalog provenance change was verified by the complete local CI
+pipeline against the clean commit `c97110890ea025ab115288ca88171af21f0a6615`:
+
+- status: passed;
+- stages: 8/8;
+- failed stages: 0;
+- duration: 56,296 ms.
+
+This evidence validates repository contracts, boundary checks, generated
+bindings and the workspace test gates. It does not promote the four offline
+catalog snapshots to live Provider admission.
+
 ## Correction
 
 A Provider is not a model. One Provider profile owns a model catalog and one
