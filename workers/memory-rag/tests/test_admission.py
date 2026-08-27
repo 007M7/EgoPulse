@@ -100,3 +100,29 @@ def test_real_project_baseline_can_be_used_as_gate_input() -> None:
 
     assert decision.eligible_for_opt_in is True
     assert decision.dataset_sha256 == baseline.dataset_sha256
+
+
+def test_metric_outside_probability_range_is_rejected_before_admission() -> None:
+    invalid_baseline = report(metric=1.1)
+
+    try:
+        evaluate_candidate_gate(baseline=invalid_baseline, candidate_package=package())
+    except ValueError as error:
+        assert "outside the [0, 1] range" in str(error)
+    else:
+        raise AssertionError("out-of-range evaluation metrics must fail closed")
+
+
+def test_partial_timing_provenance_is_rejected() -> None:
+    candidate = package()
+    candidate["timing_ms"] = {
+        "model_initialization_and_digest": 1.0,
+        "lexical_evaluation": 1.0,
+        "semantic_evaluation": None,
+        "hybrid_evaluation": 1.0,
+    }
+
+    decision = evaluate_candidate_gate(baseline=report(ROLLBACK_ALGORITHM_ID), candidate_package=candidate)
+
+    assert decision.eligible_for_opt_in is False
+    assert "semantic_evaluation_timing_missing_or_invalid" in decision.reasons

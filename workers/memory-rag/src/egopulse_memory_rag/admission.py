@@ -147,22 +147,27 @@ def evaluate_candidate_gate(
         timing = {}
     initialization_ms = _finite_number(timing.get("model_initialization_and_digest"))
     if initialization_ms is None:
-        reasons.append("initialization_timing_missing")
-    elif initialization_ms > active_limits.max_initialization_ms:
-        reasons.append("initialization_budget_exceeded")
-    evaluation_ms = sum(
-        value
-        for value in (
-            _finite_number(timing.get("lexical_evaluation")),
-            _finite_number(timing.get("semantic_evaluation")),
-            _finite_number(timing.get("hybrid_evaluation")),
-        )
-        if value is not None
+        reasons.append("initialization_timing_missing_or_invalid")
+    else:
+        if initialization_ms > active_limits.max_initialization_ms:
+            reasons.append("initialization_budget_exceeded")
+
+    evaluation_timings = {
+        field: _finite_number(timing.get(field))
+        for field in ("lexical_evaluation", "semantic_evaluation", "hybrid_evaluation")
+    }
+    invalid_evaluation_timings = [
+        field for field, value in evaluation_timings.items() if value is None
+    ]
+    reasons.extend(
+        f"{field}_timing_missing_or_invalid" for field in invalid_evaluation_timings
     )
-    if evaluation_ms == 0.0:
-        reasons.append("evaluation_timing_missing")
-    elif evaluation_ms > active_limits.max_evaluation_ms:
-        reasons.append("evaluation_budget_exceeded")
+    if not invalid_evaluation_timings:
+        evaluation_ms = sum(value for value in evaluation_timings.values() if value is not None)
+        if evaluation_ms == 0.0:
+            reasons.append("evaluation_timing_missing")
+        elif evaluation_ms > active_limits.max_evaluation_ms:
+            reasons.append("evaluation_budget_exceeded")
 
     process = candidate_package.get("process")
     if isinstance(process, Mapping):
@@ -210,6 +215,10 @@ def _report_values(report: EvaluationReport | Mapping[str, Any], label: str) -> 
     for metric in _METRICS:
         if _finite_number(values[metric]) is None:
             raise EvaluationAdmissionError(f"{label} metric {metric} is invalid")
+        if not 0.0 <= float(values[metric]) <= 1.0:
+            raise EvaluationAdmissionError(
+                f"{label} metric {metric} is outside the [0, 1] range"
+            )
     return values
 
 
