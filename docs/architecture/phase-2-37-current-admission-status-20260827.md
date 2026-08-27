@@ -39,16 +39,21 @@ The packaged binaries are bound to the exact code commit below. Later commits
 that change documentation only do not change this binary candidate.
 
 ```text
-code commit: 46c54d4fb3626139172a4a8f1b59eeb78ef88813
+code commit: 380444216517b54514f60592b1ff0ec015f1308f
 platform: windows-x86_64
 surfaces: cli, tui
-archive: .artifacts/release-candidate/egopulse-0.1.0-46c54d4fb362-windows-x86_64-20260826T234621Z.zip
-archive SHA-256: 828e9accf80c333d4fc7793efcac9d0763c962e30fdf499dda696361629d9a29
+archive: .artifacts/release-candidate/egopulse-0.1.0-380444216517-windows-x86_64-20260827T000153Z.zip
+archive SHA-256: 98c1a443422201f1eeeb0727983d1c3d1cc82d73b189e299a544311b125da76d
 ```
 
 The matching local CI evidence passed all eight stages with a clean worktree.
 The package verifier passed all 52 file hashes, CLI/TUI/agentosd help probes,
 Memory Worker setup and the production-profile no-`fastembed` check.
+An independent extract-to-short-path audit repeated the same package checks,
+including fresh Memory Worker dependency installation and import. Windows
+package audits must use a short extraction root because a deep temporary path
+can exceed Python's effective Windows path limit and create a false missing-
+module diagnosis.
 
 The current implementation was rechecked on Windows x64 after this status
 record was prepared:

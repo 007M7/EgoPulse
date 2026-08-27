@@ -1,0 +1,75 @@
+# Phase 2-39: Configuration preflight and current candidate refresh
+
+- Status: locally verified; unsigned early-access candidate refreshed
+- Evidence date: 2026-08-27
+- Decision owner: Founder
+
+## Purpose
+
+The first release needs a low-cost way to distinguish malformed local
+configuration from store, IPC or provider-runtime failures. This slice adds a
+non-invasive daemon preflight and binds the refreshed Windows x64 candidate to
+the same commit that contains it.
+
+## Configuration preflight contract
+
+```text
+agentosd --check-config
+        |
+        +-- parse DaemonConfig from environment
+        +-- parse ProductionBootstrapConfig and user-owned JSON
+        +-- validate identities, paths and required read-model/token keys
+        +-- do not open Authority stores
+        +-- do not create business databases
+        +-- do not bind local IPC
+```
+
+Successful validation prints:
+
+```text
+agentosd configuration=passed stores_opened=false
+```
+
+Invalid or missing configuration is refused with exit code `78`. The real
+binary test confirms that the rejected check does not create the configured
+user-owned file or open the stores. This is a diagnostic boundary only; it
+does not accept memory candidates, start a Harness, or modify configuration.
+
+## Evidence
+
+```text
+cargo fmt --all -- --check                         passed
+cargo clippy -p egopulse-agentosd --all-targets -- -D warnings  passed
+cargo test -p egopulse-agentosd --test config_check -- --nocapture  1 passed
+pnpm run ci:local                                  8/8 stages passed
+```
+
+The full local CI evidence is bound to commit
+`380444216517b54514f60592b1ff0ec015f1308f` and started from a clean
+worktree. GitHub Actions is informational while the repository's Actions
+quota is exhausted; Windows local CI/CD remains the operational authority.
+
+## Refreshed candidate
+
+```text
+classification: unsigned-release-candidate
+commit: 380444216517b54514f60592b1ff0ec015f1308f
+archive: .artifacts/release-candidate/egopulse-0.1.0-380444216517-windows-x86_64-20260827T000153Z.zip
+archive SHA-256: 98c1a443422201f1eeeb0727983d1c3d1cc82d73b189e299a544311b125da76d
+package files: 52
+package verifier: passed
+independent short-path extract audit: passed
+```
+
+The candidate contains CLI, TUI and `agentosd`; CLI and TUI continue to share
+the Rust kernel and governed Local API. No signing certificate is available,
+so this remains an unsigned early-access package and must carry the expected
+Windows SmartScreen warning.
+
+## Boundary and remaining decisions
+
+The preflight reduces configuration failure cost but does not change the
+frozen architecture or admission policy. Lexical-overlap-v0 remains the
+production retrieval baseline until Founder explicitly admits semantic RAG.
+Codex remains the sole admitted production Harness; Kimi and DSH remain
+candidate-only pending their independent lifecycle and return-path evidence.
