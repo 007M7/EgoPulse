@@ -121,6 +121,14 @@ fn check_config_json_emits_redacted_provider_catalog_without_secret_values() {
         "DEEPSEEK_API_KEY"
     );
     assert_eq!(report["provider_profiles"][1]["admission"], "held");
+    assert_eq!(
+        report["provider_profiles"][1]["catalog_snapshot"]["source"],
+        "offline-fallback:egopulse-config-example"
+    );
+    assert_eq!(
+        report["provider_profiles"][1]["catalog_snapshot"]["harness_version"],
+        "not-probed"
+    );
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains(&key),
         "authority key must never appear in provider report"

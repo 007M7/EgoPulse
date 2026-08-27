@@ -195,6 +195,12 @@
         { "harness_model_id": "gpt-5.6-luna", "provider_model_id": "gpt-5.6-luna" },
         { "harness_model_id": "gpt-5.3-codex", "provider_model_id": "gpt-5.3-codex" }
       ],
+      "catalog_snapshot": {
+        "source": "offline-fallback:egopulse-config-example",
+        "fetched_at": "2026-08-27T00:00:00Z",
+        "harness_version": "not-probed",
+        "evidence_digest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
       "selected_model": "gpt-5.6-sol",
       "executable": "codex",
       "credential": { "mode": "harness_account" }
@@ -209,6 +215,12 @@
         { "harness_model_id": "deepseek-v4-flash", "provider_model_id": "deepseek-v4-flash" },
         { "harness_model_id": "deepseek-v4-flash-vision-exp", "provider_model_id": "deepseek-v4-flash-vision-exp" }
       ],
+      "catalog_snapshot": {
+        "source": "offline-fallback:egopulse-config-example",
+        "fetched_at": "2026-08-27T00:00:00Z",
+        "harness_version": "not-probed",
+        "evidence_digest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
       "selected_model": "deepseek-v4-pro",
       "executable": "dsh",
       "credential": {
@@ -227,6 +239,12 @@
         { "harness_model_id": "kimi-code/k3", "provider_model_id": "k3" },
         { "harness_model_id": "kimi-k2.5", "provider_model_id": "kimi-k2.5" }
       ],
+      "catalog_snapshot": {
+        "source": "offline-fallback:egopulse-config-example",
+        "fetched_at": "2026-08-27T00:00:00Z",
+        "harness_version": "not-probed",
+        "evidence_digest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
       "selected_model": "kimi-code/k3",
       "executable": "kimi",
       "credential": {
@@ -245,6 +263,12 @@
         { "harness_model_id": "zai/glm-5.3", "provider_model_id": "glm-5.3" },
         { "harness_model_id": "zai/glm-5.3-flash", "provider_model_id": "glm-5.3-flash" }
       ],
+      "catalog_snapshot": {
+        "source": "offline-fallback:egopulse-config-example",
+        "fetched_at": "2026-08-27T00:00:00Z",
+        "harness_version": "not-probed",
+        "evidence_digest_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
       "selected_model": "zai/glm-5.3",
       "executable": "opencode",
       "credential": { "mode": "harness_account" },

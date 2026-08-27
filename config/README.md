@@ -54,6 +54,11 @@ the Harness/provider-owned model catalog, cache a redacted snapshot and let the
 user explicitly change `selected_model`. Refresh never changes the selection
 automatically.
 
+When present, `catalog_snapshot` records the source, collection time, Harness
+version and evidence digest of that catalog. These fields establish
+provenance for configuration review; they do not prove that the executable,
+credentials or model lifecycle is reachable.
+
 `credential.mode=api_key_environment` stores only `source_env` and
 `target_env`. The secret value remains outside JSON. Production profiles
 resolve it only at startup and inject it into the selected child process.

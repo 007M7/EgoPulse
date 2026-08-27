@@ -121,6 +121,17 @@ pub struct ProviderModelBinding {
     pub provider_model_id: String,
 }
 
+/// Provenance for a local model-catalog snapshot. This describes where the
+/// editable catalog came from; it is not evidence that the Harness is
+/// reachable or that any model is production-admitted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderCatalogSnapshot {
+    pub source: String,
+    pub fetched_at: String,
+    pub harness_version: String,
+    pub evidence_digest_sha256: String,
+}
+
 /// Redaction-safe provider bootstrap profile shared by daemon startup and the
 /// future CLI/TUI provider status projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +143,7 @@ pub struct ProviderBootstrapProfile {
     /// User/provider supplied model catalog. It is configuration data, not a
     /// claim that every model is currently reachable.
     pub models: Vec<ProviderModelBinding>,
+    pub catalog_snapshot: Option<ProviderCatalogSnapshot>,
     /// The exact Harness model identifier sent when a work input does not
     /// override the profile.
     pub exact_model: String,
@@ -150,6 +162,8 @@ pub struct ProviderCatalogProfileView {
     pub harness: String,
     pub admission: String,
     pub models: Vec<ProviderCatalogModelView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_snapshot: Option<ProviderCatalogSnapshot>,
     pub selected_model: String,
     pub executable: String,
     pub credential_mode: String,
@@ -187,6 +201,7 @@ impl ProviderBootstrapProfile {
                     provider_model_id: model.provider_model_id.clone(),
                 })
                 .collect(),
+            catalog_snapshot: self.catalog_snapshot.clone(),
             selected_model: self.exact_model.clone(),
             executable: self.executable.display().to_string(),
             credential_mode: credential_mode.to_owned(),
@@ -470,6 +485,8 @@ struct ProviderProfileFile {
     #[serde(default)]
     models: Vec<ProviderModelFile>,
     #[serde(default)]
+    catalog_snapshot: Option<ProviderCatalogSnapshotFile>,
+    #[serde(default)]
     selected_model: Option<String>,
     executable: String,
     credential: ProviderCredentialFile,
@@ -482,6 +499,15 @@ struct ProviderProfileFile {
 struct ProviderModelFile {
     harness_model_id: String,
     provider_model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderCatalogSnapshotFile {
+    source: String,
+    fetched_at: String,
+    harness_version: String,
+    evidence_digest_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -910,6 +936,10 @@ impl ProviderProfileFile {
             ));
         }
         let executable = PathBuf::from(required(self.executable, "provider_profiles.executable")?);
+        let catalog_snapshot = self
+            .catalog_snapshot
+            .map(ProviderCatalogSnapshotFile::into_typed)
+            .transpose()?;
         let credential = match self.credential {
             ProviderCredentialFile::HarnessAccount => ProviderCredentialReference::HarnessAccount,
             ProviderCredentialFile::ApiKeyEnvironment {
@@ -943,10 +973,40 @@ impl ProviderProfileFile {
             harness,
             admission,
             models,
+            catalog_snapshot,
             exact_model,
             executable,
             credential,
             hold_reason: self.hold_reason,
+        })
+    }
+}
+
+impl ProviderCatalogSnapshotFile {
+    fn into_typed(self) -> Result<ProviderCatalogSnapshot, ProductionBootstrapError> {
+        let source = bounded_text(self.source, "provider_profiles.catalog_snapshot.source")?;
+        let fetched_at = bounded_text(
+            self.fetched_at,
+            "provider_profiles.catalog_snapshot.fetched_at",
+        )?;
+        let harness_version = bounded_text(
+            self.harness_version,
+            "provider_profiles.catalog_snapshot.harness_version",
+        )?;
+        let evidence_digest_sha256 = required(
+            self.evidence_digest_sha256,
+            "provider_profiles.catalog_snapshot.evidence_digest_sha256",
+        )?;
+        if !is_lowercase_sha256(&evidence_digest_sha256) {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.catalog_snapshot.evidence_digest_sha256",
+            ));
+        }
+        Ok(ProviderCatalogSnapshot {
+            source,
+            fetched_at,
+            harness_version,
+            evidence_digest_sha256,
         })
     }
 }
@@ -1421,6 +1481,21 @@ fn required(value: String, field: &'static str) -> Result<String, ProductionBoot
         return Err(ProductionBootstrapError::InvalidConfiguration(field));
     }
     Ok(value)
+}
+
+fn bounded_text(value: String, field: &'static str) -> Result<String, ProductionBootstrapError> {
+    let value = required(value, field)?;
+    if value.len() > 4 * 1024 {
+        return Err(ProductionBootstrapError::InvalidConfiguration(field));
+    }
+    Ok(value)
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn set(values: Vec<String>) -> BTreeSet<String> {
@@ -2173,6 +2248,12 @@ mod tests {
                 harness_model_id: "zai/glm-5.3".to_owned(),
                 provider_model_id: "glm-5.3".to_owned(),
             }],
+            catalog_snapshot: Some(ProviderCatalogSnapshotFile {
+                source: "offline-fallback:provider-docs".to_owned(),
+                fetched_at: "2026-08-27T00:00:00Z".to_owned(),
+                harness_version: "opencode-unverified".to_owned(),
+                evidence_digest_sha256: "a".repeat(64),
+            }),
             selected_model: Some("zai/glm-5.3".to_owned()),
             executable: "opencode".to_owned(),
             credential: ProviderCredentialFile::HarnessAccount,
@@ -2193,6 +2274,33 @@ mod tests {
             profile.credential,
             ProviderCredentialReference::HarnessAccount
         ));
+        assert_eq!(
+            profile.catalog_snapshot,
+            Some(ProviderCatalogSnapshot {
+                source: "offline-fallback:provider-docs".to_owned(),
+                fetched_at: "2026-08-27T00:00:00Z".to_owned(),
+                harness_version: "opencode-unverified".to_owned(),
+                evidence_digest_sha256: "a".repeat(64),
+            })
+        );
+    }
+
+    #[test]
+    fn provider_catalog_snapshot_rejects_noncanonical_evidence_digest() {
+        let result = ProviderCatalogSnapshotFile {
+            source: "harness".to_owned(),
+            fetched_at: "2026-08-27T00:00:00Z".to_owned(),
+            harness_version: "1.0.0".to_owned(),
+            evidence_digest_sha256: "A".repeat(64),
+        }
+        .into_typed();
+
+        assert!(matches!(
+            result,
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.catalog_snapshot.evidence_digest_sha256"
+            ))
+        ));
     }
 
     #[test]
@@ -2205,6 +2313,7 @@ mod tests {
             exact_model: None,
             model_ids: vec!["deepseek-chat".to_owned()],
             models: Vec::new(),
+            catalog_snapshot: None,
             selected_model: Some("deepseek-reasoner".to_owned()),
             executable: "dsh".to_owned(),
             credential: ProviderCredentialFile::ApiKeyEnvironment {

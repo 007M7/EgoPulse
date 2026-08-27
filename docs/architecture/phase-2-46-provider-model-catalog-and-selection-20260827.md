@@ -70,8 +70,17 @@ status, logs and serialized configuration.
 
 ## Remaining implementation gates
 
-1. Add a provider-neutral model-catalog read contract and local snapshot with
-   source, fetched-at time, Harness version and evidence digest.
+The configuration baseline now accepts and redacts an optional
+`catalog_snapshot` containing source, fetched-at time, Harness version and a
+canonical evidence digest. The example profiles carry explicit
+`offline-fallback` provenance and `not-probed` Harness versions. This is
+configuration provenance only; it does not imply a live catalog refresh or
+Provider admission.
+
+The remaining gates are:
+
+1. Add a provider-neutral model-catalog read contract and local refresh
+   projection without changing selected-model semantics.
 2. Implement Harness-native refresh in this order: Codex app-server, DSH,
    Kimi Code, OpenCode. Direct Provider API calls are fallback adapters, not a
    second Agent framework.
