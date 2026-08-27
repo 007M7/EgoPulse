@@ -3,15 +3,15 @@
 - Date: 2026-08-27
 - Scope: `agentosd`, CLI, TUI and packaged read-only Memory/RAG Worker
 - Status: locally packaged and verified; unsigned early-access candidate
-- Commit: `b160689bcf316d6c6e4c543596c708da2780a865`
+- Commit: `38d665b68a35d8d736e70beb20495c78bd7d1b3c`
 
 ## Candidate identity
 
 ```text
 platform: windows-x86_64
 surfaces: cli, tui
-archive: .artifacts/release-candidate/egopulse-0.1.0-b160689bcf31-windows-x86_64-20260827T130048Z.zip
-archive SHA-256: 11ade2f586c0a67469041531b49356357befff54392fb1d0000957a92a357d8d
+archive: .artifacts/release-candidate/egopulse-0.1.0-38d665b68a35-windows-x86_64-20260827T142127Z.zip
+archive SHA-256: 0733c03a3613893af24faa12bc78b158a66eb57d76fc8d88913e7c108fa0d936
 classification: unsigned-release-candidate
 ```
 
@@ -27,7 +27,7 @@ release build then produced the three declared binaries, and package creation
 completed with `ci_provider=local`. The package verifier passed:
 
 ```text
-archive_sha256=11ade2f586c0a67469041531b49356357befff54392fb1d0000957a92a357d8d
+archive_sha256=0733c03a3613893af24faa12bc78b158a66eb57d76fc8d88913e7c108fa0d936
 egopulse.exe_help=passed
 egopulse-tui.exe_help=passed
 agentosd.exe_help=passed
@@ -61,6 +61,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 
 
 It was verified with `scripts/verify-windows-package.ps1` using the archive
 hash above and `-VerifyMemoryWorker`.
+
+The current candidate was produced from a clean worktree after the Windows
+GitHub transport hardening change. Local CI evidence for the exact commit is
+`.local-ci/evidence/latest.json`, with all eight steps passed in 67,671 ms.
 
 ## Separate Desktop-inclusive candidate
 

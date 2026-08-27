@@ -237,7 +237,7 @@ Exit evidence:
 - the release can return to the last accepted profile without data loss.
 
 Current disposition: **unsigned CLI/TUI early-access candidate verified at
-commit `b160689`; the current package contains 55 files and passes package,
+commit `38d665b`; the current package contains 55 files and passes package,
 startup and Memory Worker checks. Desktop remains a separately buildable
 shared-kernel candidate and is not included until native GUI acceptance is
 closed. Final release and governed evolution loop remain pending**. See

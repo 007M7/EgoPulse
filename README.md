@@ -24,7 +24,7 @@ Available now:
 - explicit Sego/checker verification composition with owner-backed Artifact reads, supervised execution, immutable verification artifacts and Task write-back;
 - Protobuf/Buf and JSON Schema contract roots;
 - local CI, repository-boundary checks and commit-bound unsigned Windows early-access packaging;
-- a verified Windows x64 CLI/TUI candidate at commit `b160689` (the current package intentionally excludes the not-yet-closed native Desktop distribution path); the exact archive and SHA-256 evidence are recorded in `docs/architecture/phase-2-54-windows-cli-tui-candidate-20260827.md`;
+- a verified Windows x64 CLI/TUI candidate at commit `38d665b` (the current package intentionally excludes the not-yet-closed native Desktop distribution path); the exact archive and SHA-256 evidence are recorded in `docs/architecture/phase-2-54-windows-cli-tui-candidate-20260827.md`;
 - account-authenticated Windows Named Pipe / Unix Domain Socket transport and an ephemeral, policy-resolved local session service.
 
 For the current Windows x64 package path, see [Windows early access](WINDOWS-EARLY-ACCESS.md).
