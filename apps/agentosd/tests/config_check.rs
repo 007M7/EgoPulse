@@ -139,3 +139,35 @@ fn check_config_json_emits_redacted_provider_catalog_without_secret_values() {
         "authority key must never appear in provider report"
     );
 }
+
+#[test]
+fn packaged_example_grants_every_advertised_user_operation() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config/agentos-config.example.json")
+        .canonicalize()
+        .expect("packaged example config exists");
+    let source: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).expect("read packaged example config"))
+            .expect("parse packaged example config");
+    let permissions = source["identity"]["permission_codes"]
+        .as_array()
+        .expect("permission catalog array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<std::collections::HashSet<_>>();
+
+    for permission in [
+        "local.task.cancellation.request",
+        "local.founder-verdict.issue",
+        "local.founder-verdict.revoke",
+        "local.founder-verdict.apply",
+        "local.memory.retrieve",
+        "local.memory.candidate.submit",
+        "local.memory.govern",
+    ] {
+        assert!(
+            permissions.contains(permission),
+            "packaged example must grant advertised operation {permission}"
+        );
+    }
+}
