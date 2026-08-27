@@ -1,6 +1,6 @@
 # Phase 2-39: Configuration preflight and current candidate refresh
 
-- Status: locally verified; unsigned early-access candidate refreshed
+- Status: locally verified; unsigned early-access candidate refreshed and package setup hardened
 - Evidence date: 2026-08-27
 - Decision owner: Founder
 
@@ -46,7 +46,7 @@ pnpm run ci:local                                  8/8 stages passed
 ```
 
 The full local CI evidence is bound to commit
-`4dddcdfb0053c4ee987d6554f51835470a896d89` and started from a clean
+`294fe9bb712d8079503899513f91910f059f5f71` and started from a clean
 worktree. GitHub Actions is informational while the repository's Actions
 quota is exhausted; Windows local CI/CD remains the operational authority.
 
@@ -54,9 +54,9 @@ quota is exhausted; Windows local CI/CD remains the operational authority.
 
 ```text
 classification: unsigned-release-candidate
-commit: 4dddcdfb0053c4ee987d6554f51835470a896d89
-archive: .artifacts/release-candidate/egopulse-0.1.0-4dddcdfb0053-windows-x86_64-20260827T002231Z.zip
-archive SHA-256: 327d3c1db028448540998ce0c845a4ce99ba3b9885d9a2dd78e4b198c5450e54
+commit: 294fe9bb712d8079503899513f91910f059f5f71
+archive: .artifacts/release-candidate/egopulse-0.1.0-294fe9bb712d-windows-x86_64-20260827T003543Z.zip
+archive SHA-256: 006a0af71a912b83b3c5bdce3fe31e5e60015a334e5a7527a7ec1f7ffa41f2ba
 package files: 52
 package verifier: passed
 independent short-path extract audit: passed
@@ -65,7 +65,8 @@ independent short-path extract audit: passed
 The candidate contains CLI, TUI and `agentosd`; CLI and TUI continue to share
 the Rust kernel and governed Local API. No signing certificate is available,
 so this remains an unsigned early-access package and must carry the expected
-Windows SmartScreen warning.
+Windows SmartScreen warning. Its packaged Memory Worker setup uses a writable
+package-local `.cache/uv` directory by default.
 
 ## Boundary and remaining decisions
 
