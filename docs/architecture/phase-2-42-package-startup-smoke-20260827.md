@@ -51,3 +51,21 @@ egopulse-tui_foundation_check=passed
 agentosd_missing_config_fail_closed=passed
 windows_package_verification=passed
 ```
+
+The existing Windows x64 candidate was executed on 2026-08-27 after the
+verifier change, with the following observed result:
+
+```text
+egopulse.exe_help=passed
+egopulse-tui.exe_help=passed
+agentosd.exe_help=passed
+egopulse-tui_foundation_check=passed
+agentosd_missing_config_fail_closed=passed
+memory_worker_setup=passed
+memory_worker_production_profile=passed
+windows_package_verification=passed files=52
+```
+
+The candidate remains bound to code commit
+`294fe9bb712d8079503899513f91910f059f5f71` and archive SHA-256
+`006a0af71a912b83b3c5bdce3fe31e5e60015a334e5a7527a7ec1f7ffa41f2ba`.
