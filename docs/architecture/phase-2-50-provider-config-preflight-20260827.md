@@ -57,6 +57,16 @@ passed
 cargo test -p egopulse-agentosd --lib provider_catalog_refresh -- --nocapture
 3 passed, 0 failed
 
+The complete local CI also passed for the implementation commit
+`11fcad83c8edfce58dd480e0a183186566a3b58d`:
+
+```text
+status=passed
+stages=8/8
+failed=0
+duration_ms=54071
+```
+
 agentosd.exe --check-config --json
 configuration=passed
 stores_opened=false
