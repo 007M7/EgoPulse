@@ -800,7 +800,7 @@ impl ProviderProfileFile {
         }
         let exact_model = self
             .selected_model
-            .or_else(|| self.exact_model)
+            .or(self.exact_model)
             .unwrap_or_else(|| models[0].harness_model_id.clone());
         let exact_model = required(exact_model, "provider_profiles.selected_model")?;
         if !models
