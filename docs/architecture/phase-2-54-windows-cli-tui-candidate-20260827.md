@@ -61,3 +61,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 
 
 It was verified with `scripts/verify-windows-package.ps1` using the archive
 hash above and `-VerifyMemoryWorker`.
+
+## Separate Desktop-inclusive candidate
+
+The same local CI evidence was also used to build a separate Desktop-inclusive
+candidate from documentation commit `03358f8e73136d607e85cb13266a9876184c0f10`:
+
+```text
+archive: .artifacts/release-candidate/egopulse-0.1.0-03358f8e7313-windows-x86_64-20260827T130801Z.zip
+archive SHA-256: 74b19ea55e2dac818bb3ae27f68a2e40a4b8cad7fa577b48b220db90e1defb8d
+surfaces: cli, tui, desktop
+files: 56
+```
+
+The verifier reported `egopulse-desktop.exe_present=passed` and
+`windows_package_verification=passed files=56`, alongside the same CLI/TUI,
+daemon and Memory Worker probes. This candidate proves packaging and binary
+presence only. Native Tauri GUI automation, remaining Desktop workflows and
+first-run GUI acceptance remain open Stage 5 items.
