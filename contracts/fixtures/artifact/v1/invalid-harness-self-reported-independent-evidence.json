@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-invalid-harness-self-reported-independent-evidence",
+  "category": "invalid",
+  "requirementRefs": ["C04-EVID-02", "D02-EVID-INDEPENDENCE"],
+  "principal": { "kind": "HARNESS", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "claimId": "claim_change_01", "claimProposerPrincipalId": "adapter:codex", "sealedArtifactIds": ["art_harness_report_01"] },
+  "command": { "recordEvidence": { "evidenceId": "evidence_self_01", "claimId": "claim_change_01", "relation": "EVIDENCE_RELATION_SUPPORTS", "artifactIds": ["art_harness_report_01"], "producerClass": "EVIDENCE_PRODUCER_CLASS_HARNESS", "independentOfClaimProposer": true, "integrityStatus": "INTEGRITY_STATUS_DIGEST_VERIFIED" } },
+  "expected": { "outcome": "error", "businessWriteCount": 0, "errorCode": "ARTIFACT_ERROR_CODE_INDEPENDENCE_VIOLATION", "verificationPerformed": false }
+}

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-stale-artifact-set-revision",
+  "category": "stale",
+  "requirementRefs": ["C04-CAS-01"],
+  "principal": { "kind": "ARTIFACT_AUTHORITY", "principalId": "agentosd:artifact-authority", "authenticated": true },
+  "startingState": { "artifactSetId": "artifact_set_01", "revision": 2, "status": "ARTIFACT_SET_STATUS_SEALED" },
+  "command": { "submitReturnHandoff": { "returnHandoffId": "return_stale_01", "expectedArtifactSetRevision": 1, "artifactSetId": "artifact_set_01" } },
+  "expected": { "outcome": "error", "businessWriteCount": 0, "errorCode": "ARTIFACT_ERROR_CODE_REVISION_CONFLICT", "returnReceiptCreated": false }
+}

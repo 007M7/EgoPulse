@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "egopulse-contract-import-provenance/v0.1",
+  "featureId": "v01-governed-single-harness-work-loop",
+  "status": "targeted_revision_founder_confirmed_implementation_ssot",
+  "importedOn": "2026-08-23",
+  "source": "founder-agent-os/planning/v01-governed-single-harness-work-loop/contracts-candidate/v0.1",
+  "acceptedCandidateVersion": "0.1.0-draft.11",
+  "acceptedManifestSha256": "adbcba96ee023f886ba6ea8de0083d7f09c2f5db67b60ddd6db6b231932fbe66",
+  "gate3AuthorityRef": "conversation:2026-08-23:founder-v01-gate3-pass",
+  "gate4DriAuthorityRef": "conversation:2026-08-23:founder-v01-gate4-dri-confirmation",
+  "implementationSsotAfterVerifiedImport": true,
+  "currentContractVersion": "0.1.0-draft.16",
+  "targetedRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3",
+  "approvalReadModelRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a",
+  "g408cSupportProfilesAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
+  "memoryRagAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m01-m06-freeze",
+  "memoryRetrievalAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m07-m10-freeze",
+  "targetedRevisionScope": ["C-03", "C-07", "C-08", "G4-07A", "G4-08A", "G4-08C-A1", "G4-08C-A3", "M-01..M-06", "M-07..M-10"],
+  "note": "Draft.11 remains the immutable accepted Gate 3 import. Draft.12 inserted Policy Decision Authority. Draft.13 added the independently rebuildable Harness Approval Read Model. Draft.14 added digest-addressed client and authorization profiles. Draft.15 froze the Memory/RAG Worker contract. Draft.16 froze the governed Memory retrieval daemon, authorization, CLI and TUI boundary."
+}

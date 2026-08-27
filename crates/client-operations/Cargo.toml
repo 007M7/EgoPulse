@@ -1,0 +1,20 @@
+[package]
+name = "egopulse-client-operations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+egopulse-client-kernel.workspace = true
+egopulse-domain-contracts.workspace = true
+egopulse-local-api.workspace = true
+hex.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[lib]
+path = "src/lib.rs"

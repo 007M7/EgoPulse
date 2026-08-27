@@ -1,0 +1,331 @@
+syntax = "proto3";
+
+package egopulse.persistence.v1;
+
+import "egopulse/collaboration/v1/collaboration.proto";
+import "egopulse/common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+enum PersistenceDomain {
+  PERSISTENCE_DOMAIN_UNSPECIFIED = 0;
+  PERSISTENCE_DOMAIN_TASK = 1;
+  PERSISTENCE_DOMAIN_COLLABORATION = 2;
+  PERSISTENCE_DOMAIN_HARNESS_ADAPTER = 3;
+  PERSISTENCE_DOMAIN_ARTIFACT_METADATA = 4;
+  PERSISTENCE_DOMAIN_ARTIFACT_BLOB = 5;
+  PERSISTENCE_DOMAIN_VERIFICATION = 6;
+  PERSISTENCE_DOMAIN_FOUNDER_VERDICT = 7;
+  PERSISTENCE_DOMAIN_LOCAL_READ_MODEL = 8;
+  PERSISTENCE_DOMAIN_RECOVERY_COORDINATOR = 9;
+  PERSISTENCE_DOMAIN_POLICY_DECISION = 10;
+}
+
+enum StoreRole {
+  STORE_ROLE_UNSPECIFIED = 0;
+  STORE_ROLE_AUTHORITY = 1;
+  STORE_ROLE_ADAPTER_DURABLE_EDGE = 2;
+  STORE_ROLE_IMMUTABLE_BLOB = 3;
+  STORE_ROLE_DERIVED_REBUILDABLE = 4;
+  STORE_ROLE_RECOVERY_METADATA = 5;
+}
+
+enum StoreHealth {
+  STORE_HEALTH_UNSPECIFIED = 0;
+  STORE_HEALTH_HEALTHY = 1;
+  STORE_HEALTH_RECOVERING = 2;
+  STORE_HEALTH_READ_ONLY_DEGRADED = 3;
+  STORE_HEALTH_HELD = 4;
+  STORE_HEALTH_INTEGRITY_FAILED = 5;
+  STORE_HEALTH_SCHEMA_INCOMPATIBLE = 6;
+}
+
+enum OutboxDeliveryState {
+  OUTBOX_DELIVERY_STATE_UNSPECIFIED = 0;
+  OUTBOX_DELIVERY_STATE_PENDING = 1;
+  OUTBOX_DELIVERY_STATE_DELIVERED = 2;
+  OUTBOX_DELIVERY_STATE_CONSUMED = 3;
+  OUTBOX_DELIVERY_STATE_HELD = 4;
+}
+
+enum BackupStatus {
+  BACKUP_STATUS_UNSPECIFIED = 0;
+  BACKUP_STATUS_PREPARING = 1;
+  BACKUP_STATUS_COMPLETE = 2;
+  BACKUP_STATUS_INCOMPLETE = 3;
+  BACKUP_STATUS_REJECTED = 4;
+  BACKUP_STATUS_EXPIRED = 5;
+}
+
+enum RecoveryPhase {
+  RECOVERY_PHASE_UNSPECIFIED = 0;
+  RECOVERY_PHASE_FENCED = 1;
+  RECOVERY_PHASE_INSPECTING = 2;
+  RECOVERY_PHASE_DOMAIN_CONTINUITY_VERIFIED = 3;
+  RECOVERY_PHASE_OUTBOX_REPLAY = 4;
+  RECOVERY_PHASE_SIDE_EFFECT_RECONCILIATION = 5;
+  RECOVERY_PHASE_READ_MODEL_REBUILD = 6;
+  RECOVERY_PHASE_READY = 7;
+  RECOVERY_PHASE_READ_ONLY_DEGRADED = 8;
+  RECOVERY_PHASE_HELD = 9;
+}
+
+enum PersistenceErrorCode {
+  PERSISTENCE_ERROR_CODE_UNSPECIFIED = 0;
+  PERSISTENCE_ERROR_CODE_INVALID_ARGUMENT = 1;
+  PERSISTENCE_ERROR_CODE_UNAUTHENTICATED = 2;
+  PERSISTENCE_ERROR_CODE_PERMISSION_DENIED = 3;
+  PERSISTENCE_ERROR_CODE_REVISION_CONFLICT = 4;
+  PERSISTENCE_ERROR_CODE_FENCE_STALE = 5;
+  PERSISTENCE_ERROR_CODE_DURABILITY_NOT_PROVEN = 6;
+  PERSISTENCE_ERROR_CODE_ATOMIC_COMMIT_VIOLATION = 7;
+  PERSISTENCE_ERROR_CODE_INTEGRITY_FAILURE = 8;
+  PERSISTENCE_ERROR_CODE_SCHEMA_INCOMPATIBLE = 9;
+  PERSISTENCE_ERROR_CODE_BACKUP_INCOMPLETE = 10;
+  PERSISTENCE_ERROR_CODE_BLOB_COVERAGE_INCOMPLETE = 11;
+  PERSISTENCE_ERROR_CODE_RESTORE_NOT_VERIFIED = 12;
+  PERSISTENCE_ERROR_CODE_RECOVERY_REQUIRED = 13;
+  PERSISTENCE_ERROR_CODE_MEDIA_LOSS_NOT_COVERED = 14;
+  PERSISTENCE_ERROR_CODE_MIGRATION_NOT_AUTHORIZED = 15;
+}
+
+message DurabilityFence {
+  string store_epoch = 1;
+  uint64 fencing_token = 2;
+  string holder_instance_id = 3;
+}
+
+message DomainWatermark {
+  PersistenceDomain domain = 1;
+  StoreRole store_role = 2;
+  string store_instance_id = 3;
+  string store_epoch = 4;
+  egopulse.common.v1.ContractReference schema_ref = 5;
+  uint64 last_committed_revision = 6;
+  uint64 last_event_sequence = 7;
+  string last_event_id = 8;
+  uint64 pending_outbox_count = 9;
+  uint64 last_consumed_inbox_sequence = 10;
+  google.protobuf.Timestamp durable_at = 11;
+}
+
+message DurableCommitReceipt {
+  PersistenceDomain owner_domain = 1;
+  string aggregate_id = 2;
+  uint64 aggregate_revision = 3;
+  string committed_event_id = 4;
+  repeated string committed_outbox_message_ids = 5;
+  string idempotency_key = 6;
+  string request_digest_sha256 = 7;
+  DurabilityFence durability_fence = 8;
+  google.protobuf.Timestamp committed_at = 9;
+  bool acknowledged_after_durability_barrier = 10;
+}
+
+message OutboxEnvelope {
+  string message_id = 1;
+  PersistenceDomain source_domain = 2;
+  string source_event_id = 3;
+  uint64 source_revision = 4;
+  PersistenceDomain destination_domain = 5;
+  egopulse.common.v1.ContractReference command_contract_ref = 6;
+  string canonical_payload_digest_sha256 = 7;
+  string idempotency_key = 8;
+  string correlation_id = 9;
+  optional string causation_id = 10;
+  OutboxDeliveryState state = 11;
+  google.protobuf.Timestamp created_at = 12;
+}
+
+message InboxConsumptionReceipt {
+  string receipt_id = 1;
+  string source_message_id = 2;
+  PersistenceDomain consumer_domain = 3;
+  string consumer_event_id = 4;
+  uint64 consumer_revision = 5;
+  bool duplicate_delivery = 6;
+  google.protobuf.Timestamp consumed_at = 7;
+}
+
+message DomainStoreInspection {
+  DomainWatermark watermark = 1;
+  StoreHealth health = 2;
+  bool state_event_continuity_verified = 3;
+  bool idempotency_index_verified = 4;
+  bool outbox_inbox_continuity_verified = 5;
+  bool referenced_blob_coverage_verified = 6;
+  optional string safe_reason_code = 7;
+  repeated string evidence_refs = 8;
+}
+
+message DomainSnapshotDescriptor {
+  string snapshot_id = 1;
+  PersistenceDomain domain = 2;
+  StoreRole store_role = 3;
+  DomainWatermark watermark = 4;
+  string snapshot_digest_sha256 = 5;
+  uint64 byte_length = 6;
+  egopulse.common.v1.ContractReference encryption_profile_ref = 7;
+  bool contains_current_state = 8;
+  bool contains_authority_events = 9;
+  bool contains_idempotency_results = 10;
+  bool contains_pending_outbox = 11;
+  bool contains_inbox_receipts = 12;
+  google.protobuf.Timestamp created_at = 13;
+}
+
+message ArtifactBlobCoverage {
+  string coverage_manifest_digest_sha256 = 1;
+  uint64 live_reference_count = 2;
+  uint64 covered_blob_count = 3;
+  uint64 missing_blob_count = 4;
+}
+
+message BackupManifest {
+  string backup_id = 1;
+  string backup_epoch = 2;
+  string quiescence_barrier_id = 3;
+  BackupStatus status = 4;
+  repeated DomainSnapshotDescriptor domain_snapshots = 5;
+  ArtifactBlobCoverage artifact_blob_coverage = 6;
+  egopulse.common.v1.ContractReference retention_policy_ref = 7;
+  string canonical_manifest_digest_sha256 = 8;
+  bool all_required_domains_covered = 9;
+  bool pending_outbox_preserved = 10;
+  google.protobuf.Timestamp created_at = 11;
+}
+
+message RestoreVerificationReport {
+  string report_id = 1;
+  string backup_id = 2;
+  bool verified_in_isolation = 3;
+  bool manifest_digest_verified = 4;
+  bool schema_compatibility_verified = 5;
+  bool domain_revision_continuity_verified = 6;
+  bool event_continuity_verified = 7;
+  bool outbox_inbox_continuity_verified = 8;
+  bool artifact_blob_coverage_verified = 9;
+  bool valid_for_cutover = 10;
+  repeated string evidence_refs = 11;
+  repeated string safe_failure_reason_codes = 12;
+  google.protobuf.Timestamp verified_at = 13;
+}
+
+message RecoveryItem {
+  string item_id = 1;
+  PersistenceDomain domain = 2;
+  optional string aggregate_id = 3;
+  optional string attempt_id = 4;
+  egopulse.collaboration.v1.RecoveryClass recovery_class = 5;
+  string safe_reason_code = 6;
+  repeated string evidence_refs = 7;
+}
+
+message RecoveryPlan {
+  string recovery_plan_id = 1;
+  DurabilityFence coordinator_fence = 2;
+  RecoveryPhase phase = 3;
+  repeated PersistenceDomain required_domains = 4;
+  repeated DomainStoreInspection inspections = 5;
+  repeated RecoveryItem items = 6;
+  bool command_gateway_enabled = 7;
+  bool read_model_rebuild_required = 8;
+  optional string target_projection_epoch = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+message InspectDomainRequest {
+  PersistenceDomain domain = 1;
+  DurabilityFence coordinator_fence = 2;
+}
+
+message InspectDomainResponse {
+  DomainStoreInspection inspection = 1;
+  PersistenceErrorCode error_code = 2;
+}
+
+message PrepareDomainSnapshotRequest {
+  string backup_id = 1;
+  string quiescence_barrier_id = 2;
+  PersistenceDomain domain = 3;
+  DurabilityFence coordinator_fence = 4;
+}
+
+message PrepareDomainSnapshotResponse {
+  DomainSnapshotDescriptor snapshot = 1;
+  PersistenceErrorCode error_code = 2;
+}
+
+message ReplayOutboxRequest {
+  PersistenceDomain source_domain = 1;
+  optional string after_message_id = 2;
+  DurabilityFence coordinator_fence = 3;
+}
+
+message ReplayOutboxResponse {
+  uint64 inspected_count = 1;
+  uint64 delivered_count = 2;
+  uint64 consumed_count = 3;
+  uint64 held_count = 4;
+  PersistenceErrorCode error_code = 5;
+}
+
+message CreateBackupManifestRequest {
+  string backup_id = 1;
+  string quiescence_barrier_id = 2;
+  repeated DomainSnapshotDescriptor snapshots = 3;
+  ArtifactBlobCoverage artifact_blob_coverage = 4;
+  egopulse.common.v1.ContractReference retention_policy_ref = 5;
+}
+
+message CreateBackupManifestResponse {
+  BackupManifest manifest = 1;
+  PersistenceErrorCode error_code = 2;
+}
+
+message VerifyRestoreCandidateRequest {
+  BackupManifest manifest = 1;
+  string isolated_restore_location_ref = 2;
+  repeated egopulse.common.v1.ContractReference supported_schema_refs = 3;
+}
+
+message VerifyRestoreCandidateResponse {
+  RestoreVerificationReport report = 1;
+  PersistenceErrorCode error_code = 2;
+}
+
+message BeginRecoveryRequest {
+  string recovery_plan_id = 1;
+  DurabilityFence coordinator_fence = 2;
+  repeated PersistenceDomain required_domains = 3;
+}
+
+message BeginRecoveryResponse {
+  RecoveryPlan plan = 1;
+  PersistenceErrorCode error_code = 2;
+}
+
+message CommitRestoreCutoverRequest {
+  string recovery_plan_id = 1;
+  string restore_verification_report_id = 2;
+  DurabilityFence coordinator_fence = 3;
+  string authenticated_principal_id = 4;
+}
+
+message CommitRestoreCutoverResponse {
+  RecoveryPlan plan = 1;
+  PersistenceErrorCode error_code = 2;
+}
+
+service PersistenceParticipantService {
+  rpc InspectDomain(InspectDomainRequest) returns (InspectDomainResponse);
+  rpc PrepareDomainSnapshot(PrepareDomainSnapshotRequest) returns (PrepareDomainSnapshotResponse);
+  rpc ReplayOutbox(ReplayOutboxRequest) returns (ReplayOutboxResponse);
+}
+
+service BackupRecoveryCoordinatorService {
+  rpc CreateBackupManifest(CreateBackupManifestRequest) returns (CreateBackupManifestResponse);
+  rpc VerifyRestoreCandidate(VerifyRestoreCandidateRequest) returns (VerifyRestoreCandidateResponse);
+  rpc BeginRecovery(BeginRecoveryRequest) returns (BeginRecoveryResponse);
+  rpc CommitRestoreCutover(CommitRestoreCutoverRequest) returns (CommitRestoreCutoverResponse);
+}

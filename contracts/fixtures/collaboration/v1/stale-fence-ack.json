@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "v01-collaboration-fixture/v0.1",
+  "fixtureId": "collaboration-stale-fence-ack",
+  "category": "stale",
+  "requirementRefs": ["V01-D03", "C02-LEASE-02", "QR-04"],
+  "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingSnapshot": { "run": { "runId": "run-001", "revision": 6, "status": "RUN_STATUS_ACTIVE" }, "step": { "stepId": "step-001", "revision": 4, "status": "STEP_STATUS_ACTIVE" }, "attempt": { "attemptId": "attempt-001", "revision": 4, "status": "ATTEMPT_STATUS_DISPATCHED", "lastHarnessSequence": 0, "lease": { "leaseId": "lease-002", "fencingToken": 8 } } },
+  "resolvedReferences": { "leaseAuthority": { "currentFencingToken": 8, "presentedFencingToken": 7 } },
+  "command": { "recordHarnessAck": { "base": { "meta": { "commandId": "cmd-ack-stale-001", "idempotencyKey": "ack-stale-001", "idempotencyScope": "attempt-001", "requestDigestSha256": "4040404040404040404040404040404040404040404040404040404040404040", "issuedAt": "2026-08-23T03:03:00Z", "correlationId": "corr-run-004" }, "runId": "run-001", "expectedRunRevision": 6, "stepId": "step-001", "expectedStepRevision": 4, "attemptId": "attempt-001", "expectedAttemptRevision": 4 }, "dispatchId": "dispatch-001", "fencingToken": 7, "harnessSequence": 1, "ackReceiptId": "ack-001", "receiptDigestSha256": "4141414141414141414141414141414141414141414141414141414141414141" } },
+  "expected": { "outcome": "error", "errorCode": "COLLABORATION_ERROR_CODE_FENCING_REJECTED", "quarantineObservation": true, "businessWriteCount": 0 }
+}

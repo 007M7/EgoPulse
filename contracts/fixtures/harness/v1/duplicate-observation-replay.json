@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-duplicate-observation-replay", "category": "duplicate",
+  "requirementRefs": ["C03-IDEMPOTENCY-01", "QA-01"], "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "fencingToken": 3, "lastObservationSequence": 4, "processedObservationIds": ["obs-item-001"] },
+  "resolvedReferences": { "original": { "observationId": "obs-item-001", "nativeEventDigestSha256": "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0" } },
+  "command": { "ingestObservation": { "observationId": "obs-item-001", "adapterId": "codex-adapter", "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 3, "observationSequence": 4, "nativeEventDigestSha256": "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0", "capabilityProfileId": "codex-app-server-v2-0.148.0-alpha.15", "criticality": "OBSERVATION_CRITICALITY_INFORMATIONAL", "rawEvidenceRef": "raw-item-001", "lifecycle": { "kind": "LIFECYCLE_KIND_ITEM_COMPLETED", "sideEffectCertainty": "SIDE_EFFECT_CERTAINTY_KNOWN_AND_RECORDED" } } },
+  "expected": { "outcome": "replayed", "replayed": true, "resultingObservationSequence": 4, "businessWriteCount": 0 }
+}

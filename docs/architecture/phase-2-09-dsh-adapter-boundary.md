@@ -1,0 +1,105 @@
+# Phase 2-09 DeepSeek Harness adapter boundary
+
+## Status
+
+Candidate adapter implemented and locally verified. DSH is not yet a
+production Harness and does not receive a `ProbeVerified` capability profile.
+No V-01 contract, generated binding or daemon provider selection changed.
+
+## Implemented surface
+
+`crates/dsh-adapter` provides the same provider-neutral `NativeHarnessDriver`
+shape used by the Codex and Kimi candidates. Its locally verified candidate
+slice includes:
+
+- configurable absolute executable, argument list, working directory and
+  environment overrides;
+- native ACP `initialize` and `session/new` request/response probe;
+- fresh-session native ACP `session/prompt` dispatch;
+- supervised `session/update` parsing and terminal `stopReason` mapping;
+- native ACP `session/cancel` delivery and cancelled terminal observation;
+- opaque native session reference and SHA-256 evidence references;
+- degraded readiness until a native schema digest is attested;
+- native `session/request_permission` is projected as a provider-neutral
+  approval observation, pauses the event stream, and accepts only a governed
+  one-shot allow/deny/cancel response; unknown server requests remain fail
+  closed;
+- reconciliation remains `OutcomeUnknown` because native load/resume is absent.
+
+The adapter does not promote a committed assistant message to a terminal
+Verdict or Artifact. It now exposes the committed text through the
+provider-neutral `TerminalOutputCandidate` handoff, but that handoff is
+one-shot, in-memory candidate data only. It is not persisted as an
+`ArtifactReturnObservation`, and it cannot write Artifact Authority. A
+separate governed collector must still perform blob publication, digest
+verification, Artifact/Claim/Evidence/ArtifactSet construction and
+ReturnHandoff submission before any technical return receipt exists. The
+candidate test `committed_terminal_text_is_exposed_only_as_a_one_shot_candidate`
+proves the extraction and replay boundary.
+
+## Why this integration shape
+
+| Decision | Reason | Cost accepted |
+|---|---|---|
+| Native DSH ACP over the existing supervised process boundary | DSH's own source exposes an automation-only JSON-RPC stdio server; reusing the same process governance keeps executable, timeout and crash semantics uniform across models | DSH's compiled bundle and profile composition become runtime prerequisites; no direct in-process TypeScript reuse is available to the Rust daemon |
+| Candidate-only adapter | Fresh prompt/cancel lifecycle is replay-attested, but approval routing, artifact semantics and native recovery are not | DSH cannot be selected by a reviewed `StepPlan` or write an authority store yet |
+| Opaque native ids and evidence hashes | Prevents provider-specific ids or raw protocol payloads from becoming EgoPulse truth | The adapter needs later correlation logic before it can produce provider-neutral lifecycle facts |
+| Configurable command arguments and environment | Supports the installed DSH launcher and the compiled keyless replay composition without hard-coding a machine path | Deployment configuration must pin the executable, profile, version and environment policy explicitly |
+
+## Evidence
+
+- DSH `0.1.0-rc.5` executable discovery passed.
+- Isolated `DSH_HOME` CLI profile dump/help passed in read-only mode.
+- Compiled ACP composition returned successful `initialize` and `session/new`
+  responses over stdio without a prompt or API call.
+- Keyless `multi-turn` replay returned two committed assistant updates and two
+  `end_turn` prompt responses over the same compiled ACP subprocess.
+- Keyless `cancel` replay accepted native `session/cancel` and returned
+  `stopReason=cancelled` before clean process exit.
+- Rust candidate replay tests passed locally on Windows x64 against the real
+  compiled ACP demo: fresh terminal lifecycle, native cancellation, and a
+  governed native permission round-trip, all without a model/API call.
+- DSH adapter Clippy with warnings denied: passed.
+- The provider-neutral terminal candidate extraction unit test passed; it
+  proves committed ACP text is available to a future collector exactly once,
+  without treating it as an Artifact or terminal completion fact.
+
+The keyless lifecycle evidence is now complete for the ACP operations DSH
+actually implements: multi-turn prompt, committed update, and cancellation.
+The real compiled replay also exercised `session/request_permission`: the Rust
+adapter projected the request into the provider-neutral approval contract,
+accepted an EgoPulse `AllowOnce` decision with an authority receipt, sent the
+native ACP response, and observed the completed terminal lifecycle. The exact
+local command was:
+
+```powershell
+$env:EGOPULSE_DSH_REPLAY_ROOT = 'D:\deepseek harness\deepseek-harness-git'
+$env:EGOPULSE_DSH_NODE = 'C:\Program Files\nodejs\node.exe'
+cargo test -p egopulse-dsh-adapter --test replay -- --ignored --nocapture
+```
+
+Result: `3 passed, 0 failed` (multi-turn, cancellation, governed permission).
+This proves the current DSH fixture's permission round-trip; it does not prove
+that every DSH tool emits or honors identical approval semantics. Artifact
+behavior is still independently unattested, so the candidate remains held.
+The recovery capability probe also confirms that DSH advertises fresh sessions
+only: `session/load` and `session/resume` are rejected. The candidate therefore
+remains held rather than being promoted; a restarted DSH process cannot be
+treated as recovery of a prior native session. Any future adapter would need
+EgoPulse-owned dispatch receipts and an explicit uncertain-outcome policy, not a
+synthetic native recovery claim.
+
+The Rust adapter now exposes the recovery hold as the stable evidence reference
+`dsh-reconcile:native-session-load-resume-unsupported`. Its regression test
+`native_recovery_is_explicitly_outcome_unknown_without_synthetic_resume`
+asserts that the native reconciliation result is exactly `OutcomeUnknown`; it
+cannot be interpreted as a recovered terminal result or as permission to
+automatically redispatch. This makes the unsupported-native-recovery boundary
+executable and reviewable while keeping DSH candidate-only.
+
+The follow-up integration evidence is recorded in
+`phase-2-22-dsh-governed-return-settlement.md`: the real DSH replay output now
+passes through `GovernedHarnessAdapter`, Adapter Edge and the governed return
+collector to create the technical Artifact/Claim/Evidence/Return Handoff
+receipt. This closes the candidate return-settlement path only; native
+restart recovery remains unsupported and DSH remains candidate-only.

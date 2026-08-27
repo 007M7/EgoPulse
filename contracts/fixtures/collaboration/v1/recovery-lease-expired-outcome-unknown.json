@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "v01-collaboration-fixture/v0.1",
+  "fixtureId": "collaboration-recovery-lease-expired-outcome-unknown",
+  "category": "recovery",
+  "requirementRefs": ["V01-D03", "C02-RECOVERY-01", "QR-04"],
+  "principal": { "kind": "RECOVERY_WORKER", "principalId": "recovery-worker:test", "authenticated": true },
+  "startingSnapshot": { "run": { "runId": "run-001", "revision": 7, "status": "RUN_STATUS_ACTIVE" }, "step": { "stepId": "step-001", "revision": 5, "status": "STEP_STATUS_ACTIVE" }, "attempt": { "attemptId": "attempt-001", "revision": 6, "status": "ATTEMPT_STATUS_RUNNING", "lastHarnessSequence": 2, "lease": { "leaseId": "lease-001", "fencingToken": 3, "expiresAt": "2026-08-23T03:00:00Z" } } },
+  "resolvedReferences": { "uncertaintyEvidence": { "evidenceId": "uncertainty-001", "leaseExpired": true, "externalProcessStopped": "not_proven", "sideEffects": "unknown" } },
+  "command": { "markAttemptOutcomeUnknown": { "base": { "meta": { "commandId": "cmd-unknown-001", "idempotencyKey": "unknown-001", "idempotencyScope": "attempt-001", "requestDigestSha256": "7070707070707070707070707070707070707070707070707070707070707070", "issuedAt": "2026-08-23T03:06:00Z", "correlationId": "corr-run-007" }, "runId": "run-001", "expectedRunRevision": 7, "stepId": "step-001", "expectedStepRevision": 5, "attemptId": "attempt-001", "expectedAttemptRevision": 6 }, "reasonCode": "LEASE_EXPIRED_EXTERNAL_OUTCOME_UNKNOWN", "uncertaintyEvidenceId": "uncertainty-001" } },
+  "expected": { "outcome": "committed", "eventKind": "COLLABORATION_EVENT_KIND_OUTCOME_MARKED_UNKNOWN", "resultingRunStatus": "RUN_STATUS_HELD", "resultingRunRevision": 8, "resultingStepStatus": "STEP_STATUS_HELD", "resultingStepRevision": 6, "resultingAttemptStatus": "ATTEMPT_STATUS_OUTCOME_UNKNOWN", "resultingAttemptRevision": 7, "automaticRetryAllowed": false, "businessWriteCount": 1 }
+}

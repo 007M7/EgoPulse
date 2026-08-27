@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "egopulse-vendored-build-tool/v0.1",
+  "package": "protoc-gen-prost",
+  "version": "0.5.0",
+  "archive": "protoc-gen-prost-0.5.0.crate",
+  "sha256": "4018e7b5e3a213d241d79a0ef43a442a17dc23dcdd5b81b0c42b2549197897fd",
+  "verifiedBinary": {
+    "path": "protoc-gen-prost/windows-x86_64/protoc-gen-prost.exe",
+    "target": "x86_64-pc-windows-msvc",
+    "sha256": "cfd828f8d2b98854bd69869353d0f72f2bbcfd28c2ee599060cdb86e31a9c4a3",
+    "rustc": "1.98.0"
+  },
+  "registry": "registry+https://github.com/rust-lang/crates.io-index",
+  "license": "Apache-2.0",
+  "upstreamRepository": "https://github.com/neoeinstein/protoc-gen-prost",
+  "provenance": "The source archive, Cargo installation metadata, and Windows binary were recovered byte-for-byte from the Gate 3 verified toolchain used to generate the accepted V-01 Rust bindings. The initial EgoPulse CI baseline is Windows x86_64; unsupported hosts fail closed.",
+  "gate3Evidence": "contracts/manifest.json#validation.crossLanguageGeneration"
+}

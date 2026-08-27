@@ -1,0 +1,315 @@
+{
+  "dataset_id": "egopulse-project-boundaries-v0",
+  "schema_version": 1,
+  "provenance": "Non-sensitive labels derived from frozen EgoPulse architecture and contract decisions through phase 2-13.",
+  "cases": [
+    {
+      "case_id": "en-memory-truth-owner",
+      "language": "en",
+      "challenge": "authority-vs-reader",
+      "query": "Which component may commit accepted Memory truth?",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["rust-memory-authority"],
+      "records": [
+        {
+          "memory_id": "rust-memory-authority",
+          "content": "The Rust Memory Authority is the single writer for accepted Memory state."
+        },
+        {
+          "memory_id": "python-snapshot-reader",
+          "content": "The Python Worker reads accepted Memory records from a bounded snapshot."
+        },
+        {
+          "memory_id": "local-api-reader",
+          "content": "The Local API exposes governed Memory retrieval to authenticated clients."
+        }
+      ]
+    },
+    {
+      "case_id": "en-worker-write-boundary",
+      "language": "en",
+      "challenge": "paraphrase-with-durable-negative",
+      "query": "Can the cognition worker update a durable fact?",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["worker-read-only"],
+      "records": [
+        {
+          "memory_id": "worker-read-only",
+          "content": "Python ranks supplied records but cannot create, modify, promote or revoke a Memory fact."
+        },
+        {
+          "memory_id": "durable-dispatch",
+          "content": "The Rust control plane records each durable Harness dispatch."
+        },
+        {
+          "memory_id": "agent-candidate",
+          "content": "An agent may propose a candidate Memory record for later governance."
+        }
+      ]
+    },
+    {
+      "case_id": "en-shared-cli-tui-kernel",
+      "language": "en",
+      "challenge": "surface-vs-capability",
+      "query": "Do CLI and TUI have different business capabilities?",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["shared-rust-kernel"],
+      "records": [
+        {
+          "memory_id": "shared-rust-kernel",
+          "content": "CLI and TUI use one shared Rust kernel; only presentation and interaction sequencing differ."
+        },
+        {
+          "memory_id": "desktop-order",
+          "content": "Desktop delivery follows CLI and TUI in the planned product sequence."
+        },
+        {
+          "memory_id": "tui-rendering",
+          "content": "The TUI renders terminal-oriented status and approval views."
+        }
+      ]
+    },
+    {
+      "case_id": "en-candidate-promotion-owner",
+      "language": "en",
+      "challenge": "role-separation",
+      "query": "Who may promote an agent-written Memory candidate?",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["founder-promotion"],
+      "records": [
+        {
+          "memory_id": "founder-promotion",
+          "content": "Only Founder governance may promote a candidate Memory record to accepted state."
+        },
+        {
+          "memory_id": "agent-proposal",
+          "content": "An agent can write a candidate proposal but cannot accept its own Memory."
+        },
+        {
+          "memory_id": "worker-ranking",
+          "content": "The retrieval Worker ranks accepted records without changing their state."
+        }
+      ]
+    },
+    {
+      "case_id": "en-retrieval-snapshot-admission",
+      "language": "en",
+      "challenge": "state-filtering",
+      "query": "What records are allowed to enter retrieval?",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["accepted-scope-snapshot"],
+      "records": [
+        {
+          "memory_id": "accepted-scope-snapshot",
+          "content": "Retrieval receives accepted records from one exact governed scope snapshot."
+        },
+        {
+          "memory_id": "candidate-awaits-review",
+          "content": "Candidate records remain outside retrieval while they await Founder review."
+        },
+        {
+          "memory_id": "revoked-history",
+          "content": "Revoked records remain auditable but cannot participate in retrieval."
+        }
+      ]
+    },
+    {
+      "case_id": "en-vector-index-authority",
+      "language": "en",
+      "challenge": "derived-data-vs-source-of-truth",
+      "query": "Is a vector index the authoritative Memory database?",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["index-derived"],
+      "records": [
+        {
+          "memory_id": "index-derived",
+          "content": "Vector indexes are rebuildable derived data and never the source of Memory truth."
+        },
+        {
+          "memory_id": "sqlcipher-authority",
+          "content": "SQLCipher persistence stores governed Memory Authority facts."
+        },
+        {
+          "memory_id": "embedding-candidate",
+          "content": "An embedding model converts query and record text into candidate vectors."
+        }
+      ]
+    },
+    {
+      "case_id": "en-current-production-harness",
+      "language": "en",
+      "challenge": "current-vs-candidate",
+      "query": "Which Harness is admitted for production execution today?",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["codex-production"],
+      "records": [
+        {
+          "memory_id": "codex-production",
+          "content": "Codex App Server is the only Harness currently admitted to the production composition."
+        },
+        {
+          "memory_id": "kimi-candidate",
+          "content": "Kimi remains a Harness candidate with an authentication-required probe result."
+        },
+        {
+          "memory_id": "dsh-candidate",
+          "content": "DSH remains a Harness candidate without native recovery proof."
+        }
+      ]
+    },
+    {
+      "case_id": "en-second-harness-admission",
+      "language": "en",
+      "challenge": "capability-vs-admission",
+      "query": "What evidence is missing before a second Harness can go live?",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["second-harness-gate"],
+      "records": [
+        {
+          "memory_id": "second-harness-gate",
+          "content": "A second Harness needs authenticated lifecycle and native recovery evidence before production admission."
+        },
+        {
+          "memory_id": "provider-neutral-contract",
+          "content": "The provider-neutral contract can describe more than one Harness capability profile."
+        },
+        {
+          "memory_id": "codex-proof",
+          "content": "The Codex production runner already has a live governed work-loop proof."
+        }
+      ]
+    },
+    {
+      "case_id": "zh-python-memory-write",
+      "language": "zh",
+      "challenge": "cross-language-write-boundary",
+      "query": "Python 认知 Worker 能直接写入或修改 Memory 吗？",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["zh-worker-read-only"],
+      "records": [
+        {
+          "memory_id": "zh-worker-read-only",
+          "content": "Python 认知 Worker 只有只读检索权，不能创建、修改、晋升或撤销 Memory 事实。"
+        },
+        {
+          "memory_id": "zh-worker-ranking",
+          "content": "Python Worker 对 Rust 提供的 Memory 快照执行候选排序。"
+        },
+        {
+          "memory_id": "zh-agent-candidate",
+          "content": "Agent 可以提交候选 Memory，但候选尚未成为被接受的事实。"
+        }
+      ]
+    },
+    {
+      "case_id": "zh-cli-tui-capability",
+      "language": "zh",
+      "challenge": "cross-language-shared-kernel",
+      "query": "CLI 和 TUI 是否拥有不同的内核业务能力？",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["zh-shared-kernel"],
+      "records": [
+        {
+          "memory_id": "zh-shared-kernel",
+          "content": "CLI 与 TUI 共用同一个 Rust 内核，差异只在展示方式和交互顺序。"
+        },
+        {
+          "memory_id": "zh-desktop-order",
+          "content": "Desktop 在一期 CLI、TUI 能力完成后再进入交付。"
+        },
+        {
+          "memory_id": "zh-tui-view",
+          "content": "TUI 使用终端组件展示任务、审批和执行状态。"
+        }
+      ]
+    },
+    {
+      "case_id": "zh-reference-only-output",
+      "language": "zh",
+      "challenge": "content-vs-reference",
+      "query": "检索结果会把原始记忆正文直接返回给调用端吗？",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["zh-reference-output"],
+      "records": [
+        {
+          "memory_id": "zh-reference-output",
+          "content": "检索 Worker 只返回 Memory 引用、来源引用、内容摘要值、分数和证据引用，不返回原始正文。"
+        },
+        {
+          "memory_id": "zh-snapshot-content",
+          "content": "Rust Authority 向受监督 Worker 提供有界的原始 Memory 内容快照。"
+        },
+        {
+          "memory_id": "zh-client-render",
+          "content": "CLI 和 TUI 根据治理后的读取模型展示检索状态。"
+        }
+      ]
+    },
+    {
+      "case_id": "zh-retrieval-job-persistence",
+      "language": "zh",
+      "challenge": "sync-vs-durable-job",
+      "query": "Memory 检索会作为持久化后台任务保存吗？",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["zh-sync-not-persisted"],
+      "records": [
+        {
+          "memory_id": "zh-sync-not-persisted",
+          "content": "当前 Memory 检索在有界超时内同步执行，检索结果不会持久化为后台作业。"
+        },
+        {
+          "memory_id": "zh-durable-dispatch",
+          "content": "Harness 执行派发具有持久化 Attempt 和恢复语义。"
+        },
+        {
+          "memory_id": "zh-worker-process",
+          "content": "Python 检索进程由 Rust 监督并限制帧大小和执行时间。"
+        }
+      ]
+    },
+    {
+      "case_id": "zh-retrieval-authorization-owner",
+      "language": "zh",
+      "challenge": "authorization-vs-input-validation",
+      "query": "谁负责检索调用者权限与 scope 授权校验？",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["zh-daemon-authz"],
+      "records": [
+        {
+          "memory_id": "zh-daemon-authz",
+          "content": "Daemon 根据已认证 principal 和治理策略执行 Memory 检索权限及 scope 授权。"
+        },
+        {
+          "memory_id": "zh-worker-scope-check",
+          "content": "Python Worker 校验输入记录与请求 scope 是否一致，但不拥有调用者授权。"
+        },
+        {
+          "memory_id": "zh-client-session",
+          "content": "CLI 与 TUI 通过本地认证会话调用 Local Cognition Service。"
+        }
+      ]
+    },
+    {
+      "case_id": "zh-embedding-architecture-boundary",
+      "language": "zh",
+      "challenge": "architecture-vs-technology",
+      "query": "Embedding 模型一旦选定就是不可替换的冻结架构吗？",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["zh-embedding-replaceable"],
+      "records": [
+        {
+          "memory_id": "zh-embedding-replaceable",
+          "content": "Embedding 模型、维度和融合参数属于 Worker 边界后的可替换技术选择，不是 Memory 所有权架构。"
+        },
+        {
+          "memory_id": "zh-authority-frozen",
+          "content": "Rust 单写者、治理状态与审计证据属于已经冻结的 Memory 架构边界。"
+        },
+        {
+          "memory_id": "zh-index-candidate",
+          "content": "向量索引只有在质量、延迟和生命周期证据充足后才可能进入技术选型。"
+        }
+      ]
+    }
+  ]
+}

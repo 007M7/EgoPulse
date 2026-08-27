@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1",
+  "fixtureId": "harness-valid-approval-request-withdrawn",
+  "category": "valid",
+  "requirementRefs": ["C03-APPROVAL-LIFECYCLE-01", "G4-08A-REC-01"],
+  "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "attemptStatus": "ATTEMPT_STATUS_RUNNING", "fencingToken": 3, "lastObservationSequence": 3, "approvalRequestId": "approval-001", "requestRevision": 1, "requestLifecycle": "APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN" },
+  "command": { "ingestObservation": { "observationId": "obs-approval-withdrawn-001", "adapterId": "codex-adapter", "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 3, "observationSequence": 4, "nativeEventDigestSha256": "e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4", "capabilityProfileId": "codex-app-server-v2-0.148.0-alpha.15", "criticality": "OBSERVATION_CRITICALITY_SECURITY", "rawEvidenceRef": "raw-approval-withdrawn-001", "approvalRequest": { "approvalRequestId": "approval-001", "kind": "APPROVAL_KIND_COMMAND", "actionDigestSha256": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3", "requestedScopeRef": "scope-command-once-001", "displaySummaryRef": "summary-approval-001", "nativeRoutingRef": "native-approval-route-001", "lifecycle": "APPROVAL_REQUEST_LIFECYCLE_KIND_WITHDRAWN", "requestRevision": 2 } } },
+  "expected": { "outcome": "committed", "resultingObservationSequence": 4, "automaticApproval": false, "actionable": false, "policyDecisionWriteCount": 0, "businessWriteCount": 1 }
+}

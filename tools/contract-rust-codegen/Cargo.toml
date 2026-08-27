@@ -1,0 +1,16 @@
+[package]
+name = "egopulse-contract-rust-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+tonic-prost-build.workspace = true
+
+[[bin]]
+name = "egopulse-contract-rust-codegen"
+path = "src/main.rs"

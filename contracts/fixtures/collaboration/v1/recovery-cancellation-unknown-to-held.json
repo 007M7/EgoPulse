@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "v01-collaboration-fixture/v0.1",
+  "fixtureId": "collaboration-recovery-cancellation-unknown-to-held",
+  "category": "recovery",
+  "requirementRefs": ["V01-D03", "C02-CANCEL-02", "QR-04"],
+  "principal": { "kind": "COLLABORATION_CONTROL", "principalId": "collaboration-control:test", "authenticated": true },
+  "startingSnapshot": { "run": { "runId": "run-001", "revision": 9, "status": "RUN_STATUS_CANCELLATION_PENDING" }, "step": { "stepId": "step-001", "revision": 7, "status": "STEP_STATUS_ACTIVE" }, "attempt": { "attemptId": "attempt-001", "revision": 8, "status": "ATTEMPT_STATUS_CANCELLATION_PENDING", "lease": { "leaseId": "lease-001", "fencingToken": 3 } } },
+  "resolvedReferences": { "cancellationEvidence": { "evidenceId": "cancel-uncertain-001", "deadlineExceeded": true, "externalProcessStopped": "not_proven" } },
+  "command": { "holdAttempt": { "base": { "meta": { "commandId": "cmd-hold-attempt-001", "idempotencyKey": "hold-attempt-001", "idempotencyScope": "attempt-001", "requestDigestSha256": "8080808080808080808080808080808080808080808080808080808080808080", "issuedAt": "2026-08-23T03:07:00Z", "correlationId": "corr-run-008" }, "runId": "run-001", "expectedRunRevision": 9, "stepId": "step-001", "expectedStepRevision": 7, "attemptId": "attempt-001", "expectedAttemptRevision": 8 }, "holdReasonCode": "CANCELLATION_OUTCOME_UNKNOWN", "evidenceId": "cancel-uncertain-001" } },
+  "expected": { "outcome": "committed", "eventKind": "COLLABORATION_EVENT_KIND_ATTEMPT_HELD", "resultingRunStatus": "RUN_STATUS_HELD", "resultingRunRevision": 10, "resultingStepStatus": "STEP_STATUS_HELD", "resultingStepRevision": 8, "resultingAttemptStatus": "ATTEMPT_STATUS_HELD", "resultingAttemptRevision": 9, "automaticRetryAllowed": false, "businessWriteCount": 1 }
+}

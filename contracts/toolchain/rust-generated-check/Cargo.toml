@@ -1,0 +1,14 @@
+[package]
+name = "egopulse-v01-generated-contract-check"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[dependencies]
+prost = "=0.14.4"
+prost-types = "=0.14.4"
+tonic = "=0.14.6"
+tonic-prost = "=0.14.6"
+
+[workspace]

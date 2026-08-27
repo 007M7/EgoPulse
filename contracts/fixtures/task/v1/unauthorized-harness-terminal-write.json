@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "v01-task-fixture/v0.1",
+  "fixtureId": "task-unauthorized-harness-terminal-write",
+  "category": "unauthorized",
+  "requirementRefs": ["AC-03", "AC-06", "QA-04", "QH-02"],
+  "principal": { "kind": "HARNESS", "principalId": "codex-adapter:test", "authenticated": true },
+  "startingSnapshot": { "taskId": "task-001", "revision": 4, "workRevision": 1, "status": "TASK_STATUS_ACTIVE" },
+  "resolvedReferences": { "founderVerdict": null, "agentReportedComplete": true },
+  "command": {
+    "applyFounderVerdict": {
+      "meta": { "commandId": "cmd-forged-complete", "idempotencyKey": "forged-complete", "idempotencyScope": "task-001", "requestDigestSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "issuedAt": "2026-08-23T00:06:00Z", "correlationId": "corr-004" },
+      "taskId": "task-001", "expectedRevision": 4, "workRevision": 1, "founderVerdictId": "forged-by-harness"
+    }
+  },
+  "expected": { "outcome": "error", "errorCode": "TASK_ERROR_CODE_PERMISSION_DENIED", "currentRevision": 4, "businessWriteCount": 0, "auditEventRequired": true }
+}
+

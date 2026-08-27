@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "v01-collaboration-fixture/v0.1",
+  "fixtureId": "collaboration-valid-acquire-lease",
+  "category": "valid",
+  "requirementRefs": ["V01-D03", "C02-LEASE-01", "QR-04"],
+  "principal": { "kind": "COLLABORATION_CONTROL", "principalId": "collaboration-control:test", "authenticated": true },
+  "startingSnapshot": { "run": { "runId": "run-001", "revision": 3, "status": "RUN_STATUS_ACTIVE" }, "step": { "stepId": "step-001", "revision": 2, "status": "STEP_STATUS_ACTIVE" }, "attempt": { "attemptId": "attempt-001", "revision": 1, "status": "ATTEMPT_STATUS_CREATED", "lastHarnessSequence": 0 } },
+  "resolvedReferences": { "leasePolicy": { "valid": true, "authorityClock": "2026-08-23T03:01:30Z" } },
+  "command": { "acquireAttemptLease": { "base": { "meta": { "commandId": "cmd-lease-acquire-001", "idempotencyKey": "lease-acquire-001", "idempotencyScope": "attempt-001", "requestDigestSha256": "2525252525252525252525252525252525252525252525252525252525252525", "issuedAt": "2026-08-23T03:01:30Z", "correlationId": "corr-run-002a" }, "runId": "run-001", "expectedRunRevision": 3, "stepId": "step-001", "expectedStepRevision": 2, "attemptId": "attempt-001", "expectedAttemptRevision": 1 }, "ownerInstanceId": "attempt-supervisor-001", "leasePolicyRef": { "contractId": "v01-attempt-lease", "version": "0.1", "sha256": "2626262626262626262626262626262626262626262626262626262626262626" } } },
+  "expected": { "outcome": "committed", "eventKind": "COLLABORATION_EVENT_KIND_LEASE_ACQUIRED", "resultingRunStatus": "RUN_STATUS_ACTIVE", "resultingRunRevision": 4, "resultingStepStatus": "STEP_STATUS_ACTIVE", "resultingStepRevision": 3, "resultingAttemptStatus": "ATTEMPT_STATUS_LEASED", "resultingAttemptRevision": 2, "leaseIdCreated": true, "resultingFencingToken": 1, "businessWriteCount": 1 }
+}

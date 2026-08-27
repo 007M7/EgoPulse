@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-invalid-protocol-fingerprint-drift", "category": "invalid",
+  "requirementRefs": ["C03-COMPAT-01", "QA-09"], "principal": { "kind": "COLLABORATION_CONTROL", "principalId": "collaboration-control:test", "authenticated": true },
+  "startingState": { "attemptStatus": "ATTEMPT_STATUS_DISPATCH_PENDING", "nativeDispatchCount": 0 },
+  "resolvedReferences": { "capabilityProfile": { "schemaSha256": "b4e8157096dd054c008a4f1b538fb6cd8f1f2cb9577a97a4afef59c2296ed608", "active": true }, "runtime": { "schemaSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" } },
+  "command": { "dispatch": { "meta": { "commandId": "cmd-drift-001", "idempotencyKey": "drift-001", "idempotencyScope": "attempt-001", "requestDigestSha256": "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2", "issuedAt": "2026-08-23T04:10:00Z", "correlationId": "corr-harness-010" }, "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 3, "capabilityProfileRef": { "contractId": "codex-app-server-v2-0.148.0-alpha.15", "version": "1", "sha256": "f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3" } } },
+  "expected": { "outcome": "error", "errorCode": "HARNESS_ERROR_CODE_PROTOCOL_MISMATCH", "nativeDispatchCount": 0, "businessWriteCount": 0 }
+}

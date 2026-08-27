@@ -1,0 +1,37 @@
+{
+  "dataset_id": "egopulse-memory-retrieval-smoke-v0",
+  "cases": [
+    {
+      "case_id": "exact-authority-boundary",
+      "query": "Rust authority boundary",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["memory-authority"],
+      "records": [
+        {
+          "memory_id": "memory-authority",
+          "content": "Rust owns the deterministic authority boundary."
+        },
+        {
+          "memory_id": "python-worker",
+          "content": "Python performs replaceable retrieval algorithms."
+        }
+      ]
+    },
+    {
+      "case_id": "semantic-paraphrase-gap",
+      "query": "Who controls durable facts?",
+      "scope_ref": "scope:founder",
+      "relevant_memory_ids": ["accepted-state-owner"],
+      "records": [
+        {
+          "memory_id": "accepted-state-owner",
+          "content": "Rust owns accepted Memory state."
+        },
+        {
+          "memory_id": "dispatch-durability",
+          "content": "The control plane records a durable dispatch."
+        }
+      ]
+    }
+  ]
+}

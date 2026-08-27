@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-recovery-return-receipt-replay",
+  "category": "recovery",
+  "requirementRefs": ["C04-REC-02", "C04-IDEMP-01", "D03-RPO-0"],
+  "principal": { "kind": "ARTIFACT_AUTHORITY", "principalId": "agentosd:artifact-recovery", "authenticated": true },
+  "startingState": { "returnHandoffId": "return_02", "returnCommitted": true, "receiptCommitted": true, "receiptDeliveryObserved": false, "outboxPending": true, "crashPoint": "after_transaction_before_consumer_ack" },
+  "command": { "submitReturnHandoff": { "commandId": "cmd_return_02", "requestDigest": "6666666666666666666666666666666666666666666666666666666666666666", "returnHandoffId": "return_02", "expectedArtifactSetRevision": 2, "artifactSetId": "artifact_set_02", "recoveryMode": "replay_outbox" } },
+  "expected": { "outcome": "replayed", "businessWriteCount": 0, "replayed": true, "sameReturnHandoffId": "return_02", "sameReceiptId": "receipt_02", "outboxRedelivered": true, "verificationPerformed": false, "taskCompletionDecided": false }
+}

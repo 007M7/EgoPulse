@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-recovery-orphan-staged-blob",
+  "category": "recovery",
+  "requirementRefs": ["C04-REC-01", "D03-RPO-0"],
+  "principal": { "kind": "ARTIFACT_AUTHORITY", "principalId": "agentosd:artifact-recovery", "authenticated": true },
+  "startingState": { "blobPresent": true, "blobDigest": "5555555555555555555555555555555555555555555555555555555555555555", "artifactMetadataPresent": false, "outboxCommitted": false, "crashPoint": "after_blob_write_before_metadata_commit" },
+  "command": { "stageArtifact": { "artifactId": "art_recovery_01", "content": { "algorithm": "HASH_ALGORITHM_SHA256", "digest": "5555555555555555555555555555555555555555555555555555555555555555", "byteLength": 321 }, "recoveryMode": "reconcile_orphan" } },
+  "expected": { "outcome": "committed", "businessWriteCount": 1, "resultingStatus": "ARTIFACT_STATUS_STAGED", "resultingRevision": 1, "blobReused": true, "duplicateBlobWritten": false, "sealed": false }
+}

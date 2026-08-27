@@ -11,8 +11,24 @@
 
 Technical choices must state why they fit EgoPulse constraints, what alternatives were rejected, and where their costs will be paid. Popularity or familiarity alone is not a decision.
 
+## Rust and SQLCipher checks
+
+Run the repository Rust gate through:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-rust.ps1
+```
+
+The SQLCipher build uses vendored OpenSSL and therefore requires Perl plus the Visual C++ build tools on Windows. The script accepts Perl already on `PATH` and also detects the standard Strawberry Perl location. It fails with an explicit prerequisite error instead of silently replacing SQLCipher with plaintext SQLite.
+
 ## Branches and commits
 
 - Keep commits scoped and reviewable.
 - Do not mix generated files, unrelated refactors and behavior changes without a reason.
 - Never commit credentials, runtime state, model weights or personal data.
+- Install `.githooks/pre-push` with `scripts/install-git-hooks.ps1`; every push must pass the local CI gate.
+- Keep Founder governance, Gate evidence, methodology and research in `founder-agent-os`, not in this product repository.
+
+## Local delivery gates
+
+Run `pnpm run ci:local` for the full local CI gate. Run `pnpm run cd:local` only when a commit-bound Windows release candidate is needed. See [Local CI/CD and repository classification](docs/engineering/local-ci-cd.md).

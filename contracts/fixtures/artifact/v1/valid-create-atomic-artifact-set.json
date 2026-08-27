@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-valid-create-atomic-artifact-set",
+  "category": "valid",
+  "requirementRefs": ["C04-SET-01", "C04-ATOMIC-01"],
+  "principal": { "kind": "ARTIFACT_AUTHORITY", "principalId": "agentosd:artifact-authority", "authenticated": true },
+  "startingState": { "sealedArtifactIds": ["art_baseline_01", "art_patch_01", "art_workspace_01", "art_side_effects_01", "art_command_receipt_01"], "claimIds": ["claim_change_01"], "evidenceIds": ["evidence_command_01"] },
+  "command": { "createArtifactSet": {
+    "artifactSetId": "artifact_set_01", "artifactIds": ["art_baseline_01", "art_patch_01", "art_workspace_01", "art_side_effects_01", "art_command_receipt_01"], "claimIds": ["claim_change_01"], "evidenceIds": ["evidence_command_01"],
+    "lineage": { "taskId": "task_01", "taskRevision": 3, "workRevision": 2, "runId": "run_01", "stepId": "step_01", "attemptId": "attempt_01", "fencingToken": 1 }
+  }},
+  "expected": { "outcome": "committed", "businessWriteCount": 1, "resultingStatus": "ARTIFACT_SET_STATUS_DRAFT", "resultingRevision": 1, "allMembersSameLineage": true }
+}

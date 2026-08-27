@@ -1,0 +1,88 @@
+# Phase 2-04 Memory/RAG Worker boundary
+
+## Status
+
+This is the Python cognition boundary implementation behind the approved
+`egopulse.memory.v1` contract. The contract is tracked in
+`contracts/proto/egopulse/memory/v1/memory.proto`; this document still does
+not change the frozen Memory Authority schema.
+
+## Ownership
+
+```text
+Rust Memory Authority / Context Compiler
+        |  accepted records + scope + content digest
+        v
+Python Memory/RAG Worker
+        |  ranked memory references + algorithm/evidence digest
+        v
+Rust Context Compiler / governed Harness dispatch
+```
+
+The Rust side remains the owner of Memory truth, lifecycle, scope, provenance,
+acceptance/revocation and persistence. The Python Worker is a read-only
+consumer. It cannot create, mutate, accept, revoke or promote a memory fact,
+and it has no database handle.
+
+## First implementation slice
+
+`workers/memory-rag` implements a dependency-free lexical baseline:
+
+- verifies every supplied record's content SHA-256 before use;
+- fails the entire request if any supplied record is not `accepted` or is
+  outside the requested scope, so an upstream snapshot error is not hidden;
+- returns memory IDs, source references, content digests, scores and matched
+  terms, not authoritative content ownership;
+- uses deterministic tokenization, smoothed IDF weighting and memory ID
+  tie-breaking, with no undeclared salience or model-owned ranking input;
+- emits a deterministic evidence digest that binds request limits and every
+  returned candidate's identity, source reference, content digest, score and
+  matched terms;
+- rejects malformed, duplicated, tampered, over-sized or out-of-scope input.
+
+The implementation enforces the approved initial-boundary limits in code:
+16 KiB UTF-8 query, 4 KiB routing fields, 2,048 supplied records, 64 returned
+candidates and 8 MiB total supplied content. These are resource and failure
+boundary limits, not retrieval-quality claims.
+
+This baseline is intentionally not called semantic retrieval and does not
+freeze an embedding model, vector database or LangChain/LangGraph runtime.
+Those choices require a separate evaluation record covering model identity,
+index ownership, rebuild/versioning, cost and rollback. A future embedding or
+reranker must remain behind this read-only boundary and must not become a
+Memory Authority.
+
+## Selection rationale and cost
+
+Python is used here because the cognition plane already reserves Python for
+parsing, model experiments and evaluation, and because an isolated `uv`
+project keeps those fast-changing dependencies out of the Rust authority and
+the TypeScript client. The immediate cost is one more runtime boundary and a
+future cross-language contract to maintain; that cost is accepted only for
+experimental cognition code, not for authoritative state.
+
+The lexical baseline is selected because it is dependency-free, reproducible,
+easy to inspect in a failing fixture and cheap to run on a local Windows
+installation. It gives up semantic recall, multilingual quality and large
+corpus performance compared with embeddings plus a vector index. Those are
+known product costs, not hidden architecture decisions. They must be measured
+against representative local data before an embedding model, vector store or
+framework is admitted.
+
+LangChain and LangGraph are therefore not dependencies of this worker. They
+remain possible cognition-plane implementation tools, but selecting either
+would introduce framework lifecycle, upgrade and observability coupling
+without a measured retrieval-quality and index-lifecycle decision.
+
+## Acceptance evidence
+
+The local tests cover normal ranking, scope/state rejection, digest mismatch,
+duplicate identity, routing/query/content/record/result limits, non-searchable
+queries and deterministic tie/evidence replay. The first deterministic golden
+vector is pinned in
+`workers/memory-rag/tests/test_retrieval.py`; it fixes the ordered candidate
+identity, matched terms, query digest and evidence digest for the
+`lexical-overlap-v0` baseline. This is algorithm regression evidence only. It
+does not authorize a particular embedding, index or reranker. The worker has
+no persistence dependency and therefore cannot silently write Memory facts
+during retrieval.

@@ -1,0 +1,337 @@
+{
+  "schema_version": "egopulse.production-bootstrap/v2",
+  "stores": {
+    "task": {
+      "database_path": "egopulse-data/task.db",
+      "store_epoch": "replace-task-epoch",
+      "key_env": "EGOPULSE_TASK_KEY_HEX"
+    },
+    "memory": {
+      "database_path": "egopulse-data/memory.db",
+      "store_epoch": "replace-memory-epoch",
+      "key_env": "EGOPULSE_MEMORY_KEY_HEX"
+    },
+    "artifact": {
+      "database_path": "egopulse-data/artifact.db",
+      "blob_root": "egopulse-data/artifact-blobs",
+      "store_epoch": "replace-artifact-epoch",
+      "key_env": "EGOPULSE_ARTIFACT_KEY_HEX"
+    },
+    "verification": {
+      "database_path": "egopulse-data/verification.db",
+      "store_epoch": "replace-verification-epoch",
+      "key_env": "EGOPULSE_VERIFICATION_KEY_HEX"
+    },
+    "policy": {
+      "database_path": "egopulse-data/policy.db",
+      "store_epoch": "replace-policy-epoch",
+      "key_env": "EGOPULSE_POLICY_KEY_HEX"
+    },
+    "verdict": {
+      "database_path": "egopulse-data/verdict.db",
+      "store_epoch": "replace-verdict-epoch",
+      "key_env": "EGOPULSE_VERDICT_KEY_HEX"
+    },
+    "adapter": {
+      "database_path": "egopulse-data/codex-adapter.db",
+      "store_epoch": "replace-adapter-epoch",
+      "key_env": "EGOPULSE_ADAPTER_KEY_HEX"
+    },
+    "collaboration": {
+      "database_path": "egopulse-data/collaboration.db",
+      "store_epoch": "replace-collaboration-epoch",
+      "key_env": "EGOPULSE_COLLABORATION_KEY_HEX"
+    }
+  },
+  "identity": {
+    "os_fingerprint_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "principal_id": "local-user:replace-me",
+    "permission_codes": [
+      "local.task.read",
+      "local.task.create",
+      "local.task.cancellation.request",
+      "local.approval.read",
+      "local.approval.decide",
+      "local.founder-verdict.issue",
+      "local.evidence.read",
+      "local.projection.status.read",
+      "local.projection.await",
+      "local.memory.retrieve"
+    ],
+    "authorization_policy_ref": {
+      "contract_id": "egopulse.authorization.v1",
+      "version": "0.1.0",
+      "sha256": "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1"
+    },
+    "task_kind": "Founder",
+    "policy_kind": "LocalUser",
+    "verdict_kind": "FounderAuthority"
+  },
+  "task_guard": {
+    "allowed_work_types": ["governed_repository_change"],
+    "allowed_input_snapshot_ids": ["replace-input-snapshot"],
+    "allowed_target_scope_refs": ["replace-target-scope"],
+    "acceptance_contract_ref": {
+      "contract_id": "replace-acceptance-contract",
+      "version": "v1",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "budget_profile_ref": {
+      "contract_id": "replace-budget-profile",
+      "version": "v1",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  },
+  "artifact": {
+    "allowed_workspace_refs": ["workspace:replace-me"],
+    "allowed_artifact_type_refs": [
+      {
+        "contract_id": "replace-artifact-type",
+        "version": "v1",
+        "sha256": "1919191919191919191919191919191919191919191919191919191919191919"
+      }
+    ],
+    "allowed_transformation_contract_refs": [
+      {
+        "contract_id": "replace-artifact-transformation",
+        "version": "v1",
+        "sha256": "2020202020202020202020202020202020202020202020202020202020202020"
+      }
+    ],
+    "allowed_retention_profile_refs": [
+      {
+        "contract_id": "replace-artifact-retention",
+        "version": "v1",
+        "sha256": "2121212121212121212121212121212121212121212121212121212121212121"
+      }
+    ],
+    "allowed_claim_semantic_profile_refs": [
+      {
+        "contract_id": "replace-claim-semantic-profile",
+        "version": "v1",
+        "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+      }
+    ],
+    "allowed_claim_acceptance_contract_refs": [
+      {
+        "contract_id": "replace-claim-acceptance",
+        "version": "v1",
+        "sha256": "2323232323232323232323232323232323232323232323232323232323232323"
+      }
+    ],
+    "allowed_evidence_profile_refs": [
+      {
+        "contract_id": "replace-evidence-profile",
+        "version": "v1",
+        "sha256": "2424242424242424242424242424242424242424242424242424242424242424"
+      }
+    ]
+  },
+  "memory_retrieval": {
+    "worker_executable": "C:\\replace\\EgoPulse\\workers\\memory-rag\\.venv\\Scripts\\python.exe",
+    "worker_arguments": ["-m", "egopulse_memory_rag"],
+    "working_directory": "C:\\replace\\EgoPulse",
+    "inherited_environment": ["SystemRoot", "WINDIR"],
+    "environment_overrides": {
+      "PYTHONPATH": "C:\\replace\\EgoPulse\\workers\\memory-rag\\src;C:\\replace\\EgoPulse\\workers\\contract-bindings\\src"
+    },
+    "timeout_ms": 15000,
+    "output_limit_bytes": 16777216,
+    "principal_scope_allowlist": {
+      "local-user:replace-me": ["scope:founder"]
+    }
+  },
+  "memory_candidate_producers": [
+    {
+      "producer_id": "harness:codex",
+      "principal_id": "harness:codex",
+      "principal_kind": "Harness",
+      "scope_ref": "scope:founder"
+    }
+  ],
+  "verification": {
+    "criteria": [
+      {
+        "criterion_id": "replace-criterion-id",
+        "requirement": 1,
+        "minimum_assurance": 1,
+        "not_applicable_allowed": false,
+        "checker_profile_ids": ["replace-checker-profile-id"]
+      }
+    ]
+  },
+  "policy": {
+    "authentication_context_ref": "local-ipc:windows-named-pipe",
+    "authorization_policy_ref": {
+      "contract_id": "egopulse.authorization.v1",
+      "version": "0.1.0",
+        "sha256": "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1"
+    },
+    "allowed_scope_refs": ["adapter-edge://codex/approval/scope"],
+    "decision_ttl_seconds": 300
+  },
+  "founder": {
+    "allowed_founder_principal_ids": ["local-user:replace-me"],
+    "authority_ref": "founder-authority:local",
+    "authority_policy_ref": {
+      "contract_id": "replace-founder-policy",
+      "version": "v1",
+      "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "allowed_confirmation_proof_refs": ["confirmation://replace-me"],
+    "non_overridable_gate_ids": ["G0", "G1", "G2", "G3"],
+    "confirmation_ttl_seconds": 300
+  },
+  "provider_profiles": [
+    {
+      "profile_id": "gpt-codex-default",
+      "provider": "gpt",
+      "harness": "codex_app_server",
+      "admission": "production",
+      "models": [
+        { "harness_model_id": "gpt-5.6", "provider_model_id": "gpt-5.6-sol" },
+        { "harness_model_id": "gpt-5.6-sol", "provider_model_id": "gpt-5.6-sol" },
+        { "harness_model_id": "gpt-5.6-terra", "provider_model_id": "gpt-5.6-terra" },
+        { "harness_model_id": "gpt-5.6-luna", "provider_model_id": "gpt-5.6-luna" },
+        { "harness_model_id": "gpt-5.3-codex", "provider_model_id": "gpt-5.3-codex" }
+      ],
+      "selected_model": "gpt-5.6-sol",
+      "executable": "codex",
+      "credential": { "mode": "harness_account" }
+    },
+    {
+      "profile_id": "deepseek-dsh-candidate",
+      "provider": "deepseek",
+      "harness": "dsh_acp",
+      "admission": "held",
+      "models": [
+        { "harness_model_id": "deepseek-v4-pro", "provider_model_id": "deepseek-v4-pro" },
+        { "harness_model_id": "deepseek-v4-flash", "provider_model_id": "deepseek-v4-flash" },
+        { "harness_model_id": "deepseek-v4-flash-vision-exp", "provider_model_id": "deepseek-v4-flash-vision-exp" }
+      ],
+      "selected_model": "deepseek-v4-pro",
+      "executable": "dsh",
+      "credential": {
+        "mode": "api_key_environment",
+        "source_env": "DEEPSEEK_API_KEY",
+        "target_env": "DEEPSEEK_API_KEY"
+      },
+      "hold_reason": "DSH ACP native load/resume and independent artifact admission are not yet attested"
+    },
+    {
+      "profile_id": "kimi-cli-candidate",
+      "provider": "kimi",
+      "harness": "kimi_cli_acp",
+      "admission": "held",
+      "models": [
+        { "harness_model_id": "kimi-code/k3", "provider_model_id": "k3" },
+        { "harness_model_id": "kimi-k2.5", "provider_model_id": "kimi-k2.5" }
+      ],
+      "selected_model": "kimi-code/k3",
+      "executable": "kimi",
+      "credential": {
+        "mode": "api_key_environment",
+        "source_env": "KIMI_MODEL_API_KEY",
+        "target_env": "KIMI_MODEL_API_KEY"
+      },
+      "hold_reason": "Current Kimi Code documents a BYOK KIMI_MODEL_* route; the pinned executable still needs authenticated ACP lifecycle and exact-model evidence"
+    },
+    {
+      "profile_id": "glm-opencode-candidate",
+      "provider": "glm",
+      "harness": "opencode_acp",
+      "admission": "held",
+      "models": [
+        { "harness_model_id": "zai/glm-5.3", "provider_model_id": "glm-5.3" },
+        { "harness_model_id": "zai/glm-5.3-flash", "provider_model_id": "glm-5.3-flash" }
+      ],
+      "selected_model": "zai/glm-5.3",
+      "executable": "opencode",
+      "credential": { "mode": "harness_account" },
+      "hold_reason": "OpenCode Z.AI /connect credential storage, GLM-5.3 lifecycle, schema and recovery evidence are pending"
+    }
+  ],
+  "codex": {
+    "input_bundle_root": "egopulse-data/input-bundles",
+    "workspace_root": "egopulse-workspaces",
+    "codex_executable": "codex",
+    "default_model": "gpt-5.6-sol",
+    "lease_ttl_seconds": 300,
+    "workflow": {
+      "run_id": "run:replace-me",
+      "attempt_id": "attempt:replace-me",
+      "dispatch_id": "dispatch:replace-me",
+      "harness_id": "codex",
+      "capability_profile_ref": {
+        "contract_id": "codex-app-server-v2-0.148.0-alpha.15",
+        "version": "v1",
+        "sha256": "b4e8157096dd054c008a4f1b538fb6cd8f1f2cb9577a97a4afef59c2296ed608"
+      },
+      "workspace_ref": "workspace:replace-me",
+      "lease_policy_ref": {
+        "contract_id": "replace-lease-policy",
+        "version": "v1",
+        "sha256": "1212121212121212121212121212121212121212121212121212121212121212"
+      },
+      "owner_instance_id": "agentosd:default",
+      "task_authority_principal_id": "task-authority:local",
+      "collaboration_principal_id": "collaboration-control:local",
+      "attempt_supervisor_principal_id": "attempt-supervisor:local",
+      "harness_adapter_principal_id": "harness-adapter:codex",
+      "plan": {
+        "plan_id": "plan:replace-me",
+        "digest_sha256": "1313131313131313131313131313131313131313131313131313131313131313",
+        "max_active_attempts": 1,
+        "step": {
+          "step_id": "step:replace-me",
+          "step_kind": "governed_repository_change",
+          "depends_on_step_ids": [],
+          "input_bundle_ref": "input-bundle:replace-me",
+          "expected_output_contract_ref": {
+            "contract_id": "replace-output-contract",
+            "version": "v1",
+            "sha256": "abababababababababababababababababababababababababababababababab"
+          },
+          "required_capability_profile_ref": {
+            "contract_id": "codex-app-server-v2-0.148.0-alpha.15",
+            "version": "v1",
+            "sha256": "b4e8157096dd054c008a4f1b538fb6cd8f1f2cb9577a97a4afef59c2296ed608"
+          },
+          "max_attempts": 2
+        },
+        "budget_profile_ref": {
+          "contract_id": "replace-budget-profile",
+          "version": "v1",
+          "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        }
+      },
+      "material": {
+        "input_bundle_sha256": "1414141414141414141414141414141414141414141414141414141414141414",
+        "sandbox_profile_ref": {
+          "contract_id": "replace-sandbox-profile",
+          "version": "v1",
+          "sha256": "1515151515151515151515151515151515151515151515151515151515151515"
+        },
+        "tool_policy_ref": {
+          "contract_id": "replace-tool-policy",
+          "version": "v1",
+          "sha256": "1616161616161616161616161616161616161616161616161616161616161616"
+        },
+        "data_egress_policy_ref": {
+          "contract_id": "replace-egress-policy",
+          "version": "v1",
+          "sha256": "1717171717171717171717171717171717171717171717171717171717171717"
+        },
+        "approval_policy_ref": {
+          "contract_id": "replace-approval-policy",
+          "version": "v1",
+          "sha256": "1818181818181818181818181818181818181818181818181818181818181818"
+        },
+        "session_strategy": "create_new",
+        "native_session_ref": null,
+        "checkpoint_ref": null,
+        "evidence_refs": ["config://replace-me"]
+      }
+    }
+  }
+}

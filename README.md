@@ -2,29 +2,40 @@
 
 EgoPulse is the clean implementation repository for the Founder-controlled Personal Agent OS.
 
-The repository starts from the frozen architecture and technology baseline, but it does not copy the historical governance runtime or claim that product capabilities already exist.
+The repository starts from the frozen architecture and technology baseline. It does not copy the historical governance runtime; each implemented vertical is carried by its own contracts, persistence boundaries, tests and release evidence.
 
 ## Foundation status
 
-Current maturity: **foundation scaffold**.
+Current maturity: **Gate 4 vertical implementation in progress — V-01/C5 CLI+TUI closed, typed production bootstrap wired, Sego single-criterion verification closed, Memory/RAG M-01–M-11 locally verified**.
 
 Available now:
 
 - Rust workspace for deterministic authorities, collaboration control, daemon, CLI and TUI;
+- V-01 governed single-Harness control path: Task activation → Collaboration commit → Adapter dispatch → activation acknowledgement;
+- Codex App Server adapter with durable Adapter Edge and an explicit `CodexHarnessCompositionConfig` composition root;
+- C5 real Windows local-IPC E2E coverage for daemon, CLI and TUI;
+- user-owned production bootstrap JSON with environment-resolved secret keys and fail-closed validation;
 - Tauri 2 + React + TypeScript desktop shell;
 - TypeScript packages for generated clients, Agent SDK and the bounded native Harness;
-- isolated CPython 3.14 Worker project managed by uv;
+- isolated CPython 3.14 Worker projects managed by uv;
+- internal Rust Memory Authority with SQLCipher persistence, candidate-only agent writes, Founder promotion/revocation and accepted retrieval snapshots;
+- governed `LocalCognitionService/RetrieveMemory` exposed consistently through CLI and TUI, with daemon-owned scope authorization, supervised Python retrieval, typed failure semantics and reference-only output;
+- offline Memory retrieval evaluation with dataset-digest evidence, Recall/MRR/nDCG metrics, injected exact-vector scoring and validated RRF experiment adapters;
+- explicit Sego/checker verification composition with owner-backed Artifact reads, supervised execution, immutable verification artifacts and Task write-back;
 - Protobuf/Buf and JSON Schema contract roots;
-- CI, repository-boundary checks and minimal smoke tests.
+- local CI, repository-boundary checks and commit-bound unsigned Windows early-access packaging for the CLI/TUI shared kernel;
+- account-authenticated Windows Named Pipe / Unix Domain Socket transport and an ephemeral, policy-resolved local session service.
+
+For the current Windows x64 package path, see [Windows early access](WINDOWS-EARLY-ACCESS.md).
 
 Not implemented yet:
 
-- Task, Memory, Policy, Verdict or Release authority behavior;
-- local IPC transport;
-- SQLCipher persistence or Qdrant indexing;
-- Codex, Kimi or DeepSeek Harness adapters;
-- Sego verification integration;
-- production packaging or release.
+- Desktop product surface and Tauri distribution (the desktop shell exists, but phase one ships CLI/TUI capabilities first);
+- production semantic/vector retrieval, reranking and representative-corpus evaluation; exact-vector and RRF plumbing exists only behind the offline experiment gate, while the first release still defaults to the deterministic lexical Worker baseline;
+- authenticated second Harness lifecycle and provider admission (the
+  provider-neutral multi-model composition boundary exists, but DSH/Kimi are
+  still candidate-only);
+- signed production release and SmartScreen reputation.
 
 ## Repository map
 
@@ -38,14 +49,16 @@ crates/
   domain-contracts/  domain-facing Rust types only
   cognition-runtime/ authority boundary skeletons
   local-ide-control/ deterministic collaboration control skeletons
-  local-api/          local API client boundary
-  process-supervision/process and Attempt supervision primitives
+  local-api/         local API client/server gateway boundary
+  local-ipc-platform/ OS peer identity and owner-only local transport
+  process-supervision/ process and Attempt supervision primitives
 packages/
   generated-client/  generated TypeScript contract target
-  agent-sdk/          AgentOS-native SDK boundary
-  native-harness/     bounded Layer 4 LangGraph.js Harness
+  agent-sdk/         AgentOS-native SDK boundary
+  native-harness/    bounded Layer 4 LangGraph.js Harness
 workers/
-  foundation-probe/  isolated Python Worker pattern
+  foundation-probe/ isolated Python Worker pattern
+  memory-rag/        supervised read-only deterministic retrieval Worker
 contracts/
   proto/             internal Protobuf source
   json-schema/       Artifact and tool schemas
@@ -73,4 +86,4 @@ uv sync --project workers/foundation-probe --frozen
 uv run --project workers/foundation-probe --frozen pytest workers/foundation-probe --rootdir workers/foundation-probe
 ```
 
-See [Foundation Gate](docs/foundation-gate.md) and [Architecture](ARCHITECTURE.md).
+For the current delivery controls, install the tracked fast pre-push hook with `scripts/install-git-hooks.ps1`. GitHub Actions CI/CD remains configured for pull requests and release tags, but the current development gate uses local CI/CD because the Actions usage quota is exhausted; remote failures are non-blocking until capacity returns. See [Local CI/CD](docs/engineering/local-ci-cd.md), [Foundation Gate](docs/foundation-gate.md) and [Architecture](ARCHITECTURE.md).

@@ -1,0 +1,553 @@
+syntax = "proto3";
+
+package egopulse.harness.v1;
+
+import "egopulse/common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+enum HarnessResourceType {
+  HARNESS_RESOURCE_TYPE_UNSPECIFIED = 0;
+  HARNESS_RESOURCE_TYPE_NATIVE_MODEL_HARNESS = 1;
+  HARNESS_RESOURCE_TYPE_AGENTOS_NATIVE_HARNESS = 2;
+  HARNESS_RESOURCE_TYPE_COGNITIVE_WORKER = 3;
+}
+
+enum CapabilityProfileStatus {
+  CAPABILITY_PROFILE_STATUS_UNSPECIFIED = 0;
+  CAPABILITY_PROFILE_STATUS_CANDIDATE = 1;
+  CAPABILITY_PROFILE_STATUS_ACTIVE = 2;
+  CAPABILITY_PROFILE_STATUS_DEPRECATED = 3;
+  CAPABILITY_PROFILE_STATUS_REVOKED = 4;
+  CAPABILITY_PROFILE_STATUS_EXPIRED = 5;
+}
+
+enum AttestationLevel {
+  ATTESTATION_LEVEL_UNSPECIFIED = 0;
+  ATTESTATION_LEVEL_DECLARED = 1;
+  ATTESTATION_LEVEL_STATICALLY_VERIFIED = 2;
+  ATTESTATION_LEVEL_PROBE_VERIFIED = 3;
+}
+
+enum SupportLevel {
+  SUPPORT_LEVEL_UNSPECIFIED = 0;
+  SUPPORT_LEVEL_NATIVE_STRUCTURED = 1;
+  SUPPORT_LEVEL_ADAPTER_EMULATED = 2;
+  SUPPORT_LEVEL_PROCESS_ONLY = 3;
+  SUPPORT_LEVEL_UNSUPPORTED = 4;
+  SUPPORT_LEVEL_UNKNOWN = 5;
+}
+
+enum CancellationSemantics {
+  CANCELLATION_SEMANTICS_UNSPECIFIED = 0;
+  CANCELLATION_SEMANTICS_NATIVE_COOPERATIVE = 1;
+  CANCELLATION_SEMANTICS_PROCESS_TERMINATION = 2;
+  CANCELLATION_SEMANTICS_UNSUPPORTED = 3;
+  CANCELLATION_SEMANTICS_UNKNOWN = 4;
+}
+
+enum ResumeSemantics {
+  RESUME_SEMANTICS_UNSPECIFIED = 0;
+  RESUME_SEMANTICS_SESSION_CONTINUE = 1;
+  RESUME_SEMANTICS_PARTIAL_EXECUTION_RESUME = 2;
+  RESUME_SEMANTICS_CHECKPOINT_RESTORE = 3;
+  RESUME_SEMANTICS_REPLAY_ONLY = 4;
+  RESUME_SEMANTICS_UNSUPPORTED = 5;
+  RESUME_SEMANTICS_UNKNOWN = 6;
+}
+
+enum EventOrderingGuarantee {
+  EVENT_ORDERING_GUARANTEE_UNSPECIFIED = 0;
+  EVENT_ORDERING_GUARANTEE_NATIVE_MONOTONIC = 1;
+  EVENT_ORDERING_GUARANTEE_ADAPTER_DURABLE_MONOTONIC = 2;
+  EVENT_ORDERING_GUARANTEE_BEST_EFFORT = 3;
+  EVENT_ORDERING_GUARANTEE_FINAL_ONLY = 4;
+}
+
+enum HarnessReadiness {
+  HARNESS_READINESS_UNSPECIFIED = 0;
+  HARNESS_READINESS_READY = 1;
+  HARNESS_READINESS_DEGRADED = 2;
+  HARNESS_READINESS_UNAVAILABLE = 3;
+  HARNESS_READINESS_PROTOCOL_MISMATCH = 4;
+}
+
+enum NativeSessionStrategy {
+  NATIVE_SESSION_STRATEGY_UNSPECIFIED = 0;
+  NATIVE_SESSION_STRATEGY_CREATE_NEW = 1;
+  NATIVE_SESSION_STRATEGY_CONTINUE_EXISTING = 2;
+}
+
+enum DeliveryDisposition {
+  DELIVERY_DISPOSITION_UNSPECIFIED = 0;
+  DELIVERY_DISPOSITION_DELIVERED = 1;
+  DELIVERY_DISPOSITION_REJECTED = 2;
+  DELIVERY_DISPOSITION_UNKNOWN = 3;
+}
+
+enum AckDisposition {
+  ACK_DISPOSITION_UNSPECIFIED = 0;
+  ACK_DISPOSITION_ACCEPTED = 1;
+  ACK_DISPOSITION_REJECTED = 2;
+  ACK_DISPOSITION_UNKNOWN = 3;
+}
+
+enum ObservationCriticality {
+  OBSERVATION_CRITICALITY_UNSPECIFIED = 0;
+  OBSERVATION_CRITICALITY_INFORMATIONAL = 1;
+  OBSERVATION_CRITICALITY_CONTROL = 2;
+  OBSERVATION_CRITICALITY_SECURITY = 3;
+  OBSERVATION_CRITICALITY_TERMINAL = 4;
+  OBSERVATION_CRITICALITY_ARTIFACT = 5;
+}
+
+enum LifecycleKind {
+  LIFECYCLE_KIND_UNSPECIFIED = 0;
+  LIFECYCLE_KIND_SESSION_CREATED = 1;
+  LIFECYCLE_KIND_EXECUTION_STARTED = 2;
+  LIFECYCLE_KIND_ITEM_STARTED = 3;
+  LIFECYCLE_KIND_ITEM_COMPLETED = 4;
+  LIFECYCLE_KIND_CONTEXT_COMPACTED = 5;
+  LIFECYCLE_KIND_USAGE_UPDATED = 6;
+  LIFECYCLE_KIND_EXECUTION_COMPLETED = 7;
+  LIFECYCLE_KIND_EXECUTION_INTERRUPTED = 8;
+  LIFECYCLE_KIND_EXECUTION_FAILED = 9;
+  LIFECYCLE_KIND_PROCESS_EXITED = 10;
+}
+
+enum SideEffectCertainty {
+  SIDE_EFFECT_CERTAINTY_UNSPECIFIED = 0;
+  SIDE_EFFECT_CERTAINTY_NONE_PROVEN = 1;
+  SIDE_EFFECT_CERTAINTY_KNOWN_AND_RECORDED = 2;
+  SIDE_EFFECT_CERTAINTY_UNKNOWN = 3;
+}
+
+enum ApprovalKind {
+  APPROVAL_KIND_UNSPECIFIED = 0;
+  APPROVAL_KIND_COMMAND = 1;
+  APPROVAL_KIND_FILE_CHANGE = 2;
+  APPROVAL_KIND_NETWORK = 3;
+  APPROVAL_KIND_TOOL = 4;
+  APPROVAL_KIND_PERMISSION = 5;
+  APPROVAL_KIND_USER_INPUT = 6;
+}
+
+enum ApprovalDecision {
+  APPROVAL_DECISION_UNSPECIFIED = 0;
+  APPROVAL_DECISION_ALLOW_ONCE = 1;
+  APPROVAL_DECISION_DENY = 2;
+  APPROVAL_DECISION_CANCEL_ATTEMPT = 3;
+}
+
+// Adapter-owned lifecycle of one immutable native approval request. This is
+// a candidate control fact, not a Policy Authority decision.
+enum ApprovalRequestLifecycleKind {
+  APPROVAL_REQUEST_LIFECYCLE_KIND_UNSPECIFIED = 0;
+  APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN = 1;
+  APPROVAL_REQUEST_LIFECYCLE_KIND_WITHDRAWN = 2;
+  APPROVAL_REQUEST_LIFECYCLE_KIND_RESOLVED = 3;
+}
+
+enum CancellationDeliveryDisposition {
+  CANCELLATION_DELIVERY_DISPOSITION_UNSPECIFIED = 0;
+  CANCELLATION_DELIVERY_DISPOSITION_DELIVERED = 1;
+  CANCELLATION_DELIVERY_DISPOSITION_REJECTED = 2;
+  CANCELLATION_DELIVERY_DISPOSITION_UNKNOWN = 3;
+  CANCELLATION_DELIVERY_DISPOSITION_UNSUPPORTED = 4;
+}
+
+enum ResumeDeliveryDisposition {
+  RESUME_DELIVERY_DISPOSITION_UNSPECIFIED = 0;
+  RESUME_DELIVERY_DISPOSITION_DELIVERED = 1;
+  RESUME_DELIVERY_DISPOSITION_REJECTED = 2;
+  RESUME_DELIVERY_DISPOSITION_UNKNOWN = 3;
+  RESUME_DELIVERY_DISPOSITION_UNSUPPORTED = 4;
+}
+
+enum HarnessErrorCode {
+  HARNESS_ERROR_CODE_UNSPECIFIED = 0;
+  HARNESS_ERROR_CODE_INVALID_ARGUMENT = 1;
+  HARNESS_ERROR_CODE_UNAUTHENTICATED = 2;
+  HARNESS_ERROR_CODE_PERMISSION_DENIED = 3;
+  HARNESS_ERROR_CODE_CONFIG_INVALID = 4;
+  HARNESS_ERROR_CODE_PROTOCOL_MISMATCH = 5;
+  HARNESS_ERROR_CODE_CAPABILITY_MISMATCH = 6;
+  HARNESS_ERROR_CODE_DELIVERY_REJECTED = 7;
+  HARNESS_ERROR_CODE_DELIVERY_UNKNOWN = 8;
+  HARNESS_ERROR_CODE_ACK_TIMEOUT = 9;
+  HARNESS_ERROR_CODE_FENCING_REJECTED = 10;
+  HARNESS_ERROR_CODE_SEQUENCE_CONFLICT = 11;
+  HARNESS_ERROR_CODE_APPROVAL_REQUIRED = 12;
+  HARNESS_ERROR_CODE_CANCEL_OUTCOME_UNKNOWN = 13;
+  HARNESS_ERROR_CODE_RESUME_UNSUPPORTED = 14;
+  HARNESS_ERROR_CODE_SCHEMA_INVALID = 15;
+  HARNESS_ERROR_CODE_INTEGRITY_FAILURE = 16;
+  HARNESS_ERROR_CODE_BUDGET_EXHAUSTED = 17;
+  HARNESS_ERROR_CODE_SANDBOX_VIOLATION = 18;
+  HARNESS_ERROR_CODE_DEPENDENCY_UNAVAILABLE = 19;
+  HARNESS_ERROR_CODE_PROCESS_EXITED = 20;
+  HARNESS_ERROR_CODE_UNKNOWN_CRITICAL_EVENT = 21;
+  HARNESS_ERROR_CODE_PROFILE_REVISION_CONFLICT = 22;
+  HARNESS_ERROR_CODE_PROFILE_NOT_ACTIVE = 23;
+  HARNESS_ERROR_CODE_NOT_FOUND = 24;
+  HARNESS_ERROR_CODE_INTERNAL = 25;
+}
+
+message NativeProtocolFingerprint {
+  string protocol_name = 1;
+  string protocol_version = 2;
+  string schema_sha256 = 3;
+  string adapter_version = 4;
+  string native_executable_version = 5;
+  optional string native_binary_sha256 = 6;
+}
+
+message CapabilitySemantics {
+  SupportLevel structured_dispatch = 1;
+  SupportLevel structured_events = 2;
+  SupportLevel approval_requests = 3;
+  SupportLevel artifact_return = 4;
+  SupportLevel usage_receipts = 5;
+  SupportLevel checkpoint_refs = 6;
+  SupportLevel side_effect_receipts = 7;
+  CancellationSemantics cancellation = 8;
+  repeated ResumeSemantics resume = 9;
+  EventOrderingGuarantee event_ordering = 10;
+}
+
+message CapabilityDeclaration {
+  string declaration_id = 1;
+  string adapter_id = 2;
+  string harness_id = 3;
+  HarnessResourceType resource_type = 4;
+  NativeProtocolFingerprint native_protocol = 5;
+  repeated string provider_selectors = 6;
+  repeated string model_family_selectors = 7;
+  repeated egopulse.common.v1.ContractReference input_contract_refs = 8;
+  repeated egopulse.common.v1.ContractReference output_contract_refs = 9;
+  repeated ApprovalKind approval_kinds = 10;
+  CapabilitySemantics semantics = 11;
+  egopulse.common.v1.ContractReference sandbox_profile_ref = 12;
+  egopulse.common.v1.ContractReference tool_policy_ref = 13;
+  egopulse.common.v1.ContractReference data_egress_policy_ref = 14;
+  egopulse.common.v1.ContractReference trust_profile_ref = 15;
+  google.protobuf.Timestamp declared_at = 16;
+}
+
+message CapabilityProfile {
+  string profile_id = 1;
+  uint64 revision = 2;
+  string digest_sha256 = 3;
+  CapabilityProfileStatus status = 4;
+  CapabilityDeclaration declaration = 5;
+  AttestationLevel attestation_level = 6;
+  repeated string attestation_evidence_refs = 7;
+  google.protobuf.Timestamp activated_at = 8;
+  google.protobuf.Timestamp valid_until = 9;
+}
+
+message AttestCapabilityCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  uint64 expected_registry_revision = 2;
+  string profile_id = 3;
+  CapabilityDeclaration declaration = 4;
+  AttestationLevel attestation_level = 5;
+  repeated string attestation_evidence_refs = 6;
+  google.protobuf.Timestamp valid_until = 7;
+}
+
+message CapabilityProfileEvent {
+  string event_id = 1;
+  string command_id = 2;
+  uint64 expected_registry_revision = 3;
+  uint64 resulting_registry_revision = 4;
+  string profile_id = 5;
+  string profile_digest_sha256 = 6;
+  string authenticated_principal_id = 7;
+  string authority_ref = 8;
+  string idempotency_key = 9;
+  string request_digest_sha256 = 10;
+  google.protobuf.Timestamp occurred_at = 11;
+}
+
+message AttestCapabilityResult {
+  bool replayed = 1;
+  oneof outcome {
+    CapabilityProfile profile = 2;
+    HarnessError error = 3;
+  }
+  CapabilityProfileEvent committed_event = 4;
+}
+
+message GetCapabilityProfileRequest {
+  string profile_id = 1;
+}
+
+message GetCapabilityProfileResponse {
+  oneof outcome {
+    CapabilityProfile profile = 1;
+    HarnessError error = 2;
+  }
+}
+
+message ProbeHarnessRequest {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string adapter_id = 2;
+  string expected_protocol_schema_sha256 = 3;
+  egopulse.common.v1.ContractReference probe_profile_ref = 4;
+}
+
+message ProbeHarnessResult {
+  string probe_id = 1;
+  HarnessReadiness readiness = 2;
+  NativeProtocolFingerprint observed_protocol = 3;
+  repeated string safe_diagnostic_codes = 4;
+  repeated string evidence_refs = 5;
+  google.protobuf.Timestamp observed_at = 6;
+}
+
+message DispatchEnvelope {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string run_id = 2;
+  uint64 run_revision = 3;
+  string step_id = 4;
+  uint64 step_revision = 5;
+  string attempt_id = 6;
+  uint64 attempt_revision = 7;
+  string dispatch_id = 8;
+  string dispatch_fingerprint = 9;
+  uint64 fencing_token = 10;
+  egopulse.common.v1.ContractReference capability_profile_ref = 11;
+  string input_bundle_ref = 12;
+  string input_bundle_sha256 = 13;
+  string workspace_ref = 14;
+  egopulse.common.v1.ContractReference budget_profile_ref = 15;
+  egopulse.common.v1.ContractReference sandbox_profile_ref = 16;
+  egopulse.common.v1.ContractReference tool_policy_ref = 17;
+  egopulse.common.v1.ContractReference data_egress_policy_ref = 18;
+  egopulse.common.v1.ContractReference approval_policy_ref = 19;
+  NativeSessionStrategy session_strategy = 20;
+  optional string native_session_ref = 21;
+  optional string checkpoint_ref = 22;
+}
+
+message DispatchReceipt {
+  string receipt_id = 1;
+  DeliveryDisposition disposition = 2;
+  string attempt_id = 3;
+  string dispatch_id = 4;
+  uint64 fencing_token = 5;
+  string adapter_id = 6;
+  string capability_profile_id = 7;
+  NativeProtocolFingerprint observed_protocol = 8;
+  optional string native_request_ref = 9;
+  optional string native_session_ref = 10;
+  optional string native_execution_ref = 11;
+  string receipt_digest_sha256 = 12;
+  string evidence_ref = 13;
+  google.protobuf.Timestamp delivered_at = 14;
+}
+
+message HarnessAckObservation {
+  AckDisposition disposition = 1;
+  string ack_receipt_id = 2;
+  optional string native_session_ref = 3;
+  optional string native_execution_ref = 4;
+}
+
+message LifecycleObservation {
+  LifecycleKind kind = 1;
+  optional string native_item_ref = 2;
+  optional string safe_status_code = 3;
+  SideEffectCertainty side_effect_certainty = 4;
+  optional bool native_will_retry = 5;
+}
+
+message ApprovalRequestObservation {
+  string approval_request_id = 1;
+  ApprovalKind kind = 2;
+  string action_digest_sha256 = 3;
+  string requested_scope_ref = 4;
+  string display_summary_ref = 5;
+  string native_routing_ref = 6;
+  ApprovalRequestLifecycleKind lifecycle = 7;
+  uint64 request_revision = 8;
+}
+
+message UsageObservation {
+  string usage_receipt_ref = 1;
+  uint64 input_tokens = 2;
+  uint64 output_tokens = 3;
+  optional uint64 cached_input_tokens = 4;
+  optional string cost_receipt_ref = 5;
+}
+
+message CheckpointObservation {
+  string checkpoint_candidate_ref = 1;
+  string checkpoint_digest_sha256 = 2;
+  ResumeSemantics resume_semantics = 3;
+}
+
+message ArtifactReturnObservation {
+  string return_receipt_id = 1;
+  string return_digest_sha256 = 2;
+  string native_completion_ref = 3;
+  string output_manifest_ref = 4;
+  string output_manifest_sha256 = 5;
+  string workspace_delta_ref = 6;
+  string side_effect_ledger_ref = 7;
+  string usage_receipt_ref = 8;
+  optional string final_message_ref = 9;
+}
+
+message DiagnosticObservation {
+  string safe_diagnostic_code = 1;
+  optional string error_fingerprint = 2;
+  bool recovery_required = 3;
+}
+
+message HarnessObservation {
+  string observation_id = 1;
+  string adapter_id = 2;
+  string attempt_id = 3;
+  string dispatch_id = 4;
+  uint64 fencing_token = 5;
+  uint64 observation_sequence = 6;
+  optional string native_event_id = 7;
+  optional uint64 native_sequence = 8;
+  string native_event_digest_sha256 = 9;
+  string capability_profile_id = 10;
+  ObservationCriticality criticality = 11;
+  string raw_evidence_ref = 12;
+  google.protobuf.Timestamp native_observed_at = 13;
+  google.protobuf.Timestamp adapter_received_at = 14;
+  oneof payload {
+    HarnessAckObservation ack = 20;
+    LifecycleObservation lifecycle = 21;
+    ApprovalRequestObservation approval_request = 22;
+    UsageObservation usage = 23;
+    CheckpointObservation checkpoint = 24;
+    ArtifactReturnObservation artifact_return = 25;
+    DiagnosticObservation diagnostic = 26;
+  }
+}
+
+message ApprovalDecisionEnvelope {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string attempt_id = 2;
+  string dispatch_id = 3;
+  uint64 fencing_token = 4;
+  string approval_request_id = 5;
+  string action_digest_sha256 = 6;
+  ApprovalDecision decision = 7;
+  string authority_decision_ref = 8;
+  string native_routing_ref = 9;
+}
+
+message ApprovalDecisionReceipt {
+  string receipt_id = 1;
+  string approval_request_id = 2;
+  ApprovalDecision decision = 3;
+  DeliveryDisposition disposition = 4;
+  string receipt_digest_sha256 = 5;
+  google.protobuf.Timestamp delivered_at = 6;
+}
+
+message CancelExecutionEnvelope {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string attempt_id = 2;
+  string dispatch_id = 3;
+  uint64 fencing_token = 4;
+  string cancellation_request_id = 5;
+  string native_session_ref = 6;
+  string native_execution_ref = 7;
+  google.protobuf.Timestamp confirmation_deadline = 8;
+}
+
+message CancelExecutionReceipt {
+  string receipt_id = 1;
+  string cancellation_request_id = 2;
+  CancellationDeliveryDisposition disposition = 3;
+  string receipt_digest_sha256 = 4;
+  string evidence_ref = 5;
+  google.protobuf.Timestamp delivered_at = 6;
+}
+
+message ResumeExecutionEnvelope {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string attempt_id = 2;
+  string dispatch_id = 3;
+  uint64 fencing_token = 4;
+  string resume_request_id = 5;
+  ResumeSemantics required_semantics = 6;
+  string native_session_ref = 7;
+  string checkpoint_ref = 8;
+  string recovery_evidence_ref = 9;
+}
+
+message ResumeExecutionReceipt {
+  string receipt_id = 1;
+  string resume_request_id = 2;
+  ResumeDeliveryDisposition disposition = 3;
+  ResumeSemantics delivered_semantics = 4;
+  string receipt_digest_sha256 = 5;
+  string evidence_ref = 6;
+  google.protobuf.Timestamp delivered_at = 7;
+}
+
+message SubscribeObservationsRequest {
+  string adapter_id = 1;
+  string attempt_id = 2;
+  uint64 after_observation_sequence = 3;
+  uint64 fencing_token = 4;
+}
+
+message HarnessError {
+  HarnessErrorCode code = 1;
+  string safe_detail_code = 2;
+  bool retryable_delivery = 3;
+  bool recovery_required = 4;
+  optional string error_fingerprint = 5;
+  optional string audit_ref = 6;
+}
+
+message DispatchResult {
+  oneof outcome {
+    DispatchReceipt receipt = 1;
+    HarnessError error = 2;
+  }
+}
+
+message ApprovalDecisionResult {
+  oneof outcome {
+    ApprovalDecisionReceipt receipt = 1;
+    HarnessError error = 2;
+  }
+}
+
+message CancelExecutionResult {
+  oneof outcome {
+    CancelExecutionReceipt receipt = 1;
+    HarnessError error = 2;
+  }
+}
+
+message ResumeExecutionResult {
+  oneof outcome {
+    ResumeExecutionReceipt receipt = 1;
+    HarnessError error = 2;
+  }
+}
+
+service HarnessAdapterService {
+  rpc Probe(ProbeHarnessRequest) returns (ProbeHarnessResult);
+  rpc Dispatch(DispatchEnvelope) returns (DispatchResult);
+  rpc DecideApproval(ApprovalDecisionEnvelope) returns (ApprovalDecisionResult);
+  rpc Cancel(CancelExecutionEnvelope) returns (CancelExecutionResult);
+  rpc Resume(ResumeExecutionEnvelope) returns (ResumeExecutionResult);
+  rpc SubscribeObservations(SubscribeObservationsRequest) returns (stream HarnessObservation);
+}
+
+service HarnessRegistryService {
+  rpc AttestCapability(AttestCapabilityCommand) returns (AttestCapabilityResult);
+  rpc GetCapabilityProfile(GetCapabilityProfileRequest) returns (GetCapabilityProfileResponse);
+}

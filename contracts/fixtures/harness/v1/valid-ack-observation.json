@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-valid-ack-observation", "category": "valid",
+  "requirementRefs": ["AC-02", "C03-ACK-01"], "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "attemptStatus": "ATTEMPT_STATUS_DISPATCHED", "fencingToken": 3, "lastObservationSequence": 0 },
+  "resolvedReferences": { "dispatchReceipt": { "receiptId": "delivery-001", "digestValid": true } },
+  "command": { "ingestObservation": { "observationId": "obs-ack-001", "adapterId": "codex-adapter", "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 3, "observationSequence": 1, "nativeEventDigestSha256": "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0", "capabilityProfileId": "codex-app-server-v2-0.148.0-alpha.15", "criticality": "OBSERVATION_CRITICALITY_CONTROL", "rawEvidenceRef": "raw-jsonrpc-response-001", "ack": { "disposition": "ACK_DISPOSITION_ACCEPTED", "ackReceiptId": "ack-001", "nativeSessionRef": "thread-opaque-001", "nativeExecutionRef": "turn-opaque-001" } } },
+  "expected": { "outcome": "committed", "resultingObservationSequence": 1, "attemptStatus": "ATTEMPT_STATUS_ACKNOWLEDGED", "nativeRefsRemainOpaque": true, "businessWriteCount": 1 }
+}

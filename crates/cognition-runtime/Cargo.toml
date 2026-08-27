@@ -7,6 +7,19 @@ repository.workspace = true
 
 [dependencies]
 egopulse-domain-contracts.workspace = true
+egopulse-process-supervision.workspace = true
+hex.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+rusqlite.workspace = true
+rusqlite_migration.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dev-dependencies]
+tokio.workspace = true

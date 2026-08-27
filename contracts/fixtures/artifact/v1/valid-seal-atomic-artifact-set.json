@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-valid-seal-atomic-artifact-set",
+  "category": "valid",
+  "requirementRefs": ["C04-SET-02", "C04-ATOMIC-02"],
+  "principal": { "kind": "ARTIFACT_AUTHORITY", "principalId": "agentosd:artifact-authority", "authenticated": true },
+  "startingState": { "artifactSetId": "artifact_set_01", "revision": 1, "status": "ARTIFACT_SET_STATUS_DRAFT", "allMembersSealed": true, "canonicalManifestDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+  "command": { "sealArtifactSet": { "artifactSetId": "artifact_set_01", "expectedRevision": 1, "observedManifest": { "algorithm": "HASH_ALGORITHM_SHA256", "digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "byteLength": 1630 } } },
+  "expected": { "outcome": "committed", "businessWriteCount": 1, "resultingStatus": "ARTIFACT_SET_STATUS_SEALED", "resultingRevision": 2, "membershipImmutable": true }
+}

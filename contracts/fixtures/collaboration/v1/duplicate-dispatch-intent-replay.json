@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "v01-collaboration-fixture/v0.1",
+  "fixtureId": "collaboration-duplicate-dispatch-intent-replay",
+  "category": "duplicate",
+  "requirementRefs": ["V01-D03", "C02-IDEMPOTENCY-01", "QA-01"],
+  "principal": { "kind": "COLLABORATION_CONTROL", "principalId": "collaboration-control:test", "authenticated": true },
+  "startingSnapshot": { "run": { "runId": "run-001", "revision": 5, "status": "RUN_STATUS_ACTIVE" }, "step": { "stepId": "step-001", "revision": 3, "status": "STEP_STATUS_ACTIVE" }, "attempt": { "attemptId": "attempt-001", "revision": 3, "status": "ATTEMPT_STATUS_DISPATCH_PENDING", "dispatchId": "dispatch-001", "lease": { "leaseId": "lease-001", "fencingToken": 8 } } },
+  "resolvedReferences": { "idempotencyRecord": { "idempotencyKey": "dispatch-intent-001", "requestDigestSha256": "3030303030303030303030303030303030303030303030303030303030303030", "originalEventId": "event-dispatch-001" } },
+  "command": { "recordDispatchIntent": { "base": { "meta": { "commandId": "cmd-dispatch-retry-001", "idempotencyKey": "dispatch-intent-001", "idempotencyScope": "attempt-001", "requestDigestSha256": "3030303030303030303030303030303030303030303030303030303030303030", "issuedAt": "2026-08-23T03:02:00Z", "correlationId": "corr-run-003" }, "runId": "run-001", "expectedRunRevision": 4, "stepId": "step-001", "expectedStepRevision": 2, "attemptId": "attempt-001", "expectedAttemptRevision": 2 }, "leaseId": "lease-001", "fencingToken": 8, "dispatchId": "dispatch-001", "dispatchFingerprint": "3131313131313131313131313131313131313131313131313131313131313131" } },
+  "expected": { "outcome": "replayed", "replayed": true, "originalEventId": "event-dispatch-001", "resultingRunRevision": 5, "resultingStepRevision": 3, "resultingAttemptRevision": 3, "businessWriteCount": 0 }
+}

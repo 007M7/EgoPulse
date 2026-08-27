@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "v01-task-fixture/v0.1",
+  "fixtureId": "task-recovery-interrupted-to-held",
+  "category": "recovery",
+  "requirementRefs": ["AC-07", "QA-02", "QT-08"],
+  "principal": { "kind": "COLLABORATION_CONTROL", "principalId": "collaboration-control:test", "authenticated": true },
+  "startingSnapshot": { "taskId": "task-001", "revision": 5, "workRevision": 1, "status": "TASK_STATUS_INTERRUPTED", "currentRunId": "run-001" },
+  "resolvedReferences": { "recoveryEvidence": { "evidenceId": "recovery-001", "classification": "reconcile_before_retry", "certaintyRestored": false } },
+  "command": {
+    "holdTask": {
+      "meta": { "commandId": "cmd-hold-001", "idempotencyKey": "hold-001", "idempotencyScope": "task-001", "requestDigestSha256": "1111111111111111111111111111111111111111111111111111111111111111", "issuedAt": "2026-08-23T00:07:00Z", "correlationId": "corr-005" },
+      "taskId": "task-001", "expectedRevision": 5, "holdReasonCode": "SIDE_EFFECT_RESULT_UNKNOWN", "recoveryEvidenceId": "recovery-001"
+    }
+  },
+  "expected": { "outcome": "committed", "eventKind": "TASK_EVENT_KIND_HELD", "resultingStatus": "TASK_STATUS_HELD", "resumeStatus": "TASK_STATUS_INTERRUPTED", "resultingRevision": 6, "resultingWorkRevision": 1, "businessWriteCount": 1 }
+}
+

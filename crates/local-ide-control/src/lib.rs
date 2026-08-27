@@ -2,6 +2,8 @@
 
 use egopulse_domain_contracts::FoundationHealth;
 
+pub mod collaboration_control;
+
 pub const CONTROL_BOUNDARIES: &[&str] = &[
     "collaboration-run-planner",
     "capability-harness-registry",

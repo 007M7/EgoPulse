@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-unauthorized-harness-seal-artifact",
+  "category": "unauthorized",
+  "requirementRefs": ["C04-OWN-01", "C04-AUTH-01"],
+  "principal": { "kind": "HARNESS", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "artifactId": "art_patch_01", "revision": 1, "status": "ARTIFACT_STATUS_STAGED" },
+  "command": { "sealArtifact": { "artifactId": "art_patch_01", "expectedRevision": 1, "observedContent": { "algorithm": "HASH_ALGORITHM_SHA256", "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "byteLength": 842 } } },
+  "expected": { "outcome": "error", "businessWriteCount": 0, "errorCode": "ARTIFACT_ERROR_CODE_PERMISSION_DENIED", "resultingStatus": "ARTIFACT_STATUS_STAGED" }
+}

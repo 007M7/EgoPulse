@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "v01-collaboration-fixture/v0.1",
+  "fixtureId": "collaboration-valid-create-attempt",
+  "category": "valid",
+  "requirementRefs": ["V01-D03", "C02-ATTEMPT-01", "QT-03"],
+  "principal": { "kind": "COLLABORATION_CONTROL", "principalId": "collaboration-control:test", "authenticated": true },
+  "startingSnapshot": { "run": { "runId": "run-001", "revision": 2, "status": "RUN_STATUS_ACTIVE", "maxActiveAttempts": 1 }, "step": { "stepId": "step-001", "revision": 1, "status": "STEP_STATUS_READY", "attemptIds": [] }, "attempt": null },
+  "resolvedReferences": { "capabilityProfile": { "valid": true }, "workspace": { "workspaceRef": "workspace-001", "isolated": true } },
+  "command": { "createAttempt": { "base": { "meta": { "commandId": "cmd-attempt-create-001", "idempotencyKey": "attempt-create-001", "idempotencyScope": "run-001/step-001", "requestDigestSha256": "2020202020202020202020202020202020202020202020202020202020202020", "issuedAt": "2026-08-23T03:01:00Z", "correlationId": "corr-run-002" }, "runId": "run-001", "expectedRunRevision": 2 }, "stepId": "step-001", "expectedStepRevision": 1, "attemptId": "attempt-001", "harnessId": "codex", "capabilityProfileRef": { "contractId": "single-harness-capability", "version": "0.1", "sha256": "2121212121212121212121212121212121212121212121212121212121212121" }, "workspaceRef": "workspace-001" } },
+  "expected": { "outcome": "committed", "eventKind": "COLLABORATION_EVENT_KIND_ATTEMPT_CREATED", "resultingRunStatus": "RUN_STATUS_ACTIVE", "resultingRunRevision": 3, "resultingStepStatus": "STEP_STATUS_ACTIVE", "resultingStepRevision": 2, "resultingAttemptStatus": "ATTEMPT_STATUS_CREATED", "resultingAttemptRevision": 1, "businessWriteCount": 1 }
+}

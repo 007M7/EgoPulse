@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-invalid-partial-resume-unsupported", "category": "invalid",
+  "requirementRefs": ["C03-RESUME-01", "QA-02"], "principal": { "kind": "COLLABORATION_CONTROL", "principalId": "collaboration-control:test", "authenticated": true },
+  "startingState": { "attemptStatus": "ATTEMPT_STATUS_INTERRUPTED", "fencingToken": 4 },
+  "resolvedReferences": { "capabilityProfile": { "resume": ["RESUME_SEMANTICS_SESSION_CONTINUE"] }, "checkpoint": { "recoveryClass": "RECOVERY_CLASS_RESUME_SAFE" } },
+  "command": { "resume": { "meta": { "commandId": "cmd-resume-partial-001", "idempotencyKey": "resume-partial-001", "idempotencyScope": "attempt-001", "requestDigestSha256": "f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8", "issuedAt": "2026-08-23T04:15:00Z", "correlationId": "corr-harness-015" }, "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 4, "resumeRequestId": "resume-001", "requiredSemantics": "RESUME_SEMANTICS_PARTIAL_EXECUTION_RESUME", "nativeSessionRef": "thread-opaque-001", "checkpointRef": "checkpoint-001", "recoveryEvidenceRef": "recovery-001" } },
+  "expected": { "outcome": "error", "errorCode": "HARNESS_ERROR_CODE_RESUME_UNSUPPORTED", "nativeResumeCount": 0, "attemptStatusUnchanged": "ATTEMPT_STATUS_INTERRUPTED", "businessWriteCount": 0 }
+}

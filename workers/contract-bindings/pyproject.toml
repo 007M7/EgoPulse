@@ -1,0 +1,21 @@
+[project]
+name = "egopulse-contract-bindings"
+version = "0.1.0"
+description = "Generated Python consumers of the frozen EgoPulse machine contracts"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+  "protobuf==7.35.1",
+]
+
+[dependency-groups]
+dev = [
+  "pytest==9.0.2",
+]
+
+[tool.pytest.ini_options]
+addopts = ["-p", "no:cacheprovider"]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.uv]
+package = false

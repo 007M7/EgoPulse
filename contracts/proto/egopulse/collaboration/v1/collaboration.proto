@@ -1,0 +1,471 @@
+syntax = "proto3";
+
+package egopulse.collaboration.v1;
+
+import "egopulse/common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+enum RunStatus {
+  RUN_STATUS_UNSPECIFIED = 0;
+  RUN_STATUS_PLANNED = 1;
+  RUN_STATUS_ACTIVE = 2;
+  RUN_STATUS_RETURN_PENDING = 3;
+  RUN_STATUS_HELD = 4;
+  RUN_STATUS_CANCELLATION_PENDING = 5;
+  RUN_STATUS_RETURNED = 6;
+  RUN_STATUS_FAILED = 7;
+  RUN_STATUS_CANCELLED = 8;
+  RUN_STATUS_SUPERSEDED = 9;
+  RUN_STATUS_EXPIRED = 10;
+}
+
+enum StepStatus {
+  STEP_STATUS_UNSPECIFIED = 0;
+  STEP_STATUS_BLOCKED = 1;
+  STEP_STATUS_READY = 2;
+  STEP_STATUS_ACTIVE = 3;
+  STEP_STATUS_RETURN_PENDING = 4;
+  STEP_STATUS_HELD = 5;
+  STEP_STATUS_RETURNED = 6;
+  STEP_STATUS_FAILED = 7;
+  STEP_STATUS_CANCELLED = 8;
+  STEP_STATUS_SKIPPED = 9;
+  STEP_STATUS_SUPERSEDED = 10;
+}
+
+enum AttemptStatus {
+  ATTEMPT_STATUS_UNSPECIFIED = 0;
+  ATTEMPT_STATUS_CREATED = 1;
+  ATTEMPT_STATUS_LEASED = 2;
+  ATTEMPT_STATUS_DISPATCH_PENDING = 3;
+  ATTEMPT_STATUS_DISPATCHED = 4;
+  ATTEMPT_STATUS_ACKNOWLEDGED = 5;
+  ATTEMPT_STATUS_RUNNING = 6;
+  ATTEMPT_STATUS_CANCELLATION_PENDING = 7;
+  ATTEMPT_STATUS_OUTCOME_UNKNOWN = 8;
+  ATTEMPT_STATUS_RECONCILING = 9;
+  ATTEMPT_STATUS_INTERRUPTED = 10;
+  ATTEMPT_STATUS_HELD = 11;
+  ATTEMPT_STATUS_RETURNED = 12;
+  ATTEMPT_STATUS_FAILED = 13;
+  ATTEMPT_STATUS_CANCELLED = 14;
+  ATTEMPT_STATUS_SUPERSEDED = 15;
+  ATTEMPT_STATUS_EXPIRED = 16;
+}
+
+enum RecoveryClass {
+  RECOVERY_CLASS_UNSPECIFIED = 0;
+  RECOVERY_CLASS_RESUME_SAFE = 1;
+  RECOVERY_CLASS_RETRY_IDEMPOTENT = 2;
+  RECOVERY_CLASS_RECONCILE_BEFORE_RETRY = 3;
+  RECOVERY_CLASS_COMPENSATABLE = 4;
+  RECOVERY_CLASS_MANUAL_ONLY = 5;
+  RECOVERY_CLASS_IRREVERSIBLE = 6;
+}
+
+enum ReconciliationDisposition {
+  RECONCILIATION_DISPOSITION_UNSPECIFIED = 0;
+  RECONCILIATION_DISPOSITION_RETURN_FOUND = 1;
+  RECONCILIATION_DISPOSITION_NO_EFFECT_PROVEN = 2;
+  RECONCILIATION_DISPOSITION_RESUME_SAFE = 3;
+  RECONCILIATION_DISPOSITION_RETRY_IDEMPOTENT = 4;
+  RECONCILIATION_DISPOSITION_COMPENSATE = 5;
+  RECONCILIATION_DISPOSITION_MANUAL_ONLY = 6;
+  RECONCILIATION_DISPOSITION_IRREVERSIBLE_UNKNOWN = 7;
+}
+
+enum AttemptCancellationDisposition {
+  ATTEMPT_CANCELLATION_DISPOSITION_UNSPECIFIED = 0;
+  ATTEMPT_CANCELLATION_DISPOSITION_CANCELLED_CONFIRMED = 1;
+  ATTEMPT_CANCELLATION_DISPOSITION_RETURN_FOUND = 2;
+  ATTEMPT_CANCELLATION_DISPOSITION_OUTCOME_UNKNOWN = 3;
+}
+
+enum CollaborationEventKind {
+  COLLABORATION_EVENT_KIND_UNSPECIFIED = 0;
+  COLLABORATION_EVENT_KIND_RUN_CREATED = 1;
+  COLLABORATION_EVENT_KIND_RUN_ACTIVATED = 2;
+  COLLABORATION_EVENT_KIND_ATTEMPT_CREATED = 3;
+  COLLABORATION_EVENT_KIND_LEASE_ACQUIRED = 4;
+  COLLABORATION_EVENT_KIND_LEASE_RENEWED = 5;
+  COLLABORATION_EVENT_KIND_DISPATCH_INTENT_RECORDED = 6;
+  COLLABORATION_EVENT_KIND_DELIVERY_RECORDED = 7;
+  COLLABORATION_EVENT_KIND_ACK_RECORDED = 8;
+  COLLABORATION_EVENT_KIND_RUNNING_OBSERVED = 9;
+  COLLABORATION_EVENT_KIND_RETURN_RECORDED = 10;
+  COLLABORATION_EVENT_KIND_OUTCOME_MARKED_UNKNOWN = 11;
+  COLLABORATION_EVENT_KIND_RECONCILIATION_STARTED = 12;
+  COLLABORATION_EVENT_KIND_RECONCILIATION_RECORDED = 13;
+  COLLABORATION_EVENT_KIND_CHECKPOINT_RECORDED = 14;
+  COLLABORATION_EVENT_KIND_CANCELLATION_REQUESTED = 15;
+  COLLABORATION_EVENT_KIND_CANCELLATION_RECORDED = 16;
+  COLLABORATION_EVENT_KIND_ATTEMPT_HELD = 17;
+  COLLABORATION_EVENT_KIND_ATTEMPT_RESUMED = 18;
+  COLLABORATION_EVENT_KIND_STEP_RETURN_COMMITTED = 19;
+  COLLABORATION_EVENT_KIND_RUN_SUPERSEDED = 20;
+  COLLABORATION_EVENT_KIND_RUN_EXPIRED = 21;
+}
+
+enum CollaborationErrorCode {
+  COLLABORATION_ERROR_CODE_UNSPECIFIED = 0;
+  COLLABORATION_ERROR_CODE_INVALID_ARGUMENT = 1;
+  COLLABORATION_ERROR_CODE_UNAUTHENTICATED = 2;
+  COLLABORATION_ERROR_CODE_PERMISSION_DENIED = 3;
+  COLLABORATION_ERROR_CODE_NOT_FOUND = 4;
+  COLLABORATION_ERROR_CODE_RUN_REVISION_CONFLICT = 5;
+  COLLABORATION_ERROR_CODE_ENTITY_REVISION_CONFLICT = 6;
+  COLLABORATION_ERROR_CODE_STATE_CONFLICT = 7;
+  COLLABORATION_ERROR_CODE_IDEMPOTENCY_CONFLICT = 8;
+  COLLABORATION_ERROR_CODE_FENCING_REJECTED = 9;
+  COLLABORATION_ERROR_CODE_SEQUENCE_CONFLICT = 10;
+  COLLABORATION_ERROR_CODE_CAPACITY_EXHAUSTED = 11;
+  COLLABORATION_ERROR_CODE_STALE_TASK_REFERENCE = 12;
+  COLLABORATION_ERROR_CODE_CONTRACT_MISMATCH = 13;
+  COLLABORATION_ERROR_CODE_OUTCOME_UNKNOWN = 14;
+  COLLABORATION_ERROR_CODE_RECOVERY_REQUIRED = 15;
+  COLLABORATION_ERROR_CODE_INTEGRITY_FAILURE = 16;
+  COLLABORATION_ERROR_CODE_INTERNAL = 17;
+}
+
+message Lease {
+  string lease_id = 1;
+  string owner_instance_id = 2;
+  uint64 fencing_token = 3;
+  google.protobuf.Timestamp acquired_at = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  google.protobuf.Timestamp heartbeat_at = 6;
+  egopulse.common.v1.ContractReference lease_policy_ref = 7;
+}
+
+message CheckpointReference {
+  string checkpoint_id = 1;
+  string digest_sha256 = 2;
+  string attempt_id = 3;
+  uint64 attempt_revision = 4;
+  uint64 fencing_token = 5;
+  uint64 last_collaboration_sequence = 6;
+  optional string harness_checkpoint_ref = 7;
+  optional string harness_session_ref = 8;
+  optional string workspace_snapshot_ref = 9;
+  string side_effect_ledger_ref = 10;
+  string budget_receipt_ref = 11;
+  RecoveryClass recovery_class = 12;
+  google.protobuf.Timestamp created_at = 13;
+  string task_id = 14;
+  uint64 work_revision = 15;
+  string run_id = 16;
+  string step_id = 17;
+}
+
+message StepPlan {
+  string step_id = 1;
+  string step_kind = 2;
+  repeated string depends_on_step_ids = 3;
+  string input_bundle_ref = 4;
+  egopulse.common.v1.ContractReference expected_output_contract_ref = 5;
+  egopulse.common.v1.ContractReference required_capability_profile_ref = 6;
+  uint32 max_attempts = 7;
+}
+
+message RunPlan {
+  string plan_id = 1;
+  string digest_sha256 = 2;
+  uint32 max_active_attempts = 3;
+  repeated StepPlan steps = 4;
+  egopulse.common.v1.ContractReference budget_profile_ref = 5;
+}
+
+message RunSnapshot {
+  string run_id = 1;
+  uint64 revision = 2;
+  string task_id = 3;
+  uint64 task_revision_at_creation = 4;
+  uint64 work_revision = 5;
+  RunStatus status = 6;
+  RunPlan plan = 7;
+  repeated string step_ids = 8;
+  optional string hold_reason_code = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+message StepSnapshot {
+  string step_id = 1;
+  string run_id = 2;
+  uint64 revision = 3;
+  StepStatus status = 4;
+  repeated string attempt_ids = 5;
+  optional string current_attempt_id = 6;
+  optional string artifact_set_id = 7;
+  optional string return_handoff_id = 8;
+  optional string hold_reason_code = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+message AttemptSnapshot {
+  string attempt_id = 1;
+  string run_id = 2;
+  string step_id = 3;
+  uint64 revision = 4;
+  uint32 attempt_number = 5;
+  AttemptStatus status = 6;
+  string harness_id = 7;
+  egopulse.common.v1.ContractReference capability_profile_ref = 8;
+  string workspace_ref = 9;
+  optional string dispatch_id = 10;
+  optional string dispatch_fingerprint = 11;
+  optional string harness_session_ref = 12;
+  uint64 last_harness_sequence = 13;
+  Lease lease = 14;
+  optional string latest_checkpoint_id = 15;
+  RecoveryClass recovery_class = 16;
+  optional string hold_reason_code = 17;
+  google.protobuf.Timestamp created_at = 18;
+  google.protobuf.Timestamp updated_at = 19;
+}
+
+message CollaborationSnapshot {
+  RunSnapshot run = 1;
+  repeated StepSnapshot steps = 2;
+  repeated AttemptSnapshot attempts = 3;
+}
+
+message RunCommandBase {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string run_id = 2;
+  uint64 expected_run_revision = 3;
+}
+
+message AttemptCommandBase {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string run_id = 2;
+  uint64 expected_run_revision = 3;
+  string step_id = 4;
+  uint64 expected_step_revision = 5;
+  string attempt_id = 6;
+  uint64 expected_attempt_revision = 7;
+}
+
+message CreateRunCommand {
+  egopulse.common.v1.CommandMetadata meta = 1;
+  string run_id = 2;
+  string task_id = 3;
+  uint64 task_revision = 4;
+  uint64 work_revision = 5;
+  RunPlan plan = 6;
+}
+
+message ActivateRunCommand {
+  RunCommandBase base = 1;
+  uint64 confirmed_task_revision = 2;
+}
+
+message CreateAttemptCommand {
+  RunCommandBase base = 1;
+  string step_id = 2;
+  uint64 expected_step_revision = 3;
+  string attempt_id = 4;
+  string harness_id = 5;
+  egopulse.common.v1.ContractReference capability_profile_ref = 6;
+  string workspace_ref = 7;
+}
+
+message AcquireAttemptLeaseCommand {
+  AttemptCommandBase base = 1;
+  string owner_instance_id = 2;
+  egopulse.common.v1.ContractReference lease_policy_ref = 3;
+}
+
+message RenewAttemptLeaseCommand {
+  AttemptCommandBase base = 1;
+  string lease_id = 2;
+  uint64 fencing_token = 3;
+}
+
+message RecordDispatchIntentCommand {
+  AttemptCommandBase base = 1;
+  string lease_id = 2;
+  uint64 fencing_token = 3;
+  string dispatch_id = 4;
+  string dispatch_fingerprint = 5;
+}
+
+message RecordDeliveryReceiptCommand {
+  AttemptCommandBase base = 1;
+  string dispatch_id = 2;
+  uint64 fencing_token = 3;
+  string delivery_receipt_id = 4;
+  string receipt_digest_sha256 = 5;
+}
+
+message RecordHarnessAckCommand {
+  AttemptCommandBase base = 1;
+  string dispatch_id = 2;
+  uint64 fencing_token = 3;
+  uint64 harness_sequence = 4;
+  string ack_receipt_id = 5;
+  string receipt_digest_sha256 = 6;
+}
+
+message RecordRunningObservationCommand {
+  AttemptCommandBase base = 1;
+  uint64 fencing_token = 2;
+  uint64 harness_sequence = 3;
+  string lifecycle_event_id = 4;
+  string event_digest_sha256 = 5;
+}
+
+message RecordAttemptReturnCommand {
+  AttemptCommandBase base = 1;
+  uint64 fencing_token = 2;
+  uint64 harness_sequence = 3;
+  string artifact_return_receipt_id = 4;
+  string receipt_digest_sha256 = 5;
+}
+
+message MarkAttemptOutcomeUnknownCommand {
+  AttemptCommandBase base = 1;
+  string reason_code = 2;
+  string uncertainty_evidence_id = 3;
+}
+
+message BeginAttemptReconciliationCommand {
+  AttemptCommandBase base = 1;
+  string reconciliation_id = 2;
+}
+
+message RecordAttemptReconciliationCommand {
+  AttemptCommandBase base = 1;
+  string reconciliation_id = 2;
+  ReconciliationDisposition disposition = 3;
+  string evidence_id = 4;
+}
+
+message RecordCheckpointCommand {
+  AttemptCommandBase base = 1;
+  CheckpointReference checkpoint = 2;
+}
+
+message RequestAttemptCancellationCommand {
+  AttemptCommandBase base = 1;
+  string task_cancellation_request_id = 2;
+}
+
+message RecordAttemptCancellationOutcomeCommand {
+  AttemptCommandBase base = 1;
+  AttemptCancellationDisposition disposition = 2;
+  string cancellation_receipt_id = 3;
+}
+
+message HoldAttemptCommand {
+  AttemptCommandBase base = 1;
+  string hold_reason_code = 2;
+  string evidence_id = 3;
+}
+
+message ResumeAttemptCommand {
+  AttemptCommandBase base = 1;
+  string recovery_evidence_id = 2;
+}
+
+message CommitStepReturnCommand {
+  RunCommandBase base = 1;
+  string step_id = 2;
+  uint64 expected_step_revision = 3;
+  string attempt_id = 4;
+  string artifact_set_id = 5;
+  string return_handoff_id = 6;
+}
+
+message SupersedeRunCommand {
+  RunCommandBase base = 1;
+  string replacement_run_id = 2;
+  string reason_code = 3;
+}
+
+message ExpireRunCommand {
+  RunCommandBase base = 1;
+  string policy_decision_id = 2;
+}
+
+message CollaborationCommand {
+  oneof command {
+    CreateRunCommand create_run = 1;
+    ActivateRunCommand activate_run = 2;
+    CreateAttemptCommand create_attempt = 3;
+    AcquireAttemptLeaseCommand acquire_attempt_lease = 4;
+    RenewAttemptLeaseCommand renew_attempt_lease = 5;
+    RecordDispatchIntentCommand record_dispatch_intent = 6;
+    RecordDeliveryReceiptCommand record_delivery_receipt = 7;
+    RecordHarnessAckCommand record_harness_ack = 8;
+    RecordRunningObservationCommand record_running_observation = 9;
+    RecordAttemptReturnCommand record_attempt_return = 10;
+    MarkAttemptOutcomeUnknownCommand mark_attempt_outcome_unknown = 11;
+    BeginAttemptReconciliationCommand begin_attempt_reconciliation = 12;
+    RecordAttemptReconciliationCommand record_attempt_reconciliation = 13;
+    RecordCheckpointCommand record_checkpoint = 14;
+    RequestAttemptCancellationCommand request_attempt_cancellation = 15;
+    RecordAttemptCancellationOutcomeCommand record_attempt_cancellation_outcome = 16;
+    HoldAttemptCommand hold_attempt = 17;
+    ResumeAttemptCommand resume_attempt = 18;
+    CommitStepReturnCommand commit_step_return = 19;
+    SupersedeRunCommand supersede_run = 20;
+    ExpireRunCommand expire_run = 21;
+  }
+}
+
+message CollaborationEvent {
+  string event_id = 1;
+  string command_id = 2;
+  CollaborationEventKind kind = 3;
+  string run_id = 4;
+  uint64 expected_run_revision = 5;
+  uint64 resulting_run_revision = 6;
+  optional string step_id = 7;
+  optional uint64 resulting_step_revision = 8;
+  optional string attempt_id = 9;
+  optional uint64 resulting_attempt_revision = 10;
+  string authenticated_principal_id = 11;
+  string authority_ref = 12;
+  string idempotency_key = 13;
+  string request_digest_sha256 = 14;
+  string correlation_id = 15;
+  optional string causation_id = 16;
+  repeated string evidence_refs = 17;
+  google.protobuf.Timestamp occurred_at = 18;
+}
+
+message CollaborationError {
+  CollaborationErrorCode code = 1;
+  string safe_detail_code = 2;
+  bool retryable = 3;
+  bool recovery_required = 4;
+  optional uint64 current_run_revision = 5;
+  optional uint64 current_entity_revision = 6;
+  optional string audit_ref = 7;
+}
+
+message CollaborationCommandResult {
+  bool replayed = 1;
+  oneof outcome {
+    CollaborationSnapshot snapshot = 2;
+    CollaborationError error = 3;
+  }
+  CollaborationEvent committed_event = 4;
+}
+
+message GetCollaborationRequest {
+  string run_id = 1;
+}
+
+message GetCollaborationResponse {
+  oneof outcome {
+    CollaborationSnapshot snapshot = 1;
+    CollaborationError error = 2;
+  }
+}
+
+service CollaborationControlService {
+  rpc Execute(CollaborationCommand) returns (CollaborationCommandResult);
+  rpc GetCollaboration(GetCollaborationRequest) returns (GetCollaborationResponse);
+}

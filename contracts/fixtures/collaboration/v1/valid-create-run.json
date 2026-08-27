@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "v01-collaboration-fixture/v0.1",
+  "fixtureId": "collaboration-valid-create-run",
+  "category": "valid",
+  "requirementRefs": ["V01-D02", "C02-RUN-01", "QA-01"],
+  "principal": { "kind": "TASK_AUTHORITY", "principalId": "task-authority:test", "authenticated": true },
+  "startingSnapshot": null,
+  "resolvedReferences": { "task": { "taskId": "task-001", "revision": 2, "workRevision": 1, "status": "TASK_STATUS_ACTIVE" } },
+  "command": {
+    "createRun": {
+      "meta": { "commandId": "cmd-run-create-001", "idempotencyKey": "run-create-001", "idempotencyScope": "task-001/work-1", "requestDigestSha256": "1010101010101010101010101010101010101010101010101010101010101010", "issuedAt": "2026-08-23T03:00:00Z", "correlationId": "corr-run-001" },
+      "runId": "run-001", "taskId": "task-001", "taskRevision": 2, "workRevision": 1,
+      "plan": { "planId": "plan-001", "digestSha256": "1111111111111111111111111111111111111111111111111111111111111111", "maxActiveAttempts": 1, "steps": [{ "stepId": "step-001", "stepKind": "governed_harness_work", "dependsOnStepIds": [], "inputBundleRef": "input-001", "expectedOutputContractRef": { "contractId": "repository-change-return", "version": "0.1", "sha256": "1212121212121212121212121212121212121212121212121212121212121212" }, "requiredCapabilityProfileRef": { "contractId": "single-harness-capability", "version": "0.1", "sha256": "1313131313131313131313131313131313131313131313131313131313131313" }, "maxAttempts": 2 }], "budgetProfileRef": { "contractId": "v01-budget", "version": "0.1", "sha256": "1414141414141414141414141414141414141414141414141414141414141414" } }
+    }
+  },
+  "expected": { "outcome": "committed", "eventKind": "COLLABORATION_EVENT_KIND_RUN_CREATED", "resultingRunStatus": "RUN_STATUS_PLANNED", "resultingRunRevision": 1, "resultingStepStatus": "STEP_STATUS_READY", "resultingStepRevision": 1, "planStepCount": 1, "maxActiveAttempts": 1, "maxAttempts": 2, "businessWriteCount": 1 }
+}

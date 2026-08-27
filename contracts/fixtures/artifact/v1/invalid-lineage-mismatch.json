@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-invalid-lineage-mismatch",
+  "category": "invalid",
+  "requirementRefs": ["C04-LINEAGE-01"],
+  "principal": { "kind": "ARTIFACT_AUTHORITY", "principalId": "agentosd:artifact-authority", "authenticated": true },
+  "startingState": { "artifactSetId": "artifact_set_03", "revision": 1, "lineageAttemptId": "attempt_01", "memberLineageAttemptIds": ["attempt_01", "attempt_02"] },
+  "command": { "sealArtifactSet": { "artifactSetId": "artifact_set_03", "expectedRevision": 1, "observedManifest": { "algorithm": "HASH_ALGORITHM_SHA256", "digest": "3333333333333333333333333333333333333333333333333333333333333333", "byteLength": 1200 } } },
+  "expected": { "outcome": "error", "businessWriteCount": 0, "errorCode": "ARTIFACT_ERROR_CODE_LINEAGE_MISMATCH", "resultingStatus": "ARTIFACT_SET_STATUS_DRAFT" }
+}

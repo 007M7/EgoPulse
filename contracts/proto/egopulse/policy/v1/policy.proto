@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+package egopulse.policy.v1;
+
+import "egopulse/common/v1/common.proto";
+import "egopulse/harness/v1/harness.proto";
+import "google/protobuf/timestamp.proto";
+
+enum HarnessApprovalDecisionStateKind {
+  HARNESS_APPROVAL_DECISION_STATE_KIND_UNSPECIFIED = 0;
+  HARNESS_APPROVAL_DECISION_STATE_KIND_ISSUED = 1;
+  HARNESS_APPROVAL_DECISION_STATE_KIND_CONSUMED = 2;
+  HARNESS_APPROVAL_DECISION_STATE_KIND_REVOKED = 3;
+  HARNESS_APPROVAL_DECISION_STATE_KIND_EXPIRED = 4;
+  HARNESS_APPROVAL_DECISION_STATE_KIND_SUPERSEDED = 5;
+}
+
+enum PolicyDecisionEventKind {
+  POLICY_DECISION_EVENT_KIND_UNSPECIFIED = 0;
+  POLICY_DECISION_EVENT_KIND_ISSUED = 1;
+  POLICY_DECISION_EVENT_KIND_CONSUMED = 2;
+  POLICY_DECISION_EVENT_KIND_REVOKED = 3;
+  POLICY_DECISION_EVENT_KIND_EXPIRED = 4;
+  POLICY_DECISION_EVENT_KIND_SUPERSEDED = 5;
+}
+
+enum PolicyDecisionErrorCode {
+  POLICY_DECISION_ERROR_CODE_UNSPECIFIED = 0;
+  POLICY_DECISION_ERROR_CODE_INVALID_ARGUMENT = 1;
+  POLICY_DECISION_ERROR_CODE_UNAUTHENTICATED = 2;
+  POLICY_DECISION_ERROR_CODE_PERMISSION_DENIED = 3;
+  POLICY_DECISION_ERROR_CODE_NOT_FOUND = 4;
+  POLICY_DECISION_ERROR_CODE_REVISION_CONFLICT = 5;
+  POLICY_DECISION_ERROR_CODE_IDEMPOTENCY_CONFLICT = 6;
+  POLICY_DECISION_ERROR_CODE_REQUEST_MISMATCH = 7;
+  POLICY_DECISION_ERROR_CODE_FENCING_REJECTED = 8;
+  POLICY_DECISION_ERROR_CODE_POLICY_DENIED = 9;
+  POLICY_DECISION_ERROR_CODE_ALREADY_CONSUMED = 10;
+  POLICY_DECISION_ERROR_CODE_EXPIRED = 11;
+  POLICY_DECISION_ERROR_CODE_REVOKED = 12;
+  POLICY_DECISION_ERROR_CODE_INTEGRITY_FAILURE = 13;
+  POLICY_DECISION_ERROR_CODE_DELIVERY_RECEIPT_INVALID = 14;
+}
+
+// Immutable binding resolved from the durable Harness approval observation.
+// Client input cannot supply native_routing_ref or fencing facts.
+message HarnessApprovalRequestBinding {
+  string adapter_id = 1;
+  string attempt_id = 2;
+  string dispatch_id = 3;
+  uint64 fencing_token = 4;
+  string approval_request_id = 5;
+  egopulse.harness.v1.ApprovalKind kind = 6;
+  string action_digest_sha256 = 7;
+  string requested_scope_ref = 8;
+  string native_routing_ref = 9;
+  string request_observation_id = 10;
+  uint64 request_observation_sequence = 11;
+  egopulse.harness.v1.ApprovalRequestLifecycleKind request_lifecycle = 12;
+  uint64 request_revision = 13;
+}
+
+// Created by the authority from trusted IPC identity and policy evaluation.
+// It is never accepted as a client-authored assertion.
+message PolicyAuthorityProof {
+  string authenticated_principal_id = 1;
+  string authentication_context_ref = 2;
+  egopulse.common.v1.ContractReference authorization_policy_ref = 3;
+  string authorization_decision_id = 4;
+  google.protobuf.Timestamp verified_at = 5;
+}
+
+message HarnessApprovalDecisionRecord {
+  string authority_decision_ref = 1;
+  uint64 version = 2;
+  HarnessApprovalRequestBinding request = 3;
+  egopulse.harness.v1.ApprovalDecision decision = 4;
+  string reason_code = 5;
+  PolicyAuthorityProof authority_proof = 6;
+  google.protobuf.Timestamp issued_at = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  string canonical_payload_digest_sha256 = 9;
+  optional string supersedes_authority_decision_ref = 10;
+}
+
+message HarnessApprovalDecisionState {
+  string authority_decision_ref = 1;
+  uint64 revision = 2;
+  HarnessApprovalDecisionStateKind state = 3;
+  optional string consumption_receipt_id = 4;
+  optional string superseded_by_authority_decision_ref = 5;
+  optional string terminal_reason_code = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message HarnessApprovalConsumptionReceipt {
+  string consumption_receipt_id = 1;
+  string authority_decision_ref = 2;
+  egopulse.harness.v1.ApprovalDecisionReceipt adapter_receipt = 3;
+  google.protobuf.Timestamp consumed_at = 4;
+}
+
+// This is the only approval-write command exposed through Local API. The
+// authority resolves all routing, scope, principal and fencing facts itself.
+message IssueHarnessApprovalDecisionCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string approval_request_id = 2;
+  string expected_action_digest_sha256 = 3;
+  string expected_request_observation_id = 4;
+  uint64 expected_request_observation_sequence = 5;
+  egopulse.harness.v1.ApprovalDecision decision = 6;
+  string reason_code = 7;
+  optional string confirmation_proof_ref = 8;
+  uint64 expected_request_revision = 9;
+}
+
+// System-only command emitted after the Adapter has durably committed its
+// delivery receipt. It cannot repeat the native Harness decision.
+message ConsumeHarnessApprovalDecisionCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string authority_decision_ref = 2;
+  uint64 expected_state_revision = 3;
+  egopulse.harness.v1.ApprovalDecisionReceipt adapter_receipt = 4;
+}
+
+message RevokeHarnessApprovalDecisionCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string authority_decision_ref = 2;
+  uint64 expected_state_revision = 3;
+  string reason_code = 4;
+  string confirmation_proof_ref = 5;
+}
+
+message ExpireHarnessApprovalDecisionCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string authority_decision_ref = 2;
+  uint64 expected_state_revision = 3;
+  string policy_evaluation_ref = 4;
+}
+
+message PolicyDecisionCommand {
+  oneof command {
+    IssueHarnessApprovalDecisionCommand issue_harness_approval_decision = 1;
+    ConsumeHarnessApprovalDecisionCommand consume_harness_approval_decision = 2;
+    RevokeHarnessApprovalDecisionCommand revoke_harness_approval_decision = 3;
+    ExpireHarnessApprovalDecisionCommand expire_harness_approval_decision = 4;
+  }
+}
+
+message PolicyDecisionEvent {
+  string event_id = 1;
+  PolicyDecisionEventKind kind = 2;
+  string authority_decision_ref = 3;
+  uint64 resulting_state_revision = 4;
+  string authenticated_principal_id = 5;
+  string command_id = 6;
+  repeated string evidence_refs = 7;
+  google.protobuf.Timestamp committed_at = 8;
+}
+
+message PolicyDecisionCommandResult {
+  bool committed = 1;
+  bool replayed = 2;
+  HarnessApprovalDecisionRecord decision_record = 3;
+  HarnessApprovalDecisionState state = 4;
+  HarnessApprovalConsumptionReceipt consumption_receipt = 5;
+  PolicyDecisionEvent event = 6;
+  PolicyDecisionErrorCode error_code = 7;
+  optional string safe_error_fingerprint = 8;
+}
+
+service PolicyDecisionAuthorityService {
+  rpc Execute(PolicyDecisionCommand) returns (PolicyDecisionCommandResult);
+}

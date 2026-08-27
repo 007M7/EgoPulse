@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://egopulse.local/contracts/client-kernel-profile/v0.1",
+  "title": "EgoPulse Client Kernel Conformance Profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "contractId", "contractVersion", "authorityRef", "localApiCompatibility", "implementationBoundary", "capabilities", "invariants"],
+  "properties": {
+    "schemaVersion": { "const": "egopulse.client-kernel-profile/v0.1" },
+    "contractId": { "const": "egopulse.client-kernel.v1" },
+    "contractVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "authorityRef": { "type": "string", "minLength": 1 },
+    "localApiCompatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contractId", "minimumVersion", "maximumVersionExclusive", "runtimeReferenceRequired"],
+      "properties": {
+        "contractId": { "const": "egopulse.localapi.v1" },
+        "minimumVersion": { "type": "string", "minLength": 1 },
+        "maximumVersionExclusive": { "type": "string", "minLength": 1 },
+        "runtimeReferenceRequired": { "const": true }
+      }
+    },
+    "implementationBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sharedKernelLanguage", "surfaces", "typescriptBusinessKernelAllowed", "transport"],
+      "properties": {
+        "sharedKernelLanguage": { "const": "rust" },
+        "surfaces": { "type": "array", "uniqueItems": true, "minItems": 3, "items": { "enum": ["cli", "tui", "desktop_tauri_backend"] } },
+        "typescriptBusinessKernelAllowed": { "const": false },
+        "transport": { "const": "tonic_grpc_http2_semantics_over_named_pipe_or_uds_no_tcp" }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "minItems": 10,
+      "items": { "enum": ["session_negotiation", "query", "list", "watch_complete_snapshots", "await_projection", "typed_command", "stable_cursor", "reset_and_refetch", "read_your_write", "typed_error", "frame_deduplication"] }
+    },
+    "invariants": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surfaceNeutral", "completeSnapshotStreams", "orderedWithinEpoch", "atLeastOnceDelivery", "unknownFrameFailClosed", "gapRequiresReset", "authorityResultPreserved", "clientNeverBecomesAuthority"],
+      "properties": {
+        "surfaceNeutral": { "const": true },
+        "completeSnapshotStreams": { "const": true },
+        "orderedWithinEpoch": { "const": true },
+        "atLeastOnceDelivery": { "const": true },
+        "unknownFrameFailClosed": { "const": true },
+        "gapRequiresReset": { "const": true },
+        "authorityResultPreserved": { "const": true },
+        "clientNeverBecomesAuthority": { "const": true }
+      }
+    }
+  }
+}

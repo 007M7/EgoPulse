@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://egopulse.local/gate3/v01/verification-fixture-envelope-v0.1.schema.json",
+  "title": "V-01 Gate 3 Verification Contract Fixture Envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "fixtureId", "category", "requirementRefs", "principal", "startingState", "command", "expected"],
+  "properties": {
+    "schemaVersion": { "const": "v01-verification-fixture/v0.1" },
+    "fixtureId": { "type": "string", "minLength": 1 },
+    "category": { "enum": ["valid", "invalid", "duplicate", "stale", "unauthorized", "recovery"] },
+    "requirementRefs": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "principalId", "authenticated"],
+      "properties": {
+        "kind": { "enum": ["VERIFICATION_AUTHORITY", "SEGO_CHECKER", "TASK_AUTHORITY", "POLICY_AUTHORITY", "FOUNDER", "HARNESS", "UNAUTHENTICATED"] },
+        "principalId": { "type": "string", "minLength": 1 },
+        "authenticated": { "type": "boolean" }
+      }
+    },
+    "startingState": { "type": ["object", "null"] },
+    "command": { "type": "object", "minProperties": 1, "maxProperties": 1 },
+    "expected": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["outcome", "businessWriteCount"],
+      "properties": {
+        "outcome": { "enum": ["committed", "replayed", "error"] },
+        "businessWriteCount": { "type": "integer", "minimum": 0, "maximum": 1 }
+      }
+    }
+  }
+}

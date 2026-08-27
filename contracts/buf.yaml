@@ -1,0 +1,15 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # Authority and adapter services deliberately expose reusable command/result
+    # envelopes. Renaming them after each RPC would duplicate the same wire type
+    # and obscure the single command contract consumed by Local API adapters.
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+breaking:
+  use:
+    - FILE

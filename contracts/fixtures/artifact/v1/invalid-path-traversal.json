@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-invalid-path-traversal",
+  "category": "invalid",
+  "requirementRefs": ["C04-SEC-01"],
+  "principal": { "kind": "GOVERNED_COLLECTOR", "principalId": "collector:workspace", "authenticated": true },
+  "startingState": null,
+  "command": { "stageArtifact": { "artifactId": "art_escape_01", "semanticClass": "ARTIFACT_SEMANTIC_CLASS_WORKSPACE_MANIFEST", "content": { "algorithm": "HASH_ALGORITHM_SHA256", "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "byteLength": 214 }, "workspaceRef": "workspace:ws_01", "relativePaths": ["../../secrets.txt"], "secretScan": "passed" } },
+  "expected": { "outcome": "error", "businessWriteCount": 0, "errorCode": "ARTIFACT_ERROR_CODE_SCOPE_VIOLATION", "blobCommitted": false }
+}

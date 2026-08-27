@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-valid-running-observation", "category": "valid",
+  "requirementRefs": ["AC-02", "C03-EVENT-01"], "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "attemptStatus": "ATTEMPT_STATUS_ACKNOWLEDGED", "fencingToken": 3, "lastObservationSequence": 1 }, "resolvedReferences": {},
+  "command": { "ingestObservation": { "observationId": "obs-running-001", "adapterId": "codex-adapter", "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 3, "observationSequence": 2, "nativeEventId": "turn.started:turn-opaque-001", "nativeEventDigestSha256": "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1", "capabilityProfileId": "codex-app-server-v2-0.148.0-alpha.15", "criticality": "OBSERVATION_CRITICALITY_CONTROL", "rawEvidenceRef": "raw-turn-started-001", "lifecycle": { "kind": "LIFECYCLE_KIND_EXECUTION_STARTED", "safeStatusCode": "CODEX_TURN_IN_PROGRESS", "sideEffectCertainty": "SIDE_EFFECT_CERTAINTY_NONE_PROVEN" } } },
+  "expected": { "outcome": "committed", "resultingObservationSequence": 2, "attemptStatus": "ATTEMPT_STATUS_RUNNING", "businessWriteCount": 1 }
+}

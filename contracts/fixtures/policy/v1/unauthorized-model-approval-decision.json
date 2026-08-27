@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "v01-policy-fixture/v0.1",
+  "fixtureId": "policy-unauthorized-model-approval-decision",
+  "category": "unauthorized",
+  "requirementRefs": ["G4-07A-AUTH-02", "QA-04"],
+  "principal": { "kind": "MODEL", "principalId": "model:codex", "authenticated": true },
+  "startingState": null,
+  "resolvedReferences": { "approvalRequest": { "approvalRequestId": "approval-001", "durable": true } },
+  "command": {
+    "issueHarnessApprovalDecision": {
+      "metadata": { "commandId": "cmd-policy-model-001", "idempotencyKey": "policy-model-001", "idempotencyScope": "approval-001", "requestDigestSha256": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1", "issuedAt": "2026-08-24T01:13:00Z", "correlationId": "corr-policy-004" },
+      "approvalRequestId": "approval-001",
+      "expectedActionDigestSha256": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
+      "expectedRequestObservationId": "observation-approval-001",
+      "expectedRequestObservationSequence": 12,
+      "expectedRequestRevision": 1,
+      "decision": "APPROVAL_DECISION_ALLOW_ONCE",
+      "reasonCode": "MODEL_SELF_APPROVAL"
+    }
+  },
+  "expected": { "outcome": "error", "businessWriteCount": 0, "errorCode": "POLICY_DECISION_ERROR_CODE_PERMISSION_DENIED", "founderDelegationInferred": false, "adapterEnvelopeOutboxCount": 0 }
+}

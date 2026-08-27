@@ -9,7 +9,21 @@ members = [
   "crates/cognition-runtime",
   "crates/local-ide-control",
   "crates/local-api",
-  "crates/process-supervision"
+  "crates/client-kernel",
+  "crates/client-operations",
+  "crates/local-ipc-platform",
+  "crates/local-read-model",
+  "crates/process-supervision",
+  "crates/harness-adapter",
+  "crates/codex-adapter",
+  "crates/kimi-adapter",
+  "crates/dsh-adapter",
+  "crates/opencode-adapter",
+  "crates/artifact-authority",
+  "crates/verification-authority",
+  "crates/founder-verdict-authority",
+  "crates/policy-decision-authority",
+  "tools/contract-rust-codegen"
 ]
 
 [workspace.package]
@@ -19,19 +33,52 @@ rust-version = "1.98"
 repository = "https://github.com/007M7/EgoPulse"
 
 [workspace.dependencies]
+base64 = "=0.22.1"
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.29.0"
 ratatui = "0.30.2"
 tauri = "2.11.5"
 tauri-build = "2.6.3"
-tokio = { version = "1.53.1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "=0.1.19"
 tracing = "0.1.44"
+prost = "=0.14.4"
+prost-types = "=0.14.4"
+tonic = "=0.14.6"
+tonic-prost = "=0.14.6"
+tonic-prost-build = "=0.14.6"
+hex = "=0.4.3"
+hmac = "=0.12.1"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite_migration = { version = "=2.6.0", default-features = false }
+sha2 = "=0.10.9"
+thiserror = "=2.0.20"
+uuid = { version = "=1.24.1", features = ["v7"] }
+zeroize = "=1.9.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+hyper-util = { version = "=0.1.20", features = ["tokio"] }
+tower = { version = "=0.5.3", features = ["util"] }
+futures-util = "=0.3.34"
 
 egopulse-domain-contracts = { path = "crates/domain-contracts" }
 egopulse-cognition-runtime = { path = "crates/cognition-runtime" }
 egopulse-local-ide-control = { path = "crates/local-ide-control" }
 egopulse-local-api = { path = "crates/local-api" }
+egopulse-client-kernel = { path = "crates/client-kernel" }
+egopulse-client-operations = { path = "crates/client-operations" }
+egopulse-local-ipc-platform = { path = "crates/local-ipc-platform" }
+egopulse-local-read-model = { path = "crates/local-read-model" }
 egopulse-process-supervision = { path = "crates/process-supervision" }
+egopulse-harness-adapter = { path = "crates/harness-adapter" }
+egopulse-codex-adapter = { path = "crates/codex-adapter" }
+egopulse-kimi-adapter = { path = "crates/kimi-adapter" }
+egopulse-dsh-adapter = { path = "crates/dsh-adapter" }
+egopulse-opencode-adapter = { path = "crates/opencode-adapter" }
+egopulse-artifact-authority = { path = "crates/artifact-authority" }
+egopulse-verification-authority = { path = "crates/verification-authority" }
+egopulse-founder-verdict-authority = { path = "crates/founder-verdict-authority" }
+egopulse-policy-decision-authority = { path = "crates/policy-decision-authority" }
 
 [profile.release]
 codegen-units = 1

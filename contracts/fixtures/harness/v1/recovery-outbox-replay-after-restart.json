@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-recovery-outbox-replay-after-restart", "category": "recovery",
+  "requirementRefs": ["QA-02", "C03-REPLAY-01"], "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "consumerOffset": 6, "adapterOutboxHighWatermark": 7, "fencingToken": 3 },
+  "resolvedReferences": { "durableOutbox": { "observationId": "obs-replay-007", "sequence": 7, "digestValid": true } },
+  "command": { "ingestObservation": { "observationId": "obs-replay-007", "adapterId": "codex-adapter", "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 3, "observationSequence": 7, "nativeEventDigestSha256": "f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7", "capabilityProfileId": "codex-app-server-v2-0.148.0-alpha.15", "criticality": "OBSERVATION_CRITICALITY_INFORMATIONAL", "rawEvidenceRef": "raw-usage-007", "usage": { "usageReceiptRef": "usage-007", "inputTokens": 21441, "outputTokens": 12 } } },
+  "expected": { "outcome": "committed", "resultingConsumerOffset": 7, "nativeRedispatchCount": 0, "businessWriteCount": 1 }
+}

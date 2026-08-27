@@ -1,0 +1,55 @@
+{
+  "schemaVersion": "v01-policy-fixture/v0.1",
+  "fixtureId": "policy-valid-issue-harness-approval-decision",
+  "category": "valid",
+  "requirementRefs": ["G4-07A-AUTH-01", "C03-APPROVAL-02", "C07-AUTH-03"],
+  "principal": { "kind": "FOUNDER", "principalId": "os-user:founder", "authenticated": true },
+  "startingState": null,
+  "resolvedReferences": {
+    "approvalRequest": {
+      "adapterId": "adapter:codex",
+      "attemptId": "attempt-001",
+      "dispatchId": "dispatch-001",
+      "fencingToken": 3,
+      "approvalRequestId": "approval-001",
+      "actionDigestSha256": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
+      "requestObservationId": "observation-approval-001",
+      "requestObservationSequence": 12,
+      "requestLifecycle": "APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN",
+      "requestRevision": 1,
+      "nativeRoutingRef": "native-approval-route-001",
+      "durable": true
+    }
+  },
+  "command": {
+    "issueHarnessApprovalDecision": {
+      "metadata": {
+        "commandId": "cmd-policy-issue-001",
+        "idempotencyKey": "policy-issue-001",
+        "idempotencyScope": "approval-001",
+        "requestDigestSha256": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "issuedAt": "2026-08-24T01:10:00Z",
+        "correlationId": "corr-policy-001"
+      },
+      "approvalRequestId": "approval-001",
+      "expectedActionDigestSha256": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
+      "expectedRequestObservationId": "observation-approval-001",
+      "expectedRequestObservationSequence": 12,
+      "expectedRequestRevision": 1,
+      "decision": "APPROVAL_DECISION_ALLOW_ONCE",
+      "reasonCode": "FOUNDER_CONFIRMED"
+    }
+  },
+  "expected": {
+    "outcome": "committed",
+    "businessWriteCount": 1,
+    "resultingState": "HARNESS_APPROVAL_DECISION_STATE_KIND_ISSUED",
+    "resultingStateRevision": 1,
+    "authorityDecisionRefGenerated": true,
+    "authorityProofDerivedFromTrustedContext": true,
+    "clientSuppliedAuthorityDecisionRef": false,
+    "clientSuppliedNativeRoutingRef": false,
+    "adapterEnvelopeOutboxCount": 1,
+    "adapterCalledSynchronously": false
+  }
+}

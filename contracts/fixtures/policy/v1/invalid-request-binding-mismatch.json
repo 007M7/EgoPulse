@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "v01-policy-fixture/v0.1",
+  "fixtureId": "policy-invalid-request-binding-mismatch",
+  "category": "invalid",
+  "requirementRefs": ["G4-07A-BIND-01", "QA-04"],
+  "principal": { "kind": "FOUNDER", "principalId": "os-user:founder", "authenticated": true },
+  "startingState": null,
+  "resolvedReferences": {
+    "approvalRequest": {
+      "approvalRequestId": "approval-001",
+      "actionDigestSha256": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
+      "requestObservationId": "observation-approval-001",
+      "requestObservationSequence": 12,
+      "durable": true
+    }
+  },
+  "command": {
+    "issueHarnessApprovalDecision": {
+      "metadata": { "commandId": "cmd-policy-mismatch-001", "idempotencyKey": "policy-mismatch-001", "idempotencyScope": "approval-001", "requestDigestSha256": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1", "issuedAt": "2026-08-24T01:11:00Z", "correlationId": "corr-policy-002" },
+      "approvalRequestId": "approval-001",
+      "expectedActionDigestSha256": "f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4",
+      "expectedRequestObservationId": "observation-approval-001",
+      "expectedRequestObservationSequence": 12,
+      "expectedRequestRevision": 1,
+      "decision": "APPROVAL_DECISION_ALLOW_ONCE",
+      "reasonCode": "FOUNDER_CONFIRMED"
+    }
+  },
+  "expected": { "outcome": "error", "businessWriteCount": 0, "errorCode": "POLICY_DECISION_ERROR_CODE_REQUEST_MISMATCH", "adapterEnvelopeOutboxCount": 0 }
+}

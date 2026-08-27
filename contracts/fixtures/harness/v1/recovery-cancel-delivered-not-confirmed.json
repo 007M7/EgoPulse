@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-recovery-cancel-delivered-not-confirmed", "category": "recovery",
+  "requirementRefs": ["V01-D03", "C03-CANCEL-01", "QR-04"], "principal": { "kind": "COLLABORATION_CONTROL", "principalId": "collaboration-control:test", "authenticated": true },
+  "startingState": { "attemptStatus": "ATTEMPT_STATUS_CANCELLATION_PENDING", "fencingToken": 3 },
+  "resolvedReferences": { "capabilityProfile": { "cancellation": "CANCELLATION_SEMANTICS_NATIVE_COOPERATIVE" } },
+  "command": { "cancel": { "meta": { "commandId": "cmd-cancel-001", "idempotencyKey": "cancel-001", "idempotencyScope": "attempt-001", "requestDigestSha256": "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6", "issuedAt": "2026-08-23T04:13:00Z", "correlationId": "corr-harness-013" }, "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 3, "cancellationRequestId": "cancel-request-001", "nativeSessionRef": "thread-opaque-001", "nativeExecutionRef": "turn-opaque-001", "confirmationDeadline": "2026-08-23T04:13:10Z" } },
+  "expected": { "outcome": "committed", "deliveryDisposition": "CANCELLATION_DELIVERY_DISPOSITION_DELIVERED", "cancellationConfirmed": false, "attemptStatusAfterReceipt": "ATTEMPT_STATUS_CANCELLATION_PENDING", "onDeadlineWithoutTerminalObservation": "ATTEMPT_STATUS_OUTCOME_UNKNOWN", "automaticRetryAllowed": false, "businessWriteCount": 1 }
+}

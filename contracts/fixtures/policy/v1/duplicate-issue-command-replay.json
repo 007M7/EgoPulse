@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "v01-policy-fixture/v0.1",
+  "fixtureId": "policy-duplicate-issue-command-replay",
+  "category": "duplicate",
+  "requirementRefs": ["G4-07A-IDEMP-01", "QH-05"],
+  "principal": { "kind": "FOUNDER", "principalId": "os-user:founder", "authenticated": true },
+  "startingState": { "authorityDecisionRef": "policy-decision-001", "revision": 1, "state": "HARNESS_APPROVAL_DECISION_STATE_KIND_ISSUED", "originalCommandCommitted": true },
+  "resolvedReferences": { "approvalRequest": { "approvalRequestId": "approval-001", "durable": true } },
+  "command": {
+    "issueHarnessApprovalDecision": {
+      "metadata": { "commandId": "cmd-policy-issue-001-retry", "idempotencyKey": "policy-issue-001", "idempotencyScope": "approval-001", "requestDigestSha256": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1", "issuedAt": "2026-08-24T01:10:01Z", "correlationId": "corr-policy-001" },
+      "approvalRequestId": "approval-001",
+      "expectedActionDigestSha256": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
+      "expectedRequestObservationId": "observation-approval-001",
+      "expectedRequestObservationSequence": 12,
+      "expectedRequestRevision": 1,
+      "decision": "APPROVAL_DECISION_ALLOW_ONCE",
+      "reasonCode": "FOUNDER_CONFIRMED"
+    }
+  },
+  "expected": { "outcome": "replayed", "replayed": true, "businessWriteCount": 0, "authorityDecisionRef": "policy-decision-001", "duplicateAuthorityDecisionCreated": false, "duplicateOutboxMessageCreated": false }
+}

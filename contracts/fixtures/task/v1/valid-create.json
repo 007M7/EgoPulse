@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "v01-task-fixture/v0.1",
+  "fixtureId": "task-valid-create",
+  "category": "valid",
+  "requirementRefs": ["AC-01", "QA-01", "QH-08"],
+  "principal": { "kind": "FOUNDER", "principalId": "founder:test", "authenticated": true },
+  "startingSnapshot": null,
+  "resolvedReferences": {
+    "acceptanceContract": { "valid": true, "contractId": "repository_change_acceptance", "version": "1", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    "budgetProfile": { "valid": true, "contractId": "v01-quality-budget", "version": "0.1", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+  },
+  "command": {
+    "createTask": {
+      "meta": { "commandId": "cmd-create-001", "idempotencyKey": "create-001", "idempotencyScope": "founder:test/v01", "requestDigestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "issuedAt": "2026-08-23T00:00:00Z", "correlationId": "corr-001" },
+      "workType": "governed_repository_change",
+      "inputSnapshotId": "input-001",
+      "targetScopeRef": "repo-scope-001",
+      "acceptanceContractRef": { "contractId": "repository_change_acceptance", "version": "1", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      "budgetProfileRef": { "contractId": "v01-quality-budget", "version": "0.1", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+    }
+  },
+  "expected": { "outcome": "committed", "eventKind": "TASK_EVENT_KIND_CREATED", "resultingStatus": "TASK_STATUS_READY", "resultingRevision": 1, "resultingWorkRevision": 1, "businessWriteCount": 1 }
+}
+

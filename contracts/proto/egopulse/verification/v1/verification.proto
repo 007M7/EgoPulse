@@ -1,0 +1,328 @@
+syntax = "proto3";
+
+package egopulse.verification.v1;
+
+import "egopulse/artifact/v1/artifact.proto";
+import "egopulse/common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+enum CheckerProfileStatus {
+  CHECKER_PROFILE_STATUS_UNSPECIFIED = 0;
+  CHECKER_PROFILE_STATUS_ACTIVE = 1;
+  CHECKER_PROFILE_STATUS_RETIRED = 2;
+  CHECKER_PROFILE_STATUS_REVOKED = 3;
+  CHECKER_PROFILE_STATUS_QUARANTINED = 4;
+}
+
+enum CheckerAssuranceClass {
+  CHECKER_ASSURANCE_CLASS_UNSPECIFIED = 0;
+  CHECKER_ASSURANCE_CLASS_DETERMINISTIC = 1;
+  CHECKER_ASSURANCE_CLASS_MODEL_ASSISTED = 2;
+  CHECKER_ASSURANCE_CLASS_HUMAN_REQUIRED = 3;
+}
+
+enum VerificationStatus {
+  VERIFICATION_STATUS_UNSPECIFIED = 0;
+  VERIFICATION_STATUS_QUEUED = 1;
+  VERIFICATION_STATUS_RUNNING = 2;
+  VERIFICATION_STATUS_CANCELLATION_PENDING = 3;
+  VERIFICATION_STATUS_COMPLETED = 4;
+  VERIFICATION_STATUS_HELD = 5;
+  VERIFICATION_STATUS_CANCELLED = 6;
+  VERIFICATION_STATUS_SUPERSEDED = 7;
+}
+
+enum VerificationConclusion {
+  VERIFICATION_CONCLUSION_UNSPECIFIED = 0;
+  VERIFICATION_CONCLUSION_PASSED = 1;
+  VERIFICATION_CONCLUSION_FAILED = 2;
+  VERIFICATION_CONCLUSION_PARTIAL = 3;
+  VERIFICATION_CONCLUSION_INDETERMINATE = 4;
+}
+
+enum CriterionRequirement {
+  CRITERION_REQUIREMENT_UNSPECIFIED = 0;
+  CRITERION_REQUIREMENT_MUST_PASS = 1;
+  CRITERION_REQUIREMENT_SHOULD_PASS = 2;
+  CRITERION_REQUIREMENT_INFORMATIONAL = 3;
+}
+
+enum CriterionOutcome {
+  CRITERION_OUTCOME_UNSPECIFIED = 0;
+  CRITERION_OUTCOME_PASSED = 1;
+  CRITERION_OUTCOME_FAILED = 2;
+  CRITERION_OUTCOME_UNVERIFIED = 3;
+  CRITERION_OUTCOME_ERROR = 4;
+  CRITERION_OUTCOME_NOT_APPLICABLE = 5;
+}
+
+enum EvidenceCoverage {
+  EVIDENCE_COVERAGE_UNSPECIFIED = 0;
+  EVIDENCE_COVERAGE_COMPLETE = 1;
+  EVIDENCE_COVERAGE_PARTIAL = 2;
+  EVIDENCE_COVERAGE_MISSING = 3;
+  EVIDENCE_COVERAGE_INTEGRITY_FAILED = 4;
+}
+
+enum DiscrepancySeverity {
+  DISCREPANCY_SEVERITY_UNSPECIFIED = 0;
+  DISCREPANCY_SEVERITY_BLOCKER = 1;
+  DISCREPANCY_SEVERITY_MAJOR = 2;
+  DISCREPANCY_SEVERITY_MINOR = 3;
+  DISCREPANCY_SEVERITY_NIT = 4;
+  DISCREPANCY_SEVERITY_INFO = 5;
+}
+
+enum UnverifiedReason {
+  UNVERIFIED_REASON_UNSPECIFIED = 0;
+  UNVERIFIED_REASON_REQUIRES_JUDGEMENT = 1;
+  UNVERIFIED_REASON_INSUFFICIENT_EVIDENCE = 2;
+  UNVERIFIED_REASON_SUBJECTIVE = 3;
+  UNVERIFIED_REASON_POLICY_AMBIGUOUS = 4;
+  UNVERIFIED_REASON_SCOPE_NOT_CAPTURED = 5;
+  UNVERIFIED_REASON_DEPENDENCY_NOT_CAPTURED = 6;
+  UNVERIFIED_REASON_CHECKER_UNAVAILABLE = 7;
+}
+
+enum VerificationEventKind {
+  VERIFICATION_EVENT_KIND_UNSPECIFIED = 0;
+  VERIFICATION_EVENT_KIND_CHECKER_PROFILE_ATTESTED = 1;
+  VERIFICATION_EVENT_KIND_REQUEST_CREATED = 2;
+  VERIFICATION_EVENT_KIND_RUN_STARTED = 3;
+  VERIFICATION_EVENT_KIND_CRITERION_RECORDED = 4;
+  VERIFICATION_EVENT_KIND_ARTIFACT_COMMITTED = 5;
+  VERIFICATION_EVENT_KIND_CANCELLATION_REQUESTED = 6;
+  VERIFICATION_EVENT_KIND_CANCELLED = 7;
+  VERIFICATION_EVENT_KIND_HELD = 8;
+  VERIFICATION_EVENT_KIND_SUPERSEDED = 9;
+}
+
+enum VerificationErrorCode {
+  VERIFICATION_ERROR_CODE_UNSPECIFIED = 0;
+  VERIFICATION_ERROR_CODE_INVALID_ARGUMENT = 1;
+  VERIFICATION_ERROR_CODE_UNAUTHENTICATED = 2;
+  VERIFICATION_ERROR_CODE_PERMISSION_DENIED = 3;
+  VERIFICATION_ERROR_CODE_NOT_FOUND = 4;
+  VERIFICATION_ERROR_CODE_REVISION_CONFLICT = 5;
+  VERIFICATION_ERROR_CODE_IDEMPOTENCY_CONFLICT = 6;
+  VERIFICATION_ERROR_CODE_BINDING_STALE = 7;
+  VERIFICATION_ERROR_CODE_ARTIFACT_SET_NOT_SEALED = 8;
+  VERIFICATION_ERROR_CODE_MANIFEST_MISMATCH = 9;
+  VERIFICATION_ERROR_CODE_CLAIM_MISMATCH = 10;
+  VERIFICATION_ERROR_CODE_ACCEPTANCE_CONTRACT_MISMATCH = 11;
+  VERIFICATION_ERROR_CODE_CHECKER_PROFILE_MISMATCH = 12;
+  VERIFICATION_ERROR_CODE_EVIDENCE_INCOMPLETE = 13;
+  VERIFICATION_ERROR_CODE_SCHEMA_INVALID = 14;
+  VERIFICATION_ERROR_CODE_INTEGRITY_FAILURE = 15;
+  VERIFICATION_ERROR_CODE_CHECKER_UNAVAILABLE = 16;
+  VERIFICATION_ERROR_CODE_CHECKER_TIMEOUT = 17;
+  VERIFICATION_ERROR_CODE_OUTPUT_UNTRUSTED = 18;
+  VERIFICATION_ERROR_CODE_CANCELLATION_OUTCOME_UNKNOWN = 19;
+  VERIFICATION_ERROR_CODE_UNKNOWN_CRITICAL_RESULT = 20;
+}
+
+message CheckerProfile {
+  string checker_profile_id = 1;
+  uint64 revision = 2;
+  CheckerProfileStatus status = 3;
+  string checker_id = 4;
+  string checker_version = 5;
+  egopulse.common.v1.ContractReference input_contract_ref = 6;
+  egopulse.common.v1.ContractReference output_contract_ref = 7;
+  repeated string supported_criterion_types = 8;
+  CheckerAssuranceClass assurance_class = 9;
+  egopulse.common.v1.ContractReference sandbox_profile_ref = 10;
+  egopulse.common.v1.ContractReference tool_policy_ref = 11;
+  egopulse.common.v1.ContractReference data_egress_policy_ref = 12;
+  uint64 timeout_ms = 13;
+  bool network_allowed = 14;
+  string profile_digest_sha256 = 15;
+  repeated string attestation_evidence_artifact_ids = 16;
+  google.protobuf.Timestamp attested_at = 17;
+}
+
+message VerificationBinding {
+  egopulse.artifact.v1.LineageBinding lineage = 1;
+  string artifact_set_id = 2;
+  egopulse.artifact.v1.ContentAddress artifact_set_manifest = 3;
+  string claim_id = 4;
+  egopulse.common.v1.ContractReference claim_semantic_profile_ref = 5;
+  egopulse.common.v1.ContractReference acceptance_contract_ref = 6;
+}
+
+message VerificationRequest {
+  string verification_request_id = 1;
+  uint64 revision = 2;
+  VerificationStatus status = 3;
+  string verification_type = 4;
+  VerificationBinding binding = 5;
+  repeated string criterion_ids = 6;
+  repeated egopulse.common.v1.ContractReference checker_profile_refs = 7;
+  google.protobuf.Timestamp created_at = 8;
+  optional string hold_reason_code = 9;
+}
+
+message CriterionResult {
+  string criterion_result_id = 1;
+  string criterion_id = 2;
+  CriterionRequirement requirement = 3;
+  CriterionOutcome outcome = 4;
+  CheckerAssuranceClass assurance_class = 5;
+  egopulse.common.v1.ContractReference checker_profile_ref = 6;
+  EvidenceCoverage evidence_coverage = 7;
+  repeated string evidence_ids = 8;
+  repeated string discrepancy_ids = 9;
+  repeated string unverified_item_ids = 10;
+  uint64 duration_ms = 11;
+  optional string safe_detail_artifact_id = 12;
+}
+
+message Discrepancy {
+  string discrepancy_id = 1;
+  string criterion_id = 2;
+  DiscrepancySeverity severity = 3;
+  repeated string evidence_ids = 4;
+  string description_artifact_id = 5;
+  optional string suggested_fix_artifact_id = 6;
+}
+
+message UnverifiedItem {
+  string unverified_item_id = 1;
+  string criterion_id = 2;
+  UnverifiedReason reason = 3;
+  repeated string evidence_ids = 4;
+  optional string context_artifact_id = 5;
+}
+
+message VerificationProvenance {
+  string verifier_principal_id = 1;
+  repeated egopulse.common.v1.ContractReference checker_profile_refs = 2;
+  repeated string tool_receipt_artifact_ids = 3;
+  repeated string model_call_receipt_artifact_ids = 4;
+  repeated string raw_output_artifact_ids = 5;
+  uint64 duration_ms = 6;
+  optional string cost_receipt_artifact_id = 7;
+}
+
+message VerificationArtifact {
+  string verification_artifact_id = 1;
+  uint64 version = 2;
+  string verification_request_id = 3;
+  string verification_run_id = 4;
+  string verification_type = 5;
+  VerificationBinding binding = 6;
+  VerificationConclusion conclusion = 7;
+  EvidenceCoverage overall_evidence_coverage = 8;
+  repeated CriterionResult criterion_results = 9;
+  repeated Discrepancy discrepancies = 10;
+  repeated UnverifiedItem unverified_items = 11;
+  VerificationProvenance provenance = 12;
+  egopulse.artifact.v1.ContentAddress canonical_payload = 13;
+  google.protobuf.Timestamp completed_at = 14;
+  optional string supersedes_verification_artifact_id = 15;
+}
+
+message VerificationRun {
+  string verification_run_id = 1;
+  string verification_request_id = 2;
+  uint64 revision = 3;
+  VerificationStatus status = 4;
+  repeated CriterionResult criterion_results = 5;
+  google.protobuf.Timestamp started_at = 6;
+  google.protobuf.Timestamp ended_at = 7;
+  optional string hold_reason_code = 8;
+}
+
+message AttestCheckerProfileCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  CheckerProfile profile = 2;
+}
+
+message CreateVerificationRequestCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  VerificationRequest request = 2;
+}
+
+message StartVerificationRunCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string verification_request_id = 2;
+  uint64 expected_request_revision = 3;
+  string verification_run_id = 4;
+}
+
+message RecordCriterionResultCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string verification_run_id = 2;
+  uint64 expected_run_revision = 3;
+  CriterionResult result = 4;
+}
+
+message CompleteVerificationCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string verification_run_id = 2;
+  uint64 expected_run_revision = 3;
+  VerificationArtifact artifact = 4;
+}
+
+message RequestVerificationCancellationCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string verification_run_id = 2;
+  uint64 expected_run_revision = 3;
+  string authority_ref = 4;
+}
+
+message RecordVerificationCancellationCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string verification_run_id = 2;
+  uint64 expected_run_revision = 3;
+  bool cancellation_confirmed = 4;
+  repeated string evidence_artifact_ids = 5;
+}
+
+message HoldVerificationCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string verification_run_id = 2;
+  uint64 expected_run_revision = 3;
+  string reason_code = 4;
+  repeated string evidence_artifact_ids = 5;
+}
+
+message VerificationCommand {
+  oneof command {
+    AttestCheckerProfileCommand attest_checker_profile = 1;
+    CreateVerificationRequestCommand create_verification_request = 2;
+    StartVerificationRunCommand start_verification_run = 3;
+    RecordCriterionResultCommand record_criterion_result = 4;
+    CompleteVerificationCommand complete_verification = 5;
+    RequestVerificationCancellationCommand request_verification_cancellation = 6;
+    RecordVerificationCancellationCommand record_verification_cancellation = 7;
+    HoldVerificationCommand hold_verification = 8;
+  }
+}
+
+message VerificationEvent {
+  string event_id = 1;
+  VerificationEventKind kind = 2;
+  string aggregate_id = 3;
+  uint64 aggregate_revision = 4;
+  string authenticated_principal_id = 5;
+  string command_id = 6;
+  repeated string evidence_artifact_ids = 7;
+  google.protobuf.Timestamp committed_at = 8;
+}
+
+message VerificationCommandResult {
+  bool committed = 1;
+  bool replayed = 2;
+  CheckerProfile checker_profile = 3;
+  VerificationRequest request = 4;
+  VerificationRun run = 5;
+  VerificationArtifact artifact = 6;
+  VerificationEvent event = 7;
+  VerificationErrorCode error_code = 8;
+  optional string safe_error_fingerprint = 9;
+}
+
+service VerificationAuthorityService {
+  rpc Execute(VerificationCommand) returns (VerificationCommandResult);
+}

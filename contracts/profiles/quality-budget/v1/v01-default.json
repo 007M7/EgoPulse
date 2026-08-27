@@ -1,0 +1,54 @@
+{
+  "schemaVersion": "egopulse.quality-budget-profile/v0.1",
+  "profileId": "v01-quality-budget",
+  "profileVersion": "0.1.0",
+  "authorityRef": "conversation:2026-08-22:founder-v01-d03-quality-budget",
+  "designBindingGate": "Gate 3",
+  "verificationGate": "Gate 6",
+  "rules": [
+    { "requirementId": "QH-01", "class": "governance_redline", "metric": "task_completed_without_matching_founder_verdict_count", "limits": { "maxCount": 0 }, "failureDisposition": "fail_gate6_and_block_integration" },
+    { "requirementId": "QH-02", "class": "governance_redline", "metric": "non_authority_direct_business_write_count", "limits": { "maxCount": 0 }, "failureDisposition": "fail_closed_and_audit" },
+    { "requirementId": "QH-03", "class": "governance_redline", "metric": "duplicate_authority_transition_or_dispatch_count", "limits": { "maxCount": 0 }, "failureDisposition": "isolate_conflict_and_hold" },
+    { "requirementId": "QH-04", "class": "governance_redline", "metric": "integrity_mismatch_verified_pass_count", "limits": { "maxCount": 0 }, "failureDisposition": "verification_failed_or_partial" },
+    { "requirementId": "QH-05", "class": "governance_redline", "metric": "unknown_external_effect_blind_retry_count", "limits": { "maxCount": 0 }, "failureDisposition": "reconcile_before_retry_or_hold" },
+    { "requirementId": "QH-06", "class": "governance_redline", "metric": "secret_or_full_credential_exposure_count", "limits": { "maxCount": 0 }, "failureDisposition": "block_redact_and_emit_security_event" },
+    { "requirementId": "QH-07", "class": "governance_redline", "metric": "committed_authority_metadata_loss", "limits": { "rpoSeconds": 0, "faultModel": "PROCESS_OR_OS_CRASH_DURABLE_MEDIA_INTACT" }, "failureDisposition": "fail_recovery_validation" },
+    { "requirementId": "QH-08", "class": "governance_redline", "metric": "unattributed_task_transition_count", "limits": { "maxCount": 0, "auditCompletenessPercent": 100 }, "failureDisposition": "reject_transition" },
+
+    { "requirementId": "QT-01", "class": "latency", "metric": "local_authority_command_latency", "limits": { "p95Milliseconds": 250, "singleFailureMilliseconds": 1000 }, "failureDisposition": "record_performance_failure_without_replay" },
+    { "requirementId": "QT-02", "class": "latency", "metric": "agentosd_cold_start_to_recovered_local_api", "limits": { "p95Milliseconds": 2000, "degradedAfterMilliseconds": 5000 }, "failureDisposition": "show_degraded_or_held" },
+    { "requirementId": "QT-03", "class": "latency", "metric": "authority_revision_to_connected_client_projection", "limits": { "p95Milliseconds": 500, "staleAfterMilliseconds": 2000 }, "failureDisposition": "mark_stale_and_resync" },
+    { "requirementId": "QT-04", "class": "latency", "metric": "dispatch_commit_to_first_codex_lifecycle_event", "limits": { "p95Milliseconds": 10000, "heldAfterMilliseconds": 30000 }, "failureDisposition": "adapter_unresponsive_and_hold_without_redispatch" },
+    { "requirementId": "QT-05", "class": "latency", "metric": "task_commit_to_founder_visible_verification_artifact", "limits": { "p95Milliseconds": 600000, "defaultAttemptWallClockMilliseconds": 1200000 }, "failureDisposition": "cancel_then_reconcile_or_hold" },
+    { "requirementId": "QT-06", "class": "latency", "metric": "cancellation_commit_dispatch_and_confirmation", "limits": { "commitMilliseconds": 250, "adapterDispatchMilliseconds": 1000, "confirmOrHoldMilliseconds": 10000 }, "failureDisposition": "hold_if_termination_unproven" },
+    { "requirementId": "QT-07", "class": "latency", "metric": "read_model_recovery_after_agentosd_restart", "limits": { "p95Milliseconds": 5000, "readOnlyDegradedAfterMilliseconds": 10000 }, "failureDisposition": "read_only_degraded" },
+    { "requirementId": "QT-08", "class": "latency", "metric": "unterminated_attempt_recovery_classification", "limits": { "p95Milliseconds": 30000 }, "failureDisposition": "no_automatic_rerun_without_deterministic_evidence" },
+
+    { "requirementId": "QC-01", "class": "concurrency", "metric": "system_active_harness_attempts", "limits": { "maxCount": 1 }, "failureDisposition": "reject_overlapping_attempt" },
+    { "requirementId": "QC-02", "class": "concurrency", "metric": "waiting_task_queue_depth", "limits": { "maxCount": 32 }, "failureDisposition": "reject_new_dispatch_and_preserve_committed_task" },
+    { "requirementId": "QC-03", "class": "concurrency", "metric": "automatic_dispatch_retry_count", "limits": { "afterAckOrUnknownMaxCount": 0, "definitelyUndeliveredMaxCount": 1 }, "failureDisposition": "hold_for_ambiguous_outcome" },
+    { "requirementId": "QC-04", "class": "concurrency", "metric": "attempt_wall_clock", "limits": { "defaultMilliseconds": 1200000, "founderElevatedMaximumMilliseconds": 3600000 }, "failureDisposition": "require_reauthorization_for_long_task" },
+
+    { "requirementId": "QR-01", "class": "resource", "metric": "agentosd_rss_bytes", "limits": { "p95Bytes": 268435456, "hardBytes": 536870912 }, "failureDisposition": "stop_new_dispatch_preserve_control_cancel_export" },
+    { "requirementId": "QR-02", "class": "resource", "metric": "desktop_process_tree_rss_bytes", "limits": { "p95Bytes": 536870912, "hardBytes": 805306368 }, "failureDisposition": "degrade_view_and_stop_new_tasks" },
+    { "requirementId": "QR-03", "class": "resource", "metric": "harness_and_tool_process_tree_rss_bytes", "limits": { "hardBytes": 2147483648 }, "failureDisposition": "cancel_then_terminate_tree_and_hold" },
+    { "requirementId": "QR-04", "class": "resource", "metric": "attempt_captured_output_bytes", "limits": { "fullBytes": 16777216, "previewBytes": 65536 }, "failureDisposition": "truncate_preview_preserve_hash_and_marker" },
+    { "requirementId": "QR-05", "class": "resource", "metric": "canonical_change_artifact_bytes", "limits": { "hardBytes": 52428800 }, "failureDisposition": "reject_verification_and_request_smaller_scope" },
+    { "requirementId": "QR-06", "class": "resource", "metric": "v01_managed_data_bytes", "limits": { "warningBytes": 1073741824, "stopDispatchBytes": 2147483648 }, "failureDisposition": "allow_view_export_verdict_and_audited_cleanup" },
+    { "requirementId": "QR-07", "class": "resource", "metric": "free_disk_before_dispatch_bytes", "limits": { "minimumBytes": 2147483648 }, "failureDisposition": "do_not_dispatch" },
+    { "requirementId": "QR-08", "class": "resource", "metric": "authority_metadata_automatic_deletion", "limits": { "allowed": false }, "failureDisposition": "retain_until_explicit_governed_policy" },
+    { "requirementId": "QR-09", "class": "resource", "metric": "artifact_log_blob_retention", "limits": { "minimumSecondsAfterTaskTerminal": 2592000, "founderPinExtendsIndefinitely": true }, "failureDisposition": "delete_only_after_policy_reference_check_and_audit" },
+
+    { "requirementId": "QM-01", "class": "model_usage", "metric": "attempt_input_tokens", "limits": { "warningTokens": 250000, "hardTokens": 500000 }, "failureDisposition": "prevent_unbounded_context_loop" },
+    { "requirementId": "QM-02", "class": "model_usage", "metric": "attempt_output_tokens", "limits": { "warningTokens": 25000, "hardTokens": 50000 }, "failureDisposition": "request_controlled_convergence_or_checkpoint" },
+    { "requirementId": "QM-03", "class": "model_usage", "metric": "usage_observability", "limits": { "usedAndRemainingVisible": true, "unknownMayRenderAsZero": false }, "failureDisposition": "show_unknown_explicitly" },
+    { "requirementId": "QM-04", "class": "model_usage", "metric": "fixed_usd_limit", "limits": { "frozenInV01": false }, "failureDisposition": "add_only_after_stable_provider_receipts" }
+  ],
+  "measurementPolicy": {
+    "releaseBuildRequired": true,
+    "failedSamplesIncluded": true,
+    "crashInjectionsPerBoundary": 10,
+    "crashBoundaryCount": 8,
+    "providerAndLocalLatencySeparated": true
+  }
+}

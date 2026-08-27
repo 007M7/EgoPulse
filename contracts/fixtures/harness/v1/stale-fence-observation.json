@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1", "fixtureId": "harness-stale-fence-observation", "category": "stale",
+  "requirementRefs": ["C03-FENCE-01", "QR-04"], "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "currentFencingToken": 8, "lastObservationSequence": 5 }, "resolvedReferences": {},
+  "command": { "ingestObservation": { "observationId": "obs-stale-001", "adapterId": "codex-adapter", "attemptId": "attempt-001", "dispatchId": "dispatch-001", "fencingToken": 7, "observationSequence": 6, "nativeEventDigestSha256": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1", "capabilityProfileId": "codex-app-server-v2-0.148.0-alpha.15", "criticality": "OBSERVATION_CRITICALITY_TERMINAL", "rawEvidenceRef": "raw-stale-001", "lifecycle": { "kind": "LIFECYCLE_KIND_EXECUTION_COMPLETED", "sideEffectCertainty": "SIDE_EFFECT_CERTAINTY_UNKNOWN" } } },
+  "expected": { "outcome": "error", "errorCode": "HARNESS_ERROR_CODE_FENCING_REJECTED", "quarantineEvidence": true, "businessWriteCount": 0 }
+}

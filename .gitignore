@@ -1,4 +1,6 @@
-/target/
+**/target/
+/.artifacts/
+/.local-ci/
 **/node_modules/
 /.cache/
 /.pnpm-store/

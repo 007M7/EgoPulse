@@ -6,7 +6,24 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 egopulse-domain-contracts.workspace = true
+egopulse-local-ipc-platform.workspace = true
+egopulse-local-read-model.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+hyper-util.workspace = true
+hmac.workspace = true
+prost-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+tower.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
 
 [lib]
 path = "src/lib.rs"

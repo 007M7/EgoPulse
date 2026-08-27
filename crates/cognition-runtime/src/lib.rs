@@ -2,6 +2,10 @@
 
 use egopulse_domain_contracts::FoundationHealth;
 
+pub mod memory_authority;
+pub mod memory_rag;
+pub mod task_authority;
+
 pub const AUTHORITY_BOUNDARIES: &[&str] = &[
     "task-authority",
     "policy-approval-authority",

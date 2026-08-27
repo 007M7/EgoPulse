@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "v01-artifact-fixture/v0.1",
+  "fixtureId": "artifact-valid-submit-return-handoff-receipt",
+  "category": "valid",
+  "requirementRefs": ["C04-RETURN-01", "A4-4-PARENT-RECEIPT", "BDD-RETURN-01"],
+  "principal": { "kind": "ARTIFACT_AUTHORITY", "principalId": "agentosd:artifact-authority", "authenticated": true },
+  "startingState": { "artifactSetId": "artifact_set_01", "artifactSetRevision": 2, "artifactSetStatus": "ARTIFACT_SET_STATUS_SEALED", "manifestDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+  "command": { "submitReturnHandoff": {
+    "returnHandoffId": "return_01", "expectedArtifactSetRevision": 2, "artifactSetId": "artifact_set_01", "artifactSetManifestDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "primaryClaimIds": ["claim_change_01"], "evidenceIds": ["evidence_command_01"], "limitationArtifactIds": ["art_limitations_01"], "unknownArtifactIds": ["art_unknowns_01"],
+    "lineage": { "taskId": "task_01", "taskRevision": 3, "workRevision": 2, "runId": "run_01", "stepId": "step_01", "attemptId": "attempt_01", "fencingToken": 1 }
+  }},
+  "expected": { "outcome": "committed", "businessWriteCount": 1, "resultingStatus": "RETURN_HANDOFF_STATUS_RECEIPTED", "resultingRevision": 1, "returnReceiptCreated": true, "acceptedForEvidenceIntake": true, "verificationPerformed": false, "taskCompletionDecided": false, "collaborationCommitStillRequired": true }
+}

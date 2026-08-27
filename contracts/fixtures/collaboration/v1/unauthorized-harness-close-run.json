@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "v01-collaboration-fixture/v0.1",
+  "fixtureId": "collaboration-unauthorized-harness-close-run",
+  "category": "unauthorized",
+  "requirementRefs": ["C02-AUTH-01", "QT-01"],
+  "principal": { "kind": "HARNESS", "principalId": "harness:codex", "authenticated": true },
+  "startingSnapshot": { "run": { "runId": "run-001", "revision": 8, "status": "RUN_STATUS_RETURN_PENDING" }, "step": { "stepId": "step-001", "revision": 6, "status": "STEP_STATUS_RETURN_PENDING" }, "attempt": { "attemptId": "attempt-001", "revision": 7, "status": "ATTEMPT_STATUS_RETURNED" } },
+  "resolvedReferences": {},
+  "command": { "supersedeRun": { "base": { "meta": { "commandId": "cmd-harness-close-001", "idempotencyKey": "harness-close-001", "idempotencyScope": "run-001", "requestDigestSha256": "6060606060606060606060606060606060606060606060606060606060606060", "issuedAt": "2026-08-23T03:05:00Z", "correlationId": "corr-run-006" }, "runId": "run-001", "expectedRunRevision": 8 }, "replacementRunId": "run-002", "reasonCode": "HARNESS_DECIDED_DONE" } },
+  "expected": { "outcome": "error", "errorCode": "COLLABORATION_ERROR_CODE_PERMISSION_DENIED", "businessWriteCount": 0 }
+}
