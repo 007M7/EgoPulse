@@ -53,3 +53,15 @@ agentosd_missing_config_fail_closed=passed
 memory_worker_production_profile=passed
 windows_package_verification=passed files=52
 ```
+
+The first automated run completed on 2026-08-27 with
+`pnpm run cd:local -- -SkipCi`, using the matching clean local CI evidence for
+commit `d3258b320d9d6ed7682ea5a684b87c4916b69adf`. It produced and verified:
+
+```text
+archive_sha256=03af4b679270d865b940cb267ab96301f3ede80457314bded76efa9b51ebda56
+egopulse-tui_foundation_check=passed
+agentosd_missing_config_fail_closed=passed
+memory_worker_production_profile=passed
+windows_package_verification=passed files=52
+```
