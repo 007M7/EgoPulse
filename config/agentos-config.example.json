@@ -61,7 +61,7 @@
     "authorization_policy_ref": {
       "contract_id": "egopulse.authorization.v1",
       "version": "0.1.0",
-      "sha256": "c9faacd839b431263be7b24dbe1527a990399f4edfa22a41208635a5e416f8de"
+      "sha256": "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1"
     },
     "task_kind": "Founder",
     "policy_kind": "LocalUser",
@@ -165,7 +165,7 @@
     "authorization_policy_ref": {
       "contract_id": "egopulse.authorization.v1",
       "version": "0.1.0",
-      "sha256": "c9faacd839b431263be7b24dbe1527a990399f4edfa22a41208635a5e416f8de"
+        "sha256": "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1"
     },
     "allowed_scope_refs": ["adapter-edge://codex/approval/scope"],
     "decision_ttl_seconds": 300
