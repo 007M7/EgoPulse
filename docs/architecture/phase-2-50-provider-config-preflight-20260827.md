@@ -25,6 +25,15 @@ The report never resolves or serializes secret values. A successful preflight
 does not prove that a native executable is installed, that authentication
 works, or that the profile has passed Provider admission.
 
+The report now also includes two non-invasive local diagnostics:
+
+- `executable_available`: whether the configured path or PATH command exists;
+- `credential_status`: `present` or `missing` for an API-key environment
+  reference, and `harness_account_delegated` for Harness-owned login state.
+
+These fields inspect local configuration only. They never execute a Harness,
+read an API-key value, or promote a profile to production.
+
 The bootstrap profile now also exposes a pure catalog-refresh preview for the
 next Harness-native adapter layer. The preview accepts a typed, provider-
 neutral model list, canonicalizes its order, rejects empty/invalid/duplicate

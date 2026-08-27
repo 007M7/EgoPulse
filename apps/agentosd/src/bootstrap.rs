@@ -166,7 +166,13 @@ pub struct ProviderCatalogProfileView {
     pub catalog_snapshot: Option<ProviderCatalogSnapshot>,
     pub selected_model: String,
     pub executable: String,
+    /// Read-only local discovery result. This is not a protocol or
+    /// authentication attestation and never executes the Harness.
+    pub executable_available: bool,
     pub credential_mode: String,
+    /// `present`/`missing` applies only to API-key environment references;
+    /// `harness_account_delegated` means the Harness owns authentication.
+    pub credential_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_source_env: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -209,10 +215,16 @@ pub enum ProviderCatalogRefreshError {
 impl ProviderBootstrapProfile {
     #[must_use]
     pub fn redacted_catalog_view(&self) -> ProviderCatalogProfileView {
-        let (credential_mode, credential_source_env) = match &self.credential {
-            ProviderCredentialReference::HarnessAccount => ("harness_account", None),
+        let (credential_mode, credential_status, credential_source_env) = match &self.credential {
+            ProviderCredentialReference::HarnessAccount => {
+                ("harness_account", "harness_account_delegated", None)
+            }
             ProviderCredentialReference::ApiKeyEnvironment { source_env, .. } => {
-                ("api_key_environment", Some(source_env.clone()))
+                let status = match std::env::var(source_env) {
+                    Ok(value) if !value.trim().is_empty() => "present",
+                    _ => "missing",
+                };
+                ("api_key_environment", status, Some(source_env.clone()))
             }
         };
         ProviderCatalogProfileView {
@@ -231,7 +243,9 @@ impl ProviderBootstrapProfile {
             catalog_snapshot: self.catalog_snapshot.clone(),
             selected_model: self.exact_model.clone(),
             executable: self.executable.display().to_string(),
+            executable_available: provider_executable_available(&self.executable),
             credential_mode: credential_mode.to_owned(),
+            credential_status: credential_status.to_owned(),
             credential_source_env,
             hold_reason: self.hold_reason.clone(),
         }
@@ -285,6 +299,40 @@ impl ProviderBootstrapProfile {
                 .then_some("selected_model_missing_from_refresh".to_owned()),
         })
     }
+}
+
+/// Performs non-invasive executable discovery for setup diagnostics.
+///
+/// A configured command can be a path or a bare command name. On Windows,
+/// `PATHEXT` is honored so `.cmd` Harness launchers are reported correctly.
+/// This function only inspects the filesystem/PATH; it never starts a child
+/// process and therefore cannot be mistaken for a Provider capability probe.
+fn provider_executable_available(executable: &Path) -> bool {
+    if executable.components().count() > 1 || executable.extension().is_some() {
+        return executable.is_file();
+    }
+    let Some(path_value) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let candidates =
+        std::env::split_paths(&path_value).flat_map(|directory| {
+            let direct = directory.join(executable);
+            let extensions = if cfg!(windows) {
+                std::env::var_os("PATHEXT")
+                    .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|extension| !extension.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            std::iter::once(direct).chain(extensions.into_iter().map(move |extension| {
+                directory.join(format!("{}{}", executable.display(), extension))
+            }))
+        });
+    candidates.into_iter().any(|candidate| candidate.is_file())
 }
 
 fn validate_refreshed_model_identity(

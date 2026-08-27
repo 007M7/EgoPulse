@@ -129,6 +129,11 @@ fn check_config_json_emits_redacted_provider_catalog_without_secret_values() {
         report["provider_profiles"][1]["catalog_snapshot"]["harness_version"],
         "not-probed"
     );
+    assert!(report["provider_profiles"][1]["executable_available"].is_boolean());
+    assert_eq!(
+        report["provider_profiles"][1]["credential_status"],
+        "missing"
+    );
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains(&key),
         "authority key must never appear in provider report"
