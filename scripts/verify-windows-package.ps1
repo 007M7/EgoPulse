@@ -80,6 +80,46 @@ foreach ($executable in @('egopulse.exe', 'egopulse-tui.exe', 'agentosd.exe')) {
     Write-Output "${executable}_help=passed"
 }
 
+# These probes exercise the two safe, non-daemon startup paths shipped in the
+# first package. TUI must be able to report its local foundation state without
+# entering raw terminal mode. The daemon must fail closed when no user-owned
+# configuration is present; a package verifier must never accidentally pass by
+# consuming a developer's ambient EGOPULSE_USER_CONFIG.
+& (Join-Path $root 'bin/egopulse-tui.exe') --foundation-check *> $null
+if ($LASTEXITCODE -ne 0) {
+    throw "egopulse-tui.exe --foundation-check failed with exit code $LASTEXITCODE"
+}
+Write-Output 'egopulse-tui_foundation_check=passed'
+
+$previousUserConfig = $env:EGOPULSE_USER_CONFIG
+try {
+    $env:EGOPULSE_USER_CONFIG = Join-Path $root '.verification-missing-config.json'
+    $probeErrorAction = $ErrorActionPreference
+    try {
+        # Windows PowerShell promotes native stderr to a non-terminating
+        # NativeCommandError under Stop. Continue only for this intentional
+        # refusal, then assert the native process exit code explicitly.
+        $ErrorActionPreference = 'Continue'
+        & (Join-Path $root 'bin/agentosd.exe') --check-config 2>$null *> $null
+        $probeExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $probeErrorAction
+    }
+    if ($probeExitCode -ne 78) {
+        throw "agentosd.exe --check-config expected fail-closed exit code 78, got $probeExitCode"
+    }
+    Write-Output 'agentosd_missing_config_fail_closed=passed'
+}
+finally {
+    if ($null -eq $previousUserConfig) {
+        Remove-Item Env:EGOPULSE_USER_CONFIG -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:EGOPULSE_USER_CONFIG = $previousUserConfig
+    }
+}
+
 if ($VerifyMemoryWorker) {
     $uvCacheDir = Join-Path $root '.cache/uv'
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'setup-memory-worker.ps1') -PackageRoot $root -UvCacheDir $uvCacheDir

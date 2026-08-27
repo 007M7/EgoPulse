@@ -63,7 +63,13 @@ pnpm run cd:local
 
 `pnpm run cd:local` is an offline reproduction command. It runs local CI once, then calls the shared Windows packaging script. If local CI has already passed for the same clean `HEAD`, use `pnpm run cd:local -- -SkipCi` to avoid rerunning it. The first candidate packages the shared kernel as three Windows x64 binaries: `agentosd.exe`, `egopulse.exe` and `egopulse-tui.exe`, plus public configuration templates, the locked Memory/RAG Worker source, generated Python contract consumers and the setup script required for first-run setup. Desktop packaging is an explicit later-phase opt-in via `scripts/package-windows.ps1 -IncludeDesktop`. The packaging script requires a clean worktree, uses an external CPython 3.14 + uv runtime, includes dependency locks and available CI evidence, generates per-file SHA-256 hashes, and creates a ZIP plus an archive hash beneath `.artifacts/release-candidate/`. The packaging-only command is `pnpm run package:windows`.
 
-The candidate is explicitly classified as `unsigned-release-candidate`. It must not be represented as a production release. Code signing, SBOM generation, protected release approval and remote provenance attestation remain release-Gate requirements.
+The package verifier exercises all three binary help paths, the non-interactive
+TUI foundation probe and the daemon's missing-configuration fail-closed path.
+It also verifies the locked production Memory Worker profile without installing
+the evaluation-only `fastembed` dependency. The candidate is explicitly
+classified as `unsigned-release-candidate`. It must not be represented as a
+production release. Code signing, SBOM generation, protected release approval
+and remote provenance attestation remain release-Gate requirements.
 
 ## GitHub CI/CD
 
