@@ -2,8 +2,8 @@
 
 - Date: 2026-08-27
 - Scope: Tauri 2 + React + TypeScript Desktop surface
-- Status: shared-kernel read slice, TaskCreate, Task cancellation, Approval decision, and Memory
-  mutation commands implemented; shared-kernel Windows IPC loopback verified,
+- Status: shared-kernel read slice, TaskCreate, Task cancellation, Approval decision, Memory
+  mutation and Memory retrieval commands implemented; shared-kernel Windows IPC loopback verified,
   native Tauri GUI automation remains a separate acceptance item
 
 ## Boundary
@@ -41,8 +41,9 @@ cross-domain execution receipt remain separate work. `decide_approval`
 accepts only the decision facts copied from the current projection and routes
 them through `DecideHarnessApproval`; it does not reconstruct approval context
 or bypass the Policy Authority. `submit_memory_candidate`, `accept_memory` and
-`revoke_memory` use the same typed Memory mutation gateway as CLI and TUI; the
-Desktop process still has no Memory store handle.
+`revoke_memory` use the same typed Memory mutation gateway as CLI and TUI;
+`retrieve_memory` uses the same read-only cognition RPC and returns only
+snapshot-bound references. The Desktop process still has no Memory store handle.
 
 ## User-facing behavior
 
@@ -63,6 +64,9 @@ Desktop process still has no Memory store handle.
 - Memory candidate submission, acceptance and revocation require explicit
   identifiers, evidence and idempotency keys; the returned receipt is shown
   only after the Memory Authority durability barrier;
+- Memory retrieval shows the selected algorithm, snapshot digest, evidence
+  reference and bounded result references without copying authoritative content
+  into Desktop state;
 - CLI, TUI and Desktop continue to share the same Rust client kernel and Local
   API contracts.
 

@@ -15,11 +15,11 @@ Available now:
 - Codex App Server adapter with durable Adapter Edge and an explicit `CodexHarnessCompositionConfig` composition root;
 - C5 real Windows local-IPC E2E coverage for daemon, CLI and TUI;
 - user-owned production bootstrap JSON with environment-resolved secret keys and fail-closed validation;
-- Tauri 2 + React + TypeScript Desktop shell attached to the same authenticated local API and Rust Client Kernel as CLI/TUI, including governed Task cancellation;
+- Tauri 2 + React + TypeScript Desktop shell attached to the same authenticated local API and Rust Client Kernel as CLI/TUI, including governed Task cancellation, Memory governance and accepted-snapshot retrieval;
 - TypeScript packages for generated clients, Agent SDK and the bounded native Harness;
 - isolated CPython 3.14 Worker projects managed by uv;
 - internal Rust Memory Authority with SQLCipher persistence, candidate-only agent writes, Founder promotion/revocation and accepted retrieval snapshots;
-- governed `LocalCognitionService/RetrieveMemory` exposed consistently through CLI and TUI, with daemon-owned scope authorization, supervised Python retrieval, typed failure semantics and reference-only output;
+- governed `LocalCognitionService/RetrieveMemory` exposed consistently through CLI, TUI and Desktop, with daemon-owned scope authorization, supervised Python retrieval, typed failure semantics and reference-only output;
 - offline Memory retrieval evaluation with dataset-digest evidence, Recall/MRR/nDCG metrics, injected exact-vector scoring and validated RRF experiment adapters;
 - explicit Sego/checker verification composition with owner-backed Artifact reads, supervised execution, immutable verification artifacts and Task write-back;
 - Protobuf/Buf and JSON Schema contract roots;
