@@ -61,7 +61,21 @@ Create a release candidate with:
 pnpm run cd:local
 ```
 
-`pnpm run cd:local` is an offline reproduction command. It runs local CI once, then calls the shared Windows packaging script. If local CI has already passed for the same clean `HEAD`, use `pnpm run cd:local -- -SkipCi` to avoid rerunning it. The first candidate packages the shared kernel as three Windows x64 binaries: `agentosd.exe`, `egopulse.exe` and `egopulse-tui.exe`, plus public configuration templates, the locked Memory/RAG Worker source, generated Python contract consumers and the setup script required for first-run setup. Desktop packaging is an explicit later-phase opt-in via `scripts/package-windows.ps1 -IncludeDesktop`. The packaging script requires a clean worktree, uses an external CPython 3.14 + uv runtime, includes dependency locks and available CI evidence, generates per-file SHA-256 hashes, and creates a ZIP plus an archive hash beneath `.artifacts/release-candidate/`. The packaging-only command is `pnpm run package:windows`.
+`pnpm run cd:local` is an offline reproduction command. It runs local CI once,
+calls the shared Windows packaging script, and automatically verifies the exact
+candidate directory and archive it just produced. If local CI has already
+passed for the same clean `HEAD`, use `pnpm run cd:local -- -SkipCi` to avoid
+rerunning it. The first candidate packages the shared kernel as three Windows
+x64 binaries: `agentosd.exe`, `egopulse.exe` and `egopulse-tui.exe`, plus public
+configuration templates, the locked Memory/RAG Worker source, generated Python
+contract consumers and the setup script required for first-run setup. Desktop
+packaging is an explicit later-phase opt-in via
+`scripts/package-windows.ps1 -IncludeDesktop`. The packaging script requires a
+clean worktree, uses an external CPython 3.14 + uv runtime, includes dependency
+locks and available CI evidence, generates per-file SHA-256 hashes, and creates
+a ZIP plus an archive hash beneath `.artifacts/release-candidate/`. The
+packaging-only command is `pnpm run package:windows`; it does not imply package
+verification unless the verifier is invoked separately.
 
 The package verifier exercises all three binary help paths, the non-interactive
 TUI foundation probe and the daemon's missing-configuration fail-closed path.
