@@ -308,7 +308,10 @@ impl ProviderBootstrapProfile {
 /// This function only inspects the filesystem/PATH; it never starts a child
 /// process and therefore cannot be mistaken for a Provider capability probe.
 fn provider_executable_available(executable: &Path) -> bool {
-    if executable.components().count() > 1 || executable.extension().is_some() {
+    // An extension does not make a command an explicit path: `codex.cmd` is
+    // still a valid PATH lookup on Windows. Only a path-like value should be
+    // checked relative to the current filesystem location.
+    if executable.components().count() > 1 {
         return executable.is_file();
     }
     let Some(path_value) = std::env::var_os("PATH") else {
