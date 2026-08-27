@@ -13,7 +13,7 @@ is a frozen repository contract and must remain unchanged. Then set:
 $env:EGOPULSE_USER_CONFIG = 'D:\EgoPulse\data\agentos-config.json'
 ```
 
-The eight Authority keys must be non-zero 32-byte hexadecimal strings supplied
+The ten local encryption/authentication keys must be non-zero 32-byte hexadecimal strings supplied
 by their corresponding environment variables:
 
 - `EGOPULSE_TASK_KEY_HEX`
@@ -24,6 +24,8 @@ by their corresponding environment variables:
 - `EGOPULSE_VERDICT_KEY_HEX`
 - `EGOPULSE_ADAPTER_KEY_HEX`
 - `EGOPULSE_COLLABORATION_KEY_HEX`
+- `EGOPULSE_READ_MODEL_KEY_HEX`
+- `EGOPULSE_TOKEN_MAC_KEY_HEX`
 
 The read model and local session variables are also supported:
 

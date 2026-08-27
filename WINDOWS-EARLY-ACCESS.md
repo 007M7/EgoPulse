@@ -10,7 +10,35 @@ unknown-publisher warning. Verify the downloaded archive with the adjacent
 for per-file verification. Do not treat an unsigned candidate as a production
 release.
 
-## First-run setup
+## One-click installation
+
+After extracting the archive to a short path such as `C:\EgoPulse`, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-egopulse.ps1 -Launch
+```
+
+The installer creates a user-owned configuration under
+`%LOCALAPPDATA%\EgoPulse`, generates the ten local Authority/read-model
+encryption and session keys as user environment variables, installs the locked Memory Worker,
+performs `agentosd --check-config`, and launches the daemon. It never writes
+Provider API keys to the package or configuration. A pre-existing
+configuration is preserved unless `-Force` is explicitly supplied; forced
+replacement creates a timestamped backup.
+
+The installer requires Windows x64, Python/uv-compatible Memory Worker setup,
+and an installed `uv` command. If `uv` is absent, install it from
+`https://docs.astral.sh/uv/` first.
+
+After installation, open a new PowerShell window so the user environment is
+loaded and run:
+
+```powershell
+.\bin\egopulse.exe status
+.\bin\egopulse-tui.exe
+```
+
+## Manual first-run setup
 
 Install Windows x64 CPython 3.14 and [uv](https://docs.astral.sh/uv/), then
 run this script from the extracted package directory:

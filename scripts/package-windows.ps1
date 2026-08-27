@@ -146,7 +146,7 @@ foreach ($binary in $binaries) {
 }
 
 Copy-Item -LiteralPath 'README.md', 'SECURITY.md' -Destination $candidateRoot
-Copy-Item -LiteralPath 'WINDOWS-EARLY-ACCESS.md', 'setup-memory-worker.ps1' -Destination $candidateRoot
+Copy-Item -LiteralPath 'WINDOWS-EARLY-ACCESS.md', 'setup-memory-worker.ps1', 'install-egopulse.ps1' -Destination $candidateRoot
 $configRoot = Join-Path $candidateRoot 'config'
 New-Item -ItemType Directory -Force -Path $configRoot | Out-Null
 Copy-Item -LiteralPath @(

@@ -19,6 +19,7 @@ $requiredFiles = @(
     'BUILD-METADATA.json',
     'SHA256SUMS',
     'setup-memory-worker.ps1',
+    'install-egopulse.ps1',
     'workers/memory-rag/pyproject.toml',
     'workers/memory-rag/uv.lock',
     'workers/contract-bindings/pyproject.toml',
