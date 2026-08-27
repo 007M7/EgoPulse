@@ -39,17 +39,24 @@ Observed result: `1 passed, 0 failed`.
 
 ## Admission decision
 
-This evidence closes only the reachability/probe row. It does not admit Kimi
+This evidence closes reachability and, after the Phase 2-45 rerun, confirms
+that Kimi 1.49.0 declares native load/resume capability. It does not admit Kimi
 as a production Harness because the authenticated lifecycle is not available
 in this environment. The following evidence is still required:
 
 - authenticated session and model dispatch;
 - provider-native approval routing;
 - Artifact and Verification-bound return settlement;
-- restart/recovery behavior;
+- restart/recovery behavior tied to a specific dispatch outcome rather than
+  session reachability alone;
+- a BYOK-capable authentication route; Kimi Code OAuth reachability does not
+  prove that the multi-session ACP accepts a user-owned API key;
 - a reviewed capability profile and daemon composition binding.
 
 Until those rows pass, Codex remains the sole production Harness. Kimi also
 cannot be granted a Memory candidate producer handle merely because its ACP
 process is reachable; its producer identity and scope must be configured only
 after the provider lifecycle is admitted.
+
+The corrected recovery and exact-model analysis is recorded in
+`phase-2-45-kimi-recovery-and-model-boundary-20260827.md`.

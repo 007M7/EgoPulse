@@ -28,8 +28,10 @@ use uuid::Uuid;
 pub const KIMI_ADAPTER_ID: &str = "kimi-adapter";
 pub const KIMI_ACP_PROTOCOL: &str = "agent-client-protocol";
 pub const KIMI_ACP_PROTOCOL_VERSION: &str = "v1";
-pub const KIMI_NATIVE_RECOVERY_UNSUPPORTED_EVIDENCE_REF: &str =
-    "kimi-reconcile:native-session-recovery-not-attested";
+pub const KIMI_NATIVE_RECOVERY_NO_SESSION_REF: &str =
+    "kimi-reconcile:no-durable-native-session-reference";
+pub const KIMI_NATIVE_RECOVERY_OUTCOME_UNATTESTED: &str =
+    "kimi-reconcile:session-resumed-dispatch-outcome-unattested";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KimiSessionProbeDisposition {
@@ -58,6 +60,10 @@ pub struct KimiAcpConfig {
     pub executable: PathBuf,
     pub working_directory: PathBuf,
     pub share_directory: Option<PathBuf>,
+    /// Exact ACP model id expected from `session/new` and `session/resume`.
+    /// Production composition must set this so a configured Kimi profile
+    /// cannot silently route to a different model.
+    pub required_model: Option<String>,
     pub request_timeout: Duration,
 }
 
@@ -68,6 +74,7 @@ impl KimiAcpConfig {
             executable: executable.into(),
             working_directory: working_directory.into(),
             share_directory: None,
+            required_model: None,
             request_timeout: Duration::from_secs(10),
         }
     }
@@ -75,6 +82,12 @@ impl KimiAcpConfig {
     #[must_use]
     pub fn with_share_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.share_directory = Some(directory.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_required_model(mut self, model: impl Into<String>) -> Self {
+        self.required_model = Some(model.into());
         self
     }
 }
@@ -102,7 +115,7 @@ struct PendingApproval {
 
 /// Candidate-only Kimi ACP driver.
 ///
-/// The driver supports the native fresh-session ACP lifecycle and keeps all
+/// The driver supports the native ACP session lifecycle and keeps all
 /// resulting execution, approval and output evidence behind the same
 /// provider-neutral `NativeHarnessDriver` boundary as the other candidates.
 /// It remains candidate-only until an authenticated lifecycle, schema,
@@ -160,15 +173,17 @@ impl KimiAcpDriver {
             acp::parse_message(initialize_raw.as_bytes()).map_err(|detail| {
                 driver_error("KIMI_ACP_INITIALIZE_INVALID_MESSAGE", detail.as_bytes())
             })?;
-        if !matches!(
-            initialize_message,
-            acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Result { .. })
-        ) {
-            return Err(driver_error(
-                "KIMI_ACP_INITIALIZE_REJECTED",
-                initialize_raw.as_bytes(),
-            ));
-        }
+        let initialize_result = match initialize_message {
+            acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Result { result, .. }) => result,
+            _ => {
+                return Err(driver_error(
+                    "KIMI_ACP_INITIALIZE_REJECTED",
+                    initialize_raw.as_bytes(),
+                ));
+            }
+        };
+        validate_required_recovery_capabilities(&initialize_result)
+            .map_err(|code| driver_error(code, initialize_raw.as_bytes()))?;
 
         let session_request = session_new_request(working_directory);
         write_json_line(
@@ -189,14 +204,18 @@ impl KimiAcpDriver {
         let session_id = match acp::parse_message(session_raw.as_bytes()).map_err(|detail| {
             driver_error("KIMI_ACP_SESSION_NEW_INVALID_MESSAGE", detail.as_bytes())
         })? {
-            acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Result { result, .. }) => result
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    driver_error("KIMI_ACP_SESSION_ID_MISSING", session_raw.as_bytes())
-                })?,
+            acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Result { result, .. }) => {
+                validate_required_session_model(&result, self.config.required_model.as_deref())
+                    .map_err(|code| driver_error(code, session_raw.as_bytes()))?;
+                result
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        driver_error("KIMI_ACP_SESSION_ID_MISSING", session_raw.as_bytes())
+                    })?
+            }
             acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Error { .. }) => {
                 return Err(driver_error(
                     "KIMI_ACP_SESSION_NEW_REJECTED",
@@ -462,12 +481,88 @@ impl NativeHarnessDriver for KimiAcpDriver {
 
     fn reconcile<'a>(
         &'a mut self,
-        _context: &'a ReconciliationContext,
+        context: &'a ReconciliationContext,
     ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
-        Box::pin(async {
-            Ok(ReconciliationFinding::OutcomeUnknown {
-                evidence_ref: KIMI_NATIVE_RECOVERY_UNSUPPORTED_EVIDENCE_REF.to_owned(),
-            })
+        Box::pin(async move {
+            let native_session_ref = self
+                .active
+                .as_ref()
+                .filter(|active| active.dispatch_id == context.envelope.dispatch_id)
+                .map(|active| active.native_session_ref.clone())
+                .or_else(|| {
+                    context
+                        .delivery_receipt
+                        .as_ref()
+                        .and_then(|receipt| receipt.native_session_ref.clone())
+                });
+            let Some(native_session_ref) = native_session_ref else {
+                return Ok(ReconciliationFinding::OutcomeUnknown {
+                    evidence_ref: KIMI_NATIVE_RECOVERY_NO_SESSION_REF.to_owned(),
+                });
+            };
+
+            let mut process = spawn_process(&self.config).await?;
+            let initialize = initialize_request();
+            write_json_line(
+                &mut process,
+                &initialize,
+                "KIMI_ACP_RECOVERY_INITIALIZE_WRITE_FAILED",
+            )
+            .await?;
+            let initialize_raw = read_json_line(
+                &mut process,
+                self.config.request_timeout,
+                "KIMI_ACP_RECOVERY_INITIALIZE_TIMEOUT",
+                "KIMI_ACP_RECOVERY_INITIALIZE_READ_FAILED",
+                "KIMI_ACP_RECOVERY_INITIALIZE_EOF",
+                &initialize,
+            )
+            .await?;
+            let initialize_result =
+                match acp::parse_message(initialize_raw.as_bytes()).map_err(|detail| {
+                    driver_error(
+                        "KIMI_ACP_RECOVERY_INITIALIZE_INVALID_MESSAGE",
+                        detail.as_bytes(),
+                    )
+                })? {
+                    acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Result {
+                        result, ..
+                    }) => result,
+                    _ => {
+                        return Err(driver_error(
+                            "KIMI_ACP_RECOVERY_INITIALIZE_REJECTED",
+                            initialize_raw.as_bytes(),
+                        ));
+                    }
+                };
+            validate_required_recovery_capabilities(&initialize_result)
+                .map_err(|code| driver_error(code, initialize_raw.as_bytes()))?;
+
+            let resume_request =
+                session_resume_request(&context.material.workspace_root, &native_session_ref, 2);
+            write_json_value(
+                &mut process,
+                &resume_request,
+                "KIMI_ACP_SESSION_RESUME_WRITE_FAILED",
+            )
+            .await?;
+            let resume_bytes = serde_json::to_vec(&resume_request).unwrap_or_default();
+            let resume_raw = read_json_line(
+                &mut process,
+                self.config.request_timeout,
+                "KIMI_ACP_SESSION_RESUME_TIMEOUT",
+                "KIMI_ACP_SESSION_RESUME_READ_FAILED",
+                "KIMI_ACP_SESSION_RESUME_EOF",
+                &resume_bytes,
+            )
+            .await?;
+            let finding = classify_session_resume_response(
+                resume_raw.as_bytes(),
+                self.config.required_model.as_deref(),
+            )?;
+            let _ = process.terminate().await;
+            let _ = process.wait().await;
+            Ok(finding)
         })
     }
 
@@ -558,7 +653,8 @@ async fn probe_session(config: &KimiAcpConfig) -> Result<KimiSessionProbeResult,
         &session_request,
     )
     .await?;
-    let session_result = parse_session_new_response(session_line.as_bytes())?;
+    let session_result =
+        parse_session_new_response(session_line.as_bytes(), config.required_model.as_deref())?;
     let _ = process.terminate().await;
     let _ = process.wait().await;
     Ok(KimiSessionProbeResult {
@@ -690,6 +786,19 @@ fn session_new_request(working_directory: &Path) -> Vec<u8> {
     .unwrap_or_default()
 }
 
+fn session_resume_request(working_directory: &Path, session_id: &str, id: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/resume",
+        "params": {
+            "cwd": working_directory,
+            "sessionId": session_id,
+            "mcpServers": []
+        }
+    })
+}
+
 async fn write_json_value(
     process: &mut SupervisedProcess,
     value: &Value,
@@ -790,6 +899,7 @@ fn parse_initialize_response(raw: &[u8]) -> Result<ProbeHarnessResult, DriverErr
     let result = value
         .get("result")
         .ok_or_else(|| driver_error("KIMI_ACP_INITIALIZE_RESULT_MISSING", raw))?;
+    validate_required_recovery_capabilities(result).map_err(|code| driver_error(code, raw))?;
     let version = result
         .pointer("/agentInfo/version")
         .and_then(Value::as_str)
@@ -820,7 +930,10 @@ fn parse_initialize_response(raw: &[u8]) -> Result<ProbeHarnessResult, DriverErr
     })
 }
 
-fn parse_session_new_response(raw: &[u8]) -> Result<KimiSessionProbeDisposition, DriverError> {
+fn parse_session_new_response(
+    raw: &[u8],
+    required_model: Option<&str>,
+) -> Result<KimiSessionProbeDisposition, DriverError> {
     let value: Value = serde_json::from_slice(raw).map_err(|error| {
         driver_error(
             "KIMI_ACP_SESSION_NEW_INVALID_JSON",
@@ -861,10 +974,81 @@ fn parse_session_new_response(raw: &[u8]) -> Result<KimiSessionProbeDisposition,
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| driver_error("KIMI_ACP_SESSION_ID_MISSING", raw))?;
+    validate_required_session_model(value.get("result").unwrap_or(&Value::Null), required_model)
+        .map_err(|code| driver_error(code, raw))?;
     Ok(KimiSessionProbeDisposition::Created {
         native_session_ref: session_id.to_owned(),
         evidence_ref,
     })
+}
+
+fn validate_required_recovery_capabilities(result: &Value) -> Result<(), &'static str> {
+    if result
+        .pointer("/agentCapabilities/loadSession")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err("KIMI_ACP_LOAD_SESSION_UNATTESTED");
+    }
+    if !result
+        .pointer("/agentCapabilities/sessionCapabilities/resume")
+        .is_some_and(Value::is_object)
+    {
+        return Err("KIMI_ACP_SESSION_RESUME_UNATTESTED");
+    }
+    Ok(())
+}
+
+fn validate_required_session_model(
+    result: &Value,
+    required_model: Option<&str>,
+) -> Result<(), &'static str> {
+    let Some(required_model) = required_model else {
+        return Ok(());
+    };
+    let required_model = required_model.trim();
+    if required_model.is_empty() {
+        return Err("KIMI_ACP_REQUIRED_MODEL_INVALID");
+    }
+    let current_model = result
+        .pointer("/models/currentModelId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("KIMI_ACP_SESSION_MODEL_UNATTESTED")?;
+    if current_model != required_model {
+        return Err("KIMI_ACP_SESSION_MODEL_MISMATCH");
+    }
+    Ok(())
+}
+
+fn classify_session_resume_response(
+    raw: &[u8],
+    required_model: Option<&str>,
+) -> Result<ReconciliationFinding, DriverError> {
+    match acp::parse_message(raw).map_err(|detail| {
+        driver_error("KIMI_ACP_SESSION_RESUME_INVALID_MESSAGE", detail.as_bytes())
+    })? {
+        acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Result { result, .. }) => {
+            validate_required_session_model(&result, required_model)
+                .map_err(|code| driver_error(code, raw))?;
+            Ok(ReconciliationFinding::OutcomeUnknown {
+                evidence_ref: format!(
+                    "{}:sha256:{}",
+                    KIMI_NATIVE_RECOVERY_OUTCOME_UNATTESTED,
+                    sha256(raw)
+                ),
+            })
+        }
+        acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Error { .. }) => {
+            Ok(ReconciliationFinding::OutcomeUnknown {
+                evidence_ref: format!(
+                    "kimi-reconcile:session-resume-rejected:sha256:{}",
+                    sha256(raw)
+                ),
+            })
+        }
+        _ => Err(driver_error("KIMI_ACP_SESSION_RESUME_INVALID_MESSAGE", raw)),
+    }
 }
 
 fn dependency_error(detail: &str) -> DriverError {
@@ -931,7 +1115,7 @@ mod tests {
     #[test]
     fn initialize_response_is_reachable_but_not_probe_verified_without_schema_digest() {
         let result = parse_initialize_response(
-            br#"{"jsonrpc":"2.0","id":1,"result":{"agentInfo":{"name":"Kimi Code CLI","version":"1.49.0"},"protocolVersion":1}}"#,
+            br#"{"jsonrpc":"2.0","id":1,"result":{"agentInfo":{"name":"Kimi Code CLI","version":"1.49.0"},"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"resume":{}}}}}"#,
         )
         .expect("parse initialize response");
         assert_eq!(result.readiness, HarnessReadiness::Degraded as i32);
@@ -969,6 +1153,7 @@ mod tests {
     fn session_authentication_error_is_a_controlled_probe_disposition() {
         let result = parse_session_new_response(
             br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"Authentication required","data":{"authMethods":[{"id":"login"}]}}}"#,
+            None,
         )
         .expect("parse authentication response");
         assert_eq!(
@@ -989,6 +1174,7 @@ mod tests {
     fn session_creation_keeps_native_session_reference_opaque() {
         let result = parse_session_new_response(
             br#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kimi-session-001"}}"#,
+            None,
         )
         .expect("parse session response");
         assert!(matches!(
@@ -997,6 +1183,87 @@ mod tests {
                 native_session_ref,
                 ..
             } if native_session_ref == "kimi-session-001"
+        ));
+    }
+
+    #[test]
+    fn initialize_requires_native_load_and_resume_capabilities() {
+        let missing_load = parse_initialize_response(
+            br#"{"jsonrpc":"2.0","id":1,"result":{"agentInfo":{"name":"Kimi Code CLI","version":"1.49.0"},"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}"#,
+        )
+        .expect_err("loadSession is mandatory");
+        assert_eq!(
+            missing_load.safe_detail_code,
+            "KIMI_ACP_LOAD_SESSION_UNATTESTED"
+        );
+
+        let missing_resume = parse_initialize_response(
+            br#"{"jsonrpc":"2.0","id":1,"result":{"agentInfo":{"name":"Kimi Code CLI","version":"1.49.0"},"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}"#,
+        )
+        .expect_err("session resume is mandatory");
+        assert_eq!(
+            missing_resume.safe_detail_code,
+            "KIMI_ACP_SESSION_RESUME_UNATTESTED"
+        );
+    }
+
+    #[test]
+    fn exact_session_model_is_required_when_configured() {
+        let response = br#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kimi-session-001","models":{"currentModelId":"kimi-k2.5,thinking"}}}"#;
+        assert!(
+            parse_session_new_response(response, Some("kimi-k2.5,thinking")).is_ok(),
+            "the exact Kimi ACP model id should be accepted"
+        );
+        assert_eq!(
+            parse_session_new_response(response, Some("kimi-k2.5"))
+                .expect_err("model fallback must fail closed")
+                .safe_detail_code,
+            "KIMI_ACP_SESSION_MODEL_MISMATCH"
+        );
+        assert_eq!(
+            parse_session_new_response(
+                br#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"kimi-session-001"}}"#,
+                Some("kimi-k2.5"),
+            )
+            .expect_err("an unattested model must fail closed")
+            .safe_detail_code,
+            "KIMI_ACP_SESSION_MODEL_UNATTESTED"
+        );
+    }
+
+    #[test]
+    fn resume_request_binds_workspace_and_opaque_session_identity() {
+        let request =
+            session_resume_request(Path::new(r"D:\workspace"), "kimi-session-opaque-001", 9);
+        assert_eq!(request["method"], "session/resume");
+        assert_eq!(request["id"], 9);
+        assert_eq!(request["params"]["sessionId"], "kimi-session-opaque-001");
+        assert_eq!(request["params"]["cwd"], r"D:\workspace");
+    }
+
+    #[test]
+    fn resumed_session_never_claims_dispatch_outcome() {
+        let raw = br#"{"jsonrpc":"2.0","id":2,"result":{"models":{"currentModelId":"kimi-k2.5"}}}"#;
+        assert!(matches!(
+            classify_session_resume_response(raw, Some("kimi-k2.5"))
+                .expect("valid native resume response"),
+            ReconciliationFinding::OutcomeUnknown { evidence_ref }
+                if evidence_ref.starts_with(KIMI_NATIVE_RECOVERY_OUTCOME_UNATTESTED)
+        ));
+        assert_eq!(
+            classify_session_resume_response(raw, Some("other-model"))
+                .expect_err("recovery must preserve the exact model route")
+                .safe_detail_code,
+            "KIMI_ACP_SESSION_MODEL_MISMATCH"
+        );
+
+        let rejected =
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Session not found"}}"#;
+        assert!(matches!(
+            classify_session_resume_response(rejected, Some("kimi-k2.5"))
+                .expect("a rejection is reconciliation evidence"),
+            ReconciliationFinding::OutcomeUnknown { evidence_ref }
+                if evidence_ref.starts_with("kimi-reconcile:session-resume-rejected")
         ));
     }
 
@@ -1153,7 +1420,7 @@ mod tests {
         assert!(matches!(
             driver.reconcile(&context).await.expect("reconciliation hold"),
             ReconciliationFinding::OutcomeUnknown { evidence_ref }
-                if evidence_ref == KIMI_NATIVE_RECOVERY_UNSUPPORTED_EVIDENCE_REF
+                if evidence_ref == KIMI_NATIVE_RECOVERY_NO_SESSION_REF
         ));
     }
 }

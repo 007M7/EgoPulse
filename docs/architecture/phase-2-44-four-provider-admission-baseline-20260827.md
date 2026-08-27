@@ -15,7 +15,7 @@ path.
 |---|---|---|
 | GPT | OpenAI Codex app-server | Production-admitted for the frozen Codex capability profile |
 | DeepSeek | DeepSeek Harness ACP | Candidate; native restart/reconciliation and Artifact semantics remain held |
-| Kimi | Kimi CLI ACP | Candidate; authenticated lifecycle and recovery evidence remain held |
+| Kimi | Kimi CLI multi-session ACP | Candidate; native session resume and exact-model checks implemented, BYOK and dispatch-outcome evidence held |
 | GLM | OpenCode ACP with an exact `zai/...` or `zhipuai/...` model route | Candidate; authenticated GLM lifecycle, schema and recovery evidence remain held |
 
 OpenCode is selected for GLM because its official open-source Harness exposes
@@ -83,6 +83,20 @@ existing ACP transport/parser implementation. It does not add another JSON-RPC
 stack. It maps evidence and diagnostic namespaces to OpenCode and requires an
 exact provider/model route.
 
+### Kimi capability correction
+
+The installed Kimi CLI 1.49.0 implementation was inspected and rerun through a
+no-inference probe. Its multi-session ACP implements load, list and resume. The
+Kimi adapter now requires those capabilities and validates the exact
+`models.currentModelId` on both new and resumed sessions.
+
+A successful native resume remains only session-reachability evidence. It does
+not prove the outcome of the exact interrupted dispatch, so reconciliation
+continues to return `OutcomeUnknown` with a hashed native resume receipt. The
+inspected multi-session entry point also checks Kimi Code OAuth before session
+creation; a supported user-owned API-key path remains an independent product
+gate. See `phase-2-45-kimi-recovery-and-model-boundary-20260827.md`.
+
 ## Remaining GLM admission gates
 
 1. pin and attest the OpenCode executable version and ACP schema digest;
@@ -104,6 +118,7 @@ The following targeted tests passed:
 ```text
 cargo test -p egopulse-dsh-adapter
 cargo test -p egopulse-opencode-adapter
+cargo test -p egopulse-kimi-adapter
 cargo test -p egopulse-agentosd multi_provider_policy_routes_exactly_one_adapter_and_rejects_collisions --lib
 ```
 

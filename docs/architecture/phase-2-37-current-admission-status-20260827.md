@@ -30,7 +30,7 @@ The second fact never implies the third without provider-specific evidence.
 | Multi-provider Policy routing | Approval requests resolve across isolated provider Adapter stores; zero or ambiguous matches fail closed | Boundary closed; production bootstrap wiring remains pending |
 | GLM / OpenCode ACP | OpenCode 1.18.23 initialize/session boundary probed; exact ACP model route rejects silent fallback | Candidate held pending authenticated lifecycle, schema, recovery and Artifact evidence |
 | Codex | Real authenticated app-server lifecycle, governed approval/recovery/return path and current candidate package are verified locally | Active production Harness |
-| Kimi | ACP initialize probe reaches authentication-required in an isolated process; authenticated prompt/approval/recovery/return evidence is absent | Candidate-only / held |
+| Kimi | Kimi 1.49.0 ACP declares load/resume and now passes strict capability checks; exact-model binding is implemented; BYOK authentication and dispatch-outcome recovery evidence remain absent | Candidate-only / held |
 | DSH | Fresh-session replay, cancellation and permission path are locally evidenced; native load/resume and independently attested Artifact semantics are absent | Candidate-only / held |
 | Desktop | Tauri 2 + TypeScript shell exists and shares the intended kernel boundary, but Desktop product capability/distribution is explicitly deferred | Phase four, not first release |
 | Windows package | CLI/TUI/agentosd package contains 52 hashed files and passes local package verification; no signing certificate exists | Unsigned early-access candidate |
@@ -112,9 +112,12 @@ isolation are already implemented. Admission is held because a second
 provider must independently prove authenticated lifecycle, structured
 approval, cancellation, restart/reconciliation and technical return evidence.
 
-Kimi currently fails at the authenticated boundary with
-`authentication_required`. DSH has useful local replay evidence but its native
-resume/load and Artifact semantics are unsupported or unverified. Neither
+Kimi currently reaches the authenticated boundary with
+`authentication_required`. Its multi-session ACP can resume a native session,
+but that response does not classify a specific interrupted dispatch outcome,
+and the inspected entry point has not yet proven the product's user-owned API
+key path. DSH has useful local replay evidence but its ACP does not expose
+native resume/load and its Artifact semantics remain unverified. Neither
 provider is therefore selected by production configuration.
 
 ## Next implementation order
