@@ -24,6 +24,24 @@ function New-RandomHex {
     return ([BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
 }
 
+function Get-WindowsPrincipalFingerprint {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ([string]::IsNullOrWhiteSpace($sid)) {
+        throw 'Unable to resolve the current Windows user SID.'
+    }
+    $payload = [Collections.Generic.List[byte]]::new()
+    $payload.AddRange([Text.Encoding]::UTF8.GetBytes('egopulse/windows-sid/v1'))
+    $payload.Add(0)
+    $payload.AddRange([Text.Encoding]::UTF8.GetBytes($sid))
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($hasher.ComputeHash($payload.ToArray()))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+    }
+}
+
 function Set-UserEnvironment {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -99,7 +117,7 @@ else {
         }
     }
 
-    $config.identity.os_fingerprint_hex = New-RandomHex
+    $config.identity.os_fingerprint_hex = Get-WindowsPrincipalFingerprint
     $config.identity.principal_id = $principalId
     $config.founder.allowed_founder_principal_ids = @($principalId)
     $config.memory_retrieval.principal_scope_allowlist = [pscustomobject]@{}
