@@ -18,7 +18,7 @@ agentosd --check-config
         |
         +-- parse DaemonConfig from environment
         +-- parse ProductionBootstrapConfig and user-owned JSON
-        +-- validate identities, paths and required read-model/token keys
+    +-- validate identities, paths, required read-model/token keys and daemon settings
         +-- do not open Authority stores
         +-- do not create business databases
         +-- do not bind local IPC
@@ -30,17 +30,18 @@ Successful validation prints:
 agentosd configuration=passed stores_opened=false
 ```
 
-Invalid or missing configuration is refused with exit code `78`. The real
-binary test confirms that the rejected check does not create the configured
-user-owned file or open the stores. This is a diagnostic boundary only; it
-does not accept memory candidates, start a Harness, or modify configuration.
+Invalid, missing or out-of-range configuration is refused with exit code
+`78`. The real binary tests confirm that rejected checks do not create the
+configured user-owned file or open the stores. This is a diagnostic boundary
+only; it does not accept memory candidates, start a Harness, or modify
+configuration.
 
 ## Evidence
 
 ```text
 cargo fmt --all -- --check                         passed
 cargo clippy -p egopulse-agentosd --all-targets -- -D warnings  passed
-cargo test -p egopulse-agentosd --test config_check -- --nocapture  1 passed
+cargo test -p egopulse-agentosd --test config_check -- --nocapture  2 passed
 pnpm run ci:local                                  8/8 stages passed
 ```
 

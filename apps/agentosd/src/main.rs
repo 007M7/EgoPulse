@@ -100,11 +100,9 @@ async fn main() {
 }
 
 fn check_configuration() -> Result<(), String> {
-    DaemonConfig::from_environment()
+    let daemon = DaemonConfig::from_environment().map_err(|error| error.to_string())?;
+    daemon.validate().map_err(|error| error.to_string())?;
+    ProductionBootstrapConfig::from_environment()
+        .map(|_| ())
         .map_err(|error| error.to_string())
-        .and_then(|_| {
-            ProductionBootstrapConfig::from_environment()
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
 }
