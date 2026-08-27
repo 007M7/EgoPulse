@@ -32,8 +32,8 @@ The second fact never implies the third without provider-specific evidence.
 | Codex | Real authenticated app-server lifecycle, governed approval/recovery/return path and current candidate package are verified locally | Active production Harness |
 | Kimi | Kimi 1.49.0 ACP declares load/resume and now passes strict capability checks; exact-model binding is implemented; BYOK authentication and dispatch-outcome recovery evidence remain absent | Candidate-only / held |
 | DSH | Fresh-session replay, cancellation and permission path are locally evidenced; native load/resume and independently attested Artifact semantics are absent | Candidate-only / held |
-| Desktop | Tauri 2 + TypeScript shell now attaches through the shared Client Kernel and reads the authenticated bounded projection; Desktop writes/distribution remain deferred | Phase four read slice verified; write surface pending |
-| Windows package | CLI/TUI/agentosd package contains 55 hashed files and passes local package verification; no signing certificate exists | Unsigned early-access candidate |
+| Desktop | Tauri 2 + TypeScript shell attaches through the shared Client Kernel, reads the authenticated bounded projection, and exposes governed Task, Approval and Memory writes | Shared-kernel Windows IPC loopback verified; native GUI automation remains pending |
+| Windows package | CLI/TUI/agentosd/Desktop package contains 56 hashed files and passes local package verification; no signing certificate exists | Unsigned early-access candidate |
 
 ## Current release candidate
 
@@ -41,16 +41,17 @@ The packaged binaries are bound to the exact code commit below. Later commits
 that change documentation only do not change this binary candidate.
 
 ```text
-code commit: b1e5317217fdf992525549c379da1458cd42bda3
+code commit: 5eb7b327ebf0ec26a418356fee26810b37c9c853
 platform: windows-x86_64
-surfaces: cli, tui
-archive: .artifacts/release-candidate/egopulse-0.1.0-b1e5317217fd-windows-x86_64-20260827T105634Z.zip
-archive SHA-256: 48dfab9b9997135cf8ea9257b745e4baf026fb56c8834cbdc70ceb078d06d20c
+surfaces: cli, tui, desktop
+archive: .artifacts/release-candidate/egopulse-0.1.0-5eb7b327ebf0-windows-x86_64-20260827T112524Z.zip
+archive SHA-256: b9e7a88fc35959a00eb7f1c80edb21e3d5191f1ed9a5f13ba2a7bee5366fb5f7
 ```
 
 The matching local CI evidence passed all eight stages with a clean worktree.
 The local CD now invokes the package verifier automatically, and that verifier
-passed all 55 file hashes, CLI/TUI/agentosd help probes, the TUI foundation
+passed all 56 file hashes, CLI/TUI/agentosd help probes, Desktop binary
+presence, the TUI foundation
 probe, the daemon missing-configuration fail-closed probe, Memory Worker setup
 and the production-profile no-`fastembed` check. The packaged setup script now
 uses an isolated package-local `uv` cache by default, so verification does not
@@ -138,14 +139,13 @@ provider is therefore selected by production configuration.
    must not bypass Founder acceptance. See
    `phase-2-38-production-memory-producer-composition-20260827.md`.
 4. After the chosen Memory profile and product-facing candidate bridge are
-   evidenced, refresh the CLI/TUI early-access package. The current package was
-   refreshed for the fixed producer-proposal boundary; Desktop's shared-kernel
-   read slice is now verified, while its write surface remains a later
-   vertical.
+   evidenced, refresh the early-access package. The current package now
+   includes the shared-kernel Desktop binary and the Desktop write surface;
+   native GUI automation remains a separate acceptance item.
 
 ## Non-claims
 
 This status does not claim semantic/vector retrieval in the first package,
 automatic transcript learning, authenticated Kimi/DSH production support,
-Desktop distribution, signed Windows binaries, cloud telemetry, enterprise
+native Desktop GUI automation, signed Windows binaries, cloud telemetry, enterprise
 identity, or server-scale capacity.

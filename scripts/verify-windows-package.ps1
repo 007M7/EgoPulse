@@ -43,6 +43,17 @@ if ($metadata.platform -ne 'windows-x86_64') {
 if (@($metadata.surfaces) -notcontains 'cli' -or @($metadata.surfaces) -notcontains 'tui') {
     throw 'Package metadata must declare both CLI and TUI surfaces'
 }
+if (@($metadata.surfaces) -contains 'desktop') {
+    $desktopBinary = Join-Path $root 'bin/egopulse-desktop.exe'
+    if (-not (Test-Path -LiteralPath $desktopBinary -PathType Leaf)) {
+        throw 'Package metadata declares Desktop but egopulse-desktop.exe is missing'
+    }
+    $desktopLength = (Get-Item -LiteralPath $desktopBinary).Length
+    if ($desktopLength -le 0) {
+        throw 'Desktop binary is empty'
+    }
+    Write-Output "egopulse-desktop.exe_present=passed size=$desktopLength"
+}
 
 $sumLines = Get-Content -LiteralPath $sumsPath | Where-Object { $_.Trim() -ne '' }
 if ($sumLines.Count -eq 0) {
