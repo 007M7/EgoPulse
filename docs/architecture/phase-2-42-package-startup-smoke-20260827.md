@@ -52,8 +52,8 @@ agentosd_missing_config_fail_closed=passed
 windows_package_verification=passed
 ```
 
-The existing Windows x64 candidate was executed on 2026-08-27 after the
-verifier change, with the following observed result:
+The current Windows x64 candidate was executed on 2026-08-27 through the
+automated local CD path, with the following observed result:
 
 ```text
 egopulse.exe_help=passed
@@ -66,6 +66,6 @@ memory_worker_production_profile=passed
 windows_package_verification=passed files=52
 ```
 
-The candidate remains bound to code commit
-`294fe9bb712d8079503899513f91910f059f5f71` and archive SHA-256
-`006a0af71a912b83b3c5bdce3fe31e5e60015a334e5a7527a7ec1f7ffa41f2ba`.
+The candidate is bound to code commit
+`d3258b320d9d6ed7682ea5a684b87c4916b69adf` and archive SHA-256
+`03af4b679270d865b940cb267ab96301f3ede80457314bded76efa9b51ebda56`.

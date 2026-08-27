@@ -39,18 +39,20 @@ The packaged binaries are bound to the exact code commit below. Later commits
 that change documentation only do not change this binary candidate.
 
 ```text
-code commit: 294fe9bb712d8079503899513f91910f059f5f71
+code commit: d3258b320d9d6ed7682ea5a684b87c4916b69adf
 platform: windows-x86_64
 surfaces: cli, tui
-archive: .artifacts/release-candidate/egopulse-0.1.0-294fe9bb712d-windows-x86_64-20260827T003543Z.zip
-archive SHA-256: 006a0af71a912b83b3c5bdce3fe31e5e60015a334e5a7527a7ec1f7ffa41f2ba
+archive: .artifacts/release-candidate/egopulse-0.1.0-d3258b320d9d-windows-x86_64-20260827T005933Z.zip
+archive SHA-256: 03af4b679270d865b940cb267ab96301f3ede80457314bded76efa9b51ebda56
 ```
 
 The matching local CI evidence passed all eight stages with a clean worktree.
-The package verifier passed all 52 file hashes, CLI/TUI/agentosd help probes,
-Memory Worker setup and the production-profile no-`fastembed` check. The
-packaged setup script now uses an isolated package-local `uv` cache by default,
-so verification does not depend on a writable user-global cache.
+The local CD now invokes the package verifier automatically, and that verifier
+passed all 52 file hashes, CLI/TUI/agentosd help probes, the TUI foundation
+probe, the daemon missing-configuration fail-closed probe, Memory Worker setup
+and the production-profile no-`fastembed` check. The packaged setup script now
+uses an isolated package-local `uv` cache by default, so verification does not
+depend on a writable user-global cache.
 An independent extract-to-short-path audit repeated the same package checks,
 including fresh Memory Worker dependency installation and import. Windows
 package audits must use a short extraction root because a deep temporary path
