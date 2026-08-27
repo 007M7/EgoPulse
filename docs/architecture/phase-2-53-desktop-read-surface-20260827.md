@@ -2,7 +2,7 @@
 
 - Date: 2026-08-27
 - Scope: Tauri 2 + React + TypeScript Desktop surface
-- Status: shared-kernel read slice, TaskCreate, Approval decision, and Memory
+- Status: shared-kernel read slice, TaskCreate, Task cancellation, Approval decision, and Memory
   mutation commands implemented; shared-kernel Windows IPC loopback verified,
   native Tauri GUI automation remains a separate acceptance item
 
@@ -29,7 +29,12 @@ the structured architecture and local transport facts; `dashboard_snapshot`
 reports projection health, staleness, position, tasks and approval requests.
 `create_task` requires all frozen contract references and cannot invent default
 contract or budget identities; Authority and Local API remain responsible for
-authorization, digest validation, idempotency and persistence. `decide_approval`
+authorization, digest validation, idempotency and persistence. `cancel_task`
+accepts the task identifier, expected revision and explicit reason code from the
+current projection/user action, then routes `RequestTaskCancellation` through
+the same typed Task gateway. It does not terminate a Provider process directly
+or claim cancellation completion before the Authority records the resulting
+state. `decide_approval`
 accepts only the decision facts copied from the current projection and routes
 them through `DecideHarnessApproval`; it does not reconstruct approval context
 or bypass the Policy Authority. `submit_memory_candidate`, `accept_memory` and
@@ -44,7 +49,7 @@ Desktop process still has no Memory store handle.
 - stale projections are marked `STALE` rather than presented as current;
 - task and approval identifiers remain available for correlation, while no
   secret or provider credential is displayed;
-- TaskCreate is explicit and contract-complete; a rejected command is surfaced
+- TaskCreate and Task cancellation are explicit and contract-complete; a rejected command is surfaced
   without local fallback or direct WebView persistence;
 - Approval decision is explicit: the UI displays the action digest and bounded
   request references, requires a reason code, and offers only `allow-once` or

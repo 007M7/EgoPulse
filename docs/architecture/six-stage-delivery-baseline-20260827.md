@@ -255,9 +255,12 @@ The order after this baseline is deliberately narrow:
    fresh prompt as full Harness admission;
 4. complete the Memory candidate proposal review path and decide whether the
    semantic profile is opt-in or remains evaluation-only;
-5. refresh the CLI/TUI package only after the selected Provider/Memory
-   capabilities have their required evidence;
-6. then implement Desktop and the final release/evolution obligations.
+5. complete the included-surface acceptance work: native Desktop GUI smoke,
+   reconnect/restart behavior and the remaining equivalent CLI/TUI/Desktop
+   workflows;
+6. refresh the three-surface Windows package only after the selected
+   Provider/Memory capabilities have their required evidence, then close the
+   final release and governed-evolution obligations.
 
 ## Evidence rule
 

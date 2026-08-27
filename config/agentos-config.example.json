@@ -53,10 +53,14 @@
       "local.approval.read",
       "local.approval.decide",
       "local.founder-verdict.issue",
+      "local.founder-verdict.revoke",
+      "local.founder-verdict.apply",
       "local.evidence.read",
       "local.projection.status.read",
       "local.projection.await",
-      "local.memory.retrieve"
+      "local.memory.retrieve",
+      "local.memory.candidate.submit",
+      "local.memory.govern"
     ],
     "authorization_policy_ref": {
       "contract_id": "egopulse.authorization.v1",

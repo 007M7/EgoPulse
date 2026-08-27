@@ -6,7 +6,7 @@ The repository starts from the frozen architecture and technology baseline. It d
 
 ## Foundation status
 
-Current maturity: **Gate 4 vertical implementation in progress — V-01/C5 CLI+TUI closed, typed production bootstrap wired, Sego single-criterion verification closed, Memory/RAG M-01–M-11 locally verified**.
+Current maturity: **Gate 4 vertical implementation in progress — V-01/C5 CLI+TUI closed, the Desktop surface is attached to the same shared Rust kernel, typed production bootstrap is wired, Sego single-criterion verification is closed, and Memory/RAG M-01–M-11 are locally verified**.
 
 Available now:
 
@@ -15,7 +15,7 @@ Available now:
 - Codex App Server adapter with durable Adapter Edge and an explicit `CodexHarnessCompositionConfig` composition root;
 - C5 real Windows local-IPC E2E coverage for daemon, CLI and TUI;
 - user-owned production bootstrap JSON with environment-resolved secret keys and fail-closed validation;
-- Tauri 2 + React + TypeScript desktop shell;
+- Tauri 2 + React + TypeScript Desktop shell attached to the same authenticated local API and Rust Client Kernel as CLI/TUI, including governed Task cancellation;
 - TypeScript packages for generated clients, Agent SDK and the bounded native Harness;
 - isolated CPython 3.14 Worker projects managed by uv;
 - internal Rust Memory Authority with SQLCipher persistence, candidate-only agent writes, Founder promotion/revocation and accepted retrieval snapshots;
@@ -23,19 +23,17 @@ Available now:
 - offline Memory retrieval evaluation with dataset-digest evidence, Recall/MRR/nDCG metrics, injected exact-vector scoring and validated RRF experiment adapters;
 - explicit Sego/checker verification composition with owner-backed Artifact reads, supervised execution, immutable verification artifacts and Task write-back;
 - Protobuf/Buf and JSON Schema contract roots;
-- local CI, repository-boundary checks and commit-bound unsigned Windows early-access packaging for the CLI/TUI shared kernel;
-- a verified Windows x64 unsigned early-access candidate at commit `3d9c42c`;
+- local CI, repository-boundary checks and commit-bound unsigned Windows early-access packaging;
+- a verified Windows x64 three-surface candidate at commit `5eb7b32` (CLI, TUI and Desktop); the latest branch contains subsequent test and documentation hardening and requires a final rebuild before release;
 - account-authenticated Windows Named Pipe / Unix Domain Socket transport and an ephemeral, policy-resolved local session service.
 
 For the current Windows x64 package path, see [Windows early access](WINDOWS-EARLY-ACCESS.md).
 
-Not implemented yet:
+Not admitted or not yet closed:
 
-- Desktop product surface and Tauri distribution (the desktop shell exists, but phase one ships CLI/TUI capabilities first);
-- production semantic/vector retrieval, reranking and representative-corpus evaluation; exact-vector and RRF plumbing exists only behind the offline experiment gate, while the first release still defaults to the deterministic lexical Worker baseline;
-- authenticated second Harness lifecycle and provider admission (the
-  provider-neutral multi-model composition boundary exists, but DSH/Kimi are
-  still candidate-only);
+- native Desktop GUI automation and the remaining end-to-end Desktop workflows (the shared-kernel read, TaskCreate, Task cancellation, Approval and Memory mutation paths are locally verified);
+- the contract-compatible Provider/Model selection surface, plus authenticated production admission for DeepSeek/DSH, Kimi and GLM/OpenCode;
+- production semantic/vector retrieval and reranking; exact-vector and RRF plumbing exists only behind the offline experiment gate, while the release baseline remains deterministic lexical retrieval;
 - signed production release and SmartScreen reputation; the current package is
   explicitly unsigned and must be treated as early access.
 

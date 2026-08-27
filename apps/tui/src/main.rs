@@ -35,8 +35,8 @@ use egopulse_domain_contracts::v01::egopulse::{
     },
     task::v1::TaskStatus,
     task::v1::{
-        ApplyFounderVerdictCommand, CreateTaskCommand, TaskCommand, task_command,
-        task_command_result,
+        ApplyFounderVerdictCommand, CreateTaskCommand, RequestTaskCancellationCommand, TaskCommand,
+        task_command, task_command_result,
     },
     verdict::v1::{
         FounderVerdictDecision, IssueFounderVerdictCommand, RevokeFounderVerdictCommand,
@@ -104,6 +104,16 @@ enum TuiCommand {
         #[arg(long)]
         work_revision: u64,
         founder_verdict_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Request cancellation of a user-owned Task through the Task Authority.
+    TaskCancel {
+        task_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        reason_code: String,
         #[arg(long)]
         json: bool,
     },
@@ -277,6 +287,7 @@ impl Panel {
 enum CommandKind {
     TaskCreate,
     TaskApplyVerdict,
+    TaskCancel,
     ApprovalDecide,
     Await,
     VerdictIssue,
@@ -289,9 +300,10 @@ enum CommandKind {
 }
 
 impl CommandKind {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::TaskCreate,
         Self::TaskApplyVerdict,
+        Self::TaskCancel,
         Self::ApprovalDecide,
         Self::Await,
         Self::VerdictIssue,
@@ -307,6 +319,7 @@ impl CommandKind {
         match self {
             Self::TaskCreate => "Create governed task",
             Self::TaskApplyVerdict => "Apply Founder Verdict",
+            Self::TaskCancel => "Request task cancellation",
             Self::ApprovalDecide => "Decide harness approval",
             Self::Await => "Await projection",
             Self::VerdictIssue => "Issue Founder Verdict",
@@ -377,6 +390,11 @@ impl CommandForm {
                 FormField::required("expected-revision"),
                 FormField::required("work-revision"),
                 FormField::required("founder-verdict-id"),
+            ],
+            CommandKind::TaskCancel => vec![
+                FormField::required("task-id"),
+                FormField::required("expected-revision"),
+                FormField::required("reason-code"),
             ],
             CommandKind::ApprovalDecide => vec![
                 FormField::required("approval-request-id"),
@@ -490,6 +508,14 @@ impl CommandForm {
                     .parse()
                     .map_err(|_| "work-revision must be an integer".to_owned())?,
                 founder_verdict_id: next(&mut values, "founder-verdict-id")?,
+                json: false,
+            }),
+            CommandKind::TaskCancel => Ok(TuiCommand::TaskCancel {
+                task_id: next(&mut values, "task-id")?,
+                expected_revision: next(&mut values, "expected-revision")?
+                    .parse()
+                    .map_err(|_| "expected-revision must be an integer".to_owned())?,
+                reason_code: next(&mut values, "reason-code")?,
                 json: false,
             }),
             CommandKind::ApprovalDecide => Ok(TuiCommand::ApprovalDecide {
@@ -893,6 +919,89 @@ async fn run_command_with_output(
                 } else {
                     println!(
                         "TUI Task Founder Verdict applied: task={} revision={} status={} replayed={}",
+                        payload["data"]["taskId"].as_str().unwrap_or(""),
+                        payload["data"]["revision"].as_u64().unwrap_or_default(),
+                        payload["data"]["status"].as_str().unwrap_or(""),
+                        payload["data"]["replayed"].as_bool().unwrap_or(false),
+                    );
+                }
+            }
+            Ok(CommandResult::Completed)
+        }
+        TuiCommand::TaskCancel {
+            task_id,
+            expected_revision,
+            reason_code,
+            json,
+        } => {
+            let attached = AttachedClient::open(instance).await?;
+            attached.require_command(
+                "LocalCommandGatewayService/ExecuteTaskCommand",
+                "request_task_cancellation",
+            )?;
+            let correlation_id = Uuid::now_v7().to_string();
+            let mut command = TaskCommand {
+                command: Some(task_command::Command::RequestTaskCancellation(
+                    RequestTaskCancellationCommand {
+                        meta: Some(command_metadata(
+                            &correlation_id,
+                            "egopulse-tui/task-cancel",
+                        )),
+                        task_id,
+                        expected_revision,
+                        reason_code,
+                    },
+                )),
+            };
+            set_task_digest(&mut command);
+            let response = attached
+                .0
+                .connection
+                .command_gateway_service()
+                .execute_task_command(ExecuteTaskCommandRequest {
+                    client: Some(attached.metadata_with_correlation(correlation_id.clone())?),
+                    command: Some(command),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .into_inner();
+            if let Some(error) = response.gateway_error {
+                return Err(local_error_message(error));
+            }
+            let result = response
+                .authority_result
+                .ok_or_else(|| "task authority result missing".to_owned())?;
+            let task = match result.outcome {
+                Some(task_command_result::Outcome::Task(task)) => task,
+                Some(task_command_result::Outcome::Error(error)) => {
+                    return Err(format!(
+                        "task authority rejected: {}",
+                        error.safe_detail_code
+                    ));
+                }
+                None => return Err("task authority outcome missing".to_owned()),
+            };
+            let payload = json!({
+                "schemaVersion": "egopulse.tui-result/v0.1",
+                "ok": true,
+                "operation": "task.cancel",
+                "data": {
+                    "taskId": task.task_id,
+                    "revision": task.revision,
+                    "status": TaskStatus::try_from(task.status)
+                        .map(|value| value.as_str_name())
+                        .unwrap_or("TASK_STATUS_UNSPECIFIED"),
+                    "replayed": result.replayed,
+                    "awaitToken": await_token_json(response.await_token),
+                },
+                "correlationId": correlation_id,
+            });
+            if output == CommandOutput::Console {
+                if json {
+                    println!("{}", serde_json::to_string(&payload).unwrap());
+                } else {
+                    println!(
+                        "TUI task cancellation requested: {} revision={} status={} replayed={}",
                         payload["data"]["taskId"].as_str().unwrap_or(""),
                         payload["data"]["revision"].as_u64().unwrap_or_default(),
                         payload["data"]["status"].as_str().unwrap_or(""),
@@ -1587,6 +1696,7 @@ fn command_kind(command: &TuiCommand) -> &'static str {
     match command {
         TuiCommand::TaskCreate { .. } => "task.create",
         TuiCommand::TaskApplyVerdict { .. } => "task.apply-verdict",
+        TuiCommand::TaskCancel { .. } => "task.cancel",
         TuiCommand::ApprovalDecide { .. } => "approval.decide",
         TuiCommand::Await { .. } => "await",
         TuiCommand::VerdictIssue { .. } => "verdict.issue",
@@ -2338,6 +2448,8 @@ mod tests {
         let mut app = App::new("default".to_owned());
         app.open_palette();
         assert!(matches!(app.mode, InteractiveMode::Palette { selected: 0 }));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("palette navigation");
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
             .expect("palette navigation");
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))

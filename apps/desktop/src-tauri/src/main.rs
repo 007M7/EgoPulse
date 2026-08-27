@@ -13,7 +13,10 @@ use egopulse_domain_contracts::v01::egopulse::{
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
     },
-    task::v1::{CreateTaskCommand, TaskCommand, TaskStatus, task_command, task_command_result},
+    task::v1::{
+        CreateTaskCommand, RequestTaskCancellationCommand, TaskCommand, TaskStatus, task_command,
+        task_command_result,
+    },
 };
 use egopulse_local_api::{LocalApiClient, LocalTransport};
 use serde::{Deserialize, Serialize};
@@ -73,6 +76,15 @@ struct DesktopTaskCreateResult {
     status: String,
     replayed: bool,
     await_token_present: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopTaskCancellationRequest {
+    instance: String,
+    task_id: String,
+    expected_revision: u64,
+    reason_code: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -650,12 +662,99 @@ async fn create_task(request: DesktopTaskCreateRequest) -> Result<DesktopTaskCre
     })
 }
 
+#[tauri::command]
+async fn cancel_task(
+    request: DesktopTaskCancellationRequest,
+) -> Result<DesktopTaskCreateResult, String> {
+    let DesktopTaskCancellationRequest {
+        instance,
+        task_id,
+        expected_revision,
+        reason_code,
+    } = request;
+    require_non_empty(&task_id, "task_id")?;
+    require_non_empty(&reason_code, "reason_code")?;
+    let instance = if instance.trim().is_empty() {
+        "default".to_owned()
+    } else {
+        instance
+    };
+    let attachment = attach(
+        &instance,
+        ClientSurface::Desktop,
+        format!("egopulse-desktop-{}", Uuid::now_v7()),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    attachment
+        .require_command(
+            "LocalCommandGatewayService/ExecuteTaskCommand",
+            "request_task_cancellation",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let correlation_id = Uuid::now_v7().to_string();
+    let mut command = TaskCommand {
+        command: Some(task_command::Command::RequestTaskCancellation(
+            RequestTaskCancellationCommand {
+                meta: Some(egopulse_client_operations::command_metadata(
+                    &correlation_id,
+                    "egopulse-desktop/task-cancel",
+                )),
+                task_id,
+                expected_revision,
+                reason_code,
+            },
+        )),
+    };
+    egopulse_client_operations::set_task_digest(&mut command);
+    let response = attachment
+        .connection
+        .command_gateway_service()
+        .execute_task_command(ExecuteTaskCommandRequest {
+            client: Some(
+                attachment
+                    .metadata(Some(correlation_id))
+                    .map_err(|error| error.to_string())?,
+            ),
+            command: Some(command),
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .into_inner();
+    if let Some(error) = response.gateway_error.as_ref() {
+        return Err(safe_local_api_error(error));
+    }
+    let authority_result = response
+        .authority_result
+        .ok_or_else(|| "task authority result missing".to_owned())?;
+    let replayed = authority_result.replayed;
+    let task = match authority_result.outcome {
+        Some(task_command_result::Outcome::Task(task)) => Ok(task),
+        Some(task_command_result::Outcome::Error(error)) => Err(format!(
+            "task authority rejected the command: code={} detail={}",
+            error.code, error.safe_detail_code
+        )),
+        None => Err("task authority outcome missing".to_owned()),
+    }?;
+    Ok(DesktopTaskCreateResult {
+        task_id: task.task_id,
+        revision: task.revision,
+        status: TaskStatus::try_from(task.status)
+            .map(|value| value.as_str_name().to_owned())
+            .unwrap_or_else(|_| "TASK_STATUS_UNKNOWN".to_owned()),
+        replayed,
+        await_token_present: response.await_token.is_some(),
+    })
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             foundation_status,
             dashboard_snapshot,
             create_task,
+            cancel_task,
             decide_approval,
             submit_memory_candidate,
             accept_memory,

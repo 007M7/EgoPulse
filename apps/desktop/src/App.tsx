@@ -157,6 +157,37 @@ export function App() {
     }
   }
 
+  async function cancelTask(task: DesktopTask) {
+    const reasonCode = window.prompt("Cancellation reason code", "desktop-user-cancelled");
+    if (!reasonCode?.trim()) {
+      setNote("Task cancellation was not submitted: a reason code is required.");
+      return;
+    }
+    setTaskBusy(true);
+    try {
+      const result = await invoke<{
+        taskId: string;
+        revision: number;
+        status: string;
+        replayed: boolean;
+        awaitTokenPresent: boolean;
+      }>("cancel_task", {
+        request: {
+          instance,
+          taskId: task.taskId,
+          expectedRevision: task.revision,
+          reasonCode,
+        },
+      });
+      setNote(`Cancellation requested for ${result.taskId}; status is ${result.status}.`);
+      await connectToDaemon();
+    } catch (error) {
+      setNote(`Task cancellation rejected: ${String(error)}`);
+    } finally {
+      setTaskBusy(false);
+    }
+  }
+
   async function decideApproval(approval: DesktopApproval, decision: "allow-once" | "deny") {
     setApprovalBusy(approval.approvalRequestId);
     try {
@@ -347,7 +378,14 @@ export function App() {
                 <ul>{snapshot.tasks.map((task) => (
                   <li key={task.taskId}>
                     <div><strong>{task.workType || "Untitled task"}</strong><small>{task.taskId}</small></div>
-                    <span>{task.status.replace("TASK_STATUS_", "")}</span>
+                    <div className="task-actions">
+                      <span>{task.status.replace("TASK_STATUS_", "")}</span>
+                      {!["TASK_STATUS_CANCELLED", "TASK_STATUS_COMPLETED", "TASK_STATUS_REJECTED"].includes(task.status) ? (
+                        <button className="secondary" type="button" onClick={() => cancelTask(task)} disabled={taskBusy}>
+                          {taskBusy ? "Saving…" : "Request cancellation"}
+                        </button>
+                      ) : null}
+                    </div>
                   </li>
                 ))}</ul>
               )}
