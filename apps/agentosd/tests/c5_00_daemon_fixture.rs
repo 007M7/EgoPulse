@@ -1084,7 +1084,9 @@ async fn c5_05_real_desktop_surface_uses_shared_kernel_for_read_and_writes() {
     let mut child = spawn_fixture_with_mode(&root, &instance, "allow").await;
     wait_for_cli_status(&instance).await;
 
-    let attachment = loop {
+    let mut attachment = None;
+    let mut last_attach_error = String::from("Desktop attachment did not start");
+    for _ in 0..80 {
         match egopulse_client_operations::attach(
             &instance,
             ClientSurface::Desktop,
@@ -1092,16 +1094,30 @@ async fn c5_05_real_desktop_surface_uses_shared_kernel_for_read_and_writes() {
         )
         .await
         {
-            Ok(attachment) => break attachment,
+            Ok(value) => {
+                attachment = Some(value);
+                break;
+            }
             Err(error) => {
+                last_attach_error = error.to_string();
                 assert!(
-                    !error.to_string().contains("permission"),
-                    "Desktop session must not fail because of surface-specific permissions: {error}"
+                    !last_attach_error.contains("permission"),
+                    "Desktop session must not fail because of surface-specific permissions: {last_attach_error}"
                 );
                 sleep(Duration::from_millis(50)).await;
             }
         }
+    }
+    let attachment = match attachment {
+        Some(value) => value,
+        None => {
+            panic!("Desktop attachment should become ready within timeout: {last_attach_error}")
+        }
     };
+    assert!(
+        !last_attach_error.contains("permission"),
+        "Desktop attachment failed with a permission error: {last_attach_error}"
+    );
     let projection = attachment
         .read_projection_snapshot()
         .await
