@@ -73,6 +73,11 @@ reads a bounded accepted snapshot.
 
 - Python Memory/RAG test suite: 45 passed, including gate pass, metric
   regression rejection, missing provenance rejection, and rollback assertions.
+- The real local semantic candidate run for `multilingual-e5-small-v0` was
+  executed on the fixed project corpus and rejected by the quality gate:
+  Recall@2 regressed from `1.0` to `0.92857143` and NDCG@2 regressed from
+  `0.8681892` to `0.84948495`. The detailed evidence is in
+  `phase-2-52-semantic-rag-candidate-evaluation-20260827.md`.
 - Rust DSH/Kimi/OpenCode adapter tests compile, including all three ignored
   authenticated lifecycle entry points.
 - No real Provider prompt was sent in this implementation run: the current

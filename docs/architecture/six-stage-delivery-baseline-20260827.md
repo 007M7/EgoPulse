@@ -167,9 +167,11 @@ Worker result
 
 Current disposition: **governance boundary and lexical production baseline
 closed; semantic RAG admission incomplete**. M-01–M-11 and the current
-evaluation gate are locally verified. A semantic candidate may become
-opt-in only after the Founder selects the profile and the package/runtime
-costs, provenance and rollback behavior are accepted.
+evaluation gate are locally verified. The first real semantic/hybrid candidate
+was evaluated and rejected for Recall/NDCG regression; a semantic candidate
+may become opt-in only after a passing evaluation, Founder selection of the
+profile, and acceptance of package/runtime costs, provenance and rollback
+behavior.
 
 ### Stage 5 — complete product surfaces
 
