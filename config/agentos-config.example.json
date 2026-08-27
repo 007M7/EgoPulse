@@ -263,9 +263,9 @@
       "dispatch_id": "dispatch:replace-me",
       "harness_id": "codex",
       "capability_profile_ref": {
-        "contract_id": "replace-capability-profile",
+        "contract_id": "codex-app-server-v2-0.148.0-alpha.15",
         "version": "v1",
-        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        "sha256": "b4e8157096dd054c008a4f1b538fb6cd8f1f2cb9577a97a4afef59c2296ed608"
       },
       "workspace_ref": "workspace:replace-me",
       "lease_policy_ref": {
@@ -293,9 +293,9 @@
             "sha256": "abababababababababababababababababababababababababababababababab"
           },
           "required_capability_profile_ref": {
-            "contract_id": "replace-capability-profile",
+            "contract_id": "codex-app-server-v2-0.148.0-alpha.15",
             "version": "v1",
-            "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            "sha256": "b4e8157096dd054c008a4f1b538fb6cd8f1f2cb9577a97a4afef59c2296ed608"
           },
           "max_attempts": 2
         },
