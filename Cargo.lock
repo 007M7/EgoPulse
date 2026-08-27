@@ -1179,9 +1179,13 @@ dependencies = [
 name = "egopulse-desktop"
 version = "0.1.0"
 dependencies = [
+ "egopulse-client-operations",
+ "egopulse-domain-contracts",
  "egopulse-local-api",
+ "serde",
  "tauri",
  "tauri-build",
+ "uuid",
 ]
 
 [[package]]

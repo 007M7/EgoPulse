@@ -202,8 +202,9 @@ Exit evidence:
 - a clean Windows x64 package can be installed and used by a new user.
 
 Current disposition: **CLI/TUI first-release slice is substantially usable;
-Desktop product surface is intentionally pending**. The existing Tauri shell
-is not evidence that the Desktop vertical is complete.
+Desktop shared-kernel read surface is implemented and locally verified;
+Desktop write workflows and distribution remain pending**. The authoritative
+slice evidence is `phase-2-53-desktop-read-surface-20260827.md`.
 
 ### Stage 6 — release, maintenance and governed evolution
 
