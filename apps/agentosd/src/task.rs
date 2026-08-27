@@ -203,6 +203,22 @@ impl TaskTransitionGuard for ConfiguredTaskTransitionGuard {
                     founder_verdict_state_revision: None,
                 })
             }
+            Some(task_command::Command::RequestTaskCancellation(value))
+                if (current.status == TaskStatus::Ready as i32
+                    || current.status == TaskStatus::Active as i32)
+                    && value.task_id == current.task_id
+                    && value.expected_revision == current.revision
+                    && !value.reason_code.trim().is_empty() =>
+            {
+                Ok(TransitionAuthorization {
+                    evidence_refs: vec![format!(
+                        "task-cancellation-request:{}@founder",
+                        value.reason_code
+                    )],
+                    founder_decision: None,
+                    founder_verdict_state_revision: None,
+                })
+            }
             Some(task_command::Command::ApplyFounderVerdict(value)) => {
                 let Some(founder_verdict) = self.founder_verdict.as_ref() else {
                     return Err(TransitionGuardRejection::UnverifiedReference);

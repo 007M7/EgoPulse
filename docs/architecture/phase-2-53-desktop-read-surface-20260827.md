@@ -34,7 +34,10 @@ accepts the task identifier, expected revision and explicit reason code from the
 current projection/user action, then routes `RequestTaskCancellation` through
 the same typed Task gateway. It does not terminate a Provider process directly
 or claim cancellation completion before the Authority records the resulting
-state. `decide_approval`
+state. Task Authority durably records an accepted request as
+`CANCELLATION_PENDING`; this is a governed request boundary, not proof that a
+Provider process has terminated. A later cancellation-outcome command and
+cross-domain execution receipt remain separate work. `decide_approval`
 accepts only the decision facts copied from the current projection and routes
 them through `DecideHarnessApproval`; it does not reconstruct approval context
 or bypass the Policy Authority. `submit_memory_candidate`, `accept_memory` and
@@ -49,8 +52,9 @@ Desktop process still has no Memory store handle.
 - stale projections are marked `STALE` rather than presented as current;
 - task and approval identifiers remain available for correlation, while no
   secret or provider credential is displayed;
-- TaskCreate and Task cancellation are explicit and contract-complete; a rejected command is surfaced
-  without local fallback or direct WebView persistence;
+- TaskCreate and the Task cancellation-request transition are explicit and
+  contract-complete; a rejected command is surfaced without local fallback or
+  direct WebView persistence;
 - Approval decision is explicit: the UI displays the action digest and bounded
   request references, requires a reason code, and offers only `allow-once` or
   `deny` when the projection exposes `DECIDE_HARNESS_APPROVAL`;

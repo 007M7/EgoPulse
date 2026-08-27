@@ -12,9 +12,9 @@ use std::{
 };
 
 use egopulse_agentosd::{
-    AuthorityCompositionInputs, AuthorityPrincipalResolver, DaemonComposition, DaemonConfig,
-    DaemonProviders, MemoryRetrievalCompositionConfig, OwnerProjectionSource,
-    PendingOwnerProjection, ProjectionSourceFailure,
+    AuthorityCompositionInputs, AuthorityPrincipalResolver, ConfiguredTaskTransitionGuard,
+    DaemonComposition, DaemonConfig, DaemonProviders, MemoryRetrievalCompositionConfig,
+    OwnerProjectionSource, PendingOwnerProjection, ProjectionSourceFailure,
 };
 use egopulse_client_kernel::{ClientKernel, api_contract_ref, authorization_contract_ref};
 use egopulse_cognition_runtime::{
@@ -45,7 +45,10 @@ use egopulse_domain_contracts::v01::egopulse::{
         ConsumeHarnessApprovalDecisionCommand, HarnessApprovalDecisionRecord,
         IssueHarnessApprovalDecisionCommand,
     },
-    task::v1::{CreateTaskCommand, TaskCommand, TaskEvent, TaskSnapshot, TaskStatus, task_command},
+    task::v1::{
+        CreateTaskCommand, RequestTaskCancellationCommand, TaskCommand, TaskEvent, TaskSnapshot,
+        TaskStatus, task_command,
+    },
     verdict::v1::{ConsumeFounderVerdictCommand, IssueFounderVerdictCommand},
 };
 use egopulse_founder_verdict_authority::{
@@ -534,13 +537,14 @@ where
     P: egopulse_policy_decision_authority::PolicyReferenceResolver,
     V: egopulse_founder_verdict_authority::VerdictReferenceResolver,
 {
-    let task = TaskAuthority::open(
+    let task = TaskAuthority::open_with_transition_guard(
         TaskAuthorityConfig {
             database_path: root.join("task-authority.db"),
             store_epoch: "c5-00-task-epoch".to_owned(),
             key: SqlCipherKey::new([0x11; 32]),
         },
         task_guard,
+        ConfiguredTaskTransitionGuard::new(),
     )
     .expect("fixture task authority should open");
     let policy = PolicyDecisionAuthority::open(
@@ -1180,14 +1184,67 @@ async fn c5_05_real_desktop_surface_uses_shared_kernel_for_read_and_writes() {
     let task_result = task_response
         .authority_result
         .expect("Desktop TaskCreate authority result");
-    assert!(matches!(
-        task_result.outcome,
+    let (created_task_id, task_revision) = match task_result.outcome {
         Some(
             egopulse_domain_contracts::v01::egopulse::task::v1::task_command_result::Outcome::Task(
-                _
-            )
-        )
-    ));
+                task,
+            ),
+        ) => (task.task_id, task.revision),
+        _ => panic!("Desktop TaskCreate must return a task snapshot"),
+    };
+    let cancellation_correlation_id = Uuid::now_v7().to_string();
+    let mut cancellation_command = TaskCommand {
+        command: Some(task_command::Command::RequestTaskCancellation(
+            RequestTaskCancellationCommand {
+                meta: Some(egopulse_client_operations::command_metadata(
+                    &cancellation_correlation_id,
+                    "egopulse-desktop-test/task-cancel",
+                )),
+                task_id: created_task_id,
+                expected_revision: task_revision,
+                reason_code: "desktop-test-cancel".to_owned(),
+            },
+        )),
+    };
+    egopulse_client_operations::set_task_digest(&mut cancellation_command);
+    let cancellation_response = attachment
+        .connection
+        .command_gateway_service()
+        .execute_task_command(ExecuteTaskCommandRequest {
+            client: Some(
+                attachment
+                    .metadata(Some(cancellation_correlation_id))
+                    .expect("Desktop cancellation metadata"),
+            ),
+            command: Some(cancellation_command),
+        })
+        .await
+        .expect("Desktop Task cancellation RPC")
+        .into_inner();
+    assert!(cancellation_response.gateway_error.is_none());
+    let cancellation_result = cancellation_response
+        .authority_result
+        .expect("Desktop Task cancellation authority result");
+    let cancellation_task = match cancellation_result.outcome {
+        Some(
+            egopulse_domain_contracts::v01::egopulse::task::v1::task_command_result::Outcome::Task(
+                task,
+            ),
+        ) => task,
+        Some(
+            egopulse_domain_contracts::v01::egopulse::task::v1::task_command_result::Outcome::Error(
+                error,
+            ),
+        ) => panic!(
+            "Desktop Task cancellation must return a task snapshot, got {}",
+            error.safe_detail_code
+        ),
+        _ => panic!("Desktop Task cancellation must return a task snapshot"),
+    };
+    assert_eq!(
+        cancellation_task.status,
+        TaskStatus::CancellationPending as i32
+    );
 
     let memory_id = format!("c5-05-desktop-memory-{}", Uuid::now_v7());
     let memory_metadata = attachment

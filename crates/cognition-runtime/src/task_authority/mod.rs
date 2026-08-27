@@ -8,8 +8,9 @@ mod store;
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::task::v1::{
     ApplyFounderVerdictCommand, CreateTaskCommand, FounderDecision, GetTaskResponse,
-    ReviseTaskCommand, TaskCommand, TaskCommandResult, TaskError, TaskErrorCode, TaskEvent,
-    TaskEventKind, TaskSnapshot, TaskStatus, get_task_response, task_command, task_command_result,
+    RequestTaskCancellationCommand, ReviseTaskCommand, TaskCommand, TaskCommandResult, TaskError,
+    TaskErrorCode, TaskEvent, TaskEventKind, TaskSnapshot, TaskStatus, get_task_response,
+    task_command, task_command_result,
 };
 use egopulse_domain_contracts::v01::egopulse::verdict::v1::{
     ConsumeFounderVerdictCommand, VerdictCommand, verdict_command,
@@ -210,9 +211,9 @@ impl TaskAuthority {
         })
     }
 
-    /// Executes one frozen Task command. Only CreateTask reaches a mutation in
-    /// G4-02; other operations fail closed after the applicable front-door
-    /// checks until their cross-domain proof is implemented.
+    /// Executes one frozen Task command. Task creation and the bounded
+    /// cancellation-request transition are local Authority mutations; other
+    /// operations fail closed until their cross-domain proof is implemented.
     pub fn execute(
         &mut self,
         command: &TaskCommand,
@@ -329,7 +330,8 @@ impl TaskAuthority {
             | Some(task_command::Command::SubmitTaskEvidence(_))
             | Some(task_command::Command::RecordTaskVerification(_))
             | Some(task_command::Command::ApplyFounderVerdict(_))
-            | Some(task_command::Command::ReviseTask(_)) => {
+            | Some(task_command::Command::ReviseTask(_))
+            | Some(task_command::Command::RequestTaskCancellation(_)) => {
                 self.commit_transition(command, principal, &actual_digest)
             }
             Some(_) => Ok(error_result(
@@ -772,6 +774,27 @@ impl TaskAuthority {
                     None,
                 )
             }
+            Some(task_command::Command::RequestTaskCancellation(value)) => {
+                if !request_task_cancellation_structure_is_complete(value)
+                    || !matches!(
+                        current.status,
+                        status if status == TaskStatus::Ready as i32
+                            || status == TaskStatus::Active as i32
+                    )
+                {
+                    return Ok(error_result(
+                        TaskErrorCode::StateConflict,
+                        "CANCELLATION_PRECONDITION_FAILED",
+                        Some(current.revision),
+                    ));
+                }
+                next.status = TaskStatus::CancellationPending as i32;
+                (
+                    TaskEventKind::CancellationRequested,
+                    vec![format!("cancellation-reason:{}", value.reason_code)],
+                    None,
+                )
+            }
             _ => unreachable!("caller limits supported transitions"),
         };
         evidence_refs.extend(authorization.evidence_refs);
@@ -1036,6 +1059,12 @@ fn revise_structure_complete(command: &ReviseTaskCommand) -> bool {
             .new_acceptance_contract_ref
             .as_ref()
             .is_some_and(contract_reference_is_complete)
+}
+
+fn request_task_cancellation_structure_is_complete(
+    command: &RequestTaskCancellationCommand,
+) -> bool {
+    !command.task_id.trim().is_empty() && !command.reason_code.trim().is_empty()
 }
 
 fn build_consume_verdict_command(

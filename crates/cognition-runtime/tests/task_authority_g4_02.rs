@@ -5,9 +5,9 @@ use egopulse_cognition_runtime::task_authority::{
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::task::v1::{
-    ActivateTaskCommand, ApplyFounderVerdictCommand, CreateTaskCommand, TaskCommand, TaskErrorCode,
-    TaskEvent, TaskEventKind, TaskSnapshot, TaskStatus, get_task_response, task_command,
-    task_command_result,
+    ActivateTaskCommand, ApplyFounderVerdictCommand, CreateTaskCommand,
+    RequestTaskCancellationCommand, TaskCommand, TaskErrorCode, TaskEvent, TaskEventKind,
+    TaskSnapshot, TaskStatus, get_task_response, task_command, task_command_result,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -167,6 +167,9 @@ fn set_digest(command: &mut TaskCommand) {
         task_command::Command::ApplyFounderVerdict(value) => {
             value.meta.as_mut().expect("metadata").request_digest_sha256 = digest;
         }
+        task_command::Command::RequestTaskCancellation(value) => {
+            value.meta.as_mut().expect("metadata").request_digest_sha256 = digest;
+        }
         _ => panic!("test helper does not support this command"),
     }
 }
@@ -275,6 +278,56 @@ fn valid_create_duplicate_and_conflict_preserve_one_atomic_commit() {
     assert_eq!(two_commits.commit_receipt_count, 2);
     assert_eq!(two_commits.last_committed_revision, 2);
     assert_eq!(two_commits.last_event_sequence, 2);
+}
+
+#[test]
+fn founder_cancellation_request_commits_pending_state_and_replays_idempotently() {
+    let isolated = IsolatedStore::new("task-cancellation");
+    let mut authority = open_authority(&isolated.database_path());
+    let created = authority
+        .execute(&valid_create_command(), &founder())
+        .expect("create Task before cancellation");
+    let task = committed_task(&created);
+    let mut cancellation = TaskCommand {
+        command: Some(task_command::Command::RequestTaskCancellation(
+            RequestTaskCancellationCommand {
+                meta: Some(metadata("cmd-cancel-001", "cancel-001", "corr-cancel-001")),
+                task_id: task.task_id.clone(),
+                expected_revision: task.revision,
+                reason_code: "founder-requested-stop".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut cancellation);
+
+    let result = authority
+        .execute(&cancellation, &founder())
+        .expect("commit Task cancellation request");
+    assert!(!result.replayed);
+    let pending = committed_task(&result);
+    assert_eq!(pending.status, TaskStatus::CancellationPending as i32);
+    assert_eq!(pending.revision, task.revision + 1);
+    let event = result.committed_event.as_ref().expect("cancellation event");
+    assert_eq!(event.kind, TaskEventKind::CancellationRequested as i32);
+    assert!(
+        event
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == "cancellation-reason:founder-requested-stop")
+    );
+
+    let replayed = authority
+        .execute(&cancellation, &founder())
+        .expect("replay Task cancellation request");
+    assert!(replayed.replayed);
+    assert_eq!(committed_task(&replayed), pending);
+    assert_eq!(
+        authority
+            .inspect_store()
+            .expect("inspect cancellation store")
+            .event_count,
+        2
+    );
 }
 
 #[test]
