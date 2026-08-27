@@ -102,3 +102,33 @@ local fast check -> one remote CI run -> dependent remote Windows CD
 ```
 
 The release build is not a duplicate test gate: it produces optimized binaries that the debug/test CI job does not produce. Within the first CD path, only the three CLI/TUI/kernel binaries are compiled; the Tauri CLI installer path and desktop frontend are intentionally not invoked until the desktop vertical is ready. Local full CI/CD remains an opt-in diagnostic and offline path.
+
+## Windows Git transport incident
+
+If a task shows a Windows dialog for `git-remote-https.exe` with an
+application error, inspect the transport before retrying the task. This is a
+Git TLS/proxy process failure, not an EgoPulse contract or Rust test failure.
+The affected setup has been observed with Git's global `schannel` backend and
+an injected local `HTTPS_PROXY`.
+
+Use the following one-shot diagnostic first; it does not change repository
+state or print credentials:
+
+```powershell
+git config --show-origin --get http.sslbackend
+[Environment]::GetEnvironmentVariable('HTTPS_PROXY', 'Process')
+```
+
+For a GitHub push, use the controlled authenticated push procedure recorded by
+the maintainer, or a one-shot OpenSSL transport override. Never put a token in
+a remote URL or commit it to configuration. If the local proxy is intentionally
+running, the one-shot form is:
+
+```powershell
+git -c http.sslBackend=openssl push origin HEAD:<branch>
+```
+
+If the proxy is not intended for the current task, remove it from the task's
+process environment and retry. A persistent global backend change is an
+operator decision and must be tested against other Git remotes before being
+made; it is not part of EgoPulse's runtime or release contract.
