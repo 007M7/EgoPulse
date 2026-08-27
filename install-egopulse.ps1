@@ -141,6 +141,14 @@ foreach ($keyName in $authorityKeys) {
 }
 Set-UserEnvironment -Name 'EGOPULSE_USER_CONFIG' -Value $configPath
 Set-UserEnvironment -Name 'EGOPULSE_IPC_INSTANCE' -Value 'default'
+$runtimeConfig = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$taskEpoch = [string]$runtimeConfig.stores.task.store_epoch
+if ([string]::IsNullOrWhiteSpace($taskEpoch)) {
+    throw 'Installed configuration is missing stores.task.store_epoch.'
+}
+$readModelEpoch = $taskEpoch -replace '^egopulse-task-', 'egopulse-read-model-'
+Set-UserEnvironment -Name 'EGOPULSE_READ_MODEL_DB' -Value (Join-Path $data 'read-model.db')
+Set-UserEnvironment -Name 'EGOPULSE_READ_MODEL_EPOCH' -Value $readModelEpoch
 
 if (-not $SkipMemoryWorker) {
     & (Join-Path $root 'setup-memory-worker.ps1') -PackageRoot $root
