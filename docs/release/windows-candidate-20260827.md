@@ -2,7 +2,7 @@
 
 - Date: 2026-08-27
 - Repository: `007M7/EgoPulse`
-- Commit: `3d9c42c24de4ab4d1e72053de0fbc0e8c2c6c5ca`
+- Commit: `149e89663eda24547e1cae7f96a287a0d450e783`
 - Classification: `unsigned-release-candidate`
 - Included surfaces: CLI and TUI over the shared Rust client kernel
 - Desktop: intentionally excluded from this first candidate
@@ -27,9 +27,9 @@ ignored by Git; the candidate package contains a copy at
 
 ## Package evidence
 
-- Archive: `egopulse-0.1.0-3d9c42c24de4-windows-x86_64-20260827T095649Z.zip`
+- Archive: `egopulse-0.1.0-149e89663eda-windows-x86_64-20260827T101506Z.zip`
 - Archive SHA-256:
-  `86aa3185a0076b0375c894fb41e5d05c0aad240ea4c2b8a2454bbee5626b4ca2`
+  `d2e25d019c3dede77cf0046f0a3903798451b12f50f6990cb5e951d319dc4446`
 - Package verification: passed, `files=55`
 - `egopulse.exe --help`: passed
 - `egopulse-tui.exe --help`: passed
@@ -38,6 +38,22 @@ ignored by Git; the candidate package contains a copy at
 - daemon missing-configuration fail-closed probe: passed
 - isolated Memory Worker setup: passed
 - locked production Memory Worker profile: passed
+
+## Isolated installation smoke
+
+The packaged `install-egopulse.ps1` was run with an isolated data directory,
+`-NoPersistEnvironment`, and without launching the daemon. It completed
+successfully and printed these redacted Provider facts:
+
+```text
+gpt-codex-default      executable_available=True  credential_status=harness_account_delegated admission=production
+deepseek-dsh-candidate  executable_available=True  credential_status=missing                 admission=held
+kimi-cli-candidate      executable_available=True  credential_status=missing                 admission=held
+glm-opencode-candidate  executable_available=False credential_status=harness_account_delegated admission=held
+```
+
+No user environment variable was persisted, no API-key value was read into
+the report, and no Provider inference request was sent.
 
 The package verifier created the Worker environment inside the candidate
 directory and validated that retrieval remains a read-only, lexical baseline.

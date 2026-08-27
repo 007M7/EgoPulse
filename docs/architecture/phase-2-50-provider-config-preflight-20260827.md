@@ -83,6 +83,12 @@ four configured Provider profiles emitted
 credential values absent
 ```
 
+The packaged installer was also smoke-tested with an isolated data directory
+and `-NoPersistEnvironment`. It completed successfully and reported the
+expected local facts: GPT/Codex executable present with delegated Harness
+authentication; DSH and Kimi executables present but their API-key sources
+missing; OpenCode executable absent. No Harness was started by this smoke test.
+
 The exact implementation is in `apps/agentosd/src/bootstrap.rs` and
 `apps/agentosd/src/main.rs`. The report is derived from the same typed
 bootstrap profile used by daemon startup, so setup output cannot invent a
