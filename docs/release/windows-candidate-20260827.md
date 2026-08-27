@@ -2,7 +2,7 @@
 
 - Date: 2026-08-27
 - Repository: `007M7/EgoPulse`
-- Commit: `2568955fb65de922f5ac4a85770bb6d745fc161a`
+- Commit: `a5c4e5befceec6376cd054bd6e303ba02dc34ff9`
 - Classification: `unsigned-release-candidate`
 - Included surfaces: CLI and TUI over the shared Rust client kernel
 - Desktop: intentionally excluded from this first candidate
@@ -27,9 +27,9 @@ ignored by Git; the candidate package contains a copy at
 
 ## Package evidence
 
-- Archive: `egopulse-0.1.0-2568955fb65d-windows-x86_64-20260827T102755Z.zip`
+- Archive: `egopulse-0.1.0-a5c4e5befcee-windows-x86_64-20260827T103641Z.zip`
 - Archive SHA-256:
-  `f545a09043646a95f94ca1d44528ca0d286076da4db41398a836ad096eb615b6`
+  `9e5918749cf57f88d2d9cce443642910eaca0ab986c6c21194b34432ed2260fa`
 - Package verification: passed, `files=55`
 - `egopulse.exe --help`: passed
 - `egopulse-tui.exe --help`: passed
