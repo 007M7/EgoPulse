@@ -486,3 +486,47 @@ fn update_sequence(
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn accepted_snapshot_bounds_are_checked_before_rows_are_loaded() {
+        let root = std::env::temp_dir().join(format!("egopulse-memory-store-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create isolated store directory");
+        let path = root.join("memory-authority.sqlcipher");
+        let mut store = MemoryStore::open(&path, &[71_u8; 32], "store-test-epoch")
+            .expect("open encrypted store");
+        let content = "x".repeat(MEMORY_MAX_TOTAL_CONTENT_BYTES + 1);
+        let memory = StoredMemory {
+            memory_id: "memory-over-limit".to_owned(),
+            revision: 1,
+            content: content.clone(),
+            content_sha256: hex::encode(Sha256::digest(content.as_bytes())),
+            source_ref: "source:test".to_owned(),
+            scope_ref: "scope:test".to_owned(),
+            state: StoredState::from("accepted"),
+            created_at_seconds: 1,
+            updated_at_seconds: 1,
+        };
+        store
+            .insert_candidate(
+                &memory,
+                "event:test",
+                "principal:test",
+                "idempotency:test",
+                "request:test",
+            )
+            .expect("insert semantic-boundary fixture");
+
+        assert!(matches!(
+            store.accepted_memories("scope:test"),
+            Err(StoreError::SnapshotBounds)
+        ));
+
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+}

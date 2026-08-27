@@ -35,13 +35,14 @@ cargo fmt --all -- --check
 passed
 
 cargo test -p egopulse-cognition-runtime --lib --test memory_authority
-unit tests: 4 passed
+unit tests: 5 passed
 Memory Authority integration tests: 7 passed
 ```
 
 The tests cover matching and drifted content digests, encrypted-store
 reopen, candidate-only writes, idempotency, terminal revocation,
-unauthenticated writes, and oversized candidate content/routing fields.
+unauthenticated writes, oversized candidate content/routing fields, and the
+SQL-side snapshot-bound rejection before row contents are loaded.
 
 ## Non-claims
 
