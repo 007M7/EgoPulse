@@ -46,7 +46,7 @@ pnpm run ci:local                                  8/8 stages passed
 ```
 
 The full local CI evidence is bound to commit
-`380444216517b54514f60592b1ff0ec015f1308f` and started from a clean
+`d6308b458ebe0ce3354314182b05fa21819bedd7` and started from a clean
 worktree. GitHub Actions is informational while the repository's Actions
 quota is exhausted; Windows local CI/CD remains the operational authority.
 
@@ -54,9 +54,9 @@ quota is exhausted; Windows local CI/CD remains the operational authority.
 
 ```text
 classification: unsigned-release-candidate
-commit: 380444216517b54514f60592b1ff0ec015f1308f
-archive: .artifacts/release-candidate/egopulse-0.1.0-380444216517-windows-x86_64-20260827T000153Z.zip
-archive SHA-256: 98c1a443422201f1eeeb0727983d1c3d1cc82d73b189e299a544311b125da76d
+commit: d6308b458ebe0ce3354314182b05fa21819bedd7
+archive: .artifacts/release-candidate/egopulse-0.1.0-d6308b458ebe-windows-x86_64-20260827T001748Z.zip
+archive SHA-256: 33ff3895059431c918357d5b1497f78b1627752f01bb10157761b9451080a47a
 package files: 52
 package verifier: passed
 independent short-path extract audit: passed
