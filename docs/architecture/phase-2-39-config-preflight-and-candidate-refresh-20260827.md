@@ -41,7 +41,7 @@ configuration.
 ```text
 cargo fmt --all -- --check                         passed
 cargo clippy -p egopulse-agentosd --all-targets -- -D warnings  passed
-cargo test -p egopulse-agentosd --test config_check -- --nocapture  2 passed
+cargo test -p egopulse-agentosd --test config_check -- --nocapture  3 passed
 pnpm run ci:local                                  8/8 stages passed
 ```
 
