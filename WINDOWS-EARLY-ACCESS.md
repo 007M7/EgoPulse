@@ -1,10 +1,10 @@
 # Windows x64 early access
 
-This package is the Windows x64 early-access candidate of EgoPulse. CLI, TUI,
-Desktop and `agentosd.exe` use the same Rust Client Kernel and local IPC
-transport. Desktop currently exposes the shared-kernel projection, governed
-TaskCreate, Task cancellation, Approval decision and Memory mutation candidate paths; native GUI
-automation and some remaining workflows are still acceptance work.
+This package is the Windows x64 CLI/TUI early-access candidate of EgoPulse.
+CLI, TUI and `agentosd.exe` use the same Rust Client Kernel and local IPC
+transport. Desktop is implemented as a separate shared-kernel candidate, but
+is intentionally excluded from this first CLI/TUI package until native GUI
+automation and the remaining Desktop workflows are accepted.
 
 The package is intentionally **unsigned**. Windows SmartScreen may show an
 unknown-publisher warning. Verify the downloaded archive with the adjacent
@@ -46,14 +46,9 @@ loaded and run:
 .\bin\egopulse-tui.exe
 ```
 
-To open the Desktop candidate, run:
-
-```powershell
-Start-Process .\bin\egopulse-desktop.exe
-```
-
-The Desktop executable is verified as present and non-empty in the package;
-the current package evidence does not claim a fully automated native GUI test.
+The current CLI/TUI package does not contain `egopulse-desktop.exe`. A Desktop
+candidate must be built with the explicit `-IncludeDesktop` packaging option
+after its native GUI acceptance gate is closed.
 
 ## Manual first-run setup
 

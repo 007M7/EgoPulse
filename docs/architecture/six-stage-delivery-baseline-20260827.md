@@ -236,10 +236,12 @@ Exit evidence:
   an explicit governed activation;
 - the release can return to the last accepted profile without data loss.
 
-Current disposition: **unsigned CLI/TUI/Desktop early-access candidate verified
-at commit `5eb7b32`; isolated installation smoke and packaged Memory Worker
-verification passed. Final release and governed evolution loop remain
-pending**.
+Current disposition: **unsigned CLI/TUI early-access candidate verified at
+commit `b160689`; the current package contains 55 files and passes package,
+startup and Memory Worker checks. Desktop remains a separately buildable
+shared-kernel candidate and is not included until native GUI acceptance is
+closed. Final release and governed evolution loop remain pending**. See
+`phase-2-54-windows-cli-tui-candidate-20260827.md`.
 The reproducible evidence is recorded in
 `docs/release/windows-candidate-20260827.md`.
 
