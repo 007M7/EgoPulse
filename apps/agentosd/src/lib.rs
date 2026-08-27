@@ -86,7 +86,9 @@ pub use artifact::{
 };
 pub use bootstrap::{
     DenyVerificationReferences, LocalUserPolicyBootstrapConfig, ProductionBootstrapConfig,
-    ProductionBootstrapError, ProviderCatalogModelView, ProviderCatalogProfileView,
+    ProductionBootstrapError, ProviderBootstrapProfile, ProviderCatalogModelView,
+    ProviderCatalogProfileView, ProviderCatalogRefreshError, ProviderCatalogRefreshPreview,
+    ProviderCatalogSnapshot, ProviderModelBinding,
 };
 pub use memory_mutation::{
     MemoryCandidateProducerBinding, MemoryCandidateProducerConfigurationError,

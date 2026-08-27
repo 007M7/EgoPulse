@@ -179,6 +179,33 @@ pub struct ProviderCatalogModelView {
     pub provider_model_id: String,
 }
 
+/// A provider-neutral preview of a refreshed Harness catalog.
+///
+/// This is intentionally a pure value and does not mutate user configuration.
+/// A refresh can make the currently selected model unavailable, but it can
+/// never select a replacement implicitly.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderCatalogRefreshPreview {
+    pub profile_id: String,
+    pub models: Vec<ProviderCatalogModelView>,
+    pub selected_model: String,
+    pub selected_model_available: bool,
+    pub selection_changed: bool,
+    pub requires_user_action: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum ProviderCatalogRefreshError {
+    #[error("refreshed provider catalog must contain at least one model")]
+    EmptyCatalog,
+    #[error("refreshed provider catalog contains an invalid {0}")]
+    InvalidModelIdentity(&'static str),
+    #[error("refreshed provider catalog contains a duplicate Harness model id")]
+    DuplicateHarnessModelId,
+}
+
 impl ProviderBootstrapProfile {
     #[must_use]
     pub fn redacted_catalog_view(&self) -> ProviderCatalogProfileView {
@@ -209,6 +236,69 @@ impl ProviderBootstrapProfile {
             hold_reason: self.hold_reason.clone(),
         }
     }
+
+    /// Previews a Harness-native catalog refresh without changing selection.
+    ///
+    /// The returned preview is suitable for a future read/selection surface.
+    /// It deliberately has no persistence side effect: selecting a model is a
+    /// separate, Founder-visible operation that must later be bound to the
+    /// frozen Local API contract and an exact dispatch receipt.
+    pub fn preview_catalog_refresh(
+        &self,
+        refreshed_models: &[ProviderModelBinding],
+    ) -> Result<ProviderCatalogRefreshPreview, ProviderCatalogRefreshError> {
+        if refreshed_models.is_empty() {
+            return Err(ProviderCatalogRefreshError::EmptyCatalog);
+        }
+        let mut models = refreshed_models.to_vec();
+        for model in &models {
+            validate_refreshed_model_identity(model)?;
+        }
+        models.sort_by(|left, right| {
+            left.harness_model_id
+                .cmp(&right.harness_model_id)
+                .then_with(|| left.provider_model_id.cmp(&right.provider_model_id))
+        });
+        if models
+            .windows(2)
+            .any(|pair| pair[0].harness_model_id == pair[1].harness_model_id)
+        {
+            return Err(ProviderCatalogRefreshError::DuplicateHarnessModelId);
+        }
+        let selected_model_available = models
+            .iter()
+            .any(|model| model.harness_model_id == self.exact_model);
+        Ok(ProviderCatalogRefreshPreview {
+            profile_id: self.profile_id.clone(),
+            models: models
+                .into_iter()
+                .map(|model| ProviderCatalogModelView {
+                    harness_model_id: model.harness_model_id,
+                    provider_model_id: model.provider_model_id,
+                })
+                .collect(),
+            selected_model: self.exact_model.clone(),
+            selected_model_available,
+            selection_changed: false,
+            requires_user_action: !selected_model_available,
+            reason_code: (!selected_model_available)
+                .then_some("selected_model_missing_from_refresh".to_owned()),
+        })
+    }
+}
+
+fn validate_refreshed_model_identity(
+    model: &ProviderModelBinding,
+) -> Result<(), ProviderCatalogRefreshError> {
+    for (value, field) in [
+        (&model.harness_model_id, "harness model identity"),
+        (&model.provider_model_id, "provider model identity"),
+    ] {
+        if value.is_empty() || value.trim() != value || value.len() > 4 * 1024 {
+            return Err(ProviderCatalogRefreshError::InvalidModelIdentity(field));
+        }
+    }
+    Ok(())
 }
 
 impl ProviderId {
@@ -2301,6 +2391,128 @@ mod tests {
                 "provider_profiles.catalog_snapshot.evidence_digest_sha256"
             ))
         ));
+    }
+
+    #[test]
+    fn provider_catalog_refresh_preserves_an_available_exact_selection() {
+        let profile = ProviderBootstrapProfile {
+            profile_id: "deepseek".to_owned(),
+            provider: ProviderId::DeepSeek,
+            harness: ProviderHarnessKind::DshAcp,
+            admission: ProviderAdmission::Candidate,
+            models: vec![ProviderModelBinding {
+                harness_model_id: "deepseek-chat".to_owned(),
+                provider_model_id: "deepseek-chat".to_owned(),
+            }],
+            catalog_snapshot: None,
+            exact_model: "deepseek-chat".to_owned(),
+            executable: "dsh".into(),
+            credential: ProviderCredentialReference::ApiKeyEnvironment {
+                source_env: "DEEPSEEK_API_KEY".to_owned(),
+                target_env: "DEEPSEEK_API_KEY".to_owned(),
+            },
+            hold_reason: Some("candidate".to_owned()),
+        };
+
+        let preview = profile
+            .preview_catalog_refresh(&[
+                ProviderModelBinding {
+                    harness_model_id: "deepseek-reasoner".to_owned(),
+                    provider_model_id: "deepseek-reasoner".to_owned(),
+                },
+                ProviderModelBinding {
+                    harness_model_id: "deepseek-chat".to_owned(),
+                    provider_model_id: "deepseek-chat".to_owned(),
+                },
+            ])
+            .expect("valid refreshed catalog");
+
+        assert!(preview.selected_model_available);
+        assert!(!preview.selection_changed);
+        assert!(!preview.requires_user_action);
+        assert_eq!(preview.selected_model, "deepseek-chat");
+        assert_eq!(preview.models[0].harness_model_id, "deepseek-chat");
+    }
+
+    #[test]
+    fn provider_catalog_refresh_never_falls_back_when_selection_disappears() {
+        let profile = ProviderBootstrapProfile {
+            profile_id: "kimi".to_owned(),
+            provider: ProviderId::Kimi,
+            harness: ProviderHarnessKind::KimiCliAcp,
+            admission: ProviderAdmission::Held,
+            models: vec![ProviderModelBinding {
+                harness_model_id: "kimi-k2.5".to_owned(),
+                provider_model_id: "kimi-k2.5".to_owned(),
+            }],
+            catalog_snapshot: None,
+            exact_model: "kimi-k2.5".to_owned(),
+            executable: "kimi".into(),
+            credential: ProviderCredentialReference::HarnessAccount,
+            hold_reason: Some("pending".to_owned()),
+        };
+
+        let preview = profile
+            .preview_catalog_refresh(&[ProviderModelBinding {
+                harness_model_id: "kimi-k2.6".to_owned(),
+                provider_model_id: "kimi-k2.6".to_owned(),
+            }])
+            .expect("valid refreshed catalog");
+
+        assert!(!preview.selected_model_available);
+        assert!(!preview.selection_changed);
+        assert!(preview.requires_user_action);
+        assert_eq!(preview.selected_model, "kimi-k2.5");
+        assert_eq!(
+            preview.reason_code.as_deref(),
+            Some("selected_model_missing_from_refresh")
+        );
+    }
+
+    #[test]
+    fn provider_catalog_refresh_rejects_empty_invalid_and_duplicate_models() {
+        let profile = ProviderBootstrapProfile {
+            profile_id: "glm".to_owned(),
+            provider: ProviderId::Glm,
+            harness: ProviderHarnessKind::OpenCodeAcp,
+            admission: ProviderAdmission::Held,
+            models: vec![ProviderModelBinding {
+                harness_model_id: "zai/glm-5.3".to_owned(),
+                provider_model_id: "glm-5.3".to_owned(),
+            }],
+            catalog_snapshot: None,
+            exact_model: "zai/glm-5.3".to_owned(),
+            executable: "opencode".into(),
+            credential: ProviderCredentialReference::HarnessAccount,
+            hold_reason: Some("pending".to_owned()),
+        };
+
+        assert_eq!(
+            profile.preview_catalog_refresh(&[]),
+            Err(ProviderCatalogRefreshError::EmptyCatalog)
+        );
+        assert_eq!(
+            profile.preview_catalog_refresh(&[ProviderModelBinding {
+                harness_model_id: " ".to_owned(),
+                provider_model_id: "glm-5.3".to_owned(),
+            }]),
+            Err(ProviderCatalogRefreshError::InvalidModelIdentity(
+                "harness model identity"
+            ))
+        );
+        assert_eq!(
+            profile.preview_catalog_refresh(&[
+                ProviderModelBinding {
+                    harness_model_id: "zai/glm-5.3".to_owned(),
+                    provider_model_id: "glm-5.3".to_owned(),
+                },
+                ProviderModelBinding {
+                    harness_model_id: "zai/glm-5.3".to_owned(),
+                    provider_model_id: "glm-5.3-alias".to_owned(),
+                },
+            ]),
+            Err(ProviderCatalogRefreshError::DuplicateHarnessModelId)
+        );
     }
 
     #[test]

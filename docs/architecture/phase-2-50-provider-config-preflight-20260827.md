@@ -25,6 +25,14 @@ The report never resolves or serializes secret values. A successful preflight
 does not prove that a native executable is installed, that authentication
 works, or that the profile has passed Provider admission.
 
+The bootstrap profile now also exposes a pure catalog-refresh preview for the
+next Harness-native adapter layer. The preview accepts a typed, provider-
+neutral model list, canonicalizes its order, rejects empty/invalid/duplicate
+Harness model identifiers, and reports whether the existing exact selection
+is still present. If it is absent, the preview sets
+`requires_user_action=true` and `selection_changed=false`; it never chooses a
+replacement and never mutates the user configuration.
+
 ## Boundary decision
 
 This unit intentionally does not add a Local API message or mutate the frozen
@@ -45,6 +53,9 @@ passed
 
 cargo clippy -p egopulse-agentosd --all-targets -- -D warnings
 passed
+
+cargo test -p egopulse-agentosd --lib provider_catalog_refresh -- --nocapture
+3 passed, 0 failed
 
 agentosd.exe --check-config --json
 configuration=passed
