@@ -7,7 +7,8 @@ use egopulse_domain_contracts::v01::egopulse::{
     harness::v1::{ApprovalDecision, ApprovalRequestLifecycleKind},
     localapi::v1::{
         AvailableActionKind, ClientSurface, DecideHarnessApprovalRequest,
-        ExecuteTaskCommandRequest, LocalApiError,
+        ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest, LocalApiError,
+        MemoryMutationCommand, MemoryMutationReceipt, memory_mutation_command,
     },
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
@@ -113,6 +114,38 @@ struct DesktopApprovalDecisionResult {
     state: String,
     state_revision: u64,
     await_token_present: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopMemoryCandidateRequest {
+    instance: String,
+    memory_id: String,
+    content: String,
+    source_ref: String,
+    scope_ref: String,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopMemoryReviewRequest {
+    instance: String,
+    memory_id: String,
+    expected_revision: u64,
+    evidence_ref: String,
+    idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopMemoryMutationResult {
+    memory_id: String,
+    revision: u64,
+    state: String,
+    event_id: String,
+    request_digest_sha256: String,
+    acknowledged_after_durability_barrier: bool,
 }
 
 fn transport_name(transport: LocalTransport) -> &'static str {
@@ -354,6 +387,163 @@ async fn decide_approval(
     })
 }
 
+async fn execute_memory_mutation(
+    instance: String,
+    mut branch: memory_mutation_command::Command,
+    oneof: &'static str,
+) -> Result<DesktopMemoryMutationResult, String> {
+    let instance = if instance.trim().is_empty() {
+        "default".to_owned()
+    } else {
+        instance
+    };
+    let attachment = attach(
+        &instance,
+        ClientSurface::Desktop,
+        format!("egopulse-desktop-{}", Uuid::now_v7()),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    attachment
+        .require_command("LocalCommandGatewayService/ExecuteMemoryMutation", oneof)
+        .map_err(|error| error.to_string())?;
+    let correlation_id = Uuid::now_v7().to_string();
+    let metadata = attachment
+        .metadata(Some(correlation_id))
+        .map_err(|error| error.to_string())?;
+    match &mut branch {
+        memory_mutation_command::Command::SubmitMemoryCandidate(command) => {
+            command.metadata = Some(metadata.clone())
+        }
+        memory_mutation_command::Command::AcceptMemory(command) => {
+            command.metadata = Some(metadata.clone())
+        }
+        memory_mutation_command::Command::RevokeMemory(command) => {
+            command.metadata = Some(metadata.clone())
+        }
+    }
+    let response = attachment
+        .connection
+        .command_gateway_service()
+        .execute_memory_mutation(ExecuteMemoryMutationRequest {
+            client: Some(metadata),
+            command: Some(MemoryMutationCommand {
+                command: Some(branch),
+            }),
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .into_inner();
+    if let Some(error) = response.gateway_error.as_ref() {
+        return Err(safe_local_api_error(error));
+    }
+    let receipt: MemoryMutationReceipt = response
+        .authority_result
+        .ok_or_else(|| "memory mutation receipt missing".to_owned())?;
+    Ok(DesktopMemoryMutationResult {
+        memory_id: receipt.memory_id,
+        revision: receipt.revision,
+        state: receipt.state,
+        event_id: receipt.event_id,
+        request_digest_sha256: receipt.request_digest_sha256,
+        acknowledged_after_durability_barrier: receipt.acknowledged_after_durability_barrier,
+    })
+}
+
+#[tauri::command]
+async fn submit_memory_candidate(
+    request: DesktopMemoryCandidateRequest,
+) -> Result<DesktopMemoryMutationResult, String> {
+    let DesktopMemoryCandidateRequest {
+        instance,
+        memory_id,
+        content,
+        source_ref,
+        scope_ref,
+        idempotency_key,
+    } = request;
+    require_non_empty(&memory_id, "memory_id")?;
+    require_non_empty(&content, "content")?;
+    require_non_empty(&source_ref, "source_ref")?;
+    require_non_empty(&scope_ref, "scope_ref")?;
+    require_non_empty(&idempotency_key, "idempotency_key")?;
+    execute_memory_mutation(
+        instance,
+        memory_mutation_command::Command::SubmitMemoryCandidate(
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::SubmitMemoryCandidateCommand {
+                metadata: None,
+                memory_id,
+                content,
+                source_ref,
+                scope_ref,
+                idempotency_key,
+            },
+        ),
+        "submit_memory_candidate",
+    )
+    .await
+}
+
+#[tauri::command]
+async fn accept_memory(
+    request: DesktopMemoryReviewRequest,
+) -> Result<DesktopMemoryMutationResult, String> {
+    let DesktopMemoryReviewRequest {
+        instance,
+        memory_id,
+        expected_revision,
+        evidence_ref,
+        idempotency_key,
+    } = request;
+    require_non_empty(&memory_id, "memory_id")?;
+    require_non_empty(&evidence_ref, "evidence_ref")?;
+    require_non_empty(&idempotency_key, "idempotency_key")?;
+    execute_memory_mutation(
+        instance,
+        memory_mutation_command::Command::AcceptMemory(
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::AcceptMemoryCommand {
+                metadata: None,
+                memory_id,
+                expected_revision,
+                evidence_ref,
+                idempotency_key,
+            },
+        ),
+        "accept_memory",
+    )
+    .await
+}
+
+#[tauri::command]
+async fn revoke_memory(
+    request: DesktopMemoryReviewRequest,
+) -> Result<DesktopMemoryMutationResult, String> {
+    let DesktopMemoryReviewRequest {
+        instance,
+        memory_id,
+        expected_revision,
+        evidence_ref,
+        idempotency_key,
+    } = request;
+    require_non_empty(&memory_id, "memory_id")?;
+    require_non_empty(&evidence_ref, "evidence_ref")?;
+    require_non_empty(&idempotency_key, "idempotency_key")?;
+    execute_memory_mutation(
+        instance,
+        memory_mutation_command::Command::RevokeMemory(
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::RevokeMemoryCommand {
+                metadata: None,
+                memory_id,
+                expected_revision,
+                evidence_ref,
+                idempotency_key,
+            },
+        ),
+        "revoke_memory",
+    )
+    .await
+}
+
 #[tauri::command]
 async fn create_task(request: DesktopTaskCreateRequest) -> Result<DesktopTaskCreateResult, String> {
     let DesktopTaskCreateRequest {
@@ -466,7 +656,10 @@ fn main() {
             foundation_status,
             dashboard_snapshot,
             create_task,
-            decide_approval
+            decide_approval,
+            submit_memory_candidate,
+            accept_memory,
+            revoke_memory
         ])
         .run(tauri::generate_context!())
         .expect("failed to run EgoPulse desktop foundation shell");

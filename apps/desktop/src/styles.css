@@ -142,6 +142,35 @@ h1 {
   margin-top: 1.25rem;
 }
 
+.memory-panel {
+  border-color: #46695a;
+}
+
+.memory-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.5rem;
+}
+
+.memory-grid form,
+.memory-grid > div {
+  display: grid;
+  align-content: start;
+  gap: 1rem;
+}
+
+textarea {
+  width: 100%;
+  min-height: 7rem;
+  resize: vertical;
+  border: 1px solid #34483e;
+  border-radius: 0.6rem;
+  padding: 0.7rem 0.8rem;
+  color: #e8ede9;
+  background: #111a16;
+  font: inherit;
+}
+
 .form-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -256,6 +285,10 @@ li div {
   gap: 0.45rem;
 }
 
+.review-buttons {
+  justify-content: flex-start;
+}
+
 .button-row button {
   padding: 0.55rem 0.75rem;
   font-size: 0.8rem;
@@ -295,7 +328,8 @@ li span {
 
   .cards,
   .tables,
-  .form-grid {
+  .form-grid,
+  .memory-grid {
     grid-template-columns: 1fr;
   }
 }

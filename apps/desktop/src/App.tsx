@@ -51,6 +51,21 @@ type TaskDraft = {
   budgetProfileSha256: string;
 };
 
+type MemoryCandidateDraft = {
+  memoryId: string;
+  content: string;
+  sourceRef: string;
+  scopeRef: string;
+  idempotencyKey: string;
+};
+
+type MemoryReviewDraft = {
+  memoryId: string;
+  expectedRevision: string;
+  evidenceRef: string;
+  idempotencyKey: string;
+};
+
 const staticHealth: FoundationStatus = {
   product: "EgoPulse",
   architectureVersion: "1.0",
@@ -66,6 +81,7 @@ export function App() {
   const [taskBusy, setTaskBusy] = useState(false);
   const [approvalBusy, setApprovalBusy] = useState<string | null>(null);
   const [approvalReason, setApprovalReason] = useState("desktop-user-decision");
+  const [memoryBusy, setMemoryBusy] = useState(false);
   const [taskDraft, setTaskDraft] = useState<TaskDraft>({
     workType: "",
     inputSnapshotId: "",
@@ -76,6 +92,19 @@ export function App() {
     budgetProfileId: "",
     budgetProfileVersion: "",
     budgetProfileSha256: "",
+  });
+  const [memoryCandidate, setMemoryCandidate] = useState<MemoryCandidateDraft>({
+    memoryId: "",
+    content: "",
+    sourceRef: "",
+    scopeRef: "",
+    idempotencyKey: "desktop-memory-candidate-1",
+  });
+  const [memoryReview, setMemoryReview] = useState<MemoryReviewDraft>({
+    memoryId: "",
+    expectedRevision: "",
+    evidenceRef: "",
+    idempotencyKey: "desktop-memory-review-1",
   });
   const [note, setNote] = useState("Desktop is ready; connect to the local governed daemon to load a projection.");
 
@@ -160,6 +189,43 @@ export function App() {
     }
   }
 
+  async function submitMemoryCandidate(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setMemoryBusy(true);
+    try {
+      const result = await invoke<{ memoryId: string; revision: number; state: string }>("submit_memory_candidate", {
+        request: { instance, ...memoryCandidate },
+      });
+      setNote(`Memory candidate ${result.memoryId} is ${result.state} at revision ${result.revision}.`);
+      await connectToDaemon();
+    } catch (error) {
+      setNote(`Memory candidate rejected: ${String(error)}`);
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
+  async function reviewMemory(decision: "accept_memory" | "revoke_memory") {
+    setMemoryBusy(true);
+    try {
+      const result = await invoke<{ memoryId: string; revision: number; state: string }>(decision, {
+        request: {
+          instance,
+          memoryId: memoryReview.memoryId,
+          expectedRevision: Number(memoryReview.expectedRevision),
+          evidenceRef: memoryReview.evidenceRef,
+          idempotencyKey: memoryReview.idempotencyKey,
+        },
+      });
+      setNote(`Memory ${result.memoryId} is ${result.state} at revision ${result.revision}.`);
+      await connectToDaemon();
+    } catch (error) {
+      setNote(`Memory review rejected: ${String(error)}`);
+    } finally {
+      setMemoryBusy(false);
+    }
+  }
+
   return (
     <main className="shell">
       <header className="hero">
@@ -217,6 +283,43 @@ export function App() {
           </div>
           <button type="submit" disabled={taskBusy}>{taskBusy ? "Submitting…" : "Create task"}</button>
         </form>
+      </section>
+
+      <section className="write-panel memory-panel" aria-label="Memory governance">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">EXPLICIT WRITE</p>
+            <h2>Memory governance</h2>
+          </div>
+          <span className="badge">MEMORY AUTHORITY</span>
+        </div>
+        <p className="muted">Candidates are not authoritative. Submission, acceptance and revocation all use the same Rust Memory Authority and durability barrier as CLI and TUI.</p>
+        <div className="memory-grid">
+          <form onSubmit={submitMemoryCandidate}>
+            <h3>Submit candidate</h3>
+            <div className="form-grid">
+              <label>Memory ID<input required value={memoryCandidate.memoryId} onChange={(event) => setMemoryCandidate((current) => ({ ...current, memoryId: event.target.value }))} /></label>
+              <label>Source ref<input required value={memoryCandidate.sourceRef} onChange={(event) => setMemoryCandidate((current) => ({ ...current, sourceRef: event.target.value }))} /></label>
+              <label>Scope ref<input required value={memoryCandidate.scopeRef} onChange={(event) => setMemoryCandidate((current) => ({ ...current, scopeRef: event.target.value }))} /></label>
+              <label>Idempotency key<input required value={memoryCandidate.idempotencyKey} onChange={(event) => setMemoryCandidate((current) => ({ ...current, idempotencyKey: event.target.value }))} /></label>
+            </div>
+            <label>Candidate content<textarea required value={memoryCandidate.content} onChange={(event) => setMemoryCandidate((current) => ({ ...current, content: event.target.value }))} /></label>
+            <button type="submit" disabled={memoryBusy}>{memoryBusy ? "Submitting…" : "Submit candidate"}</button>
+          </form>
+          <div>
+            <h3>Review memory</h3>
+            <div className="form-grid">
+              <label>Memory ID<input required value={memoryReview.memoryId} onChange={(event) => setMemoryReview((current) => ({ ...current, memoryId: event.target.value }))} /></label>
+              <label>Expected revision<input required type="number" min="0" value={memoryReview.expectedRevision} onChange={(event) => setMemoryReview((current) => ({ ...current, expectedRevision: event.target.value }))} /></label>
+              <label>Evidence ref<input required value={memoryReview.evidenceRef} onChange={(event) => setMemoryReview((current) => ({ ...current, evidenceRef: event.target.value }))} /></label>
+              <label>Idempotency key<input required value={memoryReview.idempotencyKey} onChange={(event) => setMemoryReview((current) => ({ ...current, idempotencyKey: event.target.value }))} /></label>
+            </div>
+            <div className="button-row review-buttons">
+              <button type="button" onClick={() => reviewMemory("accept_memory")} disabled={memoryBusy}>Accept</button>
+              <button className="secondary" type="button" onClick={() => reviewMemory("revoke_memory")} disabled={memoryBusy}>Revoke</button>
+            </div>
+          </div>
+        </div>
       </section>
 
       {snapshot ? (

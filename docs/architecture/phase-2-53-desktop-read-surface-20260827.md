@@ -2,9 +2,9 @@
 
 - Date: 2026-08-27
 - Scope: Tauri 2 + React + TypeScript Desktop surface
-- Status: shared-kernel read slice, TaskCreate, and Approval decision commands
-  implemented; local build verified, Desktop write E2E remains a separate
-  acceptance item
+- Status: shared-kernel read slice, TaskCreate, Approval decision, and Memory
+  mutation commands implemented; local build verified, Desktop write E2E
+  remains a separate acceptance item
 
 ## Boundary
 
@@ -32,7 +32,9 @@ contract or budget identities; Authority and Local API remain responsible for
 authorization, digest validation, idempotency and persistence. `decide_approval`
 accepts only the decision facts copied from the current projection and routes
 them through `DecideHarnessApproval`; it does not reconstruct approval context
-or bypass the Policy Authority.
+or bypass the Policy Authority. `submit_memory_candidate`, `accept_memory` and
+`revoke_memory` use the same typed Memory mutation gateway as CLI and TUI; the
+Desktop process still has no Memory store handle.
 
 ## User-facing behavior
 
@@ -49,6 +51,9 @@ or bypass the Policy Authority.
   `deny` when the projection exposes `DECIDE_HARNESS_APPROVAL`;
 - stale approval facts are rejected by the existing observation, revision and
   digest fences, with the safe Local API error surfaced to the user;
+- Memory candidate submission, acceptance and revocation require explicit
+  identifiers, evidence and idempotency keys; the returned receipt is shown
+  only after the Memory Authority durability barrier;
 - CLI, TUI and Desktop continue to share the same Rust client kernel and Local
   API contracts.
 
