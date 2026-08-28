@@ -57,6 +57,35 @@ authoritative snapshot would be a governance regression.
 
 ## Alternatives
 
+### Option A' — internal Context Authority first, without a public Proto change
+
+Implement the Context Compiler/Authority as an internal Rust owner first. It
+persists an immutable context snapshot, derives its identity from the actual
+compiled bytes, and exposes only an owner-backed resolver to the existing
+dispatch and Task creation seams. The existing `input_snapshot_id` remains an
+opaque reference; `FileDispatchMaterialResolver` is replaced or wrapped by a
+resolver that proves the referenced snapshot, digest, scope and expiry before
+producing dispatch material.
+
+This is an implementation stage, not a complete normal-user surface. It can
+prove snapshot persistence, dispatch-time validation, restart/recovery and
+Task-side binding without changing generated bindings. A subsequent Local API
+prepare/confirm operation is still required if CLI/TUI are to expose the
+two-step natural-language flow without making users fill low-level Task
+fields.
+
+Why choose it first: it reduces public-contract churn while exercising the
+hardest ownership and failure semantics against the existing Authority and
+Harness boundaries. It follows the existing Memory pattern: establish the
+Rust owner and read boundary before admitting a cross-language/public
+consumer.
+
+Cost: the first implementation cannot by itself make `work plan` confirmable
+by an ordinary user. A temporary profile or diagnostic command would still be
+needed, and that command must not be presented as the final product flow. The
+Context Authority schema and internal resolver nevertheless become migration,
+recovery and compatibility obligations.
+
 ### Option A — first-class ContextSnapshot and two-step confirmation
 
 Add the smallest public contract needed for the already-frozen interaction:
@@ -71,12 +100,19 @@ ConfirmWork(confirmation binding)
 ```
 
 The Context Compiler persists an immutable snapshot (or an immutable,
-owner-backed reference to one) with its source/digest, scope, visibility,
-expiry, acceptance contract, budget profile, non-goals and recovery facts.
+owner-backed reference to one) with its source/include-exclude ledger and
+content digest, scope, visibility/redaction, expiry, acceptance contract,
+budget profile, non-goals, deadline, recovery entry, allowed read/write paths,
+allowed tools/external resources, and the accepted MemoryPack plus its Memory
+Authority revision. Consumption records the required per-model
+`MemoryUseReceipt` facts. These are context-governance fields, not model
+prompt decoration.
 The confirmation command contains the snapshot identity and the exact preview
 binding, but not arbitrary contract values or raw credentials. The daemon
-resolves reviewed references and invokes the existing Task Authority command
-port.
+resolves reviewed references, rejects an expired snapshot at consumption, and
+invokes the existing Task Authority command port. Dispatch must query the
+Context Authority rather than trusting the string ID; otherwise the binding is
+only documentary.
 
 Why choose it: it makes the existing Founder interaction truthful, gives
 replay and expiry semantics a durable owner, and preserves the distinction
@@ -101,7 +137,10 @@ Cost: it cannot carry the frozen ContextSnapshot semantics (source digest,
 visibility, expiry, non-goals and confirmation binding) as a first-class
 object. It also makes the natural-language preview only an advisory label
 unless a separate durable owner is added. It is suitable only as a temporary
-single-profile bootstrap, not as the final product interaction contract.
+single-profile bootstrap, not as the final product interaction contract. If it
+is used temporarily, the preview fingerprint must bind to the request
+correlation and profile mapping must fail closed on missing or ambiguous
+matches; no silent default may be introduced.
 
 ### Option C — client-side local preview file and direct Task.Create
 
@@ -111,12 +150,16 @@ cross-surface equivalence unverifiable.
 
 ## Recommended decision
 
-Admit Option A as the implementation of the already-frozen architecture. Do
-not enumerate application scenarios in the contract. Freeze only the generic
-context envelope, ownership, digest, expiry, confirmation binding and
-Task-authority handoff. Application-specific work types, Providers, models,
-RAG algorithms and Harness policies remain reviewed configuration or separate
-contracts.
+Implement Option A' first, then admit the minimal public part of Option A when
+the internal owner and resolver have their failure evidence. Do not enumerate
+application scenarios in the contract. Freeze only the generic context
+envelope, ownership, digest, expiry, confirmation binding and Task-authority
+handoff. Application-specific work types, Providers, models, RAG algorithms
+and Harness policies remain reviewed configuration or separate contracts.
+
+Any public Proto change must pass the existing Buf lint/breaking baseline,
+cross-language code generation, contract manifest and TypeScript/Python/Rust
+binding checks before it can be called admitted.
 
 The first implementation slice should be limited to:
 
