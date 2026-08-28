@@ -305,6 +305,7 @@ impl Panel {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandKind {
+    WorkPlan,
     TaskCreate,
     TaskApplyVerdict,
     TaskCancel,
@@ -320,7 +321,8 @@ enum CommandKind {
 }
 
 impl CommandKind {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
+        Self::WorkPlan,
         Self::TaskCreate,
         Self::TaskApplyVerdict,
         Self::TaskCancel,
@@ -337,6 +339,7 @@ impl CommandKind {
 
     const fn label(self) -> &'static str {
         match self {
+            Self::WorkPlan => "Preview governed work",
             Self::TaskCreate => "Create governed task",
             Self::TaskApplyVerdict => "Apply Founder Verdict",
             Self::TaskCancel => "Request task cancellation",
@@ -394,6 +397,12 @@ struct CommandForm {
 impl CommandForm {
     fn new(kind: CommandKind) -> Self {
         let fields = match kind {
+            CommandKind::WorkPlan => vec![
+                FormField::required("intent"),
+                FormField::required("scope-ref"),
+                FormField::required("work-type").with_value("general"),
+                FormField::optional("context-ref"),
+            ],
             CommandKind::TaskCreate => vec![
                 FormField::required("work-type"),
                 FormField::required("input-snapshot-id"),
@@ -507,6 +516,19 @@ impl CommandForm {
             values.next().ok_or_else(|| format!("{label} is missing"))
         };
         match self.kind {
+            CommandKind::WorkPlan => Ok(TuiCommand::WorkPlan {
+                intent: next(&mut values, "intent")?,
+                scope: next(&mut values, "scope-ref")?,
+                work_type: next(&mut values, "work-type")?,
+                context_refs: {
+                    let value = next(&mut values, "context-ref")?;
+                    (!value.trim().is_empty())
+                        .then_some(value)
+                        .into_iter()
+                        .collect()
+                },
+                json: false,
+            }),
             CommandKind::TaskCreate => Ok(TuiCommand::TaskCreate {
                 work_type: next(&mut values, "work-type")?,
                 input_snapshot_id: next(&mut values, "input-snapshot-id")?,
@@ -2530,6 +2552,19 @@ mod tests {
         let mut app = App::new("default".to_owned());
         app.open_palette();
         assert!(matches!(app.mode, InteractiveMode::Palette { selected: 0 }));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open work preview form");
+        assert!(matches!(
+            app.mode,
+            InteractiveMode::Form(CommandForm {
+                kind: CommandKind::WorkPlan,
+                ..
+            })
+        ));
+
+        app.open_palette();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("palette navigation");
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
             .expect("palette navigation");
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
@@ -2544,6 +2579,33 @@ mod tests {
                 kind: CommandKind::ApprovalDecide,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn work_preview_form_preserves_natural_language_and_optional_context() {
+        let mut form = CommandForm::new(CommandKind::WorkPlan);
+        for (field, value) in form.fields.iter_mut().zip([
+            "整理当前项目的 Memory 治理".to_owned(),
+            "project:egopulse".to_owned(),
+            "research_implementation".to_owned(),
+            "docs/ARCHITECTURE.md".to_owned(),
+        ]) {
+            field.value = value;
+        }
+        let command = form.into_command().expect("valid work preview form");
+        assert!(matches!(
+            command,
+            TuiCommand::WorkPlan {
+                intent,
+                scope,
+                work_type,
+                context_refs,
+                json: false,
+            } if intent == "整理当前项目的 Memory 治理"
+                && scope == "project:egopulse"
+                && work_type == "research_implementation"
+                && context_refs == vec!["docs/ARCHITECTURE.md"]
         ));
     }
 
