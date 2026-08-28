@@ -1,4 +1,4 @@
-use super::{ContextSnapshot, ContextStoreInspection};
+use super::{ContextSnapshot, ContextStoreInspection, MemoryUseReceipt};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
 use sha2::{Digest, Sha256};
@@ -7,7 +7,7 @@ use std::path::Path;
 use thiserror::Error;
 
 const SCHEMA_PROFILE_ID: &str = "egopulse/context-authority-store/v1";
-const SCHEMA: &str = r#"
+const LEGACY_SCHEMA: &str = r#"
 CREATE TABLE context_store_metadata (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   store_epoch TEXT NOT NULL,
@@ -49,6 +49,33 @@ CREATE TABLE context_idempotency_results (
   PRIMARY KEY (principal_id, idempotency_key),
   FOREIGN KEY (snapshot_id) REFERENCES context_snapshots(snapshot_id),
   FOREIGN KEY (event_id) REFERENCES context_events(event_id)
+) STRICT;
+"#;
+
+const MEMORY_USE_SCHEMA: &str = r#"
+
+CREATE TABLE context_memory_use_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  snapshot_id TEXT NOT NULL,
+  snapshot_revision INTEGER NOT NULL,
+  consumer_principal_id TEXT NOT NULL,
+  model_ref TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  dispatch_id TEXT NOT NULL,
+  memory_authority_revision INTEGER NOT NULL,
+  memory_pack_snapshot_sha256 TEXT NOT NULL,
+  committed_at_seconds INTEGER NOT NULL,
+  UNIQUE(snapshot_id, model_ref, attempt_id, dispatch_id),
+  FOREIGN KEY (snapshot_id) REFERENCES context_snapshots(snapshot_id)
+) STRICT;
+
+CREATE TABLE context_memory_use_idempotency (
+  principal_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_digest_sha256 TEXT NOT NULL,
+  receipt_id TEXT NOT NULL,
+  PRIMARY KEY (principal_id, idempotency_key),
+  FOREIGN KEY (receipt_id) REFERENCES context_memory_use_receipts(receipt_id)
 ) STRICT;
 "#;
 
@@ -115,12 +142,19 @@ impl ContextStore {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "secure_delete", "ON")?;
-        Migrations::new(vec![M::up(SCHEMA)]).to_latest(&mut connection)?;
-        let schema_digest = hex::encode(Sha256::digest(SCHEMA.as_bytes()));
+        Migrations::new(vec![M::up(LEGACY_SCHEMA), M::up(MEMORY_USE_SCHEMA)])
+            .to_latest(&mut connection)?;
+        let schema_digest = schema_digest();
+        let legacy_schema_digest = hex::encode(Sha256::digest(LEGACY_SCHEMA.as_bytes()));
         connection.execute(
             "INSERT OR IGNORE INTO context_store_metadata(singleton, store_epoch, schema_profile_id, schema_profile_sha256)
              VALUES(1, ?1, ?2, ?3)",
             params![store_epoch, SCHEMA_PROFILE_ID, schema_digest],
+        )?;
+        connection.execute(
+            "UPDATE context_store_metadata SET schema_profile_sha256=?1
+             WHERE singleton=1 AND schema_profile_sha256=?2",
+            params![schema_digest, legacy_schema_digest],
         )?;
         let metadata: (String, String, String) = connection.query_row(
             "SELECT store_epoch, schema_profile_id, schema_profile_sha256
@@ -241,6 +275,141 @@ impl ContextStore {
         Ok(())
     }
 
+    pub(super) fn memory_use_idempotency_record(
+        &self,
+        principal_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<(String, String)>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT request_digest_sha256, receipt_id
+                 FROM context_memory_use_idempotency
+                 WHERE principal_id=?1 AND idempotency_key=?2",
+                params![principal_id, idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub(super) fn memory_use_receipt(
+        &self,
+        receipt_id: &str,
+    ) -> Result<Option<MemoryUseReceipt>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT receipt_id, snapshot_id, snapshot_revision,
+                        consumer_principal_id, model_ref, attempt_id, dispatch_id,
+                        memory_authority_revision, memory_pack_snapshot_sha256
+                 FROM context_memory_use_receipts WHERE receipt_id=?1",
+                [receipt_id],
+                |row| {
+                    Ok(MemoryUseReceipt {
+                        receipt_id: row.get(0)?,
+                        snapshot_id: row.get(1)?,
+                        snapshot_revision: row.get::<_, i64>(2)? as u64,
+                        consumer_principal_id: row.get(3)?,
+                        model_ref: row.get(4)?,
+                        attempt_id: row.get(5)?,
+                        dispatch_id: row.get(6)?,
+                        memory_authority_revision: row.get::<_, i64>(7)? as u64,
+                        memory_pack_snapshot_sha256: row.get(8)?,
+                        request_digest_sha256: String::new(),
+                        replayed: false,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub(super) fn memory_use_receipt_by_tuple(
+        &self,
+        snapshot_id: &str,
+        model_ref: &str,
+        attempt_id: &str,
+        dispatch_id: &str,
+    ) -> Result<Option<MemoryUseReceipt>, StoreError> {
+        let receipt_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT receipt_id FROM context_memory_use_receipts
+                 WHERE snapshot_id=?1 AND model_ref=?2 AND attempt_id=?3 AND dispatch_id=?4",
+                params![snapshot_id, model_ref, attempt_id, dispatch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        receipt_id
+            .map(|value| self.memory_use_receipt(&value))
+            .transpose()
+            .map(|value| value.flatten())
+    }
+
+    pub(super) fn bind_memory_use_idempotency(
+        &mut self,
+        principal_id: &str,
+        idempotency_key: &str,
+        request_digest_sha256: &str,
+        receipt_id: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO context_memory_use_idempotency(
+             principal_id,idempotency_key,request_digest_sha256,receipt_id)
+             VALUES(?1,?2,?3,?4)",
+            params![
+                principal_id,
+                idempotency_key,
+                request_digest_sha256,
+                receipt_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn insert_memory_use_receipt(
+        &mut self,
+        receipt: &MemoryUseReceipt,
+        principal_id: &str,
+        idempotency_key: &str,
+        committed_at_seconds: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO context_memory_use_receipts(
+             receipt_id,snapshot_id,snapshot_revision,consumer_principal_id,model_ref,
+             attempt_id,dispatch_id,memory_authority_revision,memory_pack_snapshot_sha256,
+             committed_at_seconds)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                receipt.receipt_id,
+                receipt.snapshot_id,
+                receipt.snapshot_revision as i64,
+                receipt.consumer_principal_id,
+                receipt.model_ref,
+                receipt.attempt_id,
+                receipt.dispatch_id,
+                receipt.memory_authority_revision as i64,
+                receipt.memory_pack_snapshot_sha256,
+                committed_at_seconds,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO context_memory_use_idempotency(
+             principal_id,idempotency_key,request_digest_sha256,receipt_id)
+             VALUES(?1,?2,?3,?4)",
+            params![
+                principal_id,
+                idempotency_key,
+                receipt.request_digest_sha256,
+                receipt.receipt_id,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(super) fn insert(&mut self, input: ContextInsert<'_>) -> Result<(), StoreError> {
         let descriptor =
             serde_json::to_string(input.snapshot).map_err(|_| StoreError::DescriptorDecode)?;
@@ -321,4 +490,11 @@ impl ContextStore {
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         Ok(result == "ok")
     }
+}
+
+fn schema_digest() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(LEGACY_SCHEMA.as_bytes());
+    hasher.update(MEMORY_USE_SCHEMA.as_bytes());
+    hex::encode(hasher.finalize())
 }

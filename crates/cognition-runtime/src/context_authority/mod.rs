@@ -129,6 +129,34 @@ pub struct ContextSnapshotReceipt {
     pub replayed: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryUseReceiptRequest {
+    pub snapshot_id: String,
+    pub expected_scope_ref: String,
+    pub consumer_principal_id: String,
+    pub model_ref: String,
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub memory_authority_revision: u64,
+    pub memory_pack_snapshot_sha256: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryUseReceipt {
+    pub receipt_id: String,
+    pub snapshot_id: String,
+    pub snapshot_revision: u64,
+    pub consumer_principal_id: String,
+    pub model_ref: String,
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub memory_authority_revision: u64,
+    pub memory_pack_snapshot_sha256: String,
+    pub request_digest_sha256: String,
+    pub replayed: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContextStoreInspection {
     pub snapshot_count: u64,
@@ -322,6 +350,117 @@ impl ContextAuthority {
         })
     }
 
+    /// Records the immutable Memory revision consumed by one model dispatch.
+    /// The daemon must obtain the revision and pack digest from Memory
+    /// Authority before calling this method; this owner only records and
+    /// revalidates the ContextSnapshot binding.
+    pub fn record_memory_use(
+        &mut self,
+        input: &MemoryUseReceiptRequest,
+        principal: &AuthenticatedContextPrincipal,
+        now_seconds: i64,
+    ) -> Result<MemoryUseReceipt, ContextAuthorityFailure> {
+        validate_principal(principal)?;
+        if principal.kind != ContextPrincipalKind::GovernanceKernel {
+            return Err(ContextAuthorityFailure::Unauthorized);
+        }
+        validate_routing(&input.consumer_principal_id, "consumer_principal_id")?;
+        validate_routing(&input.model_ref, "model_ref")?;
+        validate_routing(&input.attempt_id, "attempt_id")?;
+        validate_routing(&input.dispatch_id, "dispatch_id")?;
+        validate_routing(&input.idempotency_key, "idempotency_key")?;
+        validate_digest(
+            &input.memory_pack_snapshot_sha256,
+            "memory_pack_snapshot_sha256",
+        )?;
+        if input.memory_authority_revision == 0 {
+            return Err(ContextAuthorityFailure::InvalidArgument(
+                "memory_authority_revision",
+            ));
+        }
+        let resolved = self.resolve(&input.snapshot_id, &input.expected_scope_ref, now_seconds)?;
+        let memory_pack = resolved
+            .snapshot
+            .memory_pack
+            .as_ref()
+            .ok_or(ContextAuthorityFailure::InvalidArgument("memory_pack"))?;
+        if memory_pack.scope_ref != input.expected_scope_ref
+            || memory_pack.authority_revision != input.memory_authority_revision
+            || memory_pack.snapshot_sha256 != input.memory_pack_snapshot_sha256
+        {
+            return Err(ContextAuthorityFailure::IntegrityFailure);
+        }
+
+        let request_digest = memory_use_digest(input, &resolved.snapshot);
+        if let Some(existing) = self
+            .store
+            .memory_use_idempotency_record(&principal.principal_id, &input.idempotency_key)?
+        {
+            if existing.0 != request_digest {
+                return Err(ContextAuthorityFailure::IdempotencyConflict);
+            }
+            let receipt = self
+                .store
+                .memory_use_receipt(&existing.1)?
+                .ok_or(ContextAuthorityFailure::IntegrityFailure)?;
+            return Ok(MemoryUseReceipt {
+                request_digest_sha256: request_digest,
+                replayed: true,
+                ..receipt
+            });
+        }
+
+        let receipt_id = format!(
+            "memory-use:{}",
+            sha256(
+                format!(
+                    "{}\n{}\n{}\n{}",
+                    input.snapshot_id, input.model_ref, input.attempt_id, input.dispatch_id
+                )
+                .as_bytes()
+            )
+        );
+        if let Some(existing) = self.store.memory_use_receipt_by_tuple(
+            &input.snapshot_id,
+            &input.model_ref,
+            &input.attempt_id,
+            &input.dispatch_id,
+        )? {
+            self.store.bind_memory_use_idempotency(
+                &principal.principal_id,
+                &input.idempotency_key,
+                &request_digest,
+                &existing.receipt_id,
+            )?;
+            return Ok(MemoryUseReceipt {
+                request_digest_sha256: request_digest,
+                replayed: true,
+                ..existing
+            });
+        }
+
+        let receipt = MemoryUseReceipt {
+            receipt_id,
+            snapshot_id: resolved.snapshot.snapshot_id.clone(),
+            snapshot_revision: resolved.snapshot.revision,
+            consumer_principal_id: input.consumer_principal_id.clone(),
+            model_ref: input.model_ref.clone(),
+            attempt_id: input.attempt_id.clone(),
+            dispatch_id: input.dispatch_id.clone(),
+            memory_authority_revision: input.memory_authority_revision,
+            memory_pack_snapshot_sha256: input.memory_pack_snapshot_sha256.clone(),
+            request_digest_sha256: request_digest.clone(),
+            replayed: false,
+        };
+        self.store.insert_memory_use_receipt(
+            &receipt,
+            &principal.principal_id,
+            &input.idempotency_key,
+            now_seconds,
+        )?;
+        Ok(receipt)
+    }
+
     pub fn get(
         &self,
         snapshot_id: &str,
@@ -487,6 +626,19 @@ fn snapshot_digest(snapshot: &ContextSnapshot) -> String {
     sha256(&descriptor)
 }
 
+fn memory_use_digest(input: &MemoryUseReceiptRequest, snapshot: &ContextSnapshot) -> String {
+    let descriptor = serde_json::json!({
+        "snapshot": snapshot,
+        "consumer_principal_id": input.consumer_principal_id,
+        "model_ref": input.model_ref,
+        "attempt_id": input.attempt_id,
+        "dispatch_id": input.dispatch_id,
+        "memory_authority_revision": input.memory_authority_revision,
+        "memory_pack_snapshot_sha256": input.memory_pack_snapshot_sha256,
+    });
+    sha256(&serde_json::to_vec(&descriptor).expect("Memory use descriptor is serializable"))
+}
+
 fn confirmation_digest(
     snapshot_id: &str,
     intent_sha256: &str,
@@ -581,6 +733,14 @@ mod tests {
         AuthenticatedContextPrincipal {
             kind: ContextPrincipalKind::ContextCompiler,
             principal_id: "context-compiler".to_owned(),
+            authenticated: true,
+        }
+    }
+
+    fn governance_kernel() -> AuthenticatedContextPrincipal {
+        AuthenticatedContextPrincipal {
+            kind: ContextPrincipalKind::GovernanceKernel,
+            principal_id: "governance-kernel".to_owned(),
             authenticated: true,
         }
     }
@@ -812,6 +972,93 @@ mod tests {
         assert_eq!(
             unchanged.allowed_write_paths, first.allowed_write_paths,
             "the original governance fields remain immutable"
+        );
+    }
+
+    #[test]
+    fn memory_use_receipt_is_bound_per_model_and_replays_idempotently() {
+        let mut authority = authority();
+        let (_, snapshot) = authority
+            .issue(&input("memory-use-context"), &compiler())
+            .expect("issue");
+        let memory_pack = snapshot.memory_pack.as_ref().expect("memory pack");
+        let request = MemoryUseReceiptRequest {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            expected_scope_ref: "scope:repo".to_owned(),
+            consumer_principal_id: "model:gpt".to_owned(),
+            model_ref: "gpt:model-1".to_owned(),
+            attempt_id: "attempt-1".to_owned(),
+            dispatch_id: "dispatch-1".to_owned(),
+            memory_authority_revision: memory_pack.authority_revision,
+            memory_pack_snapshot_sha256: memory_pack.snapshot_sha256.clone(),
+            idempotency_key: "memory-use-1".to_owned(),
+        };
+        let first = authority
+            .record_memory_use(
+                &request,
+                &governance_kernel(),
+                current_timestamp().expect("clock"),
+            )
+            .expect("record memory use");
+        assert!(!first.replayed);
+        assert_eq!(first.snapshot_id, snapshot.snapshot_id);
+        assert_eq!(first.model_ref, "gpt:model-1");
+
+        let replay = authority
+            .record_memory_use(
+                &request,
+                &governance_kernel(),
+                current_timestamp().expect("clock"),
+            )
+            .expect("replay memory use");
+        assert!(replay.replayed);
+        assert_eq!(replay.receipt_id, first.receipt_id);
+        assert_eq!(replay.request_digest_sha256, first.request_digest_sha256);
+
+        let mut another_model = request.clone();
+        another_model.model_ref = "deepseek:model-1".to_owned();
+        another_model.idempotency_key = "memory-use-2".to_owned();
+        let second = authority
+            .record_memory_use(
+                &another_model,
+                &governance_kernel(),
+                current_timestamp().expect("clock"),
+            )
+            .expect("record second model use");
+        assert!(!second.replayed);
+        assert_ne!(second.receipt_id, first.receipt_id);
+    }
+
+    #[test]
+    fn memory_use_revision_or_principal_mismatch_fails_closed() {
+        let mut authority = authority();
+        let (_, snapshot) = authority
+            .issue(&input("memory-use-invalid"), &compiler())
+            .expect("issue");
+        let memory_pack = snapshot.memory_pack.as_ref().expect("memory pack");
+        let mut request = MemoryUseReceiptRequest {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            expected_scope_ref: "scope:repo".to_owned(),
+            consumer_principal_id: "model:gpt".to_owned(),
+            model_ref: "gpt:model-1".to_owned(),
+            attempt_id: "attempt-2".to_owned(),
+            dispatch_id: "dispatch-2".to_owned(),
+            memory_authority_revision: memory_pack.authority_revision + 1,
+            memory_pack_snapshot_sha256: memory_pack.snapshot_sha256.clone(),
+            idempotency_key: "memory-use-invalid-1".to_owned(),
+        };
+        assert_eq!(
+            authority.record_memory_use(
+                &request,
+                &governance_kernel(),
+                current_timestamp().expect("clock")
+            ),
+            Err(ContextAuthorityFailure::IntegrityFailure)
+        );
+        request.memory_authority_revision = memory_pack.authority_revision;
+        assert_eq!(
+            authority.record_memory_use(&request, &compiler(), current_timestamp().expect("clock")),
+            Err(ContextAuthorityFailure::Unauthorized)
         );
     }
 }
