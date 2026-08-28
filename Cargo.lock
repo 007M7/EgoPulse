@@ -1161,6 +1161,8 @@ dependencies = [
  "prost-types",
  "rusqlite",
  "rusqlite_migration",
+ "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.20",
  "tokio",
