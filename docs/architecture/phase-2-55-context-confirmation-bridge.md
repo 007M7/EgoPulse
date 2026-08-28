@@ -2,7 +2,8 @@
 
 - Date: 2026-08-28
 - Scope: frozen CLI/TUI interaction from work preview to governed Task creation
-- Status: decision package; implementation not yet admitted
+- Status: implementation candidate in progress; contract revision draft.17 is
+  generated and locally verified, pending Founder acceptance
 - Decision owner: Founder
 
 ## Why this package exists
@@ -17,11 +18,13 @@ natural-language intent
   -> authoritative Task / Run / Step creation
 ```
 
-The current repository implements the first three items as a pure Director
-preview and implements the low-level `Task.Create` command separately. It does
-not yet contain the authority-owned bridge between those two surfaces. This
-document records that fact and the implementation decision that must precede a
-public contract change.
+The repository now contains the authority-owned bridge as a candidate
+implementation. `PrepareWork` compiles a daemon-owned context snapshot and
+returns an Authority-owned preview; `ConfirmWork` accepts only the exact
+snapshot binding and delegates Task creation to Task Authority. The generated
+cross-language bindings and local contract checks are updated to draft.17, but
+the revision remains pending Founder acceptance until the runtime and surface
+E2E evidence is complete.
 
 ## Evidence from the current implementation
 
@@ -35,9 +38,10 @@ The following facts are verified in the current branch:
    snapshot IDs, target scopes and exact acceptance/budget contract references.
 4. The daemon resolves the authenticated principal and recomputes the command
    digest; the CLI/TUI do not own Task persistence.
-5. `input_snapshot_id` is currently an opaque, allowlisted reference. There is
-   no first-class `ContextSnapshot` message, durable context owner, or
-   two-step preview/confirmation RPC.
+5. The candidate now has a first-class daemon-owned `ContextSnapshot` record,
+   `PrepareWork`/`ConfirmWork` RPCs, and equivalent CLI/TUI commands. The
+   low-level `input_snapshot_id` path remains available only as a diagnostic
+   compatibility seam.
 
 Therefore, sending arbitrary preview text as `input_snapshot_id`, inventing
 contract references in the client, or treating a local preview file as an
@@ -150,12 +154,12 @@ cross-surface equivalence unverifiable.
 
 ## Recommended decision
 
-Implement Option A' first, then admit the minimal public part of Option A when
-the internal owner and resolver have their failure evidence. Do not enumerate
-application scenarios in the contract. Freeze only the generic context
-envelope, ownership, digest, expiry, confirmation binding and Task-authority
-handoff. Application-specific work types, Providers, models, RAG algorithms
-and Harness policies remain reviewed configuration or separate contracts.
+The implementation follows Option A' internally and has now added the minimal
+public part of Option A as a draft.17 candidate. Do not enumerate application
+scenarios in the contract. Freeze only the generic context envelope, ownership,
+digest, expiry, confirmation binding and Task-authority handoff.
+Application-specific work types, Providers, models, RAG algorithms and Harness
+policies remain reviewed configuration or separate contracts.
 
 Any public Proto change must pass the existing Buf lint/breaking baseline,
 cross-language code generation, contract manifest and TypeScript/Python/Rust
@@ -163,14 +167,18 @@ binding checks before it can be called admitted.
 
 The first implementation slice should be limited to:
 
-1. an Authority-owned immutable context snapshot record and read boundary;
-2. a preparation result bound to the exact normalized intent, sources, scope,
-   Gate result and snapshot digest;
-3. a Founder confirmation command with expiry, idempotency and replay checks;
-4. daemon-side resolution of reviewed Task creation references;
-5. a real CLI/TUI `work confirm` path over the shared Client Kernel;
-6. tests proving stale, altered, expired, replayed and cross-principal
-   confirmations fail closed.
+1. [x] an Authority-owned immutable context snapshot record and read boundary;
+2. [x] a preparation result bound to the exact normalized intent, sources,
+   scope, Gate result and snapshot digest;
+3. [x] a Founder confirmation command with expiry, idempotency and replay
+   checks;
+4. [x] daemon-side resolution of reviewed Task creation references;
+5. [x] a real CLI/TUI `work prepare` and `work confirm` path over the shared
+   Client Kernel;
+6. [x] unit evidence proving stale, altered, expired, replayed and
+   cross-principal confirmations fail closed;
+7. [ ] Authority-backed dispatch resolution, full projection E2E and
+   user-visible streaming evidence.
 
 The first slice must not add Provider routing, automatic Memory writes,
 semantic RAG selection, raw Harness output to the public contract, or Desktop

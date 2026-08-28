@@ -67,6 +67,10 @@ pub struct ContextRedaction {
 /// the snapshot identity; it is never reconstructed from the user intent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IssueContextSnapshot {
+    /// Authenticated session principal that is allowed to confirm this
+    /// snapshot. The internal compiler principal remains the authority that
+    /// persists it, but it must not erase the founder/session binding.
+    pub owner_principal_id: String,
     pub intent: String,
     pub work_type: String,
     pub target_scope_ref: String,
@@ -92,6 +96,7 @@ pub struct IssueContextSnapshot {
 pub struct ContextSnapshot {
     pub snapshot_id: String,
     pub revision: u64,
+    pub owner_principal_id: String,
     pub intent: String,
     pub intent_sha256: String,
     pub work_type: String,
@@ -491,11 +496,15 @@ fn build_snapshot(
         &input.target_scope_ref,
         &input.acceptance_contract_ref,
         &input.budget_profile_ref,
+        compiled_context_sha256,
+        &source_ledger_digest(&input.sources, &input.recovery_entry),
+        &input.owner_principal_id,
         input.expires_at_seconds,
     );
     Ok(ContextSnapshot {
         snapshot_id: snapshot_id.to_owned(),
         revision: 1,
+        owner_principal_id: input.owner_principal_id.clone(),
         intent: input.intent.clone(),
         intent_sha256,
         work_type: input.work_type.clone(),
@@ -531,6 +540,7 @@ fn validate_principal(
 
 fn validate_input(input: &IssueContextSnapshot) -> Result<(), ContextAuthorityFailure> {
     let now = current_timestamp()?;
+    validate_routing(&input.owner_principal_id, "owner_principal_id")?;
     validate_text(&input.intent, "intent", MAX_CONTEXT_BYTES)?;
     validate_routing(&input.work_type, "work_type")?;
     validate_routing(&input.target_scope_ref, "target_scope_ref")?;
@@ -646,6 +656,9 @@ fn confirmation_digest(
     target_scope_ref: &str,
     acceptance_contract_ref: &str,
     budget_profile_ref: &str,
+    compiled_context_sha256: &str,
+    source_and_gate_digest: &str,
+    owner_principal_id: &str,
     expires_at_seconds: i64,
 ) -> String {
     let values = [
@@ -655,6 +668,9 @@ fn confirmation_digest(
         target_scope_ref,
         acceptance_contract_ref,
         budget_profile_ref,
+        compiled_context_sha256,
+        source_and_gate_digest,
+        owner_principal_id,
         &expires_at_seconds.to_string(),
     ];
     let mut hasher = Sha256::new();
@@ -663,6 +679,14 @@ fn confirmation_digest(
         hasher.update(value.as_bytes());
     }
     hex::encode(hasher.finalize())
+}
+
+fn source_ledger_digest(sources: &[ContextSourceFact], recovery_entry: &str) -> String {
+    let descriptor = serde_json::json!({
+        "sources": sources,
+        "gateRecoveryEntry": recovery_entry,
+    });
+    sha256(&serde_json::to_vec(&descriptor).expect("source ledger is serializable"))
 }
 
 fn sha256(value: &[u8]) -> String {
@@ -694,6 +718,7 @@ mod tests {
 
     fn input(idempotency_key: &str) -> IssueContextSnapshot {
         IssueContextSnapshot {
+            owner_principal_id: "founder:test".to_owned(),
             intent: "inspect the local repository".to_owned(),
             work_type: "governed_repository_change".to_owned(),
             target_scope_ref: "scope:repo".to_owned(),

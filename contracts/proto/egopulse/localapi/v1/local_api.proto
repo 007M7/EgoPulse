@@ -147,6 +147,102 @@ message EvidenceGraphView {
   repeated RedactedField redactions = 7;
 }
 
+// User-facing preparation input. The client supplies only natural-language
+// intent, reviewed work classification, scope and explicit source references;
+// the daemon compiles and verifies the authoritative context envelope.
+message WorkSourceRequest {
+  string source_ref = 1;
+  string label = 2;
+}
+
+// Authority-owned source fact returned in a preparation preview. The client
+// may request a source, but cannot author its authority or content digest.
+message WorkSourceFact {
+  string source_ref = 1;
+  string label = 2;
+  string authority = 3;
+  string content_sha256 = 4;
+  bool included = 5;
+}
+
+message WorkGateNotice {
+  string code = 1;
+  string detail = 2;
+  string source_ref = 3;
+}
+
+// Sanitized, Authority-owned preparation result. Raw compiled context,
+// credentials, process configuration and client-selected authority fields are
+// never returned here.
+message WorkPreparationPreview {
+  string snapshot_id = 1;
+  uint64 snapshot_revision = 2;
+  string normalized_intent = 3;
+  string work_type = 4;
+  string target_scope_ref = 5;
+  string compiled_context_sha256 = 6;
+  repeated WorkSourceFact included_sources = 7;
+  repeated WorkGateNotice excluded_sources = 8;
+  repeated string non_goals = 9;
+  repeated string allowed_read_paths = 10;
+  repeated string allowed_write_paths = 11;
+  repeated string allowed_tools = 12;
+  repeated string external_resources = 13;
+  egopulse.common.v1.ContractReference acceptance_contract_ref = 14;
+  egopulse.common.v1.ContractReference budget_profile_ref = 15;
+  optional uint64 memory_authority_revision = 16;
+  optional string memory_pack_snapshot_sha256 = 17;
+  string recovery_entry = 18;
+  string visibility = 19;
+  repeated RedactedField redactions = 20;
+  google.protobuf.Timestamp expires_at = 21;
+  string confirmation_binding_sha256 = 22;
+  // Both fields are true only when the Authority-owned preparation gate is
+  // clear; neither means that a Task has been created or dispatched.
+  bool gate_ready = 23;
+  repeated WorkGateNotice blockers = 24;
+  repeated WorkGateNotice warnings = 25;
+  repeated string required_confirmations = 26;
+  repeated string evidence_required = 27;
+  bool ready_for_founder_confirmation = 28;
+  google.protobuf.Timestamp deadline = 29;
+}
+
+message PrepareWorkRequest {
+  ClientRequestMetadata client = 1;
+  string intent = 2;
+  string work_type = 3;
+  string target_scope_ref = 4;
+  repeated WorkSourceRequest sources = 5;
+  string idempotency_key = 6;
+}
+
+message PrepareWorkResponse {
+  oneof outcome {
+    WorkPreparationPreview preview = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message ConfirmWorkRequest {
+  ClientRequestMetadata client = 1;
+  string snapshot_id = 2;
+  string confirmation_binding_sha256 = 3;
+  string idempotency_key = 4;
+}
+
+message ConfirmWorkAccepted {
+  egopulse.task.v1.TaskCommandResult authority_result = 1;
+  ProjectionAwaitToken await_token = 2;
+}
+
+message ConfirmWorkResponse {
+  oneof outcome {
+    ConfirmWorkAccepted accepted = 1;
+    LocalApiError error = 2;
+  }
+}
+
 // Sanitized Authority result safe for Local API clients. The owning Policy
 // Authority remains the source of this result; native routing and proof
 // internals are deliberately absent.
@@ -489,6 +585,8 @@ service LocalReadModelService {
 }
 
 service LocalCommandGatewayService {
+  rpc PrepareWork(PrepareWorkRequest) returns (PrepareWorkResponse);
+  rpc ConfirmWork(ConfirmWorkRequest) returns (ConfirmWorkResponse);
   rpc ExecuteTaskCommand(ExecuteTaskCommandRequest) returns (ExecuteTaskCommandResponse);
   rpc DecideHarnessApproval(DecideHarnessApprovalRequest) returns (DecideHarnessApprovalResponse);
   rpc ExecuteFounderVerdict(ExecuteFounderVerdictRequest) returns (ExecuteFounderVerdictResponse);

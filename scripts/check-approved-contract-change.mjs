@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,27 +18,38 @@ if (actualPreviousSha256 !== expectedPreviousSha256) {
 
 const require = createRequire(import.meta.url);
 const executable = require.resolve("@bufbuild/buf/bin/buf");
-const result = spawnSync(process.execPath, [executable, "breaking", "--against", previousBaseline], {
-  cwd: repositoryRoot,
-  encoding: "utf8",
-  env: { ...process.env, BUF_CACHE_DIR: cacheDirectory },
-});
+// Node 24 on Windows can reject child-process stdout/stderr pipes with EPERM
+// in restricted workspaces. A temporary file handle preserves the exact
+// output inspection below without weakening the approved-break assertion.
+const outputPath = join(cacheDirectory, "approved-breaking-output.txt");
+const outputHandle = openSync(outputPath, "w");
+let result;
+try {
+  result = spawnSync(process.execPath, [executable, "breaking", "--against", previousBaseline], {
+    cwd: repositoryRoot,
+    env: { ...process.env, BUF_CACHE_DIR: cacheDirectory },
+    stdio: ["ignore", outputHandle, outputHandle],
+  });
+} finally {
+  closeSync(outputHandle);
+}
 if (result.error) throw result.error;
+const output = readFileSync(outputPath, "utf8");
 if (result.status === 0) {
   throw new Error("Founder-authorized Local API wire break was not detected against draft.11");
 }
 
-const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.replaceAll("\\", "/");
+const normalizedOutput = output.replaceAll("\\", "/");
 const approvedBreaks = [
   'Previously present field "2" with name "decision" on message "DecideHarnessApprovalRequest" was deleted.',
   'Previously present field "1" with name "authority_result" on message "DecideHarnessApprovalResponse" was deleted.',
 ];
 for (const approved of approvedBreaks) {
-  if (!output.includes(approved)) throw new Error(`approved breaking change was not detected: ${approved}`);
+  if (!normalizedOutput.includes(approved)) throw new Error(`approved breaking change was not detected: ${approved}`);
 }
-const detectedBreaks = output.split(/\r?\n/).filter((line) => line.includes("Previously present field "));
+const detectedBreaks = normalizedOutput.split(/\r?\n/).filter((line) => line.includes("Previously present field "));
 if (detectedBreaks.length !== approvedBreaks.length) {
-  throw new Error(`unexpected breaking-change set against draft.11:\n${output}`);
+  throw new Error(`unexpected breaking-change set against draft.11:\n${normalizedOutput}`);
 }
 
 console.log("Founder-authorized draft.11 break set detected exactly: Local API approval request field 2 and response field 1");

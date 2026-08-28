@@ -5,12 +5,16 @@ use egopulse_domain_contracts::{
     v01::egopulse::{
         common::v1::CommandMetadata,
         localapi::v1::{
-            ClientRequestMetadata, DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
+            ClientRequestMetadata, ConfirmWorkRequest, ConfirmWorkResponse,
+            DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
             ExecuteFounderVerdictRequest, ExecuteFounderVerdictResponse,
             ExecuteMemoryMutationRequest, ExecuteMemoryMutationResponse, ExecuteTaskCommandRequest,
             ExecuteTaskCommandResponse, HarnessApprovalAuthorityResult, LocalApiError,
-            LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken,
-            SourceRevision, local_command_gateway_service_server::LocalCommandGatewayService,
+            LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt, PrepareWorkRequest,
+            PrepareWorkResponse, ProjectionAwaitToken, SourceRevision, WorkPreparationPreview,
+            confirm_work_response,
+            local_command_gateway_service_server::LocalCommandGatewayService,
+            prepare_work_response,
         },
         policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
         task::v1::{TaskCommand, TaskCommandResult, task_command},
@@ -30,6 +34,8 @@ const RPC_EXECUTE_TASK: &str = "LocalCommandGatewayService/ExecuteTaskCommand";
 const RPC_DECIDE_APPROVAL: &str = "LocalCommandGatewayService/DecideHarnessApproval";
 const RPC_EXECUTE_VERDICT: &str = "LocalCommandGatewayService/ExecuteFounderVerdict";
 const RPC_EXECUTE_MEMORY: &str = "LocalCommandGatewayService/ExecuteMemoryMutation";
+const RPC_PREPARE_WORK: &str = "LocalCommandGatewayService/PrepareWork";
+const RPC_CONFIRM_WORK: &str = "LocalCommandGatewayService/ConfirmWork";
 
 /// The principal boundary passed from the governed Local API session into an
 /// owning Authority adapter. The gateway never constructs an Authority
@@ -108,6 +114,45 @@ impl MemoryMutationPort for FailClosedMemoryMutationPort {
     }
 }
 
+/// Preparation and confirmation are routed to the owning daemon composition.
+/// The Local API deliberately has no Context/Task store and cannot compile a
+/// client-authored snapshot. Implementations must prove the snapshot and then
+/// delegate confirmation to the Task Authority.
+pub trait WorkPreparationPort: Send + Sync + 'static {
+    fn prepare(
+        &self,
+        request: &PrepareWorkRequest,
+        principal: &CommandPrincipal,
+    ) -> Result<WorkPreparationPreview, CommandPortFailure>;
+
+    fn confirm(
+        &self,
+        request: &ConfirmWorkRequest,
+        principal: &CommandPrincipal,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure>;
+}
+
+#[derive(Default)]
+pub struct FailClosedWorkPreparationPort;
+
+impl WorkPreparationPort for FailClosedWorkPreparationPort {
+    fn prepare(
+        &self,
+        _request: &PrepareWorkRequest,
+        _principal: &CommandPrincipal,
+    ) -> Result<WorkPreparationPreview, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
+
+    fn confirm(
+        &self,
+        _request: &ConfirmWorkRequest,
+        _principal: &CommandPrincipal,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
+}
+
 pub struct CommandGatewayApplication {
     registry: Arc<SessionRegistry>,
     profiles: Arc<ContractProfiles>,
@@ -116,6 +161,7 @@ pub struct CommandGatewayApplication {
     policy_port: Arc<dyn PolicyCommandPort>,
     verdict_port: Arc<dyn VerdictCommandPort>,
     memory_port: Arc<dyn MemoryMutationPort>,
+    work_port: Arc<dyn WorkPreparationPort>,
 }
 
 impl CommandGatewayApplication {
@@ -149,6 +195,29 @@ impl CommandGatewayApplication {
         verdict_port: Arc<dyn VerdictCommandPort>,
         memory_port: Arc<dyn MemoryMutationPort>,
     ) -> Self {
+        Self::new_with_memory_and_work(
+            registry,
+            profiles,
+            token_codec,
+            task_port,
+            policy_port,
+            verdict_port,
+            memory_port,
+            Arc::new(FailClosedWorkPreparationPort),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_memory_and_work(
+        registry: Arc<SessionRegistry>,
+        profiles: Arc<ContractProfiles>,
+        token_codec: Arc<ReadTokenCodec>,
+        task_port: Arc<dyn TaskCommandPort>,
+        policy_port: Arc<dyn PolicyCommandPort>,
+        verdict_port: Arc<dyn VerdictCommandPort>,
+        memory_port: Arc<dyn MemoryMutationPort>,
+        work_port: Arc<dyn WorkPreparationPort>,
+    ) -> Self {
         Self {
             registry,
             profiles,
@@ -157,6 +226,81 @@ impl CommandGatewayApplication {
             policy_port,
             verdict_port,
             memory_port,
+            work_port,
+        }
+    }
+
+    pub fn prepare_work(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: PrepareWorkRequest,
+    ) -> PrepareWorkResponse {
+        let correlation_id = client_correlation_id(request.client.as_ref());
+        let context = match self.authorize_rpc(peer, request.client.as_ref(), RPC_PREPARE_WORK) {
+            Ok(context) => context,
+            Err(error) => {
+                return PrepareWorkResponse {
+                    outcome: Some(prepare_work_response::Outcome::Error(
+                        (*error).with_correlation(correlation_id),
+                    )),
+                };
+            }
+        };
+        match self.work_port.prepare(&request, &context.principal) {
+            Ok(preview) => PrepareWorkResponse {
+                outcome: Some(prepare_work_response::Outcome::Preview(preview)),
+            },
+            Err(error) => PrepareWorkResponse {
+                outcome: Some(prepare_work_response::Outcome::Error(port_error(
+                    error,
+                    correlation_id,
+                ))),
+            },
+        }
+    }
+
+    pub fn confirm_work(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: ConfirmWorkRequest,
+    ) -> ConfirmWorkResponse {
+        let correlation_id = client_correlation_id(request.client.as_ref());
+        let context = match self.authorize_rpc(peer, request.client.as_ref(), RPC_CONFIRM_WORK) {
+            Ok(context) => context,
+            Err(error) => {
+                return ConfirmWorkResponse {
+                    outcome: Some(confirm_work_response::Outcome::Error(
+                        (*error).with_correlation(correlation_id),
+                    )),
+                };
+            }
+        };
+        match self.work_port.confirm(&request, &context.principal) {
+            Ok(port_result) => {
+                let (await_token, gateway_error) = self.issue_await_token(
+                    &context.session,
+                    port_result.source_revision,
+                    port_result.await_target,
+                    correlation_id,
+                );
+                ConfirmWorkResponse {
+                    outcome: Some(match gateway_error {
+                        Some(error) => confirm_work_response::Outcome::Error(error),
+                        None => confirm_work_response::Outcome::Accepted(
+                            egopulse_domain_contracts::v01::egopulse::localapi::v1::ConfirmWorkAccepted {
+                                authority_result: Some(port_result.result),
+                                await_token,
+                            },
+                        ),
+                    }),
+                }
+            }
+            Err(error) => ConfirmWorkResponse {
+                outcome: Some(confirm_work_response::Outcome::Error(port_error(
+                    error,
+                    correlation_id,
+                ))),
+            },
         }
     }
 
@@ -428,6 +572,54 @@ impl CommandGatewayApplication {
         })
     }
 
+    fn authorize_rpc(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        metadata: Option<&ClientRequestMetadata>,
+        rpc: &str,
+    ) -> Result<WorkContext, Box<LocalApiError>> {
+        let correlation_id = client_correlation_id(metadata);
+        let peer = peer.ok_or_else(|| {
+            Box::new(invalid_error(
+                "peer_identity_missing",
+                correlation_id.clone(),
+            ))
+        })?;
+        let metadata = metadata.ok_or_else(|| {
+            Box::new(invalid_error(
+                "invalid_client_metadata",
+                correlation_id.clone(),
+            ))
+        })?;
+        validate_client_metadata(metadata).map_err(|_| {
+            Box::new(invalid_error(
+                "invalid_client_metadata",
+                correlation_id.clone(),
+            ))
+        })?;
+        let session = self
+            .registry
+            .authenticate(Some(metadata), peer)
+            .map_err(|failure| Box::new(session_error(failure, correlation_id.clone())))?;
+        self.profiles
+            .authorize_rpc(rpc, &session.permission_codes)
+            .map_err(|failure| Box::new(profile_error(failure, correlation_id.clone())))?;
+        Ok(WorkContext {
+            principal: CommandPrincipal {
+                principal_id: session.authenticated_principal_id.clone(),
+                // Preparation is compiler-only, while confirmation has one
+                // fixed downstream write owner. The constraint is derived by
+                // this gateway and cannot be supplied or widened by a client.
+                required_authority_principal_kinds: if rpc == RPC_CONFIRM_WORK {
+                    vec!["TaskAuthority.Founder".to_owned()]
+                } else {
+                    Vec::new()
+                },
+            },
+            session,
+        })
+    }
+
     fn issue_await_token(
         &self,
         session: &AuthenticatedSession,
@@ -491,6 +683,11 @@ struct CommandContext {
     _authorized: AuthorizedCommand,
 }
 
+struct WorkContext {
+    principal: CommandPrincipal,
+    session: AuthenticatedSession,
+}
+
 pub struct LocalCommandGatewayEndpoint {
     application: Arc<CommandGatewayApplication>,
 }
@@ -508,6 +705,28 @@ impl LocalCommandGatewayEndpoint {
 
 #[tonic::async_trait]
 impl LocalCommandGatewayService for LocalCommandGatewayEndpoint {
+    async fn prepare_work(
+        &self,
+        request: Request<PrepareWorkRequest>,
+    ) -> Result<Response<PrepareWorkResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(
+            self.application
+                .prepare_work(peer.as_ref(), request.into_inner()),
+        ))
+    }
+
+    async fn confirm_work(
+        &self,
+        request: Request<ConfirmWorkRequest>,
+    ) -> Result<Response<ConfirmWorkResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(
+            self.application
+                .confirm_work(peer.as_ref(), request.into_inner()),
+        ))
+    }
+
     async fn execute_task_command(
         &self,
         request: Request<ExecuteTaskCommandRequest>,

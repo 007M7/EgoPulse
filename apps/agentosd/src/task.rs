@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use egopulse_cognition_runtime::context_authority::ContextAuthority;
 use egopulse_cognition_runtime::task_authority::{
     CreationAuthorization, CreationGuardRejection, TaskCreationGuard, TaskTransitionGuard,
     TransitionAuthorization, TransitionGuardRejection,
@@ -23,6 +24,7 @@ pub struct ConfiguredTaskCreationGuard {
     allowed_target_scope_refs: BTreeSet<String>,
     acceptance_contract_ref: ContractReference,
     budget_profile_ref: ContractReference,
+    context_authority: Option<Arc<Mutex<ContextAuthority>>>,
 }
 
 impl ConfiguredTaskCreationGuard {
@@ -55,10 +57,42 @@ impl ConfiguredTaskCreationGuard {
             allowed_target_scope_refs: config.allowed_target_scope_refs,
             acceptance_contract_ref: config.acceptance_contract_ref,
             budget_profile_ref: config.budget_profile_ref,
+            context_authority: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_context_authority(mut self, authority: Arc<Mutex<ContextAuthority>>) -> Self {
+        self.context_authority = Some(authority);
+        self
+    }
+
+    fn context_snapshot_matches(
+        &self,
+        authority: &Arc<Mutex<ContextAuthority>>,
+        command: &CreateTaskCommand,
+    ) -> bool {
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(value) => value.as_secs() as i64,
+            Err(_) => return false,
+        };
+        let Ok(authority) = authority.lock() else {
+            return false;
+        };
+        let Ok(resolved) =
+            authority.resolve(&command.input_snapshot_id, &command.target_scope_ref, now)
+        else {
+            return false;
+        };
+        let snapshot = resolved.snapshot;
+        snapshot.work_type == command.work_type
+            && snapshot.acceptance_contract_ref
+                == contract_reference_key(&self.acceptance_contract_ref)
+            && snapshot.budget_profile_ref == contract_reference_key(&self.budget_profile_ref)
     }
 }
 
+#[derive(Clone)]
 pub struct ConfiguredTaskCreationGuardConfig {
     pub allowed_work_types: BTreeSet<String>,
     pub allowed_input_snapshot_ids: BTreeSet<String>,
@@ -78,10 +112,15 @@ impl TaskCreationGuard for ConfiguredTaskCreationGuard {
         {
             return Err(CreationGuardRejection::InvalidArgument);
         }
-        if !self.allowed_work_types.contains(&command.work_type)
-            || !self
-                .allowed_input_snapshot_ids
+        let snapshot_is_reviewed =
+            self.allowed_input_snapshot_ids
                 .contains(&command.input_snapshot_id)
+                || (command.input_snapshot_id.starts_with("ctx:")
+                    && self.context_authority.as_ref().is_some_and(|authority| {
+                        self.context_snapshot_matches(authority, command)
+                    }));
+        if !self.allowed_work_types.contains(&command.work_type)
+            || !snapshot_is_reviewed
             || !self
                 .allowed_target_scope_refs
                 .contains(&command.target_scope_ref)
@@ -383,6 +422,13 @@ fn contract_reference_is_complete(reference: &ContractReference) -> bool {
         && hex::decode(&reference.sha256)
             .map(|bytes| bytes.len() == 32)
             .unwrap_or(false)
+}
+
+fn contract_reference_key(reference: &ContractReference) -> String {
+    format!(
+        "{}@{}#{}",
+        reference.contract_id, reference.version, reference.sha256
+    )
 }
 
 #[cfg(test)]

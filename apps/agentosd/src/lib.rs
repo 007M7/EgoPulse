@@ -40,7 +40,7 @@ use egopulse_local_api::{
     command_gateway::{
         CommandGatewayApplication, CommandPortFailure, CommandPortResult, CommandPrincipal,
         FailClosedMemoryMutationPort, LocalCommandGatewayEndpoint, MemoryMutationPort,
-        PolicyCommandPort, TaskCommandPort, VerdictCommandPort,
+        PolicyCommandPort, TaskCommandPort, VerdictCommandPort, WorkPreparationPort,
     },
     read_gateway::{NoopReadGatewayAuditSink, ReadGatewayApplication},
     read_gateway_policy::ReadGatewayPolicy,
@@ -80,6 +80,7 @@ mod task_recovery;
 mod verdict;
 mod verdict_consumer;
 mod verification;
+mod work_preparation;
 
 pub use artifact::{
     ArtifactAdmissionGuardConfigurationError, ArtifactAuthorityReferenceSource,
@@ -143,6 +144,7 @@ pub use verification::{
     VerificationWorker, VerificationWorkerConfig, VerificationWorkerConfigurationError,
     VerificationWorkerCycleError, VerificationWorkerCycleResult,
 };
+pub use work_preparation::ConfiguredWorkPreparationPort;
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -330,6 +332,7 @@ pub struct DaemonProviders {
     /// Internal candidate-only producer capabilities. This is deliberately
     /// separate from the public Local API mutation port.
     pub memory_candidate_producers: Arc<MemoryCandidateProducerRegistry>,
+    pub work_preparation_port: Arc<dyn WorkPreparationPort>,
 }
 
 /// Explicit workflow configuration boundary for the first vertical. It does
@@ -568,6 +571,9 @@ impl DaemonProviders {
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
+            work_preparation_port: Arc::new(
+                egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
+            ),
         }
     }
 
@@ -639,6 +645,9 @@ impl DaemonProviders {
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
+            work_preparation_port: Arc::new(
+                egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
+            ),
         }
     }
 
@@ -684,12 +693,21 @@ impl DaemonProviders {
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
+            work_preparation_port: Arc::new(
+                egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
+            ),
         }
     }
 
     #[must_use]
     pub fn with_harness_dispatch_runner(mut self, runner: Arc<dyn HarnessDispatchRunner>) -> Self {
         self.harness_dispatch_runner = Some(runner);
+        self
+    }
+
+    #[must_use]
+    pub fn with_work_preparation_port(mut self, port: Arc<dyn WorkPreparationPort>) -> Self {
+        self.work_preparation_port = port;
         self
     }
 
@@ -1182,7 +1200,7 @@ impl DaemonComposition {
             Arc::new(NoopReadGatewayAuditSink),
         ));
         let read_model = LocalReadModelEndpoint::new(read_application);
-        let command_application = Arc::new(CommandGatewayApplication::new_with_memory(
+        let command_application = Arc::new(CommandGatewayApplication::new_with_memory_and_work(
             Arc::clone(&registry),
             Arc::clone(&profiles),
             token_codec,
@@ -1190,6 +1208,7 @@ impl DaemonComposition {
             providers.policy_port,
             providers.verdict_port,
             providers.memory_mutation_port,
+            providers.work_preparation_port,
         ));
         let command = LocalCommandGatewayEndpoint::new(command_application);
         let cognition_application = Arc::new(CognitionGatewayApplication::new(

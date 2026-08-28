@@ -9,8 +9,8 @@ use std::{process::ExitCode, time::Duration};
 use clap::{Parser, Subcommand};
 use egopulse_client_kernel::{SnapshotStreamTracker, StreamApply};
 use egopulse_client_operations::{
-    AttachError, ClientAttachment, attach as attach_client, command_metadata, set_policy_digest,
-    set_task_digest, set_verdict_digest, timestamp_after,
+    AttachError, ClientAttachment, ClientWorkError, attach as attach_client, command_metadata,
+    set_policy_digest, set_task_digest, set_verdict_digest, timestamp_after,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -119,11 +119,36 @@ enum WorkCommand {
         #[arg(long)]
         scope: String,
         /// Product work classification used by the preparation gate.
-        #[arg(long, default_value = "general")]
+        #[arg(long)]
         work_type: String,
         /// Explicit source references to include in the exact-context preview.
         #[arg(long = "context-ref")]
         context_refs: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the daemon-owned Context Authority to compile a real preview.
+    Prepare {
+        #[arg(long)]
+        intent: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        work_type: String,
+        #[arg(long = "context-ref")]
+        context_refs: Vec<String>,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Confirm the exact binding shown by `work prepare`.
+    Confirm {
+        snapshot_id: String,
+        #[arg(long)]
+        confirmation_binding_sha256: String,
+        #[arg(long)]
+        idempotency_key: String,
         #[arg(long)]
         json: bool,
     },
@@ -675,7 +700,7 @@ async fn main() -> ExitCode {
         Command::Approval { command } => approval(command).await,
         Command::Verdict { command } => verdict(command).await,
         Command::Memory { command } => memory(command).await,
-        Command::Work { command } => work(command),
+        Command::Work { command } => work(command).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -724,7 +749,10 @@ fn command_json(command: &Command) -> bool {
                 | MemoryCommand::Revoke { json, .. },
         } => *json,
         Command::Work {
-            command: WorkCommand::Plan { json, .. },
+            command:
+                WorkCommand::Plan { json, .. }
+                | WorkCommand::Prepare { json, .. }
+                | WorkCommand::Confirm { json, .. },
         } => *json,
     }
 }
@@ -773,7 +801,10 @@ async fn attach(operation: &'static str) -> Result<AttachedClient, CliFailure> {
                 AttachError::InvalidInstance(detail) => {
                     CliFailure::protocol(format!("invalid IPC instance: {detail}"))
                 }
-                AttachError::Kernel(error) => CliFailure::protocol(error.to_string()),
+                AttachError::Kernel(error) => {
+                    eprintln!("attach debug: kernel error: {error:?}");
+                    CliFailure::protocol(error.to_string())
+                }
             })?;
         Ok::<_, CliFailure>(AttachedClient(attached))
     }
@@ -784,7 +815,7 @@ async fn attach(operation: &'static str) -> Result<AttachedClient, CliFailure> {
     })
 }
 
-fn work(command: WorkCommand) -> Result<(), CliFailure> {
+async fn work(command: WorkCommand) -> Result<(), CliFailure> {
     match command {
         WorkCommand::Plan {
             intent,
@@ -850,7 +881,180 @@ fn work(command: WorkCommand) -> Result<(), CliFailure> {
             }
             Ok(())
         }
+        WorkCommand::Prepare {
+            intent,
+            scope,
+            work_type,
+            context_refs,
+            idempotency_key,
+            json,
+        } => {
+            let attached = attach("work.prepare").await?;
+            attached.require_rpc("LocalCommandGatewayService/PrepareWork", "work.prepare")?;
+            let preview = attached
+                .0
+                .prepare_work(
+                    intent,
+                    work_type,
+                    scope,
+                    context_refs
+                        .into_iter()
+                        .map(|value| (value.clone(), value))
+                        .collect(),
+                    idempotency_key,
+                )
+                .await
+                .map_err(|error| client_work_failure(error, "work.prepare"))?;
+            let payload = json!({
+                "schemaVersion": "egopulse.cli-result/v0.1",
+                "ok": true,
+                "operation": "work.prepare",
+                "data": work_preview_json(&preview),
+                "correlationId": Uuid::now_v7().to_string(),
+            });
+            if json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                println!(
+                    "Work prepared: snapshot={} gate_ready={} sources={} expires_at={}",
+                    preview.snapshot_id,
+                    preview.gate_ready,
+                    preview.included_sources.len(),
+                    preview
+                        .expires_at
+                        .as_ref()
+                        .map(|value| value.seconds.to_string())
+                        .unwrap_or_else(|| "-".to_owned()),
+                );
+                println!("Next: review the preview, then run work confirm with its binding.");
+            }
+            Ok(())
+        }
+        WorkCommand::Confirm {
+            snapshot_id,
+            confirmation_binding_sha256,
+            idempotency_key,
+            json,
+        } => {
+            let attached = attach("work.confirm").await?;
+            attached.require_rpc("LocalCommandGatewayService/ConfirmWork", "work.confirm")?;
+            let confirmed = attached
+                .0
+                .confirm_work(snapshot_id, confirmation_binding_sha256, idempotency_key)
+                .await
+                .map_err(|error| client_work_failure(error, "work.confirm"))?;
+            let replayed = confirmed.result.replayed;
+            let task = match confirmed.result.outcome {
+                Some(task_command_result::Outcome::Task(task)) => task,
+                Some(task_command_result::Outcome::Error(error)) => {
+                    return Err(CliFailure::task_authority(
+                        error.code,
+                        error.safe_detail_code,
+                        "work.confirm",
+                    ));
+                }
+                None => {
+                    return Err(
+                        CliFailure::protocol("confirmed task authority outcome missing")
+                            .for_operation("work.confirm"),
+                    );
+                }
+            };
+            let payload = json!({
+                "schemaVersion": "egopulse.cli-result/v0.1",
+                "ok": true,
+                "operation": "work.confirm",
+                "data": {
+                    "taskId": task.task_id,
+                    "revision": task.revision,
+                    "status": TaskStatus::try_from(task.status).map(|status| status.as_str_name()).unwrap_or("TASK_STATUS_UNSPECIFIED"),
+                    "replayed": replayed,
+                    "awaitToken": await_token_json(confirmed.await_token),
+                },
+                "correlationId": Uuid::now_v7().to_string(),
+            });
+            if json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                println!(
+                    "Work confirmed: task={} revision={} status={} replayed={}",
+                    payload["data"]["taskId"].as_str().unwrap_or(""),
+                    payload["data"]["revision"].as_u64().unwrap_or_default(),
+                    payload["data"]["status"].as_str().unwrap_or(""),
+                    payload["data"]["replayed"].as_bool().unwrap_or(false),
+                );
+            }
+            Ok(())
+        }
     }
+}
+
+fn client_work_failure(error: ClientWorkError, operation: &'static str) -> CliFailure {
+    match error {
+        ClientWorkError::Api(error) => {
+            CliFailure::from_local_api_error(*error).for_operation(operation)
+        }
+        ClientWorkError::Transport(detail) => CliFailure::protocol(detail).for_operation(operation),
+        ClientWorkError::Kernel(detail) => {
+            CliFailure::protocol(detail.to_string()).for_operation(operation)
+        }
+        ClientWorkError::Protocol(detail) => CliFailure::protocol(detail).for_operation(operation),
+    }
+}
+
+fn work_preview_json(
+    preview: &egopulse_domain_contracts::v01::egopulse::localapi::v1::WorkPreparationPreview,
+) -> serde_json::Value {
+    json!({
+        "snapshotId": preview.snapshot_id,
+        "snapshotRevision": preview.snapshot_revision,
+        "normalizedIntent": preview.normalized_intent,
+        "workType": preview.work_type,
+        "targetScopeRef": preview.target_scope_ref,
+        "compiledContextSha256": preview.compiled_context_sha256,
+        "includedSources": preview.included_sources.iter().map(|source| json!({
+            "sourceRef": source.source_ref,
+            "label": source.label,
+            "authority": source.authority,
+            "contentSha256": source.content_sha256,
+            "included": source.included,
+        })).collect::<Vec<_>>(),
+        "excludedSources": preview.excluded_sources.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
+        "nonGoals": preview.non_goals,
+        "allowedReadPaths": preview.allowed_read_paths,
+        "allowedWritePaths": preview.allowed_write_paths,
+        "allowedTools": preview.allowed_tools,
+        "externalResources": preview.external_resources,
+        "acceptanceContractRef": preview.acceptance_contract_ref.as_ref().map(contract_ref_json),
+        "budgetProfileRef": preview.budget_profile_ref.as_ref().map(contract_ref_json),
+        "memoryAuthorityRevision": preview.memory_authority_revision,
+        "memoryPackSnapshotSha256": preview.memory_pack_snapshot_sha256,
+        "recoveryEntry": preview.recovery_entry,
+        "visibility": preview.visibility,
+        "expiresAt": preview.expires_at.as_ref().map(timestamp_json),
+        "confirmationBindingSha256": preview.confirmation_binding_sha256,
+        "gateReady": preview.gate_ready,
+        "blockers": preview.blockers.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail})).collect::<Vec<_>>(),
+        "warnings": preview.warnings.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail})).collect::<Vec<_>>(),
+        "requiredConfirmations": preview.required_confirmations,
+        "evidenceRequired": preview.evidence_required,
+        "readyForFounderConfirmation": preview.ready_for_founder_confirmation,
+        "deadline": preview.deadline.as_ref().map(timestamp_json),
+    })
+}
+
+fn contract_ref_json(
+    reference: &egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference,
+) -> serde_json::Value {
+    json!({
+        "contractId": reference.contract_id,
+        "version": reference.version,
+        "sha256": reference.sha256,
+    })
+}
+
+fn timestamp_json(timestamp: &prost_types::Timestamp) -> serde_json::Value {
+    json!({"seconds": timestamp.seconds, "nanos": timestamp.nanos})
 }
 
 async fn memory(command: MemoryCommand) -> Result<(), CliFailure> {

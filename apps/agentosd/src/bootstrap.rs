@@ -9,6 +9,7 @@ use std::{
 use egopulse_artifact_authority::{
     ArtifactAuthority, ArtifactAuthorityConfig, ArtifactAuthorityFailure, ArtifactSqlCipherKey,
 };
+use egopulse_cognition_runtime::context_authority::{ContextAuthority, ContextAuthorityConfig};
 use egopulse_cognition_runtime::memory_authority::{
     MemoryAuthority, MemoryAuthorityConfig, MemoryAuthorityFailure, MemoryPrincipalKind,
 };
@@ -44,6 +45,7 @@ use prost_types::Timestamp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::ConfiguredWorkPreparationPort;
 use crate::{AllowlistedPrincipal, AllowlistedPrincipalResolver, PrincipalPolicyError};
 use crate::{
     ArtifactAuthorityReferenceSource, ArtifactProjectionSource, AuthorityPrincipalBinding,
@@ -466,7 +468,23 @@ impl ProductionBootstrapConfig {
     /// vertical. Missing or invalid references fail before a serving daemon is
     /// built; no test resolver is used as a production fallback.
     pub fn build(self) -> Result<DaemonProviders, ProductionBootstrapError> {
-        let task_guard = ConfiguredTaskCreationGuard::new(self.task_guard)?;
+        let context_database_path = self
+            .memory
+            .database_path
+            .parent()
+            .map(|parent| parent.join("context-authority.sqlite3"))
+            .unwrap_or_else(|| PathBuf::from("context-authority.sqlite3"));
+        let context = Arc::new(Mutex::new(
+            ContextAuthority::open(ContextAuthorityConfig {
+                database_path: context_database_path,
+                store_epoch: format!("{}-context", self.memory.store_epoch),
+                key: self.memory.key.duplicate_for_related_store(),
+            })
+            .map_err(|_| ProductionBootstrapError::ContextAuthority)?,
+        ));
+        let task_guard_config = self.task_guard;
+        let task_guard = ConfiguredTaskCreationGuard::new(task_guard_config.clone())?
+            .with_context_authority(Arc::clone(&context));
         let founder_verdict_handle = Arc::new(Mutex::new(None));
         let task = Arc::new(Mutex::new(TaskAuthority::open_with_transition_guard(
             self.task,
@@ -578,6 +596,16 @@ impl ProductionBootstrapConfig {
             providers = providers.with_memory_retrieval(Arc::clone(&memory), memory_retrieval)?;
         }
         providers = providers.with_memory_mutation(Arc::clone(&memory), memory_principal_resolver);
+        let work_port = ConfiguredWorkPreparationPort::new(
+            Arc::clone(&context),
+            Arc::clone(&providers.task_port),
+            self.codex.native.workspace_root.clone(),
+            task_guard_config.allowed_work_types,
+            task_guard_config.acceptance_contract_ref,
+            task_guard_config.budget_profile_ref,
+        )
+        .map_err(|_| ProductionBootstrapError::WorkPreparation)?;
+        providers = providers.with_work_preparation_port(Arc::new(work_port));
         if !self.memory_candidate_producers.is_empty() {
             providers = providers.with_memory_candidate_producers(
                 Arc::clone(&memory),
@@ -2252,6 +2280,10 @@ pub enum ProductionBootstrapError {
     TaskAuthority(#[from] TaskAuthorityFailure),
     #[error("Memory Authority could not be opened")]
     MemoryAuthority(#[from] MemoryAuthorityFailure),
+    #[error("Context Authority could not be opened")]
+    ContextAuthority,
+    #[error("Work preparation composition is invalid")]
+    WorkPreparation,
     #[error("Artifact admission guard configuration is invalid")]
     ArtifactGuard(#[from] crate::ArtifactAdmissionGuardConfigurationError),
     #[error("Artifact Authority could not be opened")]

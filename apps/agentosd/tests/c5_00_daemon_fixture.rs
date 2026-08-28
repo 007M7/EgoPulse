@@ -13,11 +13,13 @@ use std::{
 
 use egopulse_agentosd::{
     AuthorityCompositionInputs, AuthorityPrincipalResolver, ConfiguredTaskTransitionGuard,
-    DaemonComposition, DaemonConfig, DaemonProviders, MemoryRetrievalCompositionConfig,
-    OwnerProjectionSource, PendingOwnerProjection, ProjectionSourceFailure,
+    ConfiguredWorkPreparationPort, DaemonComposition, DaemonConfig, DaemonProviders,
+    MemoryRetrievalCompositionConfig, OwnerProjectionSource, PendingOwnerProjection,
+    ProjectionSourceFailure,
 };
 use egopulse_client_kernel::{ClientKernel, api_contract_ref, authorization_contract_ref};
 use egopulse_cognition_runtime::{
+    context_authority::{ContextAuthority, ContextAuthorityConfig},
     memory_authority::{
         AuthenticatedMemoryPrincipal, GovernMemory, MemoryAuthority, MemoryAuthorityConfig,
         MemoryPrincipalKind, SubmitMemoryCandidate,
@@ -612,10 +614,36 @@ where
         )
         .expect("fixture Memory candidate should be accepted or replayed");
     let memory = Arc::new(std::sync::Mutex::new(memory));
-    providers
+    let providers = providers
         .with_memory_retrieval(Arc::clone(&memory), memory_worker_config())
         .expect("fixture Memory retrieval should configure")
-        .with_memory_mutation(memory, Arc::new(FixtureAuthorityPrincipalResolver))
+        .with_memory_mutation(memory, Arc::new(FixtureAuthorityPrincipalResolver));
+    let task_port = Arc::clone(&providers.task_port);
+    let context = ContextAuthority::open(ContextAuthorityConfig {
+        database_path: root.join("context-authority.db"),
+        store_epoch: "c5-context-epoch".to_owned(),
+        key: SqlCipherKey::new([0x15; 32]),
+    })
+    .expect("fixture Context Authority should open");
+    providers.with_work_preparation_port(Arc::new(
+        ConfiguredWorkPreparationPort::new(
+            Arc::new(std::sync::Mutex::new(context)),
+            task_port,
+            root.to_owned(),
+            BTreeSet::from(["governed_repository_change".to_owned()]),
+            egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference {
+                contract_id: "c5-acceptance".to_owned(),
+                version: "v0.1".to_owned(),
+                sha256: "44".repeat(32),
+            },
+            egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference {
+                contract_id: "c5-budget".to_owned(),
+                version: "v0.1".to_owned(),
+                sha256: "55".repeat(32),
+            },
+        )
+        .expect("fixture Work Preparation should configure"),
+    ))
 }
 
 fn memory_worker_config() -> MemoryRetrievalCompositionConfig {
@@ -734,14 +762,42 @@ async fn run_tui(instance: &str, arguments: &[&str]) -> std::process::Output {
 }
 
 async fn wait_for_cli_status(instance: &str) -> std::process::Output {
+    let mut last_failure = String::new();
     for _ in 0..80 {
         let output = run_cli(instance, &["status", "--json"]).await;
         if output.status.success() {
             return output;
         }
+        last_failure = format!(
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         sleep(Duration::from_millis(50)).await;
     }
-    panic!("CLI should attach to the real fixture daemon");
+    panic!("CLI should attach to the real fixture daemon: {last_failure}");
+}
+
+async fn wait_for_cli_status_with_child(instance: &str, child: &mut Child) -> std::process::Output {
+    let mut last_failure = String::new();
+    for _ in 0..80 {
+        let output = run_cli(instance, &["status", "--json"]).await;
+        if output.status.success() {
+            return output;
+        }
+        last_failure = format!(
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("fixture daemon exited before IPC became ready: {status}");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("CLI should attach to the real fixture daemon: {last_failure}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1079,6 +1135,118 @@ async fn m11_real_cli_and_tui_share_governed_memory_mutations_over_local_ipc() {
     let status = child.wait().await.expect("M-11 fixture child exit");
     assert!(status.success(), "M-11 fixture child failed: {status}");
     fs::remove_dir_all(&root).expect("remove M-11 fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c5_06_real_cli_prepare_confirm_creates_task_only_after_founder_binding() {
+    let root = std::env::temp_dir().join(format!("egopulse-c5-06-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create C5-06 fixture root");
+    fs::write(
+        root.join("context.md"),
+        "reviewed context for a governed repository change",
+    )
+    .expect("write C5-06 context source");
+    let instance = format!("c5-06-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, "allow").await;
+    wait_for_cli_status_with_child(&instance, &mut child).await;
+
+    let prepare = run_cli(
+        &instance,
+        &[
+            "work",
+            "prepare",
+            "--intent",
+            "review the current repository change",
+            "--scope",
+            "scope:c5-06",
+            "--work-type",
+            "governed_repository_change",
+            "--context-ref",
+            "context.md",
+            "--idempotency-key",
+            "c5-06-prepare",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        prepare.status.success(),
+        "prepare must succeed before confirmation: stdout={} stderr={}",
+        String::from_utf8_lossy(&prepare.stdout),
+        String::from_utf8_lossy(&prepare.stderr)
+    );
+    let prepare_json: serde_json::Value =
+        serde_json::from_slice(&prepare.stdout).expect("C5-06 prepare JSON envelope");
+    assert_eq!(prepare_json["operation"], "work.prepare");
+    assert_eq!(prepare_json["data"]["gateReady"], true);
+    assert_eq!(prepare_json["data"]["readyForFounderConfirmation"], true);
+    assert_eq!(
+        prepare_json["data"]["includedSources"][0]["sourceRef"],
+        "context.md"
+    );
+    let snapshot_id = prepare_json["data"]["snapshotId"]
+        .as_str()
+        .expect("C5-06 context snapshot id")
+        .to_owned();
+    let binding = prepare_json["data"]["confirmationBindingSha256"]
+        .as_str()
+        .expect("C5-06 confirmation binding")
+        .to_owned();
+
+    let confirm = run_cli(
+        &instance,
+        &[
+            "work",
+            "confirm",
+            snapshot_id.as_str(),
+            "--confirmation-binding-sha256",
+            binding.as_str(),
+            "--idempotency-key",
+            "c5-06-confirm",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        confirm.status.success(),
+        "confirm must delegate to Task Authority: stdout={} stderr={}",
+        String::from_utf8_lossy(&confirm.stdout),
+        String::from_utf8_lossy(&confirm.stderr)
+    );
+    let confirm_json: serde_json::Value =
+        serde_json::from_slice(&confirm.stdout).expect("C5-06 confirm JSON envelope");
+    assert_eq!(confirm_json["operation"], "work.confirm");
+    assert!(confirm_json["data"]["taskId"].as_str().is_some());
+    assert_eq!(confirm_json["data"]["replayed"], false);
+
+    let replay = run_cli(
+        &instance,
+        &[
+            "work",
+            "confirm",
+            snapshot_id.as_str(),
+            "--confirmation-binding-sha256",
+            binding.as_str(),
+            "--idempotency-key",
+            "c5-06-confirm",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        replay.status.success(),
+        "identical confirm must replay: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay_json: serde_json::Value =
+        serde_json::from_slice(&replay.stdout).expect("C5-06 replay JSON envelope");
+    assert_eq!(replay_json["data"]["replayed"], true);
+
+    drop(child.stdin.take());
+    let status = child.wait().await.expect("C5-06 fixture child exit");
+    assert!(status.success(), "C5-06 fixture child failed: {status}");
+    fs::remove_dir_all(&root).expect("remove C5-06 fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1573,20 +1741,7 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
     fs::create_dir_all(&root).expect("create C5 successful CLI fixture root");
     let instance = format!("c5-03-allow-{}", Uuid::now_v7());
     let mut child = spawn_fixture_with_mode(&root, &instance, "allow").await;
-
-    let mut status_output = None;
-    for _ in 0..80 {
-        let output = run_cli(&instance, &["status", "--json"]).await;
-        if output.status.success() {
-            status_output = Some(output);
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        status_output.is_some(),
-        "successful fixture daemon must become ready"
-    );
+    let _status_output = wait_for_cli_status_with_child(&instance, &mut child).await;
 
     let tui_output = run_tui_once(&instance).await;
     assert!(

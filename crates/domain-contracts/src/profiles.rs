@@ -20,7 +20,7 @@ pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =
 pub const AUTHORIZATION_CONTRACT_ID: &str = "egopulse.authorization.v1";
 pub const AUTHORIZATION_CONTRACT_VERSION: &str = "0.1.0";
 pub const AUTHORIZATION_PROFILE_DIGEST_SHA256: &str =
-    "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1";
+    "d50a4f5ff79d8ca1d7a9a289e22265792aa566b8cb13e77de62394b3b34588f7";
 
 const CLIENT_KERNEL_PROFILE_BYTES: &[u8] =
     include_bytes!("../../../contracts/profiles/client-kernel/v1/v01-default.json");

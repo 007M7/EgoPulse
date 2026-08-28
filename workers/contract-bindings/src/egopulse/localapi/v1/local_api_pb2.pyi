@@ -247,6 +247,152 @@ class EvidenceGraphView(_message.Message):
     redactions: _containers.RepeatedCompositeFieldContainer[RedactedField]
     def __init__(self, metadata: _Optional[_Union[ProjectionMetadata, _Mapping]] = ..., task_id: _Optional[str] = ..., artifact_set_id: _Optional[str] = ..., artifacts: _Optional[_Iterable[_Union[_artifact_pb2.ArtifactDescriptor, _Mapping]]] = ..., claims: _Optional[_Iterable[_Union[_artifact_pb2.Claim, _Mapping]]] = ..., evidence: _Optional[_Iterable[_Union[_artifact_pb2.Evidence, _Mapping]]] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ...) -> None: ...
 
+class WorkSourceRequest(_message.Message):
+    __slots__ = ("source_ref", "label")
+    SOURCE_REF_FIELD_NUMBER: _ClassVar[int]
+    LABEL_FIELD_NUMBER: _ClassVar[int]
+    source_ref: str
+    label: str
+    def __init__(self, source_ref: _Optional[str] = ..., label: _Optional[str] = ...) -> None: ...
+
+class WorkSourceFact(_message.Message):
+    __slots__ = ("source_ref", "label", "authority", "content_sha256", "included")
+    SOURCE_REF_FIELD_NUMBER: _ClassVar[int]
+    LABEL_FIELD_NUMBER: _ClassVar[int]
+    AUTHORITY_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_SHA256_FIELD_NUMBER: _ClassVar[int]
+    INCLUDED_FIELD_NUMBER: _ClassVar[int]
+    source_ref: str
+    label: str
+    authority: str
+    content_sha256: str
+    included: bool
+    def __init__(self, source_ref: _Optional[str] = ..., label: _Optional[str] = ..., authority: _Optional[str] = ..., content_sha256: _Optional[str] = ..., included: _Optional[bool] = ...) -> None: ...
+
+class WorkGateNotice(_message.Message):
+    __slots__ = ("code", "detail", "source_ref")
+    CODE_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_REF_FIELD_NUMBER: _ClassVar[int]
+    code: str
+    detail: str
+    source_ref: str
+    def __init__(self, code: _Optional[str] = ..., detail: _Optional[str] = ..., source_ref: _Optional[str] = ...) -> None: ...
+
+class WorkPreparationPreview(_message.Message):
+    __slots__ = ("snapshot_id", "snapshot_revision", "normalized_intent", "work_type", "target_scope_ref", "compiled_context_sha256", "included_sources", "excluded_sources", "non_goals", "allowed_read_paths", "allowed_write_paths", "allowed_tools", "external_resources", "acceptance_contract_ref", "budget_profile_ref", "memory_authority_revision", "memory_pack_snapshot_sha256", "recovery_entry", "visibility", "redactions", "expires_at", "confirmation_binding_sha256", "gate_ready", "blockers", "warnings", "required_confirmations", "evidence_required", "ready_for_founder_confirmation", "deadline")
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_REVISION_FIELD_NUMBER: _ClassVar[int]
+    NORMALIZED_INTENT_FIELD_NUMBER: _ClassVar[int]
+    WORK_TYPE_FIELD_NUMBER: _ClassVar[int]
+    TARGET_SCOPE_REF_FIELD_NUMBER: _ClassVar[int]
+    COMPILED_CONTEXT_SHA256_FIELD_NUMBER: _ClassVar[int]
+    INCLUDED_SOURCES_FIELD_NUMBER: _ClassVar[int]
+    EXCLUDED_SOURCES_FIELD_NUMBER: _ClassVar[int]
+    NON_GOALS_FIELD_NUMBER: _ClassVar[int]
+    ALLOWED_READ_PATHS_FIELD_NUMBER: _ClassVar[int]
+    ALLOWED_WRITE_PATHS_FIELD_NUMBER: _ClassVar[int]
+    ALLOWED_TOOLS_FIELD_NUMBER: _ClassVar[int]
+    EXTERNAL_RESOURCES_FIELD_NUMBER: _ClassVar[int]
+    ACCEPTANCE_CONTRACT_REF_FIELD_NUMBER: _ClassVar[int]
+    BUDGET_PROFILE_REF_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_AUTHORITY_REVISION_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_PACK_SNAPSHOT_SHA256_FIELD_NUMBER: _ClassVar[int]
+    RECOVERY_ENTRY_FIELD_NUMBER: _ClassVar[int]
+    VISIBILITY_FIELD_NUMBER: _ClassVar[int]
+    REDACTIONS_FIELD_NUMBER: _ClassVar[int]
+    EXPIRES_AT_FIELD_NUMBER: _ClassVar[int]
+    CONFIRMATION_BINDING_SHA256_FIELD_NUMBER: _ClassVar[int]
+    GATE_READY_FIELD_NUMBER: _ClassVar[int]
+    BLOCKERS_FIELD_NUMBER: _ClassVar[int]
+    WARNINGS_FIELD_NUMBER: _ClassVar[int]
+    REQUIRED_CONFIRMATIONS_FIELD_NUMBER: _ClassVar[int]
+    EVIDENCE_REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    READY_FOR_FOUNDER_CONFIRMATION_FIELD_NUMBER: _ClassVar[int]
+    DEADLINE_FIELD_NUMBER: _ClassVar[int]
+    snapshot_id: str
+    snapshot_revision: int
+    normalized_intent: str
+    work_type: str
+    target_scope_ref: str
+    compiled_context_sha256: str
+    included_sources: _containers.RepeatedCompositeFieldContainer[WorkSourceFact]
+    excluded_sources: _containers.RepeatedCompositeFieldContainer[WorkGateNotice]
+    non_goals: _containers.RepeatedScalarFieldContainer[str]
+    allowed_read_paths: _containers.RepeatedScalarFieldContainer[str]
+    allowed_write_paths: _containers.RepeatedScalarFieldContainer[str]
+    allowed_tools: _containers.RepeatedScalarFieldContainer[str]
+    external_resources: _containers.RepeatedScalarFieldContainer[str]
+    acceptance_contract_ref: _common_pb2.ContractReference
+    budget_profile_ref: _common_pb2.ContractReference
+    memory_authority_revision: int
+    memory_pack_snapshot_sha256: str
+    recovery_entry: str
+    visibility: str
+    redactions: _containers.RepeatedCompositeFieldContainer[RedactedField]
+    expires_at: _timestamp_pb2.Timestamp
+    confirmation_binding_sha256: str
+    gate_ready: bool
+    blockers: _containers.RepeatedCompositeFieldContainer[WorkGateNotice]
+    warnings: _containers.RepeatedCompositeFieldContainer[WorkGateNotice]
+    required_confirmations: _containers.RepeatedScalarFieldContainer[str]
+    evidence_required: _containers.RepeatedScalarFieldContainer[str]
+    ready_for_founder_confirmation: bool
+    deadline: _timestamp_pb2.Timestamp
+    def __init__(self, snapshot_id: _Optional[str] = ..., snapshot_revision: _Optional[int] = ..., normalized_intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., compiled_context_sha256: _Optional[str] = ..., included_sources: _Optional[_Iterable[_Union[WorkSourceFact, _Mapping]]] = ..., excluded_sources: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., non_goals: _Optional[_Iterable[str]] = ..., allowed_read_paths: _Optional[_Iterable[str]] = ..., allowed_write_paths: _Optional[_Iterable[str]] = ..., allowed_tools: _Optional[_Iterable[str]] = ..., external_resources: _Optional[_Iterable[str]] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., memory_authority_revision: _Optional[int] = ..., memory_pack_snapshot_sha256: _Optional[str] = ..., recovery_entry: _Optional[str] = ..., visibility: _Optional[str] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., confirmation_binding_sha256: _Optional[str] = ..., gate_ready: _Optional[bool] = ..., blockers: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., warnings: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., required_confirmations: _Optional[_Iterable[str]] = ..., evidence_required: _Optional[_Iterable[str]] = ..., ready_for_founder_confirmation: _Optional[bool] = ..., deadline: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class PrepareWorkRequest(_message.Message):
+    __slots__ = ("client", "intent", "work_type", "target_scope_ref", "sources", "idempotency_key")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    INTENT_FIELD_NUMBER: _ClassVar[int]
+    WORK_TYPE_FIELD_NUMBER: _ClassVar[int]
+    TARGET_SCOPE_REF_FIELD_NUMBER: _ClassVar[int]
+    SOURCES_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    intent: str
+    work_type: str
+    target_scope_ref: str
+    sources: _containers.RepeatedCompositeFieldContainer[WorkSourceRequest]
+    idempotency_key: str
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., sources: _Optional[_Iterable[_Union[WorkSourceRequest, _Mapping]]] = ..., idempotency_key: _Optional[str] = ...) -> None: ...
+
+class PrepareWorkResponse(_message.Message):
+    __slots__ = ("preview", "error")
+    PREVIEW_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    preview: WorkPreparationPreview
+    error: LocalApiError
+    def __init__(self, preview: _Optional[_Union[WorkPreparationPreview, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class ConfirmWorkRequest(_message.Message):
+    __slots__ = ("client", "snapshot_id", "confirmation_binding_sha256", "idempotency_key")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    CONFIRMATION_BINDING_SHA256_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    snapshot_id: str
+    confirmation_binding_sha256: str
+    idempotency_key: str
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., snapshot_id: _Optional[str] = ..., confirmation_binding_sha256: _Optional[str] = ..., idempotency_key: _Optional[str] = ...) -> None: ...
+
+class ConfirmWorkAccepted(_message.Message):
+    __slots__ = ("authority_result", "await_token")
+    AUTHORITY_RESULT_FIELD_NUMBER: _ClassVar[int]
+    AWAIT_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    authority_result: _task_pb2.TaskCommandResult
+    await_token: ProjectionAwaitToken
+    def __init__(self, authority_result: _Optional[_Union[_task_pb2.TaskCommandResult, _Mapping]] = ..., await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ...) -> None: ...
+
+class ConfirmWorkResponse(_message.Message):
+    __slots__ = ("accepted", "error")
+    ACCEPTED_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    accepted: ConfirmWorkAccepted
+    error: LocalApiError
+    def __init__(self, accepted: _Optional[_Union[ConfirmWorkAccepted, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
 class HarnessApprovalAuthorityResult(_message.Message):
     __slots__ = ("committed", "replayed", "authority_decision_ref", "decision", "state", "state_revision", "expires_at", "error_code", "safe_error_fingerprint")
     COMMITTED_FIELD_NUMBER: _ClassVar[int]

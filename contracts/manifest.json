@@ -1,8 +1,8 @@
 {
   "schemaVersion": "v01-gate3-contract-candidate-manifest/v0.1",
   "candidateId": "v01-gate3-contracts",
-  "candidateVersion": "0.1.0-draft.16",
-  "status": "targeted_gate3_revision_founder_confirmed_g4_08c_support_profiles_reverified_memory_retrieval_daemon_cli_tui_frozen",
+  "candidateVersion": "0.1.0-draft.17",
+  "status": "targeted_revision_candidate_prepare_confirm_implementation_pending_founder_confirmation",
   "ssotRole": "implementation_contract_ssot",
   "featureId": "v01-governed-single-harness-work-loop",
   "architectureAuthorityRef": "conversation:2026-08-23:founder-v01-feature-adr-a01",
@@ -25,6 +25,7 @@
   "g408cSupportProfilesAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
   "memoryRagAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m01-m06-freeze",
   "memoryRetrievalAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m07-m10-freeze",
+  "workPrepareConfirmAuthorityRef": "conversation:2026-08-28:founder-work-prepare-confirm-candidate",
   "implementationAuthorized": true,
   "handoffRule": {
     "gate": "Gate 4",
@@ -121,15 +122,15 @@
   "validation": {
     "localCandidateValidator": "scripts/validate-candidate.js",
     "localCandidateStatus": "passed_181_domain_fixtures_plus_1_foundation_fixture",
-    "bufLint": "passed_buf_1.72.0_draft16_with_two_documented_rpc_naming_exceptions",
-    "bufBuild": "passed_draft16_proto_descriptor",
-    "bufBreaking": "passed_no_new_wire_breaks_against_draft13_and_exact_founder_authorized_two_field_breaks_against_draft11",
-    "protocCompile": "passed_libprotoc_35.1_draft16_eleven_v01_modules_plus_foundation",
-    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_draft16_eleven_v01_modules_plus_foundation",
+    "bufLint": "passed_buf_1.72.0_draft17_with_two_documented_rpc_naming_exceptions",
+    "bufBuild": "passed_draft17_proto_descriptor",
+    "bufBreaking": "candidate_pending_full_validation_against_draft13_and_exact_founder_authorized_two_field_breaks_against_draft11",
+    "protocCompile": "candidate_pending_libprotoc_35.1_draft17_eleven_v01_modules_plus_foundation",
+    "crossLanguageGeneration": "candidate_pending_typescript_rust_tonic_python_draft17_eleven_v01_modules_plus_foundation",
     "faultConformance": "passed_existing_real_process_and_sqlcipher_suite_plus_memory_retrieval_permission_scope_concurrency_crash_timeout_and_real_daemon_cli_tui_parity",
     "qualityBudgetProfile": "passed_33_d03_rules_exactly_once_with_gate3_design_gate6_verification_binding",
     "clientKernelProfile": "passed_versioned_surface_neutral_rust_shared_kernel_profile_with_exact_digest_reference",
-    "authorizationCapabilityProfile": "passed_exact_permission_rpc_command_oneof_catalog_with_fail_closed_defaults"
+    "authorizationCapabilityProfile": "candidate_adds_work_prepare_confirm_permissions_and_rpc_rules"
   },
   "artifacts": [
     {
@@ -914,11 +915,11 @@
     },
     {
       "path": "IMPLEMENTATION-SSOT.json",
-      "sha256": "ac2199effc73c2ab859892a454cf03df2c9822aa0d2bdb081796de2ce073227c"
+      "sha256": "f311bc68288c3bf161ae08705fd6b7b969984557e3413606a1de6b5fdb7c666c"
     },
     {
       "path": "IMPLEMENTATION-SSOT.md",
-      "sha256": "ec3b65a56255a6caffa2846e24b2152e2bccbf6b3b2c36347205231ef4d105c2"
+      "sha256": "561839a6f440ec6686ecead255b920b3bf6d98a9a6ddc8574913e50cfaf45a83"
     },
     {
       "path": "json-schema/foundation-health.schema.json",
@@ -938,7 +939,7 @@
     },
     {
       "path": "profiles/authorization/v1/v01-default.json",
-      "sha256": "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1"
+      "sha256": "d50a4f5ff79d8ca1d7a9a289e22265792aa566b8cb13e77de62394b3b34588f7"
     },
     {
       "path": "profiles/client-kernel/v1/v01-default.json",
@@ -970,7 +971,7 @@
     },
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
-      "sha256": "0a8247e4446d718e502cecc7c61e61d0c167f30dfbad8295f939a49fb735abd9"
+      "sha256": "f5bd462d07ee2e35d230b9438a86ff4ef9d07443129596ae47bade7445c8ccac"
     },
     {
       "path": "proto/egopulse/memory/v1/memory.proto",

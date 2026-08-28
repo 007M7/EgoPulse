@@ -43,6 +43,15 @@ impl SqlCipherKey {
     pub(crate) fn expose(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Creates a related-store key without exposing key bytes to callers.
+    /// Context Authority is a sibling local store in the same installation;
+    /// composition code may use this method to bind it to the same protected
+    /// key material while keeping the bytes opaque.
+    #[must_use]
+    pub fn duplicate_for_related_store(&self) -> Self {
+        Self(self.0)
+    }
 }
 
 impl Drop for SqlCipherKey {

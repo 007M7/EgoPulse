@@ -6,9 +6,10 @@ use egopulse_client_kernel::{ClientKernel, KernelError};
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::CommandMetadata,
     localapi::v1::{
-        ClientRequestMetadata, ClientSurface, GetProjectionStatusRequest, HarnessApprovalView,
-        ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError, ProjectionMetadata,
-        TaskView,
+        ClientRequestMetadata, ClientSurface, ConfirmWorkRequest, ConfirmWorkResponse,
+        GetProjectionStatusRequest, HarnessApprovalView, ListHarnessApprovalViewsRequest,
+        ListTaskViewsRequest, LocalApiError, PrepareWorkRequest, ProjectionMetadata, TaskView,
+        WorkPreparationPreview, WorkSourceRequest,
     },
     policy::v1::{PolicyDecisionCommand, policy_decision_command},
     task::v1::{TaskCommand, task_command},
@@ -47,6 +48,25 @@ pub enum ClientReadError {
     Api(Box<LocalApiError>),
     #[error("local API returned an incomplete response: {0}")]
     Protocol(&'static str),
+}
+
+#[derive(Debug, Error)]
+pub enum ClientWorkError {
+    #[error("client kernel rejected the work operation: {0}")]
+    Kernel(#[from] KernelError),
+    #[error("local API transport failed: {0}")]
+    Transport(String),
+    #[error("local API rejected the work operation: {0:?}")]
+    Api(Box<LocalApiError>),
+    #[error("local API returned an incomplete work response: {0}")]
+    Protocol(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfirmedWork {
+    pub result: egopulse_domain_contracts::v01::egopulse::task::v1::TaskCommandResult,
+    pub await_token:
+        Option<egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionAwaitToken>,
 }
 
 impl ClientAttachment {
@@ -142,6 +162,71 @@ impl ClientAttachment {
             tasks: tasks.views,
             approvals: approvals.views,
         })
+    }
+
+    /// The shared client operation for both CLI and TUI. The request contains
+    /// only user intent, scope and explicit source references; all governance
+    /// facts are returned by the daemon-owned preparation compiler.
+    pub async fn prepare_work(
+        &self,
+        intent: String,
+        work_type: String,
+        target_scope_ref: String,
+        sources: Vec<(String, String)>,
+        idempotency_key: String,
+    ) -> Result<WorkPreparationPreview, ClientWorkError> {
+        let response = self
+            .connection
+            .command_gateway_service()
+            .prepare_work(PrepareWorkRequest {
+                client: Some(self.metadata(None)?),
+                intent,
+                work_type,
+                target_scope_ref,
+                sources: sources
+                    .into_iter()
+                    .map(|(source_ref, label)| WorkSourceRequest { source_ref, label })
+                    .collect(),
+                idempotency_key,
+            })
+            .await
+            .map_err(|error| ClientWorkError::Transport(error.to_string()))?
+            .into_inner();
+        match response.outcome {
+            Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::prepare_work_response::Outcome::Preview(preview)) => Ok(preview),
+            Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::prepare_work_response::Outcome::Error(error)) => Err(ClientWorkError::Api(Box::new(error))),
+            None => Err(ClientWorkError::Protocol("prepare outcome missing")),
+        }
+    }
+
+    /// Confirms exactly the binding displayed in the preparation preview. The
+    /// daemon—not this client—creates the Task command through Task Authority.
+    pub async fn confirm_work(
+        &self,
+        snapshot_id: String,
+        confirmation_binding_sha256: String,
+        idempotency_key: String,
+    ) -> Result<ConfirmedWork, ClientWorkError> {
+        let response: ConfirmWorkResponse = self
+            .connection
+            .command_gateway_service()
+            .confirm_work(ConfirmWorkRequest {
+                client: Some(self.metadata(None)?),
+                snapshot_id,
+                confirmation_binding_sha256,
+                idempotency_key,
+            })
+            .await
+            .map_err(|error| ClientWorkError::Transport(error.to_string()))?
+            .into_inner();
+        match response.outcome {
+            Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Accepted(accepted)) => Ok(ConfirmedWork {
+                result: accepted.authority_result.ok_or(ClientWorkError::Protocol("confirmed task result missing"))?,
+                await_token: accepted.await_token,
+            }),
+            Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Error(error)) => Err(ClientWorkError::Api(Box::new(error))),
+            None => Err(ClientWorkError::Protocol("confirm outcome missing")),
+        }
     }
 }
 

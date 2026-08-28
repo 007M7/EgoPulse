@@ -13,7 +13,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use egopulse_client_operations::{
-    ClientAttachment, ClientReadError, attach as attach_client, command_metadata,
+    ClientAttachment, ClientReadError, ClientWorkError, attach as attach_client, command_metadata,
     set_policy_digest, set_task_digest, set_verdict_digest, timestamp_after,
 };
 use egopulse_director_facade::{
@@ -85,11 +85,36 @@ enum TuiCommand {
         #[arg(long)]
         scope: String,
         /// Product work classification used by the preparation gate.
-        #[arg(long, default_value = "general")]
+        #[arg(long)]
         work_type: String,
         /// Explicit source references to include in the exact-context preview.
         #[arg(long = "context-ref")]
         context_refs: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compile a daemon-owned, digest-bound work preview.
+    WorkPrepare {
+        #[arg(long)]
+        intent: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        work_type: String,
+        #[arg(long = "context-ref")]
+        context_refs: Vec<String>,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Confirm the exact preparation binding and create a Task through the daemon.
+    WorkConfirm {
+        snapshot_id: String,
+        #[arg(long)]
+        confirmation_binding_sha256: String,
+        #[arg(long)]
+        idempotency_key: String,
         #[arg(long)]
         json: bool,
     },
@@ -306,6 +331,8 @@ impl Panel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandKind {
     WorkPlan,
+    WorkPrepare,
+    WorkConfirm,
     TaskCreate,
     TaskApplyVerdict,
     TaskCancel,
@@ -321,8 +348,10 @@ enum CommandKind {
 }
 
 impl CommandKind {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 15] = [
         Self::WorkPlan,
+        Self::WorkPrepare,
+        Self::WorkConfirm,
         Self::TaskCreate,
         Self::TaskApplyVerdict,
         Self::TaskCancel,
@@ -340,6 +369,8 @@ impl CommandKind {
     const fn label(self) -> &'static str {
         match self {
             Self::WorkPlan => "Preview governed work",
+            Self::WorkPrepare => "Prepare governed work",
+            Self::WorkConfirm => "Confirm and create governed task",
             Self::TaskCreate => "Create governed task",
             Self::TaskApplyVerdict => "Apply Founder Verdict",
             Self::TaskCancel => "Request task cancellation",
@@ -402,6 +433,18 @@ impl CommandForm {
                 FormField::required("scope-ref"),
                 FormField::required("work-type").with_value("general"),
                 FormField::optional("context-ref"),
+            ],
+            CommandKind::WorkPrepare => vec![
+                FormField::required("intent"),
+                FormField::required("scope-ref"),
+                FormField::required("work-type"),
+                FormField::optional("context-ref"),
+                FormField::required("idempotency-key"),
+            ],
+            CommandKind::WorkConfirm => vec![
+                FormField::required("snapshot-id"),
+                FormField::required("confirmation-binding-sha256"),
+                FormField::required("idempotency-key"),
             ],
             CommandKind::TaskCreate => vec![
                 FormField::required("work-type"),
@@ -527,6 +570,26 @@ impl CommandForm {
                         .into_iter()
                         .collect()
                 },
+                json: false,
+            }),
+            CommandKind::WorkPrepare => Ok(TuiCommand::WorkPrepare {
+                intent: next(&mut values, "intent")?,
+                scope: next(&mut values, "scope-ref")?,
+                work_type: next(&mut values, "work-type")?,
+                context_refs: {
+                    let value = next(&mut values, "context-ref")?;
+                    (!value.trim().is_empty())
+                        .then_some(value)
+                        .into_iter()
+                        .collect()
+                },
+                idempotency_key: next(&mut values, "idempotency-key")?,
+                json: false,
+            }),
+            CommandKind::WorkConfirm => Ok(TuiCommand::WorkConfirm {
+                snapshot_id: next(&mut values, "snapshot-id")?,
+                confirmation_binding_sha256: next(&mut values, "confirmation-binding-sha256")?,
+                idempotency_key: next(&mut values, "idempotency-key")?,
                 json: false,
             }),
             CommandKind::TaskCreate => Ok(TuiCommand::TaskCreate {
@@ -845,6 +908,116 @@ async fn run_command_with_output(
                 }
                 println!("Intent: {}", payload["data"]["work_request"]["intent"]);
                 println!("Next: Founder review is required before task creation.");
+            }
+            Ok(CommandResult::Completed)
+        }
+        TuiCommand::WorkPrepare {
+            intent,
+            scope,
+            work_type,
+            context_refs,
+            idempotency_key,
+            json,
+        } => {
+            let attached = AttachedClient::open(instance).await?;
+            attached.require_rpc("LocalCommandGatewayService/PrepareWork", "work.prepare")?;
+            let preview = attached
+                .0
+                .prepare_work(
+                    intent,
+                    work_type,
+                    scope,
+                    context_refs
+                        .into_iter()
+                        .map(|value| (value.clone(), value))
+                        .collect(),
+                    idempotency_key,
+                )
+                .await
+                .map_err(tui_work_error)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "schemaVersion": "egopulse.tui-result/v0.1",
+                        "ok": true,
+                        "operation": "work.prepare",
+                        "data": {
+                            "snapshotId": preview.snapshot_id,
+                            "snapshotRevision": preview.snapshot_revision,
+                            "gateReady": preview.gate_ready,
+                            "readyForFounderConfirmation": preview.ready_for_founder_confirmation,
+                            "compiledContextSha256": preview.compiled_context_sha256,
+                            "confirmationBindingSha256": preview.confirmation_binding_sha256,
+                            "includedSources": preview.included_sources.iter().map(|source| json!({"sourceRef": source.source_ref, "label": source.label, "contentSha256": source.content_sha256, "authority": source.authority, "included": source.included})).collect::<Vec<_>>(),
+                            "excludedSources": preview.excluded_sources.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
+                            "blockers": preview.blockers.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
+                        }
+                    }))
+                    .unwrap()
+                );
+            } else {
+                println!(
+                    "Work prepared: snapshot={} gate_ready={} sources={}",
+                    preview.snapshot_id,
+                    preview.gate_ready,
+                    preview.included_sources.len()
+                );
+                println!("Next: review the preview, then run work-confirm with its binding.");
+            }
+            Ok(CommandResult::Completed)
+        }
+        TuiCommand::WorkConfirm {
+            snapshot_id,
+            confirmation_binding_sha256,
+            idempotency_key,
+            json,
+        } => {
+            let attached = AttachedClient::open(instance).await?;
+            attached.require_rpc("LocalCommandGatewayService/ConfirmWork", "work.confirm")?;
+            let confirmed = attached
+                .0
+                .confirm_work(snapshot_id, confirmation_binding_sha256, idempotency_key)
+                .await
+                .map_err(tui_work_error)?;
+            let replayed = confirmed.result.replayed;
+            let task = match confirmed.result.outcome {
+                Some(task_command_result::Outcome::Task(task)) => task,
+                Some(task_command_result::Outcome::Error(error)) => {
+                    return Err(format!(
+                        "TASK_AUTHORITY_REJECTED code={} detail={}",
+                        error.code, error.safe_detail_code
+                    ));
+                }
+                None => return Err("confirmed task authority outcome missing".to_owned()),
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "schemaVersion": "egopulse.tui-result/v0.1",
+                        "ok": true,
+                        "operation": "work.confirm",
+                        "data": {
+                            "taskId": task.task_id,
+                            "revision": task.revision,
+                            "status": TaskStatus::try_from(task.status).map(|status| status.as_str_name()).unwrap_or("TASK_STATUS_UNSPECIFIED"),
+                            "replayed": replayed,
+                            "awaitToken": await_token_json(confirmed.await_token)
+                        }
+                    }))
+                    .unwrap()
+                );
+            } else {
+                println!(
+                    "Work confirmed: task={} revision={} status={} replayed={}",
+                    task.task_id,
+                    task.revision,
+                    TaskStatus::try_from(task.status)
+                        .map(|status| status.as_str_name())
+                        .unwrap_or("TASK_STATUS_UNSPECIFIED"),
+                    replayed,
+                );
             }
             Ok(CommandResult::Completed)
         }
@@ -1798,6 +1971,8 @@ async fn run_memory_mutation(
 fn command_kind(command: &TuiCommand) -> &'static str {
     match command {
         TuiCommand::WorkPlan { .. } => "work.plan",
+        TuiCommand::WorkPrepare { .. } => "work.prepare",
+        TuiCommand::WorkConfirm { .. } => "work.confirm",
         TuiCommand::TaskCreate { .. } => "task.create",
         TuiCommand::TaskApplyVerdict { .. } => "task.apply-verdict",
         TuiCommand::TaskCancel { .. } => "task.cancel",
@@ -1810,6 +1985,13 @@ fn command_kind(command: &TuiCommand) -> &'static str {
         TuiCommand::MemoryCandidate { .. } => "memory.candidate",
         TuiCommand::MemoryAccept { .. } => "memory.accept",
         TuiCommand::MemoryRevoke { .. } => "memory.revoke",
+    }
+}
+
+fn tui_work_error(error: ClientWorkError) -> String {
+    match error {
+        ClientWorkError::Api(error) => local_error_message(*error),
+        other => other.to_string(),
     }
 }
 
@@ -2563,14 +2745,10 @@ mod tests {
         ));
 
         app.open_palette();
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-            .expect("palette navigation");
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-            .expect("palette navigation");
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-            .expect("palette navigation");
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-            .expect("palette navigation");
+        for _ in 0..6 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                .expect("palette navigation");
+        }
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("open form");
         assert!(matches!(
@@ -2579,6 +2757,55 @@ mod tests {
                 kind: CommandKind::ApprovalDecide,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn governed_work_prepare_and_confirm_forms_map_to_kernel_commands() {
+        let mut prepare = CommandForm::new(CommandKind::WorkPrepare);
+        for (field, value) in prepare.fields.iter_mut().zip([
+            "整理当前项目的 Memory 治理".to_owned(),
+            "project:egopulse".to_owned(),
+            "research_implementation".to_owned(),
+            "docs/ARCHITECTURE.md".to_owned(),
+            "idem-prepare-1".to_owned(),
+        ]) {
+            field.value = value;
+        }
+        assert!(matches!(
+            prepare.into_command().expect("valid prepare form"),
+            TuiCommand::WorkPrepare {
+                intent,
+                scope,
+                work_type,
+                context_refs,
+                idempotency_key,
+                json: false,
+            } if intent == "整理当前项目的 Memory 治理"
+                && scope == "project:egopulse"
+                && work_type == "research_implementation"
+                && context_refs == vec!["docs/ARCHITECTURE.md"]
+                && idempotency_key == "idem-prepare-1"
+        ));
+
+        let mut confirm = CommandForm::new(CommandKind::WorkConfirm);
+        for (field, value) in confirm.fields.iter_mut().zip([
+            "ctx:abc".to_owned(),
+            "binding-sha256".to_owned(),
+            "idem-confirm-1".to_owned(),
+        ]) {
+            field.value = value;
+        }
+        assert!(matches!(
+            confirm.into_command().expect("valid confirm form"),
+            TuiCommand::WorkConfirm {
+                snapshot_id,
+                confirmation_binding_sha256,
+                idempotency_key,
+                json: false,
+            } if snapshot_id == "ctx:abc"
+                && confirmation_binding_sha256 == "binding-sha256"
+                && idempotency_key == "idem-confirm-1"
         ));
     }
 

@@ -7,11 +7,11 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
 const contractsRoot = join(repositoryRoot, "contracts");
 const manifestPath = join(contractsRoot, "manifest.json");
-const expectedManifestSha256 = "ddeff9d0f3bcb860e44cddc25233cadb0e21768bbf8193589eb1f8f7aa719b07";
+const expectedManifestSha256 = "0998001bc3da061a2fa83635060ff9b704d07d3ddb94b224fc124fbb91c2bb0f";
 const expectedArtifactCount = 239;
 const expectedFixtureCount = 182;
 const expectedClientKernelProfileSha256 = "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9";
-const expectedAuthorizationProfileSha256 = "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1";
+const expectedAuthorizationProfileSha256 = "d50a4f5ff79d8ca1d7a9a289e22265792aa566b8cb13e77de62394b3b34588f7";
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -37,7 +37,7 @@ const manifestSha256 = sha256(manifestBytes);
 assert(manifestSha256 === expectedManifestSha256, `manifest digest mismatch: ${manifestSha256}`);
 
 const manifest = JSON.parse(manifestBytes.toString("utf8"));
-assert(manifest.candidateVersion === "0.1.0-draft.16", "unexpected V-01 implementation contract version");
+assert(manifest.candidateVersion === "0.1.0-draft.17", "unexpected V-01 implementation contract version");
 assert(manifest.targetedRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3", "missing Founder authority for targeted revision");
 assert(manifest.approvalReadModelRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a", "missing Founder authority for approval read model revision");
 assert(manifest.g408cSupportProfilesAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3", "missing Founder authority for G4-08C support profiles");

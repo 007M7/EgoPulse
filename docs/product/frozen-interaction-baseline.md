@@ -123,28 +123,53 @@ Desktop 不是另一套业务内核。它只在 CLI/TUI 的权威状态和流式
 
 任何一步如果缺少权威事实源或跨语言合同，都应停在阻断状态，不能用 UI 模拟、模型自述或默认值冒充完成。
 
+Implementation note: the status table above is the original checkpoint
+snapshot. The more specific status below supersedes its Prepare/Confirm rows:
+the daemon-owned `PrepareWork` and `ConfirmWork` path is now implemented as a
+candidate revision and locally tested, but remains pending Founder acceptance
+of the contract revision. Full execution and user-visible streaming remain
+open.
+
 ## 6. Implementation checkpoint: 2026-08-28
 
 The interaction semantics and authority boundaries remain frozen. The current
-implementation must be read as a staged closure, not as a claim that the
-normal user path is already complete.
+implementation is a staged closure: the real Founder path now has a daemon-
+owned preparation and confirmation boundary, while execution, evidence,
+verdict, streaming projection, and release remain subsequent closure work.
 
 - `work plan` implements the natural-language normalization, explicit source
   context pack, Work-Start Gate and event-packet preview. It is read-only and
   non-dispatchable.
+- `work prepare` is the real Local API path for the first half of the frozen
+  workflow. The daemon reads only explicitly referenced files below the
+  configured workspace root, records source identity and content digests, and
+  issues an immutable `ctx:` snapshot. The client receives an Authority-owned
+  preview; it cannot author the snapshot, compiled context, source authority,
+  or gate result.
+- `work confirm` accepts only the exact snapshot and confirmation binding shown
+  by the preview. The binding covers the compiled-context digest, source
+  ledger, gate recovery state, owner principal, and the reviewed contract
+  references; divergent governance descriptions for the same compiled content
+  fail closed at issue instead. A successful confirmation
+  delegates Task creation to Task Authority and returns a projection await
+  token; it never returns a mixed success/error response.
+- CLI and TUI expose the same Prepare/Confirm capability through the shared
+  `ClientAttachment` and Local API contracts. TUI's palette and direct
+  subcommands are presentation paths, not a second business kernel.
 - `task create` remains a low-level diagnostic/acceptance command. It is not
   the normal Founder workflow because it accepts Task fields directly.
 - The internal Rust Context Authority A' slice is implemented and pushed in
   `ef37e40` and `596d496`: immutable content-addressed snapshots, complete
   governance-description idempotency, SQLCipher persistence, scope/expiry/
   integrity checks, restart replay and fail-closed descriptor changes.
-- The public `PrepareWork` / `ConfirmWork` surface, daemon-side preparation
-  compiler wiring, Authority-backed dispatch resolver, and equivalent CLI/TUI
-  commands remain the next implementation slice. No client may simulate these
-  by writing a snapshot or constructing a Task locally.
+- The Authority-backed dispatch resolver, user-visible streaming observation,
+  and full execution-to-evidence-to-verdict E2E remain the next implementation
+  slices. No client may bypass the preparation boundary by writing a snapshot,
+  constructing a Task locally, or dispatching directly.
 
-The product is therefore not yet declared normally usable. The truthful exit
-path remains:
+The product is therefore not yet declared fully normally usable. The truthful
+first-half path is now executable locally, while the complete product path
+remains:
 
 ```text
 CLI/TUI natural language
