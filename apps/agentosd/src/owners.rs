@@ -9,7 +9,7 @@ use egopulse_cognition_runtime::task_authority::{
 use egopulse_domain_contracts::v01::egopulse::{
     localapi::v1::{SourceDomain, SourceRevision},
     policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
-    task::v1::{TaskCommand, TaskCommandResult},
+    task::v1::{TaskCommand, TaskCommandResult, task_command},
     verdict::v1::{VerdictCommand, VerdictCommandResult},
 };
 use egopulse_founder_verdict_authority::{
@@ -199,6 +199,10 @@ impl AuthorityCommandPorts {
     }
 }
 
+/// Fixed authenticated owner used only by daemon-owned system activation.
+/// It is never derived from a client principal or request metadata.
+const SYSTEM_ACTIVATION_PRINCIPAL_ID: &str = "collaboration-control:system-activation";
+
 impl TaskCommandPort for AuthorityCommandPorts {
     fn execute(
         &self,
@@ -206,6 +210,34 @@ impl TaskCommandPort for AuthorityCommandPorts {
         principal: &CommandPrincipal,
     ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
         let owner_principal = self.task_principal(principal)?;
+        self.execute_as_owner(command, owner_principal)
+    }
+
+    fn execute_system_activation(
+        &self,
+        command: &TaskCommand,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        if !matches!(
+            command.command,
+            Some(task_command::Command::ActivateTask(_))
+        ) {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        let owner_principal = AuthenticatedPrincipal {
+            kind: TaskPrincipalKind::CollaborationControl,
+            principal_id: SYSTEM_ACTIVATION_PRINCIPAL_ID.to_owned(),
+            authenticated: true,
+        };
+        self.execute_as_owner(command, owner_principal)
+    }
+}
+
+impl AuthorityCommandPorts {
+    fn execute_as_owner(
+        &self,
+        command: &TaskCommand,
+        owner_principal: AuthenticatedPrincipal,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
         let mut authority = self
             .task
             .lock()
@@ -848,6 +880,133 @@ mod tests {
         assert!(!verdict_result.result.committed);
         assert!(verdict_result.source_revision.is_none());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn system_activation_admits_only_activate_task_under_the_fixed_owner() {
+        let root = root();
+        let task = TaskAuthority::open_with_transition_guard(
+            TaskAuthorityConfig {
+                database_path: root.join("task.db"),
+                store_epoch: "c4-task-system-activation".to_owned(),
+                key: SqlCipherKey::new([1; 32]),
+            },
+            AllowCreation,
+            AllowTransition,
+        )
+        .expect("task owner");
+        let policy = PolicyDecisionAuthority::open(
+            PolicyAuthorityConfig {
+                database_path: root.join("policy.db"),
+                store_epoch: "c4-policy-system-activation".to_owned(),
+                key: PolicySqlCipherKey::new([2; 32]),
+            },
+            DenyPolicy,
+        )
+        .expect("policy owner");
+        let verdict = FounderVerdictAuthority::open(
+            VerdictAuthorityConfig {
+                database_path: root.join("verdict.db"),
+                store_epoch: "c4-verdict-system-activation".to_owned(),
+                key: VerdictSqlCipherKey::new([3; 32]),
+            },
+            DenyVerdict,
+        )
+        .expect("verdict owner");
+        let task_handle = Arc::new(Mutex::new(task));
+
+        let snapshot = {
+            let mut authority = task_handle.lock().expect("Task owner lock");
+            let mut create = TaskCommand {
+                command: Some(task_command::Command::CreateTask(CreateTaskCommand {
+                    meta: Some(task_metadata("sysact-create", "sysact-create")),
+                    work_type: "governed_repository_change".to_owned(),
+                    input_snapshot_id: "input-sysact".to_owned(),
+                    target_scope_ref: "scope-sysact".to_owned(),
+                    acceptance_contract_ref: Some(task_contract_ref(
+                        "acceptance-sysact",
+                        "1",
+                        &"a".repeat(64),
+                    )),
+                    budget_profile_ref: Some(task_contract_ref(
+                        "budget-sysact",
+                        "1",
+                        &"b".repeat(64),
+                    )),
+                })),
+            };
+            set_task_digest(&mut create);
+            let created = authority
+                .execute(
+                    &create,
+                    &AuthenticatedPrincipal {
+                        kind: TaskPrincipalKind::Founder,
+                        principal_id: "founder:sysact-test".to_owned(),
+                        authenticated: true,
+                    },
+                )
+                .expect("create fixture Task");
+            task_snapshot(&created)
+        };
+
+        let ports = AuthorityCommandPorts::new_shared(
+            Arc::clone(&task_handle),
+            policy,
+            verdict,
+            Arc::new(StaticPrincipalResolver),
+        );
+
+        let mut smuggled_create = TaskCommand {
+            command: Some(task_command::Command::CreateTask(CreateTaskCommand {
+                meta: Some(task_metadata("sysact-smuggle", "sysact-smuggle")),
+                work_type: "governed_repository_change".to_owned(),
+                input_snapshot_id: "input-sysact".to_owned(),
+                target_scope_ref: "scope-sysact".to_owned(),
+                acceptance_contract_ref: Some(task_contract_ref(
+                    "acceptance-sysact",
+                    "1",
+                    &"a".repeat(64),
+                )),
+                budget_profile_ref: Some(task_contract_ref("budget-sysact", "1", &"b".repeat(64))),
+            })),
+        };
+        set_task_digest(&mut smuggled_create);
+        let error = ports
+            .execute_system_activation(&smuggled_create)
+            .expect_err("non-activation commands must not pass the system boundary");
+        assert!(matches!(error, CommandPortFailure::IntegrityFailure));
+
+        let mut activate = TaskCommand {
+            command: Some(task_command::Command::ActivateTask(ActivateTaskCommand {
+                meta: Some(task_metadata("sysact-activate", "sysact-activate")),
+                task_id: snapshot.task_id.clone(),
+                expected_revision: snapshot.revision,
+                work_revision: snapshot.work_revision,
+                run_id: "run-sysact-001".to_owned(),
+            })),
+        };
+        set_task_digest(&mut activate);
+        let result = ports
+            .execute_system_activation(&activate)
+            .expect("system activation commits through the owner");
+        let activated = task_snapshot(&result.result);
+        assert_eq!(activated.status, TaskStatus::Active as i32);
+        assert_eq!(activated.current_run_id.as_deref(), Some("run-sysact-001"));
+        assert!(result.source_revision.is_some());
+        assert!(matches!(
+            result.await_target,
+            Some(AwaitTarget::Task { .. })
+        ));
+
+        let replay = ports
+            .execute_system_activation(&activate)
+            .expect("replayed system activation");
+        assert!(replay.result.replayed);
+        assert!(!result.result.replayed);
+
+        drop(ports);
+        drop(task_handle);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -73,6 +73,18 @@ pub trait TaskCommandPort: Send + Sync + 'static {
         command: &TaskCommand,
         principal: &CommandPrincipal,
     ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure>;
+
+    /// Daemon-owned system activation over one reviewed ActivateTask command.
+    /// The principal is owned by the implementing port, never by the caller.
+    /// The default is fail-closed: a port that does not explicitly admit
+    /// system activation must reject it.
+    fn execute_system_activation(
+        &self,
+        command: &TaskCommand,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        let _ = command;
+        Err(CommandPortFailure::Unavailable)
+    }
 }
 
 pub trait PolicyCommandPort: Send + Sync + 'static {

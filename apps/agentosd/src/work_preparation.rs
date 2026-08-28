@@ -16,7 +16,10 @@ use egopulse_domain_contracts::v01::egopulse::{
         ConfirmWorkRequest, PrepareWorkRequest, WorkGateNotice, WorkPreparationPreview,
         WorkSourceFact,
     },
-    task::v1::{CreateTaskCommand, TaskCommand, TaskCommandResult, task_command},
+    task::v1::{
+        ActivateTaskCommand, CreateTaskCommand, TaskCommand, TaskCommandResult, TaskStatus,
+        task_command, task_command_result,
+    },
 };
 use egopulse_local_api::command_gateway::{
     CommandPortFailure, CommandPortResult, CommandPrincipal, TaskCommandPort, WorkPreparationPort,
@@ -37,6 +40,9 @@ pub struct ConfiguredWorkPreparationPort {
     allowed_work_types: BTreeSet<String>,
     acceptance_contract_ref: ContractReference,
     budget_profile_ref: ContractReference,
+    /// Reviewed daemon-owned workflow instance used for post-confirmation
+    /// activation. None is retained by foundation/unit-test compositions.
+    activation_run_id: Option<String>,
 }
 
 impl ConfiguredWorkPreparationPort {
@@ -64,7 +70,16 @@ impl ConfiguredWorkPreparationPort {
             allowed_work_types,
             acceptance_contract_ref,
             budget_profile_ref,
+            activation_run_id: None,
         })
+    }
+
+    pub fn with_activation_run_id(mut self, run_id: String) -> Result<Self, CommandPortFailure> {
+        if run_id.trim().is_empty() {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        self.activation_run_id = Some(run_id);
+        Ok(self)
     }
 
     fn compile_sources(
@@ -313,7 +328,65 @@ impl WorkPreparationPort for ConfiguredWorkPreparationPort {
             })),
         };
         set_task_digest(&mut command);
-        self.task_port.execute(&command, principal)
+        let created = self.task_port.execute(&command, principal)?;
+        let Some(run_id) = self.activation_run_id.as_deref() else {
+            return Ok(created);
+        };
+        let Some(task) = created
+            .result
+            .outcome
+            .as_ref()
+            .and_then(|outcome| match outcome {
+                task_command_result::Outcome::Task(task) => Some(task),
+                task_command_result::Outcome::Error(_) => None,
+            })
+        else {
+            return Ok(created);
+        };
+        if task.status != TaskStatus::Ready as i32 {
+            return Ok(created);
+        }
+
+        // Founder confirmation creates the Task. Activation is a separate,
+        // daemon-owned settlement against the reviewed workflow. The client
+        // cannot submit or widen this system operation. A stable derived
+        // idempotency key repairs the CreateTask/ActivateTask crash window
+        // when the same confirmation is retried.
+        let mut activation = TaskCommand {
+            command: Some(task_command::Command::ActivateTask(ActivateTaskCommand {
+                meta: Some(CommandMetadata {
+                    command_id: Uuid::now_v7().to_string(),
+                    idempotency_key: format!("{}:activate", request.idempotency_key),
+                    idempotency_scope: "local.work.confirm.activation".to_owned(),
+                    request_digest_sha256: String::new(),
+                    issued_at: Some(Timestamp {
+                        seconds: now,
+                        nanos: 0,
+                    }),
+                    correlation_id: task.task_id.clone(),
+                    causation_id: Some(request.snapshot_id.clone()),
+                }),
+                task_id: task.task_id.clone(),
+                expected_revision: task.revision,
+                work_revision: task.work_revision,
+                run_id: run_id.to_owned(),
+            })),
+        };
+        set_activation_digest(&mut activation);
+        match self.task_port.execute_system_activation(&activation) {
+            Ok(activated)
+                if matches!(
+                    &activated.result.outcome,
+                    Some(task_command_result::Outcome::Task(_))
+                ) =>
+            {
+                Ok(activated)
+            }
+            // Creation is already durable. Preserve the honest Ready result
+            // if the reviewed workflow cannot be activated yet; a retry can
+            // reconcile it without reporting a false execution.
+            Ok(_) | Err(_) => Ok(created),
+        }
     }
 }
 
@@ -392,6 +465,25 @@ fn set_task_digest(command: &mut TaskCommand) {
     }
 }
 
+fn set_activation_digest(command: &mut TaskCommand) {
+    let mut canonical = command.clone();
+    if let Some(task_command::Command::ActivateTask(activate)) = canonical.command.as_mut() {
+        if let Some(metadata) = activate.meta.as_mut() {
+            metadata.command_id.clear();
+            metadata.request_digest_sha256.clear();
+            metadata.issued_at = None;
+        }
+    }
+    let digest = sha256(&canonical.encode_to_vec());
+    if let Some(task_command::Command::ActivateTask(activate)) = command.command.as_mut() {
+        activate
+            .meta
+            .as_mut()
+            .expect("metadata exists")
+            .request_digest_sha256 = digest;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +493,7 @@ mod tests {
 
     struct RecordingTaskPort {
         commands: Mutex<Vec<TaskCommand>>,
+        return_task_snapshots: Mutex<bool>,
     }
 
     impl TaskCommandPort for RecordingTaskPort {
@@ -413,11 +506,60 @@ mod tests {
                 .lock()
                 .expect("recording port lock")
                 .push(command.clone());
+            if *self
+                .return_task_snapshots
+                .lock()
+                .expect("recording task mode lock")
+            {
+                let snapshot = match &command.command {
+                    Some(task_command::Command::CreateTask(_)) => {
+                        egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
+                            task_id: "task-work-preparation".to_owned(),
+                            revision: 1,
+                            work_revision: 1,
+                            status: TaskStatus::Ready as i32,
+                            ..Default::default()
+                        }
+                    }
+                    Some(task_command::Command::ActivateTask(value)) => {
+                        egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
+                            task_id: value.task_id.clone(),
+                            revision: value.expected_revision + 1,
+                            work_revision: value.work_revision,
+                            status: TaskStatus::Active as i32,
+                            current_run_id: Some(value.run_id.clone()),
+                            ..Default::default()
+                        }
+                    }
+                    _ => unreachable!("work preparation recording port command"),
+                };
+                return Ok(CommandPortResult {
+                    result: TaskCommandResult {
+                        outcome: Some(task_command_result::Outcome::Task(snapshot)),
+                        ..Default::default()
+                    },
+                    source_revision: None,
+                    await_target: None,
+                });
+            }
             Ok(CommandPortResult {
                 result: TaskCommandResult::default(),
                 source_revision: None,
                 await_target: None,
             })
+        }
+
+        fn execute_system_activation(
+            &self,
+            command: &TaskCommand,
+        ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+            self.execute(
+                command,
+                &CommandPrincipal {
+                    principal_id: "test-system".to_owned(),
+                    required_authority_principal_kinds: Vec::new(),
+                },
+            )
         }
     }
 
@@ -445,6 +587,7 @@ mod tests {
             ));
             let task_port = Arc::new(RecordingTaskPort {
                 commands: Mutex::new(Vec::new()),
+                return_task_snapshots: Mutex::new(false),
             });
             let port = ConfiguredWorkPreparationPort::new(
                 Arc::clone(&context),
@@ -505,6 +648,14 @@ mod tests {
                 .lock()
                 .expect("recording port lock")
                 .len()
+        }
+
+        fn enable_activation(&self) {
+            *self
+                .task_port
+                .return_task_snapshots
+                .lock()
+                .expect("recording task mode lock") = true;
         }
 
         fn finish(self) {
@@ -569,6 +720,62 @@ mod tests {
         assert!(matches!(
             commands[0].command,
             Some(task_command::Command::CreateTask(_))
+        ));
+        drop(commands);
+        fixture.finish();
+    }
+
+    #[test]
+    fn confirmation_settles_daemon_owned_activation_when_workflow_is_configured() {
+        let mut fixture = WorkFixture::open("activation");
+        fixture.enable_activation();
+        let principal = WorkFixture::founder("founder-1");
+        fixture.port = fixture
+            .port
+            .with_activation_run_id("reviewed-run-001".to_owned())
+            .expect("reviewed activation run");
+        let preview = fixture
+            .port
+            .prepare(
+                &fixture.prepare_request(
+                    "run the governed source workflow",
+                    "prepare-activation",
+                    vec![WorkSourceRequest {
+                        source_ref: "intent.md".to_owned(),
+                        label: "intent".to_owned(),
+                    }],
+                ),
+                &principal,
+            )
+            .expect("preview");
+        let result = fixture
+            .port
+            .confirm(
+                &fixture.confirm_request(&preview, "confirm-activation"),
+                &principal,
+            )
+            .expect("confirmation and activation");
+        let task = match result.result.outcome.expect("activation result") {
+            task_command_result::Outcome::Task(task) => task,
+            task_command_result::Outcome::Error(error) => {
+                panic!("unexpected activation error: {}", error.safe_detail_code)
+            }
+        };
+        assert_eq!(task.status, TaskStatus::Active as i32);
+        assert_eq!(task.current_run_id.as_deref(), Some("reviewed-run-001"));
+        let commands = fixture
+            .task_port
+            .commands
+            .lock()
+            .expect("recording port lock");
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            commands[0].command,
+            Some(task_command::Command::CreateTask(_))
+        ));
+        assert!(matches!(
+            commands[1].command,
+            Some(task_command::Command::ActivateTask(_))
         ));
         drop(commands);
         fixture.finish();

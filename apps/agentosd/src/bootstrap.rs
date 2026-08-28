@@ -604,6 +604,7 @@ impl ProductionBootstrapConfig {
             task_guard_config.acceptance_contract_ref,
             task_guard_config.budget_profile_ref,
         )
+        .and_then(|port| port.with_activation_run_id(self.codex.native.workflow.run_id.clone()))
         .map_err(|_| ProductionBootstrapError::WorkPreparation)?;
         providers = providers.with_work_preparation_port(Arc::new(work_port));
         if !self.memory_candidate_producers.is_empty() {

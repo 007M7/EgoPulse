@@ -21,7 +21,9 @@ natural-language intent
 The repository now contains the authority-owned bridge as a candidate
 implementation. `PrepareWork` compiles a daemon-owned context snapshot and
 returns an Authority-owned preview; `ConfirmWork` accepts only the exact
-snapshot binding and delegates Task creation to Task Authority. The generated
+snapshot binding and delegates Task creation to Task Authority. In the
+production composition, the daemon may then settle the resulting Task through
+the fixed system-only `ActivateTask` operation for the reviewed workflow. The generated
 cross-language bindings and local contract checks are updated to draft.17, but
 the revision remains pending Founder acceptance until the runtime and surface
 E2E evidence is complete.
@@ -177,7 +179,7 @@ The first implementation slice should be limited to:
    Client Kernel;
 6. [x] unit evidence proving stale, altered, expired, replayed and
    cross-principal confirmations fail closed;
-7. [ ] Authority-backed dispatch resolution, full projection E2E and
+7. [ ] Authority-backed dispatch-material resolution, full projection E2E and
    user-visible streaming evidence.
 
 The first slice must not add Provider routing, automatic Memory writes,

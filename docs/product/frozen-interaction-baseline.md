@@ -152,7 +152,10 @@ verdict, streaming projection, and release remain subsequent closure work.
   references; divergent governance descriptions for the same compiled content
   fail closed at issue instead. A successful confirmation
   delegates Task creation to Task Authority and returns a projection await
-  token; it never returns a mixed success/error response.
+  token; it never returns a mixed success/error response. In a production
+  composition with an admitted workflow, the daemon then settles the created
+  Task through the fixed system-only `ActivateTask` path; the client never
+  supplies that principal or operation.
 - CLI and TUI expose the same Prepare/Confirm capability through the shared
   `ClientAttachment` and Local API contracts. TUI's palette and direct
   subcommands are presentation paths, not a second business kernel.
@@ -162,9 +165,12 @@ verdict, streaming projection, and release remain subsequent closure work.
   `ef37e40` and `596d496`: immutable content-addressed snapshots, complete
   governance-description idempotency, SQLCipher persistence, scope/expiry/
   integrity checks, restart replay and fail-closed descriptor changes.
-- The Authority-backed dispatch resolver, user-visible streaming observation,
-  and full execution-to-evidence-to-verdict E2E remain the next implementation
-  slices. No client may bypass the preparation boundary by writing a snapshot,
+- The Authority-backed dispatch-material resolver, user-visible streaming
+  observation, and full execution-to-evidence-to-verdict E2E remain the next
+  implementation slices. Confirmation-to-activation is now wired for the
+  reviewed production workflow, but dispatch material must still prove its
+  Context Authority binding before this is called a complete product path.
+  No client may bypass the preparation boundary by writing a snapshot,
   constructing a Task locally, or dispatching directly.
 
 The product is therefore not yet declared fully normally usable. The truthful
@@ -177,6 +183,7 @@ CLI/TUI natural language
   -> Authority-owned preview
   -> Founder ConfirmWork
   -> Task Authority commit
+  -> daemon-owned reviewed activation
   -> projection await/watch
   -> Harness observation and governed evidence
 ```
