@@ -123,3 +123,35 @@ Desktop 不是另一套业务内核。它只在 CLI/TUI 的权威状态和流式
 
 任何一步如果缺少权威事实源或跨语言合同，都应停在阻断状态，不能用 UI 模拟、模型自述或默认值冒充完成。
 
+## 6. Implementation checkpoint: 2026-08-28
+
+The interaction semantics and authority boundaries remain frozen. The current
+implementation must be read as a staged closure, not as a claim that the
+normal user path is already complete.
+
+- `work plan` implements the natural-language normalization, explicit source
+  context pack, Work-Start Gate and event-packet preview. It is read-only and
+  non-dispatchable.
+- `task create` remains a low-level diagnostic/acceptance command. It is not
+  the normal Founder workflow because it accepts Task fields directly.
+- The internal Rust Context Authority A' slice is implemented and pushed in
+  `ef37e40` and `596d496`: immutable content-addressed snapshots, complete
+  governance-description idempotency, SQLCipher persistence, scope/expiry/
+  integrity checks, restart replay and fail-closed descriptor changes.
+- The public `PrepareWork` / `ConfirmWork` surface, daemon-side preparation
+  compiler wiring, Authority-backed dispatch resolver, and equivalent CLI/TUI
+  commands remain the next implementation slice. No client may simulate these
+  by writing a snapshot or constructing a Task locally.
+
+The product is therefore not yet declared normally usable. The truthful exit
+path remains:
+
+```text
+CLI/TUI natural language
+  -> Local API PrepareWork
+  -> Authority-owned preview
+  -> Founder ConfirmWork
+  -> Task Authority commit
+  -> projection await/watch
+  -> Harness observation and governed evidence
+```
