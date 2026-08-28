@@ -7,7 +7,8 @@ use egopulse_domain_contracts::v01::egopulse::artifact::v1::{
     LineageBinding, Provenance,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
-    CollaborationCommandResult, CollaborationEvent, CollaborationSnapshot, RunSnapshot,
+    AttemptSnapshot, AttemptStatus, CollaborationCommandResult, CollaborationEvent,
+    CollaborationSnapshot, RunSnapshot, RunStatus, StepSnapshot, StepStatus,
     collaboration_command_result,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
@@ -292,6 +293,66 @@ fn collaboration_input() -> CollaborationProjectionInput {
     };
     CollaborationProjectionInput {
         metadata: metadata(event_id, 1, &result),
+        result,
+    }
+}
+
+/// A real run/step/attempt snapshot as committed by the harness observation
+/// ingestion path: each revision advances the attempt's governed status
+/// exactly as ACK (Dispatched -> Acknowledged) and ExecutionStarted
+/// (Acknowledged -> Running) observations would.
+fn collaboration_attempt_input(
+    revision: u64,
+    attempt_status: AttemptStatus,
+) -> CollaborationProjectionInput {
+    let event_id = format!("collaboration-attempt-event-{revision:02}");
+    let attempt_revision = revision + 10;
+    let snapshot = CollaborationSnapshot {
+        run: Some(RunSnapshot {
+            run_id: "run-01".to_owned(),
+            revision,
+            task_id: "task-01".to_owned(),
+            work_revision: 1,
+            status: RunStatus::Active as i32,
+            step_ids: vec!["step-01".to_owned()],
+            ..Default::default()
+        }),
+        steps: vec![StepSnapshot {
+            step_id: "step-01".to_owned(),
+            revision,
+            run_id: "run-01".to_owned(),
+            status: StepStatus::Active as i32,
+            attempt_ids: vec!["attempt-01".to_owned()],
+            current_attempt_id: Some("attempt-01".to_owned()),
+            ..Default::default()
+        }],
+        attempts: vec![AttemptSnapshot {
+            attempt_id: "attempt-01".to_owned(),
+            revision: attempt_revision,
+            step_id: "step-01".to_owned(),
+            run_id: "run-01".to_owned(),
+            status: attempt_status as i32,
+            harness_id: "codex".to_owned(),
+            ..Default::default()
+        }],
+    };
+    let event = CollaborationEvent {
+        event_id: event_id.clone(),
+        run_id: "run-01".to_owned(),
+        resulting_run_revision: revision,
+        step_id: Some("step-01".to_owned()),
+        resulting_step_revision: Some(revision),
+        attempt_id: Some("attempt-01".to_owned()),
+        resulting_attempt_revision: Some(attempt_revision),
+        ..Default::default()
+    };
+    let result = CollaborationCommandResult {
+        outcome: Some(collaboration_command_result::Outcome::Snapshot(snapshot)),
+        committed_event: Some(event),
+        ..Default::default()
+    };
+    CollaborationProjectionInput {
+        metadata: metadata(&event_id, revision, &result),
         result,
     }
 }
@@ -828,6 +889,106 @@ fn task_watch_emits_current_snapshot_when_filter_membership_exits() {
         TaskStatus::Active as i32
     );
     assert_eq!(batch.observed_position.sequence, 2);
+}
+
+#[test]
+fn watch_task_views_project_harness_attempt_status_without_completing_task() {
+    let root = TempRoot::new("task-watch-attempt-status");
+    let mut model = open(&root, "epoch-01");
+    model
+        .apply_task(&task_input(1, TaskStatus::Ready, None, None, None, None))
+        .expect("project created task");
+    model
+        .apply_task(&task_input(
+            2,
+            TaskStatus::Active,
+            Some("run-01"),
+            None,
+            None,
+            None,
+        ))
+        .expect("project activated task");
+    let resume_after = model.position().expect("resume position");
+
+    // Harness delivery/ACK observation settles as the attempt's governed
+    // Dispatched -> Acknowledged status and becomes watch-visible.
+    model
+        .apply_collaboration(&collaboration_attempt_input(1, AttemptStatus::Acknowledged))
+        .expect("project acknowledged attempt");
+    let batch = model
+        .task_frames_after_batch(&resume_after, &TaskListFilter::default(), &[], access())
+        .expect("read acknowledged attempt frame");
+    let snapshot = batch
+        .frames
+        .last()
+        .expect("acknowledged attempt frame")
+        .snapshot
+        .as_ref()
+        .expect("snapshot");
+    let collaboration = snapshot.collaboration.as_ref().expect("collaboration");
+    assert_eq!(
+        collaboration.run.as_ref().expect("run").status,
+        RunStatus::Active as i32
+    );
+    assert_eq!(
+        collaboration.attempts[0].status,
+        AttemptStatus::Acknowledged as i32
+    );
+
+    // ExecutionStarted advances the attempt to Running in a later frame.
+    let running_after = model.position().expect("position after acknowledgement");
+    model
+        .apply_collaboration(&collaboration_attempt_input(2, AttemptStatus::Running))
+        .expect("project running attempt");
+    let batch = model
+        .task_frames_after_batch(&running_after, &TaskListFilter::default(), &[], access())
+        .expect("read running attempt frame");
+    let snapshot = batch
+        .frames
+        .last()
+        .expect("running attempt frame")
+        .snapshot
+        .as_ref()
+        .expect("snapshot");
+    assert_eq!(
+        snapshot
+            .collaboration
+            .as_ref()
+            .expect("collaboration")
+            .attempts[0]
+            .status,
+        AttemptStatus::Running as i32
+    );
+
+    // A harness-side terminal return ("done" output) moves only the attempt.
+    // The Task stays Active with no verdict action: raw harness completion
+    // never becomes Task completion in the projection.
+    model
+        .apply_collaboration(&collaboration_attempt_input(3, AttemptStatus::Returned))
+        .expect("project returned attempt");
+    let view = model
+        .get_task_view("task-01", access())
+        .expect("read task view")
+        .expect("task view");
+    assert_eq!(
+        view.task.as_ref().expect("task").status,
+        TaskStatus::Active as i32
+    );
+    assert_eq!(
+        view.collaboration.as_ref().expect("collaboration").attempts[0].status,
+        AttemptStatus::Returned as i32
+    );
+    assert!(
+        view.available_actions
+            .iter()
+            .any(|action| action.kind == AvailableActionKind::RequestCancellation as i32)
+    );
+    assert!(
+        !view
+            .available_actions
+            .iter()
+            .any(|action| action.kind == AvailableActionKind::SubmitFounderVerdict as i32)
+    );
 }
 
 #[test]
