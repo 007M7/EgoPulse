@@ -697,4 +697,121 @@ mod tests {
             0
         );
     }
+
+    #[test]
+    fn authority_reopens_across_restart_with_persistence_and_replay() {
+        let root = std::env::temp_dir().join(format!("egopulse-context-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("context restart test root");
+        let database_path = root.join("context.sqlcipher");
+        let config = || ContextAuthorityConfig {
+            database_path: database_path.clone(),
+            store_epoch: "context-restart-epoch".to_owned(),
+            key: SqlCipherKey::new([41; 32]),
+        };
+
+        let snapshot_id;
+        let first_event_id;
+        {
+            let mut authority = ContextAuthority::open(config()).expect("open before restart");
+            let (receipt, snapshot) = authority
+                .issue(&input("restart-1"), &compiler())
+                .expect("issue");
+            assert!(!receipt.replayed);
+            snapshot_id = snapshot.snapshot_id.clone();
+            first_event_id = receipt.event_id;
+        }
+
+        // Simulate a daemon restart: the same database is reopened and every
+        // durability property must hold — snapshot persistence, resolvable
+        // material, idempotent replay and content dedupe.
+        let mut reopened = ContextAuthority::open(config()).expect("reopen after restart");
+        let persisted = reopened
+            .get(&snapshot_id)
+            .expect("read persisted snapshot")
+            .expect("snapshot survived restart");
+        assert_eq!(persisted.snapshot_id, snapshot_id);
+        assert!(reopened.integrity_is_ok().expect("integrity after reopen"));
+        let resolved = reopened
+            .resolve(
+                &snapshot_id,
+                "scope:repo",
+                current_timestamp().expect("clock"),
+            )
+            .expect("resolve after restart");
+        assert_eq!(resolved.snapshot.snapshot_id, snapshot_id);
+
+        let (replay_receipt, replayed) = reopened
+            .issue(&input("restart-1"), &compiler())
+            .expect("idempotent replay after restart");
+        assert!(replay_receipt.replayed);
+        assert_eq!(replay_receipt.event_id, first_event_id);
+        assert_eq!(replayed.snapshot_id, snapshot_id);
+
+        let (dedupe_receipt, deduped) = reopened
+            .issue(&input("restart-1b"), &compiler())
+            .expect("content dedupe after restart");
+        assert!(dedupe_receipt.replayed);
+        assert_eq!(deduped.snapshot_id, snapshot_id);
+        assert_eq!(
+            reopened.inspect_store().expect("inspection").snapshot_count,
+            1,
+            "restart replay must not create a second snapshot"
+        );
+        drop(reopened);
+
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("remove context restart test root");
+        }
+    }
+
+    #[test]
+    fn same_content_with_changed_descriptor_fails_closed_without_second_snapshot() {
+        let mut authority = authority();
+        let (_, first) = authority
+            .issue(&input("descriptor-1"), &compiler())
+            .expect("issue baseline");
+
+        // Identical compiled bytes, different governance descriptor: the
+        // content-addressed identity collides and the owner must fail closed
+        // instead of mutating or aliasing the existing snapshot.
+        let mut changed_visibility = input("descriptor-2");
+        changed_visibility.visibility = "execution-only".to_owned();
+        assert_eq!(
+            authority.issue(&changed_visibility, &compiler()),
+            Err(ContextAuthorityFailure::IdempotencyConflict)
+        );
+
+        let mut changed_expiry = input("descriptor-3");
+        changed_expiry.expires_at_seconds += 3_600;
+        assert_eq!(
+            authority.issue(&changed_expiry, &compiler()),
+            Err(ContextAuthorityFailure::IdempotencyConflict)
+        );
+
+        let mut changed_permissions = input("descriptor-4");
+        changed_permissions.allowed_write_paths.clear();
+        assert_eq!(
+            authority.issue(&changed_permissions, &compiler()),
+            Err(ContextAuthorityFailure::IdempotencyConflict)
+        );
+
+        assert_eq!(
+            authority
+                .inspect_store()
+                .expect("inspection")
+                .snapshot_count,
+            1,
+            "a changed descriptor must never create or mutate a snapshot"
+        );
+        let unchanged = authority
+            .get(&first.snapshot_id)
+            .expect("read baseline")
+            .expect("baseline snapshot");
+        assert_eq!(unchanged.visibility, first.visibility);
+        assert_eq!(unchanged.expires_at_seconds, first.expires_at_seconds);
+        assert_eq!(
+            unchanged.allowed_write_paths, first.allowed_write_paths,
+            "the original governance fields remain immutable"
+        );
+    }
 }
