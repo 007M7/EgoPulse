@@ -84,6 +84,7 @@ pub struct EventPacketPreview {
     pub gate_result: GateResult,
     pub route: String,
     pub return_format: String,
+    pub ready_for_founder_confirmation: bool,
     pub dispatchable: bool,
 }
 
@@ -187,13 +188,17 @@ pub fn build_event_packet_preview(
         cost_gate_required: true,
     };
 
+    let ready_for_founder_confirmation = gate_result.ready;
     Ok(EventPacketPreview {
-        dispatchable: gate_result.ready,
+        // This slice is a read-only preview. A Founder confirmation and a
+        // governance-owned EventPacket are still required before dispatch.
+        dispatchable: false,
         work_request,
         context_pack,
         gate_result,
         route: "single_harness (由 Governance Kernel 最终选择)".to_owned(),
         return_format: "Artifact + Evidence + VerificationArtifact + FounderVerdict".to_owned(),
+        ready_for_founder_confirmation,
     })
 }
 
@@ -235,7 +240,8 @@ mod tests {
             authority: ContextAuthority::Project,
         }]))
         .expect("valid input");
-        assert!(preview.dispatchable);
+        assert!(!preview.dispatchable);
+        assert!(preview.ready_for_founder_confirmation);
         assert!(preview.gate_result.ready);
         assert_eq!(preview.context_pack.confidence, "source_bound");
         assert_eq!(preview.context_pack.token_budget.execution_limit, 0);

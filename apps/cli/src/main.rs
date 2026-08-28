@@ -826,13 +826,15 @@ fn work(command: WorkCommand) -> Result<(), CliFailure> {
                     "BLOCKED"
                 };
                 println!(
-                    "Work preview: gate={} sources={} dispatchable={}",
+                    "Work preview: gate={} sources={} founder_confirmable={}",
                     status,
                     payload["data"]["context_pack"]["included_sources"]
                         .as_array()
                         .map(Vec::len)
                         .unwrap_or_default(),
-                    payload["data"]["dispatchable"].as_bool().unwrap_or(false),
+                    payload["data"]["ready_for_founder_confirmation"]
+                        .as_bool()
+                        .unwrap_or(false),
                 );
                 if let Some(blockers) = gate["blockers"].as_array() {
                     for blocker in blockers {
