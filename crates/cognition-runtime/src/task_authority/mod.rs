@@ -331,7 +331,11 @@ impl TaskAuthority {
             | Some(task_command::Command::RecordTaskVerification(_))
             | Some(task_command::Command::ApplyFounderVerdict(_))
             | Some(task_command::Command::ReviseTask(_))
-            | Some(task_command::Command::RequestTaskCancellation(_)) => {
+            | Some(task_command::Command::InterruptTask(_))
+            | Some(task_command::Command::HoldTask(_))
+            | Some(task_command::Command::ResumeTask(_))
+            | Some(task_command::Command::RequestTaskCancellation(_))
+            | Some(task_command::Command::RecordTaskCancellationOutcome(_)) => {
                 self.commit_transition(command, principal, &actual_digest)
             }
             Some(_) => Ok(error_result(
@@ -792,6 +796,87 @@ impl TaskAuthority {
                 (
                     TaskEventKind::CancellationRequested,
                     vec![format!("cancellation-reason:{}", value.reason_code)],
+                    None,
+                )
+            }
+            Some(task_command::Command::InterruptTask(value)) => {
+                if current.status != TaskStatus::Active as i32
+                    || value.interruption_evidence_id.trim().is_empty()
+                {
+                    return Ok(error_result(
+                        TaskErrorCode::StateConflict,
+                        "INTERRUPT_PRECONDITION_FAILED",
+                        Some(current.revision),
+                    ));
+                }
+                next.status = TaskStatus::Interrupted as i32;
+                (
+                    TaskEventKind::Interrupted,
+                    vec![format!("interruption:{}", value.interruption_evidence_id)],
+                    None,
+                )
+            }
+            Some(task_command::Command::HoldTask(value)) => {
+                if current.status != TaskStatus::Active as i32
+                    || value.hold_reason_code.trim().is_empty()
+                    || value.recovery_evidence_id.trim().is_empty()
+                {
+                    return Ok(error_result(
+                        TaskErrorCode::StateConflict,
+                        "HOLD_PRECONDITION_FAILED",
+                        Some(current.revision),
+                    ));
+                }
+                next.status = TaskStatus::Held as i32;
+                (
+                    TaskEventKind::Held,
+                    vec![
+                        format!("hold-reason:{}", value.hold_reason_code),
+                        format!("recovery:{}", value.recovery_evidence_id),
+                    ],
+                    None,
+                )
+            }
+            Some(task_command::Command::ResumeTask(value)) => {
+                // Interruption and hold only leave an Active task, so Active is
+                // the only honest resume target the current state machine can
+                // restore without inventing a second execution continuation.
+                if (current.status != TaskStatus::Interrupted as i32
+                    && current.status != TaskStatus::Held as i32)
+                    || value.expected_resume_status != TaskStatus::Active as i32
+                    || value.recovery_evidence_id.trim().is_empty()
+                {
+                    return Ok(error_result(
+                        TaskErrorCode::StateConflict,
+                        "RESUME_PRECONDITION_FAILED",
+                        Some(current.revision),
+                    ));
+                }
+                next.status = TaskStatus::Active as i32;
+                (
+                    TaskEventKind::Resumed,
+                    vec![format!("recovery:{}", value.recovery_evidence_id)],
+                    None,
+                )
+            }
+            Some(task_command::Command::RecordTaskCancellationOutcome(value)) => {
+                if current.status != TaskStatus::CancellationPending as i32
+                    || value.outcome != TaskStatus::Cancelled as i32
+                    || value.cancellation_receipt_id.trim().is_empty()
+                {
+                    return Ok(error_result(
+                        TaskErrorCode::StateConflict,
+                        "CANCELLATION_OUTCOME_PRECONDITION_FAILED",
+                        Some(current.revision),
+                    ));
+                }
+                next.status = TaskStatus::Cancelled as i32;
+                (
+                    TaskEventKind::CancellationRecorded,
+                    vec![format!(
+                        "cancellation-receipt:{}",
+                        value.cancellation_receipt_id
+                    )],
                     None,
                 )
             }

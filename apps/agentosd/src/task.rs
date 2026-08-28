@@ -219,6 +219,73 @@ impl TaskTransitionGuard for ConfiguredTaskTransitionGuard {
                     founder_verdict_state_revision: None,
                 })
             }
+            Some(task_command::Command::InterruptTask(value))
+                if current.status == TaskStatus::Active as i32
+                    && value.task_id == current.task_id
+                    && value.expected_revision == current.revision
+                    && !value.interruption_evidence_id.trim().is_empty() =>
+            {
+                Ok(TransitionAuthorization {
+                    evidence_refs: vec![format!(
+                        "task-interruption:{}@collaboration-control",
+                        value.interruption_evidence_id
+                    )],
+                    founder_decision: None,
+                    founder_verdict_state_revision: None,
+                })
+            }
+            Some(task_command::Command::HoldTask(value))
+                if current.status == TaskStatus::Active as i32
+                    && value.task_id == current.task_id
+                    && value.expected_revision == current.revision
+                    && !value.hold_reason_code.trim().is_empty()
+                    && !value.recovery_evidence_id.trim().is_empty() =>
+            {
+                Ok(TransitionAuthorization {
+                    evidence_refs: vec![
+                        format!("task-hold:{}@collaboration-control", value.hold_reason_code),
+                        format!(
+                            "task-hold-recovery:{}@collaboration-control",
+                            value.recovery_evidence_id
+                        ),
+                    ],
+                    founder_decision: None,
+                    founder_verdict_state_revision: None,
+                })
+            }
+            Some(task_command::Command::ResumeTask(value))
+                if (current.status == TaskStatus::Interrupted as i32
+                    || current.status == TaskStatus::Held as i32)
+                    && value.task_id == current.task_id
+                    && value.expected_revision == current.revision
+                    && value.expected_resume_status == TaskStatus::Active as i32
+                    && !value.recovery_evidence_id.trim().is_empty() =>
+            {
+                Ok(TransitionAuthorization {
+                    evidence_refs: vec![format!(
+                        "task-resume-recovery:{}@collaboration-control",
+                        value.recovery_evidence_id
+                    )],
+                    founder_decision: None,
+                    founder_verdict_state_revision: None,
+                })
+            }
+            Some(task_command::Command::RecordTaskCancellationOutcome(value))
+                if current.status == TaskStatus::CancellationPending as i32
+                    && value.task_id == current.task_id
+                    && value.expected_revision == current.revision
+                    && value.outcome == TaskStatus::Cancelled as i32
+                    && !value.cancellation_receipt_id.trim().is_empty() =>
+            {
+                Ok(TransitionAuthorization {
+                    evidence_refs: vec![format!(
+                        "task-cancellation-outcome:{}@collaboration-control",
+                        value.cancellation_receipt_id
+                    )],
+                    founder_decision: None,
+                    founder_verdict_state_revision: None,
+                })
+            }
             Some(task_command::Command::ApplyFounderVerdict(value)) => {
                 let Some(founder_verdict) = self.founder_verdict.as_ref() else {
                     return Err(TransitionGuardRejection::UnverifiedReference);
