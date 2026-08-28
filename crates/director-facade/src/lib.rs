@@ -120,15 +120,10 @@ pub fn normalize_intent(input: &DirectorInput) -> Result<WorkRequest, DirectorIn
     })
 }
 
-/// Build the first Director preview from explicitly supplied context sources.
-///
-/// The current product baseline deliberately starts with exact/source-aware
-/// context. No vector search, model inference, provider routing, or durable
-/// state mutation happens here.
-pub fn build_event_packet_preview(
-    input: &DirectorInput,
-) -> Result<EventPacketPreview, DirectorInputError> {
-    let work_request = normalize_intent(input)?;
+/// Compile the explicitly supplied source references into a read-only context
+/// pack. This stage deliberately does not search, infer, persist, or select a
+/// provider. The caller may render the pack before a Start Gate is evaluated.
+pub fn build_context_pack(input: &DirectorInput) -> ContextPack {
     let included_sources: Vec<ContextSource> = input
         .context_sources
         .iter()
@@ -140,30 +135,37 @@ pub fn build_event_packet_preview(
         })
         .collect();
 
-    let mut blockers = Vec::new();
-    let mut warnings = Vec::new();
-    let mut required_reads = Vec::new();
-    let mut confidence = "low";
-
-    if included_sources.is_empty() {
-        blockers.push(ContextNotice {
-            code: "CONTEXT_PACK_EMPTY".to_owned(),
-            detail: "至少需要一个明确的项目、Founder 或运行时上下文来源".to_owned(),
-        });
-        required_reads.push("project-context".to_owned());
-    } else {
-        confidence = "source_bound";
-        warnings.push(ContextNotice {
-            code: "CONTEXT_EXACT_ONLY".to_owned(),
-            detail: "当前预览只使用显式来源，未执行语义检索或模型推断".to_owned(),
+    let mut excluded_sources = Vec::new();
+    if input
+        .context_sources
+        .iter()
+        .any(|source| source.source_ref.trim().is_empty())
+    {
+        excluded_sources.push(ContextNotice {
+            code: "CONTEXT_SOURCE_EMPTY".to_owned(),
+            detail: "空的上下文来源不会进入工作上下文包".to_owned(),
         });
     }
 
-    let context_pack = ContextPack {
+    let mut required_reads = Vec::new();
+    let mut stale_context_warnings = Vec::new();
+    let mut confidence = "low";
+
+    if included_sources.is_empty() {
+        required_reads.push("project-context".to_owned());
+    } else {
+        confidence = "source_bound";
+        stale_context_warnings.push("上下文来源尚未由 Context Authority 重新验证".to_owned());
+    }
+
+    // These fields are carried in the pack as visible preparation facts. The
+    // actual Start Gate is evaluated by evaluate_start_gate so it cannot be
+    // accidentally bypassed by a renderer or future client surface.
+    ContextPack {
         included_sources,
-        excluded_sources: Vec::new(),
+        excluded_sources,
         required_reads,
-        stale_context_warnings: Vec::new(),
+        stale_context_warnings,
         not_doing: vec![
             "不直接创建或派发 Task".to_owned(),
             "不选择 Provider、Model 或 Harness".to_owned(),
@@ -174,24 +176,50 @@ pub fn build_event_packet_preview(
             planning_limit: 4_000,
             execution_limit: 0,
         },
-    };
+    }
+}
 
-    let gate_result = GateResult {
+/// Evaluate the frozen Work-Start Gate from the compiled context pack.
+/// Readiness means only that the explicit context prerequisite is present; it
+/// never means that a Task is created or dispatch is authorized.
+pub fn evaluate_start_gate(context_pack: &ContextPack) -> GateResult {
+    let mut blockers = Vec::new();
+    if context_pack.included_sources.is_empty() {
+        blockers.push(ContextNotice {
+            code: "CONTEXT_PACK_EMPTY".to_owned(),
+            detail: "至少需要一个明确的项目、Founder 或运行时上下文来源".to_owned(),
+        });
+    }
+    GateResult {
         ready: blockers.is_empty(),
         blockers,
-        warnings,
+        warnings: if context_pack.included_sources.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContextNotice {
+                code: "CONTEXT_EXACT_ONLY".to_owned(),
+                detail: "当前预览只使用显式来源，未执行语义检索或模型推断".to_owned(),
+            }]
+        },
         required_confirmations: vec!["Founder 确认事件包后才允许进入任务创建".to_owned()],
         evidence_required: vec![
             "执行返回必须形成 Artifact/Evidence".to_owned(),
             "最终完成必须经过 Sego 验证与 Founder 裁决".to_owned(),
         ],
         cost_gate_required: true,
-    };
+    }
+}
 
+/// Assemble the event-packet preview after the context and gate stages have
+/// completed. This value remains non-dispatchable until a future governance
+/// contract records Founder confirmation and creates the authoritative Task.
+pub fn build_event_packet(
+    work_request: WorkRequest,
+    context_pack: ContextPack,
+    gate_result: GateResult,
+) -> EventPacketPreview {
     let ready_for_founder_confirmation = gate_result.ready;
-    Ok(EventPacketPreview {
-        // This slice is a read-only preview. A Founder confirmation and a
-        // governance-owned EventPacket are still required before dispatch.
+    EventPacketPreview {
         dispatchable: false,
         work_request,
         context_pack,
@@ -199,7 +227,21 @@ pub fn build_event_packet_preview(
         route: "single_harness (由 Governance Kernel 最终选择)".to_owned(),
         return_format: "Artifact + Evidence + VerificationArtifact + FounderVerdict".to_owned(),
         ready_for_founder_confirmation,
-    })
+    }
+}
+
+/// Build the first Director preview from explicitly supplied context sources.
+///
+/// The current product baseline deliberately starts with exact/source-aware
+/// context. No vector search, model inference, provider routing, or durable
+/// state mutation happens here.
+pub fn build_event_packet_preview(
+    input: &DirectorInput,
+) -> Result<EventPacketPreview, DirectorInputError> {
+    let work_request = normalize_intent(input)?;
+    let context_pack = build_context_pack(input);
+    let gate_result = evaluate_start_gate(&context_pack);
+    Ok(build_event_packet(work_request, context_pack, gate_result))
 }
 
 fn authority_name(authority: ContextAuthority) -> &'static str {
@@ -252,6 +294,39 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("Task"))
         );
+    }
+
+    #[test]
+    fn director_stages_are_composable_and_keep_dispatch_closed() {
+        let value = input(vec![ContextSourceInput {
+            source_ref: "docs/ARCHITECTURE.md".to_owned(),
+            label: "architecture boundary".to_owned(),
+            authority: ContextAuthority::Project,
+        }]);
+        let request = normalize_intent(&value).expect("normalized request");
+        let pack = build_context_pack(&value);
+        let gate = evaluate_start_gate(&pack);
+        let packet = build_event_packet(request.clone(), pack.clone(), gate.clone());
+
+        assert_eq!(packet.work_request, request);
+        assert_eq!(packet.context_pack, pack);
+        assert_eq!(packet.gate_result, gate);
+        assert!(packet.ready_for_founder_confirmation);
+        assert!(!packet.dispatchable);
+    }
+
+    #[test]
+    fn empty_context_source_is_visible_but_never_becomes_an_included_source() {
+        let value = input(vec![ContextSourceInput {
+            source_ref: "  ".to_owned(),
+            label: "empty".to_owned(),
+            authority: ContextAuthority::Project,
+        }]);
+        let pack = build_context_pack(&value);
+
+        assert!(pack.included_sources.is_empty());
+        assert_eq!(pack.excluded_sources[0].code, "CONTEXT_SOURCE_EMPTY");
+        assert!(!evaluate_start_gate(&pack).ready);
     }
 
     #[test]
