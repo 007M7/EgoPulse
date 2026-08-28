@@ -1097,6 +1097,7 @@ dependencies = [
  "clap",
  "egopulse-client-kernel",
  "egopulse-client-operations",
+ "egopulse-director-facade",
  "egopulse-domain-contracts",
  "egopulse-local-api",
  "prost-types",
@@ -1187,6 +1188,14 @@ dependencies = [
  "tauri",
  "tauri-build",
  "uuid",
+]
+
+[[package]]
+name = "egopulse-director-facade"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1387,6 +1396,7 @@ dependencies = [
  "crossterm",
  "egopulse-client-kernel",
  "egopulse-client-operations",
+ "egopulse-director-facade",
  "egopulse-domain-contracts",
  "egopulse-local-api",
  "prost-types",

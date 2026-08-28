@@ -11,6 +11,7 @@ crossterm.workspace = true
 egopulse-client-kernel.workspace = true
 egopulse-client-operations.workspace = true
 egopulse-domain-contracts.workspace = true
+egopulse-director-facade.workspace = true
 egopulse-local-api.workspace = true
 prost-types.workspace = true
 ratatui.workspace = true

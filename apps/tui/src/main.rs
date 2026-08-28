@@ -16,6 +16,9 @@ use egopulse_client_operations::{
     ClientAttachment, ClientReadError, attach as attach_client, command_metadata,
     set_policy_digest, set_task_digest, set_verdict_digest, timestamp_after,
 };
+use egopulse_director_facade::{
+    ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
+};
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
     collaboration::v1::RunStatus,
@@ -73,6 +76,23 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum TuiCommand {
+    /// Build the same governed work preview as the CLI without creating a Task.
+    WorkPlan {
+        /// Natural-language work intent from the Founder.
+        #[arg(long)]
+        intent: String,
+        /// Explicit project or workspace scope.
+        #[arg(long)]
+        scope: String,
+        /// Product work classification used by the preparation gate.
+        #[arg(long, default_value = "general")]
+        work_type: String,
+        /// Explicit source references to include in the exact-context preview.
+        #[arg(long = "context-ref")]
+        context_refs: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Submit the user-owned create_task branch through the same kernel as the dashboard.
     TaskCreate {
         #[arg(long)]
@@ -745,6 +765,65 @@ async fn run_command_with_output(
     output: CommandOutput,
 ) -> Result<CommandResult, String> {
     match command {
+        TuiCommand::WorkPlan {
+            intent,
+            scope,
+            work_type,
+            context_refs,
+            json,
+        } => {
+            let preview = build_event_packet_preview(&DirectorInput {
+                intent,
+                scope_ref: scope,
+                work_type,
+                context_sources: context_refs
+                    .into_iter()
+                    .map(|source_ref| ContextSourceInput {
+                        label: source_ref.clone(),
+                        source_ref,
+                        authority: ContextAuthority::Project,
+                    })
+                    .collect(),
+            })
+            .map_err(|error| error.to_string())?;
+            let payload = json!({
+                "schemaVersion": "egopulse.tui-result/v0.1",
+                "ok": true,
+                "operation": "work.plan",
+                "data": preview,
+            });
+            if json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                let gate = &payload["data"]["gate_result"];
+                let status = if gate["ready"].as_bool().unwrap_or(false) {
+                    "READY"
+                } else {
+                    "BLOCKED"
+                };
+                println!(
+                    "Work preview: gate={} sources={} dispatchable={}",
+                    status,
+                    payload["data"]["context_pack"]["included_sources"]
+                        .as_array()
+                        .map(Vec::len)
+                        .unwrap_or_default(),
+                    payload["data"]["dispatchable"].as_bool().unwrap_or(false),
+                );
+                if let Some(blockers) = gate["blockers"].as_array() {
+                    for blocker in blockers {
+                        println!(
+                            "Blocker {}: {}",
+                            blocker["code"].as_str().unwrap_or("UNKNOWN"),
+                            blocker["detail"].as_str().unwrap_or(""),
+                        );
+                    }
+                }
+                println!("Intent: {}", payload["data"]["work_request"]["intent"]);
+                println!("Next: Founder review is required before task creation.");
+            }
+            Ok(CommandResult::Completed)
+        }
         TuiCommand::TaskCreate {
             work_type,
             input_snapshot_id,
@@ -1694,6 +1773,7 @@ async fn run_memory_mutation(
 
 fn command_kind(command: &TuiCommand) -> &'static str {
     match command {
+        TuiCommand::WorkPlan { .. } => "work.plan",
         TuiCommand::TaskCreate { .. } => "task.create",
         TuiCommand::TaskApplyVerdict { .. } => "task.apply-verdict",
         TuiCommand::TaskCancel { .. } => "task.cancel",

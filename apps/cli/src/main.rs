@@ -12,6 +12,9 @@ use egopulse_client_operations::{
     AttachError, ClientAttachment, attach as attach_client, command_metadata, set_policy_digest,
     set_task_digest, set_verdict_digest, timestamp_after,
 };
+use egopulse_director_facade::{
+    ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
+};
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
     collaboration::v1::{RunStatus, StepStatus},
@@ -97,6 +100,32 @@ enum Command {
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
+    },
+    /// Build a governed work preview without creating or dispatching a Task.
+    Work {
+        #[command(subcommand)]
+        command: WorkCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkCommand {
+    /// Normalize Founder intent and show the context/gate/event-packet preview.
+    Plan {
+        /// Natural-language work intent from the Founder.
+        #[arg(long)]
+        intent: String,
+        /// Explicit project or workspace scope.
+        #[arg(long)]
+        scope: String,
+        /// Product work classification used by the preparation gate.
+        #[arg(long, default_value = "general")]
+        work_type: String,
+        /// Explicit source references to include in the exact-context preview.
+        #[arg(long = "context-ref")]
+        context_refs: Vec<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -646,6 +675,7 @@ async fn main() -> ExitCode {
         Command::Approval { command } => approval(command).await,
         Command::Verdict { command } => verdict(command).await,
         Command::Memory { command } => memory(command).await,
+        Command::Work { command } => work(command),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -692,6 +722,9 @@ fn command_json(command: &Command) -> bool {
                 | MemoryCommand::Candidate { json, .. }
                 | MemoryCommand::Accept { json, .. }
                 | MemoryCommand::Revoke { json, .. },
+        } => *json,
+        Command::Work {
+            command: WorkCommand::Plan { json, .. },
         } => *json,
     }
 }
@@ -749,6 +782,73 @@ async fn attach(operation: &'static str) -> Result<AttachedClient, CliFailure> {
         error.operation = operation;
         error
     })
+}
+
+fn work(command: WorkCommand) -> Result<(), CliFailure> {
+    match command {
+        WorkCommand::Plan {
+            intent,
+            scope,
+            work_type,
+            context_refs,
+            json,
+        } => {
+            let input = DirectorInput {
+                intent,
+                scope_ref: scope,
+                work_type,
+                context_sources: context_refs
+                    .into_iter()
+                    .map(|source_ref| ContextSourceInput {
+                        label: source_ref.clone(),
+                        source_ref,
+                        authority: ContextAuthority::Project,
+                    })
+                    .collect(),
+            };
+            let preview = build_event_packet_preview(&input).map_err(|error| {
+                CliFailure::protocol(error.to_string()).for_operation("work.plan")
+            })?;
+            let payload = json!({
+                "schemaVersion": "egopulse.cli-result/v0.1",
+                "ok": true,
+                "operation": "work.plan",
+                "data": preview,
+                "correlationId": Uuid::now_v7().to_string(),
+            });
+            if json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                let gate = &payload["data"]["gate_result"];
+                let status = if gate["ready"].as_bool().unwrap_or(false) {
+                    "READY"
+                } else {
+                    "BLOCKED"
+                };
+                println!(
+                    "Work preview: gate={} sources={} dispatchable={}",
+                    status,
+                    payload["data"]["context_pack"]["included_sources"]
+                        .as_array()
+                        .map(Vec::len)
+                        .unwrap_or_default(),
+                    payload["data"]["dispatchable"].as_bool().unwrap_or(false),
+                );
+                if let Some(blockers) = gate["blockers"].as_array() {
+                    for blocker in blockers {
+                        println!(
+                            "Blocker {}: {}",
+                            blocker["code"].as_str().unwrap_or("UNKNOWN"),
+                            blocker["detail"].as_str().unwrap_or(""),
+                        );
+                    }
+                }
+                println!("Intent: {}", payload["data"]["work_request"]["intent"]);
+                println!("Next: Founder review is required before task creation.");
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn memory(command: MemoryCommand) -> Result<(), CliFailure> {
