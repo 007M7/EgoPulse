@@ -26,6 +26,28 @@ use sha2::Digest;
 use std::{future::Future, pin::Pin};
 use thiserror::Error;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskRecoveryKind {
+    /// The Collaboration run reached a committed Cancelled outcome. The owning
+    /// Task may record its cancellation outcome if it is still pending.
+    CancellationConfirmed,
+    /// The Harness terminal outcome is unknown or unproven (quarantined run).
+    /// The owning Task may need an interruption record if it is still Active.
+    OutcomeUnknown,
+}
+
+/// An in-cycle, derived observation of a committed collaboration recovery
+/// fact. It carries no authority of its own: the owning Task Authority still
+/// validates task identity, current run binding, revision and status before
+/// any Task mutation is accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskRecoveryFinding {
+    pub kind: TaskRecoveryKind,
+    pub task_id: String,
+    pub run_id: String,
+    pub evidence_ref: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HarnessDispatchCycleReport {
     pub dispatches_seen: u64,
@@ -47,6 +69,10 @@ pub struct HarnessDispatchCycleReport {
     pub activations_started: u64,
     pub activations_acknowledged: u64,
     pub terminal_dispatch_ids: Vec<String>,
+    /// Committed collaboration recovery facts observed this cycle. Derived
+    /// telemetry only: durability is owned by the collaboration event log, and
+    /// every Task-side settlement re-validates against live Task state.
+    pub task_recovery_findings: Vec<TaskRecoveryFinding>,
 }
 
 #[derive(Debug, Error)]
@@ -876,6 +902,15 @@ fn merge_report(target: &mut HarnessDispatchCycleReport, source: HarnessDispatch
             target.terminal_dispatch_ids.push(dispatch_id);
         }
     }
+    for finding in source.task_recovery_findings {
+        if !target
+            .task_recovery_findings
+            .iter()
+            .any(|existing| existing == &finding)
+        {
+            target.task_recovery_findings.push(finding);
+        }
+    }
 }
 
 fn remove_terminal_envelopes(
@@ -901,53 +936,39 @@ where
     D: NativeHarnessDriver,
     A: AdapterClock,
 {
-    if observation.is_none() {
+    let Some(observation) = observation else {
         return Ok(());
-    }
-    if observation.is_some_and(|value| value.criticality == ObservationCriticality::Terminal as i32)
-    {
+    };
+    if observation.criticality == ObservationCriticality::Terminal as i32 {
         report.terminal_observations += 1;
-        if let Some(observation) = observation
-            && !report
-                .terminal_dispatch_ids
-                .iter()
-                .any(|dispatch_id| dispatch_id == &observation.dispatch_id)
+        if !report
+            .terminal_dispatch_ids
+            .iter()
+            .any(|dispatch_id| dispatch_id == &observation.dispatch_id)
         {
             report
                 .terminal_dispatch_ids
                 .push(observation.dispatch_id.clone());
         }
     }
+    record_task_recovery_finding(report, observation, &result);
     match result.disposition {
         HarnessFactIngestionDisposition::Consumed
         | HarnessFactIngestionDisposition::IgnoredInformational => {
-            if let Some(observation) = observation {
-                adapter.mark_observation_consumed(&observation.observation_id)?;
-            }
+            adapter.mark_observation_consumed(&observation.observation_id)?;
             report.observations_consumed += 1;
         }
         HarnessFactIngestionDisposition::DeferredToArtifactAuthority => {
             report.observations_deferred += 1;
-            let is_completed = observation.is_some_and(|observation| {
-                matches!(
-                    observation.payload.as_ref(),
-                    Some(harness_observation::Payload::Lifecycle(lifecycle))
-                        if lifecycle.kind == LifecycleKind::ExecutionCompleted as i32
-                )
-            });
-            let durable_terminal_handoff = if is_completed {
-                adapter.terminal_output_candidate_is_durable(
-                    &observation
-                        .expect("completed observation exists")
-                        .dispatch_id,
-                )?
-            } else {
-                false
-            };
+            let is_completed = matches!(
+                observation.payload.as_ref(),
+                Some(harness_observation::Payload::Lifecycle(lifecycle))
+                    if lifecycle.kind == LifecycleKind::ExecutionCompleted as i32
+            );
+            let durable_terminal_handoff = is_completed
+                && adapter.terminal_output_candidate_is_durable(&observation.dispatch_id)?;
             if durable_terminal_handoff {
-                if let Some(observation) = observation {
-                    adapter.mark_observation_consumed(&observation.observation_id)?;
-                }
+                adapter.mark_observation_consumed(&observation.observation_id)?;
             } else {
                 report.observations_retained += 1;
             }
@@ -956,13 +977,74 @@ where
             report.observations_retained += 1;
         }
         HarnessFactIngestionDisposition::QuarantineRequired { reason_code } => {
-            if let Some(observation) = observation {
-                adapter.quarantine_observation(&observation.observation_id, &reason_code)?;
-            }
+            adapter.quarantine_observation(&observation.observation_id, &reason_code)?;
             report.observations_quarantined += 1;
         }
     }
     Ok(())
+}
+
+/// Derives an in-cycle recovery finding from a committed collaboration
+/// authority result. Only two committed run outcomes are eligible: a run that
+/// reached `Cancelled` (cancellation completed), and a run that reached `Held`
+/// through a quarantined harness terminal outcome (outcome unknown). The
+/// finding never asserts Task state; the Task Authority re-validates task
+/// status, revision and current-run binding before accepting any mutation.
+fn record_task_recovery_finding(
+    report: &mut HarnessDispatchCycleReport,
+    observation: &HarnessObservation,
+    result: &HarnessFactIngestionResult,
+) {
+    let Some(authority) = result.authority_result.as_ref() else {
+        return;
+    };
+    if authority.committed_event.is_none() {
+        return;
+    }
+    let Some(collaboration_command_result::Outcome::Snapshot(snapshot)) =
+        authority.outcome.as_ref()
+    else {
+        return;
+    };
+    let Some(run) = snapshot.run.as_ref() else {
+        return;
+    };
+    let finding = match RunStatus::try_from(run.status) {
+        Ok(RunStatus::Cancelled) => Some(TaskRecoveryFinding {
+            kind: TaskRecoveryKind::CancellationConfirmed,
+            task_id: run.task_id.clone(),
+            run_id: run.run_id.clone(),
+            evidence_ref: format!("cancellation-receipt:{}", observation.observation_id),
+        }),
+        Ok(RunStatus::Held)
+            if matches!(
+                result.disposition,
+                HarnessFactIngestionDisposition::QuarantineRequired { .. }
+            ) =>
+        {
+            Some(TaskRecoveryFinding {
+                kind: TaskRecoveryKind::OutcomeUnknown,
+                task_id: run.task_id.clone(),
+                run_id: run.run_id.clone(),
+                evidence_ref: format!("uncertainty-evidence:{}", observation.observation_id),
+            })
+        }
+        _ => None,
+    };
+    let Some(finding) = finding else {
+        return;
+    };
+    if finding.task_id.trim().is_empty()
+        || finding.run_id.trim().is_empty()
+        || finding.evidence_ref.trim().is_empty()
+        || report
+            .task_recovery_findings
+            .iter()
+            .any(|existing| existing == &finding)
+    {
+        return;
+    }
+    report.task_recovery_findings.push(finding);
 }
 
 #[cfg(test)]

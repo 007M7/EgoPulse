@@ -76,6 +76,7 @@ mod return_collector;
 mod return_projection;
 mod security;
 mod task;
+mod task_recovery;
 mod verdict;
 mod verdict_consumer;
 mod verification;
@@ -708,6 +709,31 @@ impl DaemonProviders {
         let composite = CompositeHarnessDispatchRunner::new(runners)
             .map_err(DaemonCompositionError::InvalidConfiguration)?;
         self.harness_dispatch_runner = Some(Arc::new(composite));
+        Ok(self)
+    }
+
+    /// Wraps the configured Harness dispatch cycle with the daemon-owned Task
+    /// recovery settlement. The wrapper consumes the cycle's derived recovery
+    /// findings and settles only those that still match the live Task
+    /// snapshot through the existing Task Authority single-writer path. A
+    /// runner must already be configured; settlement never installs a cycle of
+    /// its own.
+    pub fn with_task_recovery_settlement(
+        mut self,
+        task: Arc<Mutex<egopulse_cognition_runtime::task_authority::TaskAuthority>>,
+    ) -> Result<Self, DaemonCompositionError> {
+        let runner = self.harness_dispatch_runner.take().ok_or(
+            DaemonCompositionError::InvalidConfiguration(
+                "Harness runner required before Task recovery settlement",
+            ),
+        )?;
+        let wrapped = crate::task_recovery::GovernedTaskRecoveryRunner::new(
+            runner,
+            task,
+            "collaboration-control:task-recovery",
+        )
+        .map_err(DaemonCompositionError::InvalidConfiguration)?;
+        self.harness_dispatch_runner = Some(Arc::new(wrapped));
         Ok(self)
     }
 

@@ -564,7 +564,7 @@ impl ProductionBootstrapConfig {
             });
         if let Some(worker_config) = self.verification_worker {
             let worker = ConfiguredVerificationWorker::new(
-                task,
+                Arc::clone(&task),
                 Box::new(ArtifactAuthorityReferenceSource::new_shared(Arc::clone(
                     &artifact,
                 ))),
@@ -585,6 +585,10 @@ impl ProductionBootstrapConfig {
             )?;
         }
         providers = providers.with_codex_harness(self.codex, artifact, verification)?;
+        // The production dispatch cycle settles committed collaboration
+        // recovery facts (run cancelled / harness outcome unknown) into the
+        // Task Authority through the existing single-writer path.
+        providers = providers.with_task_recovery_settlement(Arc::clone(&task))?;
         Ok(providers)
     }
 }

@@ -10,8 +10,8 @@ pub use adapter_evidence::AdapterBackedHarnessEvidenceResolver;
 pub use composite_guard::CompositeCollaborationGuard;
 pub use harness_dispatch::{
     CompositeHarnessDispatchRunner, GovernedHarnessDispatchRunner, GovernedTaskActivationRunner,
-    HarnessDispatchCycleError, HarnessDispatchCycleReport, HarnessDispatchRunner, dispatch_pending,
-    pump_observations,
+    HarnessDispatchCycleError, HarnessDispatchCycleReport, HarnessDispatchRunner,
+    TaskRecoveryFinding, TaskRecoveryKind, dispatch_pending, pump_observations,
 };
 pub use ingestion::{HarnessFactIngestionDisposition, HarnessFactIngestionResult};
 pub use single_harness_workflow::{
