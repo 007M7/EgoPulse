@@ -49,8 +49,9 @@ use zeroize::Zeroize;
 
 pub use store::CollaborationStoreInspection;
 use store::{
-    AttemptWrite, CollaborationCommit, CollaborationStore, OutboxWrite, PendingProjectionRecord,
-    ProjectionBootstrapCandidate, ProjectionBootstrapWrite, RunWrite, StepWrite, StoreError,
+    AttemptWrite, CollaborationCommit, CollaborationStore, OutboxWrite, PendingDispatchRecord,
+    PendingProjectionRecord, ProjectionBootstrapCandidate, ProjectionBootstrapWrite, RunWrite,
+    StepWrite, StoreError,
 };
 
 const AUTHORITY_REF: &str = "agentosd:collaboration-control/v1";
@@ -303,6 +304,17 @@ impl AuthorityClock for SystemAuthorityClock {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingDispatch {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub canonical_payload_digest_sha256: String,
+    pub envelope: DispatchEnvelope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// A Collaboration `delivered` outbox fact is only evidence that Collaboration
+/// recorded its own delivery transition. It is not Adapter transport proof;
+/// a C2 runner must independently revalidate the durable Adapter receipt.
+pub struct DeliveredDispatchForObservation {
     pub message_id: String,
     pub source_event_id: String,
     pub canonical_payload_digest_sha256: String,
@@ -608,24 +620,35 @@ where
         &self,
         principal: &AuthenticatedCollaborationPrincipal,
     ) -> Result<Vec<PendingDispatch>, CollaborationControlError> {
-        if !principal.authenticated
-            || principal.kind != CollaborationPrincipalKind::HarnessAdapter
-            || principal.principal_id.trim().is_empty()
-        {
-            return Err(CollaborationControlError::DispatchPollNotAuthorized);
-        }
+        authorize_harness_dispatch_read(principal)?;
         self.store
             .pending_dispatches()?
             .into_iter()
-            .map(|record| {
-                Ok(PendingDispatch {
-                    message_id: record.message_id,
-                    source_event_id: record.source_event_id,
-                    canonical_payload_digest_sha256: record.canonical_payload_digest_sha256,
-                    envelope: DispatchEnvelope::decode(record.payload.as_slice())?,
-                })
-            })
+            .map(decode_dispatch_outbox_record)
             .collect()
+    }
+
+    pub fn delivered_dispatches_for_observation(
+        &self,
+        principal: &AuthenticatedCollaborationPrincipal,
+    ) -> Result<Vec<DeliveredDispatchForObservation>, CollaborationControlError> {
+        authorize_harness_dispatch_read(principal)?;
+        let mut eligible = Vec::new();
+        for record in self.store.delivered_dispatches()? {
+            let dispatch = decode_dispatch_outbox_record(record)?;
+            let snapshot = self
+                .load_snapshot(&dispatch.envelope.run_id)?
+                .ok_or(CollaborationControlError::Persistence)?;
+            if delivered_observation_lineage_is_eligible(&snapshot, &dispatch.envelope)? {
+                eligible.push(DeliveredDispatchForObservation {
+                    message_id: dispatch.message_id,
+                    source_event_id: dispatch.source_event_id,
+                    canonical_payload_digest_sha256: dispatch.canonical_payload_digest_sha256,
+                    envelope: dispatch.envelope,
+                });
+            }
+        }
+        Ok(eligible)
     }
 
     pub fn held_dispatches_for_recovery(
@@ -644,7 +667,8 @@ where
         }
         let mut recovery = Vec::new();
         for record in self.store.held_dispatches()? {
-            let envelope = DispatchEnvelope::decode(record.payload.as_slice())?;
+            let dispatch = decode_dispatch_outbox_record(record)?;
+            let envelope = dispatch.envelope;
             let Some(snapshot) = self.load_snapshot(&envelope.run_id)? else {
                 return Err(CollaborationControlError::Persistence);
             };
@@ -694,9 +718,9 @@ where
                 _ => continue,
             };
             recovery.push(HeldDispatchForRecovery {
-                message_id: record.message_id,
-                source_event_id: record.source_event_id,
-                canonical_payload_digest_sha256: record.canonical_payload_digest_sha256,
+                message_id: dispatch.message_id,
+                source_event_id: dispatch.source_event_id,
+                canonical_payload_digest_sha256: dispatch.canonical_payload_digest_sha256,
                 envelope,
                 state,
             });
@@ -2237,6 +2261,141 @@ where
                 .collect::<Result<Vec<_>, _>>()?,
         }))
     }
+}
+
+fn authorize_harness_dispatch_read(
+    principal: &AuthenticatedCollaborationPrincipal,
+) -> Result<(), CollaborationControlError> {
+    if !principal.authenticated
+        || principal.kind != CollaborationPrincipalKind::HarnessAdapter
+        || principal.principal_id.trim().is_empty()
+    {
+        return Err(CollaborationControlError::DispatchPollNotAuthorized);
+    }
+    Ok(())
+}
+
+fn decode_dispatch_outbox_record(
+    record: PendingDispatchRecord,
+) -> Result<PendingDispatch, CollaborationControlError> {
+    let actual_digest = hex::encode(Sha256::digest(record.payload.as_slice()));
+    let attempt_id = record
+        .attempt_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(CollaborationControlError::Persistence)?;
+    if record.message_id.trim().is_empty()
+        || record.source_event_id.trim().is_empty()
+        || record.canonical_payload_digest_sha256 != actual_digest
+    {
+        return Err(CollaborationControlError::Persistence);
+    }
+    let envelope = DispatchEnvelope::decode(record.payload.as_slice())?;
+    if envelope.attempt_id != attempt_id {
+        return Err(CollaborationControlError::Persistence);
+    }
+    Ok(PendingDispatch {
+        message_id: record.message_id,
+        source_event_id: record.source_event_id,
+        canonical_payload_digest_sha256: record.canonical_payload_digest_sha256,
+        envelope,
+    })
+}
+
+fn delivered_observation_lineage_is_eligible(
+    snapshot: &CollaborationSnapshot,
+    envelope: &DispatchEnvelope,
+) -> Result<bool, CollaborationControlError> {
+    if envelope.run_id.trim().is_empty()
+        || envelope.step_id.trim().is_empty()
+        || envelope.attempt_id.trim().is_empty()
+        || envelope.dispatch_id.trim().is_empty()
+    {
+        return Err(CollaborationControlError::Persistence);
+    }
+    let run = snapshot
+        .run
+        .as_ref()
+        .filter(|run| run.run_id == envelope.run_id)
+        .ok_or(CollaborationControlError::Persistence)?;
+    let mut steps = snapshot
+        .steps
+        .iter()
+        .filter(|step| step.step_id == envelope.step_id);
+    let step = steps.next().ok_or(CollaborationControlError::Persistence)?;
+    if steps.next().is_some() {
+        return Err(CollaborationControlError::Persistence);
+    }
+    let mut attempts = snapshot
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.attempt_id == envelope.attempt_id);
+    let attempt = attempts
+        .next()
+        .ok_or(CollaborationControlError::Persistence)?;
+    if attempts.next().is_some()
+        || step.run_id != run.run_id
+        || attempt.run_id != run.run_id
+        || attempt.step_id != step.step_id
+        || attempt.dispatch_id.as_deref() != Some(envelope.dispatch_id.as_str())
+    {
+        return Err(CollaborationControlError::Persistence);
+    }
+
+    let run_status =
+        RunStatus::try_from(run.status).map_err(|_| CollaborationControlError::Persistence)?;
+    let step_status =
+        StepStatus::try_from(step.status).map_err(|_| CollaborationControlError::Persistence)?;
+    let attempt_status = AttemptStatus::try_from(attempt.status)
+        .map_err(|_| CollaborationControlError::Persistence)?;
+    let live = run_status == RunStatus::Active
+        && step_status == StepStatus::Active
+        && matches!(
+            attempt_status,
+            AttemptStatus::Dispatched | AttemptStatus::Acknowledged | AttemptStatus::Running
+        );
+    if !live {
+        return Ok(false);
+    }
+    if run
+        .step_ids
+        .iter()
+        .filter(|step_id| step_id.as_str() == envelope.step_id)
+        .count()
+        != 1
+        || step
+            .attempt_ids
+            .iter()
+            .filter(|attempt_id| attempt_id.as_str() == envelope.attempt_id)
+            .count()
+            != 1
+        || step.current_attempt_id.as_deref() != Some(envelope.attempt_id.as_str())
+    {
+        return Err(CollaborationControlError::Persistence);
+    }
+
+    let capability_profile_ref = envelope
+        .capability_profile_ref
+        .as_ref()
+        .ok_or(CollaborationControlError::Persistence)?;
+    let request_digest_sha256 = envelope
+        .meta
+        .as_ref()
+        .map(|meta| meta.request_digest_sha256.as_str())
+        .ok_or(CollaborationControlError::Persistence)?;
+    if envelope.fencing_token == 0
+        || !sha256_is_complete(&envelope.dispatch_fingerprint)
+        || !sha256_is_complete(request_digest_sha256)
+        || !contract_reference_is_complete(capability_profile_ref)
+        || attempt.capability_profile_ref.as_ref() != Some(capability_profile_ref)
+        || attempt.dispatch_fingerprint.as_deref() != Some(envelope.dispatch_fingerprint.as_str())
+        || canonical_dispatch_fingerprint(envelope) != envelope.dispatch_fingerprint
+        || request_digest_sha256 != envelope.dispatch_fingerprint
+        || !current_fence_matches(attempt, envelope.fencing_token)
+    {
+        return Err(CollaborationControlError::Persistence);
+    }
+    Ok(true)
 }
 
 fn decode_projection_record(

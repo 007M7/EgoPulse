@@ -9,8 +9,9 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
     RecordAttemptReturnCommand, RecordDeliveryReceiptCommand, RecordDispatchIntentCommand,
     RecordHarnessAckCommand, RecordRunningObservationCommand, RecoveryClass,
-    RequestAttemptCancellationCommand, RunCommandBase, RunPlan, RunStatus, StepPlan, StepStatus,
-    collaboration_command, collaboration_command_result, get_collaboration_response,
+    RequestAttemptCancellationCommand, RunCommandBase, RunPlan, RunSnapshot, RunStatus, StepPlan,
+    StepSnapshot, StepStatus, collaboration_command, collaboration_command_result,
+    get_collaboration_response,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
@@ -43,8 +44,9 @@ use egopulse_local_ide_control::collaboration_control::{
     canonical_dispatch_fingerprint, canonical_request_digest, dispatch_pending, pump_observations,
     start_single_harness_workflow,
 };
+use prost::Message;
 use prost_types::Timestamp;
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -464,12 +466,18 @@ impl HarnessEvidenceResolver for FixtureGuard {
         command: &RecordDeliveryReceiptCommand,
         _snapshot: &CollaborationSnapshot,
     ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
-        if command.delivery_receipt_id != "delivery-001" {
+        if !matches!(
+            command.delivery_receipt_id.as_str(),
+            "delivery-001" | "delivery-dispatch-002"
+        ) {
             return Err(ReferenceGuardRejection::UnverifiedReference);
         }
         Ok(ResolvedHarnessEvidence {
             harness_session_ref: Some("codex-thread-001".to_owned()),
-            evidence_refs: vec!["adapter-receipt:delivery-001@durable".to_owned()],
+            evidence_refs: vec![format!(
+                "adapter-receipt:{}@durable",
+                command.delivery_receipt_id
+            )],
         })
     }
 
@@ -869,6 +877,14 @@ fn open_control(path: &Path, clock: FixedClock) -> CollaborationControl<FixtureG
     open_control_with_guard(path, clock, FixtureGuard)
 }
 
+fn open_raw_collaboration_store(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("open encrypted Collaboration store");
+    connection
+        .pragma_update(None, "key", format!("x'{}'", hex::encode(TEST_KEY)))
+        .expect("apply Collaboration SQLCipher key");
+    connection
+}
+
 fn open_loop_adapter_edge(path: &Path) -> AdapterEdge {
     open_loop_adapter_edge_for(path, "adapter:codex", "collaboration-loop-adapter-edge-v1")
 }
@@ -1261,16 +1277,32 @@ fn dispatch_command_with_bundle(
     snapshot: &CollaborationSnapshot,
     input_bundle_sha256: &str,
 ) -> CollaborationCommand {
+    dispatch_command_with_ids(
+        snapshot,
+        input_bundle_sha256,
+        "dispatch-001",
+        "cmd-dispatch-001",
+        "dispatch-intent-001",
+    )
+}
+
+fn dispatch_command_with_ids(
+    snapshot: &CollaborationSnapshot,
+    input_bundle_sha256: &str,
+    dispatch_id: &str,
+    command_id: &str,
+    idempotency_key: &str,
+) -> CollaborationCommand {
     let run = snapshot.run.as_ref().expect("run");
     let step = snapshot.steps.first().expect("step");
     let attempt = snapshot.attempts.first().expect("attempt");
     let lease = attempt.lease.as_ref().expect("lease");
-    let source_meta = metadata("cmd-dispatch-001", "dispatch-intent-001", "attempt-001");
+    let source_meta = metadata(command_id, idempotency_key, &attempt.attempt_id);
     let mut envelope = DispatchEnvelope {
         meta: Some(CommandMetadata {
-            command_id: "dispatch-001".to_owned(),
-            idempotency_key: "dispatch-001".to_owned(),
-            idempotency_scope: "attempt-001".to_owned(),
+            command_id: dispatch_id.to_owned(),
+            idempotency_key: dispatch_id.to_owned(),
+            idempotency_scope: attempt.attempt_id.clone(),
             request_digest_sha256: String::new(),
             issued_at: Some(Timestamp {
                 seconds: FIXED_TIME,
@@ -1285,7 +1317,7 @@ fn dispatch_command_with_bundle(
         step_revision: step.revision + 1,
         attempt_id: attempt.attempt_id.clone(),
         attempt_revision: attempt.revision + 1,
-        dispatch_id: "dispatch-001".to_owned(),
+        dispatch_id: dispatch_id.to_owned(),
         dispatch_fingerprint: String::new(),
         fencing_token: lease.fencing_token,
         capability_profile_ref: attempt.capability_profile_ref.clone(),
@@ -1317,7 +1349,7 @@ fn dispatch_command_with_bundle(
                 }),
                 lease_id: lease.lease_id.clone(),
                 fencing_token: lease.fencing_token,
-                dispatch_id: "dispatch-001".to_owned(),
+                dispatch_id: dispatch_id.to_owned(),
                 dispatch_fingerprint: fingerprint,
             },
         )),
@@ -1384,6 +1416,35 @@ fn unknown_command(snapshot: &CollaborationSnapshot) -> CollaborationCommand {
     command
 }
 
+fn unknown_terminal_observation(snapshot: &CollaborationSnapshot) -> HarnessObservation {
+    let attempt = snapshot.attempts.first().expect("attempt");
+    HarnessObservation {
+        observation_id: "unknown-terminal-001".to_owned(),
+        adapter_id: "adapter:codex".to_owned(),
+        attempt_id: attempt.attempt_id.clone(),
+        dispatch_id: attempt.dispatch_id.clone().expect("dispatch ID"),
+        fencing_token: attempt.lease.as_ref().expect("lease").fencing_token,
+        observation_sequence: attempt.last_harness_sequence + 1,
+        native_event_digest_sha256: "a".repeat(64),
+        capability_profile_id: attempt
+            .capability_profile_ref
+            .as_ref()
+            .expect("capability profile")
+            .contract_id
+            .clone(),
+        criticality: ObservationCriticality::Control as i32,
+        raw_evidence_ref: "adapter-edge://unknown-terminal-001".to_owned(),
+        payload: Some(harness_observation::Payload::Lifecycle(
+            LifecycleObservation {
+                kind: LifecycleKind::ExecutionFailed as i32,
+                side_effect_certainty: SideEffectCertainty::Unknown as i32,
+                ..LifecycleObservation::default()
+            },
+        )),
+        ..HarnessObservation::default()
+    }
+}
+
 fn attempt_base(snapshot: &CollaborationSnapshot, command_id: &str) -> AttemptCommandBase {
     let run = snapshot.run.as_ref().expect("run");
     let step = snapshot.steps.first().expect("step");
@@ -1400,14 +1461,45 @@ fn attempt_base(snapshot: &CollaborationSnapshot, command_id: &str) -> AttemptCo
 }
 
 fn delivery_command(snapshot: &CollaborationSnapshot, fencing_token: u64) -> CollaborationCommand {
+    delivery_command_with_ids(snapshot, fencing_token, "cmd-delivery-001", "delivery-001")
+}
+
+fn delivery_command_with_ids(
+    snapshot: &CollaborationSnapshot,
+    fencing_token: u64,
+    command_id: &str,
+    delivery_receipt_id: &str,
+) -> CollaborationCommand {
+    let dispatch_id = snapshot
+        .attempts
+        .first()
+        .and_then(|attempt| attempt.dispatch_id.clone())
+        .expect("delivery dispatch ID");
     let mut command = CollaborationCommand {
         command: Some(collaboration_command::Command::RecordDeliveryReceipt(
             RecordDeliveryReceiptCommand {
-                base: Some(attempt_base(snapshot, "cmd-delivery-001")),
-                dispatch_id: "dispatch-001".to_owned(),
+                base: Some(attempt_base(snapshot, command_id)),
+                dispatch_id,
                 fencing_token,
-                delivery_receipt_id: "delivery-001".to_owned(),
+                delivery_receipt_id: delivery_receipt_id.to_owned(),
                 receipt_digest_sha256: "d".repeat(64),
+            },
+        )),
+    };
+    set_digest(&mut command);
+    command
+}
+
+fn acquire_lease_from_snapshot(
+    snapshot: &CollaborationSnapshot,
+    command_id: &str,
+) -> CollaborationCommand {
+    let mut command = CollaborationCommand {
+        command: Some(collaboration_command::Command::AcquireAttemptLease(
+            AcquireAttemptLeaseCommand {
+                base: Some(attempt_base(snapshot, command_id)),
+                owner_instance_id: "attempt-supervisor-001".to_owned(),
+                lease_policy_ref: Some(contract_ref("v01-attempt-lease", 'a')),
             },
         )),
     };
@@ -1674,6 +1766,335 @@ fn advance_through_running(
             )
             .expect("running"),
     )
+}
+
+fn advance_unique_run_through_delivery(
+    control: &mut CollaborationControl<FixtureGuard, FixedClock>,
+    run_id: &str,
+    step_id: &str,
+    attempt_id: &str,
+    dispatch_id: &str,
+) -> CollaborationSnapshot {
+    let mut plan = run_plan();
+    plan.plan_id = format!("plan-{run_id}");
+    plan.steps[0].step_id = step_id.to_owned();
+    let mut create_run = CollaborationCommand {
+        command: Some(collaboration_command::Command::CreateRun(
+            CreateRunCommand {
+                meta: Some(metadata(
+                    &format!("cmd-create-{run_id}"),
+                    &format!("create-{run_id}"),
+                    &format!("task-001/work-1/{run_id}"),
+                )),
+                run_id: run_id.to_owned(),
+                task_id: "task-001".to_owned(),
+                task_revision: 2,
+                work_revision: 1,
+                plan: Some(plan),
+            },
+        )),
+    };
+    set_digest(&mut create_run);
+    let created = committed_snapshot(
+        &control
+            .execute(&create_run, &task_authority())
+            .expect("create unique Run"),
+    );
+
+    let mut activate_run = CollaborationCommand {
+        command: Some(collaboration_command::Command::ActivateRun(
+            ActivateRunCommand {
+                base: Some(RunCommandBase {
+                    meta: Some(metadata(
+                        &format!("cmd-activate-{run_id}"),
+                        &format!("activate-{run_id}"),
+                        run_id,
+                    )),
+                    run_id: run_id.to_owned(),
+                    expected_run_revision: created.run.as_ref().expect("created run").revision,
+                }),
+                confirmed_task_revision: 2,
+            },
+        )),
+    };
+    set_digest(&mut activate_run);
+    let activated = committed_snapshot(
+        &control
+            .execute(&activate_run, &task_authority())
+            .expect("activate unique Run"),
+    );
+
+    let activated_run = activated.run.as_ref().expect("activated run");
+    let activated_step = activated.steps.first().expect("activated step");
+    let mut create_attempt = CollaborationCommand {
+        command: Some(collaboration_command::Command::CreateAttempt(
+            CreateAttemptCommand {
+                base: Some(RunCommandBase {
+                    meta: Some(metadata(
+                        &format!("cmd-create-{attempt_id}"),
+                        &format!("create-{attempt_id}"),
+                        &format!("{run_id}/{step_id}"),
+                    )),
+                    run_id: run_id.to_owned(),
+                    expected_run_revision: activated_run.revision,
+                }),
+                step_id: step_id.to_owned(),
+                expected_step_revision: activated_step.revision,
+                attempt_id: attempt_id.to_owned(),
+                harness_id: "codex".to_owned(),
+                capability_profile_ref: Some(contract_ref("single-harness-capability", '3')),
+                workspace_ref: "workspace-001".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut create_attempt);
+    let attempt_created = committed_snapshot(
+        &control
+            .execute(&create_attempt, &collaboration_control())
+            .expect("create unique Attempt"),
+    );
+
+    let leased = committed_snapshot(
+        &control
+            .execute(
+                &acquire_lease_from_snapshot(&attempt_created, &format!("cmd-lease-{attempt_id}")),
+                &attempt_supervisor(),
+            )
+            .expect("acquire unique Attempt lease"),
+    );
+    let dispatched = committed_snapshot(
+        &control
+            .execute(
+                &dispatch_command_with_ids(
+                    &leased,
+                    &"5".repeat(64),
+                    dispatch_id,
+                    &format!("cmd-{dispatch_id}"),
+                    &format!("intent-{dispatch_id}"),
+                ),
+                &attempt_supervisor(),
+            )
+            .expect("record unique dispatch intent"),
+    );
+    let fence = dispatched.attempts[0]
+        .lease
+        .as_ref()
+        .expect("unique Attempt lease")
+        .fencing_token;
+    committed_snapshot(
+        &control
+            .execute(
+                &delivery_command_with_ids(
+                    &dispatched,
+                    fence,
+                    &format!("cmd-delivery-{dispatch_id}"),
+                    &format!("delivery-{dispatch_id}"),
+                ),
+                &harness_adapter(),
+            )
+            .expect("record unique delivery"),
+    )
+}
+
+fn persist_delivered_dispatch(label: &str) -> (IsolatedStore, FixedClock) {
+    let isolated = IsolatedStore::new(label);
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut control = open_control(&isolated.database_path(), clock.clone());
+    let (pending, _) = advance_through_dispatch(&mut control);
+    let fence = pending.attempts[0]
+        .lease
+        .as_ref()
+        .expect("lease")
+        .fencing_token;
+    control
+        .execute(&delivery_command(&pending, fence), &harness_adapter())
+        .expect("record durable delivery");
+    assert_eq!(
+        control
+            .delivered_dispatches_for_observation(&harness_adapter())
+            .expect("read delivered dispatch")
+            .len(),
+        1
+    );
+    drop(control);
+    (isolated, clock)
+}
+
+fn rewrite_delivered_envelope(path: &Path, mutate: impl FnOnce(&mut DispatchEnvelope)) {
+    let connection = open_raw_collaboration_store(path);
+    let payload: Vec<u8> = connection
+        .query_row(
+            "SELECT payload FROM collaboration_outbox
+             WHERE destination_domain='harness-adapter'
+               AND payload_kind='dispatch-envelope'
+               AND delivery_state='delivered'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read delivered envelope");
+    let mut envelope = DispatchEnvelope::decode(payload.as_slice()).expect("decode envelope");
+    mutate(&mut envelope);
+    let payload = envelope.encode_to_vec();
+    let digest = hex::encode(Sha256::digest(payload.as_slice()));
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE collaboration_outbox
+                 SET payload=?1, canonical_payload_digest_sha256=?2
+                 WHERE destination_domain='harness-adapter'
+                   AND payload_kind='dispatch-envelope'
+                   AND delivery_state='delivered'",
+                params![payload, digest],
+            )
+            .expect("rewrite delivered envelope"),
+        1
+    );
+}
+
+fn rewrite_delivered_envelope_and_attempt(
+    path: &Path,
+    mutate: impl FnOnce(&mut DispatchEnvelope, &mut AttemptSnapshot),
+) {
+    let mut connection = open_raw_collaboration_store(path);
+    let (attempt_id, payload): (String, Vec<u8>) = connection
+        .query_row(
+            "SELECT attempt_id, payload FROM collaboration_outbox
+             WHERE destination_domain='harness-adapter'
+               AND payload_kind='dispatch-envelope'
+               AND delivery_state='delivered'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read delivered envelope and attempt identity");
+    let attempt_payload: Vec<u8> = connection
+        .query_row(
+            "SELECT snapshot FROM collaboration_attempts WHERE attempt_id=?1",
+            [&attempt_id],
+            |row| row.get(0),
+        )
+        .expect("read delivered attempt snapshot");
+    let mut envelope = DispatchEnvelope::decode(payload.as_slice()).expect("decode envelope");
+    let mut attempt =
+        AttemptSnapshot::decode(attempt_payload.as_slice()).expect("decode attempt snapshot");
+    mutate(&mut envelope, &mut attempt);
+
+    let envelope_payload = envelope.encode_to_vec();
+    let envelope_digest = hex::encode(Sha256::digest(envelope_payload.as_slice()));
+    let attempt_payload = attempt.encode_to_vec();
+    let transaction = connection.transaction().expect("begin fault injection");
+    assert_eq!(
+        transaction
+            .execute(
+                "UPDATE collaboration_outbox
+                 SET payload=?1, canonical_payload_digest_sha256=?2
+                 WHERE destination_domain='harness-adapter'
+                   AND payload_kind='dispatch-envelope'
+                   AND delivery_state='delivered'
+                   AND attempt_id=?3",
+                params![envelope_payload, envelope_digest, attempt_id],
+            )
+            .expect("rewrite delivered envelope"),
+        1
+    );
+    assert_eq!(
+        transaction
+            .execute(
+                "UPDATE collaboration_attempts
+                 SET revision=?1, status=?2, snapshot=?3
+                 WHERE attempt_id=?4",
+                params![
+                    i64::try_from(attempt.revision).expect("attempt revision fits SQLite"),
+                    attempt.status,
+                    attempt_payload,
+                    attempt.attempt_id
+                ],
+            )
+            .expect("rewrite delivered attempt"),
+        1
+    );
+    transaction.commit().expect("commit fault injection");
+}
+
+fn rewrite_delivered_hierarchy(
+    path: &Path,
+    mutate: impl FnOnce(&mut RunSnapshot, &mut StepSnapshot),
+) {
+    let mut connection = open_raw_collaboration_store(path);
+    let payload: Vec<u8> = connection
+        .query_row(
+            "SELECT payload FROM collaboration_outbox
+             WHERE destination_domain='harness-adapter'
+               AND payload_kind='dispatch-envelope'
+               AND delivery_state='delivered'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read delivered hierarchy envelope");
+    let envelope = DispatchEnvelope::decode(payload.as_slice()).expect("decode envelope");
+    let run_payload: Vec<u8> = connection
+        .query_row(
+            "SELECT snapshot FROM collaboration_runs WHERE run_id=?1",
+            [&envelope.run_id],
+            |row| row.get(0),
+        )
+        .expect("read delivered run snapshot");
+    let step_payload: Vec<u8> = connection
+        .query_row(
+            "SELECT snapshot FROM collaboration_steps WHERE step_id=?1 AND run_id=?2",
+            params![envelope.step_id, envelope.run_id],
+            |row| row.get(0),
+        )
+        .expect("read delivered step snapshot");
+    let mut run = RunSnapshot::decode(run_payload.as_slice()).expect("decode run snapshot");
+    let mut step = StepSnapshot::decode(step_payload.as_slice()).expect("decode step snapshot");
+    mutate(&mut run, &mut step);
+
+    let transaction = connection
+        .transaction()
+        .expect("begin hierarchy fault injection");
+    assert_eq!(
+        transaction
+            .execute(
+                "UPDATE collaboration_runs SET snapshot=?1 WHERE run_id=?2",
+                params![run.encode_to_vec(), run.run_id],
+            )
+            .expect("rewrite delivered run hierarchy"),
+        1
+    );
+    assert_eq!(
+        transaction
+            .execute(
+                "UPDATE collaboration_steps SET snapshot=?1
+                 WHERE step_id=?2 AND run_id=?3",
+                params![step.encode_to_vec(), step.step_id, step.run_id],
+            )
+            .expect("rewrite delivered step hierarchy"),
+        1
+    );
+    transaction
+        .commit()
+        .expect("commit hierarchy fault injection");
+}
+
+fn synchronize_dispatch_fingerprint(
+    envelope: &mut DispatchEnvelope,
+    attempt: &mut AttemptSnapshot,
+) {
+    envelope.dispatch_fingerprint.clear();
+    envelope
+        .meta
+        .as_mut()
+        .expect("dispatch metadata")
+        .request_digest_sha256
+        .clear();
+    let fingerprint = canonical_dispatch_fingerprint(envelope);
+    envelope.dispatch_fingerprint = fingerprint.clone();
+    envelope
+        .meta
+        .as_mut()
+        .expect("dispatch metadata")
+        .request_digest_sha256 = fingerprint.clone();
+    attempt.dispatch_fingerprint = Some(fingerprint);
 }
 
 #[test]
@@ -3940,12 +4361,602 @@ fn unknown_outcome_holds_the_attempt_and_existing_dispatch_outbox() {
             .expect("held dispatches")
             .is_empty()
     );
+    let held = control
+        .held_dispatches_for_recovery(&recovery_worker())
+        .expect("held recovery dispatches");
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].state, HeldDispatchRecoveryState::OutcomeUnknown);
 
     let replayed = control
         .execute(&unknown, &recovery_worker())
         .expect("replay unknown outcome");
     assert!(replayed.replayed);
     assert_eq!(control.inspect_store().expect("unknown replay"), counts);
+}
+
+#[test]
+fn delivered_terminal_unknown_atomically_holds_outbox_and_reopens_for_recovery() {
+    let isolated = IsolatedStore::new("collaboration-delivered-terminal-unknown");
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut control = open_control(&isolated.database_path(), clock.clone());
+    let running = advance_through_running(&mut control);
+    assert_eq!(
+        control
+            .delivered_dispatches_for_observation(&harness_adapter())
+            .expect("read delivered observation candidate")
+            .len(),
+        1
+    );
+
+    let observation = unknown_terminal_observation(&running);
+    let ingested = control
+        .ingest_harness_observation(&observation, &harness_adapter())
+        .expect("ingest terminal unknown observation");
+    assert!(matches!(
+        ingested.disposition,
+        HarnessFactIngestionDisposition::QuarantineRequired { ref reason_code }
+            if reason_code == "HARNESS_TERMINAL_OUTCOME_UNKNOWN"
+    ));
+    let snapshot = committed_snapshot(
+        ingested
+            .authority_result
+            .as_ref()
+            .expect("unknown Authority result"),
+    );
+    assert_eq!(
+        snapshot.run.as_ref().expect("run").status,
+        RunStatus::Held as i32
+    );
+    assert_eq!(snapshot.steps[0].status, StepStatus::Held as i32);
+    assert_eq!(
+        snapshot.attempts[0].status,
+        AttemptStatus::OutcomeUnknown as i32
+    );
+    assert!(
+        control
+            .delivered_dispatches_for_observation(&harness_adapter())
+            .expect("exclude held delivered candidate")
+            .is_empty()
+    );
+    let held = control
+        .held_dispatches_for_recovery(&recovery_worker())
+        .expect("read held recovery candidate");
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].state, HeldDispatchRecoveryState::OutcomeUnknown);
+    let before_reopen = control.inspect_store().expect("inspect held Authority");
+    let revision = snapshot.run.as_ref().expect("run").revision;
+    drop(control);
+
+    let mut reopened = open_control(&isolated.database_path(), clock);
+    assert_eq!(
+        reopened
+            .held_dispatches_for_recovery(&recovery_worker())
+            .expect("read reopened held recovery candidate")
+            .len(),
+        1
+    );
+    assert!(
+        reopened
+            .delivered_dispatches_for_observation(&harness_adapter())
+            .expect("exclude reopened held candidate")
+            .is_empty()
+    );
+    let replay = reopened
+        .ingest_harness_observation(&observation, &harness_adapter())
+        .expect("replay terminal unknown observation");
+    assert!(
+        replay
+            .authority_result
+            .as_ref()
+            .is_some_and(|result| result.replayed)
+    );
+    assert_eq!(
+        reopened.inspect_store().expect("inspect replay"),
+        before_reopen
+    );
+    assert_eq!(
+        load_snapshot(&reopened).run.as_ref().expect("run").revision,
+        revision
+    );
+}
+
+#[test]
+fn delivered_observation_read_is_authorized_and_filters_attempt_state() {
+    let isolated = IsolatedStore::new("collaboration-delivered-observation-read");
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut control = open_control(&isolated.database_path(), clock);
+    let (pending, _) = advance_through_dispatch(&mut control);
+    let fence = pending.attempts[0]
+        .lease
+        .as_ref()
+        .expect("lease")
+        .fencing_token;
+    let delivered = committed_snapshot(
+        &control
+            .execute(&delivery_command(&pending, fence), &harness_adapter())
+            .expect("record delivery"),
+    );
+    let candidates = control
+        .delivered_dispatches_for_observation(&harness_adapter())
+        .expect("read dispatched candidate");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].envelope.dispatch_id, "dispatch-001");
+    assert!(matches!(
+        control.delivered_dispatches_for_observation(&recovery_worker()),
+        Err(CollaborationControlError::DispatchPollNotAuthorized)
+    ));
+    let mut unauthenticated = harness_adapter();
+    unauthenticated.authenticated = false;
+    assert!(matches!(
+        control.delivered_dispatches_for_observation(&unauthenticated),
+        Err(CollaborationControlError::DispatchPollNotAuthorized)
+    ));
+    let empty_principal = principal(CollaborationPrincipalKind::HarnessAdapter, "");
+    assert!(matches!(
+        control.delivered_dispatches_for_observation(&empty_principal),
+        Err(CollaborationControlError::DispatchPollNotAuthorized)
+    ));
+
+    let acknowledged = committed_snapshot(
+        &control
+            .execute(&ack_command(&delivered, fence, 1), &harness_adapter())
+            .expect("record acknowledgement"),
+    );
+    assert_eq!(
+        control
+            .delivered_dispatches_for_observation(&harness_adapter())
+            .expect("read acknowledged candidate")
+            .len(),
+        1
+    );
+    let running = committed_snapshot(
+        &control
+            .execute(
+                &running_command(&acknowledged, fence, 2),
+                &harness_adapter(),
+            )
+            .expect("record running observation"),
+    );
+    assert_eq!(
+        control
+            .delivered_dispatches_for_observation(&harness_adapter())
+            .expect("read running candidate")
+            .len(),
+        1
+    );
+    control
+        .execute(&cancellation_request(&running), &attempt_supervisor())
+        .expect("request cancellation");
+    assert!(
+        control
+            .delivered_dispatches_for_observation(&harness_adapter())
+            .expect("exclude cancellation candidate")
+            .is_empty()
+    );
+}
+
+#[test]
+fn delivered_observation_batch_skips_non_live_history_with_a_stale_fence() {
+    let isolated = IsolatedStore::new("collaboration-delivered-live-and-history-batch");
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut control = open_control(&isolated.database_path(), clock.clone());
+    let running = advance_through_running(&mut control);
+    let historical_fence = running.attempts[0]
+        .lease
+        .as_ref()
+        .expect("historical attempt lease")
+        .fencing_token;
+    clock.set_seconds(FIXED_TIME + 31);
+    let outcome_unknown = committed_snapshot(
+        &control
+            .execute(&unknown_command(&running), &recovery_worker())
+            .expect("mark historical outcome unknown"),
+    );
+    assert_eq!(
+        outcome_unknown.attempts[0].status,
+        AttemptStatus::OutcomeUnknown as i32
+    );
+    assert_eq!(
+        control
+            .held_dispatches_for_recovery(&recovery_worker())
+            .expect("historical dispatch held by Authority")
+            .len(),
+        1
+    );
+    drop(control);
+
+    let connection = open_raw_collaboration_store(&isolated.database_path());
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE collaboration_outbox
+                 SET delivery_state='delivered'
+                 WHERE destination_domain='harness-adapter'
+                   AND payload_kind='dispatch-envelope'
+                   AND attempt_id='attempt-001'
+                   AND delivery_state='held'",
+                [],
+            )
+            .expect("inject legacy held-to-delivered outbox defect"),
+        1
+    );
+    drop(connection);
+
+    let mut control = open_control(&isolated.database_path(), clock);
+    let reconciling = committed_snapshot(
+        &control
+            .execute(
+                &begin_reconciliation(&outcome_unknown, "reconcile-history-001"),
+                &recovery_worker(),
+            )
+            .expect("begin historical reconciliation"),
+    );
+    let interrupted = committed_snapshot(
+        &control
+            .execute(
+                &reconciliation_result(&reconciling, "reconcile-history-001"),
+                &recovery_worker(),
+            )
+            .expect("record historical retry-idempotent reconciliation"),
+    );
+    assert_eq!(
+        interrupted.attempts[0].status,
+        AttemptStatus::Interrupted as i32
+    );
+    let reacquired = committed_snapshot(
+        &control
+            .execute(
+                &acquire_lease_from_snapshot(&interrupted, "cmd-reacquire-history-001"),
+                &attempt_supervisor(),
+            )
+            .expect("reacquire historical Attempt lease"),
+    );
+    assert_eq!(reacquired.attempts[0].status, AttemptStatus::Leased as i32);
+    assert_eq!(
+        reacquired.attempts[0]
+            .lease
+            .as_ref()
+            .expect("reacquired historical lease")
+            .fencing_token,
+        historical_fence + 1
+    );
+
+    let live = advance_unique_run_through_delivery(
+        &mut control,
+        "run-002",
+        "step-002",
+        "attempt-002",
+        "dispatch-002",
+    );
+    assert_eq!(live.attempts[0].status, AttemptStatus::Dispatched as i32);
+
+    let connection = open_raw_collaboration_store(&isolated.database_path());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM collaboration_outbox
+                 WHERE destination_domain='harness-adapter'
+                   AND payload_kind='dispatch-envelope'
+                   AND delivery_state='delivered'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count mixed delivered batch"),
+        2
+    );
+    drop(connection);
+
+    let candidates = control
+        .delivered_dispatches_for_observation(&harness_adapter())
+        .expect("non-live stale fence must not poison live candidate");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].envelope.dispatch_id, "dispatch-002");
+    assert_eq!(candidates[0].envelope.run_id, "run-002");
+}
+
+#[test]
+fn terminal_unknown_keeps_an_already_held_dispatch_held() {
+    let isolated = IsolatedStore::new("collaboration-already-held-terminal-unknown");
+    let mut control = open_control(&isolated.database_path(), FixedClock::new(FIXED_TIME));
+    let running = advance_through_running(&mut control);
+    let cancellation_pending = committed_snapshot(
+        &control
+            .execute(&cancellation_request(&running), &attempt_supervisor())
+            .expect("request cancellation"),
+    );
+    assert!(
+        control
+            .delivered_dispatches_for_observation(&harness_adapter())
+            .expect("normal queue excludes held cancellation")
+            .is_empty()
+    );
+    let ingested = control
+        .ingest_harness_observation(
+            &unknown_terminal_observation(&cancellation_pending),
+            &harness_adapter(),
+        )
+        .expect("hold already-held dispatch");
+    assert!(
+        ingested
+            .authority_result
+            .as_ref()
+            .is_some_and(|result| result.committed_event.is_some())
+    );
+    let held = control
+        .held_dispatches_for_recovery(&recovery_worker())
+        .expect("read held dispatch");
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].state, HeldDispatchRecoveryState::OutcomeUnknown);
+}
+
+#[test]
+fn stale_delivered_outbox_for_outcome_unknown_is_not_an_observation_candidate() {
+    let isolated = IsolatedStore::new("collaboration-stale-delivered-outcome-unknown");
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut control = open_control(&isolated.database_path(), clock.clone());
+    let running = advance_through_running(&mut control);
+    control
+        .ingest_harness_observation(&unknown_terminal_observation(&running), &harness_adapter())
+        .expect("hold delivered dispatch after unknown terminal observation");
+    drop(control);
+
+    let connection = open_raw_collaboration_store(&isolated.database_path());
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE collaboration_outbox
+                 SET delivery_state='delivered'
+                 WHERE destination_domain='harness-adapter'
+                   AND payload_kind='dispatch-envelope'
+                   AND delivery_state='held'",
+                [],
+            )
+            .expect("inject stale delivered recovery candidate"),
+        1
+    );
+    drop(connection);
+
+    let control = open_control(&isolated.database_path(), clock);
+    assert!(
+        control
+            .delivered_dispatches_for_observation(&harness_adapter())
+            .expect("filter stale delivered recovery candidate")
+            .is_empty()
+    );
+}
+
+#[test]
+fn delivered_observation_read_fails_closed_on_digest_attempt_and_fingerprint_tampering() {
+    let (digest_store, digest_clock) =
+        persist_delivered_dispatch("collaboration-delivered-bad-digest");
+    let digest_connection = open_raw_collaboration_store(&digest_store.database_path());
+    assert_eq!(
+        digest_connection
+            .execute(
+                "UPDATE collaboration_outbox
+                 SET canonical_payload_digest_sha256=?1
+                 WHERE destination_domain='harness-adapter'
+                   AND payload_kind='dispatch-envelope'
+                   AND delivery_state='delivered'",
+                ["0".repeat(64)],
+            )
+            .expect("tamper digest"),
+        1
+    );
+    drop(digest_connection);
+    let digest_control = open_control(&digest_store.database_path(), digest_clock);
+    assert!(matches!(
+        digest_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+
+    let (attempt_store, attempt_clock) =
+        persist_delivered_dispatch("collaboration-delivered-bad-attempt-lineage");
+    let attempt_connection = open_raw_collaboration_store(&attempt_store.database_path());
+    assert_eq!(
+        attempt_connection
+            .execute(
+                "UPDATE collaboration_outbox
+                 SET attempt_id='attempt-tampered'
+                 WHERE destination_domain='harness-adapter'
+                   AND payload_kind='dispatch-envelope'
+                   AND delivery_state='delivered'",
+                [],
+            )
+            .expect("tamper outbox attempt lineage"),
+        1
+    );
+    drop(attempt_connection);
+    let attempt_control = open_control(&attempt_store.database_path(), attempt_clock);
+    assert!(matches!(
+        attempt_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+
+    let (fingerprint_store, fingerprint_clock) =
+        persist_delivered_dispatch("collaboration-delivered-bad-fingerprint");
+    rewrite_delivered_envelope(&fingerprint_store.database_path(), |envelope| {
+        envelope.dispatch_fingerprint = "b".repeat(64);
+        envelope
+            .meta
+            .as_mut()
+            .expect("dispatch metadata")
+            .request_digest_sha256 = envelope.dispatch_fingerprint.clone();
+    });
+    let fingerprint_control = open_control(&fingerprint_store.database_path(), fingerprint_clock);
+    assert!(matches!(
+        fingerprint_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+
+    let (canonical_store, canonical_clock) =
+        persist_delivered_dispatch("collaboration-delivered-bad-canonical-fingerprint");
+    rewrite_delivered_envelope(&canonical_store.database_path(), |envelope| {
+        envelope.workspace_ref = "workspace-tampered".to_owned();
+    });
+    let canonical_control = open_control(&canonical_store.database_path(), canonical_clock);
+    assert!(matches!(
+        canonical_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+
+    let (meta_store, meta_clock) =
+        persist_delivered_dispatch("collaboration-delivered-bad-meta-request-digest");
+    rewrite_delivered_envelope(&meta_store.database_path(), |envelope| {
+        envelope
+            .meta
+            .as_mut()
+            .expect("dispatch metadata")
+            .request_digest_sha256 = "c".repeat(64);
+    });
+    let meta_control = open_control(&meta_store.database_path(), meta_clock);
+    assert!(matches!(
+        meta_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+}
+
+#[test]
+fn live_delivered_observation_requires_current_fence_and_complete_structure() {
+    let (fence_store, fence_clock) =
+        persist_delivered_dispatch("collaboration-delivered-stale-live-fence");
+    rewrite_delivered_envelope_and_attempt(&fence_store.database_path(), |_envelope, attempt| {
+        attempt
+            .lease
+            .as_mut()
+            .expect("live attempt lease")
+            .fencing_token += 1;
+    });
+    let fence_control = open_control(&fence_store.database_path(), fence_clock);
+    assert!(matches!(
+        fence_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+
+    let (profile_store, profile_clock) =
+        persist_delivered_dispatch("collaboration-delivered-malformed-live-profile");
+    rewrite_delivered_envelope_and_attempt(&profile_store.database_path(), |envelope, attempt| {
+        let mut malformed = contract_ref("single-harness-capability", '3');
+        malformed.contract_id.clear();
+        envelope.capability_profile_ref = Some(malformed.clone());
+        attempt.capability_profile_ref = Some(malformed);
+        synchronize_dispatch_fingerprint(envelope, attempt);
+    });
+    let profile_control = open_control(&profile_store.database_path(), profile_clock);
+    assert!(matches!(
+        profile_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+
+    let (zero_fence_store, zero_fence_clock) =
+        persist_delivered_dispatch("collaboration-delivered-zero-live-fence");
+    rewrite_delivered_envelope_and_attempt(
+        &zero_fence_store.database_path(),
+        |envelope, attempt| {
+            envelope.fencing_token = 0;
+            attempt
+                .lease
+                .as_mut()
+                .expect("live attempt lease")
+                .fencing_token = 0;
+            synchronize_dispatch_fingerprint(envelope, attempt);
+        },
+    );
+    let zero_fence_control = open_control(&zero_fence_store.database_path(), zero_fence_clock);
+    assert!(matches!(
+        zero_fence_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+
+    let (identity_store, identity_clock) =
+        persist_delivered_dispatch("collaboration-delivered-empty-live-dispatch-id");
+    rewrite_delivered_envelope_and_attempt(&identity_store.database_path(), |envelope, attempt| {
+        envelope.dispatch_id.clear();
+        attempt.dispatch_id = Some(String::new());
+        synchronize_dispatch_fingerprint(envelope, attempt);
+    });
+    let identity_control = open_control(&identity_store.database_path(), identity_clock);
+    assert!(matches!(
+        identity_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+
+    let (run_membership_store, run_membership_clock) =
+        persist_delivered_dispatch("collaboration-delivered-missing-live-step-membership");
+    rewrite_delivered_hierarchy(&run_membership_store.database_path(), |run, _step| {
+        run.step_ids.clear()
+    });
+    let run_membership_control =
+        open_control(&run_membership_store.database_path(), run_membership_clock);
+    assert!(matches!(
+        run_membership_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+
+    let (attempt_membership_store, attempt_membership_clock) =
+        persist_delivered_dispatch("collaboration-delivered-missing-live-attempt-membership");
+    rewrite_delivered_hierarchy(&attempt_membership_store.database_path(), |_run, step| {
+        step.attempt_ids.clear()
+    });
+    let attempt_membership_control = open_control(
+        &attempt_membership_store.database_path(),
+        attempt_membership_clock,
+    );
+    assert!(matches!(
+        attempt_membership_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+
+    let (current_attempt_store, current_attempt_clock) =
+        persist_delivered_dispatch("collaboration-delivered-wrong-live-current-attempt");
+    rewrite_delivered_hierarchy(&current_attempt_store.database_path(), |_run, step| {
+        step.current_attempt_id = Some("attempt-other".to_owned())
+    });
+    let current_attempt_control = open_control(
+        &current_attempt_store.database_path(),
+        current_attempt_clock,
+    );
+    assert!(matches!(
+        current_attempt_control.delivered_dispatches_for_observation(&harness_adapter()),
+        Err(CollaborationControlError::Persistence)
+    ));
+}
+
+#[test]
+fn outcome_unknown_hold_cas_failure_rolls_back_the_authority_commit() {
+    let isolated = IsolatedStore::new("collaboration-hold-cas-rollback");
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut control = open_control(&isolated.database_path(), clock.clone());
+    advance_through_dispatch(&mut control);
+    drop(control);
+
+    let connection = open_raw_collaboration_store(&isolated.database_path());
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE collaboration_outbox
+                 SET delivery_state='consumed'
+                 WHERE destination_domain='harness-adapter'
+                   AND payload_kind='dispatch-envelope'",
+                [],
+            )
+            .expect("inject impossible dispatch outbox state"),
+        1
+    );
+    drop(connection);
+
+    let mut control = open_control(&isolated.database_path(), clock);
+    let before_store = control.inspect_store().expect("inspect before failed CAS");
+    let before_snapshot = load_snapshot(&control);
+    assert!(matches!(
+        control.execute(&unknown_command(&before_snapshot), &recovery_worker()),
+        Err(CollaborationControlError::Persistence)
+    ));
+    assert_eq!(
+        control.inspect_store().expect("inspect after failed CAS"),
+        before_store
+    );
+    assert_eq!(load_snapshot(&control), before_snapshot);
 }
 
 #[test]
