@@ -176,6 +176,18 @@ pub struct CommandGatewayApplication {
     work_port: Arc<dyn WorkPreparationPort>,
 }
 
+pub struct CommandExtensionPorts {
+    memory: Arc<dyn MemoryMutationPort>,
+    work: Arc<dyn WorkPreparationPort>,
+}
+
+impl CommandExtensionPorts {
+    #[must_use]
+    pub fn new(memory: Arc<dyn MemoryMutationPort>, work: Arc<dyn WorkPreparationPort>) -> Self {
+        Self { memory, work }
+    }
+}
+
 impl CommandGatewayApplication {
     #[must_use]
     pub fn new(
@@ -214,8 +226,7 @@ impl CommandGatewayApplication {
             task_port,
             policy_port,
             verdict_port,
-            memory_port,
-            Arc::new(FailClosedWorkPreparationPort),
+            CommandExtensionPorts::new(memory_port, Arc::new(FailClosedWorkPreparationPort)),
         )
     }
 
@@ -227,8 +238,7 @@ impl CommandGatewayApplication {
         task_port: Arc<dyn TaskCommandPort>,
         policy_port: Arc<dyn PolicyCommandPort>,
         verdict_port: Arc<dyn VerdictCommandPort>,
-        memory_port: Arc<dyn MemoryMutationPort>,
-        work_port: Arc<dyn WorkPreparationPort>,
+        extensions: CommandExtensionPorts,
     ) -> Self {
         Self {
             registry,
@@ -237,8 +247,8 @@ impl CommandGatewayApplication {
             task_port,
             policy_port,
             verdict_port,
-            memory_port,
-            work_port,
+            memory_port: extensions.memory,
+            work_port: extensions.work,
         }
     }
 

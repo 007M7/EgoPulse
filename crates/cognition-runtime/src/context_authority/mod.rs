@@ -20,11 +20,17 @@ pub const CONTEXT_AUTHORITY_REF: &str = "egopulse/context-authority/v1";
 const MAX_ROUTING_BYTES: usize = 4 * 1024;
 const MAX_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LIST_ITEMS: usize = 256;
+const MAX_REVOKE_REASON_BYTES: usize = 128;
+const MAX_REVOKE_EVIDENCE_ITEMS: usize = 16;
+const MAX_REVOKE_EVIDENCE_BYTES: usize = 512;
+const MAX_REVOKE_EVIDENCE_TOTAL_BYTES: usize = 4 * 1024;
+const MAX_CONFIRMATION_PROOF_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContextPrincipalKind {
     ContextCompiler,
     GovernanceKernel,
+    Founder,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,6 +141,105 @@ pub struct ContextSnapshotReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextRevokeRequest {
+    pub command_id: String,
+    pub snapshot_id: String,
+    pub expected_state_revision: u64,
+    pub reason_code: String,
+    pub evidence_refs: Vec<String>,
+    pub confirmation_proof_ref: String,
+    pub idempotency_key: String,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextGovernanceState {
+    Issued,
+    Revoked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextSnapshotGovernance {
+    pub snapshot_id: String,
+    pub snapshot_revision: u64,
+    pub content_digest_sha256: String,
+    pub owner_principal_id: String,
+    pub state: ContextGovernanceState,
+    pub state_revision: u64,
+    pub expires_at_seconds: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextRevokeReceipt {
+    pub snapshot_id: String,
+    pub snapshot_revision: u64,
+    pub content_digest_sha256: String,
+    pub previous_state_revision: u64,
+    pub result_state_revision: u64,
+    pub previous_state: ContextGovernanceState,
+    pub result_state: ContextGovernanceState,
+    pub request_digest_sha256: String,
+    pub event_id: String,
+    pub committed_at_seconds: i64,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchContextConsumptionAuthorizationRequest {
+    pub command_id: String,
+    pub snapshot_id: String,
+    pub expected_state_revision: u64,
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub input_digest_sha256: String,
+    pub expected_scope_ref: String,
+    pub idempotency_key: String,
+    pub correlation_id: String,
+    pub causation_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchContextConsumptionAuthorizationReceipt {
+    pub authorization_id: String,
+    pub snapshot_id: String,
+    pub snapshot_revision: u64,
+    pub observed_state_revision: u64,
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub input_digest_sha256: String,
+    pub expected_scope_ref: String,
+    pub request_digest_sha256: String,
+    pub event_id: String,
+    pub committed_at_seconds: i64,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryContextPurpose {
+    RecoveryOrReconciliation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryContextMaterialRequest {
+    pub snapshot_id: String,
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub input_digest_sha256: String,
+    pub expected_scope_ref: String,
+    pub evidence_ref: String,
+    pub purpose: RecoveryContextPurpose,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryContextMaterial {
+    pub snapshot: ContextSnapshot,
+    pub compiled_context: Vec<u8>,
+    pub observed_governance_state: ContextGovernanceState,
+    pub observed_state_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryUseReceiptRequest {
     pub snapshot_id: String,
     pub expected_scope_ref: String,
@@ -167,6 +272,10 @@ pub struct ContextStoreInspection {
     pub snapshot_count: u64,
     pub event_count: u64,
     pub idempotency_count: u64,
+    pub revoke_receipt_count: u64,
+    pub revoke_idempotency_count: u64,
+    pub dispatch_authorization_count: u64,
+    pub dispatch_authorization_idempotency_count: u64,
     pub last_event_sequence: u64,
 }
 
@@ -178,6 +287,8 @@ pub enum ContextAuthorityFailure {
     InvalidArgument(&'static str),
     #[error("context authority principal is not authorized")]
     Unauthorized,
+    #[error("context snapshot owner does not match the authenticated Founder")]
+    OwnerMismatch,
     #[error("context snapshot was not found")]
     NotFound,
     #[error("context snapshot has expired")]
@@ -190,13 +301,34 @@ pub enum ContextAuthorityFailure {
     IntegrityFailure,
     #[error("context authority idempotency key was reused with a different request")]
     IdempotencyConflict,
+    #[error("context governance state revision does not match")]
+    StateRevisionConflict,
+    #[error("context dispatch authorization tuple conflicts with an existing grant")]
+    AuthorizationTupleConflict,
     #[error("context authority clock is before the Unix epoch")]
     Clock,
 }
 
 impl From<store::StoreError> for ContextAuthorityFailure {
-    fn from(_: store::StoreError) -> Self {
-        Self::Storage
+    fn from(value: store::StoreError) -> Self {
+        match value {
+            store::StoreError::NotFound => Self::NotFound,
+            store::StoreError::OwnerMismatch => Self::OwnerMismatch,
+            store::StoreError::Revoked => Self::Revoked,
+            store::StoreError::Expired => Self::Expired,
+            store::StoreError::ScopeMismatch => Self::ScopeMismatch,
+            store::StoreError::StateRevisionConflict => Self::StateRevisionConflict,
+            store::StoreError::IdempotencyConflict => Self::IdempotencyConflict,
+            store::StoreError::AuthorizationTupleConflict => Self::AuthorizationTupleConflict,
+            store::StoreError::IntegrityFailure | store::StoreError::DescriptorDecode => {
+                Self::IntegrityFailure
+            }
+            store::StoreError::Sql(_)
+            | store::StoreError::Migration(_)
+            | store::StoreError::Directory(_)
+            | store::StoreError::CipherUnavailable
+            | store::StoreError::StoreGenerationMismatch => Self::Storage,
+        }
     }
 }
 
@@ -216,6 +348,140 @@ impl ContextAuthority {
                 &config.store_epoch,
             )?,
         })
+    }
+
+    pub fn revoke(
+        &mut self,
+        principal: &AuthenticatedContextPrincipal,
+        request: &ContextRevokeRequest,
+    ) -> Result<ContextRevokeReceipt, ContextAuthorityFailure> {
+        validate_principal(principal)?;
+        if principal.kind != ContextPrincipalKind::Founder {
+            return Err(ContextAuthorityFailure::Unauthorized);
+        }
+        validate_revoke_request(request)?;
+        let request_digest_sha256 = context_revoke_request_digest(&principal.principal_id, request);
+        self.store
+            .revoke(store::ContextRevokeCommit {
+                snapshot_id: &request.snapshot_id,
+                expected_state_revision: request.expected_state_revision,
+                principal_id: &principal.principal_id,
+                command_id: &request.command_id,
+                idempotency_key: &request.idempotency_key,
+                reason_code: &request.reason_code,
+                evidence_refs: &request.evidence_refs,
+                confirmation_proof_ref: &request.confirmation_proof_ref,
+                correlation_id: &request.correlation_id,
+                causation_id: request.causation_id.as_deref(),
+                request_digest_sha256: &request_digest_sha256,
+                event_id: &Uuid::now_v7().to_string(),
+                committed_at_seconds: current_timestamp()?,
+            })
+            .map_err(Into::into)
+    }
+
+    /// Commits the Context decision for exactly one dispatch. This is the
+    /// linearization point shared with revoke; it does not call Adapter or a
+    /// native Harness.
+    pub fn authorize_dispatch_consumption(
+        &mut self,
+        principal: &AuthenticatedContextPrincipal,
+        request: &DispatchContextConsumptionAuthorizationRequest,
+    ) -> Result<DispatchContextConsumptionAuthorizationReceipt, ContextAuthorityFailure> {
+        validate_principal(principal)?;
+        if principal.kind != ContextPrincipalKind::GovernanceKernel {
+            return Err(ContextAuthorityFailure::Unauthorized);
+        }
+        validate_dispatch_authorization_request(request)?;
+        let committed_at_seconds = current_timestamp()?;
+        let request_digest_sha256 = dispatch_authorization_request_digest(request);
+        self.store
+            .authorize_dispatch_consumption(store::DispatchAuthorizationCommit {
+                snapshot_id: &request.snapshot_id,
+                expected_state_revision: request.expected_state_revision,
+                principal_id: &principal.principal_id,
+                command_id: &request.command_id,
+                idempotency_key: &request.idempotency_key,
+                attempt_id: &request.attempt_id,
+                dispatch_id: &request.dispatch_id,
+                input_digest_sha256: &request.input_digest_sha256,
+                expected_scope_ref: &request.expected_scope_ref,
+                correlation_id: &request.correlation_id,
+                causation_id: &request.causation_id,
+                request_digest_sha256: &request_digest_sha256,
+                authorization_id: &format!("ctxauth:{}", Uuid::now_v7()),
+                event_id: &Uuid::now_v7().to_string(),
+                committed_at_seconds,
+            })
+            .map_err(Into::into)
+    }
+
+    /// Returns immutable material only for an already-authorized historical
+    /// dispatch. The result type carries no dispatch authorization and has no
+    /// conversion into the normal dispatch-material seam.
+    pub fn resolve_for_recovery(
+        &self,
+        principal: &AuthenticatedContextPrincipal,
+        request: &RecoveryContextMaterialRequest,
+    ) -> Result<RecoveryContextMaterial, ContextAuthorityFailure> {
+        validate_principal(principal)?;
+        if principal.kind != ContextPrincipalKind::GovernanceKernel {
+            return Err(ContextAuthorityFailure::Unauthorized);
+        }
+        validate_recovery_request(request)?;
+        let stored = self
+            .store
+            .recovery_material(store::RecoveryLineageRequest {
+                snapshot_id: &request.snapshot_id,
+                attempt_id: &request.attempt_id,
+                dispatch_id: &request.dispatch_id,
+                input_digest_sha256: &request.input_digest_sha256,
+                expected_scope_ref: &request.expected_scope_ref,
+            })?;
+        Ok(RecoveryContextMaterial {
+            snapshot: stored.snapshot,
+            compiled_context: stored.compiled_context,
+            observed_governance_state: parse_governance_state(&stored.state)?,
+            observed_state_revision: stored.state_revision,
+        })
+    }
+
+    /// Revalidates a complete durable authorization without consulting the
+    /// snapshot's current revoke/expiry state. That preserves the frozen
+    /// authorization-first ordering while still rejecting receipt tampering.
+    pub fn verify_dispatch_authorization(
+        &self,
+        principal: &AuthenticatedContextPrincipal,
+        receipt: &DispatchContextConsumptionAuthorizationReceipt,
+    ) -> Result<(), ContextAuthorityFailure> {
+        validate_principal(principal)?;
+        if principal.kind != ContextPrincipalKind::GovernanceKernel {
+            return Err(ContextAuthorityFailure::Unauthorized);
+        }
+        self.store
+            .verify_dispatch_authorization(receipt)
+            .map_err(Into::into)
+    }
+
+    pub fn governance(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<ContextSnapshotGovernance>, ContextAuthorityFailure> {
+        validate_snapshot_id(snapshot_id)?;
+        self.store
+            .snapshot_with_bytes(snapshot_id)?
+            .map(|stored| {
+                Ok(ContextSnapshotGovernance {
+                    snapshot_id: stored.snapshot.snapshot_id,
+                    snapshot_revision: stored.snapshot.revision,
+                    content_digest_sha256: stored.snapshot.compiled_context_sha256,
+                    owner_principal_id: stored.snapshot.owner_principal_id,
+                    state: parse_governance_state(&stored.state)?,
+                    state_revision: stored.state_revision,
+                    expires_at_seconds: stored.snapshot.expires_at_seconds,
+                })
+            })
+            .transpose()
     }
 
     /// Issues an immutable snapshot and returns a digest-bound receipt.
@@ -524,18 +790,19 @@ fn build_snapshot(
     compiled_context_sha256: &str,
 ) -> Result<ContextSnapshot, ContextAuthorityFailure> {
     let intent_sha256 = sha256(input.intent.as_bytes());
-    let confirmation_binding_sha256 = confirmation_digest(
+    let source_and_gate_digest = source_ledger_digest(&input.sources, &input.recovery_entry);
+    let confirmation_binding_sha256 = confirmation_digest(&ConfirmationDigestInput {
         snapshot_id,
-        &intent_sha256,
-        &input.work_type,
-        &input.target_scope_ref,
-        &input.acceptance_contract_ref,
-        &input.budget_profile_ref,
+        intent_sha256: &intent_sha256,
+        work_type: &input.work_type,
+        target_scope_ref: &input.target_scope_ref,
+        acceptance_contract_ref: &input.acceptance_contract_ref,
+        budget_profile_ref: &input.budget_profile_ref,
         compiled_context_sha256,
-        &source_ledger_digest(&input.sources, &input.recovery_entry),
-        &input.owner_principal_id,
-        input.expires_at_seconds,
-    );
+        source_and_gate_digest: &source_and_gate_digest,
+        owner_principal_id: &input.owner_principal_id,
+        expires_at_seconds: input.expires_at_seconds,
+    });
     Ok(ContextSnapshot {
         snapshot_id: snapshot_id.to_owned(),
         revision: 1,
@@ -571,6 +838,195 @@ fn validate_principal(
     }
     validate_routing(&principal.principal_id, "principal_id")?;
     Ok(())
+}
+
+fn validate_revoke_request(request: &ContextRevokeRequest) -> Result<(), ContextAuthorityFailure> {
+    validate_snapshot_id(&request.snapshot_id)?;
+    if request.expected_state_revision == 0 {
+        return Err(ContextAuthorityFailure::InvalidArgument(
+            "expected_state_revision",
+        ));
+    }
+    validate_routing(&request.command_id, "command_id")?;
+    validate_routing(&request.idempotency_key, "idempotency_key")?;
+    validate_routing(&request.correlation_id, "correlation_id")?;
+    if let Some(value) = &request.causation_id {
+        validate_routing(value, "causation_id")?;
+    }
+    validate_opaque_reference(&request.reason_code, "reason_code", MAX_REVOKE_REASON_BYTES)?;
+    if request.evidence_refs.is_empty() || request.evidence_refs.len() > MAX_REVOKE_EVIDENCE_ITEMS {
+        return Err(ContextAuthorityFailure::InvalidArgument("evidence_refs"));
+    }
+    let mut total_bytes = 0usize;
+    for value in &request.evidence_refs {
+        validate_opaque_reference(value, "evidence_ref", MAX_REVOKE_EVIDENCE_BYTES)?;
+        total_bytes = total_bytes
+            .checked_add(value.len())
+            .ok_or(ContextAuthorityFailure::InvalidArgument("evidence_refs"))?;
+    }
+    if total_bytes > MAX_REVOKE_EVIDENCE_TOTAL_BYTES {
+        return Err(ContextAuthorityFailure::InvalidArgument("evidence_refs"));
+    }
+    validate_opaque_reference(
+        &request.confirmation_proof_ref,
+        "confirmation_proof_ref",
+        MAX_CONFIRMATION_PROOF_BYTES,
+    )
+}
+
+fn validate_dispatch_authorization_request(
+    request: &DispatchContextConsumptionAuthorizationRequest,
+) -> Result<(), ContextAuthorityFailure> {
+    validate_snapshot_id(&request.snapshot_id)?;
+    if request.expected_state_revision == 0 {
+        return Err(ContextAuthorityFailure::InvalidArgument(
+            "expected_state_revision",
+        ));
+    }
+    for (field, value) in [
+        ("command_id", &request.command_id),
+        ("attempt_id", &request.attempt_id),
+        ("dispatch_id", &request.dispatch_id),
+        ("expected_scope_ref", &request.expected_scope_ref),
+        ("idempotency_key", &request.idempotency_key),
+        ("correlation_id", &request.correlation_id),
+        ("causation_id", &request.causation_id),
+    ] {
+        validate_routing(value, field)?;
+    }
+    validate_canonical_digest(&request.input_digest_sha256, "input_digest_sha256")
+}
+
+fn validate_recovery_request(
+    request: &RecoveryContextMaterialRequest,
+) -> Result<(), ContextAuthorityFailure> {
+    validate_snapshot_id(&request.snapshot_id)?;
+    for (field, value) in [
+        ("attempt_id", &request.attempt_id),
+        ("dispatch_id", &request.dispatch_id),
+        ("expected_scope_ref", &request.expected_scope_ref),
+    ] {
+        validate_routing(value, field)?;
+    }
+    validate_canonical_digest(&request.input_digest_sha256, "input_digest_sha256")?;
+    validate_opaque_reference(
+        &request.evidence_ref,
+        "recovery_evidence_ref",
+        MAX_REVOKE_EVIDENCE_BYTES,
+    )
+}
+
+fn validate_snapshot_id(value: &str) -> Result<(), ContextAuthorityFailure> {
+    let Some(digest) = value.strip_prefix("ctx:") else {
+        return Err(ContextAuthorityFailure::InvalidArgument("snapshot_id"));
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ContextAuthorityFailure::InvalidArgument("snapshot_id"));
+    }
+    Ok(())
+}
+
+fn validate_opaque_reference(
+    value: &str,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<(), ContextAuthorityFailure> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+    {
+        return Err(ContextAuthorityFailure::InvalidArgument(field));
+    }
+    Ok(())
+}
+
+fn parse_governance_state(value: &str) -> Result<ContextGovernanceState, ContextAuthorityFailure> {
+    match value {
+        "issued" => Ok(ContextGovernanceState::Issued),
+        "revoked" => Ok(ContextGovernanceState::Revoked),
+        _ => Err(ContextAuthorityFailure::IntegrityFailure),
+    }
+}
+
+pub fn context_revoke_request_digest(
+    founder_principal_id: &str,
+    request: &ContextRevokeRequest,
+) -> String {
+    context_revoke_semantic_digest(
+        founder_principal_id,
+        &request.snapshot_id,
+        request.expected_state_revision,
+        &request.reason_code,
+        &request.evidence_refs,
+        &request.confirmation_proof_ref,
+    )
+}
+
+fn context_revoke_semantic_digest(
+    founder_principal_id: &str,
+    snapshot_id: &str,
+    expected_state_revision: u64,
+    reason_code: &str,
+    evidence_refs: &[String],
+    confirmation_proof_ref: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    update_digest_field(&mut hasher, b"egopulse/context-revoke/v1");
+    update_digest_field(&mut hasher, founder_principal_id.as_bytes());
+    update_digest_field(&mut hasher, snapshot_id.as_bytes());
+    update_digest_field(&mut hasher, &expected_state_revision.to_le_bytes());
+    update_digest_field(&mut hasher, reason_code.as_bytes());
+    update_digest_field(&mut hasher, &(evidence_refs.len() as u64).to_le_bytes());
+    for value in evidence_refs {
+        update_digest_field(&mut hasher, value.as_bytes());
+    }
+    update_digest_field(&mut hasher, confirmation_proof_ref.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+pub fn dispatch_authorization_request_digest(
+    request: &DispatchContextConsumptionAuthorizationRequest,
+) -> String {
+    dispatch_authorization_semantic_digest(
+        &request.snapshot_id,
+        request.expected_state_revision,
+        &request.attempt_id,
+        &request.dispatch_id,
+        &request.input_digest_sha256,
+        &request.expected_scope_ref,
+    )
+}
+
+fn dispatch_authorization_semantic_digest(
+    snapshot_id: &str,
+    expected_state_revision: u64,
+    attempt_id: &str,
+    dispatch_id: &str,
+    input_digest_sha256: &str,
+    expected_scope_ref: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    update_digest_field(
+        &mut hasher,
+        b"egopulse/context-dispatch-consumption-authorization/v1",
+    );
+    update_digest_field(&mut hasher, snapshot_id.as_bytes());
+    update_digest_field(&mut hasher, &expected_state_revision.to_le_bytes());
+    update_digest_field(&mut hasher, attempt_id.as_bytes());
+    update_digest_field(&mut hasher, dispatch_id.as_bytes());
+    update_digest_field(&mut hasher, input_digest_sha256.as_bytes());
+    update_digest_field(&mut hasher, expected_scope_ref.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn update_digest_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 fn validate_input(input: &IssueContextSnapshot) -> Result<(), ContextAuthorityFailure> {
@@ -666,6 +1122,17 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), ContextAuthor
     Ok(())
 }
 
+fn validate_canonical_digest(
+    value: &str,
+    field: &'static str,
+) -> Result<(), ContextAuthorityFailure> {
+    validate_digest(value, field)?;
+    if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(ContextAuthorityFailure::InvalidArgument(field));
+    }
+    Ok(())
+}
+
 fn snapshot_digest(snapshot: &ContextSnapshot) -> String {
     let descriptor = serde_json::to_vec(snapshot).expect("ContextSnapshot must be serializable");
     sha256(&descriptor)
@@ -684,29 +1151,32 @@ fn memory_use_digest(input: &MemoryUseReceiptRequest, snapshot: &ContextSnapshot
     sha256(&serde_json::to_vec(&descriptor).expect("Memory use descriptor is serializable"))
 }
 
-fn confirmation_digest(
-    snapshot_id: &str,
-    intent_sha256: &str,
-    work_type: &str,
-    target_scope_ref: &str,
-    acceptance_contract_ref: &str,
-    budget_profile_ref: &str,
-    compiled_context_sha256: &str,
-    source_and_gate_digest: &str,
-    owner_principal_id: &str,
+struct ConfirmationDigestInput<'a> {
+    snapshot_id: &'a str,
+    intent_sha256: &'a str,
+    work_type: &'a str,
+    target_scope_ref: &'a str,
+    acceptance_contract_ref: &'a str,
+    budget_profile_ref: &'a str,
+    compiled_context_sha256: &'a str,
+    source_and_gate_digest: &'a str,
+    owner_principal_id: &'a str,
     expires_at_seconds: i64,
-) -> String {
+}
+
+fn confirmation_digest(input: &ConfirmationDigestInput<'_>) -> String {
+    let expires_at_seconds = input.expires_at_seconds.to_string();
     let values = [
-        snapshot_id,
-        intent_sha256,
-        work_type,
-        target_scope_ref,
-        acceptance_contract_ref,
-        budget_profile_ref,
-        compiled_context_sha256,
-        source_and_gate_digest,
-        owner_principal_id,
-        &expires_at_seconds.to_string(),
+        input.snapshot_id,
+        input.intent_sha256,
+        input.work_type,
+        input.target_scope_ref,
+        input.acceptance_contract_ref,
+        input.budget_profile_ref,
+        input.compiled_context_sha256,
+        input.source_and_gate_digest,
+        input.owner_principal_id,
+        &expires_at_seconds,
     ];
     let mut hasher = Sha256::new();
     for value in values {
@@ -739,6 +1209,13 @@ fn current_timestamp() -> Result<i64, ContextAuthorityFailure> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::thread;
+    use std::time::Duration;
 
     fn authority() -> ContextAuthority {
         let root = std::env::temp_dir().join(format!("egopulse-context-{}", Uuid::now_v7()));
@@ -803,6 +1280,992 @@ mod tests {
             principal_id: "governance-kernel".to_owned(),
             authenticated: true,
         }
+    }
+
+    fn founder(principal_id: &str) -> AuthenticatedContextPrincipal {
+        AuthenticatedContextPrincipal {
+            kind: ContextPrincipalKind::Founder,
+            principal_id: principal_id.to_owned(),
+            authenticated: true,
+        }
+    }
+
+    fn test_root(label: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("egopulse-context-{label}-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("context test root");
+        root
+    }
+
+    fn authority_at(root: &Path, store_epoch: &str) -> ContextAuthority {
+        ContextAuthority::open(ContextAuthorityConfig {
+            database_path: root.join("context.sqlcipher"),
+            store_epoch: store_epoch.to_owned(),
+            key: SqlCipherKey::new([41; 32]),
+        })
+        .expect("context authority")
+    }
+
+    fn revoke_request(
+        snapshot_id: &str,
+        expected_state_revision: u64,
+        idempotency_key: &str,
+    ) -> ContextRevokeRequest {
+        ContextRevokeRequest {
+            command_id: format!("command:{idempotency_key}"),
+            snapshot_id: snapshot_id.to_owned(),
+            expected_state_revision,
+            reason_code: "founder-requested-revoke".to_owned(),
+            evidence_refs: vec!["evidence:r9a-test".to_owned()],
+            confirmation_proof_ref: "confirmation:r9a-test".to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
+            correlation_id: format!("correlation:{idempotency_key}"),
+            causation_id: Some(format!("causation:{idempotency_key}")),
+        }
+    }
+
+    fn authorization_request(
+        snapshot_id: &str,
+        attempt_id: &str,
+        dispatch_id: &str,
+        idempotency_key: &str,
+    ) -> DispatchContextConsumptionAuthorizationRequest {
+        DispatchContextConsumptionAuthorizationRequest {
+            command_id: format!("command:{idempotency_key}"),
+            snapshot_id: snapshot_id.to_owned(),
+            expected_state_revision: 1,
+            attempt_id: attempt_id.to_owned(),
+            dispatch_id: dispatch_id.to_owned(),
+            input_digest_sha256: "d".repeat(64),
+            expected_scope_ref: "scope:repo".to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
+            correlation_id: format!("correlation:{idempotency_key}"),
+            causation_id: format!("causation:{idempotency_key}"),
+        }
+    }
+
+    fn recovery_request(
+        request: &DispatchContextConsumptionAuthorizationRequest,
+    ) -> RecoveryContextMaterialRequest {
+        RecoveryContextMaterialRequest {
+            snapshot_id: request.snapshot_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            dispatch_id: request.dispatch_id.clone(),
+            input_digest_sha256: request.input_digest_sha256.clone(),
+            expected_scope_ref: request.expected_scope_ref.clone(),
+            evidence_ref: "recovery:r9a-test".to_owned(),
+            purpose: RecoveryContextPurpose::RecoveryOrReconciliation,
+        }
+    }
+
+    fn assert_revoke_replay_matches_original(
+        original: &ContextRevokeReceipt,
+        replay: &ContextRevokeReceipt,
+    ) {
+        let mut expected = original.clone();
+        expected.replayed = true;
+        assert_eq!(replay, &expected);
+    }
+
+    fn assert_authorization_replay_matches_original(
+        original: &DispatchContextConsumptionAuthorizationReceipt,
+        replay: &DispatchContextConsumptionAuthorizationReceipt,
+    ) {
+        let mut expected = original.clone();
+        expected.replayed = true;
+        assert_eq!(replay, &expected);
+    }
+
+    fn force_writer_order(
+        first: &mut ContextAuthority,
+        first_operation: store::TestWriteOperation,
+        second: &mut ContextAuthority,
+        second_operation: store::TestWriteOperation,
+    ) {
+        let competition_open = Arc::new(Barrier::new(2));
+        let busy_observed = Arc::new(Barrier::new(2));
+        let first_competition_open = Arc::clone(&competition_open);
+        let first_busy_observed = Arc::clone(&busy_observed);
+        first
+            .store
+            .set_test_write_hook(Arc::new(move |operation, phase| {
+                if operation == first_operation
+                    && phase == store::TestWritePhase::AfterBeginImmediate
+                {
+                    first_competition_open.wait();
+                    first_busy_observed.wait();
+                }
+            }))
+            .expect("install first-writer test hook");
+        let second_busy_seen = Arc::new(AtomicBool::new(false));
+        second
+            .store
+            .set_test_write_hook(Arc::new(move |operation, phase| {
+                if operation != second_operation {
+                    return;
+                }
+                if phase == store::TestWritePhase::BeforeBeginImmediate {
+                    competition_open.wait();
+                } else if phase == store::TestWritePhase::Busy
+                    && !second_busy_seen.swap(true, Ordering::SeqCst)
+                {
+                    busy_observed.wait();
+                }
+            }))
+            .expect("install second-writer test hook");
+    }
+
+    fn assert_invalid_revoke_without_writes(
+        authority: &mut ContextAuthority,
+        request: &ContextRevokeRequest,
+        expected_failure: ContextAuthorityFailure,
+        expected_governance: &ContextSnapshotGovernance,
+        expected_inspection: ContextStoreInspection,
+    ) {
+        assert_eq!(
+            authority.revoke(&founder("founder:test"), request),
+            Err(expected_failure)
+        );
+        assert_eq!(
+            authority
+                .governance(&request.snapshot_id)
+                .expect("governance after rejected revoke")
+                .expect("snapshot governance"),
+            *expected_governance
+        );
+        assert_eq!(
+            authority.inspect_store().expect("inspection after failure"),
+            expected_inspection
+        );
+    }
+
+    #[test]
+    fn r9a_revoke_exact_replay_survives_restart_and_changed_semantics_conflicts() {
+        let root = test_root("r9a-revoke-replay");
+        let store_epoch = "r9a-revoke-replay-epoch";
+        let mut authority = authority_at(&root, store_epoch);
+        let (_, snapshot) = authority
+            .issue(&input("r9a-revoke-replay-issue"), &compiler())
+            .expect("issue snapshot");
+        let immutable_snapshot = authority
+            .get(&snapshot.snapshot_id)
+            .expect("read immutable snapshot")
+            .expect("snapshot exists");
+        let issued = authority
+            .governance(&snapshot.snapshot_id)
+            .expect("read issued governance")
+            .expect("issued governance");
+        assert_eq!(issued.state, ContextGovernanceState::Issued);
+        assert_eq!(issued.state_revision, 1);
+        let issued_inspection = authority.inspect_store().expect("issued inspection");
+
+        let unauthenticated_request =
+            revoke_request(&snapshot.snapshot_id, 1, "r9a-revoke-unauthenticated");
+        let mut unauthenticated_founder = founder("founder:test");
+        unauthenticated_founder.authenticated = false;
+        assert_eq!(
+            authority.revoke(&unauthenticated_founder, &unauthenticated_request),
+            Err(ContextAuthorityFailure::Unauthorized)
+        );
+        assert_eq!(
+            authority.revoke(&compiler(), &unauthenticated_request),
+            Err(ContextAuthorityFailure::Unauthorized)
+        );
+        assert_eq!(
+            authority
+                .inspect_store()
+                .expect("inspection after unauthorized revoke"),
+            issued_inspection
+        );
+
+        let owner_mismatch = revoke_request(&snapshot.snapshot_id, 1, "r9a-revoke-owner");
+        assert_eq!(
+            authority.revoke(&founder("founder:other"), &owner_mismatch),
+            Err(ContextAuthorityFailure::OwnerMismatch)
+        );
+        assert_eq!(
+            authority
+                .governance(&snapshot.snapshot_id)
+                .expect("governance after owner mismatch")
+                .expect("snapshot governance"),
+            issued
+        );
+        assert_eq!(
+            authority
+                .inspect_store()
+                .expect("inspection after owner mismatch"),
+            issued_inspection
+        );
+
+        let stale = revoke_request(&snapshot.snapshot_id, 2, "r9a-revoke-stale");
+        assert_eq!(
+            authority.revoke(&founder("founder:test"), &stale),
+            Err(ContextAuthorityFailure::StateRevisionConflict)
+        );
+        assert_eq!(
+            authority
+                .governance(&snapshot.snapshot_id)
+                .expect("governance after stale CAS")
+                .expect("snapshot governance"),
+            issued
+        );
+        assert_eq!(
+            authority
+                .inspect_store()
+                .expect("inspection after stale CAS"),
+            issued_inspection
+        );
+
+        let request = revoke_request(&snapshot.snapshot_id, 1, "r9a-revoke-replay");
+        let original = authority
+            .revoke(&founder("founder:test"), &request)
+            .expect("commit revoke");
+        assert!(!original.replayed);
+        assert_eq!(original.snapshot_revision, snapshot.revision);
+        assert_eq!(
+            original.content_digest_sha256,
+            snapshot.compiled_context_sha256
+        );
+        assert_eq!(original.previous_state_revision, 1);
+        assert_eq!(original.result_state_revision, 2);
+        assert_eq!(original.previous_state, ContextGovernanceState::Issued);
+        assert_eq!(original.result_state, ContextGovernanceState::Revoked);
+        let revoked = authority
+            .governance(&snapshot.snapshot_id)
+            .expect("read revoked governance")
+            .expect("revoked governance");
+        assert_eq!(revoked.state, ContextGovernanceState::Revoked);
+        assert_eq!(revoked.state_revision, 2);
+        assert_eq!(
+            authority
+                .get(&snapshot.snapshot_id)
+                .expect("read after revoke")
+                .expect("snapshot after revoke"),
+            immutable_snapshot
+        );
+        let committed_inspection = authority.inspect_store().expect("committed inspection");
+        assert_eq!(
+            committed_inspection.event_count,
+            issued_inspection.event_count + 1
+        );
+        assert_eq!(committed_inspection.revoke_receipt_count, 1);
+        assert_eq!(committed_inspection.revoke_idempotency_count, 1);
+        assert_eq!(committed_inspection.dispatch_authorization_count, 0);
+        assert_eq!(
+            committed_inspection.dispatch_authorization_idempotency_count,
+            0
+        );
+
+        drop(authority);
+        let mut reopened = authority_at(&root, store_epoch);
+        let replay = reopened
+            .revoke(&founder("founder:test"), &request)
+            .expect("replay revoke after restart");
+        assert_revoke_replay_matches_original(&original, &replay);
+        assert_eq!(
+            reopened
+                .inspect_store()
+                .expect("inspection after exact replay"),
+            committed_inspection
+        );
+        assert_eq!(
+            reopened
+                .governance(&snapshot.snapshot_id)
+                .expect("governance after replay")
+                .expect("snapshot governance"),
+            revoked
+        );
+
+        let mut changed_semantics = request.clone();
+        changed_semantics.reason_code = "different-governance-reason".to_owned();
+        assert_eq!(
+            reopened.revoke(&founder("founder:test"), &changed_semantics),
+            Err(ContextAuthorityFailure::IdempotencyConflict)
+        );
+        assert_eq!(
+            reopened
+                .inspect_store()
+                .expect("inspection after idempotency conflict"),
+            committed_inspection
+        );
+        assert_eq!(
+            reopened
+                .get(&snapshot.snapshot_id)
+                .expect("read immutable snapshot after restart")
+                .expect("snapshot after restart"),
+            immutable_snapshot
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove revoke replay root");
+    }
+
+    #[test]
+    fn r9a_expired_issued_snapshot_can_be_revoked() {
+        let root = test_root("r9a-expired-revoke");
+        let mut authority = authority_at(&root, "r9a-expired-revoke-epoch");
+        let mut expiring = input("r9a-expired-revoke-issue");
+        expiring.expires_at_seconds = current_timestamp().expect("clock") + 2;
+        let (_, snapshot) = authority
+            .issue(&expiring, &compiler())
+            .expect("issue expiring snapshot");
+        while current_timestamp().expect("clock") < snapshot.expires_at_seconds {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            authority.resolve_for_consumption(&snapshot.snapshot_id, snapshot.expires_at_seconds),
+            Err(ContextAuthorityFailure::Expired)
+        );
+        let expired_inspection = authority.inspect_store().expect("expired inspection");
+        let expired_authorization = authorization_request(
+            &snapshot.snapshot_id,
+            "attempt:r9a-expired",
+            "dispatch:r9a-expired",
+            "r9a-expired-authorization",
+        );
+        assert_eq!(
+            authority.authorize_dispatch_consumption(&governance_kernel(), &expired_authorization),
+            Err(ContextAuthorityFailure::Expired)
+        );
+        assert_eq!(
+            authority
+                .inspect_store()
+                .expect("inspection after expired authorization"),
+            expired_inspection
+        );
+        let immutable_snapshot = authority
+            .get(&snapshot.snapshot_id)
+            .expect("read expired snapshot")
+            .expect("expired snapshot exists");
+        let receipt = authority
+            .revoke(
+                &founder("founder:test"),
+                &revoke_request(&snapshot.snapshot_id, 1, "r9a-expired-revoke"),
+            )
+            .expect("revoke expired issued snapshot");
+        assert_eq!(receipt.previous_state, ContextGovernanceState::Issued);
+        assert_eq!(receipt.result_state, ContextGovernanceState::Revoked);
+        let governance = authority
+            .governance(&snapshot.snapshot_id)
+            .expect("read expired revoked governance")
+            .expect("snapshot governance");
+        assert_eq!(governance.state, ContextGovernanceState::Revoked);
+        assert_eq!(governance.state_revision, 2);
+        assert_eq!(governance.expires_at_seconds, snapshot.expires_at_seconds);
+        assert_eq!(
+            authority
+                .get(&snapshot.snapshot_id)
+                .expect("read immutable revoked snapshot")
+                .expect("revoked snapshot exists"),
+            immutable_snapshot
+        );
+        drop(authority);
+        fs::remove_dir_all(root).expect("remove expired revoke root");
+    }
+
+    #[test]
+    fn r9a_authorization_first_survives_revoke_and_recovery_is_read_only() {
+        let root = test_root("r9a-authorization-first");
+        let store_epoch = "r9a-authorization-first-epoch";
+        let mut authority = authority_at(&root, store_epoch);
+        let (_, snapshot) = authority
+            .issue(&input("r9a-authorization-first-issue"), &compiler())
+            .expect("issue snapshot");
+        let request = authorization_request(
+            &snapshot.snapshot_id,
+            "attempt:r9a-authorization-first",
+            "dispatch:r9a-authorization-first",
+            "r9a-authorization-first",
+        );
+        let authorization = authority
+            .authorize_dispatch_consumption(&governance_kernel(), &request)
+            .expect("authorize dispatch consumption");
+        assert!(!authorization.replayed);
+        assert_eq!(authorization.observed_state_revision, 1);
+        let revoke = authority
+            .revoke(
+                &founder("founder:test"),
+                &revoke_request(&snapshot.snapshot_id, 1, "r9a-authorization-first-revoke"),
+            )
+            .expect("revoke after authorization");
+        assert_eq!(revoke.result_state_revision, 2);
+        let revoked_governance = authority
+            .governance(&snapshot.snapshot_id)
+            .expect("read revoked governance")
+            .expect("snapshot governance");
+        let stable_inspection = authority.inspect_store().expect("stable inspection");
+        assert_eq!(stable_inspection.dispatch_authorization_count, 1);
+        assert_eq!(
+            stable_inspection.dispatch_authorization_idempotency_count,
+            1
+        );
+        assert_eq!(stable_inspection.revoke_receipt_count, 1);
+
+        drop(authority);
+        let mut reopened = authority_at(&root, store_epoch);
+        let replay = reopened
+            .authorize_dispatch_consumption(&governance_kernel(), &request)
+            .expect("replay authorization after revoke and restart");
+        assert_authorization_replay_matches_original(&authorization, &replay);
+        reopened
+            .verify_dispatch_authorization(&governance_kernel(), &authorization)
+            .expect("verify original authorization after revoke");
+        reopened
+            .verify_dispatch_authorization(&governance_kernel(), &replay)
+            .expect("verify replayed authorization after revoke");
+        let recovery = recovery_request(&request);
+        let first_material = reopened
+            .resolve_for_recovery(&governance_kernel(), &recovery)
+            .expect("recover authorized material after revoke");
+        assert_eq!(first_material.snapshot, snapshot);
+        assert_eq!(
+            first_material.compiled_context,
+            input("unused").compiled_context
+        );
+        assert_eq!(
+            first_material.observed_governance_state,
+            ContextGovernanceState::Revoked
+        );
+        assert_eq!(first_material.observed_state_revision, 2);
+        let second_material = reopened
+            .resolve_for_recovery(&governance_kernel(), &recovery)
+            .expect("replay recovery read");
+        assert_eq!(second_material, first_material);
+        assert_eq!(
+            reopened
+                .inspect_store()
+                .expect("inspection after replay and recovery reads"),
+            stable_inspection
+        );
+        assert_eq!(
+            reopened
+                .governance(&snapshot.snapshot_id)
+                .expect("governance after recovery reads")
+                .expect("snapshot governance"),
+            revoked_governance
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove authorization-first root");
+    }
+
+    #[test]
+    fn r9a_revoke_first_blocks_authorization_with_zero_writes() {
+        let root = test_root("r9a-revoke-first");
+        let mut authority = authority_at(&root, "r9a-revoke-first-epoch");
+        let (_, snapshot) = authority
+            .issue(&input("r9a-revoke-first-issue"), &compiler())
+            .expect("issue snapshot");
+        authority
+            .revoke(
+                &founder("founder:test"),
+                &revoke_request(&snapshot.snapshot_id, 1, "r9a-revoke-first"),
+            )
+            .expect("revoke before authorization");
+        let revoked_governance = authority
+            .governance(&snapshot.snapshot_id)
+            .expect("read revoked governance")
+            .expect("snapshot governance");
+        let stable_inspection = authority.inspect_store().expect("inspection after revoke");
+        let request = authorization_request(
+            &snapshot.snapshot_id,
+            "attempt:r9a-revoke-first",
+            "dispatch:r9a-revoke-first",
+            "r9a-revoke-first-authorization",
+        );
+        assert_eq!(
+            authority.authorize_dispatch_consumption(&governance_kernel(), &request),
+            Err(ContextAuthorityFailure::Revoked)
+        );
+        assert_eq!(
+            authority.resolve_for_recovery(&governance_kernel(), &recovery_request(&request)),
+            Err(ContextAuthorityFailure::NotFound)
+        );
+        assert_eq!(
+            authority
+                .inspect_store()
+                .expect("inspection after rejection"),
+            stable_inspection
+        );
+        assert_eq!(stable_inspection.dispatch_authorization_count, 0);
+        assert_eq!(
+            stable_inspection.dispatch_authorization_idempotency_count,
+            0
+        );
+        assert_eq!(
+            authority
+                .governance(&snapshot.snapshot_id)
+                .expect("governance after rejection")
+                .expect("snapshot governance"),
+            revoked_governance
+        );
+        drop(authority);
+        fs::remove_dir_all(root).expect("remove revoke-first root");
+    }
+
+    #[test]
+    fn r9a_two_connections_deterministically_linearize_authorization_first() {
+        let root = test_root("r9a-concurrent-authorization-first");
+        let store_epoch = "r9a-concurrent-authorization-first-epoch";
+        let mut issuer = authority_at(&root, store_epoch);
+        let (_, snapshot) = issuer
+            .issue(
+                &input("r9a-concurrent-authorization-first-issue"),
+                &compiler(),
+            )
+            .expect("issue snapshot");
+        drop(issuer);
+
+        let request = authorization_request(
+            &snapshot.snapshot_id,
+            "attempt:r9a-concurrent-authorization-first",
+            "dispatch:r9a-concurrent-authorization-first",
+            "r9a-concurrent-authorization-first",
+        );
+        let revoke = revoke_request(
+            &snapshot.snapshot_id,
+            1,
+            "r9a-concurrent-authorization-first-revoke",
+        );
+        let mut authorization_authority = authority_at(&root, store_epoch);
+        let mut revoke_authority = authority_at(&root, store_epoch);
+        force_writer_order(
+            &mut authorization_authority,
+            store::TestWriteOperation::AuthorizeDispatchConsumption,
+            &mut revoke_authority,
+            store::TestWriteOperation::Revoke,
+        );
+
+        let concurrent_request = request.clone();
+        let authorization = thread::spawn(move || {
+            authorization_authority
+                .authorize_dispatch_consumption(&governance_kernel(), &concurrent_request)
+        });
+        let concurrent_revoke = revoke.clone();
+        let revocation = thread::spawn(move || {
+            revoke_authority.revoke(&founder("founder:test"), &concurrent_revoke)
+        });
+
+        let authorization = authorization
+            .join()
+            .expect("authorization thread")
+            .expect("authorization wins write lock");
+        let revocation = revocation
+            .join()
+            .expect("revoke thread")
+            .expect("revoke follows committed authorization");
+        assert_eq!(authorization.observed_state_revision, 1);
+        assert_eq!(revocation.previous_state_revision, 1);
+        assert_eq!(revocation.result_state_revision, 2);
+
+        let mut reopened = authority_at(&root, store_epoch);
+        let stable_inspection = reopened.inspect_store().expect("concurrent inspection");
+        assert_eq!(
+            stable_inspection,
+            ContextStoreInspection {
+                snapshot_count: 1,
+                event_count: 3,
+                idempotency_count: 1,
+                revoke_receipt_count: 1,
+                revoke_idempotency_count: 1,
+                dispatch_authorization_count: 1,
+                dispatch_authorization_idempotency_count: 1,
+                last_event_sequence: 3,
+            }
+        );
+        let replay = reopened
+            .authorize_dispatch_consumption(&governance_kernel(), &request)
+            .expect("authorization replay after revoke and restart");
+        assert_authorization_replay_matches_original(&authorization, &replay);
+        let revoke_replay = reopened
+            .revoke(&founder("founder:test"), &revoke)
+            .expect("revoke replay after authorization and restart");
+        assert_revoke_replay_matches_original(&revocation, &revoke_replay);
+        reopened
+            .verify_dispatch_authorization(&governance_kernel(), &authorization)
+            .expect("original authorization remains verifiable");
+        let recovery = reopened
+            .resolve_for_recovery(&governance_kernel(), &recovery_request(&request))
+            .expect("authorized recovery after revoke and restart");
+        assert_eq!(recovery.snapshot, snapshot);
+        assert_eq!(recovery.compiled_context, input("unused").compiled_context);
+        assert_eq!(
+            recovery.observed_governance_state,
+            ContextGovernanceState::Revoked
+        );
+        assert_eq!(recovery.observed_state_revision, 2);
+        assert_eq!(
+            reopened
+                .inspect_store()
+                .expect("inspection after replay and recovery"),
+            stable_inspection
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove concurrent authorization-first root");
+    }
+
+    #[test]
+    fn r9a_two_connections_deterministically_linearize_revoke_first() {
+        let root = test_root("r9a-concurrent-revoke-first");
+        let store_epoch = "r9a-concurrent-revoke-first-epoch";
+        let mut issuer = authority_at(&root, store_epoch);
+        let (_, snapshot) = issuer
+            .issue(&input("r9a-concurrent-revoke-first-issue"), &compiler())
+            .expect("issue snapshot");
+        drop(issuer);
+
+        let request = authorization_request(
+            &snapshot.snapshot_id,
+            "attempt:r9a-concurrent-revoke-first",
+            "dispatch:r9a-concurrent-revoke-first",
+            "r9a-concurrent-revoke-first",
+        );
+        let revoke = revoke_request(
+            &snapshot.snapshot_id,
+            1,
+            "r9a-concurrent-revoke-first-revoke",
+        );
+        let mut revoke_authority = authority_at(&root, store_epoch);
+        let mut authorization_authority = authority_at(&root, store_epoch);
+        force_writer_order(
+            &mut revoke_authority,
+            store::TestWriteOperation::Revoke,
+            &mut authorization_authority,
+            store::TestWriteOperation::AuthorizeDispatchConsumption,
+        );
+
+        let concurrent_revoke = revoke.clone();
+        let revocation = thread::spawn(move || {
+            revoke_authority.revoke(&founder("founder:test"), &concurrent_revoke)
+        });
+        let concurrent_request = request.clone();
+        let authorization = thread::spawn(move || {
+            authorization_authority
+                .authorize_dispatch_consumption(&governance_kernel(), &concurrent_request)
+        });
+
+        let revocation = revocation
+            .join()
+            .expect("revoke thread")
+            .expect("revoke wins write lock");
+        assert_eq!(
+            authorization.join().expect("authorization thread"),
+            Err(ContextAuthorityFailure::Revoked)
+        );
+
+        let mut reopened = authority_at(&root, store_epoch);
+        let stable_inspection = reopened.inspect_store().expect("concurrent inspection");
+        assert_eq!(
+            stable_inspection,
+            ContextStoreInspection {
+                snapshot_count: 1,
+                event_count: 2,
+                idempotency_count: 1,
+                revoke_receipt_count: 1,
+                revoke_idempotency_count: 1,
+                dispatch_authorization_count: 0,
+                dispatch_authorization_idempotency_count: 0,
+                last_event_sequence: 2,
+            }
+        );
+        let replay = reopened
+            .revoke(&founder("founder:test"), &revoke)
+            .expect("revoke replay after restart");
+        assert_revoke_replay_matches_original(&revocation, &replay);
+        assert_eq!(
+            reopened.authorize_dispatch_consumption(&governance_kernel(), &request),
+            Err(ContextAuthorityFailure::Revoked)
+        );
+        assert_eq!(
+            reopened.resolve_for_recovery(&governance_kernel(), &recovery_request(&request)),
+            Err(ContextAuthorityFailure::NotFound)
+        );
+        assert_eq!(
+            reopened
+                .inspect_store()
+                .expect("inspection after rejected authorization and recovery"),
+            stable_inspection
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).expect("remove concurrent revoke-first root");
+    }
+
+    #[test]
+    fn r9a_authorization_and_recovery_tuple_tamper_fail_closed() {
+        let root = test_root("r9a-tuple-tamper");
+        let mut authority = authority_at(&root, "r9a-tuple-tamper-epoch");
+        let (_, snapshot) = authority
+            .issue(&input("r9a-tuple-tamper-issue"), &compiler())
+            .expect("issue snapshot");
+        let request = authorization_request(
+            &snapshot.snapshot_id,
+            "attempt:r9a-tuple",
+            "dispatch:r9a-tuple",
+            "r9a-tuple-authorization",
+        );
+        let authorization = authority
+            .authorize_dispatch_consumption(&governance_kernel(), &request)
+            .expect("authorize dispatch consumption");
+        authority
+            .verify_dispatch_authorization(&governance_kernel(), &authorization)
+            .expect("verify exact authorization");
+        let stable_inspection = authority.inspect_store().expect("stable inspection");
+        let stable_governance = authority
+            .governance(&snapshot.snapshot_id)
+            .expect("read governance")
+            .expect("snapshot governance");
+
+        assert_eq!(
+            authority.verify_dispatch_authorization(&founder("founder:test"), &authorization),
+            Err(ContextAuthorityFailure::Unauthorized)
+        );
+        assert_eq!(
+            authority.resolve_for_recovery(&founder("founder:test"), &recovery_request(&request)),
+            Err(ContextAuthorityFailure::Unauthorized)
+        );
+
+        let mut same_key_changed_input = request.clone();
+        same_key_changed_input.input_digest_sha256 = "e".repeat(64);
+        assert_eq!(
+            authority.authorize_dispatch_consumption(&governance_kernel(), &same_key_changed_input),
+            Err(ContextAuthorityFailure::IdempotencyConflict)
+        );
+        let mut same_dispatch_changed_tuple = request.clone();
+        same_dispatch_changed_tuple.idempotency_key = "r9a-tuple-new-key".to_owned();
+        same_dispatch_changed_tuple.attempt_id = "attempt:r9a-tuple-other".to_owned();
+        assert_eq!(
+            authority
+                .authorize_dispatch_consumption(&governance_kernel(), &same_dispatch_changed_tuple),
+            Err(ContextAuthorityFailure::AuthorizationTupleConflict)
+        );
+
+        let mut missing_authorization = authorization.clone();
+        missing_authorization.authorization_id = format!("ctxauth:{}", Uuid::now_v7());
+        assert_eq!(
+            authority.verify_dispatch_authorization(&governance_kernel(), &missing_authorization),
+            Err(ContextAuthorityFailure::NotFound)
+        );
+        let mut tampered_receipts = Vec::new();
+        let mut tampered = authorization.clone();
+        tampered.snapshot_id = format!("ctx:{}", "0".repeat(64));
+        tampered_receipts.push(tampered);
+        let mut tampered = authorization.clone();
+        tampered.snapshot_revision += 1;
+        tampered_receipts.push(tampered);
+        let mut tampered = authorization.clone();
+        tampered.observed_state_revision += 1;
+        tampered_receipts.push(tampered);
+        let mut tampered = authorization.clone();
+        tampered.attempt_id.push_str(":tampered");
+        tampered_receipts.push(tampered);
+        let mut tampered = authorization.clone();
+        tampered.dispatch_id.push_str(":tampered");
+        tampered_receipts.push(tampered);
+        let mut tampered = authorization.clone();
+        tampered.input_digest_sha256 = "f".repeat(64);
+        tampered_receipts.push(tampered);
+        let mut tampered = authorization.clone();
+        tampered.expected_scope_ref.push_str(":tampered");
+        tampered_receipts.push(tampered);
+        let mut tampered = authorization.clone();
+        tampered.request_digest_sha256 = "0".repeat(64);
+        tampered_receipts.push(tampered);
+        let mut tampered = authorization.clone();
+        tampered.event_id = Uuid::now_v7().to_string();
+        tampered_receipts.push(tampered);
+        let mut tampered = authorization.clone();
+        tampered.committed_at_seconds += 1;
+        tampered_receipts.push(tampered);
+        for tampered in tampered_receipts {
+            assert_eq!(
+                authority.verify_dispatch_authorization(&governance_kernel(), &tampered),
+                Err(ContextAuthorityFailure::AuthorizationTupleConflict)
+            );
+        }
+
+        let recovery = recovery_request(&request);
+        authority
+            .resolve_for_recovery(&governance_kernel(), &recovery)
+            .expect("resolve exact recovery tuple");
+        let mut tampered = recovery.clone();
+        tampered.snapshot_id = format!("ctx:{}", "0".repeat(64));
+        assert_eq!(
+            authority.resolve_for_recovery(&governance_kernel(), &tampered),
+            Err(ContextAuthorityFailure::AuthorizationTupleConflict)
+        );
+        let mut tampered = recovery.clone();
+        tampered.attempt_id.push_str(":tampered");
+        assert_eq!(
+            authority.resolve_for_recovery(&governance_kernel(), &tampered),
+            Err(ContextAuthorityFailure::AuthorizationTupleConflict)
+        );
+        let mut tampered = recovery.clone();
+        tampered.dispatch_id.push_str(":tampered");
+        assert_eq!(
+            authority.resolve_for_recovery(&governance_kernel(), &tampered),
+            Err(ContextAuthorityFailure::NotFound)
+        );
+        let mut tampered = recovery.clone();
+        tampered.input_digest_sha256 = "f".repeat(64);
+        assert_eq!(
+            authority.resolve_for_recovery(&governance_kernel(), &tampered),
+            Err(ContextAuthorityFailure::AuthorizationTupleConflict)
+        );
+        let mut tampered = recovery.clone();
+        tampered.expected_scope_ref.push_str(":tampered");
+        assert_eq!(
+            authority.resolve_for_recovery(&governance_kernel(), &tampered),
+            Err(ContextAuthorityFailure::AuthorizationTupleConflict)
+        );
+        assert_eq!(
+            authority
+                .inspect_store()
+                .expect("inspection after tuple tamper"),
+            stable_inspection
+        );
+        assert_eq!(
+            authority
+                .governance(&snapshot.snapshot_id)
+                .expect("governance after tuple tamper")
+                .expect("snapshot governance"),
+            stable_governance
+        );
+        drop(authority);
+        fs::remove_dir_all(root).expect("remove tuple tamper root");
+    }
+
+    #[test]
+    fn r9a_revoke_reference_bounds_and_empty_padded_or_control_values_fail_closed() {
+        let root = test_root("r9a-revoke-validation");
+        let mut authority = authority_at(&root, "r9a-revoke-validation-epoch");
+        let (_, snapshot) = authority
+            .issue(&input("r9a-revoke-validation-issue"), &compiler())
+            .expect("issue snapshot");
+        let governance = authority
+            .governance(&snapshot.snapshot_id)
+            .expect("read governance")
+            .expect("snapshot governance");
+        let inspection = authority.inspect_store().expect("baseline inspection");
+        let base = revoke_request(&snapshot.snapshot_id, 1, "r9a-revoke-validation");
+        let mut cases = Vec::new();
+
+        let mut request = base.clone();
+        request.reason_code.clear();
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("reason_code"),
+        ));
+        let mut request = base.clone();
+        request.reason_code = " padded".to_owned();
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("reason_code"),
+        ));
+        let mut request = base.clone();
+        request.reason_code = "control\u{0007}".to_owned();
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("reason_code"),
+        ));
+        let mut request = base.clone();
+        request.reason_code = "r".repeat(MAX_REVOKE_REASON_BYTES + 1);
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("reason_code"),
+        ));
+
+        let mut request = base.clone();
+        request.evidence_refs.clear();
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("evidence_refs"),
+        ));
+        let mut request = base.clone();
+        request.evidence_refs = vec![String::new()];
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("evidence_ref"),
+        ));
+        let mut request = base.clone();
+        request.evidence_refs = vec!["padded ".to_owned()];
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("evidence_ref"),
+        ));
+        let mut request = base.clone();
+        request.evidence_refs = vec!["control\nvalue".to_owned()];
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("evidence_ref"),
+        ));
+        let mut request = base.clone();
+        request.evidence_refs = vec!["e".repeat(MAX_REVOKE_EVIDENCE_BYTES + 1)];
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("evidence_ref"),
+        ));
+        let mut request = base.clone();
+        request.evidence_refs = vec!["evidence".to_owned(); MAX_REVOKE_EVIDENCE_ITEMS + 1];
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("evidence_refs"),
+        ));
+        let mut request = base.clone();
+        request.evidence_refs = vec!["e".repeat(MAX_REVOKE_EVIDENCE_BYTES); 9];
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("evidence_refs"),
+        ));
+
+        let mut request = base.clone();
+        request.confirmation_proof_ref.clear();
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("confirmation_proof_ref"),
+        ));
+        let mut request = base.clone();
+        request.confirmation_proof_ref = " padded".to_owned();
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("confirmation_proof_ref"),
+        ));
+        let mut request = base.clone();
+        request.confirmation_proof_ref = "control\rvalue".to_owned();
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("confirmation_proof_ref"),
+        ));
+        let mut request = base.clone();
+        request.confirmation_proof_ref = "p".repeat(MAX_CONFIRMATION_PROOF_BYTES + 1);
+        cases.push((
+            request,
+            ContextAuthorityFailure::InvalidArgument("confirmation_proof_ref"),
+        ));
+
+        for (request, expected_failure) in cases {
+            assert_invalid_revoke_without_writes(
+                &mut authority,
+                &request,
+                expected_failure,
+                &governance,
+                inspection,
+            );
+        }
+
+        let mut boundary = base;
+        boundary.reason_code = "r".repeat(MAX_REVOKE_REASON_BYTES);
+        boundary.evidence_refs = vec![
+            "e".repeat(MAX_REVOKE_EVIDENCE_BYTES);
+            MAX_REVOKE_EVIDENCE_TOTAL_BYTES / MAX_REVOKE_EVIDENCE_BYTES
+        ];
+        boundary.confirmation_proof_ref = "p".repeat(MAX_CONFIRMATION_PROOF_BYTES);
+        authority
+            .revoke(&founder("founder:test"), &boundary)
+            .expect("accept exact opaque-reference bounds");
+        let final_inspection = authority.inspect_store().expect("final inspection");
+        assert_eq!(final_inspection.event_count, inspection.event_count + 1);
+        assert_eq!(final_inspection.revoke_receipt_count, 1);
+        assert_eq!(final_inspection.revoke_idempotency_count, 1);
+        drop(authority);
+        fs::remove_dir_all(root).expect("remove revoke validation root");
     }
 
     #[test]

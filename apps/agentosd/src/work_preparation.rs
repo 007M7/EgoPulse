@@ -512,7 +512,10 @@ fn context_failure(error: ContextAuthorityFailure) -> CommandPortFailure {
         | ContextAuthorityFailure::ScopeMismatch
         | ContextAuthorityFailure::InvalidArgument(_)
         | ContextAuthorityFailure::Unauthorized
+        | ContextAuthorityFailure::OwnerMismatch
         | ContextAuthorityFailure::IdempotencyConflict
+        | ContextAuthorityFailure::StateRevisionConflict
+        | ContextAuthorityFailure::AuthorizationTupleConflict
         | ContextAuthorityFailure::Clock => CommandPortFailure::IntegrityFailure,
     }
 }

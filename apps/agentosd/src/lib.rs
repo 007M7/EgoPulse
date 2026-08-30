@@ -40,9 +40,10 @@ use egopulse_local_api::{
         MemoryRetrievalPort,
     },
     command_gateway::{
-        CommandGatewayApplication, CommandPortFailure, CommandPortResult, CommandPrincipal,
-        FailClosedMemoryMutationPort, LocalCommandGatewayEndpoint, MemoryMutationPort,
-        PolicyCommandPort, TaskCommandPort, VerdictCommandPort, WorkPreparationPort,
+        CommandExtensionPorts, CommandGatewayApplication, CommandPortFailure, CommandPortResult,
+        CommandPrincipal, FailClosedMemoryMutationPort, LocalCommandGatewayEndpoint,
+        MemoryMutationPort, PolicyCommandPort, TaskCommandPort, VerdictCommandPort,
+        WorkPreparationPort,
     },
     read_gateway::{NoopReadGatewayAuditSink, ReadGatewayApplication},
     read_gateway_policy::ReadGatewayPolicy,
@@ -1297,8 +1298,10 @@ impl DaemonComposition {
             providers.task_port,
             providers.policy_port,
             providers.verdict_port,
-            providers.memory_mutation_port,
-            providers.work_preparation_port,
+            CommandExtensionPorts::new(
+                providers.memory_mutation_port,
+                providers.work_preparation_port,
+            ),
         ));
         let command = LocalCommandGatewayEndpoint::new(command_application);
         let cognition_application = Arc::new(CognitionGatewayApplication::new(
