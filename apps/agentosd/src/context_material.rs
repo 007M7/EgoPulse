@@ -1,15 +1,19 @@
 use egopulse_cognition_runtime::context_authority::{
-    AuthenticatedContextPrincipal, ContextAuthority, ContextAuthorityFailure, ContextPrincipalKind,
+    AuthenticatedContextPrincipal, ContextAuthority, ContextAuthorityFailure,
+    ContextGovernanceState, ContextPrincipalKind, ContextSnapshot,
     DispatchContextConsumptionAuthorizationLookup,
     DispatchContextConsumptionAuthorizationReceipt as AuthorityAuthorizationReceipt,
-    DispatchContextConsumptionAuthorizationRequest,
+    DispatchContextConsumptionAuthorizationRequest, RecoveryContextMaterialRequest,
+    RecoveryContextPurpose,
 };
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     DispatchEnvelope, HarnessError, HarnessErrorCode,
 };
 use egopulse_harness_adapter::{
     AuthorizedDispatchContext, DispatchContextAuthorization, DispatchContextAuthorizationGate,
-    DispatchContextAuthorizationReceipt, DispatchContextBinding, DispatchContextReference,
+    DispatchContextAuthorizationReceipt, DispatchContextBinding, DispatchContextRecovery,
+    DispatchContextRecoveryGate, DispatchContextReference, HistoricalDispatchContext,
+    HistoricalDispatchContextBinding, HistoricalDispatchContextState,
     classify_dispatch_context_reference,
 };
 use sha2::{Digest, Sha256};
@@ -165,6 +169,191 @@ impl DispatchContextAuthorizationGate for ContextDispatchAuthorizationGate {
     ) -> Result<DispatchContextAuthorization, HarnessError> {
         self.authorize_or_lookup(envelope, false)
     }
+}
+
+/// Independent, read-only production bridge for reconciliation of a dispatch
+/// whose exact Context authorization lineage is already durable. It shares the
+/// same Authority instance as normal authorization but cannot mint a receipt.
+pub(crate) struct ContextDispatchRecoveryGate {
+    context: Arc<Mutex<ContextAuthority>>,
+    principal: AuthenticatedContextPrincipal,
+}
+
+impl ContextDispatchRecoveryGate {
+    pub(crate) fn new(context: Arc<Mutex<ContextAuthority>>) -> Self {
+        Self {
+            context,
+            principal: AuthenticatedContextPrincipal {
+                kind: ContextPrincipalKind::GovernanceKernel,
+                principal_id: GOVERNANCE_KERNEL_PRINCIPAL_ID.to_owned(),
+                authenticated: true,
+            },
+        }
+    }
+}
+
+impl DispatchContextRecoveryGate for ContextDispatchRecoveryGate {
+    fn recover_existing_dispatch(
+        &self,
+        envelope: &DispatchEnvelope,
+    ) -> Result<DispatchContextRecovery, HarnessError> {
+        let snapshot_id = match classify_dispatch_context_reference(&envelope.input_bundle_ref) {
+            DispatchContextReference::NotContextBound => {
+                return Ok(DispatchContextRecovery::NotContextBound);
+            }
+            DispatchContextReference::ContextSnapshot { snapshot_id } => snapshot_id,
+            DispatchContextReference::InvalidContextBinding => {
+                return Err(context_error(
+                    HarnessErrorCode::ConfigInvalid,
+                    "CONTEXT_BINDING_INVALID",
+                    false,
+                ));
+            }
+        };
+        let authority = self.context.lock().map_err(|_| {
+            context_error(
+                HarnessErrorCode::IntegrityFailure,
+                "CONTEXT_AUTHORITY_LOCK_FAILED",
+                false,
+            )
+        })?;
+        let snapshot = authority
+            .get(&snapshot_id)
+            .map_err(map_authority_failure)?
+            .ok_or_else(|| {
+                context_error(
+                    HarnessErrorCode::DependencyUnavailable,
+                    "CONTEXT_SNAPSHOT_NOT_FOUND",
+                    false,
+                )
+            })?;
+        if snapshot.snapshot_id != snapshot_id
+            || snapshot.revision == 0
+            || snapshot.compiled_context_sha256 != envelope.input_bundle_sha256
+            || !canonical_sha256_is_valid(&snapshot.compiled_context_sha256)
+            || snapshot.target_scope_ref.is_empty()
+        {
+            return Err(context_error(
+                HarnessErrorCode::IntegrityFailure,
+                "CONTEXT_SNAPSHOT_BINDING_INVALID",
+                false,
+            ));
+        }
+        let lookup = DispatchContextConsumptionAuthorizationLookup {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            attempt_id: envelope.attempt_id.clone(),
+            dispatch_id: envelope.dispatch_id.clone(),
+            input_digest_sha256: envelope.input_bundle_sha256.clone(),
+            expected_scope_ref: snapshot.target_scope_ref.clone(),
+        };
+        let receipt = authority
+            .dispatch_authorization_by_dispatch_id(&self.principal, &lookup)
+            .map_err(map_authority_failure)?
+            .ok_or_else(|| {
+                context_error(
+                    HarnessErrorCode::IntegrityFailure,
+                    "CONTEXT_AUTHORIZATION_MISSING",
+                    false,
+                )
+            })?;
+        if !recovery_authorization_matches(&snapshot, envelope, &receipt) {
+            return Err(context_error(
+                HarnessErrorCode::IntegrityFailure,
+                "CONTEXT_AUTHORIZATION_INVALID",
+                false,
+            ));
+        }
+        authority
+            .verify_dispatch_authorization(&self.principal, &receipt)
+            .map_err(map_authority_failure)?;
+        let evidence_ref = stable_recovery_evidence_ref(&snapshot, envelope, &receipt);
+        let recovered = authority
+            .resolve_for_recovery(
+                &self.principal,
+                &RecoveryContextMaterialRequest {
+                    snapshot_id: snapshot.snapshot_id.clone(),
+                    attempt_id: envelope.attempt_id.clone(),
+                    dispatch_id: envelope.dispatch_id.clone(),
+                    input_digest_sha256: envelope.input_bundle_sha256.clone(),
+                    expected_scope_ref: snapshot.target_scope_ref.clone(),
+                    evidence_ref,
+                    purpose: RecoveryContextPurpose::RecoveryOrReconciliation,
+                },
+            )
+            .map_err(map_authority_failure)?;
+        if recovered.snapshot != snapshot
+            || recovered.observed_state_revision == 0
+            || sha256(&recovered.compiled_context) != snapshot.compiled_context_sha256
+        {
+            return Err(context_error(
+                HarnessErrorCode::IntegrityFailure,
+                "CONTEXT_RECOVERY_EVIDENCE_INVALID",
+                false,
+            ));
+        }
+        let observed_state = match recovered.observed_governance_state {
+            ContextGovernanceState::Issued => HistoricalDispatchContextState::Issued,
+            ContextGovernanceState::Revoked => HistoricalDispatchContextState::Revoked,
+        };
+        Ok(DispatchContextRecovery::Historical(Box::new(
+            HistoricalDispatchContext {
+                binding: HistoricalDispatchContextBinding {
+                    snapshot_id: snapshot.snapshot_id,
+                    snapshot_revision: snapshot.revision,
+                    content_digest_sha256: snapshot.compiled_context_sha256,
+                    expected_scope_ref: snapshot.target_scope_ref,
+                },
+                authority_immutable_bytes: recovered.compiled_context,
+                observed_state_revision: recovered.observed_state_revision,
+                observed_state,
+            },
+        )))
+    }
+}
+
+fn recovery_authorization_matches(
+    snapshot: &ContextSnapshot,
+    envelope: &DispatchEnvelope,
+    receipt: &AuthorityAuthorizationReceipt,
+) -> bool {
+    !receipt.authorization_id.is_empty()
+        && receipt.snapshot_id == snapshot.snapshot_id
+        && receipt.snapshot_revision == snapshot.revision
+        && receipt.observed_state_revision > 0
+        && receipt.attempt_id == envelope.attempt_id
+        && receipt.dispatch_id == envelope.dispatch_id
+        && receipt.input_digest_sha256 == envelope.input_bundle_sha256
+        && receipt.input_digest_sha256 == snapshot.compiled_context_sha256
+        && receipt.expected_scope_ref == snapshot.target_scope_ref
+        && canonical_sha256_is_valid(&receipt.request_digest_sha256)
+        && !receipt.event_id.is_empty()
+        && receipt.committed_at_seconds > 0
+}
+
+fn stable_recovery_evidence_ref(
+    snapshot: &ContextSnapshot,
+    envelope: &DispatchEnvelope,
+    receipt: &AuthorityAuthorizationReceipt,
+) -> String {
+    fn field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = Sha256::new();
+    field(&mut hasher, b"egopulse/context-recovery-evidence/v1");
+    field(&mut hasher, snapshot.snapshot_id.as_bytes());
+    field(&mut hasher, &snapshot.revision.to_le_bytes());
+    field(&mut hasher, snapshot.compiled_context_sha256.as_bytes());
+    field(&mut hasher, snapshot.target_scope_ref.as_bytes());
+    field(&mut hasher, envelope.attempt_id.as_bytes());
+    field(&mut hasher, envelope.dispatch_id.as_bytes());
+    field(&mut hasher, envelope.input_bundle_sha256.as_bytes());
+    field(&mut hasher, receipt.authorization_id.as_bytes());
+    field(&mut hasher, &receipt.observed_state_revision.to_le_bytes());
+    field(&mut hasher, receipt.request_digest_sha256.as_bytes());
+    field(&mut hasher, receipt.event_id.as_bytes());
+    format!("context-recovery-sha256:{:x}", hasher.finalize())
 }
 
 fn authorized_context(
@@ -554,5 +743,148 @@ mod tests {
             "CONTEXT_AUTHORIZATION_TUPLE_CONFLICT"
         );
         assert_eq!(inspect(&authority), after_revoke);
+    }
+
+    #[test]
+    fn authorization_first_then_revoke_recovers_exact_immutable_material_without_writes() {
+        let root = FixtureRoot::new("recovery-authorization-first");
+        let authority = open_authority(&root);
+        let snapshot = issue_snapshot(&authority, "issue-recovery-authorization-first");
+        let dispatch = envelope(&snapshot, "dispatch:recovery-authorization-first");
+        ContextDispatchAuthorizationGate::new(Arc::clone(&authority))
+            .authorize_ready_dispatch(&dispatch)
+            .expect("authorize ready dispatch");
+        revoke(&authority, &snapshot, "revoke-before-recovery");
+        let before_recovery = inspect(&authority);
+
+        let recovered = ContextDispatchRecoveryGate::new(Arc::clone(&authority))
+            .recover_existing_dispatch(&dispatch)
+            .expect("recover exact authorized dispatch after revoke");
+        let DispatchContextRecovery::Historical(recovered) = recovered else {
+            panic!("context dispatch must recover historical material");
+        };
+        assert_eq!(recovered.binding.snapshot_id, snapshot.snapshot_id);
+        assert_eq!(recovered.binding.snapshot_revision, snapshot.revision);
+        assert_eq!(
+            recovered.binding.content_digest_sha256,
+            snapshot.compiled_context_sha256
+        );
+        assert_eq!(
+            recovered.binding.expected_scope_ref,
+            snapshot.target_scope_ref
+        );
+        assert_eq!(
+            recovered.authority_immutable_bytes,
+            br#"{"prompt":"authorized context"}"#
+        );
+        assert_eq!(
+            recovered.observed_state,
+            HistoricalDispatchContextState::Revoked
+        );
+        assert!(recovered.observed_state_revision > 1);
+        assert_eq!(inspect(&authority), before_recovery);
+    }
+
+    #[test]
+    fn recovery_requires_existing_exact_authorization_tuple_and_never_writes() {
+        let root = FixtureRoot::new("recovery-exact-tuple");
+        let authority = open_authority(&root);
+        let snapshot = issue_snapshot(&authority, "issue-recovery-exact-tuple");
+        let dispatch = envelope(&snapshot, "dispatch:recovery-exact-tuple");
+        let recovery_gate = ContextDispatchRecoveryGate::new(Arc::clone(&authority));
+
+        let before_missing = inspect(&authority);
+        let missing = recovery_gate
+            .recover_existing_dispatch(&dispatch)
+            .expect_err("missing authorization must fail closed");
+        assert_eq!(missing.safe_detail_code, "CONTEXT_AUTHORIZATION_MISSING");
+        assert_eq!(inspect(&authority), before_missing);
+
+        ContextDispatchAuthorizationGate::new(Arc::clone(&authority))
+            .authorize_ready_dispatch(&dispatch)
+            .expect("authorize exact tuple");
+        let before_drift = inspect(&authority);
+        let mut changed = dispatch.clone();
+        changed.attempt_id = "attempt:wrong-recovery-lineage".to_owned();
+        let drift = recovery_gate
+            .recover_existing_dispatch(&changed)
+            .expect_err("wrong tuple must fail closed");
+        assert_eq!(
+            drift.safe_detail_code,
+            "CONTEXT_AUTHORIZATION_TUPLE_CONFLICT"
+        );
+        assert_eq!(inspect(&authority), before_drift);
+    }
+
+    #[test]
+    fn recovery_receipt_match_and_evidence_digest_bind_the_complete_lineage() {
+        let root = FixtureRoot::new("recovery-lineage-digest");
+        let authority = open_authority(&root);
+        let snapshot = issue_snapshot(&authority, "issue-recovery-lineage-digest");
+        let dispatch = envelope(&snapshot, "dispatch:recovery-lineage-digest");
+        let gate = ContextDispatchAuthorizationGate::new(Arc::clone(&authority));
+        gate.authorize_ready_dispatch(&dispatch)
+            .expect("authorize exact tuple");
+        let lookup = DispatchContextConsumptionAuthorizationLookup {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            attempt_id: dispatch.attempt_id.clone(),
+            dispatch_id: dispatch.dispatch_id.clone(),
+            input_digest_sha256: dispatch.input_bundle_sha256.clone(),
+            expected_scope_ref: snapshot.target_scope_ref.clone(),
+        };
+        let receipt = authority
+            .lock()
+            .expect("context lock")
+            .dispatch_authorization_by_dispatch_id(&gate.principal, &lookup)
+            .expect("lookup authorization")
+            .expect("authorization receipt");
+        let before = inspect(&authority);
+        assert!(recovery_authorization_matches(
+            &snapshot, &dispatch, &receipt
+        ));
+
+        for field in [
+            "snapshot-id",
+            "snapshot-revision",
+            "state-revision",
+            "attempt",
+            "dispatch",
+            "input-digest",
+            "scope",
+            "request-digest",
+        ] {
+            let mut changed = receipt.clone();
+            match field {
+                "snapshot-id" => changed.snapshot_id.push_str(":drift"),
+                "snapshot-revision" => changed.snapshot_revision += 1,
+                "state-revision" => changed.observed_state_revision = 0,
+                "attempt" => changed.attempt_id.push_str(":drift"),
+                "dispatch" => changed.dispatch_id.push_str(":drift"),
+                "input-digest" => changed.input_digest_sha256 = "f".repeat(64),
+                "scope" => changed.expected_scope_ref.push_str(":drift"),
+                "request-digest" => changed.request_digest_sha256 = "F".repeat(64),
+                _ => unreachable!(),
+            }
+            assert!(
+                !recovery_authorization_matches(&snapshot, &dispatch, &changed),
+                "receipt drift must fail: {field}"
+            );
+        }
+
+        let evidence = stable_recovery_evidence_ref(&snapshot, &dispatch, &receipt);
+        assert!(evidence.starts_with("context-recovery-sha256:"));
+        assert_eq!(evidence.len(), "context-recovery-sha256:".len() + 64);
+        assert!(!evidence.contains(&dispatch.dispatch_id));
+        assert_eq!(
+            evidence,
+            stable_recovery_evidence_ref(&snapshot, &dispatch, &receipt)
+        );
+        let mut drifted_dispatch = dispatch.clone();
+        drifted_dispatch.attempt_id.push_str(":drift");
+        assert_ne!(
+            evidence,
+            stable_recovery_evidence_ref(&snapshot, &drifted_dispatch, &receipt)
+        );
+        assert_eq!(inspect(&authority), before);
     }
 }

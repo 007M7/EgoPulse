@@ -1117,9 +1117,15 @@ impl DaemonProviders {
                 SystemAdapterClock,
             );
             let adapter = match self.context_authority.as_ref() {
-                Some(context) => adapter.with_dispatch_context_authorization_gate(
-                    context_material::ContextDispatchAuthorizationGate::new(Arc::clone(context)),
-                ),
+                Some(context) => adapter
+                    .with_dispatch_context_authorization_gate(
+                        context_material::ContextDispatchAuthorizationGate::new(Arc::clone(
+                            context,
+                        )),
+                    )
+                    .with_dispatch_context_recovery_gate(
+                        context_material::ContextDispatchRecoveryGate::new(Arc::clone(context)),
+                    ),
                 None => adapter,
             };
             let principal = AuthenticatedCollaborationPrincipal {

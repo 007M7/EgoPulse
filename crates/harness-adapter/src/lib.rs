@@ -17,10 +17,11 @@ pub use edge::{
 pub use runtime::{
     AdapterClock, AdapterReconciliationEvidence, AuthorizedDispatchContext,
     DispatchContextAuthorization, DispatchContextAuthorizationGate,
-    DispatchContextAuthorizationReceipt, DispatchContextBinding, DispatchContextReference,
-    DispatchMaterialResolver, DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent,
-    GovernedAdapterError, GovernedHarnessAdapter, NativeHarnessDriver, NativeHarnessFuture,
-    ProbeValidationError, ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
-    SystemAdapterClock, TerminalOutputCandidate, classify_dispatch_context_reference,
-    validate_probe_result,
+    DispatchContextAuthorizationReceipt, DispatchContextBinding, DispatchContextRecovery,
+    DispatchContextRecoveryGate, DispatchContextReference, DispatchMaterialResolver,
+    DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, GovernedAdapterError,
+    GovernedHarnessAdapter, HistoricalDispatchContext, HistoricalDispatchContextBinding,
+    HistoricalDispatchContextState, NativeHarnessDriver, NativeHarnessFuture, ProbeValidationError,
+    ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial, SystemAdapterClock,
+    TerminalOutputCandidate, classify_dispatch_context_reference, validate_probe_result,
 };

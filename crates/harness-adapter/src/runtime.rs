@@ -140,6 +140,50 @@ pub trait DispatchContextAuthorizationGate: Send {
     ) -> Result<DispatchContextAuthorization, HarnessError>;
 }
 
+/// Immutable Context identity carried into reconciliation. This binding is
+/// intentionally separate from normal-dispatch authorization and contains no
+/// permission or authorization identifier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalDispatchContextBinding {
+    pub snapshot_id: String,
+    pub snapshot_revision: u64,
+    pub content_digest_sha256: String,
+    pub expected_scope_ref: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoricalDispatchContextState {
+    Issued,
+    Revoked,
+}
+
+/// Authority-owned immutable Context material available solely for recovering
+/// a dispatch whose authorization lineage already exists. This type does not
+/// represent permission to begin or send a dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalDispatchContext {
+    pub binding: HistoricalDispatchContextBinding,
+    pub authority_immutable_bytes: Vec<u8>,
+    pub observed_state_revision: u64,
+    pub observed_state: HistoricalDispatchContextState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DispatchContextRecovery {
+    NotContextBound,
+    Historical(Box<HistoricalDispatchContext>),
+}
+
+/// Read-only Context recovery seam. Implementations may only recover immutable
+/// material for an existing exact dispatch authorization lineage; they must
+/// never mint authorization or confer send permission.
+pub trait DispatchContextRecoveryGate: Send {
+    fn recover_existing_dispatch(
+        &self,
+        envelope: &DispatchEnvelope,
+    ) -> Result<DispatchContextRecovery, HarnessError>;
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct RejectContextAuthorizationGate;
 
@@ -159,6 +203,18 @@ impl DispatchContextAuthorizationGate for RejectContextAuthorizationGate {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RejectContextRecoveryGate;
+
+impl DispatchContextRecoveryGate for RejectContextRecoveryGate {
+    fn recover_existing_dispatch(
+        &self,
+        envelope: &DispatchEnvelope,
+    ) -> Result<DispatchContextRecovery, HarnessError> {
+        reject_context_recovery(&envelope.input_bundle_ref)
+    }
+}
+
 struct AuthorizedDispatchMaterial {
     material: ResolvedDispatchMaterial,
     _context: Option<AuthorizedDispatchContext>,
@@ -168,6 +224,11 @@ impl AuthorizedDispatchMaterial {
     fn material(&self) -> &ResolvedDispatchMaterial {
         &self.material
     }
+}
+
+struct HistoricalDispatchMaterial {
+    material: ResolvedDispatchMaterial,
+    _context: Option<HistoricalDispatchContext>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -391,6 +452,7 @@ pub struct GovernedHarnessAdapter<R, D, C> {
     clock: C,
     context_authorization_gate: Box<dyn DispatchContextAuthorizationGate>,
     context_authorization_gate_installed: bool,
+    context_recovery_gate: Box<dyn DispatchContextRecoveryGate>,
 }
 
 impl<R, D, C> GovernedHarnessAdapter<R, D, C>
@@ -419,6 +481,7 @@ where
             clock,
             context_authorization_gate: Box::new(RejectContextAuthorizationGate),
             context_authorization_gate_installed: false,
+            context_recovery_gate: Box::new(RejectContextRecoveryGate),
         }
     }
 
@@ -431,6 +494,17 @@ where
     ) -> Self {
         self.context_authorization_gate = Box::new(gate);
         self.context_authorization_gate_installed = true;
+        self
+    }
+
+    /// Installs the independent, read-only Context recovery bridge. It is not
+    /// used by normal dispatch and cannot authorize, begin, or send work.
+    #[must_use]
+    pub fn with_dispatch_context_recovery_gate(
+        mut self,
+        gate: impl DispatchContextRecoveryGate + 'static,
+    ) -> Self {
+        self.context_recovery_gate = Box::new(gate);
         self
     }
 
@@ -887,13 +961,30 @@ where
             .ok_or(GovernedAdapterError::DispatchNotFound)?;
         let delivery_receipt = self.edge.dispatch_receipt(dispatch_id)?;
         let now = self.clock.now();
-        let (finding, supplemental_raw_evidence) = match self.resolver.resolve(&envelope) {
-            Ok(material) => match self
+        let reference = classify_dispatch_context_reference(&envelope.input_bundle_ref);
+        let recovered_material = match reference {
+            DispatchContextReference::InvalidContextBinding => Err(context_binding_error(
+                HarnessErrorCode::ConfigInvalid,
+                "CONTEXT_BINDING_INVALID",
+                false,
+            )),
+            reference => self
+                .context_recovery_gate
+                .recover_existing_dispatch(&envelope)
+                .and_then(|recovery| validate_context_recovery(&envelope, &reference, recovery))
+                .and_then(|context| {
+                    self.resolver
+                        .resolve(&envelope)
+                        .and_then(|material| recover_dispatch_material(material, context))
+                }),
+        };
+        let (finding, supplemental_raw_evidence) = match recovered_material {
+            Ok(historical_material) => match self
                 .driver
                 .reconcile(&ReconciliationContext {
                     envelope: envelope.clone(),
                     delivery_receipt,
-                    material,
+                    material: historical_material.material,
                 })
                 .await
             {
@@ -1449,6 +1540,95 @@ fn reject_context_authorization(
             false,
         )),
     }
+}
+
+fn reject_context_recovery(
+    input_bundle_ref: &str,
+) -> Result<DispatchContextRecovery, HarnessError> {
+    match classify_dispatch_context_reference(input_bundle_ref) {
+        DispatchContextReference::NotContextBound => Ok(DispatchContextRecovery::NotContextBound),
+        DispatchContextReference::ContextSnapshot { .. } => Err(context_binding_error(
+            HarnessErrorCode::DependencyUnavailable,
+            "CONTEXT_RECOVERY_GATE_UNAVAILABLE",
+            true,
+        )),
+        DispatchContextReference::InvalidContextBinding => Err(context_binding_error(
+            HarnessErrorCode::ConfigInvalid,
+            "CONTEXT_BINDING_INVALID",
+            false,
+        )),
+    }
+}
+
+fn validate_context_recovery(
+    envelope: &DispatchEnvelope,
+    reference: &DispatchContextReference,
+    recovery: DispatchContextRecovery,
+) -> Result<Option<HistoricalDispatchContext>, HarnessError> {
+    let context = match (reference, recovery) {
+        (DispatchContextReference::NotContextBound, DispatchContextRecovery::NotContextBound) => {
+            None
+        }
+        (
+            DispatchContextReference::ContextSnapshot { snapshot_id },
+            DispatchContextRecovery::Historical(context),
+        ) => {
+            let binding = &context.binding;
+            let valid = binding.snapshot_id == *snapshot_id
+                && binding.snapshot_revision > 0
+                && canonical_sha256_is_valid(&binding.content_digest_sha256)
+                && binding.content_digest_sha256 == envelope.input_bundle_sha256
+                && snapshot_id
+                    .strip_prefix("ctx:")
+                    .is_some_and(|digest| digest == binding.content_digest_sha256)
+                && opaque_reference_is_valid(&binding.expected_scope_ref)
+                && context.observed_state_revision > 0
+                && sha256(&context.authority_immutable_bytes) == binding.content_digest_sha256;
+            if !valid {
+                return Err(context_binding_error(
+                    HarnessErrorCode::IntegrityFailure,
+                    "CONTEXT_RECOVERY_EVIDENCE_INVALID",
+                    false,
+                ));
+            }
+            Some(*context)
+        }
+        (DispatchContextReference::InvalidContextBinding, _) => {
+            return Err(context_binding_error(
+                HarnessErrorCode::ConfigInvalid,
+                "CONTEXT_BINDING_INVALID",
+                false,
+            ));
+        }
+        _ => {
+            return Err(context_binding_error(
+                HarnessErrorCode::IntegrityFailure,
+                "CONTEXT_RECOVERY_EVIDENCE_INVALID",
+                false,
+            ));
+        }
+    };
+    Ok(context)
+}
+
+fn recover_dispatch_material(
+    material: ResolvedDispatchMaterial,
+    context: Option<HistoricalDispatchContext>,
+) -> Result<HistoricalDispatchMaterial, HarnessError> {
+    if let Some(context) = context.as_ref()
+        && (sha256(&material.canonical_input_bundle) != context.binding.content_digest_sha256
+            || material.canonical_input_bundle != context.authority_immutable_bytes)
+    {
+        return Err(context_binding_error(
+            HarnessErrorCode::IntegrityFailure,
+            "CONTEXT_RECOVERY_EVIDENCE_INVALID",
+            false,
+        ));
+    }
+    Ok(HistoricalDispatchMaterial {
+        material,
+        _context: context,
+    })
 }
 
 fn authorize_dispatch_material(
@@ -2075,6 +2255,76 @@ mod dispatch_context_gate_tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CountingRecoveryGate {
+        recovery: DispatchContextRecovery,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DispatchContextRecoveryGate for CountingRecoveryGate {
+        fn recover_existing_dispatch(
+            &self,
+            _envelope: &DispatchEnvelope,
+        ) -> Result<DispatchContextRecovery, HarnessError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.recovery.clone())
+        }
+    }
+
+    struct RecoveryDriver {
+        reconciles: Arc<AtomicUsize>,
+    }
+
+    impl NativeHarnessDriver for RecoveryDriver {
+        fn probe<'a>(
+            &'a mut self,
+            _request: &'a ProbeHarnessRequest,
+        ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+            Box::pin(async { panic!("probe is not used") })
+        }
+
+        fn send_dispatch<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+            _material: &'a ResolvedDispatchMaterial,
+        ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+            Box::pin(async { panic!("send is forbidden during recovery") })
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+            Box::pin(async { panic!("next_event is not used") })
+        }
+
+        fn decide_approval<'a>(
+            &'a mut self,
+            _envelope: &'a ApprovalDecisionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            Box::pin(async { panic!("approval is not used") })
+        }
+
+        fn cancel<'a>(
+            &'a mut self,
+            _envelope: &'a CancelExecutionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            Box::pin(async { panic!("cancel is not used") })
+        }
+
+        fn reconcile<'a>(
+            &'a mut self,
+            _context: &'a ReconciliationContext,
+        ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+            self.reconciles.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(ReconciliationFinding::NoEffectProven {
+                    evidence_ref: "recovery:no-effect".to_owned(),
+                })
+            })
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct FixedClock;
 
@@ -2207,6 +2457,57 @@ mod dispatch_context_gate_tests {
                 fail: resolver_fails,
             },
             CountingDriver { sends },
+            FixedClock,
+        )
+    }
+
+    fn historical_recovery(
+        envelope: &DispatchEnvelope,
+        authority_immutable_bytes: Vec<u8>,
+    ) -> DispatchContextRecovery {
+        let snapshot_id = match classify_dispatch_context_reference(&envelope.input_bundle_ref) {
+            DispatchContextReference::ContextSnapshot { snapshot_id } => snapshot_id,
+            other => panic!("expected context reference, got {other:?}"),
+        };
+        DispatchContextRecovery::Historical(Box::new(HistoricalDispatchContext {
+            binding: HistoricalDispatchContextBinding {
+                snapshot_id,
+                snapshot_revision: 1,
+                content_digest_sha256: envelope.input_bundle_sha256.clone(),
+                expected_scope_ref: "scope:repo".to_owned(),
+            },
+            authority_immutable_bytes,
+            observed_state_revision: 2,
+            observed_state: HistoricalDispatchContextState::Revoked,
+        }))
+    }
+
+    fn seed_reconciliation_dispatch(path: &Path, envelope: &DispatchEnvelope) {
+        let mut edge = open_edge(path);
+        assert_eq!(
+            edge.prepare_dispatch(envelope, 1_787_488_001)
+                .expect("seed reconciliation dispatch"),
+            DispatchPreparation::Ready
+        );
+    }
+
+    fn recovery_adapter(
+        path: &Path,
+        material: ResolvedDispatchMaterial,
+        resolver_calls: Arc<AtomicUsize>,
+        reconciles: Arc<AtomicUsize>,
+    ) -> GovernedHarnessAdapter<FixtureResolver, RecoveryDriver, FixedClock> {
+        GovernedHarnessAdapter::new(
+            ADAPTER_ID,
+            PROFILE_ID,
+            protocol(),
+            open_edge(path),
+            FixtureResolver {
+                material,
+                calls: resolver_calls,
+                fail: false,
+            },
+            RecoveryDriver { reconciles },
             FixedClock,
         )
     }
@@ -2520,6 +2821,196 @@ mod dispatch_context_gate_tests {
                 if receipt.disposition == DeliveryDisposition::Delivered as i32
         ));
         assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn context_reconciliation_defaults_and_malformed_references_fail_before_resolution() {
+        for (label, malformed) in [("default", false), ("malformed", true)] {
+            let root = FixtureRoot::new(&format!("recovery-{label}"));
+            let resolved = material();
+            let mut dispatch = envelope(&resolved, &format!("dispatch-recovery-{label}"));
+            if malformed {
+                dispatch.input_bundle_ref = "ctx-not-canonical.json".to_owned();
+            }
+            seed_reconciliation_dispatch(&root.database(), &dispatch);
+            let resolver_calls = Arc::new(AtomicUsize::new(0));
+            let reconciles = Arc::new(AtomicUsize::new(0));
+            let mut governed = recovery_adapter(
+                &root.database(),
+                resolved,
+                Arc::clone(&resolver_calls),
+                Arc::clone(&reconciles),
+            );
+
+            let evidence = governed
+                .reconcile_dispatch(&format!("reconciliation-{label}"), &dispatch.dispatch_id)
+                .await
+                .expect("fail-closed recovery produces durable unknown evidence");
+            assert!(matches!(
+                evidence.finding,
+                ReconciliationFinding::OutcomeUnknown { .. }
+            ));
+            assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(reconciles.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn static_reconciliation_remains_compatible_with_the_default_recovery_gate() {
+        let root = FixtureRoot::new("recovery-static");
+        let resolved = material();
+        let mut dispatch = envelope(&resolved, "dispatch-recovery-static");
+        dispatch.input_bundle_ref = "static-bundle.json".to_owned();
+        seed_reconciliation_dispatch(&root.database(), &dispatch);
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let reconciles = Arc::new(AtomicUsize::new(0));
+        let mut governed = recovery_adapter(
+            &root.database(),
+            resolved,
+            Arc::clone(&resolver_calls),
+            Arc::clone(&reconciles),
+        );
+
+        let evidence = governed
+            .reconcile_dispatch("reconciliation-static", &dispatch.dispatch_id)
+            .await
+            .expect("static reconciliation");
+        assert!(matches!(
+            evidence.finding,
+            ReconciliationFinding::NoEffectProven { .. }
+        ));
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(reconciles.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn recovered_context_bytes_mismatch_never_reaches_native_reconciliation() {
+        let root = FixtureRoot::new("recovery-bytes-mismatch");
+        let resolved = material();
+        let dispatch = envelope(&resolved, "dispatch-recovery-bytes-mismatch");
+        seed_reconciliation_dispatch(&root.database(), &dispatch);
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let reconciles = Arc::new(AtomicUsize::new(0));
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let mut governed = recovery_adapter(
+            &root.database(),
+            resolved,
+            Arc::clone(&resolver_calls),
+            Arc::clone(&reconciles),
+        )
+        .with_dispatch_context_recovery_gate(CountingRecoveryGate {
+            recovery: historical_recovery(&dispatch, b"tampered authority bytes".to_vec()),
+            calls: Arc::clone(&gate_calls),
+        });
+
+        let evidence = governed
+            .reconcile_dispatch("reconciliation-bytes-mismatch", &dispatch.dispatch_id)
+            .await
+            .expect("mismatch produces durable unknown evidence");
+        assert!(matches!(
+            evidence.finding,
+            ReconciliationFinding::OutcomeUnknown { .. }
+        ));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reconciles.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_variant_and_reference_mismatch_fails_before_file_resolution() {
+        for static_reference in [false, true] {
+            let label = if static_reference {
+                "static-with-context"
+            } else {
+                "context-with-not-context"
+            };
+            let root = FixtureRoot::new(label);
+            let resolved = material();
+            let mut dispatch = envelope(&resolved, &format!("dispatch-{label}"));
+            let recovery = if static_reference {
+                let historical =
+                    historical_recovery(&dispatch, resolved.canonical_input_bundle.clone());
+                dispatch.input_bundle_ref = "static-bundle.json".to_owned();
+                historical
+            } else {
+                DispatchContextRecovery::NotContextBound
+            };
+            seed_reconciliation_dispatch(&root.database(), &dispatch);
+            let resolver_calls = Arc::new(AtomicUsize::new(0));
+            let reconciles = Arc::new(AtomicUsize::new(0));
+            let gate_calls = Arc::new(AtomicUsize::new(0));
+            let mut governed = recovery_adapter(
+                &root.database(),
+                resolved,
+                Arc::clone(&resolver_calls),
+                Arc::clone(&reconciles),
+            )
+            .with_dispatch_context_recovery_gate(CountingRecoveryGate {
+                recovery,
+                calls: Arc::clone(&gate_calls),
+            });
+
+            let evidence = governed
+                .reconcile_dispatch(&format!("reconciliation-{label}"), &dispatch.dispatch_id)
+                .await
+                .expect("mismatched recovery variant is retained as unknown");
+            assert!(matches!(
+                evidence.finding,
+                ReconciliationFinding::OutcomeUnknown { .. }
+            ));
+            assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(reconciles.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_reconciliation_evidence_replays_before_recovery_gate_or_native_calls() {
+        let root = FixtureRoot::new("recovery-evidence-replay");
+        let resolved = material();
+        let dispatch = envelope(&resolved, "dispatch-recovery-evidence-replay");
+        seed_reconciliation_dispatch(&root.database(), &dispatch);
+        let first_gate_calls = Arc::new(AtomicUsize::new(0));
+        let mut first = recovery_adapter(
+            &root.database(),
+            resolved.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .with_dispatch_context_recovery_gate(CountingRecoveryGate {
+            recovery: historical_recovery(&dispatch, resolved.canonical_input_bundle.clone()),
+            calls: Arc::clone(&first_gate_calls),
+        });
+        let first_evidence = first
+            .reconcile_dispatch("reconciliation-replay", &dispatch.dispatch_id)
+            .await
+            .expect("first reconciliation");
+        assert!(!first_evidence.replayed);
+        assert_eq!(first_gate_calls.load(Ordering::SeqCst), 1);
+        drop(first);
+
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let reconciles = Arc::new(AtomicUsize::new(0));
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let mut reopened = recovery_adapter(
+            &root.database(),
+            resolved,
+            Arc::clone(&resolver_calls),
+            Arc::clone(&reconciles),
+        )
+        .with_dispatch_context_recovery_gate(CountingRecoveryGate {
+            recovery: DispatchContextRecovery::NotContextBound,
+            calls: Arc::clone(&gate_calls),
+        });
+        let replay = reopened
+            .reconcile_dispatch("reconciliation-replay", &dispatch.dispatch_id)
+            .await
+            .expect("durable evidence replay");
+        assert!(replay.replayed);
+        assert_eq!(replay.evidence_id, first_evidence.evidence_id);
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reconciles.load(Ordering::SeqCst), 0);
     }
 }
 
