@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod r8b2c;
+pub mod r9a3;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -121,6 +122,9 @@ fn open_database(root: &Path) -> rusqlite::Result<Connection> {
     Ok(connection)
 }
 
+// This fixture helper keeps the persisted fact, event, and outbox fields explicit so crash
+// boundary cases cannot accidentally share or omit identifiers while being assembled.
+#[allow(clippy::too_many_arguments)]
 fn commit_fact_event_outbox(
     tx: &Transaction<'_>,
     authority: &str,
