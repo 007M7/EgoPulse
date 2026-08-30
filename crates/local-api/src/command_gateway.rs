@@ -1,19 +1,20 @@
 use std::sync::Arc;
 
 use egopulse_domain_contracts::{
+    context_revoke::ContextRevokeSemanticRequest,
     profiles::{AuthorizedCommand, ContractProfileError, ContractProfiles},
     v01::egopulse::{
         common::v1::CommandMetadata,
         localapi::v1::{
-            ClientRequestMetadata, ConfirmWorkRequest, ConfirmWorkResponse,
-            DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
+            ClientRequestMetadata, ConfirmWorkRequest, ConfirmWorkResponse, ContextMutationCommand,
+            ContextRevokeReceipt, DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
             ExecuteContextMutationRequest, ExecuteContextMutationResponse,
             ExecuteFounderVerdictRequest, ExecuteFounderVerdictResponse,
             ExecuteMemoryMutationRequest, ExecuteMemoryMutationResponse, ExecuteTaskCommandRequest,
             ExecuteTaskCommandResponse, HarnessApprovalAuthorityResult, LocalApiError,
             LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt, PrepareWorkRequest,
             PrepareWorkResponse, ProjectionAwaitToken, SourceRevision, WorkPreparationPreview,
-            confirm_work_response, execute_context_mutation_response,
+            confirm_work_response, context_mutation_command, execute_context_mutation_response,
             local_command_gateway_service_server::LocalCommandGatewayService,
             prepare_work_response,
         },
@@ -35,6 +36,7 @@ const RPC_EXECUTE_TASK: &str = "LocalCommandGatewayService/ExecuteTaskCommand";
 const RPC_DECIDE_APPROVAL: &str = "LocalCommandGatewayService/DecideHarnessApproval";
 const RPC_EXECUTE_VERDICT: &str = "LocalCommandGatewayService/ExecuteFounderVerdict";
 const RPC_EXECUTE_MEMORY: &str = "LocalCommandGatewayService/ExecuteMemoryMutation";
+const RPC_EXECUTE_CONTEXT: &str = "LocalCommandGatewayService/ExecuteContextMutation";
 const RPC_PREPARE_WORK: &str = "LocalCommandGatewayService/PrepareWork";
 const RPC_CONFIRM_WORK: &str = "LocalCommandGatewayService/ConfirmWork";
 
@@ -114,6 +116,114 @@ pub trait MemoryMutationPort: Send + Sync + 'static {
     ) -> Result<MemoryMutationReceipt, CommandPortFailure>;
 }
 
+/// A Context revoke command that crossed the authenticated Local API boundary,
+/// matched the frozen authorization profile and passed the full semantic
+/// digest check. Its fields are intentionally private: external adapters can
+/// consume but cannot construct this proof-carrying type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedContextRevokeCommand {
+    command_id: String,
+    snapshot_id: String,
+    expected_state_revision: u64,
+    reason_code: String,
+    evidence_refs: Vec<String>,
+    confirmation_proof_ref: String,
+    idempotency_key: String,
+    correlation_id: String,
+    causation_id: Option<String>,
+    request_digest_sha256: String,
+}
+
+impl VerifiedContextRevokeCommand {
+    #[must_use]
+    pub fn command_id(&self) -> &str {
+        &self.command_id
+    }
+
+    #[must_use]
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn expected_state_revision(&self) -> u64 {
+        self.expected_state_revision
+    }
+
+    #[must_use]
+    pub fn reason_code(&self) -> &str {
+        &self.reason_code
+    }
+
+    #[must_use]
+    pub fn evidence_refs(&self) -> &[String] {
+        &self.evidence_refs
+    }
+
+    #[must_use]
+    pub fn confirmation_proof_ref(&self) -> &str {
+        &self.confirmation_proof_ref
+    }
+
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    #[must_use]
+    pub fn correlation_id(&self) -> &str {
+        &self.correlation_id
+    }
+
+    #[must_use]
+    pub fn causation_id(&self) -> Option<&str> {
+        self.causation_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn request_digest_sha256(&self) -> &str {
+        &self.request_digest_sha256
+    }
+}
+
+/// Context has business failures that must remain distinguishable at the
+/// public boundary. Reusing the generic three-state command failure would
+/// erase owner, CAS, revoke and idempotency semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextMutationPortFailure {
+    InvalidArgument,
+    PermissionDenied,
+    OwnerMismatch,
+    NotFound,
+    ContextRevoked,
+    StateRevisionConflict,
+    IdempotencyConflict,
+    IntegrityFailure,
+    AuthorityUnavailable,
+    UnknownCriticalSemantics,
+}
+
+pub trait ContextMutationPort: Send + Sync + 'static {
+    fn revoke(
+        &self,
+        command: &VerifiedContextRevokeCommand,
+        principal: &CommandPrincipal,
+    ) -> Result<ContextRevokeReceipt, ContextMutationPortFailure>;
+}
+
+#[derive(Default)]
+pub struct FailClosedContextMutationPort;
+
+impl ContextMutationPort for FailClosedContextMutationPort {
+    fn revoke(
+        &self,
+        _command: &VerifiedContextRevokeCommand,
+        _principal: &CommandPrincipal,
+    ) -> Result<ContextRevokeReceipt, ContextMutationPortFailure> {
+        Err(ContextMutationPortFailure::AuthorityUnavailable)
+    }
+}
+
 #[derive(Default)]
 pub struct FailClosedMemoryMutationPort;
 
@@ -174,18 +284,30 @@ pub struct CommandGatewayApplication {
     policy_port: Arc<dyn PolicyCommandPort>,
     verdict_port: Arc<dyn VerdictCommandPort>,
     memory_port: Arc<dyn MemoryMutationPort>,
+    context_port: Arc<dyn ContextMutationPort>,
     work_port: Arc<dyn WorkPreparationPort>,
 }
 
 pub struct CommandExtensionPorts {
     memory: Arc<dyn MemoryMutationPort>,
+    context: Arc<dyn ContextMutationPort>,
     work: Arc<dyn WorkPreparationPort>,
 }
 
 impl CommandExtensionPorts {
     #[must_use]
     pub fn new(memory: Arc<dyn MemoryMutationPort>, work: Arc<dyn WorkPreparationPort>) -> Self {
-        Self { memory, work }
+        Self {
+            memory,
+            context: Arc::new(FailClosedContextMutationPort),
+            work,
+        }
+    }
+
+    #[must_use]
+    pub fn with_context(mut self, context: Arc<dyn ContextMutationPort>) -> Self {
+        self.context = context;
+        self
     }
 }
 
@@ -249,6 +371,7 @@ impl CommandGatewayApplication {
             policy_port,
             verdict_port,
             memory_port: extensions.memory,
+            context_port: extensions.context,
             work_port: extensions.work,
         }
     }
@@ -541,6 +664,85 @@ impl CommandGatewayApplication {
         }
     }
 
+    pub fn execute_context_mutation(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: ExecuteContextMutationRequest,
+    ) -> ExecuteContextMutationResponse {
+        let ExecuteContextMutationRequest { client, command } = request;
+        let correlation_id = context_command_correlation_id(client.as_ref(), command.as_ref());
+        if peer.is_none() {
+            return context_response_error(peer_identity_error(correlation_id));
+        }
+        let context = match self.authorize(
+            peer,
+            client.as_ref(),
+            RPC_EXECUTE_CONTEXT,
+            context_oneof(command.as_ref()),
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return context_response_error((*error).with_correlation(correlation_id));
+            }
+        };
+        let Some(context_mutation_command::Command::RevokeContextSnapshot(command)) =
+            command.and_then(|value| value.command)
+        else {
+            return context_response_error(invalid_error("command_missing", correlation_id));
+        };
+        let metadata =
+            match validate_context_command_metadata(client.as_ref(), command.metadata.as_ref()) {
+                Ok(()) => command.metadata.as_ref().expect("metadata was validated"),
+                Err(error) => {
+                    return context_response_error((*error).with_correlation(correlation_id));
+                }
+            };
+        if !is_canonical_sha256(&metadata.request_digest_sha256) {
+            return context_response_error(invalid_error(
+                "context_revoke_digest_malformed",
+                correlation_id,
+            ));
+        }
+        let computed_digest = ContextRevokeSemanticRequest {
+            founder_principal_id: &context.principal.principal_id,
+            snapshot_id: &command.snapshot_id,
+            expected_state_revision: command.expected_state_revision,
+            reason_code: &command.reason_code,
+            evidence_refs: &command.evidence_refs,
+            confirmation_proof_ref: &command.confirmation_proof_ref,
+        }
+        .digest_sha256();
+        if computed_digest != metadata.request_digest_sha256 {
+            return context_response_error(api_error(
+                LocalApiErrorCode::IntegrityFailure,
+                "context_revoke_digest_mismatch",
+                false,
+                None,
+                correlation_id,
+            ));
+        }
+        let verified = VerifiedContextRevokeCommand {
+            command_id: metadata.command_id.clone(),
+            snapshot_id: command.snapshot_id,
+            expected_state_revision: command.expected_state_revision,
+            reason_code: command.reason_code,
+            evidence_refs: command.evidence_refs,
+            confirmation_proof_ref: command.confirmation_proof_ref,
+            idempotency_key: metadata.idempotency_key.clone(),
+            correlation_id: metadata.correlation_id.clone(),
+            causation_id: metadata.causation_id.clone(),
+            request_digest_sha256: metadata.request_digest_sha256.clone(),
+        };
+        match self.context_port.revoke(&verified, &context.principal) {
+            Ok(receipt) => ExecuteContextMutationResponse {
+                outcome: Some(execute_context_mutation_response::Outcome::AuthorityResult(
+                    receipt,
+                )),
+            },
+            Err(error) => context_response_error(context_port_error(error, correlation_id)),
+        }
+    }
+
     fn authorize(
         &self,
         peer: Option<&PeerConnectionInfo>,
@@ -798,23 +1000,11 @@ impl LocalCommandGatewayService for LocalCommandGatewayEndpoint {
         &self,
         request: Request<ExecuteContextMutationRequest>,
     ) -> Result<Response<ExecuteContextMutationResponse>, Status> {
-        let correlation_id = request
-            .get_ref()
-            .client
-            .as_ref()
-            .and_then(|metadata| metadata.correlation_id.clone())
-            .unwrap_or_default();
-        Ok(Response::new(ExecuteContextMutationResponse {
-            outcome: Some(execute_context_mutation_response::Outcome::Error(
-                api_error(
-                    LocalApiErrorCode::AuthorityUnavailable,
-                    "context_revoke_daemon_bridge_pending",
-                    false,
-                    Some("UPDATE_TO_R9A2_DAEMON_BRIDGE"),
-                    correlation_id,
-                ),
-            )),
-        }))
+        let peer = Self::peer(&request);
+        Ok(Response::new(self.application.execute_context_mutation(
+            peer.as_ref(),
+            request.into_inner(),
+        )))
     }
 }
 
@@ -863,6 +1053,49 @@ fn validate_command_metadata(
         )));
     }
     Ok(())
+}
+
+fn validate_context_command_metadata(
+    client: Option<&ClientRequestMetadata>,
+    metadata: Option<&CommandMetadata>,
+) -> Result<(), Box<LocalApiError>> {
+    validate_command_metadata(client, metadata)?;
+    let Some(metadata) = metadata else {
+        return Err(Box::new(invalid_error(
+            "command_metadata_missing",
+            String::new(),
+        )));
+    };
+    if !is_bounded_metadata_value(&metadata.command_id)
+        || !is_bounded_metadata_value(&metadata.idempotency_key)
+        || !is_bounded_metadata_value(&metadata.idempotency_scope)
+        || !is_bounded_metadata_value(&metadata.request_digest_sha256)
+        || !is_bounded_metadata_value(&metadata.correlation_id)
+        || metadata
+            .causation_id
+            .as_deref()
+            .is_some_and(|value| !is_bounded_metadata_value(value))
+    {
+        return Err(Box::new(invalid_error(
+            "context_command_metadata_invalid",
+            String::new(),
+        )));
+    }
+    Ok(())
+}
+
+fn is_bounded_metadata_value(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 256
+        && value == value.trim()
+        && !value.chars().any(char::is_control)
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn command_correlation_id<T>(client: Option<&ClientRequestMetadata>, command: Option<&T>) -> String
@@ -994,6 +1227,33 @@ fn memory_command_correlation_id(
         .unwrap_or_else(|| Uuid::now_v7().to_string())
 }
 
+fn context_oneof(command: Option<&ContextMutationCommand>) -> Option<&'static str> {
+    Some(match command?.command.as_ref()? {
+        context_mutation_command::Command::RevokeContextSnapshot(_) => "revoke_context_snapshot",
+    })
+}
+
+fn context_metadata(command: &ContextMutationCommand) -> Option<&CommandMetadata> {
+    match command.command.as_ref()? {
+        context_mutation_command::Command::RevokeContextSnapshot(value) => value.metadata.as_ref(),
+    }
+}
+
+fn context_command_correlation_id(
+    client: Option<&ClientRequestMetadata>,
+    command: Option<&ContextMutationCommand>,
+) -> String {
+    client
+        .and_then(|value| value.correlation_id.clone())
+        .or_else(|| {
+            command
+                .and_then(context_metadata)
+                .map(|value| value.correlation_id.clone())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Uuid::now_v7().to_string())
+}
+
 fn sanitize_policy_result(result: &PolicyDecisionCommandResult) -> HarnessApprovalAuthorityResult {
     let record = result.decision_record.as_ref();
     let state = result.state.as_ref();
@@ -1096,6 +1356,96 @@ fn port_error(failure: CommandPortFailure, correlation_id: String) -> LocalApiEr
             correlation_id,
         ),
     }
+}
+
+fn context_port_error(
+    failure: ContextMutationPortFailure,
+    correlation_id: String,
+) -> LocalApiError {
+    match failure {
+        ContextMutationPortFailure::InvalidArgument => api_error(
+            LocalApiErrorCode::InvalidArgument,
+            "context_authority_invalid_argument",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::PermissionDenied => api_error(
+            LocalApiErrorCode::PermissionDenied,
+            "context_authority_permission_denied",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::OwnerMismatch => api_error(
+            LocalApiErrorCode::OwnerMismatch,
+            "context_owner_mismatch",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::NotFound => api_error(
+            LocalApiErrorCode::NotFound,
+            "context_snapshot_not_found",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::ContextRevoked => api_error(
+            LocalApiErrorCode::ContextRevoked,
+            "context_snapshot_revoked",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::StateRevisionConflict => api_error(
+            LocalApiErrorCode::StateRevisionConflict,
+            "context_state_revision_conflict",
+            false,
+            Some("REFRESH_CONTEXT"),
+            correlation_id,
+        ),
+        ContextMutationPortFailure::IdempotencyConflict => api_error(
+            LocalApiErrorCode::IdempotencyConflict,
+            "context_idempotency_conflict",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::IntegrityFailure => api_error(
+            LocalApiErrorCode::IntegrityFailure,
+            "context_authority_integrity_failure",
+            false,
+            Some("RESTART_DAEMON"),
+            correlation_id,
+        ),
+        ContextMutationPortFailure::AuthorityUnavailable => api_error(
+            LocalApiErrorCode::AuthorityUnavailable,
+            "context_authority_unavailable",
+            true,
+            Some("RETRY"),
+            correlation_id,
+        ),
+        ContextMutationPortFailure::UnknownCriticalSemantics => {
+            critical_error("context_authority_semantics_unknown", correlation_id)
+        }
+    }
+}
+
+fn context_response_error(error: LocalApiError) -> ExecuteContextMutationResponse {
+    ExecuteContextMutationResponse {
+        outcome: Some(execute_context_mutation_response::Outcome::Error(error)),
+    }
+}
+
+fn peer_identity_error(correlation_id: String) -> LocalApiError {
+    api_error(
+        LocalApiErrorCode::Unauthenticated,
+        "peer_identity_missing",
+        false,
+        Some("REOPEN_SESSION"),
+        correlation_id,
+    )
 }
 
 fn invalid_error(fingerprint: &'static str, correlation_id: String) -> LocalApiError {

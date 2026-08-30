@@ -102,3 +102,8 @@ governance.
 
 Unknown fields, missing or invalid keys, inconsistent contract references and
 unapproved verification profiles fail closed during startup.
+
+`identity.permission_codes` never selects an Authority principal kind. Founder
+Memory governance requires the reviewed `memory_kind` binding, and
+`local.context.revoke` additionally requires `context_kind: "Founder"`.
+Missing or non-Founder Context binding fails startup before the daemon serves.

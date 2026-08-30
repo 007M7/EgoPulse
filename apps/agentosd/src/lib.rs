@@ -41,9 +41,9 @@ use egopulse_local_api::{
     },
     command_gateway::{
         CommandExtensionPorts, CommandGatewayApplication, CommandPortFailure, CommandPortResult,
-        CommandPrincipal, FailClosedMemoryMutationPort, LocalCommandGatewayEndpoint,
-        MemoryMutationPort, PolicyCommandPort, TaskCommandPort, VerdictCommandPort,
-        WorkPreparationPort,
+        CommandPrincipal, ContextMutationPort, FailClosedContextMutationPort,
+        FailClosedMemoryMutationPort, LocalCommandGatewayEndpoint, MemoryMutationPort,
+        PolicyCommandPort, TaskCommandPort, VerdictCommandPort, WorkPreparationPort,
     },
     read_gateway::{NoopReadGatewayAuditSink, ReadGatewayApplication},
     read_gateway_policy::ReadGatewayPolicy,
@@ -71,6 +71,7 @@ use tonic::transport::Server;
 mod artifact;
 mod bootstrap;
 mod context_material;
+mod context_mutation;
 mod memory_mutation;
 mod memory_retrieval;
 mod owners;
@@ -96,6 +97,7 @@ pub use bootstrap::{
     ProviderCatalogProfileView, ProviderCatalogRefreshError, ProviderCatalogRefreshPreview,
     ProviderCatalogSnapshot, ProviderModelBinding,
 };
+pub use context_mutation::ContextMutationPortAdapter;
 pub use memory_mutation::{
     MemoryCandidateProducerBinding, MemoryCandidateProducerConfigurationError,
     MemoryCandidateProducerFailure, MemoryCandidateProducerHandle, MemoryCandidateProducerPort,
@@ -333,6 +335,7 @@ pub struct DaemonProviders {
     pub memory_retrieval_port: Arc<dyn MemoryRetrievalPort>,
     pub memory_retrieval_audit: Arc<dyn MemoryRetrievalAuditSink>,
     pub memory_mutation_port: Arc<dyn MemoryMutationPort>,
+    pub context_mutation_port: Arc<dyn ContextMutationPort>,
     /// Internal candidate-only producer capabilities. This is deliberately
     /// separate from the public Local API mutation port.
     pub memory_candidate_producers: Arc<MemoryCandidateProducerRegistry>,
@@ -644,6 +647,7 @@ impl DaemonProviders {
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
+            context_mutation_port: Arc::new(FailClosedContextMutationPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
@@ -719,6 +723,7 @@ impl DaemonProviders {
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
+            context_mutation_port: Arc::new(FailClosedContextMutationPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
@@ -768,6 +773,7 @@ impl DaemonProviders {
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
+            context_mutation_port: Arc::new(FailClosedContextMutationPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
@@ -779,6 +785,12 @@ impl DaemonProviders {
     #[must_use]
     pub fn with_context_authority(mut self, context: Arc<Mutex<ContextAuthority>>) -> Self {
         self.context_authority = Some(context);
+        self
+    }
+
+    #[must_use]
+    pub fn with_context_mutation(mut self, port: Arc<dyn ContextMutationPort>) -> Self {
+        self.context_mutation_port = port;
         self
     }
 
@@ -1301,7 +1313,8 @@ impl DaemonComposition {
             CommandExtensionPorts::new(
                 providers.memory_mutation_port,
                 providers.work_preparation_port,
-            ),
+            )
+            .with_context(providers.context_mutation_port),
         ));
         let command = LocalCommandGatewayEndpoint::new(command_application);
         let cognition_application = Arc::new(CognitionGatewayApplication::new(

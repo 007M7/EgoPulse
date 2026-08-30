@@ -1,7 +1,7 @@
 # R-9A Context revoke and dispatch-consumption linearization
 
-- Status: Founder-frozen architecture contract; R-9A.1 and R-9A.2a locally
-  verified, R-9A.2b/R-9A.2c/R-9A.3 implementation pending
+- Status: Founder-frozen architecture contract; R-9A.1, R-9A.2a and R-9A.2b
+  locally verified, R-9A.2c/R-9A.3 implementation pending
 - Date: 2026-08-30
 - Decision owner: Founder
 - Runtime fact owner: Context Authority
@@ -373,8 +373,8 @@ Verification evidence at this checkpoint:
   R-9A.1 P0/P1 finding.
 
 This checkpoint does not mark R-9A complete. The overall document status stays
-implementation pending until R-9A.2b/R-9A.2c, R-9A.3 and all applicable
-Acceptance Gates are closed with durable evidence.
+implementation pending until R-9A.2c, R-9A.3 and all applicable Acceptance
+Gates are closed with durable evidence.
 
 R-9A.2a is also implemented as the contract-first checkpoint. Draft.18 adds the
 typed `ExecuteContextMutation`/`revoke_context_snapshot` operation,
@@ -401,6 +401,41 @@ R-9A.2a verification evidence:
   were advanced with the contract profile;
 - independent architecture, build and test reviews report GO with no remaining
   R-9A.2a P0/P1 finding.
+
+R-9A.2b is implemented as the authenticated Local API and daemon-routing
+checkpoint. The gateway derives the Founder principal only from the trusted
+OS-peer-bound session, enforces `local.context.revoke` and the exact frozen
+`ContextAuthority.Founder` profile constraint, validates bounded command
+metadata, requires a canonical lower-case SHA-256 value, and recomputes the
+full semantic digest before constructing a private verified command. The
+daemon independently requires an explicit reviewed `context_kind: "Founder"`
+binding; permissions never select or elevate an Authority principal kind.
+The production adapter uses the same Context Authority handle as preparation
+and existing Context consumers, maps typed Authority failures without erasing
+owner/CAS/revoke/idempotency semantics, and emits only a sanitized receipt
+whose snapshot and request digests are checked before return.
+
+R-9A.2b verification evidence:
+
+- all 50 Local API tests pass, including five focused Context gateway tests for
+  real IPC/session authentication, permission and client binding, fixed digest
+  verification, bounded metadata, all typed public failure mappings, zero
+  pre-Authority calls and private-field non-disclosure;
+- one Windows component test crosses the real production seam from IPC session
+  through `CommandGatewayApplication`, its privately constructed verified
+  command and `ContextMutationPortAdapter` into the real SQLCipher Context
+  Authority; first commit and exact replay preserve the complete receipt while
+  durable event/receipt/idempotency counts do not grow on replay;
+- 13 focused daemon Context tests and an exhaustive Authority/resolver failure
+  mapping test pass; explicit Founder binding, profile drift and absent binding
+  remain fail closed;
+- independent architecture, build and test reviews report GO with no remaining
+  R-9A.2b P0/P1 finding, and the complete local CI passes.
+
+This checkpoint does not add CLI/TUI revoke interaction, dispatch-consumption
+authorization, production recovery wiring, a daemon restart witness or an
+Adapter side-effect witness. Those remain R-9A.2c and R-9A.3 work and must not
+be inferred from same-process exact replay evidence.
 
 ## Acceptance Gates
 

@@ -9,7 +9,9 @@ use std::{
 use egopulse_artifact_authority::{
     ArtifactAuthority, ArtifactAuthorityConfig, ArtifactAuthorityFailure, ArtifactSqlCipherKey,
 };
-use egopulse_cognition_runtime::context_authority::{ContextAuthority, ContextAuthorityConfig};
+use egopulse_cognition_runtime::context_authority::{
+    ContextAuthority, ContextAuthorityConfig, ContextPrincipalKind,
+};
 use egopulse_cognition_runtime::memory_authority::{
     MemoryAuthority, MemoryAuthorityConfig, MemoryAuthorityFailure, MemoryPrincipalKind,
 };
@@ -53,9 +55,9 @@ use crate::{
     ConfiguredArtifactAdmissionGuardConfig, ConfiguredAuthorityPrincipalResolver,
     ConfiguredFounderVerdictResolver, ConfiguredFounderVerdictResolverConfig,
     ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ConfiguredTaskTransitionGuard,
-    ConfiguredVerificationWorker, DaemonCompositionError, DaemonProviders,
-    FounderVerdictConfigurationError, GovernedReturnCollectorConfig, LocalUserPolicyResolver,
-    LocalUserPolicyResolverConfig, MemoryCandidateProducerBinding,
+    ConfiguredVerificationWorker, ContextMutationPortAdapter, DaemonCompositionError,
+    DaemonProviders, FounderVerdictConfigurationError, GovernedReturnCollectorConfig,
+    LocalUserPolicyResolver, LocalUserPolicyResolverConfig, MemoryCandidateProducerBinding,
     MemoryRetrievalCompositionConfig, NativeHarnessCompositionConfig,
     SharedAuthorityCompositionInputs, TaskAuthorityCommitReceiptSource,
     VerificationAuthorityArtifactSource, VerificationProjectionSource, VerificationWorkerConfig,
@@ -562,6 +564,7 @@ impl ProductionBootstrapConfig {
             self.authority_binding
         ])?);
         let memory_principal_resolver = Arc::clone(&principal_resolver);
+        let context_principal_resolver = Arc::clone(&principal_resolver);
         let session_principal_resolver =
             Arc::new(AllowlistedPrincipalResolver::new([self.os_principal])?);
         let mut providers =
@@ -580,7 +583,11 @@ impl ProductionBootstrapConfig {
                     ))),
                 ],
             })
-            .with_context_authority(Arc::clone(&context));
+            .with_context_authority(Arc::clone(&context))
+            .with_context_mutation(Arc::new(ContextMutationPortAdapter::new(
+                Arc::clone(&context),
+                context_principal_resolver,
+            )));
         if let Some(worker_config) = self.verification_worker {
             let worker = ConfiguredVerificationWorker::new(
                 Arc::clone(&task),
@@ -738,6 +745,8 @@ struct IdentityFile {
     verdict_kind: String,
     #[serde(default)]
     memory_kind: Option<String>,
+    #[serde(default)]
+    context_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1322,12 +1331,17 @@ impl UserOwnedBootstrapFile {
             ));
         }
         let principal_id = required(identity.principal_id, "identity.principal_id")?;
+        let permission_codes =
+            non_empty_set(identity.permission_codes, "identity.permission_codes")?;
+        let context_kind = identity
+            .context_kind
+            .as_deref()
+            .map(parse_context_principal)
+            .transpose()?;
+        validate_context_permission_binding(&permission_codes, context_kind)?;
         let grant = egopulse_local_api::session::PrincipalGrant {
             authenticated_principal_id: principal_id.clone(),
-            permission_codes: non_empty_set(
-                identity.permission_codes,
-                "identity.permission_codes",
-            )?,
+            permission_codes,
             authorization_policy_ref: identity_policy_ref,
         };
         let authority_binding = AuthorityPrincipalBinding {
@@ -1340,6 +1354,7 @@ impl UserOwnedBootstrapFile {
                 .as_deref()
                 .map(parse_memory_principal)
                 .transpose()?,
+            context: context_kind,
         };
 
         let task_guard = ConfiguredTaskCreationGuardConfig {
@@ -2165,6 +2180,29 @@ fn parse_memory_principal(value: &str) -> Result<MemoryPrincipalKind, Production
     }
 }
 
+fn parse_context_principal(value: &str) -> Result<ContextPrincipalKind, ProductionBootstrapError> {
+    match value {
+        "Founder" => Ok(ContextPrincipalKind::Founder),
+        _ => Err(ProductionBootstrapError::InvalidConfiguration(
+            "identity.context_kind",
+        )),
+    }
+}
+
+fn validate_context_permission_binding(
+    permission_codes: &BTreeSet<String>,
+    context_kind: Option<ContextPrincipalKind>,
+) -> Result<(), ProductionBootstrapError> {
+    if permission_codes.contains("local.context.revoke")
+        && context_kind != Some(ContextPrincipalKind::Founder)
+    {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "identity.context_kind",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_memory_producer_principal(
     value: &str,
 ) -> Result<MemoryPrincipalKind, ProductionBootstrapError> {
@@ -2797,5 +2835,46 @@ mod tests {
                 "verification_worker.mapper.raw_output_address.algorithm"
             ))
         ));
+    }
+
+    #[test]
+    fn context_revoke_permission_requires_explicit_founder_binding() {
+        let revoke_permission = BTreeSet::from(["local.context.revoke".to_owned()]);
+        assert!(matches!(
+            validate_context_permission_binding(&revoke_permission, None),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "identity.context_kind"
+            ))
+        ));
+        assert!(
+            validate_context_permission_binding(
+                &revoke_permission,
+                Some(ContextPrincipalKind::Founder)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_context_permission_binding(
+                &BTreeSet::from(["local.task.read".to_owned()]),
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn context_identity_binding_accepts_only_founder() {
+        assert_eq!(
+            parse_context_principal("Founder").expect("Founder Context binding"),
+            ContextPrincipalKind::Founder
+        );
+        for invalid in ["GovernanceKernel", "ContextCompiler", "none", "founder"] {
+            assert!(matches!(
+                parse_context_principal(invalid),
+                Err(ProductionBootstrapError::InvalidConfiguration(
+                    "identity.context_kind"
+                ))
+            ));
+        }
     }
 }

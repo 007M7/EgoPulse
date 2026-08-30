@@ -60,16 +60,18 @@
       "local.projection.await",
       "local.memory.retrieve",
       "local.memory.candidate.submit",
-      "local.memory.govern"
+      "local.memory.govern",
+      "local.context.revoke"
     ],
     "authorization_policy_ref": {
       "contract_id": "egopulse.authorization.v1",
       "version": "0.1.0",
-      "sha256": "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1"
+      "sha256": "e44e1cee143b35173372b75fa7ce4efb5732be58bb787d59e961450599d612ab"
     },
     "task_kind": "Founder",
     "policy_kind": "LocalUser",
-    "verdict_kind": "FounderAuthority"
+    "verdict_kind": "FounderAuthority",
+    "context_kind": "Founder"
   },
   "task_guard": {
     "allowed_work_types": ["governed_repository_change"],
@@ -169,7 +171,7 @@
     "authorization_policy_ref": {
       "contract_id": "egopulse.authorization.v1",
       "version": "0.1.0",
-        "sha256": "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1"
+      "sha256": "e44e1cee143b35173372b75fa7ce4efb5732be58bb787d59e961450599d612ab"
     },
     "allowed_scope_refs": ["adapter-edge://codex/approval/scope"],
     "decision_ttl_seconds": 300
