@@ -493,7 +493,8 @@ impl ProductionBootstrapConfig {
             task_guard,
             ConfiguredTaskTransitionGuard::with_founder_verdict(Arc::clone(
                 &founder_verdict_handle,
-            )),
+            ))
+            .with_context_authority(Arc::clone(&context)),
         )?));
         let memory = Arc::new(Mutex::new(MemoryAuthority::open(self.memory)?));
 

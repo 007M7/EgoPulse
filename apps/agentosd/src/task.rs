@@ -168,6 +168,7 @@ pub type SharedFounderVerdictAuthority = Arc<Mutex<Option<FounderVerdictAuthorit
 #[derive(Clone, Default)]
 pub struct ConfiguredTaskTransitionGuard {
     founder_verdict: Option<SharedFounderVerdictAuthority>,
+    context_authority: Option<Arc<Mutex<ContextAuthority>>>,
 }
 
 impl ConfiguredTaskTransitionGuard {
@@ -175,6 +176,7 @@ impl ConfiguredTaskTransitionGuard {
     pub fn new() -> Self {
         Self {
             founder_verdict: None,
+            context_authority: None,
         }
     }
 
@@ -182,7 +184,47 @@ impl ConfiguredTaskTransitionGuard {
     pub fn with_founder_verdict(founder_verdict: SharedFounderVerdictAuthority) -> Self {
         Self {
             founder_verdict: Some(founder_verdict),
+            context_authority: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_context_authority(mut self, authority: Arc<Mutex<ContextAuthority>>) -> Self {
+        self.context_authority = Some(authority);
+        self
+    }
+
+    fn activation_context_evidence(
+        &self,
+        current: &TaskSnapshot,
+    ) -> Result<Option<String>, TransitionGuardRejection> {
+        if !current.input_snapshot_id.starts_with("ctx:") {
+            return Ok(None);
+        }
+        let authority = self
+            .context_authority
+            .as_ref()
+            .ok_or(TransitionGuardRejection::UnverifiedReference)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| TransitionGuardRejection::IntegrityFailure)?
+            .as_secs();
+        let now = i64::try_from(now).map_err(|_| TransitionGuardRejection::IntegrityFailure)?;
+        let authority = authority
+            .lock()
+            .map_err(|_| TransitionGuardRejection::IntegrityFailure)?;
+        let resolved = authority
+            .resolve(&current.input_snapshot_id, &current.target_scope_ref, now)
+            .map_err(context_transition_rejection)?;
+        if resolved.snapshot.snapshot_id != current.input_snapshot_id
+            || resolved.snapshot.target_scope_ref != current.target_scope_ref
+        {
+            return Err(TransitionGuardRejection::IntegrityFailure);
+        }
+        Ok(Some(format!(
+            "context-snapshot:{}@revision:{}",
+            resolved.snapshot.snapshot_id, resolved.snapshot.revision
+        )))
     }
 }
 
@@ -198,11 +240,15 @@ impl TaskTransitionGuard for ConfiguredTaskTransitionGuard {
                     && value.work_revision == current.work_revision
                     && !value.run_id.trim().is_empty() =>
             {
+                let mut evidence_refs = vec![format!(
+                    "task-activation:{}@collaboration-control",
+                    value.run_id
+                )];
+                if let Some(context_evidence) = self.activation_context_evidence(current)? {
+                    evidence_refs.push(context_evidence);
+                }
                 Ok(TransitionAuthorization {
-                    evidence_refs: vec![format!(
-                        "task-activation:{}@collaboration-control",
-                        value.run_id
-                    )],
+                    evidence_refs,
                     founder_decision: None,
                     founder_verdict_state_revision: None,
                 })
@@ -410,6 +456,28 @@ impl TaskTransitionGuard for ConfiguredTaskTransitionGuard {
     }
 }
 
+fn context_transition_rejection(
+    error: egopulse_cognition_runtime::context_authority::ContextAuthorityFailure,
+) -> TransitionGuardRejection {
+    use egopulse_cognition_runtime::context_authority::ContextAuthorityFailure;
+
+    match error {
+        ContextAuthorityFailure::NotFound
+        | ContextAuthorityFailure::Expired
+        | ContextAuthorityFailure::Revoked
+        | ContextAuthorityFailure::ScopeMismatch => TransitionGuardRejection::StaleReference,
+        ContextAuthorityFailure::Storage
+        | ContextAuthorityFailure::IntegrityFailure
+        | ContextAuthorityFailure::InvalidArgument(_)
+        | ContextAuthorityFailure::Unauthorized
+        | ContextAuthorityFailure::OwnerMismatch
+        | ContextAuthorityFailure::IdempotencyConflict
+        | ContextAuthorityFailure::StateRevisionConflict
+        | ContextAuthorityFailure::AuthorizationTupleConflict
+        | ContextAuthorityFailure::Clock => TransitionGuardRejection::IntegrityFailure,
+    }
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum TaskCreationGuardConfigurationError {
     #[error("configured Task creation guard is invalid")]
@@ -434,10 +502,24 @@ fn contract_reference_key(reference: &ContractReference) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egopulse_domain_contracts::v01::egopulse::{
-        common::v1::ContractReference,
-        task::v1::{ActivateTaskCommand, RecordTaskVerificationCommand, SubmitTaskEvidenceCommand},
+    use egopulse_cognition_runtime::context_authority::{
+        AuthenticatedContextPrincipal, ContextAuthorityConfig, ContextPrincipalKind,
+        ContextRedaction, ContextRevokeRequest, ContextSourceFact, IssueContextSnapshot,
     };
+    use egopulse_cognition_runtime::task_authority::{
+        AuthenticatedPrincipal, PrincipalKind, SqlCipherKey as TaskSqlCipherKey, TaskAuthority,
+        TaskAuthorityConfig, canonical_request_digest,
+    };
+    use egopulse_domain_contracts::v01::egopulse::{
+        common::v1::{CommandMetadata, ContractReference},
+        task::v1::{
+            ActivateTaskCommand, RecordTaskVerificationCommand, SubmitTaskEvidenceCommand,
+            TaskErrorCode, get_task_response, task_command_result,
+        },
+    };
+    use prost_types::Timestamp;
+    use std::fs;
+    use uuid::Uuid;
 
     fn contract(id: &str, version: &str, byte: u8) -> ContractReference {
         ContractReference {
@@ -465,6 +547,42 @@ mod tests {
             acceptance_contract_ref: Some(contract("repository-change", "v1", 0x11)),
             budget_profile_ref: Some(contract("v01-quality-budget", "v1", 0x22)),
             ..Default::default()
+        }
+    }
+
+    fn task_metadata(command_id: &str) -> CommandMetadata {
+        CommandMetadata {
+            command_id: command_id.to_owned(),
+            idempotency_key: command_id.to_owned(),
+            idempotency_scope: "r9a3a-task-test".to_owned(),
+            request_digest_sha256: String::new(),
+            issued_at: Some(Timestamp {
+                seconds: 1_777_073_600,
+                nanos: 0,
+            }),
+            correlation_id: format!("correlation:{command_id}"),
+            causation_id: None,
+        }
+    }
+
+    fn seal_task_command(command: &mut TaskCommand) {
+        let digest = canonical_request_digest(command).expect("canonical Task command digest");
+        match command.command.as_mut().expect("Task command") {
+            task_command::Command::CreateTask(value) => {
+                value
+                    .meta
+                    .as_mut()
+                    .expect("create metadata")
+                    .request_digest_sha256 = digest;
+            }
+            task_command::Command::ActivateTask(value) => {
+                value
+                    .meta
+                    .as_mut()
+                    .expect("activate metadata")
+                    .request_digest_sha256 = digest;
+            }
+            _ => panic!("test helper only seals create and activate"),
         }
     }
 
@@ -558,5 +676,195 @@ mod tests {
             guard.validate(&denied, &active),
             Err(TransitionGuardRejection::UnverifiedReference)
         );
+    }
+
+    #[test]
+    fn revoked_context_blocks_activation_without_task_writes_and_static_paths_remain_compatible() {
+        let root = std::env::temp_dir().join(format!("egopulse-r9a3a-task-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("R9A.3a test root");
+        let acceptance = contract("repository-change", "v1", 0x11);
+        let budget = contract("quality-budget", "v1", 0x22);
+        let context = Arc::new(Mutex::new(
+            ContextAuthority::open(ContextAuthorityConfig {
+                database_path: root.join("context.db"),
+                store_epoch: "r9a3a-context".to_owned(),
+                key: TaskSqlCipherKey::new([41; 32]),
+            })
+            .expect("Context Authority"),
+        ));
+        let expires_at_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+            .saturating_add(600) as i64;
+        let (_, snapshot) = context
+            .lock()
+            .expect("Context lock")
+            .issue(
+                &IssueContextSnapshot {
+                    owner_principal_id: "founder:r9a3a".to_owned(),
+                    intent: "activate governed work".to_owned(),
+                    work_type: "governed_repository_change".to_owned(),
+                    target_scope_ref: "scope:r9a3a".to_owned(),
+                    compiled_context: br#"{"prompt":"r9a3a"}"#.to_vec(),
+                    sources: vec![ContextSourceFact {
+                        source_ref: "source:r9a3a".to_owned(),
+                        label: "R9A.3a".to_owned(),
+                        authority: "project".to_owned(),
+                        content_sha256: "a".repeat(64),
+                        included: true,
+                    }],
+                    memory_pack: None,
+                    allowed_read_paths: vec!["src".to_owned()],
+                    allowed_write_paths: vec!["src".to_owned()],
+                    allowed_tools: vec!["cargo".to_owned()],
+                    external_resources: Vec::new(),
+                    non_goals: vec!["no dispatch".to_owned()],
+                    acceptance_contract_ref: contract_reference_key(&acceptance),
+                    budget_profile_ref: contract_reference_key(&budget),
+                    deadline_seconds: None,
+                    recovery_entry: "hold-and-reconcile".to_owned(),
+                    visibility: "founder-only".to_owned(),
+                    redactions: vec![ContextRedaction {
+                        field_path: "credentials".to_owned(),
+                        reason_code: "secret".to_owned(),
+                    }],
+                    expires_at_seconds,
+                    idempotency_key: "r9a3a-issue".to_owned(),
+                },
+                &AuthenticatedContextPrincipal {
+                    kind: ContextPrincipalKind::ContextCompiler,
+                    principal_id: "context-compiler:r9a3a".to_owned(),
+                    authenticated: true,
+                },
+            )
+            .expect("issue Context snapshot");
+
+        let creation_guard = ConfiguredTaskCreationGuard::new(ConfiguredTaskCreationGuardConfig {
+            allowed_work_types: BTreeSet::from(["governed_repository_change".to_owned()]),
+            allowed_input_snapshot_ids: BTreeSet::from(["static-reviewed".to_owned()]),
+            allowed_target_scope_refs: BTreeSet::from(["scope:r9a3a".to_owned()]),
+            acceptance_contract_ref: acceptance.clone(),
+            budget_profile_ref: budget.clone(),
+        })
+        .expect("creation guard")
+        .with_context_authority(Arc::clone(&context));
+        let transition_guard =
+            ConfiguredTaskTransitionGuard::new().with_context_authority(Arc::clone(&context));
+        let mut task = TaskAuthority::open_with_transition_guard(
+            TaskAuthorityConfig {
+                database_path: root.join("task.db"),
+                store_epoch: "r9a3a-task".to_owned(),
+                key: TaskSqlCipherKey::new([42; 32]),
+            },
+            creation_guard,
+            transition_guard,
+        )
+        .expect("Task Authority");
+        let founder = AuthenticatedPrincipal {
+            kind: PrincipalKind::Founder,
+            principal_id: "founder:r9a3a".to_owned(),
+            authenticated: true,
+        };
+        let mut create = TaskCommand {
+            command: Some(task_command::Command::CreateTask(CreateTaskCommand {
+                meta: Some(task_metadata("r9a3a-create")),
+                work_type: "governed_repository_change".to_owned(),
+                input_snapshot_id: snapshot.snapshot_id.clone(),
+                target_scope_ref: snapshot.target_scope_ref.clone(),
+                acceptance_contract_ref: Some(acceptance),
+                budget_profile_ref: Some(budget),
+            })),
+        };
+        seal_task_command(&mut create);
+        let created = task.execute(&create, &founder).expect("create Task");
+        let created = match created.outcome.expect("create outcome") {
+            task_command_result::Outcome::Task(value) => value,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        let before_rejected_activation = task.inspect_store().expect("Task inspection");
+
+        context
+            .lock()
+            .expect("Context lock")
+            .revoke(
+                &AuthenticatedContextPrincipal {
+                    kind: ContextPrincipalKind::Founder,
+                    principal_id: "founder:r9a3a".to_owned(),
+                    authenticated: true,
+                },
+                &ContextRevokeRequest {
+                    command_id: "r9a3a-revoke-command".to_owned(),
+                    snapshot_id: snapshot.snapshot_id.clone(),
+                    expected_state_revision: 1,
+                    reason_code: "withdrawn".to_owned(),
+                    evidence_refs: vec!["evidence:r9a3a".to_owned()],
+                    confirmation_proof_ref: "proof:r9a3a".to_owned(),
+                    idempotency_key: "r9a3a-revoke".to_owned(),
+                    correlation_id: "correlation:r9a3a-revoke".to_owned(),
+                    causation_id: None,
+                },
+            )
+            .expect("revoke Context snapshot");
+        let mut activate = TaskCommand {
+            command: Some(task_command::Command::ActivateTask(ActivateTaskCommand {
+                meta: Some(task_metadata("r9a3a-activate")),
+                task_id: created.task_id.clone(),
+                expected_revision: created.revision,
+                work_revision: created.work_revision,
+                run_id: "run:r9a3a".to_owned(),
+            })),
+        };
+        seal_task_command(&mut activate);
+        assert_eq!(
+            ConfiguredTaskTransitionGuard::new().validate(&activate, &created),
+            Err(TransitionGuardRejection::UnverifiedReference)
+        );
+        let result = task
+            .execute(
+                &activate,
+                &AuthenticatedPrincipal {
+                    kind: PrincipalKind::CollaborationControl,
+                    principal_id: "collaboration:r9a3a".to_owned(),
+                    authenticated: true,
+                },
+            )
+            .expect("rejected activation result");
+        match result.outcome.expect("activation outcome") {
+            task_command_result::Outcome::Error(error) => {
+                assert_eq!(error.code, TaskErrorCode::StaleReference as i32);
+            }
+            other => panic!("revoked Context activated Task: {other:?}"),
+        }
+        assert_eq!(
+            task.inspect_store()
+                .expect("Task inspection after rejected activation"),
+            before_rejected_activation
+        );
+        let persisted = task
+            .get_task(&created.task_id)
+            .expect("read Task after rejected activation");
+        let persisted = match persisted.outcome.expect("get Task outcome") {
+            get_task_response::Outcome::Task(value) => value,
+            other => panic!("Task missing after rejected activation: {other:?}"),
+        };
+        assert_eq!(persisted, created);
+
+        let static_ready = TaskSnapshot {
+            input_snapshot_id: "static-reviewed".to_owned(),
+            target_scope_ref: "scope:r9a3a".to_owned(),
+            status: TaskStatus::Ready as i32,
+            work_revision: 1,
+            ..TaskSnapshot::default()
+        };
+        assert!(
+            ConfiguredTaskTransitionGuard::new()
+                .validate(&activate, &static_ready)
+                .is_ok()
+        );
+
+        drop(task);
+        drop(context);
+        fs::remove_dir_all(root).expect("remove R9A.3a test root");
     }
 }

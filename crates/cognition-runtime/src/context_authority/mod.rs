@@ -215,6 +215,18 @@ pub struct DispatchContextConsumptionAuthorizationReceipt {
     pub replayed: bool,
 }
 
+/// Exact immutable lineage required to recover one durable dispatch
+/// authorization. `dispatch_id` is the lookup key; the remaining fields keep
+/// the read from turning knowledge of an identifier into authorization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchContextConsumptionAuthorizationLookup {
+    pub snapshot_id: String,
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub input_digest_sha256: String,
+    pub expected_scope_ref: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryContextPurpose {
     RecoveryOrReconciliation,
@@ -458,9 +470,39 @@ impl ContextAuthority {
         if principal.kind != ContextPrincipalKind::GovernanceKernel {
             return Err(ContextAuthorityFailure::Unauthorized);
         }
+        validate_dispatch_authorization_receipt(receipt)?;
         self.store
             .verify_dispatch_authorization(receipt)
             .map_err(Into::into)
+    }
+
+    /// Recovers a complete durable authorization by dispatch identity without
+    /// consulting the snapshot's current revoke/expiry state. The exact tuple
+    /// remains mandatory and the operation is read-only.
+    pub fn dispatch_authorization_by_dispatch_id(
+        &self,
+        principal: &AuthenticatedContextPrincipal,
+        lookup: &DispatchContextConsumptionAuthorizationLookup,
+    ) -> Result<Option<DispatchContextConsumptionAuthorizationReceipt>, ContextAuthorityFailure>
+    {
+        validate_principal(principal)?;
+        if principal.kind != ContextPrincipalKind::GovernanceKernel {
+            return Err(ContextAuthorityFailure::Unauthorized);
+        }
+        validate_dispatch_authorization_lookup(lookup)?;
+        let receipt =
+            self.store
+                .dispatch_authorization_by_dispatch_id(&store::RecoveryLineageRequest {
+                    snapshot_id: &lookup.snapshot_id,
+                    attempt_id: &lookup.attempt_id,
+                    dispatch_id: &lookup.dispatch_id,
+                    input_digest_sha256: &lookup.input_digest_sha256,
+                    expected_scope_ref: &lookup.expected_scope_ref,
+                })?;
+        if let Some(receipt) = receipt.as_ref() {
+            validate_dispatch_authorization_receipt(receipt)?;
+        }
+        Ok(receipt)
     }
 
     pub fn governance(
@@ -916,6 +958,45 @@ fn validate_recovery_request(
     )
 }
 
+fn validate_dispatch_authorization_lookup(
+    lookup: &DispatchContextConsumptionAuthorizationLookup,
+) -> Result<(), ContextAuthorityFailure> {
+    validate_snapshot_id(&lookup.snapshot_id)?;
+    for (field, value) in [
+        ("attempt_id", &lookup.attempt_id),
+        ("dispatch_id", &lookup.dispatch_id),
+        ("expected_scope_ref", &lookup.expected_scope_ref),
+    ] {
+        validate_routing(value, field)?;
+    }
+    validate_canonical_digest(&lookup.input_digest_sha256, "input_digest_sha256")
+}
+
+fn validate_dispatch_authorization_receipt(
+    receipt: &DispatchContextConsumptionAuthorizationReceipt,
+) -> Result<(), ContextAuthorityFailure> {
+    validate_snapshot_id(&receipt.snapshot_id)?;
+    if receipt.snapshot_revision == 0
+        || receipt.observed_state_revision == 0
+        || receipt.committed_at_seconds <= 0
+    {
+        return Err(ContextAuthorityFailure::IntegrityFailure);
+    }
+    for (field, value) in [
+        ("authorization_id", &receipt.authorization_id),
+        ("attempt_id", &receipt.attempt_id),
+        ("dispatch_id", &receipt.dispatch_id),
+        ("expected_scope_ref", &receipt.expected_scope_ref),
+        ("event_id", &receipt.event_id),
+    ] {
+        validate_routing(value, field).map_err(|_| ContextAuthorityFailure::IntegrityFailure)?;
+    }
+    validate_canonical_digest(&receipt.input_digest_sha256, "input_digest_sha256")
+        .map_err(|_| ContextAuthorityFailure::IntegrityFailure)?;
+    validate_canonical_digest(&receipt.request_digest_sha256, "request_digest_sha256")
+        .map_err(|_| ContextAuthorityFailure::IntegrityFailure)
+}
+
 fn validate_snapshot_id(value: &str) -> Result<(), ContextAuthorityFailure> {
     let Some(digest) = value.strip_prefix("ctx:") else {
         return Err(ContextAuthorityFailure::InvalidArgument("snapshot_id"));
@@ -1309,17 +1390,33 @@ mod tests {
         dispatch_id: &str,
         idempotency_key: &str,
     ) -> DispatchContextConsumptionAuthorizationRequest {
+        let input_digest_sha256 = snapshot_id
+            .strip_prefix("ctx:")
+            .expect("test snapshot id carries compiled digest")
+            .to_owned();
         DispatchContextConsumptionAuthorizationRequest {
             command_id: format!("command:{idempotency_key}"),
             snapshot_id: snapshot_id.to_owned(),
             expected_state_revision: 1,
             attempt_id: attempt_id.to_owned(),
             dispatch_id: dispatch_id.to_owned(),
-            input_digest_sha256: "d".repeat(64),
+            input_digest_sha256,
             expected_scope_ref: "scope:repo".to_owned(),
             idempotency_key: idempotency_key.to_owned(),
             correlation_id: format!("correlation:{idempotency_key}"),
             causation_id: format!("causation:{idempotency_key}"),
+        }
+    }
+
+    fn authorization_lookup(
+        request: &DispatchContextConsumptionAuthorizationRequest,
+    ) -> DispatchContextConsumptionAuthorizationLookup {
+        DispatchContextConsumptionAuthorizationLookup {
+            snapshot_id: request.snapshot_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            dispatch_id: request.dispatch_id.clone(),
+            input_digest_sha256: request.input_digest_sha256.clone(),
+            expected_scope_ref: request.expected_scope_ref.clone(),
         }
     }
 
@@ -1685,6 +1782,14 @@ mod tests {
             .authorize_dispatch_consumption(&governance_kernel(), &request)
             .expect("replay authorization after revoke and restart");
         assert_authorization_replay_matches_original(&authorization, &replay);
+        let recovered_authorization = reopened
+            .dispatch_authorization_by_dispatch_id(
+                &governance_kernel(),
+                &authorization_lookup(&request),
+            )
+            .expect("recover authorization by dispatch after revoke and restart")
+            .expect("durable authorization exists");
+        assert_eq!(recovered_authorization, authorization);
         reopened
             .verify_dispatch_authorization(&governance_kernel(), &authorization)
             .expect("verify original authorization after revoke");
@@ -1980,6 +2085,23 @@ mod tests {
             "dispatch:r9a-tuple",
             "r9a-tuple-authorization",
         );
+        let before_mismatched_digest = authority
+            .inspect_store()
+            .expect("inspection before mismatched input digest");
+        let mut mismatched_digest = request.clone();
+        mismatched_digest.dispatch_id = "dispatch:r9a-digest-mismatch".to_owned();
+        mismatched_digest.idempotency_key = "r9a-digest-mismatch".to_owned();
+        mismatched_digest.input_digest_sha256 = "f".repeat(64);
+        assert_eq!(
+            authority.authorize_dispatch_consumption(&governance_kernel(), &mismatched_digest),
+            Err(ContextAuthorityFailure::AuthorizationTupleConflict)
+        );
+        assert_eq!(
+            authority
+                .inspect_store()
+                .expect("inspection after mismatched input digest"),
+            before_mismatched_digest
+        );
         let authorization = authority
             .authorize_dispatch_consumption(&governance_kernel(), &request)
             .expect("authorize dispatch consumption");
@@ -1999,6 +2121,20 @@ mod tests {
         assert_eq!(
             authority.resolve_for_recovery(&founder("founder:test"), &recovery_request(&request)),
             Err(ContextAuthorityFailure::Unauthorized)
+        );
+        assert_eq!(
+            authority.dispatch_authorization_by_dispatch_id(
+                &founder("founder:test"),
+                &authorization_lookup(&request),
+            ),
+            Err(ContextAuthorityFailure::Unauthorized)
+        );
+
+        let mut wrong_lookup = authorization_lookup(&request);
+        wrong_lookup.attempt_id.push_str(":other");
+        assert_eq!(
+            authority.dispatch_authorization_by_dispatch_id(&governance_kernel(), &wrong_lookup),
+            Err(ContextAuthorityFailure::AuthorizationTupleConflict)
         );
 
         let mut same_key_changed_input = request.clone();

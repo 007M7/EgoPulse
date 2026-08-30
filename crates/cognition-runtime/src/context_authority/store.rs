@@ -877,6 +877,7 @@ impl ContextStore {
             };
             if stored.snapshot.revision != receipt.snapshot_revision
                 || stored.snapshot.target_scope_ref != receipt.expected_scope_ref
+                || stored.snapshot.compiled_context_sha256 != receipt.input_digest_sha256
                 || !current_state_is_valid
             {
                 return Err(StoreError::IntegrityFailure);
@@ -910,6 +911,9 @@ impl ContextStore {
         }
         if stored.snapshot.target_scope_ref != commit.expected_scope_ref {
             return Err(StoreError::ScopeMismatch);
+        }
+        if stored.snapshot.compiled_context_sha256 != commit.input_digest_sha256 {
+            return Err(StoreError::AuthorizationTupleConflict);
         }
 
         let sequence = insert_context_event(
@@ -982,35 +986,40 @@ impl ContextStore {
         &self,
         request: RecoveryLineageRequest<'_>,
     ) -> Result<StoredSnapshot, StoreError> {
-        let lineage: Option<(String, String, String, String, String)> = self
+        let receipt = self
+            .dispatch_authorization_by_dispatch_id(&request)?
+            .ok_or(StoreError::NotFound)?;
+        let snapshot = self
+            .snapshot_with_bytes(request.snapshot_id)?
+            .ok_or(StoreError::IntegrityFailure)?;
+        if snapshot.snapshot.compiled_context_sha256 != receipt.input_digest_sha256 {
+            return Err(StoreError::IntegrityFailure);
+        }
+        Ok(snapshot)
+    }
+
+    pub(super) fn dispatch_authorization_by_dispatch_id(
+        &self,
+        request: &RecoveryLineageRequest<'_>,
+    ) -> Result<Option<DispatchContextConsumptionAuthorizationReceipt>, StoreError> {
+        let authorization_id: Option<String> = self
             .connection
             .query_row(
-                "SELECT snapshot_id,attempt_id,input_digest_sha256,expected_scope_ref,
-                        authorization_id
+                "SELECT authorization_id
                  FROM context_dispatch_authorizations WHERE dispatch_id=?1",
                 [request.dispatch_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| row.get(0),
             )
             .optional()?;
-        let lineage = lineage.ok_or(StoreError::NotFound)?;
-        if lineage.0 != request.snapshot_id
-            || lineage.1 != request.attempt_id
-            || lineage.2 != request.input_digest_sha256
-            || lineage.3 != request.expected_scope_ref
-            || lineage.4.trim().is_empty()
-        {
-            return Err(StoreError::AuthorizationTupleConflict);
+        let Some(authorization_id) = authorization_id else {
+            return Ok(None);
+        };
+        if authorization_id.trim().is_empty() {
+            return Err(StoreError::IntegrityFailure);
         }
-        let receipt = dispatch_authorization_receipt(&self.connection, &lineage.4, false)?
+        let receipt = dispatch_authorization_receipt(&self.connection, &authorization_id, false)?
             .ok_or(StoreError::IntegrityFailure)?;
+        self.verify_dispatch_authorization(&receipt)?;
         if receipt.snapshot_id != request.snapshot_id
             || receipt.attempt_id != request.attempt_id
             || receipt.dispatch_id != request.dispatch_id
@@ -1019,8 +1028,7 @@ impl ContextStore {
         {
             return Err(StoreError::AuthorizationTupleConflict);
         }
-        self.snapshot_with_bytes(request.snapshot_id)?
-            .ok_or(StoreError::IntegrityFailure)
+        Ok(Some(receipt))
     }
 
     pub(super) fn verify_dispatch_authorization(
@@ -1048,6 +1056,7 @@ impl ContextStore {
         };
         if snapshot.snapshot.revision != receipt.snapshot_revision
             || snapshot.snapshot.target_scope_ref != receipt.expected_scope_ref
+            || snapshot.snapshot.compiled_context_sha256 != receipt.input_digest_sha256
             || !current_state_is_valid
         {
             return Err(StoreError::IntegrityFailure);
