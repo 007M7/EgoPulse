@@ -1,6 +1,6 @@
 use crate::{
     AdapterEdge, AdapterEdgeError, AdapterObservationEvidence, DispatchPreparation,
-    DurableWritePreparation, PendingAdapterApprovalProjection,
+    DurableWritePreparation, NormalObservationRecoveryView, PendingAdapterApprovalProjection,
 };
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ApprovalDecisionEnvelope, ApprovalDecisionReceipt, ApprovalDecisionResult,
@@ -259,6 +259,8 @@ pub enum GovernedAdapterError {
     DispatchNotFound,
     #[error("durable reconciliation evidence is invalid")]
     InvalidReconciliationEvidence,
+    #[error("durable delivered dispatch recovery evidence is invalid")]
+    InvalidDeliveredRecoveryEvidence,
     #[error("native terminal output candidate extraction failed")]
     TerminalOutputCandidate,
 }
@@ -820,6 +822,91 @@ where
 
     pub fn pending_observations(&self) -> Result<Vec<HarnessObservation>, GovernedAdapterError> {
         self.edge.pending_observations().map_err(Into::into)
+    }
+
+    pub fn normal_observation_recovery_view(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<NormalObservationRecoveryView, GovernedAdapterError> {
+        self.edge
+            .normal_observation_recovery_view(dispatch_id, &self.capability_profile_id)
+            .map_err(Into::into)
+    }
+
+    /// Verifies the Adapter-owned transport evidence for a delivered dispatch.
+    ///
+    /// This deliberately proves only the receipt's capability profile ID. The
+    /// full profile reference version and digest remain part of the caller's
+    /// independently verified Collaboration candidate.
+    pub fn verify_delivered_recovery_candidate(
+        &self,
+        candidate: &DispatchEnvelope,
+    ) -> Result<(), GovernedAdapterError> {
+        let invalid = GovernedAdapterError::InvalidDeliveredRecoveryEvidence;
+        let Some(candidate_profile) = candidate.capability_profile_ref.as_ref() else {
+            return Err(invalid);
+        };
+        if candidate.dispatch_id.trim().is_empty()
+            || candidate.attempt_id.trim().is_empty()
+            || candidate.fencing_token == 0
+            || !sha256_is_valid(&candidate.dispatch_fingerprint)
+            || candidate_profile.contract_id.trim().is_empty()
+        {
+            return Err(invalid);
+        }
+
+        let stored = self
+            .edge
+            .stored_delivered_dispatch_evidence(&candidate.dispatch_id)?
+            .ok_or(GovernedAdapterError::InvalidDeliveredRecoveryEvidence)?;
+        if stored.delivery_state != "delivered"
+            || stored.dispatch_id != candidate.dispatch_id
+            || stored.attempt_id != candidate.attempt_id
+            || stored.fencing_token != candidate.fencing_token
+            || stored.dispatch_fingerprint != candidate.dispatch_fingerprint
+            || sha256(&stored.envelope) != stored.envelope_digest_sha256
+        {
+            return Err(GovernedAdapterError::InvalidDeliveredRecoveryEvidence);
+        }
+
+        let stored_envelope = DispatchEnvelope::decode(stored.envelope.as_slice())
+            .map_err(|_| GovernedAdapterError::InvalidDeliveredRecoveryEvidence)?;
+        if stored_envelope != *candidate {
+            return Err(GovernedAdapterError::InvalidDeliveredRecoveryEvidence);
+        }
+
+        let receipt = stored
+            .receipt
+            .ok_or(GovernedAdapterError::InvalidDeliveredRecoveryEvidence)
+            .and_then(|receipt| {
+                DispatchReceipt::decode(receipt.as_slice())
+                    .map_err(|_| GovernedAdapterError::InvalidDeliveredRecoveryEvidence)
+            })?;
+        if !matches!(
+            DeliveryDisposition::try_from(receipt.disposition),
+            Ok(DeliveryDisposition::Delivered)
+        ) || receipt.receipt_id.trim().is_empty()
+            || receipt.evidence_ref.trim().is_empty()
+            || self.adapter_id != self.edge.adapter_id()
+            || receipt.adapter_id != self.adapter_id
+            || receipt.attempt_id != candidate.attempt_id
+            || receipt.dispatch_id != candidate.dispatch_id
+            || receipt.fencing_token != candidate.fencing_token
+            || receipt.capability_profile_id != self.capability_profile_id
+            || candidate_profile.contract_id != self.capability_profile_id
+        {
+            return Err(GovernedAdapterError::InvalidDeliveredRecoveryEvidence);
+        }
+
+        let recorded_receipt_digest = receipt.receipt_digest_sha256.clone();
+        let mut canonical_receipt = receipt;
+        canonical_receipt.receipt_digest_sha256.clear();
+        if !sha256_is_valid(&recorded_receipt_digest)
+            || canonical_digest(&canonical_receipt) != recorded_receipt_digest
+        {
+            return Err(GovernedAdapterError::InvalidDeliveredRecoveryEvidence);
+        }
+        Ok(())
     }
 
     pub fn bind_dispatch_task_lineage(
@@ -1502,5 +1589,461 @@ mod probe_tests {
             validate_probe_result(&request(), &result, &expected),
             Err(ProbeValidationError::ReadinessInvalid)
         );
+    }
+}
+
+#[cfg(test)]
+mod delivered_recovery_tests {
+    use super::*;
+    use crate::{AdapterEdgeConfig, AdapterEdgeKey};
+    use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
+    use rusqlite::{Connection, params};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const ADAPTER_ID: &str = "adapter:test";
+    const PROFILE_ID: &str = "profile:test";
+    const EDGE_KEY: [u8; 32] = [0x5a; 32];
+
+    struct IsolatedStore {
+        root: PathBuf,
+    }
+
+    impl IsolatedStore {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("egopulse-{label}-{}", Uuid::now_v7()));
+            fs::create_dir_all(&root).expect("create runtime recovery test directory");
+            Self { root }
+        }
+
+        fn path(&self) -> PathBuf {
+            self.root.join("adapter-edge.sqlcipher")
+        }
+    }
+
+    impl Drop for IsolatedStore {
+        fn drop(&mut self) {
+            let temp = std::env::temp_dir();
+            assert!(self.root.starts_with(&temp));
+            if self.root.exists() {
+                fs::remove_dir_all(&self.root).expect("remove runtime recovery test directory");
+            }
+        }
+    }
+
+    struct UnusedResolver;
+
+    impl DispatchMaterialResolver for UnusedResolver {
+        fn resolve(
+            &self,
+            _envelope: &DispatchEnvelope,
+        ) -> Result<ResolvedDispatchMaterial, HarnessError> {
+            panic!("delivered recovery verification must not resolve dispatch material")
+        }
+    }
+
+    struct PanicDriver;
+
+    impl NativeHarnessDriver for PanicDriver {
+        fn probe<'a>(
+            &'a mut self,
+            _request: &'a ProbeHarnessRequest,
+        ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+            panic!("delivered recovery verification must not call the native driver")
+        }
+
+        fn send_dispatch<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+            _material: &'a ResolvedDispatchMaterial,
+        ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+            panic!("delivered recovery verification must not call the native driver")
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+            panic!("delivered recovery verification must not call the native driver")
+        }
+
+        fn decide_approval<'a>(
+            &'a mut self,
+            _envelope: &'a ApprovalDecisionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            panic!("delivered recovery verification must not call the native driver")
+        }
+
+        fn cancel<'a>(
+            &'a mut self,
+            _envelope: &'a CancelExecutionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            panic!("delivered recovery verification must not call the native driver")
+        }
+
+        fn reconcile<'a>(
+            &'a mut self,
+            _context: &'a ReconciliationContext,
+        ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+            panic!("delivered recovery verification must not call the native driver")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixedClock;
+
+    impl AdapterClock for FixedClock {
+        fn now(&self) -> Timestamp {
+            Timestamp {
+                seconds: 10,
+                nanos: 0,
+            }
+        }
+    }
+
+    fn edge(path: &Path) -> AdapterEdge {
+        AdapterEdge::open(AdapterEdgeConfig {
+            database_path: path.to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            store_epoch: "delivered-recovery-test-v1".to_owned(),
+            key: AdapterEdgeKey::new(EDGE_KEY),
+        })
+        .expect("open Adapter Edge")
+    }
+
+    fn adapter(path: &Path) -> GovernedHarnessAdapter<UnusedResolver, PanicDriver, FixedClock> {
+        adapter_with_runtime_identity(path, ADAPTER_ID, PROFILE_ID)
+    }
+
+    fn adapter_with_runtime_identity(
+        path: &Path,
+        runtime_adapter_id: &str,
+        runtime_profile_id: &str,
+    ) -> GovernedHarnessAdapter<UnusedResolver, PanicDriver, FixedClock> {
+        GovernedHarnessAdapter::new(
+            runtime_adapter_id,
+            runtime_profile_id,
+            NativeProtocolFingerprint::default(),
+            edge(path),
+            UnusedResolver,
+            PanicDriver,
+            FixedClock,
+        )
+    }
+
+    fn candidate() -> DispatchEnvelope {
+        DispatchEnvelope {
+            dispatch_id: "dispatch-001".to_owned(),
+            run_id: "run-001".to_owned(),
+            run_revision: 1,
+            step_id: "step-001".to_owned(),
+            step_revision: 1,
+            attempt_id: "attempt-001".to_owned(),
+            attempt_revision: 1,
+            fencing_token: 7,
+            dispatch_fingerprint: "a".repeat(64),
+            input_bundle_sha256: "b".repeat(64),
+            capability_profile_ref: Some(ContractReference {
+                contract_id: PROFILE_ID.to_owned(),
+                version: "v1".to_owned(),
+                sha256: "c".repeat(64),
+            }),
+            ..DispatchEnvelope::default()
+        }
+    }
+
+    fn delivered_receipt(envelope: &DispatchEnvelope) -> DispatchReceipt {
+        let mut receipt = DispatchReceipt {
+            receipt_id: "receipt-001".to_owned(),
+            disposition: DeliveryDisposition::Delivered as i32,
+            attempt_id: envelope.attempt_id.clone(),
+            dispatch_id: envelope.dispatch_id.clone(),
+            fencing_token: envelope.fencing_token,
+            adapter_id: ADAPTER_ID.to_owned(),
+            capability_profile_id: PROFILE_ID.to_owned(),
+            receipt_digest_sha256: String::new(),
+            evidence_ref: "adapter-edge://adapter:test/delivery/receipt-001".to_owned(),
+            delivered_at: Some(Timestamp {
+                seconds: 10,
+                nanos: 0,
+            }),
+            ..DispatchReceipt::default()
+        };
+        receipt.receipt_digest_sha256 = canonical_digest(&receipt);
+        receipt
+    }
+
+    fn seed_delivered(path: &Path) -> DispatchEnvelope {
+        let envelope = candidate();
+        let mut edge = edge(path);
+        assert_eq!(
+            edge.prepare_dispatch(&envelope, 8)
+                .expect("prepare dispatch"),
+            DispatchPreparation::Ready
+        );
+        edge.begin_delivery(&envelope.dispatch_id, 9)
+            .expect("begin delivery");
+        edge.record_dispatch_receipt(&delivered_receipt(&envelope), b"native-delivery", 10)
+            .expect("record delivered receipt");
+        envelope
+    }
+
+    fn raw_connection(path: &Path) -> Connection {
+        let connection = Connection::open(path).expect("open raw Adapter Edge");
+        connection
+            .pragma_update(None, "key", format!("x'{}'", hex::encode(EDGE_KEY)))
+            .expect("unlock raw Adapter Edge");
+        connection
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EvidenceTamper {
+        DeliveryState,
+        RowAttempt,
+        RowFence,
+        RowFingerprint,
+        EnvelopeDigest,
+        EnvelopeBlob,
+        EnvelopeMalformed,
+        ReceiptMissing,
+        ReceiptMalformed,
+        ReceiptDisposition,
+        ReceiptIdEmpty,
+        ReceiptEvidenceRefEmpty,
+        ReceiptAdapter,
+        ReceiptAttempt,
+        ReceiptDispatch,
+        ReceiptFence,
+        ReceiptProfile,
+        ReceiptDigest,
+    }
+
+    fn rewrite_receipt(
+        connection: &Connection,
+        recompute_digest: bool,
+        mutate: impl FnOnce(&mut DispatchReceipt),
+    ) {
+        let bytes: Vec<u8> = connection
+            .query_row(
+                "SELECT receipt FROM adapter_dispatches WHERE dispatch_id = 'dispatch-001'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read stored receipt");
+        let mut receipt = DispatchReceipt::decode(bytes.as_slice()).expect("decode stored receipt");
+        mutate(&mut receipt);
+        if recompute_digest {
+            receipt.receipt_digest_sha256.clear();
+            receipt.receipt_digest_sha256 = canonical_digest(&receipt);
+        }
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE adapter_dispatches SET receipt = ?1 WHERE dispatch_id = 'dispatch-001'",
+                    [receipt.encode_to_vec()],
+                )
+                .expect("rewrite stored receipt"),
+            1
+        );
+    }
+
+    fn inject_tamper(path: &Path, tamper: EvidenceTamper) {
+        let connection = raw_connection(path);
+        let changed = match tamper {
+            EvidenceTamper::DeliveryState => connection.execute(
+                "UPDATE adapter_dispatches SET delivery_state = 'rejected'
+                 WHERE dispatch_id = 'dispatch-001'",
+                [],
+            ),
+            EvidenceTamper::RowAttempt => connection.execute(
+                "UPDATE adapter_dispatches SET attempt_id = 'attempt-row-drift'
+                 WHERE dispatch_id = 'dispatch-001'",
+                [],
+            ),
+            EvidenceTamper::RowFence => connection.execute(
+                "UPDATE adapter_dispatches SET fencing_token = 8
+                 WHERE dispatch_id = 'dispatch-001'",
+                [],
+            ),
+            EvidenceTamper::RowFingerprint => connection.execute(
+                "UPDATE adapter_dispatches SET dispatch_fingerprint = ?1
+                 WHERE dispatch_id = 'dispatch-001'",
+                ["d".repeat(64)],
+            ),
+            EvidenceTamper::EnvelopeDigest => connection.execute(
+                "UPDATE adapter_dispatches SET envelope_digest_sha256 = ?1
+                 WHERE dispatch_id = 'dispatch-001'",
+                ["0".repeat(64)],
+            ),
+            EvidenceTamper::EnvelopeBlob => {
+                let bytes: Vec<u8> = connection
+                    .query_row(
+                        "SELECT envelope FROM adapter_dispatches
+                         WHERE dispatch_id = 'dispatch-001'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read stored envelope");
+                let mut envelope =
+                    DispatchEnvelope::decode(bytes.as_slice()).expect("decode stored envelope");
+                envelope.run_id = "run-envelope-drift".to_owned();
+                let bytes = envelope.encode_to_vec();
+                connection.execute(
+                    "UPDATE adapter_dispatches
+                     SET envelope = ?1, envelope_digest_sha256 = ?2
+                     WHERE dispatch_id = 'dispatch-001'",
+                    params![bytes, sha256(&bytes)],
+                )
+            }
+            EvidenceTamper::EnvelopeMalformed => {
+                let bytes = vec![0xff];
+                connection.execute(
+                    "UPDATE adapter_dispatches
+                     SET envelope = ?1, envelope_digest_sha256 = ?2
+                     WHERE dispatch_id = 'dispatch-001'",
+                    params![bytes, sha256(&bytes)],
+                )
+            }
+            EvidenceTamper::ReceiptMissing => connection.execute(
+                "UPDATE adapter_dispatches SET receipt = NULL
+                 WHERE dispatch_id = 'dispatch-001'",
+                [],
+            ),
+            EvidenceTamper::ReceiptMalformed => connection.execute(
+                "UPDATE adapter_dispatches SET receipt = ?1
+                 WHERE dispatch_id = 'dispatch-001'",
+                [vec![0xff]],
+            ),
+            EvidenceTamper::ReceiptDisposition => {
+                rewrite_receipt(&connection, true, |receipt| {
+                    receipt.disposition = DeliveryDisposition::Rejected as i32;
+                });
+                Ok(1)
+            }
+            EvidenceTamper::ReceiptIdEmpty => {
+                rewrite_receipt(&connection, true, |receipt| {
+                    receipt.receipt_id.clear();
+                });
+                Ok(1)
+            }
+            EvidenceTamper::ReceiptEvidenceRefEmpty => {
+                rewrite_receipt(&connection, true, |receipt| {
+                    receipt.evidence_ref.clear();
+                });
+                Ok(1)
+            }
+            EvidenceTamper::ReceiptAdapter => {
+                rewrite_receipt(&connection, true, |receipt| {
+                    receipt.adapter_id = "adapter:other".to_owned();
+                });
+                Ok(1)
+            }
+            EvidenceTamper::ReceiptAttempt => {
+                rewrite_receipt(&connection, true, |receipt| {
+                    receipt.attempt_id = "attempt-receipt-drift".to_owned();
+                });
+                Ok(1)
+            }
+            EvidenceTamper::ReceiptDispatch => {
+                rewrite_receipt(&connection, true, |receipt| {
+                    receipt.dispatch_id = "dispatch-receipt-drift".to_owned();
+                });
+                Ok(1)
+            }
+            EvidenceTamper::ReceiptFence => {
+                rewrite_receipt(&connection, true, |receipt| {
+                    receipt.fencing_token = 8;
+                });
+                Ok(1)
+            }
+            EvidenceTamper::ReceiptProfile => {
+                rewrite_receipt(&connection, true, |receipt| {
+                    receipt.capability_profile_id = "profile:other".to_owned();
+                });
+                Ok(1)
+            }
+            EvidenceTamper::ReceiptDigest => {
+                rewrite_receipt(&connection, false, |receipt| {
+                    receipt.receipt_digest_sha256 = "0".repeat(64);
+                });
+                Ok(1)
+            }
+        }
+        .expect("inject delivered evidence tamper");
+        assert_eq!(changed, 1, "tamper must change exactly one dispatch row");
+    }
+
+    #[test]
+    fn delivered_recovery_candidate_requires_complete_adapter_transport_evidence() {
+        let isolated = IsolatedStore::new("delivered-recovery-valid");
+        let candidate = seed_delivered(&isolated.path());
+        let adapter = adapter(&isolated.path());
+
+        adapter
+            .verify_delivered_recovery_candidate(&candidate)
+            .expect("verify delivered recovery candidate");
+        let normal_view = adapter
+            .normal_observation_recovery_view(&candidate.dispatch_id)
+            .expect("delegate normal recovery view");
+        assert!(normal_view.pending.is_empty());
+        assert_eq!(normal_view.durable_terminal_sequence, None);
+    }
+
+    #[test]
+    fn delivered_recovery_candidate_fails_closed_for_each_durable_binding_drift() {
+        let cases = [
+            EvidenceTamper::DeliveryState,
+            EvidenceTamper::RowAttempt,
+            EvidenceTamper::RowFence,
+            EvidenceTamper::RowFingerprint,
+            EvidenceTamper::EnvelopeDigest,
+            EvidenceTamper::EnvelopeBlob,
+            EvidenceTamper::EnvelopeMalformed,
+            EvidenceTamper::ReceiptMissing,
+            EvidenceTamper::ReceiptMalformed,
+            EvidenceTamper::ReceiptDisposition,
+            EvidenceTamper::ReceiptIdEmpty,
+            EvidenceTamper::ReceiptEvidenceRefEmpty,
+            EvidenceTamper::ReceiptAdapter,
+            EvidenceTamper::ReceiptAttempt,
+            EvidenceTamper::ReceiptDispatch,
+            EvidenceTamper::ReceiptFence,
+            EvidenceTamper::ReceiptProfile,
+            EvidenceTamper::ReceiptDigest,
+        ];
+
+        for tamper in cases {
+            let isolated = IsolatedStore::new(&format!("delivered-recovery-{tamper:?}"));
+            let candidate = seed_delivered(&isolated.path());
+            inject_tamper(&isolated.path(), tamper);
+            let adapter = adapter(&isolated.path());
+            assert!(
+                matches!(
+                    adapter.verify_delivered_recovery_candidate(&candidate),
+                    Err(GovernedAdapterError::InvalidDeliveredRecoveryEvidence)
+                ),
+                "tamper case must fail closed: {tamper:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delivered_recovery_candidate_rejects_runtime_adapter_or_profile_identity_drift() {
+        for (runtime_adapter_id, runtime_profile_id) in [
+            ("adapter:runtime-drift", PROFILE_ID),
+            (ADAPTER_ID, "profile:runtime-drift"),
+        ] {
+            let isolated = IsolatedStore::new("delivered-recovery-runtime-identity-drift");
+            let candidate = seed_delivered(&isolated.path());
+            let adapter = adapter_with_runtime_identity(
+                &isolated.path(),
+                runtime_adapter_id,
+                runtime_profile_id,
+            );
+            assert!(matches!(
+                adapter.verify_delivered_recovery_candidate(&candidate),
+                Err(GovernedAdapterError::InvalidDeliveredRecoveryEvidence)
+            ));
+        }
     }
 }

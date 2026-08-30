@@ -228,6 +228,24 @@ pub struct AdapterObservationEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalObservationRecoveryView {
+    pub pending: Vec<HarnessObservation>,
+    pub durable_terminal_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredDeliveredDispatchEvidence {
+    pub dispatch_id: String,
+    pub attempt_id: String,
+    pub fencing_token: u64,
+    pub dispatch_fingerprint: String,
+    pub envelope_digest_sha256: String,
+    pub envelope: Vec<u8>,
+    pub delivery_state: String,
+    pub receipt: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DispatchTaskLineage {
     pub task_id: String,
     pub task_revision: u64,
@@ -799,6 +817,97 @@ impl AdapterEdge {
             .collect()
     }
 
+    pub fn normal_observation_recovery_view(
+        &self,
+        dispatch_id: &str,
+        expected_capability_profile_id: &str,
+    ) -> Result<NormalObservationRecoveryView, AdapterEdgeError> {
+        if expected_capability_profile_id.trim().is_empty() {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT observation_id, dispatch_id, attempt_id, fencing_token,
+                    observation_sequence, ingestion_state,
+                    native_event_digest_sha256, raw_evidence_ref, raw_event, observation
+             FROM adapter_observations
+             WHERE dispatch_id = ?1
+               AND instr(native_key, 'reconciliation:') <> 1
+             ORDER BY observation_sequence",
+        )?;
+        let records = statement
+            .query_map([dispatch_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut pending = Vec::new();
+        let mut durable_terminal_sequence = None;
+        for (
+            observation_id,
+            row_dispatch_id,
+            attempt_id,
+            fencing_token,
+            observation_sequence,
+            ingestion_state,
+            native_event_digest_sha256,
+            raw_evidence_ref,
+            raw_event,
+            observation,
+        ) in records
+        {
+            let fencing_token =
+                u64::try_from(fencing_token).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            let observation_sequence = u64::try_from(observation_sequence)
+                .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            let observation = HarnessObservation::decode(observation.as_slice())?;
+            let criticality = ObservationCriticality::try_from(observation.criticality)
+                .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            if observation_id.trim().is_empty()
+                || row_dispatch_id.trim().is_empty()
+                || attempt_id.trim().is_empty()
+                || fencing_token == 0
+                || observation_sequence == 0
+                || row_dispatch_id != dispatch_id
+                || observation.observation_id != observation_id
+                || observation.dispatch_id != row_dispatch_id
+                || observation.attempt_id != attempt_id
+                || observation.fencing_token != fencing_token
+                || observation.observation_sequence != observation_sequence
+                || observation.adapter_id != self.adapter_id
+                || observation.capability_profile_id != expected_capability_profile_id
+                || observation.native_event_digest_sha256 != native_event_digest_sha256
+                || observation.raw_evidence_ref != raw_evidence_ref
+                || sha256(&raw_event) != native_event_digest_sha256
+                || !matches!(ingestion_state.as_str(), "pending" | "consumed")
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+            if criticality == ObservationCriticality::Terminal
+                && durable_terminal_sequence.is_none()
+            {
+                durable_terminal_sequence = Some(observation_sequence);
+            }
+            if ingestion_state == "pending" {
+                pending.push(observation);
+            }
+        }
+        Ok(NormalObservationRecoveryView {
+            pending,
+            durable_terminal_sequence,
+        })
+    }
+
     pub fn pending_approval_projection_messages(
         &self,
     ) -> Result<Vec<PendingAdapterApprovalProjection>, AdapterEdgeError> {
@@ -1198,6 +1307,59 @@ impl AdapterEdge {
             .flatten();
         bytes
             .map(|value| DispatchReceipt::decode(value.as_slice()).map_err(Into::into))
+            .transpose()
+    }
+
+    pub(crate) fn stored_delivered_dispatch_evidence(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<StoredDeliveredDispatchEvidence>, AdapterEdgeError> {
+        self.connection
+            .query_row(
+                "SELECT dispatch_id, attempt_id, fencing_token, dispatch_fingerprint,
+                        envelope_digest_sha256, envelope, delivery_state, receipt
+                 FROM adapter_dispatches WHERE dispatch_id = ?1",
+                [dispatch_id],
+                |row| {
+                    let fencing_token = row.get::<_, i64>(2)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        fencing_token,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<Vec<u8>>>(7)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(
+                |(
+                    dispatch_id,
+                    attempt_id,
+                    fencing_token,
+                    dispatch_fingerprint,
+                    envelope_digest_sha256,
+                    envelope,
+                    delivery_state,
+                    receipt,
+                )| {
+                    let fencing_token = u64::try_from(fencing_token)
+                        .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+                    Ok(StoredDeliveredDispatchEvidence {
+                        dispatch_id,
+                        attempt_id,
+                        fencing_token,
+                        dispatch_fingerprint,
+                        envelope_digest_sha256,
+                        envelope,
+                        delivery_state,
+                        receipt,
+                    })
+                },
+            )
             .transpose()
     }
 
@@ -1752,6 +1914,7 @@ mod tests {
 
     const ABORT_HELPER_ENV: &str = "EGOPULSE_ADAPTER_EDGE_ABORT_HELPER";
     const ABORT_PATH_ENV: &str = "EGOPULSE_ADAPTER_EDGE_ABORT_PATH";
+    const TEST_CAPABILITY_PROFILE_ID: &str = "profile:test";
 
     struct IsolatedEdge {
         root: PathBuf,
@@ -1834,6 +1997,7 @@ mod tests {
             attempt_id: attempt_id.to_owned(),
             dispatch_id: dispatch_id.to_owned(),
             fencing_token: 1,
+            capability_profile_id: TEST_CAPABILITY_PROFILE_ID.to_owned(),
             criticality: ObservationCriticality::Control as i32,
             payload: Some(harness_observation::Payload::Diagnostic(
                 DiagnosticObservation {
@@ -1851,6 +2015,7 @@ mod tests {
             attempt_id: "attempt-001".to_owned(),
             dispatch_id: "dispatch-001".to_owned(),
             fencing_token: 1,
+            capability_profile_id: TEST_CAPABILITY_PROFILE_ID.to_owned(),
             criticality: ObservationCriticality::Terminal as i32,
             payload: Some(harness_observation::Payload::Lifecycle(
                 egopulse_domain_contracts::v01::egopulse::harness::v1::LifecycleObservation {
@@ -2192,6 +2357,298 @@ mod tests {
         assert_eq!(inspection.cancellation_count, 1);
         assert_eq!(inspection.next_observation_sequence, 2);
         assert!(edge.integrity_is_ok().expect("edge integrity"));
+    }
+
+    #[test]
+    fn normal_observation_recovery_excludes_reconciliation_and_retains_terminal_barrier() {
+        let isolated = IsolatedEdge::new("normal-observation-recovery");
+        let mut edge = open_edge(&isolated.path());
+        edge.prepare_dispatch(&dispatch(), 10)
+            .expect("prepare dispatch");
+
+        let ObservationAppend::Committed(first) = edge
+            .append_observation(
+                "dispatch-001",
+                "normal:control",
+                b"normal-control",
+                observation(),
+                11,
+            )
+            .expect("append first normal observation")
+        else {
+            panic!("first normal observation must commit");
+        };
+        let ObservationAppend::Committed(reconciliation) = edge
+            .append_observation(
+                "dispatch-001",
+                "reconciliation:r1",
+                b"reconciliation",
+                observation(),
+                12,
+            )
+            .expect("append reconciliation observation")
+        else {
+            panic!("reconciliation observation must commit");
+        };
+        let ObservationAppend::Committed(case_variant) = edge
+            .append_observation(
+                "dispatch-001",
+                "Reconciliation:r2",
+                b"case-variant-normal",
+                observation(),
+                13,
+            )
+            .expect("append case-variant normal observation")
+        else {
+            panic!("case-variant normal observation must commit");
+        };
+        let ObservationAppend::Committed(first_terminal) = edge
+            .append_observation(
+                "dispatch-001",
+                "normal:terminal:first",
+                b"normal-terminal-first",
+                terminal_observation(),
+                14,
+            )
+            .expect("append first terminal normal observation")
+        else {
+            panic!("first terminal normal observation must commit");
+        };
+        let ObservationAppend::Committed(second_terminal) = edge
+            .append_observation(
+                "dispatch-001",
+                "normal:terminal:second",
+                b"normal-terminal-second",
+                terminal_observation(),
+                15,
+            )
+            .expect("append second terminal normal observation")
+        else {
+            panic!("second terminal normal observation must commit");
+        };
+        assert_eq!(
+            (
+                first.observation_sequence,
+                reconciliation.observation_sequence,
+                case_variant.observation_sequence,
+                first_terminal.observation_sequence,
+                second_terminal.observation_sequence
+            ),
+            (1, 2, 3, 4, 5)
+        );
+        assert!(matches!(
+            edge.normal_observation_recovery_view("dispatch-001", ""),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+
+        let view = edge
+            .normal_observation_recovery_view("dispatch-001", TEST_CAPABILITY_PROFILE_ID)
+            .expect("read normal recovery view");
+        assert_eq!(
+            view.pending
+                .iter()
+                .map(|observation| observation.observation_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4, 5]
+        );
+        assert_eq!(view.durable_terminal_sequence, Some(4));
+        assert!(
+            view.pending
+                .iter()
+                .all(|observation| observation.observation_id != reconciliation.observation_id)
+        );
+        assert!(
+            view.pending
+                .iter()
+                .any(|observation| observation.observation_id == case_variant.observation_id)
+        );
+
+        edge.mark_observation_consumed(&first_terminal.observation_id)
+            .expect("consume first terminal observation");
+        drop(edge);
+        let reopened = open_edge(&isolated.path());
+        let consumed_view = reopened
+            .normal_observation_recovery_view("dispatch-001", TEST_CAPABILITY_PROFILE_ID)
+            .expect("read recovery view after reopen");
+        assert_eq!(
+            consumed_view
+                .pending
+                .iter()
+                .map(|observation| observation.observation_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        assert_eq!(consumed_view.durable_terminal_sequence, Some(4));
+    }
+
+    #[test]
+    fn normal_observation_recovery_fails_closed_on_row_sequence_or_state_drift() {
+        let isolated = IsolatedEdge::new("normal-observation-recovery-sequence-drift");
+        let mut edge = open_edge(&isolated.path());
+        edge.prepare_dispatch(&dispatch(), 10)
+            .expect("prepare dispatch");
+        let ObservationAppend::Committed(committed_observation) = edge
+            .append_observation(
+                "dispatch-001",
+                "normal:control",
+                b"normal-control",
+                observation(),
+                11,
+            )
+            .expect("append normal observation")
+        else {
+            panic!("normal observation must commit");
+        };
+        assert_eq!(
+            edge.connection
+                .execute(
+                    "UPDATE adapter_observations SET observation_sequence = 7
+                     WHERE observation_id = ?1",
+                    [&committed_observation.observation_id],
+                )
+                .expect("inject row sequence drift"),
+            1
+        );
+
+        assert!(matches!(
+            edge.normal_observation_recovery_view("dispatch-001", TEST_CAPABILITY_PROFILE_ID),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+
+        let state_isolated = IsolatedEdge::new("normal-observation-recovery-ingestion-state-drift");
+        let mut state_edge = open_edge(&state_isolated.path());
+        state_edge
+            .prepare_dispatch(&dispatch(), 10)
+            .expect("prepare dispatch for state drift");
+        let ObservationAppend::Committed(state_observation) = state_edge
+            .append_observation(
+                "dispatch-001",
+                "normal:control",
+                b"normal-control",
+                observation(),
+                11,
+            )
+            .expect("append observation for state drift")
+        else {
+            panic!("normal observation must commit");
+        };
+        state_edge
+            .connection
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .expect("allow controlled ingestion state fault injection");
+        assert_eq!(
+            state_edge
+                .connection
+                .execute(
+                    "UPDATE adapter_observations SET ingestion_state = 'invalid'
+                     WHERE observation_id = ?1",
+                    [&state_observation.observation_id],
+                )
+                .expect("inject ingestion state drift"),
+            1
+        );
+        assert!(matches!(
+            state_edge.normal_observation_recovery_view("dispatch-001", TEST_CAPABILITY_PROFILE_ID),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+    }
+
+    #[test]
+    fn normal_observation_recovery_fails_closed_on_digest_raw_ref_or_profile_drift() {
+        for tamper in ["digest", "raw-ref", "profile"] {
+            let isolated =
+                IsolatedEdge::new(&format!("normal-observation-recovery-{tamper}-drift"));
+            let mut edge = open_edge(&isolated.path());
+            edge.prepare_dispatch(&dispatch(), 10)
+                .expect("prepare dispatch");
+            let ObservationAppend::Committed(observation) = edge
+                .append_observation(
+                    "dispatch-001",
+                    "normal:control",
+                    b"normal-control",
+                    observation(),
+                    11,
+                )
+                .expect("append normal observation")
+            else {
+                panic!("normal observation must commit");
+            };
+
+            match tamper {
+                "digest" => {
+                    let bytes: Vec<u8> = edge
+                        .connection
+                        .query_row(
+                            "SELECT observation FROM adapter_observations
+                             WHERE observation_id = ?1",
+                            [&observation.observation_id],
+                            |row| row.get(0),
+                        )
+                        .expect("read observation for digest drift");
+                    let mut stored = HarnessObservation::decode(bytes.as_slice())
+                        .expect("decode observation for digest drift");
+                    stored.native_event_digest_sha256 = "0".repeat(64);
+                    assert_eq!(
+                        edge.connection
+                            .execute(
+                                "UPDATE adapter_observations
+                                 SET native_event_digest_sha256 = ?1, observation = ?2
+                                 WHERE observation_id = ?3",
+                                params![
+                                    stored.native_event_digest_sha256,
+                                    stored.encode_to_vec(),
+                                    observation.observation_id
+                                ],
+                            )
+                            .expect("inject digest drift"),
+                        1
+                    );
+                }
+                "raw-ref" => {
+                    assert_eq!(
+                        edge.connection
+                            .execute(
+                                "UPDATE adapter_observations
+                                 SET raw_evidence_ref = 'adapter-edge://drift/raw/ref'
+                                 WHERE observation_id = ?1",
+                                [&observation.observation_id],
+                            )
+                            .expect("inject raw evidence ref drift"),
+                        1
+                    );
+                }
+                "profile" => {
+                    let bytes: Vec<u8> = edge
+                        .connection
+                        .query_row(
+                            "SELECT observation FROM adapter_observations
+                             WHERE observation_id = ?1",
+                            [&observation.observation_id],
+                            |row| row.get(0),
+                        )
+                        .expect("read observation for profile drift");
+                    let mut stored = HarnessObservation::decode(bytes.as_slice())
+                        .expect("decode observation for profile drift");
+                    stored.capability_profile_id = "profile:other".to_owned();
+                    assert_eq!(
+                        edge.connection
+                            .execute(
+                                "UPDATE adapter_observations SET observation = ?1
+                                 WHERE observation_id = ?2",
+                                params![stored.encode_to_vec(), observation.observation_id],
+                            )
+                            .expect("inject profile drift"),
+                        1
+                    );
+                }
+                _ => unreachable!("fixed tamper matrix"),
+            }
+
+            assert!(matches!(
+                edge.normal_observation_recovery_view("dispatch-001", TEST_CAPABILITY_PROFILE_ID),
+                Err(AdapterEdgeError::IntegrityFailure)
+            ));
+        }
     }
 
     #[test]

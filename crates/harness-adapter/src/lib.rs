@@ -11,8 +11,8 @@ pub use capability::{
 pub use edge::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeInspection, AdapterEdgeKey,
     AdapterObservationEvidence, DispatchPreparation, DispatchTaskLineage, DurableWritePreparation,
-    NativeExecutionBinding, ObservationAppend, PendingAdapterApprovalProjection,
-    PendingTerminalOutputCandidate,
+    NativeExecutionBinding, NormalObservationRecoveryView, ObservationAppend,
+    PendingAdapterApprovalProjection, PendingTerminalOutputCandidate,
 };
 pub use runtime::{
     AdapterClock, AdapterReconciliationEvidence, DispatchMaterialResolver, DriverDelivery,
