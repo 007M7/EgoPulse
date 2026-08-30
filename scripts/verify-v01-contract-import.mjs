@@ -7,11 +7,12 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
 const contractsRoot = join(repositoryRoot, "contracts");
 const manifestPath = join(contractsRoot, "manifest.json");
-const expectedManifestSha256 = "6b55a55558d865bcf42141d6934fad5d16e99a885b471cf0bbf96b4f4333308c";
-const expectedArtifactCount = 240;
-const expectedFixtureCount = 182;
-const expectedClientKernelProfileSha256 = "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9";
-const expectedAuthorizationProfileSha256 = "d50a4f5ff79d8ca1d7a9a289e22265792aa566b8cb13e77de62394b3b34588f7";
+const expectedManifestSha256 = "63cb39b13ca4fdce5b0cca524c8cc6496edf18758bbe5066cd920bdca9848460";
+const expectedArtifactCount = 244;
+const expectedFixtureCount = 184;
+const expectedClientKernelProfileSha256 = "c729726c718a6f49c45e74a0f7435aa0974748661461f4be0e1315b838b17fa4";
+const expectedAuthorizationProfileSha256 = "e44e1cee143b35173372b75fa7ce4efb5732be58bb787d59e961450599d612ab";
+const expectedContextRevokeProfileSha256 = "b76c42ca6de53e7140de707f4700def5a8d2e5ca29912930607fd2125a169573";
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -37,10 +38,11 @@ const manifestSha256 = sha256(manifestBytes);
 assert(manifestSha256 === expectedManifestSha256, `manifest digest mismatch: ${manifestSha256}`);
 
 const manifest = JSON.parse(manifestBytes.toString("utf8"));
-assert(manifest.candidateVersion === "0.1.0-draft.17", "unexpected V-01 implementation contract version");
+assert(manifest.candidateVersion === "0.1.0-draft.18", "unexpected V-01 implementation contract version");
 assert(manifest.targetedRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3", "missing Founder authority for targeted revision");
 assert(manifest.approvalReadModelRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a", "missing Founder authority for approval read model revision");
 assert(manifest.g408cSupportProfilesAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3", "missing Founder authority for G4-08C support profiles");
+assert(manifest.contextRevokeLinearizationAuthorityRef === "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze", "missing Founder authority for R-9A Context revoke linearization");
 assert(manifest.artifacts.length === expectedArtifactCount, "unexpected V-01 artifact count");
 
 let fixtureCount = 0;
@@ -55,6 +57,7 @@ for (const artifact of manifest.artifacts) {
 assert(fixtureCount === expectedFixtureCount, `unexpected fixture count: ${fixtureCount}`);
 assert(sha256(readFileSync(join(contractsRoot, "profiles", "client-kernel", "v1", "v01-default.json"))) === expectedClientKernelProfileSha256, "client-kernel profile digest mismatch");
 assert(sha256(readFileSync(join(contractsRoot, "profiles", "authorization", "v1", "v01-default.json"))) === expectedAuthorizationProfileSha256, "authorization capability profile digest mismatch");
+assert(sha256(readFileSync(join(contractsRoot, "profiles", "context-revoke", "v1", "v01-default.json"))) === expectedContextRevokeProfileSha256, "Context revoke semantic profile digest mismatch");
 assert(existsSync(join(contractsRoot, "proto", "egopulse", "foundation", "v1", "health.proto")), "Foundation health contract was lost during V-01 import");
 
 console.log(

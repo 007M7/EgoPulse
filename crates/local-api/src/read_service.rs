@@ -186,7 +186,9 @@ fn local_error_status(
         LocalApiErrorCode::Unauthenticated | LocalApiErrorCode::SessionExpired => {
             tonic::Code::Unauthenticated
         }
-        LocalApiErrorCode::PermissionDenied => tonic::Code::PermissionDenied,
+        LocalApiErrorCode::PermissionDenied | LocalApiErrorCode::OwnerMismatch => {
+            tonic::Code::PermissionDenied
+        }
         LocalApiErrorCode::NotFound => tonic::Code::NotFound,
         LocalApiErrorCode::ContractIncompatible => tonic::Code::FailedPrecondition,
         LocalApiErrorCode::ProjectionBehind
@@ -197,6 +199,10 @@ fn local_error_status(
             tonic::Code::Unavailable
         }
         LocalApiErrorCode::ResourceExhausted => tonic::Code::ResourceExhausted,
+        LocalApiErrorCode::ContextRevoked => tonic::Code::FailedPrecondition,
+        LocalApiErrorCode::StateRevisionConflict | LocalApiErrorCode::IdempotencyConflict => {
+            tonic::Code::Aborted
+        }
         LocalApiErrorCode::CursorInvalid
         | LocalApiErrorCode::CursorExpired
         | LocalApiErrorCode::IntegrityFailure

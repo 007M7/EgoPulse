@@ -957,36 +957,15 @@ pub fn context_revoke_request_digest(
     founder_principal_id: &str,
     request: &ContextRevokeRequest,
 ) -> String {
-    context_revoke_semantic_digest(
+    egopulse_domain_contracts::context_revoke::ContextRevokeSemanticRequest {
         founder_principal_id,
-        &request.snapshot_id,
-        request.expected_state_revision,
-        &request.reason_code,
-        &request.evidence_refs,
-        &request.confirmation_proof_ref,
-    )
-}
-
-fn context_revoke_semantic_digest(
-    founder_principal_id: &str,
-    snapshot_id: &str,
-    expected_state_revision: u64,
-    reason_code: &str,
-    evidence_refs: &[String],
-    confirmation_proof_ref: &str,
-) -> String {
-    let mut hasher = Sha256::new();
-    update_digest_field(&mut hasher, b"egopulse/context-revoke/v1");
-    update_digest_field(&mut hasher, founder_principal_id.as_bytes());
-    update_digest_field(&mut hasher, snapshot_id.as_bytes());
-    update_digest_field(&mut hasher, &expected_state_revision.to_le_bytes());
-    update_digest_field(&mut hasher, reason_code.as_bytes());
-    update_digest_field(&mut hasher, &(evidence_refs.len() as u64).to_le_bytes());
-    for value in evidence_refs {
-        update_digest_field(&mut hasher, value.as_bytes());
+        snapshot_id: &request.snapshot_id,
+        expected_state_revision: request.expected_state_revision,
+        reason_code: &request.reason_code,
+        evidence_refs: &request.evidence_refs,
+        confirmation_proof_ref: &request.confirmation_proof_ref,
     }
-    update_digest_field(&mut hasher, confirmation_proof_ref.as_bytes());
-    hex::encode(hasher.finalize())
+    .digest_sha256()
 }
 
 pub fn dispatch_authorization_request_digest(

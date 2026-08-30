@@ -55,7 +55,7 @@ use tonic::Request;
 use uuid::Uuid;
 
 const CONTRACT_DIGEST: &str = "28d05e2533ea7650d8fedbc44abfa21d33c2845f8d105650e3287676e789e7bb";
-const KERNEL_DIGEST: &str = "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9";
+const KERNEL_DIGEST: &str = "c729726c718a6f49c45e74a0f7435aa0974748661461f4be0e1315b838b17fa4";
 const POLICY_DIGEST: &str = "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1";
 
 #[derive(Clone)]

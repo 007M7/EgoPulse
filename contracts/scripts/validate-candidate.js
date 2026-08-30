@@ -19,6 +19,8 @@ const clientKernelProfileRelative = 'profiles/client-kernel/v1/v01-default.json'
 const clientKernelSchemaRelative = 'client-kernel-profile.schema.json';
 const authorizationProfileRelative = 'profiles/authorization/v1/v01-default.json';
 const authorizationSchemaRelative = 'authorization-capability-profile.schema.json';
+const contextRevokeProfileRelative = 'profiles/context-revoke/v1/v01-default.json';
+const contextRevokeSchemaRelative = 'context-revoke-semantic-profile.schema.json';
 const requiredCategories = new Set(['valid', 'invalid', 'duplicate', 'stale', 'unauthorized', 'recovery']);
 const taskCommandNames = new Set([
   'createTask', 'activateTask', 'submitTaskEvidence', 'recordTaskVerification',
@@ -129,7 +131,9 @@ const localApiOperationNames = new Set([
   'openSession', 'getTaskView', 'listTaskViews', 'getEvidenceGraph',
   'getHarnessApprovalView', 'listHarnessApprovalViews', 'getProjectionStatus',
   'watchTaskViews', 'watchHarnessApprovalViews', 'executeTaskCommand',
-  'decideHarnessApproval', 'executeFounderVerdict', 'awaitProjection',
+  'decideHarnessApproval', 'executeFounderVerdict', 'executeMemoryMutation',
+  'prepareWork', 'confirmWork', 'executeContextMutation', 'retrieveMemory',
+  'awaitProjection',
 ]);
 const persistenceOperationNames = new Set([
   'commitAuthorityMutation', 'consumeOutboxMessage', 'sealArtifactMetadata',
@@ -527,6 +531,31 @@ function validateLocalApiFixture(file) {
   if (operationName === 'executeFounderVerdict' && expected.outcome === 'ok') {
     if (expected.writeOwner !== 'FounderVerdictAuthority' || expected.localApiReinterpretedDecision !== false) fail(prefix + 'gateway cannot reinterpret Founder verdict');
   }
+  if (operationName === 'executeContextMutation') {
+    const contextOperation = value.operation.executeContextMutation;
+    const semanticInput = contextOperation.semanticInput || contextOperation;
+    const snapshotId = semanticInput.snapshotId;
+    if (!/^ctx:[0-9a-f]{64}$/.test(snapshotId) || value.startingState?.snapshotId !== snapshotId) fail(prefix + 'Context revoke fixture must bind one canonical snapshot id');
+  }
+  if (operationName === 'executeContextMutation' && expected.outcome === 'ok') {
+    if (expected.writeOwner !== 'ContextAuthority' || expected.serverDerivedFounderPrincipal !== true || expected.gatewayRecomputedExactCanonicalBytes !== true || expected.contextAuthorityCallCount !== 1 || expected.acknowledgedAfterDurabilityBarrier !== true) fail(prefix + 'Context revoke must preserve server identity, digest binding and Authority ownership');
+    for (const field of ['contextBytesReturned', 'ownerPrincipalReturned', 'reasonReturned', 'evidenceReturned', 'confirmationProofReturned']) if (expected[field] !== false) fail(prefix + 'Context revoke response leaks private field: ' + field);
+  }
+  if (value.fixtureId.includes('context-revoke-confirmation-digests')) {
+    const cases = value.operation.executeContextMutation?.confirmationCases || [];
+    const expectedCases = new Set(['missing', 'empty', 'truncated', 'malformed_uppercase', 'mismatch']);
+    if (cases.length !== expectedCases.size || cases.some((entry) => !expectedCases.delete(entry.case)) || expectedCases.size !== 0) fail(prefix + 'Context revoke confirmation fixture must cover every fail-closed digest case exactly once');
+    const validOperation = readJson(path.join(localApiFixtureRoot, 'valid-context-revoke-semantic-digest.json')).operation.executeContextMutation;
+    const semanticInput = value.operation.executeContextMutation.semanticInput;
+    for (const field of ['snapshotId', 'expectedStateRevision', 'reasonCode', 'evidenceRefs', 'confirmationProofRef']) {
+      if (JSON.stringify(semanticInput[field]) !== JSON.stringify(validOperation[field])) fail(prefix + 'invalid digest matrix changed semantic field ' + field);
+    }
+    const byCase = Object.fromEntries(cases.map((entry) => [entry.case, entry]));
+    const correctDigest = validOperation.requestDigestSha256;
+    if (byCase.missing.requestDigestSha256Absent !== true || Object.prototype.hasOwnProperty.call(byCase.missing, 'requestDigestSha256')) fail(prefix + 'missing digest case is not absent');
+    if (byCase.empty.requestDigestSha256 !== '' || byCase.truncated.requestDigestSha256 !== correctDigest.slice(0, 16) || byCase.malformed_uppercase.requestDigestSha256 !== correctDigest.toUpperCase() || byCase.mismatch.requestDigestSha256 === correctDigest) fail(prefix + 'invalid digest vectors are not derived from the frozen valid digest');
+    if (expected.allCasesRejectedBeforeContextAuthority !== true || expected.contextAuthorityCallCount !== 0 || expected.taskAuthorityCallCount !== 0 || expected.adapterCallCount !== 0 || expected.partialReceiptReturned !== false) fail(prefix + 'invalid Context revoke digest must stop before all Authorities and Adapter');
+  }
   if (operationName === 'decideHarnessApproval' && expected.outcome === 'ok') {
     const operation = value.operation[operationName];
     for (const forbidden of ['authorityDecisionRef', 'nativeRoutingRef', 'authenticatedPrincipalId', 'authorizationPolicyRef']) {
@@ -738,9 +767,12 @@ function main() {
   }
   const issuePolicyCommand = policyProto.slice(policyProto.indexOf('message IssueHarnessApprovalDecisionCommand'), policyProto.indexOf('message ConsumeHarnessApprovalDecisionCommand'));
   for (const forbidden of ['authority_decision_ref', 'native_routing_ref', 'authenticated_principal_id', 'authorization_policy_ref']) if (issuePolicyCommand.includes(forbidden)) fail('client policy issue command asserts trusted field: ' + forbidden);
-  for (const required of ['package egopulse.localapi.v1', 'SOURCE_DOMAIN_POLICY_DECISION', 'SOURCE_DOMAIN_HARNESS_ADAPTER', 'message ProjectionPosition', 'message SourceRevision', 'message ProjectionMetadata', 'message TaskView', 'message EvidenceGraphView', 'message HarnessApprovalAuthorityResult', 'message HarnessApprovalView', 'message GetHarnessApprovalViewRequest', 'message ListHarnessApprovalViewsRequest', 'message WatchHarnessApprovalViewsRequest', 'message ProjectionAwaitToken', 'message TaskViewStreamFrame', 'client_kernel_contract_ref', 'authorization_policy_ref', 'reserved 2', 'reserved "decision"', 'IssueHarnessApprovalDecisionCommand command = 3', 'reserved 1', 'reserved "authority_result"', 'PolicyDecisionCommandResult policy_authority_result = 4 [deprecated = true]', 'HarnessApprovalAuthorityResult sanitized_authority_result = 5', 'service LocalSessionService', 'service LocalReadModelService', 'service LocalCommandGatewayService']) {
+  for (const required of ['package egopulse.localapi.v1', 'SOURCE_DOMAIN_POLICY_DECISION', 'SOURCE_DOMAIN_HARNESS_ADAPTER', 'message ProjectionPosition', 'message SourceRevision', 'message ProjectionMetadata', 'message TaskView', 'message EvidenceGraphView', 'message HarnessApprovalAuthorityResult', 'message HarnessApprovalView', 'message GetHarnessApprovalViewRequest', 'message ListHarnessApprovalViewsRequest', 'message WatchHarnessApprovalViewsRequest', 'message ProjectionAwaitToken', 'message TaskViewStreamFrame', 'client_kernel_contract_ref', 'authorization_policy_ref', 'reserved 2', 'reserved "decision"', 'IssueHarnessApprovalDecisionCommand command = 3', 'reserved 1', 'reserved "authority_result"', 'PolicyDecisionCommandResult policy_authority_result = 4 [deprecated = true]', 'HarnessApprovalAuthorityResult sanitized_authority_result = 5', 'uint64 context_state_revision = 30', 'message RevokeContextSnapshotCommand', 'message ContextRevokeReceipt', 'message ExecuteContextMutationRequest', 'rpc ExecuteContextMutation', 'service LocalSessionService', 'service LocalReadModelService', 'service LocalCommandGatewayService']) {
     if (!localApiProto.includes(required)) fail('localapi proto missing: ' + required);
   }
+  const contextMutationResponse = localApiProto.slice(localApiProto.indexOf('message ExecuteContextMutationResponse'), localApiProto.indexOf('message AwaitProjectionRequest'));
+  for (const required of ['oneof outcome', 'ContextRevokeReceipt authority_result = 1', 'LocalApiError error = 2']) if (!contextMutationResponse.includes(required)) fail('Context mutation response must have mutually exclusive success/error: ' + required);
+  if (contextMutationResponse.includes('gateway_error')) fail('Context mutation Authority failure cannot be mislabeled as gateway_error');
   for (const forbidden of ['enum UnifiedTaskStatus', 'message LocalTaskFact', 'string actor_id', 'json_patch', 'surface_permission', 'tui_read_only', 'service ArtifactAuthorityService', 'ApprovalDecisionEnvelope decision = 2', 'ApprovalDecisionResult authority_result = 1']) if (localApiProto.includes(forbidden)) fail('localapi proto crosses projection/authority boundary: ' + forbidden);
   const approvalView = localApiProto.slice(localApiProto.indexOf('message HarnessApprovalView'), localApiProto.indexOf('message LocalApiError'));
   for (const forbidden of ['native_routing_ref', 'authority_proof', 'raw_command', 'credential', 'store_handle']) if (approvalView.includes(forbidden)) fail('approval read model exposes private Adapter/Authority field: ' + forbidden);
@@ -769,50 +801,56 @@ function main() {
   if (limit('QR-01', 'hardBytes') !== 536870912 || limit('QR-03', 'hardBytes') !== 2147483648 || limit('QR-09', 'minimumSecondsAfterTaskTerminal') !== 2592000) fail('resource budget values drifted');
   if (limit('QM-01', 'hardTokens') !== 500000 || limit('QM-02', 'hardTokens') !== 50000 || limit('QM-03', 'unknownMayRenderAsZero') !== false) fail('model usage budget values drifted');
   if (budgetProfile.measurementPolicy?.crashInjectionsPerBoundary !== 10 || budgetProfile.measurementPolicy?.crashBoundaryCount !== 8 || budgetProfile.measurementPolicy?.failedSamplesIncluded !== true) fail('measurement policy drifted');
-  for (const relative of [clientKernelProfileRelative, clientKernelSchemaRelative, authorizationProfileRelative, authorizationSchemaRelative]) {
+  for (const relative of [clientKernelProfileRelative, clientKernelSchemaRelative, authorizationProfileRelative, authorizationSchemaRelative, contextRevokeProfileRelative, contextRevokeSchemaRelative]) {
     if (!manifestPaths.has(relative)) fail('G4-08C support profile contract missing from manifest: ' + relative);
   }
   const clientKernelProfile = readJson(path.join(root, clientKernelProfileRelative));
   if (clientKernelProfile.schemaVersion !== 'egopulse.client-kernel-profile/v0.1' || clientKernelProfile.contractId !== 'egopulse.client-kernel.v1' || clientKernelProfile.contractVersion !== '0.1.0') fail('client-kernel profile identity drifted');
-  if (clientKernelProfile.authorityRef !== 'conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3') fail('client-kernel profile missing Founder authority');
+  if (clientKernelProfile.authorityRef !== 'conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze') fail('client-kernel profile missing latest Founder authority');
   if (clientKernelProfile.localApiCompatibility?.contractId !== 'egopulse.localapi.v1' || clientKernelProfile.localApiCompatibility?.runtimeReferenceRequired !== true) fail('client-kernel Local API compatibility binding invalid');
   const kernelBoundary = clientKernelProfile.implementationBoundary || {};
   const expectedSurfaces = new Set(['cli', 'tui', 'desktop_tauri_backend']);
   if (kernelBoundary.sharedKernelLanguage !== 'rust' || kernelBoundary.typescriptBusinessKernelAllowed !== false || kernelBoundary.transport !== 'tonic_grpc_http2_semantics_over_named_pipe_or_uds_no_tcp' || new Set(kernelBoundary.surfaces || []).size !== expectedSurfaces.size || [...expectedSurfaces].some((surface) => !(kernelBoundary.surfaces || []).includes(surface))) fail('client-kernel implementation boundary drifted');
-  const requiredKernelCapabilities = ['session_negotiation', 'query', 'list', 'watch_complete_snapshots', 'await_projection', 'typed_command', 'stable_cursor', 'reset_and_refetch', 'read_your_write', 'typed_error', 'frame_deduplication'];
+  const requiredKernelCapabilities = ['session_negotiation', 'query', 'list', 'watch_complete_snapshots', 'await_projection', 'memory_retrieval', 'context_revoke_full_digest_confirmation', 'typed_command', 'stable_cursor', 'reset_and_refetch', 'read_your_write', 'typed_error', 'frame_deduplication'];
   if (requiredKernelCapabilities.some((capability) => !(clientKernelProfile.capabilities || []).includes(capability))) fail('client-kernel conformance capability missing');
   const kernelInvariants = clientKernelProfile.invariants || {};
   for (const field of ['surfaceNeutral', 'completeSnapshotStreams', 'orderedWithinEpoch', 'atLeastOnceDelivery', 'unknownFrameFailClosed', 'gapRequiresReset', 'authorityResultPreserved', 'clientNeverBecomesAuthority']) if (kernelInvariants[field] !== true) fail('client-kernel invariant drifted: ' + field);
 
   const authorizationProfile = readJson(path.join(root, authorizationProfileRelative));
   if (authorizationProfile.schemaVersion !== 'egopulse.authorization-capability-profile/v0.1' || authorizationProfile.contractId !== 'egopulse.authorization.v1' || authorizationProfile.contractVersion !== '0.1.0' || authorizationProfile.localApiContractId !== 'egopulse.localapi.v1') fail('authorization profile identity drifted');
-  if (authorizationProfile.authorityRef !== 'conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3') fail('authorization profile missing Founder authority');
+  if (authorizationProfile.authorityRef !== 'conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze') fail('authorization profile missing latest Founder authority');
   const authorizationDefaults = authorizationProfile.defaults || {};
   if (authorizationDefaults.unknownPermission !== 'fail_closed' || authorizationDefaults.unknownRpc !== 'fail_closed' || authorizationDefaults.unknownCommandOneof !== 'fail_closed' || authorizationDefaults.surfaceNeutral !== true || authorizationDefaults.sessionGrantIsFinalAuthorization !== false || authorizationDefaults.owningAuthorityRevalidationRequired !== true) fail('authorization fail-closed defaults drifted');
-  const expectedPermissionCodes = new Set(['local.task.read', 'local.evidence.read', 'local.approval.read', 'local.projection.status.read', 'local.projection.await', 'local.task.create', 'local.task.cancellation.request', 'local.approval.decide', 'local.founder-verdict.issue', 'local.founder-verdict.revoke']);
+  const expectedPermissionCodes = new Set(['local.task.read', 'local.evidence.read', 'local.approval.read', 'local.projection.status.read', 'local.projection.await', 'local.memory.retrieve', 'local.memory.candidate.submit', 'local.memory.govern', 'local.context.revoke', 'local.task.create', 'local.work.prepare', 'local.work.confirm', 'local.task.cancellation.request', 'local.approval.decide', 'local.founder-verdict.issue', 'local.founder-verdict.revoke', 'local.founder-verdict.apply']);
   const permissionCodes = new Set((authorizationProfile.permissions || []).map((permission) => permission.code));
   if (permissionCodes.size !== expectedPermissionCodes.size || [...expectedPermissionCodes].some((code) => !permissionCodes.has(code))) fail('authorization permission catalog must contain the exact V-01 code set');
-  const expectedRpcs = new Set(['LocalSessionService/OpenSession', 'LocalReadModelService/GetTaskView', 'LocalReadModelService/ListTaskViews', 'LocalReadModelService/GetEvidenceGraph', 'LocalReadModelService/GetHarnessApprovalView', 'LocalReadModelService/ListHarnessApprovalViews', 'LocalReadModelService/GetProjectionStatus', 'LocalReadModelService/WatchTaskViews', 'LocalReadModelService/WatchHarnessApprovalViews', 'LocalReadModelService/AwaitProjection', 'LocalCommandGatewayService/ExecuteTaskCommand', 'LocalCommandGatewayService/DecideHarnessApproval', 'LocalCommandGatewayService/ExecuteFounderVerdict']);
+  const expectedRpcs = new Set(['LocalSessionService/OpenSession', 'LocalReadModelService/GetTaskView', 'LocalReadModelService/ListTaskViews', 'LocalReadModelService/GetEvidenceGraph', 'LocalReadModelService/GetHarnessApprovalView', 'LocalReadModelService/ListHarnessApprovalViews', 'LocalReadModelService/GetProjectionStatus', 'LocalReadModelService/WatchTaskViews', 'LocalReadModelService/WatchHarnessApprovalViews', 'LocalReadModelService/AwaitProjection', 'LocalCognitionService/RetrieveMemory', 'LocalCommandGatewayService/ExecuteTaskCommand', 'LocalCommandGatewayService/PrepareWork', 'LocalCommandGatewayService/ConfirmWork', 'LocalCommandGatewayService/DecideHarnessApproval', 'LocalCommandGatewayService/ExecuteFounderVerdict', 'LocalCommandGatewayService/ExecuteMemoryMutation', 'LocalCommandGatewayService/ExecuteContextMutation']);
   const rpcRules = new Map((authorizationProfile.rpcRules || []).map((rule) => [rule.rpc, rule]));
   if (rpcRules.size !== expectedRpcs.size || [...expectedRpcs].some((rpc) => !rpcRules.has(rpc))) fail('authorization RPC catalog must cover the exact Local API service set');
   for (const rule of rpcRules.values()) for (const code of rule.requiredPermissionCodes || []) if (!permissionCodes.has(code)) fail('RPC rule references unknown permission: ' + code);
   const expectedCommandRules = new Map([
-    ['LocalCommandGatewayService/ExecuteTaskCommand#create_task', ['user', 'local.task.create', 'TaskAuthority', ['TaskAuthority.Founder']]],
-    ['LocalCommandGatewayService/ExecuteTaskCommand#request_task_cancellation', ['user', 'local.task.cancellation.request', 'TaskAuthority', ['TaskAuthority.Founder']]],
-    ...['activate_task', 'submit_task_evidence', 'interrupt_task', 'hold_task', 'resume_task', 'record_task_cancellation_outcome'].map((oneof) => [`LocalCommandGatewayService/ExecuteTaskCommand#${oneof}`, ['system_only', null, 'TaskAuthority', ['TaskAuthority.CollaborationControl']]]),
-    ['LocalCommandGatewayService/ExecuteTaskCommand#record_task_verification', ['system_only', null, 'TaskAuthority', ['TaskAuthority.SegoVerification']]],
-    ...['apply_founder_verdict', 'revise_task', 'supersede_task', 'expire_task'].map((oneof) => [`LocalCommandGatewayService/ExecuteTaskCommand#${oneof}`, ['system_only', null, 'TaskAuthority', ['TaskAuthority.FounderAuthority']]]),
-    ['LocalCommandGatewayService/DecideHarnessApproval#issue_harness_approval_decision', ['user', 'local.approval.decide', 'PolicyDecisionAuthority', ['PolicyDecisionAuthority.FounderPolicy', 'PolicyDecisionAuthority.LocalUser']]],
-    ['LocalCommandGatewayService/ExecuteFounderVerdict#issue_founder_verdict', ['user', 'local.founder-verdict.issue', 'FounderVerdictAuthority', ['FounderVerdictAuthority.FounderAuthority']]],
-    ['LocalCommandGatewayService/ExecuteFounderVerdict#revoke_founder_verdict', ['user', 'local.founder-verdict.revoke', 'FounderVerdictAuthority', ['FounderVerdictAuthority.FounderAuthority']]],
-    ['LocalCommandGatewayService/ExecuteFounderVerdict#consume_founder_verdict', ['system_only', null, 'FounderVerdictAuthority', ['FounderVerdictAuthority.TaskAuthority']]],
-    ['LocalCommandGatewayService/ExecuteFounderVerdict#expire_founder_verdict', ['system_only', null, 'FounderVerdictAuthority', ['FounderVerdictAuthority.PolicyAuthority']]],
+    ['LocalCommandGatewayService/ExecuteTaskCommand#create_task', ['user', 'local.task.create', 'TaskAuthority', ['TaskAuthority.Founder'], 'none']],
+    ['LocalCommandGatewayService/ExecuteTaskCommand#request_task_cancellation', ['user', 'local.task.cancellation.request', 'TaskAuthority', ['TaskAuthority.Founder'], 'authority_contract']],
+    ...['activate_task', 'submit_task_evidence', 'interrupt_task', 'hold_task', 'resume_task', 'record_task_cancellation_outcome'].map((oneof) => [`LocalCommandGatewayService/ExecuteTaskCommand#${oneof}`, ['system_only', null, 'TaskAuthority', ['TaskAuthority.CollaborationControl'], 'authority_contract']]),
+    ['LocalCommandGatewayService/ExecuteTaskCommand#record_task_verification', ['system_only', null, 'TaskAuthority', ['TaskAuthority.SegoVerification'], 'authority_contract']],
+    ['LocalCommandGatewayService/ExecuteTaskCommand#apply_founder_verdict', ['user', 'local.founder-verdict.apply', 'TaskAuthority', ['TaskAuthority.Founder', 'TaskAuthority.FounderAuthority'], 'authority_contract']],
+    ...['revise_task', 'supersede_task', 'expire_task'].map((oneof) => [`LocalCommandGatewayService/ExecuteTaskCommand#${oneof}`, ['system_only', null, 'TaskAuthority', ['TaskAuthority.FounderAuthority'], 'authority_contract']]),
+    ['LocalCommandGatewayService/DecideHarnessApproval#issue_harness_approval_decision', ['user', 'local.approval.decide', 'PolicyDecisionAuthority', ['PolicyDecisionAuthority.FounderPolicy', 'PolicyDecisionAuthority.LocalUser'], 'authority_contract']],
+    ['LocalCommandGatewayService/ExecuteFounderVerdict#issue_founder_verdict', ['user', 'local.founder-verdict.issue', 'FounderVerdictAuthority', ['FounderVerdictAuthority.FounderAuthority'], 'authority_contract']],
+    ['LocalCommandGatewayService/ExecuteFounderVerdict#revoke_founder_verdict', ['user', 'local.founder-verdict.revoke', 'FounderVerdictAuthority', ['FounderVerdictAuthority.FounderAuthority'], 'authority_contract']],
+    ['LocalCommandGatewayService/ExecuteFounderVerdict#consume_founder_verdict', ['system_only', null, 'FounderVerdictAuthority', ['FounderVerdictAuthority.TaskAuthority'], 'authority_contract']],
+    ['LocalCommandGatewayService/ExecuteFounderVerdict#expire_founder_verdict', ['system_only', null, 'FounderVerdictAuthority', ['FounderVerdictAuthority.PolicyAuthority'], 'authority_contract']],
+    ['LocalCommandGatewayService/ExecuteMemoryMutation#submit_memory_candidate', ['user', 'local.memory.candidate.submit', 'MemoryAuthority', ['MemoryAuthority.Founder'], 'authority_contract']],
+    ['LocalCommandGatewayService/ExecuteMemoryMutation#accept_memory', ['user', 'local.memory.govern', 'MemoryAuthority', ['MemoryAuthority.Founder', 'MemoryAuthority.FounderAuthority'], 'authority_contract']],
+    ['LocalCommandGatewayService/ExecuteMemoryMutation#revoke_memory', ['user', 'local.memory.govern', 'MemoryAuthority', ['MemoryAuthority.Founder', 'MemoryAuthority.FounderAuthority'], 'authority_contract']],
+    ['LocalCommandGatewayService/ExecuteContextMutation#revoke_context_snapshot', ['user', 'local.context.revoke', 'ContextAuthority', ['ContextAuthority.Founder'], 'full_semantic_digest']],
   ]);
   const commandRules = new Map((authorizationProfile.commandRules || []).map((rule) => [`${rule.rpc}#${rule.oneof}`, rule]));
   if (commandRules.size !== expectedCommandRules.size || [...expectedCommandRules.keys()].some((key) => !commandRules.has(key))) fail('authorization command catalog must cover every exposed command oneof exactly once');
   for (const [key, expected] of expectedCommandRules) {
     const rule = commandRules.get(key);
     if (rule.access !== expected[0] || rule.writeOwner !== expected[2]) fail('authorization command ownership/access drifted: ' + key);
+    if (rule.confirmationClass !== expected[4]) fail('authorization command confirmation class drifted: ' + key);
     const requiredCodes = rule.requiredPermissionCodes || [];
     if (expected[1] === null ? requiredCodes.length !== 0 : requiredCodes.length !== 1 || requiredCodes[0] !== expected[1]) fail('authorization command permission drifted: ' + key);
     if (requiredCodes.some((code) => !permissionCodes.has(code))) fail('command rule references unknown permission: ' + key);
@@ -820,11 +858,17 @@ function main() {
     const expectedPrincipalKinds = [...expected[3]].sort();
     if (actualPrincipalKinds.length !== expectedPrincipalKinds.length || expectedPrincipalKinds.some((kind, index) => actualPrincipalKinds[index] !== kind)) fail('authorization command principal-kind mapping drifted: ' + key);
   }
+  const contextRevokeProfile = readJson(path.join(root, contextRevokeProfileRelative));
+  if (contextRevokeProfile.schemaVersion !== 'egopulse.context-revoke-semantic-profile/v0.1' || contextRevokeProfile.contractId !== 'egopulse.context-revoke-confirmation.v1' || contextRevokeProfile.contractVersion !== '0.1.0' || contextRevokeProfile.authorityRef !== 'conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze') fail('Context revoke semantic profile identity drifted');
+  if (contextRevokeProfile.domainSeparator !== 'egopulse/context-revoke/v1' || contextRevokeProfile.digest?.algorithm !== 'SHA-256' || contextRevokeProfile.digest?.outputEncoding !== 'lowercase_hex' || contextRevokeProfile.digest?.outputCharacters !== 64) fail('Context revoke digest profile drifted');
+  const expectedSemanticFields = ['domain_separator', 'founder_principal_id', 'snapshot_id', 'expected_state_revision', 'reason_code', 'evidence_refs_count', 'evidence_refs_each', 'confirmation_proof_ref'];
+  if (JSON.stringify(contextRevokeProfile.semanticFieldOrder) !== JSON.stringify(expectedSemanticFields) || contextRevokeProfile.canonicalEncoding?.normalization !== 'none' || contextRevokeProfile.canonicalEncoding?.evidenceOrder !== 'preserve_request_order') fail('Context revoke canonical byte contract drifted');
+  if (contextRevokeProfile.confirmation?.principalSource !== 'authenticated_local_session' || contextRevokeProfile.confirmation?.gatewayRule !== 'recompute_exact_match_before_context_authority' || contextRevokeProfile.confirmation?.missingOrInvalidRule !== 'reject_before_context_authority_zero_calls') fail('Context revoke gateway confirmation boundary drifted');
   const openSessionFixture = readJson(path.join(localApiFixtureRoot, 'valid-open-desktop-session.json'));
   const grantedCodes = openSessionFixture.expected?.grantedWriteCapabilities || [];
   if (grantedCodes.some((code) => !permissionCodes.has(code))) fail('open-session fixture grants permission outside authorization profile');
   const validation = manifest.validation || {};
-  for (const field of ['bufLint', 'bufBuild', 'protocCompile', 'crossLanguageGeneration', 'faultConformance', 'qualityBudgetProfile', 'clientKernelProfile', 'authorizationCapabilityProfile']) {
+  for (const field of ['bufLint', 'bufBuild', 'protocCompile', 'crossLanguageGeneration', 'faultConformance', 'qualityBudgetProfile', 'clientKernelProfile', 'authorizationCapabilityProfile', 'contextRevokeSemanticProfile']) {
     if (typeof validation[field] !== 'string' || !validation[field].startsWith('passed_')) fail('toolchain evidence is not passed: ' + field);
   }
   if (typeof validation.bufBreaking !== 'string' || (!validation.bufBreaking.startsWith('passed_') && !validation.bufBreaking.startsWith('not_applicable_initial_contract_'))) {

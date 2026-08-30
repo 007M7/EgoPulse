@@ -60,6 +60,14 @@ enum AvailableActionKind {
   AVAILABLE_ACTION_KIND_SUBMIT_FOUNDER_VERDICT = 6;
 }
 
+// Public governance projection only. Context bytes, private descriptor fields,
+// owner identity, evidence and confirmation proof never cross this boundary.
+enum ContextGovernanceState {
+  CONTEXT_GOVERNANCE_STATE_UNSPECIFIED = 0;
+  CONTEXT_GOVERNANCE_STATE_ISSUED = 1;
+  CONTEXT_GOVERNANCE_STATE_REVOKED = 2;
+}
+
 enum LocalApiErrorCode {
   LOCAL_API_ERROR_CODE_UNSPECIFIED = 0;
   LOCAL_API_ERROR_CODE_INVALID_ARGUMENT = 1;
@@ -79,6 +87,10 @@ enum LocalApiErrorCode {
   LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS = 15;
   LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED = 16;
   LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE = 17;
+  LOCAL_API_ERROR_CODE_OWNER_MISMATCH = 18;
+  LOCAL_API_ERROR_CODE_CONTEXT_REVOKED = 19;
+  LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT = 20;
+  LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT = 21;
 }
 
 message ClientRequestMetadata {
@@ -206,6 +218,9 @@ message WorkPreparationPreview {
   repeated string evidence_required = 27;
   bool ready_for_founder_confirmation = 28;
   google.protobuf.Timestamp deadline = 29;
+  // Independent governance CAS read from Context Authority. It is not the
+  // immutable snapshot revision and MUST NOT be reconstructed by a client.
+  uint64 context_state_revision = 30;
 }
 
 message PrepareWorkRequest {
@@ -536,6 +551,57 @@ message ExecuteMemoryMutationResponse {
   LocalApiError gateway_error = 2;
 }
 
+// The authenticated Founder owner is deliberately absent. The gateway derives
+// it from the validated local session and Context Authority revalidates it.
+message RevokeContextSnapshotCommand {
+  // request_digest_sha256 is the required full lower-case 64-hex confirmation
+  // digest. The semantic profile excludes all other CommandMetadata fields.
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string snapshot_id = 2;
+  uint64 expected_state_revision = 3;
+  string reason_code = 4;
+  repeated string evidence_refs = 5;
+  string confirmation_proof_ref = 6;
+}
+
+message ContextMutationCommand {
+  oneof command {
+    RevokeContextSnapshotCommand revoke_context_snapshot = 1;
+  }
+}
+
+// Sanitized Context Authority receipt. Raw Context bytes, descriptor content,
+// owner principal, reason, evidence and confirmation proof are forbidden.
+message ContextRevokeReceipt {
+  string snapshot_id = 1;
+  uint64 snapshot_revision = 2;
+  string content_digest_sha256 = 3;
+  uint64 previous_state_revision = 4;
+  uint64 result_state_revision = 5;
+  ContextGovernanceState previous_state = 6;
+  ContextGovernanceState result_state = 7;
+  string request_digest_sha256 = 8;
+  string event_id = 9;
+  google.protobuf.Timestamp committed_at = 10;
+  bool replayed = 11;
+  bool acknowledged_after_durability_barrier = 12;
+}
+
+message ExecuteContextMutationRequest {
+  ClientRequestMetadata client = 1;
+  ContextMutationCommand command = 2;
+}
+
+message ExecuteContextMutationResponse {
+  // Success and failure are wire-level mutually exclusive. The neutral error
+  // branch carries gateway or Context Authority failures without fabricating a
+  // partial success receipt.
+  oneof outcome {
+    ContextRevokeReceipt authority_result = 1;
+    LocalApiError error = 2;
+  }
+}
+
 message AwaitProjectionRequest {
   ClientRequestMetadata client = 1;
   ProjectionAwaitToken await_token = 2;
@@ -591,6 +657,7 @@ service LocalCommandGatewayService {
   rpc DecideHarnessApproval(DecideHarnessApprovalRequest) returns (DecideHarnessApprovalResponse);
   rpc ExecuteFounderVerdict(ExecuteFounderVerdictRequest) returns (ExecuteFounderVerdictResponse);
   rpc ExecuteMemoryMutation(ExecuteMemoryMutationRequest) returns (ExecuteMemoryMutationResponse);
+  rpc ExecuteContextMutation(ExecuteContextMutationRequest) returns (ExecuteContextMutationResponse);
 }
 
 service LocalCognitionService {

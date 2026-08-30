@@ -1,8 +1,8 @@
 {
   "schemaVersion": "v01-gate3-contract-candidate-manifest/v0.1",
   "candidateId": "v01-gate3-contracts",
-  "candidateVersion": "0.1.0-draft.17",
-  "status": "targeted_revision_candidate_prepare_confirm_implementation_pending_founder_confirmation",
+  "candidateVersion": "0.1.0-draft.18",
+  "status": "targeted_revision_context_revoke_contract_toolchain_reverified_implementation_pending",
   "ssotRole": "implementation_contract_ssot",
   "featureId": "v01-governed-single-harness-work-loop",
   "architectureAuthorityRef": "conversation:2026-08-23:founder-v01-feature-adr-a01",
@@ -26,6 +26,7 @@
   "memoryRagAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m01-m06-freeze",
   "memoryRetrievalAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m07-m10-freeze",
   "workPrepareConfirmAuthorityRef": "conversation:2026-08-28:founder-work-prepare-confirm-candidate",
+  "contextRevokeLinearizationAuthorityRef": "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze",
   "implementationAuthorized": true,
   "handoffRule": {
     "gate": "Gate 4",
@@ -117,20 +118,27 @@
       "name": "Memory Retrieval Daemon, Authorization, CLI and TUI Boundary",
       "status": "founder_confirmed_locally_verified",
       "founderDecisionRequired": true
+    },
+    {
+      "id": "R-9A.2",
+      "name": "Context Revoke Local API and Shared Semantic Confirmation",
+      "status": "founder_confirmed_contract_toolchain_reverified_implementation_pending",
+      "founderDecisionRequired": true
     }
   ],
   "validation": {
     "localCandidateValidator": "scripts/validate-candidate.js",
-    "localCandidateStatus": "passed_181_domain_fixtures_plus_1_foundation_fixture",
-    "bufLint": "passed_buf_1.72.0_draft17_with_two_documented_rpc_naming_exceptions",
-    "bufBuild": "passed_draft17_proto_descriptor",
-    "bufBreaking": "candidate_pending_full_validation_against_draft13_and_exact_founder_authorized_two_field_breaks_against_draft11",
-    "protocCompile": "candidate_pending_libprotoc_35.1_draft17_eleven_v01_modules_plus_foundation",
-    "crossLanguageGeneration": "candidate_pending_typescript_rust_tonic_python_draft17_eleven_v01_modules_plus_foundation",
+    "localCandidateStatus": "passed_183_domain_fixtures_plus_1_foundation_fixture",
+    "bufLint": "passed_buf_1.72.0_draft18_with_two_documented_rpc_naming_exceptions",
+    "bufBuild": "passed_draft18_proto_descriptor",
+    "bufBreaking": "passed_no_new_wire_breaks_against_draft13_and_exact_founder_authorized_two_field_breaks_against_draft11",
+    "protocCompile": "passed_libprotoc_35.1_draft18_eleven_v01_modules_plus_foundation",
+    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_draft18_eleven_v01_modules_plus_foundation",
     "faultConformance": "passed_existing_real_process_and_sqlcipher_suite_plus_memory_retrieval_permission_scope_concurrency_crash_timeout_and_real_daemon_cli_tui_parity",
     "qualityBudgetProfile": "passed_33_d03_rules_exactly_once_with_gate3_design_gate6_verification_binding",
-    "clientKernelProfile": "passed_versioned_surface_neutral_rust_shared_kernel_profile_with_exact_digest_reference",
-    "authorizationCapabilityProfile": "candidate_adds_work_prepare_confirm_permissions_and_rpc_rules"
+    "clientKernelProfile": "passed_versioned_surface_neutral_rust_shared_kernel_profile_with_context_revoke_confirmation",
+    "authorizationCapabilityProfile": "passed_exact_permission_rpc_command_oneof_catalog_with_context_authority_binding",
+    "contextRevokeSemanticProfile": "passed_exact_canonical_bytes_fixed_digest_and_fail_closed_fixture_matrix"
   },
   "artifacts": [
     {
@@ -139,7 +147,7 @@
     },
     {
       "path": "authorization-capability-profile.schema.json",
-      "sha256": "da6d77db28985d13c17b55335f6c268077916319f00dac6cb68333ea6be1cf74"
+      "sha256": "8302bda9d15418d4d03c0da565fff9b981c28637622d878bfda8ae8b03f49868"
     },
     {
       "path": "baselines/v01-gate3-draft11.binpb",
@@ -171,11 +179,15 @@
     },
     {
       "path": "client-kernel-profile.schema.json",
-      "sha256": "c37fddd130d4d8da3d4036ba07a808392bad99b07ff2c4c3dfd51196047c97c7"
+      "sha256": "80ae0d9aacc5d66c1d6202354e6f9952d4aa7acfc3d82613ca2b13359a1f6b5d"
     },
     {
       "path": "collaboration-fixture-envelope.schema.json",
       "sha256": "70178234a478c104a7b4f67c12226da39a2f38afc5fd42ecc0013602d65fae51"
+    },
+    {
+      "path": "context-revoke-semantic-profile.schema.json",
+      "sha256": "4c306d80898d1c7b0c3a36148aac591a0626877e5fd0d90089d3be3b586a6bc4"
     },
     {
       "path": "fixture-envelope.schema.json",
@@ -406,6 +418,10 @@
       "sha256": "b38dd8ffe5cb2d3a0a849043b57bcc19aa14c60a8955bb899b38d05bec09f3d1"
     },
     {
+      "path": "fixtures/localapi/v1/invalid-context-revoke-confirmation-digests.json",
+      "sha256": "4360dc151f34fd849ab3621a8c276cccd02bb0a47d18c2818892cafea38deaa2"
+    },
+    {
       "path": "fixtures/localapi/v1/invalid-cursor-filter-mismatch.json",
       "sha256": "eac339788b0fc89c6975b866f8d2349fe6a43e8bc52bac2bec2b691a54915c33"
     },
@@ -498,6 +514,10 @@
       "sha256": "b341d9f53be36db8584b930c8e3b43ee48125edbce5604c27923e2299726d5f2"
     },
     {
+      "path": "fixtures/localapi/v1/valid-context-revoke-semantic-digest.json",
+      "sha256": "c6de9b9c9ec38cbbb0e7b94814931a3b9c80dd45500bb5ae251b111784b38d2f"
+    },
+    {
       "path": "fixtures/localapi/v1/valid-desktop-founder-verdict-gateway.json",
       "sha256": "a7a403c5c65842dc2a89419e16526ad57f6fc03a03464ee8766516d5af19cd3c"
     },
@@ -527,7 +547,7 @@
     },
     {
       "path": "fixtures/localapi/v1/valid-open-desktop-session.json",
-      "sha256": "174649e6d6e174a4c1295df14424dfb8aaac08a4e7dca5df6bb01f949b9590d9"
+      "sha256": "36cc05ecd3380a669e7372e5ece398ed01257cd50f38c562697a0c8d6a09a6f4"
     },
     {
       "path": "fixtures/localapi/v1/valid-task-command-authority-result.json",
@@ -915,11 +935,11 @@
     },
     {
       "path": "IMPLEMENTATION-SSOT.json",
-      "sha256": "f311bc68288c3bf161ae08705fd6b7b969984557e3413606a1de6b5fdb7c666c"
+      "sha256": "1f4a7bfea72d8bb0858331ea4f70b19387e7393808952c8863707354c90bd9ae"
     },
     {
       "path": "IMPLEMENTATION-SSOT.md",
-      "sha256": "561839a6f440ec6686ecead255b920b3bf6d98a9a6ddc8574913e50cfaf45a83"
+      "sha256": "687d1b5681e2eeeab7649e722a6df4bdcf6f4614725eefbefef4fe46a9371698"
     },
     {
       "path": "json-schema/foundation-health.schema.json",
@@ -939,11 +959,15 @@
     },
     {
       "path": "profiles/authorization/v1/v01-default.json",
-      "sha256": "d50a4f5ff79d8ca1d7a9a289e22265792aa566b8cb13e77de62394b3b34588f7"
+      "sha256": "e44e1cee143b35173372b75fa7ce4efb5732be58bb787d59e961450599d612ab"
     },
     {
       "path": "profiles/client-kernel/v1/v01-default.json",
-      "sha256": "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9"
+      "sha256": "c729726c718a6f49c45e74a0f7435aa0974748661461f4be0e1315b838b17fa4"
+    },
+    {
+      "path": "profiles/context-revoke/v1/v01-default.json",
+      "sha256": "b76c42ca6de53e7140de707f4700def5a8d2e5ca29912930607fd2125a169573"
     },
     {
       "path": "profiles/quality-budget/v1/v01-default.json",
@@ -971,7 +995,7 @@
     },
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
-      "sha256": "f5bd462d07ee2e35d230b9438a86ff4ef9d07443129596ae47bade7445c8ccac"
+      "sha256": "d45d66f0f7d88e90630931204b57bd58c66e81271d3d87121790169fe29a49cc"
     },
     {
       "path": "proto/egopulse/memory/v1/memory.proto",
@@ -1011,7 +1035,7 @@
     },
     {
       "path": "scripts/validate-candidate.js",
-      "sha256": "f14c24585da4e6ba8c523647e67aabc18587b3190c3be8610fb0f1361f221eef"
+      "sha256": "9c9226bddd5cad6789a599b262750511741afc34ac443f099e0c879726726072"
     },
     {
       "path": "scripts/verify-faults.ps1",

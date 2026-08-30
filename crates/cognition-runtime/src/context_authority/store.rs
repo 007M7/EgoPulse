@@ -1203,14 +1203,16 @@ fn revoke_receipt(
     };
     let evidence_refs: Vec<String> =
         serde_json::from_str(&value.8).map_err(|_| StoreError::IntegrityFailure)?;
-    let canonical_digest = super::context_revoke_semantic_digest(
-        &event.3,
-        &value.0,
-        value.3.max(0) as u64,
-        &value.7,
-        &evidence_refs,
-        &value.9,
-    );
+    let canonical_digest =
+        egopulse_domain_contracts::context_revoke::ContextRevokeSemanticRequest {
+            founder_principal_id: &event.3,
+            snapshot_id: &value.0,
+            expected_state_revision: value.3.max(0) as u64,
+            reason_code: &value.7,
+            evidence_refs: &evidence_refs,
+            confirmation_proof_ref: &value.9,
+        }
+        .digest_sha256();
     if value.1 < 1
         || value.3 < 1
         || value.4 != value.3 + 1

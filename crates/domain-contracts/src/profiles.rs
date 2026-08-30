@@ -10,17 +10,17 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const API_CONTRACT_ID: &str = "egopulse.localapi.v1";
-pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.16";
+pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.18";
 pub const API_CONTRACT_DIGEST_SHA256: &str =
-    "ddeff9d0f3bcb860e44cddc25233cadb0e21768bbf8193589eb1f8f7aa719b07";
+    "63cb39b13ca4fdce5b0cca524c8cc6496edf18758bbe5066cd920bdca9848460";
 pub const CLIENT_KERNEL_CONTRACT_ID: &str = "egopulse.client-kernel.v1";
 pub const CLIENT_KERNEL_CONTRACT_VERSION: &str = "0.1.0";
 pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =
-    "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9";
+    "c729726c718a6f49c45e74a0f7435aa0974748661461f4be0e1315b838b17fa4";
 pub const AUTHORIZATION_CONTRACT_ID: &str = "egopulse.authorization.v1";
 pub const AUTHORIZATION_CONTRACT_VERSION: &str = "0.1.0";
 pub const AUTHORIZATION_PROFILE_DIGEST_SHA256: &str =
-    "d50a4f5ff79d8ca1d7a9a289e22265792aa566b8cb13e77de62394b3b34588f7";
+    "e44e1cee143b35173372b75fa7ce4efb5732be58bb787d59e961450599d612ab";
 
 const CLIENT_KERNEL_PROFILE_BYTES: &[u8] =
     include_bytes!("../../../contracts/profiles/client-kernel/v1/v01-default.json");
@@ -134,6 +134,7 @@ pub enum CommandAccess {
 pub enum ConfirmationClass {
     None,
     AuthorityContract,
+    FullSemanticDigest,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -336,6 +337,7 @@ fn validate_client_kernel_profile(
         "typed_error",
         "frame_deduplication",
         "memory_retrieval",
+        "context_revoke_full_digest_confirmation",
     ];
     if profile.schema_version != "egopulse.client-kernel-profile/v0.1"
         || profile.contract_id != CLIENT_KERNEL_CONTRACT_ID
@@ -445,6 +447,62 @@ mod tests {
         assert!(matches!(
             profiles.authorize_rpc("LocalReadModelService/FutureRpc", &read),
             Err(ContractProfileError::UnknownRpc(_))
+        ));
+    }
+
+    #[test]
+    fn context_revoke_is_surface_neutral_founder_owned_and_fail_closed() {
+        let profiles = ContractProfiles::embedded().expect("frozen profiles load");
+        assert!(profiles.client_kernel.invariants.surface_neutral);
+        assert!(
+            profiles
+                .client_kernel
+                .implementation_boundary
+                .surfaces
+                .contains("cli")
+        );
+        assert!(
+            profiles
+                .client_kernel
+                .implementation_boundary
+                .surfaces
+                .contains("tui")
+        );
+
+        let granted = BTreeSet::from(["local.context.revoke".to_owned()]);
+        let authorized = profiles
+            .authorize_command(
+                "LocalCommandGatewayService/ExecuteContextMutation",
+                "revoke_context_snapshot",
+                &granted,
+            )
+            .expect("Founder Context revoke is authorized");
+        assert_eq!(authorized.write_owner, "ContextAuthority");
+        assert_eq!(
+            authorized.confirmation_class,
+            ConfirmationClass::FullSemanticDigest
+        );
+        assert_eq!(
+            authorized.required_authority_principal_kinds,
+            ["ContextAuthority.Founder"]
+        );
+
+        assert!(matches!(
+            profiles.authorize_command(
+                "LocalCommandGatewayService/ExecuteContextMutation",
+                "revoke_context_snapshot",
+                &BTreeSet::new(),
+            ),
+            Err(ContractProfileError::PermissionDenied(permission))
+                if permission == "local.context.revoke"
+        ));
+        assert!(matches!(
+            profiles.authorize_command(
+                "LocalCommandGatewayService/ExecuteContextMutation",
+                "future_context_mutation",
+                &granted,
+            ),
+            Err(ContractProfileError::UnknownCommandOneof { .. })
         ));
     }
 }

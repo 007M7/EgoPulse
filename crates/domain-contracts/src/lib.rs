@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod context_revoke;
 pub mod memory;
 pub mod profiles;
 

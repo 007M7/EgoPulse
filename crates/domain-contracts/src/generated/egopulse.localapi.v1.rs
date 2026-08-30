@@ -224,6 +224,10 @@ pub struct WorkPreparationPreview {
     pub ready_for_founder_confirmation: bool,
     #[prost(message, optional, tag = "29")]
     pub deadline: ::core::option::Option<::prost_types::Timestamp>,
+    /// Independent governance CAS read from Context Authority. It is not the
+    /// immutable snapshot revision and MUST NOT be reconstructed by a client.
+    #[prost(uint64, tag = "30")]
+    pub context_state_revision: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrepareWorkRequest {
@@ -814,6 +818,95 @@ pub struct ExecuteMemoryMutationResponse {
     #[prost(message, optional, tag = "2")]
     pub gateway_error: ::core::option::Option<LocalApiError>,
 }
+/// The authenticated Founder owner is deliberately absent. The gateway derives
+/// it from the validated local session and Context Authority revalidates it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevokeContextSnapshotCommand {
+    /// request_digest_sha256 is the required full lower-case 64-hex confirmation
+    /// digest. The semantic profile excludes all other CommandMetadata fields.
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<super::super::common::v1::CommandMetadata>,
+    #[prost(string, tag = "2")]
+    pub snapshot_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub expected_state_revision: u64,
+    #[prost(string, tag = "4")]
+    pub reason_code: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "5")]
+    pub evidence_refs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "6")]
+    pub confirmation_proof_ref: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ContextMutationCommand {
+    #[prost(oneof = "context_mutation_command::Command", tags = "1")]
+    pub command: ::core::option::Option<context_mutation_command::Command>,
+}
+/// Nested message and enum types in `ContextMutationCommand`.
+pub mod context_mutation_command {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Command {
+        #[prost(message, tag = "1")]
+        RevokeContextSnapshot(super::RevokeContextSnapshotCommand),
+    }
+}
+/// Sanitized Context Authority receipt. Raw Context bytes, descriptor content,
+/// owner principal, reason, evidence and confirmation proof are forbidden.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ContextRevokeReceipt {
+    #[prost(string, tag = "1")]
+    pub snapshot_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub snapshot_revision: u64,
+    #[prost(string, tag = "3")]
+    pub content_digest_sha256: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub previous_state_revision: u64,
+    #[prost(uint64, tag = "5")]
+    pub result_state_revision: u64,
+    #[prost(enumeration = "ContextGovernanceState", tag = "6")]
+    pub previous_state: i32,
+    #[prost(enumeration = "ContextGovernanceState", tag = "7")]
+    pub result_state: i32,
+    #[prost(string, tag = "8")]
+    pub request_digest_sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub event_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "10")]
+    pub committed_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(bool, tag = "11")]
+    pub replayed: bool,
+    #[prost(bool, tag = "12")]
+    pub acknowledged_after_durability_barrier: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecuteContextMutationRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(message, optional, tag = "2")]
+    pub command: ::core::option::Option<ContextMutationCommand>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExecuteContextMutationResponse {
+    /// Success and failure are wire-level mutually exclusive. The neutral error
+    /// branch carries gateway or Context Authority failures without fabricating a
+    /// partial success receipt.
+    #[prost(oneof = "execute_context_mutation_response::Outcome", tags = "1, 2")]
+    pub outcome: ::core::option::Option<execute_context_mutation_response::Outcome>,
+}
+/// Nested message and enum types in `ExecuteContextMutationResponse`.
+pub mod execute_context_mutation_response {
+    /// Success and failure are wire-level mutually exclusive. The neutral error
+    /// branch carries gateway or Context Authority failures without fabricating a
+    /// partial success receipt.
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Outcome {
+        #[prost(message, tag = "1")]
+        AuthorityResult(super::ContextRevokeReceipt),
+        #[prost(message, tag = "2")]
+        Error(super::LocalApiError),
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AwaitProjectionRequest {
     #[prost(message, optional, tag = "1")]
@@ -1069,6 +1162,37 @@ impl AvailableActionKind {
         }
     }
 }
+/// Public governance projection only. Context bytes, private descriptor fields,
+/// owner identity, evidence and confirmation proof never cross this boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ContextGovernanceState {
+    Unspecified = 0,
+    Issued = 1,
+    Revoked = 2,
+}
+impl ContextGovernanceState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CONTEXT_GOVERNANCE_STATE_UNSPECIFIED",
+            Self::Issued => "CONTEXT_GOVERNANCE_STATE_ISSUED",
+            Self::Revoked => "CONTEXT_GOVERNANCE_STATE_REVOKED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CONTEXT_GOVERNANCE_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "CONTEXT_GOVERNANCE_STATE_ISSUED" => Some(Self::Issued),
+            "CONTEXT_GOVERNANCE_STATE_REVOKED" => Some(Self::Revoked),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum LocalApiErrorCode {
@@ -1090,6 +1214,10 @@ pub enum LocalApiErrorCode {
     UnknownCriticalSemantics = 15,
     ResourceExhausted = 16,
     CognitionWorkerUnavailable = 17,
+    OwnerMismatch = 18,
+    ContextRevoked = 19,
+    StateRevisionConflict = 20,
+    IdempotencyConflict = 21,
 }
 impl LocalApiErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1122,6 +1250,10 @@ impl LocalApiErrorCode {
             Self::CognitionWorkerUnavailable => {
                 "LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE"
             }
+            Self::OwnerMismatch => "LOCAL_API_ERROR_CODE_OWNER_MISMATCH",
+            Self::ContextRevoked => "LOCAL_API_ERROR_CODE_CONTEXT_REVOKED",
+            Self::StateRevisionConflict => "LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT",
+            Self::IdempotencyConflict => "LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1154,6 +1286,14 @@ impl LocalApiErrorCode {
             "LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED" => Some(Self::ResourceExhausted),
             "LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE" => {
                 Some(Self::CognitionWorkerUnavailable)
+            }
+            "LOCAL_API_ERROR_CODE_OWNER_MISMATCH" => Some(Self::OwnerMismatch),
+            "LOCAL_API_ERROR_CODE_CONTEXT_REVOKED" => Some(Self::ContextRevoked),
+            "LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT" => {
+                Some(Self::StateRevisionConflict)
+            }
+            "LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT" => {
+                Some(Self::IdempotencyConflict)
             }
             _ => None,
         }
@@ -2747,6 +2887,35 @@ pub mod local_command_gateway_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn execute_context_mutation(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ExecuteContextMutationRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExecuteContextMutationResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalCommandGatewayService/ExecuteContextMutation",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalCommandGatewayService",
+                        "ExecuteContextMutation",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -2802,6 +2971,13 @@ pub mod local_command_gateway_service_server {
             request: tonic::Request<super::ExecuteMemoryMutationRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ExecuteMemoryMutationResponse>,
+            tonic::Status,
+        >;
+        async fn execute_context_mutation(
+            &self,
+            request: tonic::Request<super::ExecuteContextMutationRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ExecuteContextMutationResponse>,
             tonic::Status,
         >;
     }
@@ -3169,6 +3345,57 @@ pub mod local_command_gateway_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ExecuteMemoryMutationSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/egopulse.localapi.v1.LocalCommandGatewayService/ExecuteContextMutation" => {
+                    #[allow(non_camel_case_types)]
+                    struct ExecuteContextMutationSvc<T: LocalCommandGatewayService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: LocalCommandGatewayService,
+                    > tonic::server::UnaryService<super::ExecuteContextMutationRequest>
+                    for ExecuteContextMutationSvc<T> {
+                        type Response = super::ExecuteContextMutationResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ExecuteContextMutationRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalCommandGatewayService>::execute_context_mutation(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ExecuteContextMutationSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

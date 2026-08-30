@@ -9,13 +9,14 @@
   "gate3AuthorityRef": "conversation:2026-08-23:founder-v01-gate3-pass",
   "gate4DriAuthorityRef": "conversation:2026-08-23:founder-v01-gate4-dri-confirmation",
   "implementationSsotAfterVerifiedImport": true,
-  "currentContractVersion": "0.1.0-draft.17",
+  "currentContractVersion": "0.1.0-draft.18",
   "targetedRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3",
   "approvalReadModelRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a",
   "g408cSupportProfilesAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
   "memoryRagAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m01-m06-freeze",
   "memoryRetrievalAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m07-m10-freeze",
   "workPrepareConfirmAuthorityRef": "conversation:2026-08-28:founder-work-prepare-confirm-candidate",
-  "targetedRevisionScope": ["C-03", "C-07", "C-08", "G4-07A", "G4-08A", "G4-08C-A1", "G4-08C-A3", "M-01..M-06", "M-07..M-10"],
-  "note": "Draft.11 remains the immutable accepted Gate 3 import. Draft.12 inserted Policy Decision Authority. Draft.13 added the independently rebuildable Harness Approval Read Model. Draft.14 added digest-addressed client and authorization profiles. Draft.15 froze the Memory/RAG Worker contract. Draft.16 froze the governed Memory retrieval daemon, authorization, CLI and TUI boundary. Draft.17 is the candidate additive PrepareWork/ConfirmWork surface and remains pending Founder confirmation until its daemon, CLI and TUI evidence closes."
+  "contextRevokeLinearizationAuthorityRef": "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze",
+  "targetedRevisionScope": ["C-03", "C-07", "C-08", "G4-07A", "G4-08A", "G4-08C-A1", "G4-08C-A3", "M-01..M-06", "M-07..M-10", "R-9A.2"],
+  "note": "Draft.11 remains the immutable accepted Gate 3 import. Draft.12 inserted Policy Decision Authority. Draft.13 added the independently rebuildable Harness Approval Read Model. Draft.14 added digest-addressed client and authorization profiles. Draft.15 froze the Memory/RAG Worker contract. Draft.16 froze the governed Memory retrieval daemon, authorization, CLI and TUI boundary. Draft.17 added the candidate PrepareWork/ConfirmWork surface. Draft.18 freezes the additive Context revoke Local API shape, server-derived Founder ownership, independent governance state revision, one shared semantic digest profile and a sanitized Authority receipt; daemon and CLI/TUI evidence remains R-9A.2 implementation work."
 }

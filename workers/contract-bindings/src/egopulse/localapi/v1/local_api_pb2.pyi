@@ -63,6 +63,12 @@ class AvailableActionKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     AVAILABLE_ACTION_KIND_DECIDE_HARNESS_APPROVAL: _ClassVar[AvailableActionKind]
     AVAILABLE_ACTION_KIND_SUBMIT_FOUNDER_VERDICT: _ClassVar[AvailableActionKind]
 
+class ContextGovernanceState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    CONTEXT_GOVERNANCE_STATE_UNSPECIFIED: _ClassVar[ContextGovernanceState]
+    CONTEXT_GOVERNANCE_STATE_ISSUED: _ClassVar[ContextGovernanceState]
+    CONTEXT_GOVERNANCE_STATE_REVOKED: _ClassVar[ContextGovernanceState]
+
 class LocalApiErrorCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     LOCAL_API_ERROR_CODE_UNSPECIFIED: _ClassVar[LocalApiErrorCode]
@@ -83,6 +89,10 @@ class LocalApiErrorCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS: _ClassVar[LocalApiErrorCode]
     LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED: _ClassVar[LocalApiErrorCode]
     LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_OWNER_MISMATCH: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_CONTEXT_REVOKED: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT: _ClassVar[LocalApiErrorCode]
 CLIENT_SURFACE_UNSPECIFIED: ClientSurface
 CLIENT_SURFACE_DESKTOP: ClientSurface
 CLIENT_SURFACE_CLI: ClientSurface
@@ -112,6 +122,9 @@ AVAILABLE_ACTION_KIND_RESUME_TASK: AvailableActionKind
 AVAILABLE_ACTION_KIND_REVISE_TASK: AvailableActionKind
 AVAILABLE_ACTION_KIND_DECIDE_HARNESS_APPROVAL: AvailableActionKind
 AVAILABLE_ACTION_KIND_SUBMIT_FOUNDER_VERDICT: AvailableActionKind
+CONTEXT_GOVERNANCE_STATE_UNSPECIFIED: ContextGovernanceState
+CONTEXT_GOVERNANCE_STATE_ISSUED: ContextGovernanceState
+CONTEXT_GOVERNANCE_STATE_REVOKED: ContextGovernanceState
 LOCAL_API_ERROR_CODE_UNSPECIFIED: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_INVALID_ARGUMENT: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_UNAUTHENTICATED: LocalApiErrorCode
@@ -130,6 +143,10 @@ LOCAL_API_ERROR_CODE_AUTHORITY_UNAVAILABLE: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_OWNER_MISMATCH: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_CONTEXT_REVOKED: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT: LocalApiErrorCode
 
 class ClientRequestMetadata(_message.Message):
     __slots__ = ("request_id", "client_instance_id", "surface", "session_id", "api_contract_ref", "correlation_id")
@@ -280,7 +297,7 @@ class WorkGateNotice(_message.Message):
     def __init__(self, code: _Optional[str] = ..., detail: _Optional[str] = ..., source_ref: _Optional[str] = ...) -> None: ...
 
 class WorkPreparationPreview(_message.Message):
-    __slots__ = ("snapshot_id", "snapshot_revision", "normalized_intent", "work_type", "target_scope_ref", "compiled_context_sha256", "included_sources", "excluded_sources", "non_goals", "allowed_read_paths", "allowed_write_paths", "allowed_tools", "external_resources", "acceptance_contract_ref", "budget_profile_ref", "memory_authority_revision", "memory_pack_snapshot_sha256", "recovery_entry", "visibility", "redactions", "expires_at", "confirmation_binding_sha256", "gate_ready", "blockers", "warnings", "required_confirmations", "evidence_required", "ready_for_founder_confirmation", "deadline")
+    __slots__ = ("snapshot_id", "snapshot_revision", "normalized_intent", "work_type", "target_scope_ref", "compiled_context_sha256", "included_sources", "excluded_sources", "non_goals", "allowed_read_paths", "allowed_write_paths", "allowed_tools", "external_resources", "acceptance_contract_ref", "budget_profile_ref", "memory_authority_revision", "memory_pack_snapshot_sha256", "recovery_entry", "visibility", "redactions", "expires_at", "confirmation_binding_sha256", "gate_ready", "blockers", "warnings", "required_confirmations", "evidence_required", "ready_for_founder_confirmation", "deadline", "context_state_revision")
     SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_REVISION_FIELD_NUMBER: _ClassVar[int]
     NORMALIZED_INTENT_FIELD_NUMBER: _ClassVar[int]
@@ -310,6 +327,7 @@ class WorkPreparationPreview(_message.Message):
     EVIDENCE_REQUIRED_FIELD_NUMBER: _ClassVar[int]
     READY_FOR_FOUNDER_CONFIRMATION_FIELD_NUMBER: _ClassVar[int]
     DEADLINE_FIELD_NUMBER: _ClassVar[int]
+    CONTEXT_STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
     snapshot_id: str
     snapshot_revision: int
     normalized_intent: str
@@ -339,7 +357,8 @@ class WorkPreparationPreview(_message.Message):
     evidence_required: _containers.RepeatedScalarFieldContainer[str]
     ready_for_founder_confirmation: bool
     deadline: _timestamp_pb2.Timestamp
-    def __init__(self, snapshot_id: _Optional[str] = ..., snapshot_revision: _Optional[int] = ..., normalized_intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., compiled_context_sha256: _Optional[str] = ..., included_sources: _Optional[_Iterable[_Union[WorkSourceFact, _Mapping]]] = ..., excluded_sources: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., non_goals: _Optional[_Iterable[str]] = ..., allowed_read_paths: _Optional[_Iterable[str]] = ..., allowed_write_paths: _Optional[_Iterable[str]] = ..., allowed_tools: _Optional[_Iterable[str]] = ..., external_resources: _Optional[_Iterable[str]] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., memory_authority_revision: _Optional[int] = ..., memory_pack_snapshot_sha256: _Optional[str] = ..., recovery_entry: _Optional[str] = ..., visibility: _Optional[str] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., confirmation_binding_sha256: _Optional[str] = ..., gate_ready: _Optional[bool] = ..., blockers: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., warnings: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., required_confirmations: _Optional[_Iterable[str]] = ..., evidence_required: _Optional[_Iterable[str]] = ..., ready_for_founder_confirmation: _Optional[bool] = ..., deadline: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+    context_state_revision: int
+    def __init__(self, snapshot_id: _Optional[str] = ..., snapshot_revision: _Optional[int] = ..., normalized_intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., compiled_context_sha256: _Optional[str] = ..., included_sources: _Optional[_Iterable[_Union[WorkSourceFact, _Mapping]]] = ..., excluded_sources: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., non_goals: _Optional[_Iterable[str]] = ..., allowed_read_paths: _Optional[_Iterable[str]] = ..., allowed_write_paths: _Optional[_Iterable[str]] = ..., allowed_tools: _Optional[_Iterable[str]] = ..., external_resources: _Optional[_Iterable[str]] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., memory_authority_revision: _Optional[int] = ..., memory_pack_snapshot_sha256: _Optional[str] = ..., recovery_entry: _Optional[str] = ..., visibility: _Optional[str] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., confirmation_binding_sha256: _Optional[str] = ..., gate_ready: _Optional[bool] = ..., blockers: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., warnings: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., required_confirmations: _Optional[_Iterable[str]] = ..., evidence_required: _Optional[_Iterable[str]] = ..., ready_for_founder_confirmation: _Optional[bool] = ..., deadline: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., context_state_revision: _Optional[int] = ...) -> None: ...
 
 class PrepareWorkRequest(_message.Message):
     __slots__ = ("client", "intent", "work_type", "target_scope_ref", "sources", "idempotency_key")
@@ -860,6 +879,72 @@ class ExecuteMemoryMutationResponse(_message.Message):
     authority_result: MemoryMutationReceipt
     gateway_error: LocalApiError
     def __init__(self, authority_result: _Optional[_Union[MemoryMutationReceipt, _Mapping]] = ..., gateway_error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class RevokeContextSnapshotCommand(_message.Message):
+    __slots__ = ("metadata", "snapshot_id", "expected_state_revision", "reason_code", "evidence_refs", "confirmation_proof_ref")
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    REASON_CODE_FIELD_NUMBER: _ClassVar[int]
+    EVIDENCE_REFS_FIELD_NUMBER: _ClassVar[int]
+    CONFIRMATION_PROOF_REF_FIELD_NUMBER: _ClassVar[int]
+    metadata: _common_pb2.CommandMetadata
+    snapshot_id: str
+    expected_state_revision: int
+    reason_code: str
+    evidence_refs: _containers.RepeatedScalarFieldContainer[str]
+    confirmation_proof_ref: str
+    def __init__(self, metadata: _Optional[_Union[_common_pb2.CommandMetadata, _Mapping]] = ..., snapshot_id: _Optional[str] = ..., expected_state_revision: _Optional[int] = ..., reason_code: _Optional[str] = ..., evidence_refs: _Optional[_Iterable[str]] = ..., confirmation_proof_ref: _Optional[str] = ...) -> None: ...
+
+class ContextMutationCommand(_message.Message):
+    __slots__ = ("revoke_context_snapshot",)
+    REVOKE_CONTEXT_SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
+    revoke_context_snapshot: RevokeContextSnapshotCommand
+    def __init__(self, revoke_context_snapshot: _Optional[_Union[RevokeContextSnapshotCommand, _Mapping]] = ...) -> None: ...
+
+class ContextRevokeReceipt(_message.Message):
+    __slots__ = ("snapshot_id", "snapshot_revision", "content_digest_sha256", "previous_state_revision", "result_state_revision", "previous_state", "result_state", "request_digest_sha256", "event_id", "committed_at", "replayed", "acknowledged_after_durability_barrier")
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_REVISION_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    PREVIOUS_STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    RESULT_STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    PREVIOUS_STATE_FIELD_NUMBER: _ClassVar[int]
+    RESULT_STATE_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    EVENT_ID_FIELD_NUMBER: _ClassVar[int]
+    COMMITTED_AT_FIELD_NUMBER: _ClassVar[int]
+    REPLAYED_FIELD_NUMBER: _ClassVar[int]
+    ACKNOWLEDGED_AFTER_DURABILITY_BARRIER_FIELD_NUMBER: _ClassVar[int]
+    snapshot_id: str
+    snapshot_revision: int
+    content_digest_sha256: str
+    previous_state_revision: int
+    result_state_revision: int
+    previous_state: ContextGovernanceState
+    result_state: ContextGovernanceState
+    request_digest_sha256: str
+    event_id: str
+    committed_at: _timestamp_pb2.Timestamp
+    replayed: bool
+    acknowledged_after_durability_barrier: bool
+    def __init__(self, snapshot_id: _Optional[str] = ..., snapshot_revision: _Optional[int] = ..., content_digest_sha256: _Optional[str] = ..., previous_state_revision: _Optional[int] = ..., result_state_revision: _Optional[int] = ..., previous_state: _Optional[_Union[ContextGovernanceState, str]] = ..., result_state: _Optional[_Union[ContextGovernanceState, str]] = ..., request_digest_sha256: _Optional[str] = ..., event_id: _Optional[str] = ..., committed_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., replayed: _Optional[bool] = ..., acknowledged_after_durability_barrier: _Optional[bool] = ...) -> None: ...
+
+class ExecuteContextMutationRequest(_message.Message):
+    __slots__ = ("client", "command")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    command: ContextMutationCommand
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., command: _Optional[_Union[ContextMutationCommand, _Mapping]] = ...) -> None: ...
+
+class ExecuteContextMutationResponse(_message.Message):
+    __slots__ = ("authority_result", "error")
+    AUTHORITY_RESULT_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    authority_result: ContextRevokeReceipt
+    error: LocalApiError
+    def __init__(self, authority_result: _Optional[_Union[ContextRevokeReceipt, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
 
 class AwaitProjectionRequest(_message.Message):
     __slots__ = ("client", "await_token", "timeout_milliseconds")

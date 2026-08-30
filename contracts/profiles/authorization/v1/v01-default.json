@@ -2,7 +2,7 @@
   "schemaVersion": "egopulse.authorization-capability-profile/v0.1",
   "contractId": "egopulse.authorization.v1",
   "contractVersion": "0.1.0",
-  "authorityRef": "conversation:2026-08-26:founder-memory-rag-m07-m10-freeze",
+  "authorityRef": "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze",
   "localApiContractId": "egopulse.localapi.v1",
   "defaults": {
     "unknownPermission": "fail_closed",
@@ -21,6 +21,7 @@
     { "code": "local.memory.retrieve", "kind": "read", "description": "Run bounded read-only Memory retrieval over an authorized scope." },
     { "code": "local.memory.candidate.submit", "kind": "write", "description": "Submit a Memory candidate without making it authoritative." },
     { "code": "local.memory.govern", "kind": "write", "description": "Accept or revoke a Memory candidate under Founder governance." },
+    { "code": "local.context.revoke", "kind": "write", "description": "Revoke an owned Context snapshot through Context Authority with full semantic-digest confirmation." },
     { "code": "local.task.create", "kind": "write", "description": "Submit the user-owned create_task command branch." },
     { "code": "local.work.prepare", "kind": "write", "description": "Prepare an Authority-owned work snapshot from explicit Founder intent and sources." },
     { "code": "local.work.confirm", "kind": "write", "description": "Confirm an unexpired work snapshot for Task Authority creation." },
@@ -47,7 +48,8 @@
     { "rpc": "LocalCommandGatewayService/ConfirmWork", "access": "granted_permission", "requiredPermissionCodes": ["local.work.confirm"], "tokenScopeEnforced": false },
     { "rpc": "LocalCommandGatewayService/DecideHarnessApproval", "access": "per_command_oneof", "requiredPermissionCodes": [] },
     { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "access": "per_command_oneof", "requiredPermissionCodes": [] },
-    { "rpc": "LocalCommandGatewayService/ExecuteMemoryMutation", "access": "per_command_oneof", "requiredPermissionCodes": [] }
+    { "rpc": "LocalCommandGatewayService/ExecuteMemoryMutation", "access": "per_command_oneof", "requiredPermissionCodes": [] },
+    { "rpc": "LocalCommandGatewayService/ExecuteContextMutation", "access": "per_command_oneof", "requiredPermissionCodes": [] }
   ],
   "commandRules": [
     { "rpc": "LocalCommandGatewayService/ExecuteTaskCommand", "oneof": "create_task", "access": "user", "requiredPermissionCodes": ["local.task.create"], "confirmationClass": "none", "writeOwner": "TaskAuthority", "requiredAuthorityPrincipalKinds": ["TaskAuthority.Founder"] },
@@ -70,6 +72,7 @@
     { "rpc": "LocalCommandGatewayService/ExecuteFounderVerdict", "oneof": "expire_founder_verdict", "access": "system_only", "requiredPermissionCodes": [], "confirmationClass": "authority_contract", "writeOwner": "FounderVerdictAuthority", "requiredAuthorityPrincipalKinds": ["FounderVerdictAuthority.PolicyAuthority"] },
     { "rpc": "LocalCommandGatewayService/ExecuteMemoryMutation", "oneof": "submit_memory_candidate", "access": "user", "requiredPermissionCodes": ["local.memory.candidate.submit"], "confirmationClass": "authority_contract", "writeOwner": "MemoryAuthority", "requiredAuthorityPrincipalKinds": ["MemoryAuthority.Founder"] },
     { "rpc": "LocalCommandGatewayService/ExecuteMemoryMutation", "oneof": "accept_memory", "access": "user", "requiredPermissionCodes": ["local.memory.govern"], "confirmationClass": "authority_contract", "writeOwner": "MemoryAuthority", "requiredAuthorityPrincipalKinds": ["MemoryAuthority.Founder", "MemoryAuthority.FounderAuthority"] },
-    { "rpc": "LocalCommandGatewayService/ExecuteMemoryMutation", "oneof": "revoke_memory", "access": "user", "requiredPermissionCodes": ["local.memory.govern"], "confirmationClass": "authority_contract", "writeOwner": "MemoryAuthority", "requiredAuthorityPrincipalKinds": ["MemoryAuthority.Founder", "MemoryAuthority.FounderAuthority"] }
+    { "rpc": "LocalCommandGatewayService/ExecuteMemoryMutation", "oneof": "revoke_memory", "access": "user", "requiredPermissionCodes": ["local.memory.govern"], "confirmationClass": "authority_contract", "writeOwner": "MemoryAuthority", "requiredAuthorityPrincipalKinds": ["MemoryAuthority.Founder", "MemoryAuthority.FounderAuthority"] },
+    { "rpc": "LocalCommandGatewayService/ExecuteContextMutation", "oneof": "revoke_context_snapshot", "access": "user", "requiredPermissionCodes": ["local.context.revoke"], "confirmationClass": "full_semantic_digest", "writeOwner": "ContextAuthority", "requiredAuthorityPrincipalKinds": ["ContextAuthority.Founder"] }
   ]
 }

@@ -7,12 +7,13 @@ use egopulse_domain_contracts::{
         localapi::v1::{
             ClientRequestMetadata, ConfirmWorkRequest, ConfirmWorkResponse,
             DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
+            ExecuteContextMutationRequest, ExecuteContextMutationResponse,
             ExecuteFounderVerdictRequest, ExecuteFounderVerdictResponse,
             ExecuteMemoryMutationRequest, ExecuteMemoryMutationResponse, ExecuteTaskCommandRequest,
             ExecuteTaskCommandResponse, HarnessApprovalAuthorityResult, LocalApiError,
             LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt, PrepareWorkRequest,
             PrepareWorkResponse, ProjectionAwaitToken, SourceRevision, WorkPreparationPreview,
-            confirm_work_response,
+            confirm_work_response, execute_context_mutation_response,
             local_command_gateway_service_server::LocalCommandGatewayService,
             prepare_work_response,
         },
@@ -791,6 +792,29 @@ impl LocalCommandGatewayService for LocalCommandGatewayEndpoint {
             peer.as_ref(),
             request.into_inner(),
         )))
+    }
+
+    async fn execute_context_mutation(
+        &self,
+        request: Request<ExecuteContextMutationRequest>,
+    ) -> Result<Response<ExecuteContextMutationResponse>, Status> {
+        let correlation_id = request
+            .get_ref()
+            .client
+            .as_ref()
+            .and_then(|metadata| metadata.correlation_id.clone())
+            .unwrap_or_default();
+        Ok(Response::new(ExecuteContextMutationResponse {
+            outcome: Some(execute_context_mutation_response::Outcome::Error(
+                api_error(
+                    LocalApiErrorCode::AuthorityUnavailable,
+                    "context_revoke_daemon_bridge_pending",
+                    false,
+                    Some("UPDATE_TO_R9A2_DAEMON_BRIDGE"),
+                    correlation_id,
+                ),
+            )),
+        }))
     }
 }
 

@@ -1,7 +1,7 @@
 # R-9A Context revoke and dispatch-consumption linearization
 
-- Status: Founder-frozen architecture contract; R-9A.1 locally verified,
-  R-9A.2/R-9A.3 implementation pending
+- Status: Founder-frozen architecture contract; R-9A.1 and R-9A.2a locally
+  verified, R-9A.2b/R-9A.2c/R-9A.3 implementation pending
 - Date: 2026-08-30
 - Decision owner: Founder
 - Runtime fact owner: Context Authority
@@ -373,8 +373,34 @@ Verification evidence at this checkpoint:
   R-9A.1 P0/P1 finding.
 
 This checkpoint does not mark R-9A complete. The overall document status stays
-implementation pending until R-9A.2, R-9A.3 and all applicable Acceptance Gates
-are closed with durable evidence.
+implementation pending until R-9A.2b/R-9A.2c, R-9A.3 and all applicable
+Acceptance Gates are closed with durable evidence.
+
+R-9A.2a is also implemented as the contract-first checkpoint. Draft.18 adds the
+typed `ExecuteContextMutation`/`revoke_context_snapshot` operation,
+`local.context.revoke`, the independently projected `context_state_revision`,
+the Context Authority/Founder command rule and a sanitized revoke receipt. The
+machine-readable semantic profile freezes exact UTF-8 bytes with no
+normalization, `u64` little-endian length framing, evidence count and request
+order, and the full lower-case 64-hex SHA-256 confirmation. Fixed valid and
+fail-closed digest fixtures are manifest-controlled, and one shared Rust oracle
+is now consumed by Context Authority commit/recovery verification. Rust,
+TypeScript and Python bindings are generated from the same Proto. The compiled
+Local API method remains deliberately fail-closed with an unavailable response
+until R-9A.2b replaces that transitional endpoint with authenticated session,
+permission and Context Authority routing.
+
+R-9A.2a verification evidence:
+
+- the contract candidate validates 244 manifest artifacts and 184 fixtures;
+- all 44 Rust, TypeScript and Python generated files are clean against the
+  draft.18 Proto and manifest digest;
+- 12 domain-contract tests, nine focused R-9A cognition tests, 10 client-kernel
+  tests and 45 Local API tests pass;
+- the complete local CI passes after the profile-digest integration baselines
+  were advanced with the contract profile;
+- independent architecture, build and test reviews report GO with no remaining
+  R-9A.2a P0/P1 finding.
 
 ## Acceptance Gates
 

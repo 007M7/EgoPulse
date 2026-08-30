@@ -216,12 +216,19 @@ impl ConfiguredWorkPreparationPort {
             principal_id: "agentosd:work-preparation".to_owned(),
             authenticated: true,
         };
-        let (_receipt, snapshot) = self
-            .context
-            .lock()
-            .map_err(|_| CommandPortFailure::IntegrityFailure)?
-            .issue(&input, &principal)
-            .map_err(context_failure)?;
+        let (_receipt, snapshot, context_state_revision) = {
+            let mut context = self
+                .context
+                .lock()
+                .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+            let (receipt, snapshot) = context.issue(&input, &principal).map_err(context_failure)?;
+            let state_revision = context
+                .governance(&snapshot.snapshot_id)
+                .map_err(context_failure)?
+                .ok_or(CommandPortFailure::IntegrityFailure)?
+                .state_revision;
+            (receipt, snapshot, state_revision)
+        };
         persist_input_bundle(
             self.input_bundle_root.as_deref(),
             &snapshot.compiled_context_sha256,
@@ -268,6 +275,7 @@ impl ConfiguredWorkPreparationPort {
                 seconds: expires_at_seconds,
                 nanos: 0,
             }),
+            context_state_revision,
         };
         Ok((preview, snapshot.snapshot_id))
     }

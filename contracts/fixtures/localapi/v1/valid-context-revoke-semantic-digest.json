@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "v01-localapi-fixture/v0.1",
+  "fixtureId": "localapi-valid-context-revoke-semantic-digest",
+  "category": "valid",
+  "requirementRefs": ["R9A.2-CONTRACT", "R9A.2-DIGEST", "R9A.2-REDACTION"],
+  "principal": {
+    "kind": "FOUNDER",
+    "principalId": "os-user:founder",
+    "authenticated": true
+  },
+  "transport": {
+    "kind": "WINDOWS_NAMED_PIPE",
+    "peerCredentialVerified": true
+  },
+  "startingState": {
+    "snapshotId": "ctx:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "snapshotRevision": 1,
+    "contextState": "CONTEXT_GOVERNANCE_STATE_ISSUED",
+    "contextStateRevision": 1,
+    "ownerPrincipalId": "os-user:founder"
+  },
+  "operation": {
+    "executeContextMutation": {
+      "command": "revokeContextSnapshot",
+      "snapshotId": "ctx:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "expectedStateRevision": 1,
+      "reasonCode": "founder-withdrawn",
+      "evidenceRefs": ["evidence:review:42"],
+      "confirmationProofRef": "confirmation:cli:01",
+      "requestDigestSha256": "08d5c9f548acdef1cf739b73205510084c6c3ecd010ece536881a155eff3befc",
+      "canonicalBytesHex": "1a0000000000000065676f70756c73652f636f6e746578742d7265766f6b652f76310f000000000000006f732d757365723a666f756e64657244000000000000006374783a30313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566080000000000000001000000000000001100000000000000666f756e6465722d77697468647261776e08000000000000000100000000000000120000000000000065766964656e63653a7265766965773a34321300000000000000636f6e6669726d6174696f6e3a636c693a3031"
+    }
+  },
+  "expected": {
+    "outcome": "ok",
+    "businessWriteCount": 1,
+    "writeOwner": "ContextAuthority",
+    "serverDerivedFounderPrincipal": true,
+    "gatewayRecomputedExactCanonicalBytes": true,
+    "contextAuthorityCallCount": 1,
+    "acknowledgedAfterDurabilityBarrier": true,
+    "responseFieldAllowlist": ["snapshotId", "snapshotRevision", "contentDigestSha256", "previousStateRevision", "resultStateRevision", "previousState", "resultState", "requestDigestSha256", "eventId", "committedAt", "replayed", "acknowledgedAfterDurabilityBarrier"],
+    "contextBytesReturned": false,
+    "ownerPrincipalReturned": false,
+    "reasonReturned": false,
+    "evidenceReturned": false,
+    "confirmationProofReturned": false
+  }
+}

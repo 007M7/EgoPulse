@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "v01-localapi-fixture/v0.1",
+  "fixtureId": "localapi-invalid-context-revoke-confirmation-digests",
+  "category": "invalid",
+  "requirementRefs": ["R9A.2-DIGEST", "R9A.2-ZERO-CALL"],
+  "principal": {
+    "kind": "FOUNDER",
+    "principalId": "os-user:founder",
+    "authenticated": true
+  },
+  "transport": {
+    "kind": "WINDOWS_NAMED_PIPE",
+    "peerCredentialVerified": true
+  },
+  "startingState": {
+    "snapshotId": "ctx:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "contextState": "CONTEXT_GOVERNANCE_STATE_ISSUED",
+    "contextStateRevision": 1,
+    "ownerPrincipalId": "os-user:founder"
+  },
+  "operation": {
+    "executeContextMutation": {
+      "semanticInput": {
+        "snapshotId": "ctx:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "expectedStateRevision": 1,
+        "reasonCode": "founder-withdrawn",
+        "evidenceRefs": ["evidence:review:42"],
+        "confirmationProofRef": "confirmation:cli:01"
+      },
+      "confirmationCases": [
+        { "case": "missing", "requestDigestSha256Absent": true },
+        { "case": "empty", "requestDigestSha256": "" },
+        { "case": "truncated", "requestDigestSha256": "08d5c9f548acdef1" },
+        { "case": "malformed_uppercase", "requestDigestSha256": "08D5C9F548ACDEF1CF739B73205510084C6C3ECD010ECE536881A155EFF3BEFC" },
+        { "case": "mismatch", "requestDigestSha256": "0000000000000000000000000000000000000000000000000000000000000000" }
+      ]
+    }
+  },
+  "expected": {
+    "outcome": "error",
+    "businessWriteCount": 0,
+    "formatErrorCode": "LOCAL_API_ERROR_CODE_INVALID_ARGUMENT",
+    "mismatchErrorCode": "LOCAL_API_ERROR_CODE_INTEGRITY_FAILURE",
+    "allCasesRejectedBeforeContextAuthority": true,
+    "contextAuthorityCallCount": 0,
+    "taskAuthorityCallCount": 0,
+    "adapterCallCount": 0,
+    "partialReceiptReturned": false
+  }
+}
