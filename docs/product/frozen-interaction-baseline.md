@@ -296,9 +296,37 @@ The user-visible meaning is fail-closed:
 Local tests now prove the production runner and stores across Unknown creation,
 held reconstruction, single reconciliation plus replay, zero resend, zero false
 observation polling, Rejected replay, held/terminal separation and tamper
-rejection. This is a component-level checkpoint, not the final restart claim.
-R-8B.2c still requires a real Windows daemon hard-kill test between
-`begin_delivery` and receipt persistence, followed by same-root/same-instance
-restart. It must also reconstruct observation polling for a dispatch whose
-Delivered receipt was already persisted. Until those pass, full crash recovery
-and resumable user-visible streaming remain open.
+rejection. R-8B.2c below adds real process-termination evidence for the two
+frozen restart windows; resumable user-visible streaming remains open.
+
+## 11. R-8B.2c Windows hard-kill checkpoint (2026-08-30)
+
+R-8B.2c proves two real Windows child-daemon hard-kill paths. The test parent
+waits for a durable checkpoint, verifies that the daemon is alive, calls
+`Child::kill`, requires an abnormal exit, and restarts the same instance against
+the same root and persisted stores.
+
+First, the daemon is killed after `begin_delivery` and the fake native send, but
+before Adapter can persist a receipt. Recovery neither resends nor polls. It
+derives `OutcomeUnknown`, performs exactly one conservative reconciliation,
+leaves the Collaboration work `Held` with `ManualOnly`, and lets Task Authority
+move the Task from `Active` to `Interrupted`.
+
+Second, the daemon is killed after the Adapter `Delivered` receipt and the
+Collaboration delivered candidate are committed but before the first observation
+poll. Recovery neither resends nor reconciles. It rebuilds polling from those
+durable proofs, returns only the original non-terminal acknowledgement, persists
+and consumes it, leaves the receipt unchanged, moves the Attempt to
+`Acknowledged`, and keeps the Task `Active`. Subsequent runner cycles do not add
+another send, acknowledgement, reconciliation, observation or Authority event.
+
+All durable-store assertions are test-only white-box, read-only conformance
+oracles; they do not add a product query surface.
+
+The native boundary remains a deterministic `FakeCodexDriver` backed by an
+independent persistent SQLite witness. This is real process-termination evidence
+for governance recovery, not evidence for a real Provider or a generally
+available product. It does not cover another crash after Adapter appends an
+observation but before Collaboration ingests it, terminal observations, Artifact
+completion, or R-9 resumable streaming and formal Context revoke. It changes
+neither Proto nor the production database schema.

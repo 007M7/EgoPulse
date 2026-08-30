@@ -3,9 +3,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, File},
     future::Future,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -19,7 +19,7 @@ use egopulse_agentosd::{
     ConfiguredWorkPreparationPort, DaemonComposition, DaemonConfig, DaemonProviders,
     DenyVerificationReferences, GovernedReturnCollectorConfig, MemoryRetrievalCompositionConfig,
     NativeHarnessCompositionConfig, OwnerProjectionSource, PendingOwnerProjection,
-    ProjectionSourceFailure,
+    ProjectionSourceFailure, SharedAuthorityCompositionInputs,
 };
 use egopulse_artifact_authority::{
     ArtifactAuthority, ArtifactAuthorityConfig, ArtifactSqlCipherKey,
@@ -39,14 +39,16 @@ use egopulse_cognition_runtime::{
 };
 use egopulse_domain_contracts::v01::egopulse::{
     collaboration::v1::{
-        AttemptSnapshot, CollaborationEvent, CollaborationSnapshot, Lease, RunPlan, RunSnapshot,
-        RunStatus, StepPlan, StepSnapshot, StepStatus, collaboration_command_result,
+        AttemptSnapshot, AttemptStatus, CollaborationEvent, CollaborationSnapshot, Lease,
+        RecoveryClass, RunPlan, RunSnapshot, RunStatus, StepPlan, StepSnapshot, StepStatus,
+        collaboration_command_result,
     },
     common::v1::ContractReference,
     harness::v1::{
         ApprovalDecisionEnvelope, ApprovalKind, ApprovalRequestLifecycleKind,
-        ApprovalRequestObservation, CancelExecutionEnvelope, DispatchEnvelope, HarnessObservation,
-        NativeSessionStrategy, ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
+        ApprovalRequestObservation, CancelExecutionEnvelope, DeliveryDisposition, DispatchEnvelope,
+        HarnessObservation, NativeSessionStrategy, ObservationCriticality, ProbeHarnessRequest,
+        ProbeHarnessResult, harness_observation,
     },
     localapi::v1::{
         ClientSurface, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
@@ -91,6 +93,10 @@ use egopulse_policy_decision_authority::{
     PolicyPrincipalKind, PolicyReferenceRejection, PolicySqlCipherKey,
     ResolvedApprovalAuthorization,
 };
+use egopulse_v01_fault_conformance::r8b2c::{
+    R8b2cNativeEventRecord, R8b2cWitnessReader, R8b2cWitnessWriter, read_r8b2c_adapter_store,
+    read_r8b2c_collaboration_store, read_r8b2c_task_store,
+};
 use egopulse_verification_authority::{
     VerificationAuthority, VerificationAuthorityConfig, VerificationSqlCipherKey,
 };
@@ -107,9 +113,17 @@ const FIXTURE_INSTANCE_ENV: &str = "EGOPULSE_C5_FIXTURE_INSTANCE";
 const FIXTURE_MODE_ENV: &str = "EGOPULSE_C5_FIXTURE_MODE";
 const R8A_FIXTURE_MODE: &str = "dynamic";
 const R8B_PAUSE_BEFORE_RUNNER_MODE: &str = "dynamic-pause-before-runner";
+const R8B2C_BEGIN_DELIVERY_MODE: &str = "dynamic-r8b2c-begin-delivery";
+const R8B2C_UNKNOWN_RECOVERY_MODE: &str = "dynamic-r8b2c-unknown-recovery";
+const R8B2C_DELIVERED_BEFORE_POLL_MODE: &str = "dynamic-r8b2c-delivered-before-poll";
+const R8B2C_ACK_RECOVERY_MODE: &str = "dynamic-r8b2c-ack-recovery";
 const R8A_ACTIVATION_RUN_ID: &str = "r8a-activation-run";
 const R8A_DRIVER_RECORD: &str = "r8a-driver-record.json";
 const R8B_FIRST_RUNNER_CYCLE_RECORD: &str = "r8b-first-runner-cycle-complete";
+const R8B2C_BEGIN_DELIVERY_PHASE: &str = "begin-delivery-before-receipt";
+const R8B2C_DELIVERED_BEFORE_POLL_PHASE: &str = "delivered-before-poll";
+const R8B2C_UNKNOWN_RECOVERED_PHASE: &str = "unknown-recovered";
+const R8B2C_ACK_REHYDRATED_PHASE: &str = "ack-rehydrated";
 
 struct FirstRunnerCycleMarker {
     inner: Arc<dyn HarnessDispatchRunner>,
@@ -158,6 +172,19 @@ impl RecordingFixtureDriver {
     fn new(root: &Path) -> Self {
         Self {
             inner: FakeCodexDriver::default(),
+            record_path: root.join(R8A_DRIVER_RECORD),
+            dispatch_count: 0,
+            observation_forwarded: false,
+        }
+    }
+
+    fn new_for_r8b2c(root: &Path) -> Self {
+        Self {
+            inner: FakeCodexDriver::default().with_reconciliation_finding(
+                ReconciliationFinding::OutcomeUnknown {
+                    evidence_ref: "fixture://codex/r8b2c/outcome-unknown".to_owned(),
+                },
+            ),
             record_path: root.join(R8A_DRIVER_RECORD),
             dispatch_count: 0,
             observation_forwarded: false,
@@ -243,6 +270,283 @@ impl NativeHarnessDriver for RecordingFixtureDriver {
     ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
         self.inner.reconcile(context)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum R8b2cDriverMode {
+    BeginDeliveryBlock,
+    Recover,
+}
+
+fn native_event_record(event: &DriverEvent) -> R8b2cNativeEventRecord {
+    assert!(matches!(
+        &event.payload,
+        harness_observation::Payload::Ack(_)
+    ));
+    R8b2cNativeEventRecord {
+        native_key: event.native_key.clone(),
+        native_event_id: event.native_event_id.clone(),
+        native_sequence: event.native_sequence,
+        observed_seconds: event.native_observed_at.seconds,
+        observed_nanos: event.native_observed_at.nanos,
+        criticality: event.criticality as i32,
+        payload: HarnessObservation {
+            payload: Some(event.payload.clone()),
+            ..HarnessObservation::default()
+        }
+        .encode_to_vec(),
+        raw_event: event.raw_event.clone(),
+    }
+}
+
+fn driver_event(record: R8b2cNativeEventRecord) -> DriverEvent {
+    let carrier = HarnessObservation::decode(record.payload.as_slice())
+        .expect("decode R-8B.2c native ACK carrier");
+    DriverEvent {
+        native_key: record.native_key,
+        native_event_id: record.native_event_id,
+        native_sequence: record.native_sequence,
+        native_observed_at: prost_types::Timestamp {
+            seconds: record.observed_seconds,
+            nanos: record.observed_nanos,
+        },
+        criticality: ObservationCriticality::try_from(record.criticality)
+            .expect("R-8B.2c native criticality"),
+        payload: carrier.payload.expect("R-8B.2c native ACK payload"),
+        raw_event: record.raw_event,
+    }
+}
+
+struct R8b2cWitnessOracle {
+    reader: R8b2cWitnessReader,
+}
+
+impl R8b2cWitnessOracle {
+    fn open_existing(root: &Path, instance: &str) -> Self {
+        Self {
+            reader: R8b2cWitnessReader::open_existing(root, instance)
+                .expect("open existing R-8B.2c witness read-only"),
+        }
+    }
+
+    fn ledger_count(&self, operation: &str) -> u64 {
+        self.reader
+            .ledger_count(operation)
+            .expect("count R-8B.2c witness ledger")
+    }
+
+    fn native_event_state(&self, dispatch_id: &str) -> Option<(String, u64)> {
+        self.reader
+            .native_event_state(dispatch_id)
+            .expect("read R-8B.2c native event state")
+    }
+}
+
+struct R8b2cFixtureDriver {
+    inner: RecordingFixtureDriver,
+    witness: R8b2cWitnessWriter,
+    root: PathBuf,
+    instance: String,
+    mode: R8b2cDriverMode,
+}
+
+impl R8b2cFixtureDriver {
+    fn new(root: &Path, instance: &str, mode: R8b2cDriverMode) -> Self {
+        Self {
+            inner: RecordingFixtureDriver::new_for_r8b2c(root),
+            witness: R8b2cWitnessWriter::initialize(root, instance)
+                .expect("initialize R-8B.2c native witness"),
+            root: root.to_owned(),
+            instance: instance.to_owned(),
+            mode,
+        }
+    }
+}
+
+impl NativeHarnessDriver for R8b2cFixtureDriver {
+    fn probe<'a>(
+        &'a mut self,
+        request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        self.inner.probe(request)
+    }
+
+    fn send_dispatch<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+        material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        Box::pin(async move {
+            self.witness
+                .append("send_dispatch", &envelope.dispatch_id, "native side effect")
+                .expect("append R-8B.2c native send");
+            let delivery = self.inner.send_dispatch(envelope, material).await?;
+            let ack = self
+                .inner
+                .next_event(envelope)
+                .await?
+                .expect("FakeCodexDriver must produce its original ACK after send");
+            self.witness
+                .persist_native_event(&envelope.dispatch_id, &native_event_record(&ack))
+                .expect("persist R-8B.2c native ACK");
+            if self.mode == R8b2cDriverMode::BeginDeliveryBlock {
+                publish_r8b2c_checkpoint(
+                    &self.root,
+                    &self.instance,
+                    &envelope.dispatch_id,
+                    R8B2C_BEGIN_DELIVERY_PHASE,
+                );
+                std::future::pending::<()>().await;
+                unreachable!("R-8B.2c begin-delivery checkpoint is permanently blocked");
+            }
+            Ok(delivery)
+        })
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        Box::pin(async move {
+            Ok(self
+                .witness
+                .next_native_event(&envelope.dispatch_id)
+                .expect("poll R-8B.2c native witness")
+                .map(driver_event))
+        })
+    }
+
+    fn decide_approval<'a>(
+        &'a mut self,
+        envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        self.inner.decide_approval(envelope)
+    }
+
+    fn cancel<'a>(
+        &'a mut self,
+        envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        self.inner.cancel(envelope)
+    }
+
+    fn reconcile<'a>(
+        &'a mut self,
+        context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        Box::pin(async move {
+            self.witness
+                .append("reconcile", &context.envelope.dispatch_id, "OutcomeUnknown")
+                .expect("append R-8B.2c reconcile");
+            self.inner.reconcile(context).await
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum R8b2cRunnerCheckpoint {
+    DeliveredBeforePoll,
+    UnknownRecovered,
+    AckRehydrated,
+}
+
+struct R8b2cCheckpointRunner {
+    inner: Arc<dyn HarnessDispatchRunner>,
+    root: PathBuf,
+    instance: String,
+    checkpoint: R8b2cRunnerCheckpoint,
+}
+
+impl HarnessDispatchRunner for R8b2cCheckpointRunner {
+    fn run_once(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let report = self.inner.run_once().await?;
+            let (reached, phase, block) = match self.checkpoint {
+                R8b2cRunnerCheckpoint::DeliveredBeforePoll => (
+                    report.dispatches_delivered > 0,
+                    R8B2C_DELIVERED_BEFORE_POLL_PHASE,
+                    true,
+                ),
+                R8b2cRunnerCheckpoint::UnknownRecovered => (
+                    report.task_recovery_findings.iter().any(|finding| {
+                        finding.kind
+                            == egopulse_local_ide_control::collaboration_control::TaskRecoveryKind::OutcomeUnknown
+                    }),
+                    R8B2C_UNKNOWN_RECOVERED_PHASE,
+                    false,
+                ),
+                R8b2cRunnerCheckpoint::AckRehydrated => (
+                    report.observations_consumed > 0,
+                    R8B2C_ACK_REHYDRATED_PHASE,
+                    false,
+                ),
+            };
+            if reached {
+                publish_r8b2c_checkpoint(&self.root, &self.instance, "r8a-dispatch", phase);
+                if block {
+                    std::future::pending::<()>().await;
+                    unreachable!("R-8B.2c runner checkpoint is permanently blocked");
+                }
+            }
+            Ok(report)
+        })
+    }
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct R8b2cCheckpoint {
+    process_id: u32,
+    fixture_root: String,
+    fixture_instance: String,
+    dispatch_id: String,
+    phase: String,
+}
+
+fn r8b2c_checkpoint_path(root: &Path, phase: &str) -> PathBuf {
+    root.join(format!("r8b2c-checkpoint-{phase}.json"))
+}
+
+fn publish_r8b2c_checkpoint(root: &Path, instance: &str, dispatch_id: &str, phase: &str) {
+    let checkpoint = R8b2cCheckpoint {
+        process_id: std::process::id(),
+        fixture_root: root.display().to_string(),
+        fixture_instance: instance.to_owned(),
+        dispatch_id: dispatch_id.to_owned(),
+        phase: phase.to_owned(),
+    };
+    let payload = serde_json::to_vec(&checkpoint).expect("serialize R-8B.2c checkpoint");
+    let path = r8b2c_checkpoint_path(root, phase);
+    if path.exists() {
+        let existing: R8b2cCheckpoint =
+            serde_json::from_slice(&fs::read(&path).expect("read existing R-8B.2c checkpoint"))
+                .expect("decode existing R-8B.2c checkpoint");
+        assert_eq!(existing.process_id, checkpoint.process_id);
+        assert_eq!(existing.fixture_root, checkpoint.fixture_root);
+        assert_eq!(existing.fixture_instance, checkpoint.fixture_instance);
+        assert_eq!(existing.dispatch_id, checkpoint.dispatch_id);
+        assert_eq!(existing.phase, checkpoint.phase);
+        return;
+    }
+    let temporary = root.join(format!(
+        ".r8b2c-checkpoint-{phase}-{}-{}.tmp",
+        std::process::id(),
+        Uuid::now_v7()
+    ));
+    let mut file = File::create(&temporary).expect("create R-8B.2c checkpoint temp file");
+    file.write_all(&payload).expect("write R-8B.2c checkpoint");
+    file.flush().expect("flush R-8B.2c checkpoint");
+    file.sync_all().expect("sync R-8B.2c checkpoint");
+    drop(file);
+    fs::rename(&temporary, &path).expect("publish R-8B.2c checkpoint");
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -658,7 +962,22 @@ fn fixture_mode() -> String {
 fn dynamic_fixture_mode() -> bool {
     matches!(
         fixture_mode().as_str(),
-        R8A_FIXTURE_MODE | R8B_PAUSE_BEFORE_RUNNER_MODE
+        R8A_FIXTURE_MODE
+            | R8B_PAUSE_BEFORE_RUNNER_MODE
+            | R8B2C_BEGIN_DELIVERY_MODE
+            | R8B2C_UNKNOWN_RECOVERY_MODE
+            | R8B2C_DELIVERED_BEFORE_POLL_MODE
+            | R8B2C_ACK_RECOVERY_MODE
+    )
+}
+
+fn r8b2c_fixture_mode() -> bool {
+    matches!(
+        fixture_mode().as_str(),
+        R8B2C_BEGIN_DELIVERY_MODE
+            | R8B2C_UNKNOWN_RECOVERY_MODE
+            | R8B2C_DELIVERED_BEFORE_POLL_MODE
+            | R8B2C_ACK_RECOVERY_MODE
     )
 }
 
@@ -810,7 +1129,13 @@ fn fixture_config(root: &Path, instance: &str) -> DaemonConfig {
 fn open_fixture_providers(root: &Path) -> DaemonProviders {
     if matches!(
         fixture_mode().as_str(),
-        "allow" | R8A_FIXTURE_MODE | R8B_PAUSE_BEFORE_RUNNER_MODE
+        "allow"
+            | R8A_FIXTURE_MODE
+            | R8B_PAUSE_BEFORE_RUNNER_MODE
+            | R8B2C_BEGIN_DELIVERY_MODE
+            | R8B2C_UNKNOWN_RECOVERY_MODE
+            | R8B2C_DELIVERED_BEFORE_POLL_MODE
+            | R8B2C_ACK_RECOVERY_MODE
     ) {
         open_fixture_providers_with_guards(
             root,
@@ -871,16 +1196,37 @@ where
     )
     .expect("fixture verdict authority should open");
 
-    let providers = DaemonProviders::from_authority_inputs(AuthorityCompositionInputs {
-        task,
-        policy,
-        verdict,
-        principal_resolver: Arc::new(FixtureAuthorityPrincipalResolver),
-        session_principal_resolver: Arc::new(FixtureSessionResolver),
-        session_clock: Arc::new(egopulse_local_api::session::SystemSessionClock),
-        session_audit: Arc::new(NoopSessionAuditSink),
-        additional_projection_sources,
-    });
+    let (providers, shared_task) = if dynamic_fixture_mode() {
+        let task = Arc::new(Mutex::new(task));
+        let verdict = Arc::new(Mutex::new(Some(verdict)));
+        (
+            DaemonProviders::from_shared_authority_inputs(SharedAuthorityCompositionInputs {
+                task: Arc::clone(&task),
+                policy,
+                verdict,
+                principal_resolver: Arc::new(FixtureAuthorityPrincipalResolver),
+                session_principal_resolver: Arc::new(FixtureSessionResolver),
+                session_clock: Arc::new(egopulse_local_api::session::SystemSessionClock),
+                session_audit: Arc::new(NoopSessionAuditSink),
+                additional_projection_sources,
+            }),
+            Some(task),
+        )
+    } else {
+        (
+            DaemonProviders::from_authority_inputs(AuthorityCompositionInputs {
+                task,
+                policy,
+                verdict,
+                principal_resolver: Arc::new(FixtureAuthorityPrincipalResolver),
+                session_principal_resolver: Arc::new(FixtureSessionResolver),
+                session_clock: Arc::new(egopulse_local_api::session::SystemSessionClock),
+                session_audit: Arc::new(NoopSessionAuditSink),
+                additional_projection_sources,
+            }),
+            None,
+        )
+    };
     let mut memory = MemoryAuthority::open(MemoryAuthorityConfig {
         database_path: root.join("memory-authority.db"),
         store_epoch: "c5-memory-epoch".to_owned(),
@@ -960,22 +1306,60 @@ where
     fs::create_dir_all(root.join(&native.workflow.workspace_ref))
         .expect("R-8A governed workspace should exist");
     let (artifact, verification) = r8a_authorities(root, &native.return_collector);
+    let mode = fixture_mode();
+    let providers = providers.with_context_authority(context);
+    let providers = if r8b2c_fixture_mode() {
+        let driver_mode = if mode == R8B2C_BEGIN_DELIVERY_MODE {
+            R8b2cDriverMode::BeginDeliveryBlock
+        } else {
+            R8b2cDriverMode::Recover
+        };
+        providers
+            .with_native_harness_driver(
+                native,
+                artifact,
+                verification,
+                R8b2cFixtureDriver::new(root, &fixture_instance(), driver_mode),
+            )
+            .expect("R-8B.2c native Harness composition")
+    } else {
+        providers
+            .with_native_harness_driver(
+                native,
+                artifact,
+                verification,
+                RecordingFixtureDriver::new(root),
+            )
+            .expect("R-8A native Harness composition")
+    };
     let mut providers = providers
-        .with_context_authority(context)
-        .with_native_harness_driver(
-            native,
-            artifact,
-            verification,
-            RecordingFixtureDriver::new(root),
+        .with_task_recovery_settlement(
+            shared_task.expect("dynamic fixture must retain the shared Task Authority"),
         )
-        .expect("R-8A native Harness composition");
-    if fixture_mode() == R8B_PAUSE_BEFORE_RUNNER_MODE {
+        .expect("dynamic fixture Task recovery settlement");
+    if mode == R8B_PAUSE_BEFORE_RUNNER_MODE {
         let runner = providers
             .harness_dispatch_runner
             .take()
             .expect("R-8B production Harness runner");
         providers.harness_dispatch_runner =
             Some(Arc::new(FirstRunnerCycleMarker::new(runner, root)));
+    } else if let Some(checkpoint) = match mode.as_str() {
+        R8B2C_DELIVERED_BEFORE_POLL_MODE => Some(R8b2cRunnerCheckpoint::DeliveredBeforePoll),
+        R8B2C_UNKNOWN_RECOVERY_MODE => Some(R8b2cRunnerCheckpoint::UnknownRecovered),
+        R8B2C_ACK_RECOVERY_MODE => Some(R8b2cRunnerCheckpoint::AckRehydrated),
+        _ => None,
+    } {
+        let runner = providers
+            .harness_dispatch_runner
+            .take()
+            .expect("R-8B.2c production Harness runner");
+        providers.harness_dispatch_runner = Some(Arc::new(R8b2cCheckpointRunner {
+            inner: runner,
+            root: root.to_owned(),
+            instance: fixture_instance(),
+            checkpoint,
+        }));
     }
     providers
 }
@@ -1035,7 +1419,15 @@ async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Chi
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(
-            if matches!(mode, R8A_FIXTURE_MODE | R8B_PAUSE_BEFORE_RUNNER_MODE) {
+            if matches!(
+                mode,
+                R8A_FIXTURE_MODE
+                    | R8B_PAUSE_BEFORE_RUNNER_MODE
+                    | R8B2C_BEGIN_DELIVERY_MODE
+                    | R8B2C_UNKNOWN_RECOVERY_MODE
+                    | R8B2C_DELIVERED_BEFORE_POLL_MODE
+                    | R8B2C_ACK_RECOVERY_MODE
+            ) {
                 Stdio::inherit()
             } else {
                 Stdio::null()
@@ -1138,6 +1530,337 @@ async fn wait_for_cli_status_with_child(instance: &str, child: &mut Child) -> st
         sleep(Duration::from_millis(50)).await;
     }
     panic!("CLI should attach to the real fixture daemon: {last_failure}");
+}
+
+async fn wait_for_r8b2c_checkpoint(
+    root: &Path,
+    instance: &str,
+    dispatch_id: &str,
+    phase: &str,
+    child: &mut Child,
+) -> R8b2cCheckpoint {
+    let path = r8b2c_checkpoint_path(root, phase);
+    for _ in 0..200 {
+        if let Ok(payload) = fs::read(&path)
+            && let Ok(checkpoint) = serde_json::from_slice::<R8b2cCheckpoint>(&payload)
+        {
+            assert_eq!(
+                checkpoint.process_id,
+                child.id().expect("R-8B.2c child PID")
+            );
+            assert_eq!(checkpoint.fixture_root, root.display().to_string());
+            assert_eq!(checkpoint.fixture_instance, instance);
+            assert_eq!(checkpoint.dispatch_id, dispatch_id);
+            assert_eq!(checkpoint.phase, phase);
+            return checkpoint;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .expect("inspect R-8B.2c child while waiting for checkpoint")
+        {
+            panic!("R-8B.2c child exited before {phase} checkpoint: {status}");
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("R-8B.2c checkpoint {phase} was not published");
+}
+
+async fn hard_kill_r8b2c_child(child: &mut Child, phase: &str) {
+    assert!(
+        child
+            .try_wait()
+            .expect("inspect R-8B.2c child before hard kill")
+            .is_none(),
+        "R-8B.2c child must still be alive at {phase} checkpoint"
+    );
+    child.kill().await.expect("hard-kill R-8B.2c child");
+    let status = child
+        .wait()
+        .await
+        .expect("wait for hard-killed R-8B.2c child");
+    assert!(
+        !status.success(),
+        "R-8B.2c child killed at {phase} must not report success: {status}"
+    );
+}
+
+async fn prepare_and_confirm_r8b2c_work(root: &Path, instance: &str, label: &str) -> String {
+    fs::write(
+        root.join("context.md"),
+        format!("R-8B.2c governed crash-window context for {label}."),
+    )
+    .expect("write R-8B.2c context source");
+    let prepare_key = format!("{label}-prepare");
+    let prepare = run_cli(
+        instance,
+        &[
+            "work",
+            "prepare",
+            "--intent",
+            "exercise a governed R-8B.2c crash recovery window",
+            "--scope",
+            "scope:r8a",
+            "--work-type",
+            "governed_repository_change",
+            "--context-ref",
+            "context.md",
+            "--idempotency-key",
+            &prepare_key,
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        prepare.status.success(),
+        "R-8B.2c prepare failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&prepare.stdout),
+        String::from_utf8_lossy(&prepare.stderr)
+    );
+    let prepared: serde_json::Value =
+        serde_json::from_slice(&prepare.stdout).expect("decode R-8B.2c prepare response");
+    let snapshot_id = prepared["data"]["snapshotId"]
+        .as_str()
+        .expect("R-8B.2c snapshot id")
+        .to_owned();
+    let confirmation_binding = prepared["data"]["confirmationBindingSha256"]
+        .as_str()
+        .expect("R-8B.2c confirmation binding")
+        .to_owned();
+    let confirm_key = format!("{label}-confirm");
+    let confirm = run_tui(
+        instance,
+        &[
+            "--instance",
+            instance,
+            "work-confirm",
+            &snapshot_id,
+            "--confirmation-binding-sha256",
+            &confirmation_binding,
+            "--idempotency-key",
+            &confirm_key,
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        confirm.status.success(),
+        "R-8B.2c confirm failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&confirm.stdout),
+        String::from_utf8_lossy(&confirm.stderr)
+    );
+    let confirmed: serde_json::Value =
+        serde_json::from_slice(&confirm.stdout).expect("decode R-8B.2c confirm response");
+    assert_eq!(
+        confirmed["data"]["status"],
+        TaskStatus::Active.as_str_name()
+    );
+    confirmed["data"]["taskId"]
+        .as_str()
+        .expect("R-8B.2c Task id")
+        .to_owned()
+}
+
+async fn wait_for_r8b2c_task_status(
+    instance: &str,
+    task_id: &str,
+    expected: TaskStatus,
+    child: &mut Child,
+) -> serde_json::Value {
+    let mut last = String::new();
+    for _ in 0..120 {
+        let output = run_cli(instance, &["task", "get", task_id, "--json"]).await;
+        last = format!(
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if output.status.success()
+            && let Ok(view) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            && view["data"]["status"] == expected.as_str_name()
+        {
+            assert_eq!(view["data"]["taskId"], task_id);
+            return view;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .expect("inspect R-8B.2c child while waiting for Task")
+        {
+            panic!("R-8B.2c child exited while waiting for Task {expected:?}: {status}");
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("R-8B.2c Task did not reach {expected:?}: {last}");
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct R8b2cCollaborationOracle {
+    run: RunSnapshot,
+    step: StepSnapshot,
+    attempt: AttemptSnapshot,
+    outbox_state: String,
+    envelope: DispatchEnvelope,
+    event_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct R8b2cTaskOracle {
+    snapshot: TaskSnapshot,
+    event_count: u64,
+}
+
+fn read_r8b2c_collaboration_oracle(root: &Path) -> R8b2cCollaborationOracle {
+    let stored = read_r8b2c_collaboration_store(
+        &root.join("r8a-collaboration.db"),
+        &[0x31; 32],
+        R8A_ACTIVATION_RUN_ID,
+        "r8a-step",
+        "r8a-attempt",
+    )
+    .expect("read R-8B.2c Collaboration store through conformance boundary");
+    let run =
+        RunSnapshot::decode(stored.run_snapshot.as_slice()).expect("decode R-8B.2c run snapshot");
+    assert_eq!(run.revision, stored.run_revision);
+    assert_eq!(run.status, stored.run_status);
+    let step = StepSnapshot::decode(stored.step_snapshot.as_slice())
+        .expect("decode R-8B.2c step snapshot");
+    assert_eq!(step.revision, stored.step_revision);
+    assert_eq!(step.status, stored.step_status);
+    let attempt = AttemptSnapshot::decode(stored.attempt_snapshot.as_slice())
+        .expect("decode R-8B.2c attempt snapshot");
+    assert_eq!(attempt.revision, stored.attempt_revision);
+    assert_eq!(attempt.status, stored.attempt_status);
+    let envelope =
+        DispatchEnvelope::decode(stored.envelope.as_slice()).expect("decode R-8B.2c envelope");
+    assert_eq!(envelope.run_id, R8A_ACTIVATION_RUN_ID);
+    assert_eq!(envelope.step_id, "r8a-step");
+    assert_eq!(envelope.attempt_id, "r8a-attempt");
+    assert_eq!(envelope.dispatch_id, "r8a-dispatch");
+    R8b2cCollaborationOracle {
+        run,
+        step,
+        attempt,
+        outbox_state: stored.outbox_state,
+        envelope,
+        event_count: stored.event_count,
+    }
+}
+
+fn read_r8b2c_task_oracle(root: &Path, task_id: &str) -> R8b2cTaskOracle {
+    let stored = read_r8b2c_task_store(&root.join("task-authority.db"), &[0x11; 32], task_id)
+        .expect("read R-8B.2c Task store through conformance boundary");
+    let snapshot =
+        TaskSnapshot::decode(stored.snapshot.as_slice()).expect("decode R-8B.2c Task snapshot");
+    assert_eq!(snapshot.task_id, task_id);
+    assert_eq!(snapshot.revision, stored.revision);
+    assert_eq!(snapshot.status, stored.status);
+    R8b2cTaskOracle {
+        snapshot,
+        event_count: stored.event_count,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct R8b2cAdapterObservationOracle {
+    observation_id: String,
+    dispatch_id: String,
+    native_key: String,
+    native_event_digest_sha256: String,
+    raw_evidence_ref: String,
+    ingestion_state: String,
+    observation: HarnessObservation,
+    raw_event: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct R8b2cAdapterOracle {
+    dispatch_count: u64,
+    delivery_unknown_count: u64,
+    observation_count: u64,
+    pending_observation_count: u64,
+    dispatch_state: String,
+    dispatch_attempt_id: String,
+    dispatch_fencing_token: u64,
+    dispatch_fingerprint: String,
+    envelope_digest_sha256: String,
+    envelope: DispatchEnvelope,
+    envelope_bytes: Vec<u8>,
+    receipt: Option<egopulse_domain_contracts::v01::egopulse::harness::v1::DispatchReceipt>,
+    receipt_bytes: Option<Vec<u8>>,
+    observations: Vec<R8b2cAdapterObservationOracle>,
+}
+
+fn read_r8b2c_adapter_oracle(root: &Path) -> R8b2cAdapterOracle {
+    let stored =
+        read_r8b2c_adapter_store(&root.join("r8a-adapter.db"), &[0x32; 32], "r8a-dispatch")
+            .expect("read R-8B.2c Adapter store through conformance boundary");
+    let envelope_bytes = stored.envelope.clone();
+    let envelope = DispatchEnvelope::decode(envelope_bytes.as_slice())
+        .expect("decode R-8B.2c Adapter dispatch envelope");
+    assert_eq!(envelope.attempt_id, stored.attempt_id);
+    assert_eq!(envelope.fencing_token, stored.fencing_token);
+    assert_eq!(envelope.dispatch_fingerprint, stored.dispatch_fingerprint);
+    assert_eq!(
+        stored.envelope_digest_sha256,
+        format!("{:x}", Sha256::digest(envelope_bytes.as_slice()))
+    );
+    let receipt_bytes = stored.receipt.clone();
+    let receipt = receipt_bytes.as_deref().map(|bytes| {
+        egopulse_domain_contracts::v01::egopulse::harness::v1::DispatchReceipt::decode(bytes)
+            .expect("decode R-8B.2c Adapter receipt")
+    });
+    if let (Some(receipt), Some(receipt_bytes)) = (receipt.as_ref(), receipt_bytes.as_ref()) {
+        assert_eq!(receipt.encode_to_vec().as_slice(), receipt_bytes.as_slice());
+    }
+    let observations = stored
+        .observations
+        .into_iter()
+        .map(|row| {
+            let observation = HarnessObservation::decode(row.observation.as_slice())
+                .expect("decode R-8B.2c Adapter observation");
+            assert_eq!(row.dispatch_id, observation.dispatch_id);
+            assert_eq!(row.observation_id, observation.observation_id);
+            assert_eq!(row.raw_evidence_ref, observation.raw_evidence_ref);
+            assert_eq!(
+                row.native_event_digest_sha256,
+                observation.native_event_digest_sha256
+            );
+            assert_eq!(
+                row.native_event_digest_sha256,
+                format!("{:x}", Sha256::digest(row.raw_event.as_slice()))
+            );
+            assert!(matches!(
+                row.ingestion_state.as_str(),
+                "pending" | "consumed"
+            ));
+            R8b2cAdapterObservationOracle {
+                observation_id: row.observation_id,
+                dispatch_id: row.dispatch_id,
+                native_key: row.native_key,
+                native_event_digest_sha256: row.native_event_digest_sha256,
+                raw_evidence_ref: row.raw_evidence_ref,
+                ingestion_state: row.ingestion_state,
+                observation,
+                raw_event: row.raw_event,
+            }
+        })
+        .collect();
+    R8b2cAdapterOracle {
+        dispatch_count: stored.dispatch_count,
+        delivery_unknown_count: stored.delivery_unknown_count,
+        observation_count: stored.observation_count,
+        pending_observation_count: stored.pending_observation_count,
+        dispatch_state: stored.dispatch_state,
+        dispatch_attempt_id: stored.attempt_id,
+        dispatch_fencing_token: stored.fencing_token,
+        dispatch_fingerprint: stored.dispatch_fingerprint,
+        envelope_digest_sha256: stored.envelope_digest_sha256,
+        envelope,
+        envelope_bytes,
+        receipt,
+        receipt_bytes,
+        observations,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1986,6 +2709,348 @@ async fn r8b_activation_outbox_survives_daemon_kill_and_dispatches_once_after_re
     ));
     drop(adapter);
     fs::remove_dir_all(&root).expect("remove R-8B.1 fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll() {
+    let root = std::env::temp_dir().join(format!("egopulse-r8b2c-begin-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create R-8B.2c begin-delivery fixture root");
+    let instance = format!("r8b2c-begin-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, R8B2C_BEGIN_DELIVERY_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut child).await;
+    let task_id = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-begin").await;
+
+    wait_for_r8b2c_checkpoint(
+        &root,
+        &instance,
+        "r8a-dispatch",
+        R8B2C_BEGIN_DELIVERY_PHASE,
+        &mut child,
+    )
+    .await;
+    let task_before_kill =
+        wait_for_r8b2c_task_status(&instance, &task_id, TaskStatus::Active, &mut child).await;
+    assert_eq!(
+        task_before_kill["data"]["currentRunId"],
+        R8A_ACTIVATION_RUN_ID
+    );
+
+    let witness = R8b2cWitnessOracle::open_existing(&root, &instance);
+    assert_eq!(witness.ledger_count("send_dispatch"), 1);
+    assert_eq!(witness.ledger_count("next_event"), 0);
+    assert_eq!(witness.ledger_count("reconcile"), 0);
+    assert_eq!(witness.ledger_count("ack_emitted"), 0);
+    assert_eq!(
+        witness.native_event_state("r8a-dispatch"),
+        Some(("pending".to_owned(), 0))
+    );
+
+    let adapter = read_r8b2c_adapter_oracle(&root);
+    assert_eq!(adapter.dispatch_count, 1);
+    assert_eq!(adapter.delivery_unknown_count, 1);
+    assert_eq!(adapter.observation_count, 0);
+    assert_eq!(adapter.pending_observation_count, 0);
+    assert_eq!(adapter.dispatch_state, "delivery_unknown");
+    assert!(adapter.receipt.is_none());
+    assert!(adapter.receipt_bytes.is_none());
+    assert_eq!(adapter.envelope.dispatch_id, "r8a-dispatch");
+
+    let collaboration = read_r8b2c_collaboration_oracle(&root);
+    assert_eq!(collaboration.outbox_state, "pending");
+    assert_eq!(collaboration.run.status, RunStatus::Active as i32);
+    assert_eq!(collaboration.step.status, StepStatus::Active as i32);
+    assert_eq!(
+        collaboration.attempt.status,
+        AttemptStatus::DispatchPending as i32
+    );
+    assert_eq!(
+        collaboration.attempt.dispatch_id.as_deref(),
+        Some(collaboration.envelope.dispatch_id.as_str())
+    );
+
+    hard_kill_r8b2c_child(&mut child, R8B2C_BEGIN_DELIVERY_PHASE).await;
+
+    let mut restarted =
+        spawn_fixture_with_mode(&root, &instance, R8B2C_UNKNOWN_RECOVERY_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut restarted).await;
+    wait_for_r8b2c_checkpoint(
+        &root,
+        &instance,
+        "r8a-dispatch",
+        R8B2C_UNKNOWN_RECOVERED_PHASE,
+        &mut restarted,
+    )
+    .await;
+
+    let interrupted =
+        wait_for_r8b2c_task_status(&instance, &task_id, TaskStatus::Interrupted, &mut restarted)
+            .await;
+    assert_eq!(interrupted["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID);
+    assert_eq!(witness.ledger_count("send_dispatch"), 1);
+    assert_eq!(witness.ledger_count("next_event"), 0);
+    assert_eq!(witness.ledger_count("reconcile"), 1);
+    assert_eq!(witness.ledger_count("ack_emitted"), 0);
+    assert_eq!(
+        witness.native_event_state("r8a-dispatch"),
+        Some(("pending".to_owned(), 0))
+    );
+
+    let adapter = read_r8b2c_adapter_oracle(&root);
+    assert_eq!(adapter.dispatch_count, 1);
+    assert_eq!(adapter.delivery_unknown_count, 1);
+    assert_eq!(adapter.observation_count, 1);
+    assert_eq!(adapter.pending_observation_count, 1);
+    let unknown_receipt = adapter
+        .receipt
+        .as_ref()
+        .expect("Unknown recovery must persist an Adapter receipt");
+    assert_eq!(
+        DeliveryDisposition::try_from(unknown_receipt.disposition),
+        Ok(DeliveryDisposition::Unknown)
+    );
+    let reconciliation_key = "reconciliation:adapter-reconciliation:r8a-dispatch";
+    let reconciliation = adapter
+        .observations
+        .iter()
+        .find(|observation| observation.native_key == reconciliation_key)
+        .expect("OutcomeUnknown reconciliation evidence must be durable");
+    assert_eq!(reconciliation.dispatch_id, "r8a-dispatch");
+    assert_eq!(reconciliation.ingestion_state, "pending");
+    assert!(!reconciliation.raw_event.is_empty());
+    assert!(matches!(
+        reconciliation.observation.payload,
+        Some(harness_observation::Payload::Diagnostic(ref diagnostic))
+            if diagnostic.safe_diagnostic_code == "ADAPTER_RECONCILIATION_OUTCOME_UNKNOWN"
+    ));
+    let collaboration = read_r8b2c_collaboration_oracle(&root);
+    assert_eq!(collaboration.outbox_state, "held");
+    assert_eq!(collaboration.run.status, RunStatus::Held as i32);
+    assert_eq!(collaboration.step.status, StepStatus::Held as i32);
+    assert_eq!(collaboration.attempt.status, AttemptStatus::Held as i32);
+    assert_eq!(
+        collaboration.attempt.recovery_class,
+        RecoveryClass::ManualOnly as i32
+    );
+    assert_eq!(
+        collaboration.run.hold_reason_code.as_deref(),
+        Some("MANUAL_RECOVERY_REQUIRED")
+    );
+    assert_eq!(
+        collaboration.step.hold_reason_code.as_deref(),
+        Some("MANUAL_RECOVERY_REQUIRED")
+    );
+    assert_eq!(
+        collaboration.attempt.hold_reason_code.as_deref(),
+        Some("MANUAL_RECOVERY_REQUIRED")
+    );
+
+    let stable_counts = (
+        witness.ledger_count("send_dispatch"),
+        witness.ledger_count("next_event"),
+        witness.ledger_count("reconcile"),
+        witness.ledger_count("ack_emitted"),
+    );
+    sleep(Duration::from_millis(175)).await;
+    assert_eq!(
+        (
+            witness.ledger_count("send_dispatch"),
+            witness.ledger_count("next_event"),
+            witness.ledger_count("reconcile"),
+            witness.ledger_count("ack_emitted"),
+        ),
+        stable_counts,
+        "Held ManualOnly recovery must not resend, poll, reconcile again, or emit the native ACK"
+    );
+
+    drop(restarted.stdin.take());
+    let status = restarted
+        .wait()
+        .await
+        .expect("wait for R-8B.2c Unknown recovery child");
+    assert!(status.success(), "R-8B.2c recovery child failed: {status}");
+    let owner_oracle = read_r8b2c_task_oracle(&root, &task_id);
+    assert_eq!(owner_oracle.snapshot.task_id, task_id);
+    assert_eq!(owner_oracle.snapshot.status, TaskStatus::Interrupted as i32);
+    assert_eq!(
+        owner_oracle.snapshot.current_run_id.as_deref(),
+        Some(R8A_ACTIVATION_RUN_ID)
+    );
+    fs::remove_dir_all(&root).expect("remove R-8B.2c begin-delivery fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
+    let root = std::env::temp_dir().join(format!("egopulse-r8b2c-delivered-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create R-8B.2c delivered fixture root");
+    let instance = format!("r8b2c-delivered-{}", Uuid::now_v7());
+    let mut child =
+        spawn_fixture_with_mode(&root, &instance, R8B2C_DELIVERED_BEFORE_POLL_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut child).await;
+    let task_id = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-delivered").await;
+
+    wait_for_r8b2c_checkpoint(
+        &root,
+        &instance,
+        "r8a-dispatch",
+        R8B2C_DELIVERED_BEFORE_POLL_PHASE,
+        &mut child,
+    )
+    .await;
+    let active =
+        wait_for_r8b2c_task_status(&instance, &task_id, TaskStatus::Active, &mut child).await;
+    assert_eq!(active["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID);
+
+    let witness = R8b2cWitnessOracle::open_existing(&root, &instance);
+    assert_eq!(witness.ledger_count("send_dispatch"), 1);
+    assert_eq!(witness.ledger_count("next_event"), 0);
+    assert_eq!(witness.ledger_count("reconcile"), 0);
+    assert_eq!(witness.ledger_count("ack_emitted"), 0);
+    assert_eq!(
+        witness.native_event_state("r8a-dispatch"),
+        Some(("pending".to_owned(), 0))
+    );
+
+    let adapter = read_r8b2c_adapter_oracle(&root);
+    assert_eq!(adapter.dispatch_count, 1);
+    assert_eq!(adapter.delivery_unknown_count, 0);
+    assert_eq!(adapter.observation_count, 0);
+    assert_eq!(adapter.pending_observation_count, 0);
+    assert_eq!(adapter.dispatch_state, "delivered");
+    let receipt_before_kill = adapter
+        .receipt
+        .clone()
+        .expect("Delivered receipt must exist before checkpoint");
+    assert_eq!(
+        DeliveryDisposition::try_from(receipt_before_kill.disposition),
+        Ok(DeliveryDisposition::Delivered)
+    );
+    let collaboration = read_r8b2c_collaboration_oracle(&root);
+    assert_eq!(collaboration.outbox_state, "delivered");
+    assert_eq!(collaboration.run.status, RunStatus::Active as i32);
+    assert_eq!(collaboration.step.status, StepStatus::Active as i32);
+    assert_eq!(
+        collaboration.attempt.status,
+        AttemptStatus::Dispatched as i32
+    );
+
+    hard_kill_r8b2c_child(&mut child, R8B2C_DELIVERED_BEFORE_POLL_PHASE).await;
+
+    let mut restarted = spawn_fixture_with_mode(&root, &instance, R8B2C_ACK_RECOVERY_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut restarted).await;
+    wait_for_r8b2c_checkpoint(
+        &root,
+        &instance,
+        "r8a-dispatch",
+        R8B2C_ACK_REHYDRATED_PHASE,
+        &mut restarted,
+    )
+    .await;
+
+    assert_eq!(witness.ledger_count("send_dispatch"), 1);
+    assert_eq!(witness.ledger_count("reconcile"), 0);
+    assert_eq!(witness.ledger_count("ack_emitted"), 1);
+    assert!(witness.ledger_count("next_event") >= 1);
+    assert_eq!(
+        witness.native_event_state("r8a-dispatch"),
+        Some(("emitted".to_owned(), 1))
+    );
+
+    let adapter = read_r8b2c_adapter_oracle(&root);
+    assert_eq!(adapter.dispatch_count, 1);
+    assert_eq!(adapter.delivery_unknown_count, 0);
+    assert_eq!(adapter.observation_count, 1);
+    assert_eq!(adapter.pending_observation_count, 0);
+    assert_eq!(adapter.dispatch_state, "delivered");
+    let receipt_after_restart = adapter
+        .receipt
+        .clone()
+        .expect("Delivered receipt remains durable");
+    assert_eq!(
+        DeliveryDisposition::try_from(receipt_after_restart.disposition),
+        Ok(DeliveryDisposition::Delivered)
+    );
+    assert_eq!(receipt_after_restart, receipt_before_kill);
+    assert_eq!(
+        receipt_after_restart.encode_to_vec(),
+        receipt_before_kill.encode_to_vec(),
+        "restart must preserve the exact protobuf bytes of the original Delivered receipt"
+    );
+
+    let observation = adapter
+        .observations
+        .iter()
+        .find(|observation| observation.native_key == "fake-ack")
+        .expect("original FakeCodexDriver ACK row must remain durable");
+    let observation_id = &observation.observation_id;
+    assert_eq!(observation.dispatch_id, "r8a-dispatch");
+    assert_eq!(observation.ingestion_state, "consumed");
+    assert_eq!(observation.observation.observation_id, *observation_id);
+    assert_eq!(observation.observation.dispatch_id, observation.dispatch_id);
+    assert!(matches!(
+        observation.observation.payload,
+        Some(harness_observation::Payload::Ack(ref ack))
+            if ack.ack_receipt_id == "fake-ack-r8a-dispatch"
+    ));
+    assert_eq!(observation.raw_event, b"fake-ack");
+    assert_eq!(
+        observation.native_event_digest_sha256,
+        format!("{:x}", Sha256::digest(observation.raw_event.as_slice()))
+    );
+    assert!(!observation.raw_evidence_ref.trim().is_empty());
+
+    let collaboration = read_r8b2c_collaboration_oracle(&root);
+    assert_eq!(collaboration.outbox_state, "delivered");
+    assert_eq!(collaboration.run.status, RunStatus::Active as i32);
+    assert_eq!(collaboration.step.status, StepStatus::Active as i32);
+    assert_eq!(
+        collaboration.attempt.status,
+        AttemptStatus::Acknowledged as i32
+    );
+    assert_eq!(collaboration.attempt.last_harness_sequence, 1);
+    let task_before_stable = read_r8b2c_task_oracle(&root, &task_id);
+    assert_eq!(
+        task_before_stable.snapshot.status,
+        TaskStatus::Active as i32
+    );
+    assert_eq!(
+        task_before_stable.snapshot.current_run_id,
+        Some(R8A_ACTIVATION_RUN_ID.to_string())
+    );
+    let stable_counts = (
+        witness.ledger_count("send_dispatch"),
+        witness.ledger_count("reconcile"),
+        witness.ledger_count("ack_emitted"),
+    );
+    sleep(Duration::from_millis(175)).await;
+    let adapter_after_stable = read_r8b2c_adapter_oracle(&root);
+    let collaboration_after_stable = read_r8b2c_collaboration_oracle(&root);
+    let task_after_stable = read_r8b2c_task_oracle(&root, &task_id);
+    assert_eq!(adapter_after_stable, adapter);
+    assert_eq!(collaboration_after_stable, collaboration);
+    assert_eq!(task_after_stable, task_before_stable);
+    assert_eq!(
+        (
+            witness.ledger_count("send_dispatch"),
+            witness.ledger_count("reconcile"),
+            witness.ledger_count("ack_emitted"),
+        ),
+        stable_counts,
+        "Delivered recovery stable window must not resend, reconcile, or emit another ACK"
+    );
+    let active =
+        wait_for_r8b2c_task_status(&instance, &task_id, TaskStatus::Active, &mut restarted).await;
+    assert_eq!(active["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID);
+
+    drop(restarted.stdin.take());
+    let status = restarted
+        .wait()
+        .await
+        .expect("wait for R-8B.2c ACK recovery child");
+    assert!(
+        status.success(),
+        "R-8B.2c ACK recovery child failed: {status}"
+    );
+    fs::remove_dir_all(&root).expect("remove R-8B.2c delivered fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

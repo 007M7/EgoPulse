@@ -37,6 +37,7 @@ uuid.workspace = true
 [dev-dependencies]
 egopulse-client-operations.workspace = true
 egopulse-dsh-adapter.workspace = true
+egopulse-v01-fault-conformance = { path = "../../contracts/toolchain/fault-conformance" }
 
 [[bin]]
 name = "agentosd"

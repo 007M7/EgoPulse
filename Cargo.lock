@@ -1058,6 +1058,7 @@ dependencies = [
  "egopulse-local-read-model",
  "egopulse-policy-decision-authority",
  "egopulse-process-supervision",
+ "egopulse-v01-fault-conformance",
  "egopulse-verification-authority",
  "hex",
  "hyper-util",
@@ -1406,6 +1407,15 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "egopulse-v01-fault-conformance"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rusqlite",
+ "sha2",
 ]
 
 [[package]]

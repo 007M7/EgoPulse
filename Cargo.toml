@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["contracts/toolchain/fault-conformance"]
 members = [
   "apps/agentosd",
   "apps/cli",

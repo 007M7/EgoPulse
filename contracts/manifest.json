@@ -1027,15 +1027,19 @@
     },
     {
       "path": "toolchain/fault-conformance/Cargo.toml",
-      "sha256": "65d535ea0a69daae9384e2f6f9f8b17414947fa973e1f7ba122e8022d4fb864c"
+      "sha256": "dd0d6983ef92ff6feb7d198c0914872233c2c9d504229cd1cc72a06c2c8e1cbd"
     },
     {
       "path": "toolchain/fault-conformance/src/lib.rs",
-      "sha256": "be00ff589d2380aac3948f1d52ed16ec0f3234ebf388432d9462ddee12ca4899"
+      "sha256": "0977c9a24cfa4e48e85455e74951aeeb08087d6eeff83d2fbc471e08864e4bfd"
     },
     {
       "path": "toolchain/fault-conformance/src/main.rs",
       "sha256": "aa1300d58b1d574f17a38effd6502fcd860ca5c41450477643813534da690e69"
+    },
+    {
+      "path": "toolchain/fault-conformance/src/r8b2c.rs",
+      "sha256": "cc12b3f9f4248e81c577603fc8a222f165ebfea7dc102d206aab28d7fd9f1ceb"
     },
     {
       "path": "toolchain/fault-conformance/tests/crash_recovery.rs",

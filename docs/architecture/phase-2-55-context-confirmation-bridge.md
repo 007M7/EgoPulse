@@ -335,9 +335,40 @@ The local production-component evidence covers Unknown receipt creation from a
 `begin_delivery` record with no receipt, zero resend and zero observation pump,
 single native reconciliation with durable replay, conservative Task settlement,
 Rejected replay without resend/pump, and fail-closed Adapter-ID, fencing-token
-and Task-lineage tamper cases. This is not yet the complete R-8B.2 claim.
-R-8B.2c must still prove the same invariants with a real Windows daemon hard kill
-and same-root/same-instance restart, and must separately rebuild polling for a
-dispatch that already has a durable Delivered receipt. Canonical outbox-payload
-and receipt-digest recomputation remain integrity hardening beyond the current
-controlled Adapter/Collaboration store trust boundary.
+and Task-lineage tamper cases. R-8B.2c below adds process-termination evidence for
+the two frozen recovery windows; it does not turn those component guarantees into
+a claim of complete product crash recovery.
+
+## R-8B.2c Windows hard-kill recovery checkpoint (2026-08-30)
+
+R-8B.2c proves two real Windows child-daemon termination windows. In both cases
+the parent waits for a durable checkpoint, verifies that the child is still
+alive, calls `Child::kill`, requires a non-success exit, and restarts the same
+instance against the same root and durable stores. A separate synchronous SQLite
+witness records the native-driver call and the original native acknowledgement;
+all parent-side Adapter, Collaboration and Task assertions use test-only
+white-box, read-only durable-store conformance oracles. No production read API is
+added.
+
+Window A kills after Adapter has committed `begin_delivery` and the fake native
+send has produced its acknowledgement, but before the driver future can return a
+receipt. Restart performs zero resend and zero observation polling, reconciles
+exactly once to `OutcomeUnknown`, and leaves the Run, Step, Attempt and dispatch
+outbox `Held` with `ManualOnly`. Task recovery records `Interrupted`; no Harness
+fact completes the Task.
+
+Window B kills after the Adapter `Delivered` receipt and the live Collaboration
+candidate are durable, but before the first production observation poll. Restart
+revalidates both proofs, performs zero resend and zero reconciliation, rehydrates
+only the original non-terminal acknowledgement, persists and consumes it, moves
+the Attempt to `Acknowledged`, preserves the byte-identical receipt, and leaves
+the Task `Active`. A multi-cycle stability window verifies that Adapter,
+Collaboration and Task snapshots and event counts do not change again.
+
+The native boundary is still `FakeCodexDriver`; the witness proves deterministic
+external-side-effect and replay behavior, not a real Provider. This checkpoint
+does not cover a second crash after Adapter append but before Collaboration
+ingest, terminal observations, Artifact return, or R-9 resumable streaming and
+formal Context revoke. It changes neither Proto nor the production schema.
+Canonical outbox-payload and receipt-digest recomputation remain separate
+integrity hardening beyond the current controlled store trust boundary.
