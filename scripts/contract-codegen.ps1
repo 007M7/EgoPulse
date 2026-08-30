@@ -17,7 +17,7 @@ $typescriptDestination = Join-Path $repositoryRoot 'packages\generated-client\sr
 $rustDestination = Join-Path $repositoryRoot 'crates\domain-contracts\src\generated'
 $pythonDestination = Join-Path $repositoryRoot 'workers\contract-bindings\src'
 $generatedManifestPath = Join-Path $repositoryRoot 'generated\contract-bindings-manifest.json'
-$expectedContractManifestSha256 = '099f0fed3d132d190d961b0598297a7fbc69e60a0c19e9f8a9c10cc6bc6f285b'
+$expectedContractManifestSha256 = 'c1e497f37d4385002bc151299c04a04821173dcc62b48568def4a573fe9d5d19'
 $cargoCommand = Get-Command 'cargo' -ErrorAction SilentlyContinue
 $cargoExecutable = if ($null -ne $cargoCommand) {
     $cargoCommand.Source

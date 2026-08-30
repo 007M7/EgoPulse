@@ -10,7 +10,11 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::{Command as StdCommand, Stdio},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -52,8 +56,8 @@ use egopulse_domain_contracts::v01::egopulse::{
     harness::v1::{
         ApprovalDecisionEnvelope, ApprovalKind, ApprovalRequestLifecycleKind,
         ApprovalRequestObservation, CancelExecutionEnvelope, DeliveryDisposition, DispatchEnvelope,
-        HarnessObservation, NativeSessionStrategy, ObservationCriticality, ProbeHarnessRequest,
-        ProbeHarnessResult, harness_observation,
+        HarnessErrorCode, HarnessObservation, NativeSessionStrategy, ObservationCriticality,
+        ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
     },
     localapi::v1::{
         ClientSurface, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
@@ -77,9 +81,9 @@ use egopulse_founder_verdict_authority::{
     VerdictReferenceRejection, VerdictSqlCipherKey,
 };
 use egopulse_harness_adapter::{
-    AdapterEdge, AdapterEdgeConfig, AdapterEdgeKey, DriverDelivery, DriverError, DriverEvent,
-    NativeHarnessDriver, NativeHarnessFuture, ReconciliationContext, ReconciliationFinding,
-    ResolvedDispatchMaterial,
+    AdapterEdge, AdapterEdgeConfig, AdapterEdgeKey, DriverDelivery, DriverError,
+    DriverErrorCertainty, DriverEvent, NativeHarnessDriver, NativeHarnessFuture,
+    ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
 };
 use egopulse_local_api::session::{
     NoopSessionAuditSink, PrincipalGrant, PrincipalResolutionFailure, TrustedPrincipalResolver,
@@ -110,6 +114,9 @@ use egopulse_v01_fault_conformance::r9a3::{
     write_send_ack_frame as write_r9a3_send_ack_frame,
     write_send_request_frame as write_r9a3_send_request_frame,
 };
+use egopulse_v01_fault_conformance::r9a3_context::{
+    R9a3ContextGovernanceState, read_r9a3_context_authority_store,
+};
 use egopulse_verification_authority::{
     VerificationAuthority, VerificationAuthorityConfig, VerificationSqlCipherKey,
 };
@@ -130,6 +137,8 @@ const R8B2C_BEGIN_DELIVERY_MODE: &str = "dynamic-r8b2c-begin-delivery";
 const R8B2C_UNKNOWN_RECOVERY_MODE: &str = "dynamic-r8b2c-unknown-recovery";
 const R8B2C_DELIVERED_BEFORE_POLL_MODE: &str = "dynamic-r8b2c-delivered-before-poll";
 const R8B2C_ACK_RECOVERY_MODE: &str = "dynamic-r8b2c-ack-recovery";
+const R9A3D_EXTERNAL_SEND_MODE: &str = "dynamic-r9a3d-external-send";
+const R9A3D_EXTERNAL_RECOVERY_MODE: &str = "dynamic-r9a3d-external-recovery";
 const R8A_ACTIVATION_RUN_ID: &str = "r8a-activation-run";
 const R8A_DRIVER_RECORD: &str = "r8a-driver-record.json";
 const R8B_FIRST_RUNNER_CYCLE_RECORD: &str = "r8b-first-runner-cycle-complete";
@@ -147,6 +156,18 @@ const R9A3_WITNESS_READY_FILE: &str = "r9a3-witness-ready.json";
 const R9A3_WITNESS_CHECKPOINT_FILE: &str = "r9a3-effect-committed.json";
 const R9A3_WITNESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const R9A3_WITNESS_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const R9A3D_WITNESS_ROOT_ENV: &str = "EGOPULSE_C5_R9A3D_WITNESS_ROOT";
+const R9A3D_WITNESS_INSTANCE_ENV: &str = "EGOPULSE_C5_R9A3D_WITNESS_INSTANCE";
+const R9A3D_SEND_ENDPOINT_ENV: &str = "EGOPULSE_C5_R9A3D_SEND_ENDPOINT";
+const R9A3D_READY_FILE: &str = "r9a3d-witness-ready.json";
+const R9A3D_COMMITTED_FILE: &str = "r9a3d-effect-committed-before-ack.json";
+const R9A3D_DISCONNECTED_FILE: &str = "r9a3d-first-sender-disconnected.json";
+const R9A3D_FORBIDDEN_CONNECTION_FILE: &str = "r9a3d-forbidden-second-connection.json";
+const R9A3D_FORBIDDEN_SEND_FILE: &str = "r9a3d-forbidden-second-send-request.json";
+const R9A3D_RECOVERY_CHECKPOINT_FILE: &str = "r9a3d-recovery-settled.json";
+const R9A3D_STABLE_CHECKPOINT_FILE: &str = "r9a3d-stable-cycle.json";
+const R9A3D_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const R9A3D_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct R9a3WitnessReady {
@@ -160,6 +181,73 @@ struct R9a3WitnessCheckpoint {
     process_id: u32,
     instance: String,
     dispatch_id: String,
+    phase: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct R9a3dWitnessReady {
+    process_id: u32,
+    fixture_root: String,
+    fixture_instance: String,
+    send_endpoint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct R9a3dRequestEvidence {
+    process_id: u32,
+    fixture_instance: String,
+    phase: String,
+    operation_id: String,
+    dispatch_id: String,
+    attempt_id: String,
+    fencing_token: u64,
+    request_digest_sha256: String,
+    payload_digest_sha256: String,
+    send_count: u64,
+}
+
+impl R9a3dRequestEvidence {
+    fn new(instance: &str, phase: &str, request: &R9a3SendRequest, send_count: u64) -> Self {
+        Self {
+            process_id: std::process::id(),
+            fixture_instance: instance.to_owned(),
+            phase: phase.to_owned(),
+            operation_id: request.operation_id.clone(),
+            dispatch_id: request.dispatch_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            fencing_token: request.fencing_token,
+            request_digest_sha256: request.request_digest_sha256.clone(),
+            payload_digest_sha256: request.payload_digest_sha256.clone(),
+            send_count,
+        }
+    }
+
+    fn assert_request(&self, request: &R9a3SendRequest) {
+        assert_eq!(self.operation_id, request.operation_id);
+        assert_eq!(self.dispatch_id, request.dispatch_id);
+        assert_eq!(self.attempt_id, request.attempt_id);
+        assert_eq!(self.fencing_token, request.fencing_token);
+        assert_eq!(self.request_digest_sha256, request.request_digest_sha256);
+        assert_eq!(self.payload_digest_sha256, request.payload_digest_sha256);
+    }
+
+    fn request(&self) -> R9a3SendRequest {
+        R9a3SendRequest {
+            protocol_version: R9A3_PROTOCOL_VERSION,
+            operation_id: self.operation_id.clone(),
+            dispatch_id: self.dispatch_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            fencing_token: self.fencing_token,
+            request_digest_sha256: self.request_digest_sha256.clone(),
+            payload_digest_sha256: self.payload_digest_sha256.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct R9a3dForbiddenConnection {
+    process_id: u32,
+    fixture_instance: String,
     phase: String,
 }
 
@@ -484,6 +572,365 @@ fn r9a3_external_side_effect_witness_is_durable_before_withheld_ack() {
     assert_eq!(reopened_effect.request, request);
     assert_eq!(reopened_effect.original_ack(), original_ack);
     assert!(!reopened_effect.original_ack().replayed);
+}
+
+fn r9a3d_path(root: &Path, file_name: &str) -> PathBuf {
+    root.join(file_name)
+}
+
+fn accept_r9a3d_connection(listener: &TcpListener, label: &str) -> TcpStream {
+    let deadline = Instant::now() + R9A3D_PHASE_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("accept R-9A.3d {label}: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "R-9A.3d {label} connection was not received before deadline"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn configure_r9a3d_stream(stream: &TcpStream, label: &str) {
+    stream
+        .set_read_timeout(Some(R9A3D_IO_TIMEOUT))
+        .unwrap_or_else(|error| panic!("set R-9A.3d {label} read timeout: {error}"));
+    stream
+        .set_write_timeout(Some(R9A3D_IO_TIMEOUT))
+        .unwrap_or_else(|error| panic!("set R-9A.3d {label} write timeout: {error}"));
+}
+
+fn wait_for_r9a3d_sender_disconnect(stream: &mut TcpStream) {
+    stream
+        .set_nonblocking(true)
+        .expect("make R-9A.3d first sender nonblocking");
+    let deadline = Instant::now() + R9A3D_PHASE_TIMEOUT;
+    let mut trailing = [0_u8; 1];
+    loop {
+        match stream.read(&mut trailing) {
+            Ok(0) => return,
+            Ok(_) => panic!("R-9A.3d first sender wrote trailing bytes after its request"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => return,
+            Err(error) => panic!("observe R-9A.3d first sender disconnect: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "R-9A.3d first sender did not disconnect before deadline"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn publish_r9a3d_request(
+    root: &Path,
+    file_name: &str,
+    instance: &str,
+    phase: &str,
+    request: &R9a3SendRequest,
+    send_count: u64,
+) {
+    publish_r9a3_json_atomically(
+        &r9a3d_path(root, file_name),
+        &R9a3dRequestEvidence::new(instance, phase, request, send_count),
+        phase,
+    );
+}
+
+#[test]
+fn r9a3d_external_side_effect_witness_helper_child() {
+    let Some(root) = std::env::var_os(R9A3D_WITNESS_ROOT_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let instance = std::env::var(R9A3D_WITNESS_INSTANCE_ENV).expect("R-9A.3d witness instance");
+    let send_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind R-9A.3d send listener");
+    send_listener
+        .set_nonblocking(true)
+        .expect("make R-9A.3d send listener nonblocking");
+    let writer = R9a3SideEffectWriter::initialize(&root, &instance)
+        .expect("initialize R-9A.3d external effect writer");
+    let ready = R9a3dWitnessReady {
+        process_id: std::process::id(),
+        fixture_root: root.display().to_string(),
+        fixture_instance: instance.clone(),
+        send_endpoint: send_listener
+            .local_addr()
+            .expect("R-9A.3d send endpoint")
+            .to_string(),
+    };
+    publish_r9a3_json_atomically(
+        &r9a3d_path(&root, R9A3D_READY_FILE),
+        &ready,
+        "R-9A.3d witness ready",
+    );
+
+    let mut first = accept_r9a3d_connection(&send_listener, "first send");
+    configure_r9a3d_stream(&first, "first send");
+    let first_request =
+        read_r9a3_send_request_frame(&mut first).expect("read R-9A.3d first send request");
+    let _original_ack = writer
+        .commit_effect(&first_request)
+        .expect("commit R-9A.3d external effect before ACK");
+    let send_count = 1_u64;
+    publish_r9a3d_request(
+        &root,
+        R9A3D_COMMITTED_FILE,
+        &instance,
+        "effect-committed-before-ack",
+        &first_request,
+        send_count,
+    );
+    wait_for_r9a3d_sender_disconnect(&mut first);
+    publish_r9a3d_request(
+        &root,
+        R9A3D_DISCONNECTED_FILE,
+        &instance,
+        "first-sender-disconnected-without-ack",
+        &first_request,
+        send_count,
+    );
+
+    let deadline = Instant::now() + R9A3D_PHASE_TIMEOUT;
+    loop {
+        match send_listener.accept() {
+            Ok((mut stream, _)) => {
+                if !r9a3d_path(&root, R9A3D_FORBIDDEN_CONNECTION_FILE).exists() {
+                    publish_r9a3_json_atomically(
+                        &r9a3d_path(&root, R9A3D_FORBIDDEN_CONNECTION_FILE),
+                        &R9a3dForbiddenConnection {
+                            process_id: std::process::id(),
+                            fixture_instance: instance.clone(),
+                            phase: "forbidden-second-connection".to_owned(),
+                        },
+                        "R-9A.3d forbidden second connection",
+                    );
+                }
+                configure_r9a3d_stream(&stream, "forbidden second send");
+                if let Ok(request) = read_r9a3_send_request_frame(&mut stream)
+                    && !r9a3d_path(&root, R9A3D_FORBIDDEN_SEND_FILE).exists()
+                {
+                    publish_r9a3d_request(
+                        &root,
+                        R9A3D_FORBIDDEN_SEND_FILE,
+                        &instance,
+                        "forbidden-second-send-request",
+                        &request,
+                        send_count + 1,
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("monitor R-9A.3d second send: {error}"),
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "R-9A.3d witness monitoring deadline elapsed before parent cleanup"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn spawn_r9a3d_witness_helper(root: &Path, instance: &str) -> R9a3WitnessProcess {
+    let executable = std::env::current_exe().expect("R-9A.3d test executable path");
+    let child = StdCommand::new(executable)
+        .args([
+            "--exact",
+            "r9a3d_external_side_effect_witness_helper_child",
+            "--nocapture",
+        ])
+        .env(R9A3D_WITNESS_ROOT_ENV, root)
+        .env(R9A3D_WITNESS_INSTANCE_ENV, instance)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn independent R-9A.3d witness helper");
+    R9a3WitnessProcess { child }
+}
+
+fn r9a3d_request(
+    envelope: &DispatchEnvelope,
+    material: &ResolvedDispatchMaterial,
+) -> R9a3SendRequest {
+    R9a3SendRequest {
+        protocol_version: R9A3_PROTOCOL_VERSION,
+        operation_id: format!("operation-r9a3d-{}", envelope.dispatch_id),
+        dispatch_id: envelope.dispatch_id.clone(),
+        attempt_id: envelope.attempt_id.clone(),
+        fencing_token: envelope.fencing_token,
+        request_digest_sha256: format!("{:x}", Sha256::digest(envelope.encode_to_vec())),
+        payload_digest_sha256: format!(
+            "{:x}",
+            Sha256::digest(material.canonical_input_bundle.as_slice())
+        ),
+    }
+}
+
+fn r9a3d_driver_error(detail: &str, error: impl std::fmt::Display) -> DriverError {
+    DriverError {
+        certainty: DriverErrorCertainty::DeliveryUnknown,
+        code: HarnessErrorCode::DependencyUnavailable,
+        safe_detail_code: detail.to_owned(),
+        error_fingerprint: None,
+        raw_evidence: format!("{detail}:{error}").into_bytes(),
+    }
+}
+
+struct R9a3dFixtureDriver {
+    probe_driver: FakeCodexDriver,
+    send_endpoint: SocketAddr,
+    witness_root: PathBuf,
+    witness_instance: String,
+}
+
+impl R9a3dFixtureDriver {
+    fn from_environment() -> Self {
+        Self {
+            probe_driver: FakeCodexDriver::default(),
+            send_endpoint: std::env::var(R9A3D_SEND_ENDPOINT_ENV)
+                .expect("R-9A.3d daemon send endpoint")
+                .parse()
+                .expect("parse R-9A.3d daemon send endpoint"),
+            witness_root: std::env::var_os(R9A3D_WITNESS_ROOT_ENV)
+                .map(PathBuf::from)
+                .expect("R-9A.3d daemon witness root"),
+            witness_instance: std::env::var(R9A3D_WITNESS_INSTANCE_ENV)
+                .expect("R-9A.3d daemon witness instance"),
+        }
+    }
+
+    fn exchange(
+        endpoint: SocketAddr,
+        request: &R9a3SendRequest,
+        detail: &str,
+    ) -> Result<R9a3SendAck, DriverError> {
+        let mut stream = TcpStream::connect_timeout(&endpoint, R9A3D_IO_TIMEOUT)
+            .map_err(|error| r9a3d_driver_error(detail, error))?;
+        configure_r9a3d_stream(&stream, detail);
+        write_r9a3_send_request_frame(&mut stream, request)
+            .map_err(|error| r9a3d_driver_error(detail, error))?;
+        stream
+            .flush()
+            .map_err(|error| r9a3d_driver_error(detail, error))?;
+        stream
+            .set_read_timeout(Some(R9A3D_PHASE_TIMEOUT))
+            .map_err(|error| r9a3d_driver_error(detail, error))?;
+        read_r9a3_send_ack_frame(&mut stream).map_err(|error| r9a3d_driver_error(detail, error))
+    }
+
+    fn require_ack(
+        request: &R9a3SendRequest,
+        ack: &R9a3SendAck,
+        replayed: bool,
+    ) -> Result<(), DriverError> {
+        let valid = ack.protocol_version == request.protocol_version
+            && ack.operation_id == request.operation_id
+            && ack.dispatch_id == request.dispatch_id
+            && ack.attempt_id == request.attempt_id
+            && ack.fencing_token == request.fencing_token
+            && ack.request_digest_sha256 == request.request_digest_sha256
+            && ack.payload_digest_sha256 == request.payload_digest_sha256
+            && ack.replayed == replayed;
+        if valid {
+            Ok(())
+        } else {
+            Err(r9a3d_driver_error(
+                "R9A3D_ACK_BINDING_INVALID",
+                "witness ACK drifted",
+            ))
+        }
+    }
+}
+
+impl NativeHarnessDriver for R9a3dFixtureDriver {
+    fn probe<'a>(
+        &'a mut self,
+        request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        self.probe_driver.probe(request)
+    }
+
+    fn send_dispatch<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+        material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        Box::pin(async move {
+            let request = r9a3d_request(envelope, material);
+            let ack = Self::exchange(self.send_endpoint, &request, "R9A3D_SEND_FAILED")?;
+            Self::require_ack(&request, &ack, false)?;
+            Ok(DriverDelivery {
+                native_request_ref: format!("r9a3d-request:{}", ack.effect_id),
+                native_session_ref: "r9a3d-session".to_owned(),
+                native_execution_ref: Some(format!("r9a3d-effect:{}", ack.effect_id)),
+                raw_evidence: ack.effect_id.into_bytes(),
+            })
+        })
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        _envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn decide_approval<'a>(
+        &'a mut self,
+        _envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async move {
+            Err(r9a3d_driver_error(
+                "R9A3D_APPROVAL_FORBIDDEN",
+                "approval is outside this fixture",
+            ))
+        })
+    }
+
+    fn cancel<'a>(
+        &'a mut self,
+        _envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async move {
+            Err(r9a3d_driver_error(
+                "R9A3D_CANCEL_FORBIDDEN",
+                "cancellation is outside this fixture",
+            ))
+        })
+    }
+
+    fn reconcile<'a>(
+        &'a mut self,
+        context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        Box::pin(async move {
+            let request = r9a3d_request(&context.envelope, &context.material);
+            let reader =
+                R9a3SideEffectReader::open_existing(&self.witness_root, &self.witness_instance)
+                    .map_err(|error| r9a3d_driver_error("R9A3D_RECOVERY_OPEN_FAILED", error))?;
+            let effect = reader
+                .effect_for_dispatch(&request.dispatch_id)
+                .map_err(|error| r9a3d_driver_error("R9A3D_RECOVERY_READ_FAILED", error))?
+                .ok_or_else(|| {
+                    r9a3d_driver_error("R9A3D_RECOVERY_EFFECT_MISSING", "effect missing")
+                })?;
+            if effect.request != request {
+                return Err(r9a3d_driver_error(
+                    "R9A3D_RECOVERY_REQUEST_DRIFT",
+                    "stored effect request drifted",
+                ));
+            }
+            let ack = effect.original_ack();
+            Self::require_ack(&request, &ack, false)?;
+            Ok(ReconciliationFinding::OutcomeUnknown {
+                evidence_ref: format!("r9a3d-effect:{}", ack.effect_id),
+            })
+        })
+    }
 }
 
 struct FirstRunnerCycleMarker {
@@ -856,6 +1303,66 @@ impl HarnessDispatchRunner for R8b2cCheckpointRunner {
                     std::future::pending::<()>().await;
                     unreachable!("R-8B.2c runner checkpoint is permanently blocked");
                 }
+            }
+            Ok(report)
+        })
+    }
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct R9a3dRunnerCheckpoint {
+    process_id: u32,
+    fixture_root: String,
+    fixture_instance: String,
+    phase: String,
+}
+
+struct R9a3dRecoveryRunner {
+    inner: Arc<dyn HarnessDispatchRunner>,
+    root: PathBuf,
+    instance: String,
+    recovery_seen: AtomicBool,
+    stable_published: AtomicBool,
+}
+
+impl HarnessDispatchRunner for R9a3dRecoveryRunner {
+    fn run_once(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let report = self.inner.run_once().await?;
+            if !report.task_recovery_findings.is_empty()
+                && !self.recovery_seen.swap(true, Ordering::SeqCst)
+            {
+                publish_r9a3_json_atomically(
+                    &r9a3d_path(&self.root, R9A3D_RECOVERY_CHECKPOINT_FILE),
+                    &R9a3dRunnerCheckpoint {
+                        process_id: std::process::id(),
+                        fixture_root: self.root.display().to_string(),
+                        fixture_instance: self.instance.clone(),
+                        phase: "recovery-settled".to_owned(),
+                    },
+                    "R-9A.3d recovery checkpoint",
+                );
+            } else if self.recovery_seen.load(Ordering::SeqCst)
+                && !self.stable_published.swap(true, Ordering::SeqCst)
+            {
+                publish_r9a3_json_atomically(
+                    &r9a3d_path(&self.root, R9A3D_STABLE_CHECKPOINT_FILE),
+                    &R9a3dRunnerCheckpoint {
+                        process_id: std::process::id(),
+                        fixture_root: self.root.display().to_string(),
+                        fixture_instance: self.instance.clone(),
+                        phase: "stable-cycle".to_owned(),
+                    },
+                    "R-9A.3d stable checkpoint",
+                );
             }
             Ok(report)
         })
@@ -1336,6 +1843,8 @@ fn dynamic_fixture_mode() -> bool {
             | R8B2C_UNKNOWN_RECOVERY_MODE
             | R8B2C_DELIVERED_BEFORE_POLL_MODE
             | R8B2C_ACK_RECOVERY_MODE
+            | R9A3D_EXTERNAL_SEND_MODE
+            | R9A3D_EXTERNAL_RECOVERY_MODE
     )
 }
 
@@ -1346,6 +1855,13 @@ fn r8b2c_fixture_mode() -> bool {
             | R8B2C_UNKNOWN_RECOVERY_MODE
             | R8B2C_DELIVERED_BEFORE_POLL_MODE
             | R8B2C_ACK_RECOVERY_MODE
+    )
+}
+
+fn r9a3d_fixture_mode() -> bool {
+    matches!(
+        fixture_mode().as_str(),
+        R9A3D_EXTERNAL_SEND_MODE | R9A3D_EXTERNAL_RECOVERY_MODE
     )
 }
 
@@ -1547,6 +2063,8 @@ fn open_fixture_providers(root: &Path) -> DaemonProviders {
             | R8B2C_UNKNOWN_RECOVERY_MODE
             | R8B2C_DELIVERED_BEFORE_POLL_MODE
             | R8B2C_ACK_RECOVERY_MODE
+            | R9A3D_EXTERNAL_SEND_MODE
+            | R9A3D_EXTERNAL_RECOVERY_MODE
     ) {
         open_fixture_providers_with_guards(
             root,
@@ -1578,6 +2096,14 @@ where
     P: egopulse_policy_decision_authority::PolicyReferenceResolver,
     V: egopulse_founder_verdict_authority::VerdictReferenceResolver,
 {
+    let mut context = ContextAuthority::open(ContextAuthorityConfig {
+        database_path: root.join("context-authority.db"),
+        store_epoch: "c5-context-epoch".to_owned(),
+        key: SqlCipherKey::new([0x15; 32]),
+    })
+    .expect("fixture Context Authority should open");
+    issue_r9a2c_context_snapshot(&mut context, R9A2C_CLI_CONTEXT_BYTES, "r9a2c-cli-issue");
+    let context = Arc::new(Mutex::new(context));
     let task = TaskAuthority::open_with_transition_guard(
         TaskAuthorityConfig {
             database_path: root.join("task-authority.db"),
@@ -1585,7 +2111,7 @@ where
             key: SqlCipherKey::new([0x11; 32]),
         },
         task_guard,
-        ConfiguredTaskTransitionGuard::new(),
+        ConfiguredTaskTransitionGuard::new().with_context_authority(Arc::clone(&context)),
     )
     .expect("fixture task authority should open");
     let policy = PolicyDecisionAuthority::open(
@@ -1677,14 +2203,6 @@ where
         .with_memory_retrieval(Arc::clone(&memory), memory_worker_config())
         .expect("fixture Memory retrieval should configure")
         .with_memory_mutation(memory, Arc::new(FixtureAuthorityPrincipalResolver));
-    let mut context = ContextAuthority::open(ContextAuthorityConfig {
-        database_path: root.join("context-authority.db"),
-        store_epoch: "c5-context-epoch".to_owned(),
-        key: SqlCipherKey::new([0x15; 32]),
-    })
-    .expect("fixture Context Authority should open");
-    issue_r9a2c_context_snapshot(&mut context, R9A2C_CLI_CONTEXT_BYTES, "r9a2c-cli-issue");
-    let context = Arc::new(Mutex::new(context));
     let mut work_port = ConfiguredWorkPreparationPort::new(
         Arc::clone(&context),
         Arc::clone(&providers.task_port),
@@ -1738,6 +2256,15 @@ where
                 R8b2cFixtureDriver::new(root, &fixture_instance(), driver_mode),
             )
             .expect("R-8B.2c native Harness composition")
+    } else if r9a3d_fixture_mode() {
+        providers
+            .with_native_harness_driver(
+                native,
+                artifact,
+                verification,
+                R9a3dFixtureDriver::from_environment(),
+            )
+            .expect("R-9A.3d native Harness composition")
     } else {
         providers
             .with_native_harness_driver(
@@ -1775,6 +2302,19 @@ where
             root: root.to_owned(),
             instance: fixture_instance(),
             checkpoint,
+        }));
+    }
+    if mode == R9A3D_EXTERNAL_RECOVERY_MODE {
+        let runner = providers
+            .harness_dispatch_runner
+            .take()
+            .expect("R-9A.3d production Harness runner");
+        providers.harness_dispatch_runner = Some(Arc::new(R9a3dRecoveryRunner {
+            inner: runner,
+            root: root.to_owned(),
+            instance: fixture_instance(),
+            recovery_seen: AtomicBool::new(false),
+            stable_published: AtomicBool::new(false),
         }));
     }
     providers
@@ -1843,6 +2383,8 @@ async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Chi
                     | R8B2C_UNKNOWN_RECOVERY_MODE
                     | R8B2C_DELIVERED_BEFORE_POLL_MODE
                     | R8B2C_ACK_RECOVERY_MODE
+                    | R9A3D_EXTERNAL_SEND_MODE
+                    | R9A3D_EXTERNAL_RECOVERY_MODE
             ) {
                 Stdio::inherit()
             } else {
@@ -1851,6 +2393,30 @@ async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Chi
         )
         .kill_on_drop(true);
     command.spawn().expect("spawn C5 fixture child")
+}
+
+async fn spawn_r9a3d_fixture(
+    root: &Path,
+    instance: &str,
+    mode: &str,
+    witness_instance: &str,
+    send_endpoint: &str,
+) -> Child {
+    let executable = std::env::current_exe().expect("R-9A.3d daemon executable path");
+    let mut command = Command::new(executable);
+    command
+        .args(["--exact", "c5_00_daemon_fixture_child", "--nocapture"])
+        .env(FIXTURE_ROOT_ENV, root)
+        .env(FIXTURE_INSTANCE_ENV, instance)
+        .env(FIXTURE_MODE_ENV, mode)
+        .env(R9A3D_WITNESS_ROOT_ENV, root)
+        .env(R9A3D_WITNESS_INSTANCE_ENV, witness_instance)
+        .env(R9A3D_SEND_ENDPOINT_ENV, send_endpoint)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    command.spawn().expect("spawn R-9A.3d daemon child")
 }
 
 fn cli_executable() -> PathBuf {
@@ -1998,6 +2564,194 @@ async fn hard_kill_r8b2c_child(child: &mut Child, phase: &str) {
         !status.success(),
         "R-8B.2c child killed at {phase} must not report success: {status}"
     );
+}
+
+async fn run_r9a3d_cli(instance: &str, arguments: &[&str]) -> std::process::Output {
+    let mut command = Command::new(cli_executable());
+    command
+        .env("EGOPULSE_IPC_INSTANCE", instance)
+        .args(arguments)
+        .kill_on_drop(true);
+    tokio::time::timeout(R9A3D_IO_TIMEOUT, command.output())
+        .await
+        .expect("R-9A.3d CLI subprocess exceeded deadline")
+        .expect("run bounded R-9A.3d CLI subprocess")
+}
+
+async fn run_r9a3d_tui(instance: &str, arguments: &[&str]) -> std::process::Output {
+    let mut command = Command::new(tui_executable());
+    command
+        .env("EGOPULSE_IPC_INSTANCE", instance)
+        .args(arguments)
+        .kill_on_drop(true);
+    tokio::time::timeout(R9A3D_IO_TIMEOUT, command.output())
+        .await
+        .expect("R-9A.3d TUI subprocess exceeded deadline")
+        .expect("run bounded R-9A.3d TUI subprocess")
+}
+
+async fn wait_for_r9a3d_daemon(instance: &str, child: &mut Child) {
+    let deadline = Instant::now() + R9A3D_PHASE_TIMEOUT;
+    loop {
+        let output = run_r9a3d_cli(instance, &["status", "--json"]).await;
+        if output.status.success() {
+            return;
+        }
+        let last = format!(
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some(status) = child
+            .try_wait()
+            .expect("inspect R-9A.3d daemon while waiting for IPC")
+        {
+            panic!("R-9A.3d daemon exited before IPC readiness: {status}; {last}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "R-9A.3d daemon did not become ready before deadline: {last}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_r9a3d_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    witness: &mut R9a3WitnessProcess,
+    daemon: &mut Child,
+    label: &str,
+) -> T {
+    let deadline = Instant::now() + R9A3D_PHASE_TIMEOUT;
+    loop {
+        if let Ok(payload) = fs::read(path)
+            && let Ok(value) = serde_json::from_slice(&payload)
+        {
+            return value;
+        }
+        if let Some(status) = witness
+            .try_wait()
+            .unwrap_or_else(|error| panic!("inspect R-9A.3d witness for {label}: {error}"))
+        {
+            panic!("R-9A.3d witness exited before {label}: {status}");
+        }
+        if let Some(status) = daemon
+            .try_wait()
+            .unwrap_or_else(|error| panic!("inspect R-9A.3d daemon for {label}: {error}"))
+        {
+            panic!("R-9A.3d daemon exited before {label}: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "R-9A.3d {label} was not durable before deadline"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn bounded_reap_r9a3d_child(
+    child: &mut Child,
+    deadline: Instant,
+) -> std::process::ExitStatus {
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("inspect R-9A.3d daemon while reaping")
+        {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "R-9A.3d daemon was not reaped before deadline"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn hard_kill_r9a3d_child(child: &mut Child, phase: &str) -> std::process::ExitStatus {
+    assert!(
+        child
+            .try_wait()
+            .expect("inspect R-9A.3d daemon before hard kill")
+            .is_none(),
+        "R-9A.3d daemon must remain alive at {phase}"
+    );
+    child
+        .start_kill()
+        .unwrap_or_else(|error| panic!("hard-kill R-9A.3d daemon at {phase}: {error}"));
+    let status = bounded_reap_r9a3d_child(child, Instant::now() + R9A3_WITNESS_REAP_TIMEOUT).await;
+    assert!(
+        !status.success(),
+        "hard-killed R-9A.3d daemon at {phase} must not report success: {status}"
+    );
+    status
+}
+
+async fn shutdown_r9a3d_child(child: &mut Child) -> std::process::ExitStatus {
+    drop(child.stdin.take());
+    let graceful_deadline = Instant::now() + R9A3D_IO_TIMEOUT;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("inspect R-9A.3d daemon during graceful shutdown")
+        {
+            assert!(
+                status.success(),
+                "R-9A.3d daemon graceful shutdown failed: {status}"
+            );
+            return status;
+        }
+        if Instant::now() >= graceful_deadline {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    child
+        .start_kill()
+        .expect("kill R-9A.3d daemon after graceful shutdown deadline");
+    let status = bounded_reap_r9a3d_child(child, Instant::now() + R9A3_WITNESS_REAP_TIMEOUT).await;
+    assert!(
+        !status.success(),
+        "R-9A.3d daemon killed after graceful shutdown timeout must not report success: {status}"
+    );
+    status
+}
+
+async fn wait_for_r9a3d_task(
+    instance: &str,
+    task_id: &str,
+    expected: TaskStatus,
+    child: &mut Child,
+) -> serde_json::Value {
+    let deadline = Instant::now() + R9A3D_PHASE_TIMEOUT;
+    loop {
+        let output = run_r9a3d_cli(instance, &["task", "get", task_id, "--json"]).await;
+        let last = format!(
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if output.status.success()
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            && value["data"]["status"] == expected.as_str_name()
+        {
+            return value;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .expect("inspect R-9A.3d daemon while waiting for Task")
+        {
+            panic!("R-9A.3d daemon exited before Task {expected:?}: {status}; {last}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "R-9A.3d Task did not reach {expected:?} before deadline: {last}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn prepare_and_confirm_r8b2c_work(root: &Path, instance: &str, label: &str) -> String {
@@ -3305,6 +4059,567 @@ async fn r8b_activation_outbox_survives_daemon_kill_and_dispatches_once_after_re
     ));
     drop(adapter);
     fs::remove_dir_all(&root).expect("remove R-8B.1 fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
+    const SOURCE_TEXT: &str = "R-9A.3d authorized Context survives revoke and crash recovery.";
+
+    let root = R9a3WitnessTempRoot::new();
+    fs::write(root.path().join("context.md"), SOURCE_TEXT)
+        .expect("write R-9A.3d governed Context source");
+    let instance = format!("r9a3d-daemon-{}", Uuid::now_v7());
+    let witness_instance = format!("r9a3d-witness-{}", Uuid::now_v7());
+    let parent_pid = std::process::id();
+    let mut witness = spawn_r9a3d_witness_helper(root.path(), &witness_instance);
+    let ready: R9a3dWitnessReady = wait_for_r9a3_json(
+        &r9a3d_path(root.path(), R9A3D_READY_FILE),
+        &mut witness,
+        "R-9A.3d witness ready",
+    );
+    assert_eq!(ready.process_id, witness.id());
+    assert_ne!(ready.process_id, parent_pid);
+    assert_eq!(ready.fixture_root, root.path().display().to_string());
+    assert_eq!(ready.fixture_instance, witness_instance);
+    let send_endpoint: SocketAddr = ready
+        .send_endpoint
+        .parse()
+        .expect("parse R-9A.3d send endpoint");
+    assert_eq!(send_endpoint.ip().to_string(), "127.0.0.1");
+    assert_ne!(send_endpoint.port(), 0);
+
+    let mut daemon_one = spawn_r9a3d_fixture(
+        root.path(),
+        &instance,
+        R9A3D_EXTERNAL_SEND_MODE,
+        &witness_instance,
+        &ready.send_endpoint,
+    )
+    .await;
+    let daemon_one_pid = daemon_one.id().expect("R-9A.3d daemon D1 PID");
+    assert_ne!(daemon_one_pid, parent_pid);
+    assert_ne!(daemon_one_pid, ready.process_id);
+    wait_for_r9a3d_daemon(&instance, &mut daemon_one).await;
+
+    let prepare = run_r9a3d_cli(
+        &instance,
+        &[
+            "work",
+            "prepare",
+            "--intent",
+            "prove R-9A.3d external effect recovery",
+            "--scope",
+            "scope:r8a",
+            "--work-type",
+            "governed_repository_change",
+            "--context-ref",
+            "context.md",
+            "--idempotency-key",
+            "r9a3d-prepare",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        prepare.status.success(),
+        "R-9A.3d CLI prepare failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&prepare.stdout),
+        String::from_utf8_lossy(&prepare.stderr)
+    );
+    let prepared: serde_json::Value =
+        serde_json::from_slice(&prepare.stdout).expect("decode R-9A.3d prepare response");
+    let snapshot_id = prepared["data"]["snapshotId"]
+        .as_str()
+        .expect("R-9A.3d snapshot id")
+        .to_owned();
+    let compiled_digest = prepared["data"]["compiledContextSha256"]
+        .as_str()
+        .expect("R-9A.3d compiled Context digest")
+        .to_owned();
+    let confirmation_binding = prepared["data"]["confirmationBindingSha256"]
+        .as_str()
+        .expect("R-9A.3d confirmation binding")
+        .to_owned();
+    assert_eq!(snapshot_id, format!("ctx:{compiled_digest}"));
+
+    let confirm = run_r9a3d_tui(
+        &instance,
+        &[
+            "--instance",
+            &instance,
+            "work-confirm",
+            &snapshot_id,
+            "--confirmation-binding-sha256",
+            &confirmation_binding,
+            "--idempotency-key",
+            "r9a3d-confirm",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        confirm.status.success(),
+        "R-9A.3d TUI confirm failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&confirm.stdout),
+        String::from_utf8_lossy(&confirm.stderr)
+    );
+    let confirmed: serde_json::Value =
+        serde_json::from_slice(&confirm.stdout).expect("decode R-9A.3d confirm response");
+    let task_id = confirmed["data"]["taskId"]
+        .as_str()
+        .expect("R-9A.3d Task id")
+        .to_owned();
+    assert!(
+        confirmed["data"]["status"] == TaskStatus::Ready.as_str_name()
+            || confirmed["data"]["status"] == TaskStatus::Active.as_str_name(),
+        "R-9A.3d confirmation response must be Ready or already Active: {}",
+        confirmed["data"]["status"]
+    );
+
+    let active =
+        wait_for_r9a3d_task(&instance, &task_id, TaskStatus::Active, &mut daemon_one).await;
+    assert_eq!(active["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID);
+
+    let committed: R9a3dRequestEvidence = wait_for_r9a3d_json(
+        &r9a3d_path(root.path(), R9A3D_COMMITTED_FILE),
+        &mut witness,
+        &mut daemon_one,
+        "external effect commit before ACK",
+    )
+    .await;
+    assert_eq!(committed.process_id, ready.process_id);
+    assert_eq!(committed.fixture_instance, witness_instance);
+    assert_eq!(committed.phase, "effect-committed-before-ack");
+    assert_eq!(committed.send_count, 1);
+    assert_eq!(committed.dispatch_id, "r8a-dispatch");
+    assert_eq!(committed.attempt_id, "r8a-attempt");
+    assert_eq!(committed.payload_digest_sha256, compiled_digest);
+    let request = committed.request();
+
+    let prekill_reader = R9a3SideEffectReader::open_existing(root.path(), &witness_instance)
+        .expect("open R-9A.3d external effect before daemon kill");
+    assert_eq!(
+        prekill_reader
+            .effect_count()
+            .expect("pre-kill effect count"),
+        1
+    );
+    let prekill_effect = prekill_reader
+        .effect_for_dispatch(&request.dispatch_id)
+        .expect("read pre-kill external effect")
+        .expect("pre-kill external effect exists");
+    assert_eq!(prekill_effect.request, request);
+    let original_ack = prekill_effect.original_ack();
+    assert!(!original_ack.replayed);
+
+    let preview = run_r9a3d_cli(
+        &instance,
+        &[
+            "context",
+            "revoke",
+            &snapshot_id,
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "r9a3d-authorized-effect-exists",
+            "--evidence-ref",
+            "evidence:r9a3d-external-effect",
+            "--confirmation-proof-ref",
+            "proof:r9a3d-revoke",
+            "--idempotency-key",
+            "r9a3d-revoke",
+            "--preview",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(preview.status.success(), "R-9A.3d revoke preview failed");
+    let preview_json: serde_json::Value =
+        serde_json::from_slice(&preview.stdout).expect("decode R-9A.3d revoke preview");
+    let revoke_digest = preview_json["data"]["requestDigestSha256"]
+        .as_str()
+        .expect("R-9A.3d revoke digest")
+        .to_owned();
+    let revoke = run_r9a3d_cli(
+        &instance,
+        &[
+            "context",
+            "revoke",
+            &snapshot_id,
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "r9a3d-authorized-effect-exists",
+            "--evidence-ref",
+            "evidence:r9a3d-external-effect",
+            "--confirmation-proof-ref",
+            "proof:r9a3d-revoke",
+            "--idempotency-key",
+            "r9a3d-revoke",
+            "--confirm-digest",
+            &revoke_digest,
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        revoke.status.success(),
+        "R-9A.3d Context revoke failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&revoke.stdout),
+        String::from_utf8_lossy(&revoke.stderr)
+    );
+    let revoke_json: serde_json::Value =
+        serde_json::from_slice(&revoke.stdout).expect("decode R-9A.3d revoke receipt");
+    assert_eq!(
+        revoke_json["data"]["resultState"],
+        "CONTEXT_GOVERNANCE_STATE_REVOKED"
+    );
+    assert_eq!(revoke_json["data"]["resultStateRevision"], 2);
+
+    let context_before_restart = read_r9a3_context_authority_store(
+        &root.path().join("context-authority.db"),
+        &[0x15; 32],
+        "c5-context-epoch",
+        &snapshot_id,
+        "r8a-dispatch",
+    )
+    .expect("read R-9A.3d Context authority before restart");
+    assert_eq!(
+        context_before_restart.snapshot.governance_state,
+        R9a3ContextGovernanceState::Revoked
+    );
+    assert_eq!(context_before_restart.snapshot.state_revision, 2);
+    let revoke_before_restart = context_before_restart
+        .revoke
+        .as_ref()
+        .expect("R-9A.3d durable revoke fact exists before restart");
+    assert_eq!(revoke_before_restart.request_digest_sha256, revoke_digest);
+    assert_eq!(revoke_before_restart.content_digest_sha256, compiled_digest);
+    assert_eq!(revoke_before_restart.previous_state_revision, 1);
+    assert_eq!(revoke_before_restart.result_state_revision, 2);
+    let authorization_before_restart = context_before_restart
+        .dispatch_authorization
+        .as_ref()
+        .expect("R-9A.3d dispatch authorization exists before restart");
+    assert_eq!(authorization_before_restart.snapshot_id, snapshot_id);
+    assert_eq!(authorization_before_restart.dispatch_id, "r8a-dispatch");
+    assert_eq!(authorization_before_restart.attempt_id, "r8a-attempt");
+    assert_eq!(
+        authorization_before_restart.input_digest_sha256,
+        compiled_digest
+    );
+    assert_eq!(authorization_before_restart.observed_state_revision, 1);
+    assert_eq!(authorization_before_restart.expected_scope_ref, "scope:r8a");
+    assert_eq!(context_before_restart.counts.authorization_count, 1);
+
+    assert!(
+        witness
+            .try_wait()
+            .expect("inspect R-9A.3d witness before D1 kill")
+            .is_none()
+    );
+    hard_kill_r9a3d_child(&mut daemon_one, "effect committed before ACK").await;
+    let disconnected: R9a3dRequestEvidence = wait_for_r9a3_json(
+        &r9a3d_path(root.path(), R9A3D_DISCONNECTED_FILE),
+        &mut witness,
+        "D1 disconnect without ACK",
+    );
+    disconnected.assert_request(&request);
+    assert_eq!(disconnected.send_count, 1);
+    assert!(
+        witness
+            .try_wait()
+            .expect("inspect R-9A.3d witness after D1 kill")
+            .is_none(),
+        "witness must survive daemon D1"
+    );
+
+    drop(prekill_reader);
+    let postkill_reader = R9a3SideEffectReader::open_existing(root.path(), &witness_instance)
+        .expect("reopen R-9A.3d external effect after D1 kill");
+    assert_eq!(
+        postkill_reader
+            .effect_count()
+            .expect("post-kill effect count"),
+        1
+    );
+    let postkill_effect = postkill_reader
+        .effect_for_dispatch(&request.dispatch_id)
+        .expect("read post-kill external effect")
+        .expect("post-kill external effect exists");
+    assert_eq!(postkill_effect.request, request);
+    assert_eq!(postkill_effect.original_ack(), original_ack);
+    drop(postkill_reader);
+
+    let context_after_kill = read_r9a3_context_authority_store(
+        &root.path().join("context-authority.db"),
+        &[0x15; 32],
+        "c5-context-epoch",
+        &snapshot_id,
+        "r8a-dispatch",
+    )
+    .expect("reopen R-9A.3d Context authority after D1 kill");
+    assert_eq!(context_after_kill, context_before_restart);
+
+    let adapter_after_kill = read_r8b2c_adapter_oracle(root.path());
+    assert_eq!(adapter_after_kill.dispatch_count, 1);
+    assert_eq!(adapter_after_kill.delivery_unknown_count, 1);
+    assert_eq!(adapter_after_kill.observation_count, 0);
+    assert_eq!(adapter_after_kill.pending_observation_count, 0);
+    assert_eq!(adapter_after_kill.dispatch_state, "delivery_unknown");
+    assert_eq!(adapter_after_kill.dispatch_attempt_id, "r8a-attempt");
+    assert!(adapter_after_kill.receipt.is_none());
+    assert!(adapter_after_kill.receipt_bytes.is_none());
+
+    let collaboration_after_kill = read_r8b2c_collaboration_oracle(root.path());
+    assert_eq!(collaboration_after_kill.outbox_state, "pending");
+    assert_eq!(
+        collaboration_after_kill.run.status,
+        RunStatus::Active as i32
+    );
+    assert_eq!(
+        collaboration_after_kill.step.status,
+        StepStatus::Active as i32
+    );
+    assert_eq!(
+        collaboration_after_kill.step.attempt_ids,
+        vec!["r8a-attempt"]
+    );
+    assert_eq!(
+        collaboration_after_kill.step.current_attempt_id.as_deref(),
+        Some("r8a-attempt")
+    );
+    assert_eq!(collaboration_after_kill.attempt.attempt_id, "r8a-attempt");
+    assert_eq!(
+        collaboration_after_kill.attempt.run_id,
+        R8A_ACTIVATION_RUN_ID
+    );
+    assert_eq!(collaboration_after_kill.attempt.step_id, "r8a-step");
+    assert!(collaboration_after_kill.attempt.attempt_number > 0);
+    assert_eq!(
+        collaboration_after_kill.attempt.status,
+        AttemptStatus::DispatchPending as i32
+    );
+    assert_eq!(
+        collaboration_after_kill.attempt.dispatch_id.as_deref(),
+        Some("r8a-dispatch")
+    );
+    let original_attempt_number = collaboration_after_kill.attempt.attempt_number;
+
+    let task_after_kill = read_r8b2c_task_oracle(root.path(), &task_id);
+    assert_eq!(task_after_kill.snapshot.status, TaskStatus::Active as i32);
+    assert_eq!(
+        task_after_kill.snapshot.current_run_id.as_deref(),
+        Some(R8A_ACTIVATION_RUN_ID)
+    );
+    assert_ne!(
+        task_after_kill.snapshot.status,
+        TaskStatus::Completed as i32
+    );
+
+    let mut daemon_two = spawn_r9a3d_fixture(
+        root.path(),
+        &instance,
+        R9A3D_EXTERNAL_RECOVERY_MODE,
+        &witness_instance,
+        &ready.send_endpoint,
+    )
+    .await;
+    let daemon_two_pid = daemon_two.id().expect("R-9A.3d daemon D2 PID");
+    assert_ne!(daemon_two_pid, parent_pid);
+    assert_ne!(daemon_two_pid, ready.process_id);
+    assert_ne!(daemon_two_pid, daemon_one_pid);
+    wait_for_r9a3d_daemon(&instance, &mut daemon_two).await;
+
+    let recovered: R9a3dRunnerCheckpoint = wait_for_r9a3d_json(
+        &r9a3d_path(root.path(), R9A3D_RECOVERY_CHECKPOINT_FILE),
+        &mut witness,
+        &mut daemon_two,
+        "conservative recovery settlement",
+    )
+    .await;
+    assert_eq!(recovered.process_id, daemon_two_pid);
+    assert_eq!(recovered.fixture_root, root.path().display().to_string());
+    assert_eq!(recovered.fixture_instance, instance);
+    assert_eq!(recovered.phase, "recovery-settled");
+
+    let interrupted = wait_for_r9a3d_task(
+        &instance,
+        &task_id,
+        TaskStatus::Interrupted,
+        &mut daemon_two,
+    )
+    .await;
+    assert_eq!(interrupted["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID);
+    assert_ne!(
+        interrupted["data"]["status"],
+        TaskStatus::Completed.as_str_name()
+    );
+
+    let adapter_after_recovery = read_r8b2c_adapter_oracle(root.path());
+    assert_eq!(adapter_after_recovery.dispatch_count, 1);
+    assert_eq!(adapter_after_recovery.delivery_unknown_count, 1);
+    assert_eq!(adapter_after_recovery.observation_count, 1);
+    assert_eq!(adapter_after_recovery.observations.len(), 1);
+    let reconciliation_observation = &adapter_after_recovery.observations[0];
+    assert_eq!(
+        reconciliation_observation.native_key,
+        "reconciliation:adapter-reconciliation:r8a-dispatch"
+    );
+    assert_eq!(reconciliation_observation.dispatch_id, "r8a-dispatch");
+    assert!(!reconciliation_observation.raw_event.is_empty());
+    assert!(matches!(
+        reconciliation_observation.observation.payload,
+        Some(harness_observation::Payload::Diagnostic(ref diagnostic))
+            if diagnostic.safe_diagnostic_code == "ADAPTER_RECONCILIATION_OUTCOME_UNKNOWN"
+    ));
+    let collaboration_after_recovery = read_r8b2c_collaboration_oracle(root.path());
+    assert_eq!(collaboration_after_recovery.outbox_state, "held");
+    assert_eq!(
+        collaboration_after_recovery.run.status,
+        RunStatus::Held as i32
+    );
+    assert_eq!(
+        collaboration_after_recovery.step.status,
+        StepStatus::Held as i32
+    );
+    assert_eq!(
+        collaboration_after_recovery.attempt.status,
+        AttemptStatus::Held as i32
+    );
+    assert_eq!(
+        collaboration_after_recovery.attempt.recovery_class,
+        RecoveryClass::ManualOnly as i32
+    );
+    assert_eq!(
+        collaboration_after_recovery.step.attempt_ids,
+        vec!["r8a-attempt"]
+    );
+    assert_eq!(
+        collaboration_after_recovery
+            .step
+            .current_attempt_id
+            .as_deref(),
+        Some("r8a-attempt")
+    );
+    assert_eq!(
+        collaboration_after_recovery.attempt.attempt_id,
+        "r8a-attempt"
+    );
+    assert_eq!(
+        collaboration_after_recovery.attempt.run_id,
+        R8A_ACTIVATION_RUN_ID
+    );
+    assert_eq!(collaboration_after_recovery.attempt.step_id, "r8a-step");
+    assert_eq!(
+        collaboration_after_recovery.attempt.attempt_number,
+        original_attempt_number
+    );
+    let task_after_recovery = read_r8b2c_task_oracle(root.path(), &task_id);
+    assert_eq!(
+        task_after_recovery.snapshot.status,
+        TaskStatus::Interrupted as i32
+    );
+    assert_ne!(
+        task_after_recovery.snapshot.status,
+        TaskStatus::Completed as i32
+    );
+
+    let context_after_recovery = read_r9a3_context_authority_store(
+        &root.path().join("context-authority.db"),
+        &[0x15; 32],
+        "c5-context-epoch",
+        &snapshot_id,
+        "r8a-dispatch",
+    )
+    .expect("read R-9A.3d Context authority after recovery");
+    assert_eq!(
+        context_after_recovery.snapshot.governance_state,
+        R9a3ContextGovernanceState::Revoked
+    );
+    assert_eq!(context_after_recovery.snapshot.state_revision, 2);
+    assert_eq!(context_after_recovery, context_after_kill);
+
+    let stable: R9a3dRunnerCheckpoint = wait_for_r9a3d_json(
+        &r9a3d_path(root.path(), R9A3D_STABLE_CHECKPOINT_FILE),
+        &mut witness,
+        &mut daemon_two,
+        "stable recovery cycle",
+    )
+    .await;
+    assert_eq!(stable.process_id, daemon_two_pid);
+    assert_eq!(stable.fixture_root, root.path().display().to_string());
+    assert_eq!(stable.fixture_instance, instance);
+    assert_eq!(stable.phase, "stable-cycle");
+    assert_eq!(
+        read_r8b2c_adapter_oracle(root.path()),
+        adapter_after_recovery
+    );
+    let collaboration_after_stable = read_r8b2c_collaboration_oracle(root.path());
+    assert_eq!(collaboration_after_stable, collaboration_after_recovery);
+    assert_eq!(
+        collaboration_after_stable.step.attempt_ids,
+        vec!["r8a-attempt"]
+    );
+    assert_eq!(
+        collaboration_after_stable
+            .step
+            .current_attempt_id
+            .as_deref(),
+        Some("r8a-attempt")
+    );
+    assert_eq!(collaboration_after_stable.attempt.attempt_id, "r8a-attempt");
+    assert_eq!(
+        collaboration_after_stable.attempt.run_id,
+        R8A_ACTIVATION_RUN_ID
+    );
+    assert_eq!(collaboration_after_stable.attempt.step_id, "r8a-step");
+    assert_eq!(
+        collaboration_after_stable.attempt.attempt_number,
+        original_attempt_number
+    );
+    assert_eq!(
+        read_r8b2c_task_oracle(root.path(), &task_id),
+        task_after_recovery
+    );
+    let context_after_stable = read_r9a3_context_authority_store(
+        &root.path().join("context-authority.db"),
+        &[0x15; 32],
+        "c5-context-epoch",
+        &snapshot_id,
+        "r8a-dispatch",
+    )
+    .expect("read R-9A.3d Context authority after stable recovery cycle");
+    assert_eq!(context_after_stable, context_after_recovery);
+    assert!(
+        !r9a3d_path(root.path(), R9A3D_FORBIDDEN_CONNECTION_FILE).exists(),
+        "D2 must not open any second native send connection"
+    );
+    assert!(
+        !r9a3d_path(root.path(), R9A3D_FORBIDDEN_SEND_FILE).exists(),
+        "D2 must not emit any second complete send request"
+    );
+
+    shutdown_r9a3d_child(&mut daemon_two).await;
+    assert!(
+        witness
+            .try_wait()
+            .expect("inspect R-9A.3d witness before cleanup")
+            .is_none()
+    );
+    let witness_status = witness.hard_kill();
+    assert!(!witness_status.success());
+    let final_reader = R9a3SideEffectReader::open_existing(root.path(), &witness_instance)
+        .expect("open final R-9A.3d external effect oracle");
+    assert_eq!(final_reader.effect_count().expect("final effect count"), 1);
+    let final_effect = final_reader
+        .effect_for_dispatch(&request.dispatch_id)
+        .expect("read final R-9A.3d effect")
+        .expect("final R-9A.3d effect exists");
+    assert_eq!(final_effect.request, request);
+    assert_eq!(final_effect.original_ack(), original_ack);
+    assert!(!r9a3d_path(root.path(), R9A3D_FORBIDDEN_CONNECTION_FILE).exists());
+    assert!(!r9a3d_path(root.path(), R9A3D_FORBIDDEN_SEND_FILE).exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

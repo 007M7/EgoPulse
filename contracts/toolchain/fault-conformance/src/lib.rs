@@ -2,6 +2,7 @@
 
 pub mod r8b2c;
 pub mod r9a3;
+pub mod r9a3_context;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};

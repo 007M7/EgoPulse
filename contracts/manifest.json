@@ -1055,7 +1055,7 @@
     },
     {
       "path": "toolchain/fault-conformance/src/lib.rs",
-      "sha256": "dc58ce378ca3452b5521d0b03777d4a0063620b6a8da8d2e92828f943e015f0a"
+      "sha256": "94747910f1bb1f62c1ff819eac51a371c0db7f48a0ac316a1404acae3c37c1e0"
     },
     {
       "path": "toolchain/fault-conformance/src/main.rs",
@@ -1068,6 +1068,10 @@
     {
       "path": "toolchain/fault-conformance/src/r9a3.rs",
       "sha256": "c5405236b55f44a33978ad04ac5d41ab20d3ff93680244a74373b4469a481ffa"
+    },
+    {
+      "path": "toolchain/fault-conformance/src/r9a3_context.rs",
+      "sha256": "7903cd703a37f156b82a2ac0bc7911607679ec04fb12f1171cdca3761c8b9b10"
     },
     {
       "path": "toolchain/fault-conformance/tests/crash_recovery.rs",
