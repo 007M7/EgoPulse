@@ -326,6 +326,7 @@ pub enum HeldDispatchRecoveryState {
     OutcomeUnknown,
     Reconciling { reconciliation_id: String },
     Held,
+    CancellationPending,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -714,6 +715,11 @@ where
                 }
                 Ok(AttemptStatus::Held) if run.status == RunStatus::Held as i32 => {
                     HeldDispatchRecoveryState::Held
+                }
+                Ok(AttemptStatus::CancellationPending)
+                    if run.status == RunStatus::CancellationPending as i32 =>
+                {
+                    HeldDispatchRecoveryState::CancellationPending
                 }
                 _ => continue,
             };

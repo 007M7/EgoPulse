@@ -1,10 +1,11 @@
 use super::{
     ArtifactReturnSource, AuthenticatedCollaborationPrincipal, AuthorityClock,
     CollaborationControl, CollaborationControlError, CollaborationPrincipalKind,
-    CollaborationReferenceGuard, HarnessEvidenceResolver, HarnessFactIngestionDisposition,
-    HarnessFactIngestionResult, HeldDispatchRecoveryState, SingleHarnessWorkConfig,
-    SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver, TaskActivationGuardSet,
-    TaskActivationReferenceHandle, TaskActivationSource, seal_request_digest,
+    CollaborationReferenceGuard, DeliveredDispatchForObservation, HarnessEvidenceResolver,
+    HarnessFactIngestionDisposition, HarnessFactIngestionResult, HeldDispatchRecoveryState,
+    SingleHarnessWorkConfig, SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
+    TaskActivationGuardSet, TaskActivationReferenceHandle, TaskActivationSource,
+    seal_request_digest,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::get_collaboration_response;
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
@@ -166,6 +167,27 @@ enum CapabilityProfileFilter {
     Exact(ContractReference),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DurableReplayBarrier {
+    Clear,
+    PendingBlocked,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservationSettlement {
+    Settled,
+    PendingBlocked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivePumpStep {
+    DurableEventAppended,
+    Idle,
+    Retire,
+    Blocked(DurableReplayBarrier),
+}
+
 impl<G, C, R, D, A> GovernedHarnessDispatchRunner<G, C, R, D, A>
 where
     G: CollaborationReferenceGuard + HarnessEvidenceResolver + Send,
@@ -229,11 +251,19 @@ where
             recover_held_dispatches(
                 control,
                 adapter,
+                &self.principal,
                 self.capability_profile_filter.as_ref(),
                 &mut report,
             )
             .await?;
-            register_pending_envelopes(
+            let delivered = register_delivered_envelopes(
+                control,
+                adapter,
+                active_envelopes,
+                &self.principal,
+                self.capability_profile_filter.as_ref(),
+            )?;
+            let pending = register_pending_envelopes(
                 control,
                 active_envelopes,
                 &self.principal,
@@ -243,6 +273,8 @@ where
                 control,
                 adapter,
                 active_envelopes,
+                &delivered,
+                &pending,
                 &self.principal,
                 &mut report,
             )
@@ -255,13 +287,6 @@ where
             )
             .await?;
             merge_report(&mut report, dispatched);
-            recover_held_dispatches(
-                control,
-                adapter,
-                self.capability_profile_filter.as_ref(),
-                &mut report,
-            )
-            .await?;
             remove_terminal_envelopes(active_envelopes, &report);
             Ok(report)
         })
@@ -417,14 +442,30 @@ where
             recover_held_dispatches(
                 control,
                 adapter,
+                &self.principal,
                 self.capability_profile_filter.as_ref(),
                 &mut report,
             )
             .await?;
+            let delivered = register_delivered_envelopes(
+                control,
+                adapter,
+                active_envelopes,
+                &self.principal,
+                self.capability_profile_filter.as_ref(),
+            )?;
+            let pending = register_pending_envelopes(
+                control,
+                active_envelopes,
+                &self.principal,
+                self.capability_profile_filter.as_ref(),
+            )?;
             pump_active_envelopes(
                 control,
                 adapter,
                 active_envelopes,
+                &delivered,
+                &pending,
                 &self.principal,
                 &mut report,
             )
@@ -461,28 +502,7 @@ where
                 }
                 report.activations_started += 1;
                 report.activations_acknowledged += 1;
-                register_pending_envelopes(
-                    control,
-                    active_envelopes,
-                    &self.principal,
-                    self.capability_profile_filter.as_ref(),
-                )?;
-                let dispatched = dispatch_pending_for_profile(
-                    control,
-                    adapter,
-                    &self.principal,
-                    self.capability_profile_filter.as_ref(),
-                )
-                .await?;
-                merge_report(&mut report, dispatched);
-                remove_terminal_envelopes(active_envelopes, &report);
             }
-            register_pending_envelopes(
-                control,
-                active_envelopes,
-                &self.principal,
-                self.capability_profile_filter.as_ref(),
-            )?;
             let dispatched = dispatch_pending_for_profile(
                 control,
                 adapter,
@@ -491,13 +511,6 @@ where
             )
             .await?;
             merge_report(&mut report, dispatched);
-            recover_held_dispatches(
-                control,
-                adapter,
-                self.capability_profile_filter.as_ref(),
-                &mut report,
-            )
-            .await?;
             remove_terminal_envelopes(active_envelopes, &report);
             Ok(report)
         })
@@ -746,6 +759,7 @@ where
 async fn recover_held_dispatches<G, C, R, D, A>(
     control: &mut CollaborationControl<G, C>,
     adapter: &mut GovernedHarnessAdapter<R, D, A>,
+    harness_principal: &AuthenticatedCollaborationPrincipal,
     capability_profile_filter: Option<&CapabilityProfileFilter>,
     report: &mut HarnessDispatchCycleReport,
 ) -> Result<(), HarnessDispatchCycleError>
@@ -756,9 +770,9 @@ where
     D: NativeHarnessDriver,
     A: AdapterClock,
 {
-    let principal = recovery_principal();
+    let recovery_principal = recovery_principal();
     let held = control
-        .held_dispatches_for_recovery(&principal)?
+        .held_dispatches_for_recovery(&recovery_principal)?
         .into_iter()
         .filter(|candidate| {
             envelope_matches_profile(&candidate.envelope, capability_profile_filter)
@@ -773,8 +787,39 @@ where
                 .held_dispatch_ids
                 .push(candidate.envelope.dispatch_id.clone());
         }
+        let barrier = drain_durable_normal_observations(
+            control,
+            adapter,
+            &candidate.envelope,
+            harness_principal,
+            report,
+        )?;
+        let mut current_matches = control
+            .held_dispatches_for_recovery(&recovery_principal)?
+            .into_iter()
+            .filter(|item| item.envelope.dispatch_id == candidate.envelope.dispatch_id);
+        let Some(current) = current_matches.next() else {
+            report
+                .held_dispatch_ids
+                .retain(|dispatch_id| dispatch_id != &candidate.envelope.dispatch_id);
+            continue;
+        };
+        if current_matches.next().is_some()
+            || current.message_id != candidate.message_id
+            || current.source_event_id != candidate.source_event_id
+            || current.canonical_payload_digest_sha256 != candidate.canonical_payload_digest_sha256
+            || current.envelope != candidate.envelope
+        {
+            return Err(HarnessDispatchCycleError::Recovery(
+                "held dispatch recovery candidate drifted during durable replay".to_owned(),
+            ));
+        }
+        if barrier != DurableReplayBarrier::Clear {
+            record_task_recovery_finding_if_still_held(control, &candidate.envelope, report)?;
+            continue;
+        }
         let mut durable_evidence = None;
-        match candidate.state {
+        match current.state {
             HeldDispatchRecoveryState::OutcomeUnknown => {
                 let reconciliation_id = stable_reconciliation_id(&candidate.envelope.dispatch_id);
                 let snapshot = collaboration_snapshot(control, &candidate.envelope.run_id)?;
@@ -796,7 +841,7 @@ where
                         "reconciliation begin command could not be sealed".to_owned(),
                     )
                 })?;
-                require_recovery_commit(control.execute(&begin, &principal)?, "begin")?;
+                require_recovery_commit(control.execute(&begin, &recovery_principal)?, "begin")?;
                 durable_evidence = Some(
                     adapter
                         .reconcile_dispatch(&reconciliation_id, &candidate.envelope.dispatch_id)
@@ -807,7 +852,7 @@ where
                 durable_evidence = adapter
                     .reconciliation_evidence(&reconciliation_id, &candidate.envelope.dispatch_id)?;
             }
-            HeldDispatchRecoveryState::Held => {}
+            HeldDispatchRecoveryState::Held | HeldDispatchRecoveryState::CancellationPending => {}
         }
 
         if let Some(evidence) = durable_evidence.as_ref() {
@@ -842,28 +887,38 @@ where
                     "reconciliation record command could not be sealed".to_owned(),
                 )
             })?;
-            require_recovery_commit(control.execute(&record, &principal)?, "record")?;
+            require_recovery_commit(control.execute(&record, &recovery_principal)?, "record")?;
         }
 
-        let snapshot = collaboration_snapshot(control, &candidate.envelope.run_id)?;
-        if snapshot
-            .run
-            .as_ref()
-            .is_some_and(|run| run.status == RunStatus::Held as i32)
-        {
-            let run = snapshot.run.as_ref().expect("checked held run");
-            let finding = TaskRecoveryFinding {
-                kind: TaskRecoveryKind::OutcomeUnknown,
-                task_id: run.task_id.clone(),
-                run_id: run.run_id.clone(),
-                evidence_ref: format!(
-                    "collaboration-held-dispatch:{}",
-                    candidate.envelope.dispatch_id
-                ),
-            };
-            if !report.task_recovery_findings.contains(&finding) {
-                report.task_recovery_findings.push(finding);
-            }
+        record_task_recovery_finding_if_still_held(control, &candidate.envelope, report)?;
+    }
+    Ok(())
+}
+
+fn record_task_recovery_finding_if_still_held<G, C>(
+    control: &CollaborationControl<G, C>,
+    envelope: &DispatchEnvelope,
+    report: &mut HarnessDispatchCycleReport,
+) -> Result<(), HarnessDispatchCycleError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+{
+    let snapshot = collaboration_snapshot(control, &envelope.run_id)?;
+    if snapshot
+        .run
+        .as_ref()
+        .is_some_and(|run| run.status == RunStatus::Held as i32)
+    {
+        let run = snapshot.run.as_ref().expect("checked held run");
+        let finding = TaskRecoveryFinding {
+            kind: TaskRecoveryKind::OutcomeUnknown,
+            task_id: run.task_id.clone(),
+            run_id: run.run_id.clone(),
+            evidence_ref: format!("collaboration-held-dispatch:{}", envelope.dispatch_id),
+        };
+        if !report.task_recovery_findings.contains(&finding) {
+            report.task_recovery_findings.push(finding);
         }
     }
     Ok(())
@@ -1007,7 +1062,7 @@ where
         } else {
             report.dispatches_rejected += 1;
         }
-        record_ingestion(&mut report, adapter, None, ingested)?;
+        let _ = record_ingestion(&mut report, adapter, None, ingested)?;
         match DeliveryDisposition::try_from(receipt.disposition) {
             Ok(DeliveryDisposition::Delivered) => {}
             Ok(DeliveryDisposition::Unknown) => {
@@ -1023,20 +1078,13 @@ where
             }
             _ => continue,
         }
-        let observation_report =
-            pump_observations(control, adapter, &dispatch.envelope, principal).await?;
-        report.observations_seen += observation_report.observations_seen;
-        report.observations_consumed += observation_report.observations_consumed;
-        report.observations_deferred += observation_report.observations_deferred;
-        report.observations_retained += observation_report.observations_retained;
-        report.observations_quarantined += observation_report.observations_quarantined;
     }
     Ok(report)
 }
 
-/// Pumps every currently available observation for one immutable dispatch
-/// envelope. It is also used after cancellation/recovery, when the original
-/// dispatch is no longer present in the Collaboration outbox.
+/// Replays durable normal observations before polling one immutable dispatch.
+/// Every native poll is gated by both the Adapter delivery receipt and the
+/// current Collaboration delivered candidate.
 pub async fn pump_observations<G, C, R, D, A>(
     control: &mut CollaborationControl<G, C>,
     adapter: &mut GovernedHarnessAdapter<R, D, A>,
@@ -1051,12 +1099,78 @@ where
     A: AdapterClock,
 {
     let mut report = HarnessDispatchCycleReport::default();
-    while let Some(observation) = adapter.pump_one(envelope).await? {
-        report.observations_seen += 1;
-        let ingested = control.ingest_harness_observation(&observation, principal)?;
-        record_ingestion(&mut report, adapter, Some(&observation), ingested)?;
+    let barrier =
+        drain_durable_normal_observations(control, adapter, envelope, principal, &mut report)?;
+    if barrier != DurableReplayBarrier::Clear {
+        return Ok(report);
     }
+    adapter.verify_delivered_recovery_candidate(envelope)?;
+    let Some(delivered) = current_delivered_candidate(control, principal, &envelope.dispatch_id)?
+    else {
+        return Ok(report);
+    };
+    if delivered.envelope != *envelope {
+        return Err(HarnessDispatchCycleError::Recovery(
+            "public observation pump envelope drifted from Collaboration candidate".to_owned(),
+        ));
+    }
+    while let ActivePumpStep::DurableEventAppended =
+        pump_active_step(control, adapter, &delivered, principal, &mut report).await?
+    {}
     Ok(report)
+}
+
+fn register_delivered_envelopes<G, C, R, D, A>(
+    control: &CollaborationControl<G, C>,
+    adapter: &GovernedHarnessAdapter<R, D, A>,
+    active_envelopes: &mut Vec<DispatchEnvelope>,
+    principal: &AuthenticatedCollaborationPrincipal,
+    capability_profile_filter: Option<&CapabilityProfileFilter>,
+) -> Result<Vec<DeliveredDispatchForObservation>, HarnessDispatchCycleError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+    R: DispatchMaterialResolver,
+    D: NativeHarnessDriver,
+    A: AdapterClock,
+{
+    let mut registered = Vec::new();
+    for delivered in control
+        .delivered_dispatches_for_observation(principal)?
+        .into_iter()
+        .filter(|dispatch| envelope_matches_profile(&dispatch.envelope, capability_profile_filter))
+    {
+        if registered
+            .iter()
+            .any(|item: &DeliveredDispatchForObservation| {
+                item.envelope.dispatch_id == delivered.envelope.dispatch_id
+            })
+        {
+            return Err(HarnessDispatchCycleError::Recovery(
+                "duplicate Collaboration delivered dispatch candidate".to_owned(),
+            ));
+        }
+        adapter.verify_delivered_recovery_candidate(&delivered.envelope)?;
+        let mut active_matches = active_envelopes
+            .iter()
+            .filter(|item| item.dispatch_id == delivered.envelope.dispatch_id);
+        if let Some(existing) = active_matches.next() {
+            if active_matches.next().is_some() {
+                return Err(HarnessDispatchCycleError::Recovery(
+                    "duplicate active dispatch identity".to_owned(),
+                ));
+            }
+            if existing != &delivered.envelope {
+                return Err(HarnessDispatchCycleError::Recovery(
+                    "active dispatch envelope drifted from delivered recovery candidate".to_owned(),
+                ));
+            }
+        } else {
+            active_envelopes.push(delivered.envelope.clone());
+        }
+        registered.push(delivered);
+    }
+    Ok(registered)
 }
 
 fn register_pending_envelopes<G, C>(
@@ -1064,24 +1178,45 @@ fn register_pending_envelopes<G, C>(
     active_envelopes: &mut Vec<DispatchEnvelope>,
     principal: &AuthenticatedCollaborationPrincipal,
     capability_profile_filter: Option<&CapabilityProfileFilter>,
-) -> Result<(), CollaborationControlError>
+) -> Result<Vec<DispatchEnvelope>, HarnessDispatchCycleError>
 where
     G: CollaborationReferenceGuard + HarnessEvidenceResolver,
     C: AuthorityClock,
 {
+    let mut registered = Vec::new();
     for pending in control
         .pending_dispatches(principal)?
         .into_iter()
         .filter(|dispatch| envelope_matches_profile(&dispatch.envelope, capability_profile_filter))
     {
-        if !active_envelopes
+        if registered
             .iter()
-            .any(|item| item.dispatch_id == pending.envelope.dispatch_id)
+            .any(|item: &DispatchEnvelope| item.dispatch_id == pending.envelope.dispatch_id)
         {
-            active_envelopes.push(pending.envelope);
+            return Err(HarnessDispatchCycleError::Recovery(
+                "duplicate Collaboration pending dispatch candidate".to_owned(),
+            ));
         }
+        let mut active_matches = active_envelopes
+            .iter()
+            .filter(|item| item.dispatch_id == pending.envelope.dispatch_id);
+        if let Some(existing) = active_matches.next() {
+            if active_matches.next().is_some() {
+                return Err(HarnessDispatchCycleError::Recovery(
+                    "duplicate active dispatch identity".to_owned(),
+                ));
+            }
+            if existing != &pending.envelope {
+                return Err(HarnessDispatchCycleError::Recovery(
+                    "active dispatch envelope drifted from pending intent".to_owned(),
+                ));
+            }
+        } else {
+            active_envelopes.push(pending.envelope.clone());
+        }
+        registered.push(pending.envelope);
     }
-    Ok(())
+    Ok(registered)
 }
 
 fn envelope_matches_profile(
@@ -1111,6 +1246,8 @@ async fn pump_active_envelopes<G, C, R, D, A>(
     control: &mut CollaborationControl<G, C>,
     adapter: &mut GovernedHarnessAdapter<R, D, A>,
     active_envelopes: &mut Vec<DispatchEnvelope>,
+    delivered_dispatches: &[DeliveredDispatchForObservation],
+    pending_envelopes: &[DispatchEnvelope],
     principal: &AuthenticatedCollaborationPrincipal,
     report: &mut HarnessDispatchCycleReport,
 ) -> Result<(), HarnessDispatchCycleError>
@@ -1122,30 +1259,196 @@ where
     A: AdapterClock,
 {
     let envelopes = std::mem::take(active_envelopes);
+    for (index, envelope) in envelopes.iter().enumerate() {
+        if envelopes[index + 1..]
+            .iter()
+            .any(|other| other.dispatch_id == envelope.dispatch_id)
+        {
+            return Err(HarnessDispatchCycleError::Recovery(
+                "duplicate active dispatch identity".to_owned(),
+            ));
+        }
+    }
     for envelope in envelopes {
         if report.held_dispatch_ids.contains(&envelope.dispatch_id) {
             continue;
         }
-        match adapter.stored_dispatch_receipt(&envelope.dispatch_id)? {
-            Some(receipt) if receipt.disposition == DeliveryDisposition::Delivered as i32 => {}
-            Some(receipt) if receipt.disposition == DeliveryDisposition::Unknown as i32 => {
-                report.held_dispatch_ids.push(envelope.dispatch_id);
-                continue;
-            }
-            Some(_) | None => {
+        let Some(delivered) = delivered_dispatches
+            .iter()
+            .find(|candidate| candidate.envelope.dispatch_id == envelope.dispatch_id)
+        else {
+            if let Some(pending) = pending_envelopes
+                .iter()
+                .find(|candidate| candidate.dispatch_id == envelope.dispatch_id)
+            {
+                if pending != &envelope {
+                    return Err(HarnessDispatchCycleError::Recovery(
+                        "pending dispatch changed before active classification".to_owned(),
+                    ));
+                }
                 active_envelopes.push(envelope);
-                continue;
             }
-        }
-        let pumped = pump_observations(control, adapter, &envelope, principal).await?;
-        merge_report(report, pumped);
-        if !report.terminal_dispatch_ids.contains(&envelope.dispatch_id)
-            && !report.held_dispatch_ids.contains(&envelope.dispatch_id)
+            continue;
+        };
+        if pending_envelopes
+            .iter()
+            .any(|candidate| candidate.dispatch_id == envelope.dispatch_id)
         {
-            active_envelopes.push(envelope);
+            return Err(HarnessDispatchCycleError::Recovery(
+                "dispatch appeared in both delivered and pending snapshots".to_owned(),
+            ));
+        }
+        if delivered.envelope != envelope {
+            return Err(HarnessDispatchCycleError::Recovery(
+                "registered delivered dispatch changed before active polling".to_owned(),
+            ));
+        }
+        loop {
+            match pump_active_step(control, adapter, delivered, principal, report).await? {
+                ActivePumpStep::DurableEventAppended => continue,
+                ActivePumpStep::Idle
+                | ActivePumpStep::Blocked(DurableReplayBarrier::PendingBlocked) => {
+                    active_envelopes.push(envelope);
+                    break;
+                }
+                ActivePumpStep::Retire
+                | ActivePumpStep::Blocked(DurableReplayBarrier::Terminal) => break,
+                ActivePumpStep::Blocked(DurableReplayBarrier::Clear) => {
+                    return Err(HarnessDispatchCycleError::Recovery(
+                        "clear durable replay barrier cannot block active polling".to_owned(),
+                    ));
+                }
+            }
         }
     }
     Ok(())
+}
+
+async fn pump_active_step<G, C, R, D, A>(
+    control: &mut CollaborationControl<G, C>,
+    adapter: &mut GovernedHarnessAdapter<R, D, A>,
+    delivered: &DeliveredDispatchForObservation,
+    principal: &AuthenticatedCollaborationPrincipal,
+    report: &mut HarnessDispatchCycleReport,
+) -> Result<ActivePumpStep, HarnessDispatchCycleError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+    R: DispatchMaterialResolver,
+    D: NativeHarnessDriver,
+    A: AdapterClock,
+{
+    let envelope = &delivered.envelope;
+    let barrier = drain_durable_normal_observations(control, adapter, envelope, principal, report)?;
+    match barrier {
+        DurableReplayBarrier::Clear => {}
+        DurableReplayBarrier::PendingBlocked | DurableReplayBarrier::Terminal => {
+            return Ok(ActivePumpStep::Blocked(barrier));
+        }
+    }
+
+    adapter.verify_delivered_recovery_candidate(envelope)?;
+    let Some(current) = current_delivered_candidate(control, principal, &envelope.dispatch_id)?
+    else {
+        return Ok(ActivePumpStep::Retire);
+    };
+    if current != *delivered {
+        return Err(HarnessDispatchCycleError::Recovery(
+            "Collaboration delivered dispatch identity drifted during polling".to_owned(),
+        ));
+    }
+
+    let Some(observation) = adapter.pump_one(envelope).await? else {
+        return Ok(ActivePumpStep::Idle);
+    };
+    let view = adapter.normal_observation_recovery_view(&envelope.dispatch_id)?;
+    if view
+        .pending
+        .iter()
+        .any(|pending| pending.observation_id == observation.observation_id)
+    {
+        Ok(ActivePumpStep::DurableEventAppended)
+    } else if view.durable_terminal_sequence.is_some() {
+        Ok(ActivePumpStep::Blocked(DurableReplayBarrier::Terminal))
+    } else {
+        // The Adapter replayed an already-consumed durable observation. Do not
+        // spin on the native key in this cycle.
+        Ok(ActivePumpStep::Idle)
+    }
+}
+
+fn current_delivered_candidate<G, C>(
+    control: &CollaborationControl<G, C>,
+    principal: &AuthenticatedCollaborationPrincipal,
+    dispatch_id: &str,
+) -> Result<Option<DeliveredDispatchForObservation>, HarnessDispatchCycleError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+{
+    let mut matches = control
+        .delivered_dispatches_for_observation(principal)?
+        .into_iter()
+        .filter(|candidate| candidate.envelope.dispatch_id == dispatch_id);
+    let Some(candidate) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(HarnessDispatchCycleError::Recovery(
+            "duplicate Collaboration delivered dispatch identity".to_owned(),
+        ));
+    }
+    Ok(Some(candidate))
+}
+
+fn drain_durable_normal_observations<G, C, R, D, A>(
+    control: &mut CollaborationControl<G, C>,
+    adapter: &mut GovernedHarnessAdapter<R, D, A>,
+    envelope: &DispatchEnvelope,
+    principal: &AuthenticatedCollaborationPrincipal,
+    report: &mut HarnessDispatchCycleReport,
+) -> Result<DurableReplayBarrier, HarnessDispatchCycleError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+    R: DispatchMaterialResolver,
+    D: NativeHarnessDriver,
+    A: AdapterClock,
+{
+    let view = adapter.normal_observation_recovery_view(&envelope.dispatch_id)?;
+    let mut pending_blocked = false;
+    for observation in view.pending {
+        if view
+            .durable_terminal_sequence
+            .is_some_and(|terminal| observation.observation_sequence > terminal)
+        {
+            break;
+        }
+        let terminal = observation.criticality == ObservationCriticality::Terminal as i32;
+        report.observations_seen += 1;
+        let ingested = control.ingest_harness_observation(&observation, principal)?;
+        let stop_after_settlement = matches!(
+            &ingested.disposition,
+            HarnessFactIngestionDisposition::DeferredToArtifactAuthority
+                | HarnessFactIngestionDisposition::RetainedForDependency
+        );
+        let settlement = record_ingestion(report, adapter, Some(&observation), ingested)?;
+        if settlement == ObservationSettlement::PendingBlocked {
+            pending_blocked = true;
+        }
+        if terminal || stop_after_settlement || pending_blocked {
+            break;
+        }
+    }
+
+    let current = adapter.normal_observation_recovery_view(&envelope.dispatch_id)?;
+    if current.durable_terminal_sequence.is_some() {
+        Ok(DurableReplayBarrier::Terminal)
+    } else if pending_blocked || !current.pending.is_empty() {
+        Ok(DurableReplayBarrier::PendingBlocked)
+    } else {
+        Ok(DurableReplayBarrier::Clear)
+    }
 }
 
 fn merge_report(target: &mut HarnessDispatchCycleReport, source: HarnessDispatchCycleReport) {
@@ -1201,14 +1504,14 @@ fn record_ingestion<R, D, A>(
     adapter: &mut GovernedHarnessAdapter<R, D, A>,
     observation: Option<&HarnessObservation>,
     result: HarnessFactIngestionResult,
-) -> Result<(), GovernedAdapterError>
+) -> Result<ObservationSettlement, GovernedAdapterError>
 where
     R: DispatchMaterialResolver,
     D: NativeHarnessDriver,
     A: AdapterClock,
 {
     let Some(observation) = observation else {
-        return Ok(());
+        return Ok(ObservationSettlement::Settled);
     };
     if observation.criticality == ObservationCriticality::Terminal as i32 {
         report.terminal_observations += 1;
@@ -1228,6 +1531,7 @@ where
         | HarnessFactIngestionDisposition::IgnoredInformational => {
             adapter.mark_observation_consumed(&observation.observation_id)?;
             report.observations_consumed += 1;
+            Ok(ObservationSettlement::Settled)
         }
         HarnessFactIngestionDisposition::DeferredToArtifactAuthority => {
             report.observations_deferred += 1;
@@ -1240,19 +1544,22 @@ where
                 && adapter.terminal_output_candidate_is_durable(&observation.dispatch_id)?;
             if durable_terminal_handoff {
                 adapter.mark_observation_consumed(&observation.observation_id)?;
+                Ok(ObservationSettlement::Settled)
             } else {
                 report.observations_retained += 1;
+                Ok(ObservationSettlement::PendingBlocked)
             }
         }
         HarnessFactIngestionDisposition::RetainedForDependency => {
             report.observations_retained += 1;
+            Ok(ObservationSettlement::PendingBlocked)
         }
         HarnessFactIngestionDisposition::QuarantineRequired { reason_code } => {
             adapter.quarantine_observation(&observation.observation_id, &reason_code)?;
             report.observations_quarantined += 1;
+            Ok(ObservationSettlement::Settled)
         }
     }
-    Ok(())
 }
 
 /// Derives an in-cycle recovery finding from a committed collaboration

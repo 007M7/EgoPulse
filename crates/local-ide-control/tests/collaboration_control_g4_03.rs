@@ -48,6 +48,7 @@ use prost::Message;
 use prost_types::Timestamp;
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,6 +91,161 @@ impl AdapterClock for FixedClock {
 struct CountingRecoveryDriver {
     reconcile_count: Arc<AtomicU64>,
     finding: ReconciliationFinding,
+}
+
+#[derive(Clone, Default)]
+struct DriverCallCounts {
+    send: Arc<AtomicU64>,
+    next: Arc<AtomicU64>,
+    reconcile: Arc<AtomicU64>,
+    order: Arc<Mutex<Vec<String>>>,
+}
+
+struct ScriptedCountingDriver {
+    counts: DriverCallCounts,
+    events: VecDeque<DriverEvent>,
+    required_consumed: Option<(PathBuf, String, String)>,
+    reconciliation_finding: ReconciliationFinding,
+}
+
+impl ScriptedCountingDriver {
+    fn new(counts: DriverCallCounts, events: Vec<DriverEvent>) -> Self {
+        Self {
+            counts,
+            events: events.into(),
+            required_consumed: None,
+            reconciliation_finding: ReconciliationFinding::OutcomeUnknown {
+                evidence_ref: "fixture://scripted/outcome-unknown".to_owned(),
+            },
+        }
+    }
+
+    fn requiring_consumed(
+        mut self,
+        database_path: &Path,
+        dispatch_id: &str,
+        observation_id: &str,
+    ) -> Self {
+        self.required_consumed = Some((
+            database_path.to_owned(),
+            dispatch_id.to_owned(),
+            observation_id.to_owned(),
+        ));
+        self
+    }
+
+    fn assert_required_observation_consumed(&self) {
+        let Some((database_path, dispatch_id, observation_id)) = self.required_consumed.as_ref()
+        else {
+            return;
+        };
+        let edge = open_loop_adapter_edge(database_path);
+        let evidence = edge
+            .observation_evidence(observation_id)
+            .expect("read durable observation evidence")
+            .expect("consumed observation row must remain durable");
+        assert_eq!(evidence.observation.observation_id, *observation_id);
+        assert_eq!(evidence.observation.dispatch_id, *dispatch_id);
+        assert_eq!(
+            evidence.observation.native_event_digest_sha256,
+            hex::encode(Sha256::digest(&evidence.raw_event)),
+            "consumed observation raw evidence digest drifted"
+        );
+        let ingestion_state: String = open_raw_adapter_store(database_path)
+            .query_row(
+                "SELECT ingestion_state FROM adapter_observations
+                 WHERE observation_id = ?1 AND dispatch_id = ?2",
+                params![observation_id, dispatch_id],
+                |row| row.get(0),
+            )
+            .expect("read consumed observation ingestion state");
+        assert_eq!(ingestion_state, "consumed");
+        let view = edge
+            .normal_observation_recovery_view(dispatch_id, "single-harness-capability")
+            .expect("read durable observation precondition");
+        assert!(
+            !view
+                .pending
+                .iter()
+                .any(|observation| observation.observation_id == *observation_id),
+            "native side effect ran before the durable observation settled"
+        );
+    }
+}
+
+impl NativeHarnessDriver for ScriptedCountingDriver {
+    fn probe<'a>(
+        &'a mut self,
+        _request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        Box::pin(async { panic!("probe not expected") })
+    }
+
+    fn send_dispatch<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+        _material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        self.assert_required_observation_consumed();
+        self.counts.send.fetch_add(1, Ordering::SeqCst);
+        self.counts
+            .order
+            .lock()
+            .expect("driver order mutex")
+            .push(format!("send:{}", envelope.dispatch_id));
+        let dispatch_id = envelope.dispatch_id.clone();
+        Box::pin(async move {
+            Ok(DriverDelivery {
+                native_request_ref: format!("scripted-request:{dispatch_id}"),
+                native_session_ref: format!("scripted-session:{dispatch_id}"),
+                native_execution_ref: Some(format!("scripted-execution:{dispatch_id}")),
+                raw_evidence: format!("scripted-delivery:{dispatch_id}").into_bytes(),
+            })
+        })
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        self.assert_required_observation_consumed();
+        self.counts.next.fetch_add(1, Ordering::SeqCst);
+        self.counts
+            .order
+            .lock()
+            .expect("driver order mutex")
+            .push(format!("next:{}", envelope.dispatch_id));
+        let event = self.events.pop_front();
+        Box::pin(async move { Ok(event) })
+    }
+
+    fn decide_approval<'a>(
+        &'a mut self,
+        _envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async { panic!("approval not expected") })
+    }
+
+    fn cancel<'a>(
+        &'a mut self,
+        _envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async { panic!("cancel not expected") })
+    }
+
+    fn reconcile<'a>(
+        &'a mut self,
+        _context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        self.counts.reconcile.fetch_add(1, Ordering::SeqCst);
+        self.counts
+            .order
+            .lock()
+            .expect("driver order mutex")
+            .push("reconcile".to_owned());
+        let finding = self.reconciliation_finding.clone();
+        Box::pin(async move { Ok(finding) })
+    }
 }
 
 impl NativeHarnessDriver for CountingRecoveryDriver {
@@ -885,6 +1041,14 @@ fn open_raw_collaboration_store(path: &Path) -> Connection {
     connection
 }
 
+fn open_raw_adapter_store(path: &Path) -> Connection {
+    let connection = Connection::open(path).expect("open encrypted Adapter store");
+    connection
+        .pragma_update(None, "key", format!("x'{}'", hex::encode(ADAPTER_TEST_KEY)))
+        .expect("apply Adapter SQLCipher key");
+    connection
+}
+
 fn open_loop_adapter_edge(path: &Path) -> AdapterEdge {
     open_loop_adapter_edge_for(path, "adapter:codex", "collaboration-loop-adapter-edge-v1")
 }
@@ -987,6 +1151,142 @@ fn contract_ref(id: &str, digest_byte: char) -> ContractReference {
         version: "0.1".to_owned(),
         sha256: digest_byte.to_string().repeat(64),
     }
+}
+
+fn scripted_event(
+    native_key: &str,
+    criticality: ObservationCriticality,
+    payload: harness_observation::Payload,
+) -> DriverEvent {
+    DriverEvent {
+        native_key: native_key.to_owned(),
+        native_event_id: Some(format!("native:{native_key}")),
+        native_sequence: None,
+        native_observed_at: Timestamp {
+            seconds: FIXED_TIME,
+            nanos: 0,
+        },
+        criticality,
+        payload,
+        raw_event: format!("raw:{native_key}").into_bytes(),
+    }
+}
+
+fn scripted_ack_event(native_key: &str) -> DriverEvent {
+    scripted_ack_event_for(native_key, "dispatch-001")
+}
+
+fn scripted_ack_event_for(native_key: &str, dispatch_id: &str) -> DriverEvent {
+    scripted_event(
+        native_key,
+        ObservationCriticality::Control,
+        harness_observation::Payload::Ack(HarnessAckObservation {
+            disposition: AckDisposition::Accepted as i32,
+            ack_receipt_id: format!("ack:{native_key}"),
+            native_session_ref: Some(format!("scripted-session:{dispatch_id}")),
+            native_execution_ref: Some(format!("scripted-execution:{dispatch_id}")),
+        }),
+    )
+}
+
+fn scripted_lifecycle_event(
+    native_key: &str,
+    criticality: ObservationCriticality,
+    kind: LifecycleKind,
+) -> DriverEvent {
+    scripted_event(
+        native_key,
+        criticality,
+        harness_observation::Payload::Lifecycle(LifecycleObservation {
+            kind: kind as i32,
+            native_item_ref: None,
+            safe_status_code: Some(format!("fixture:{native_key}")),
+            side_effect_certainty: SideEffectCertainty::Unknown as i32,
+            native_will_retry: None,
+        }),
+    )
+}
+
+fn adapter_observation(
+    envelope: &DispatchEnvelope,
+    criticality: ObservationCriticality,
+    payload: harness_observation::Payload,
+) -> HarnessObservation {
+    HarnessObservation {
+        adapter_id: "adapter:codex".to_owned(),
+        attempt_id: envelope.attempt_id.clone(),
+        dispatch_id: envelope.dispatch_id.clone(),
+        fencing_token: envelope.fencing_token,
+        capability_profile_id: "single-harness-capability".to_owned(),
+        criticality: criticality as i32,
+        native_observed_at: Some(Timestamp {
+            seconds: FIXED_TIME,
+            nanos: 0,
+        }),
+        adapter_received_at: Some(Timestamp {
+            seconds: FIXED_TIME,
+            nanos: 0,
+        }),
+        payload: Some(payload),
+        ..HarnessObservation::default()
+    }
+}
+
+async fn persist_scripted_delivered_dispatch(
+    collaboration_path: &Path,
+    adapter_path: &Path,
+    workspace_root: &Path,
+    events: Vec<DriverEvent>,
+    pump_count: usize,
+) -> (DispatchEnvelope, Vec<HarnessObservation>, Vec<u8>) {
+    let bundle = br#"{"input":"c2b-durable-recovery"}"#.to_vec();
+    let bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(adapter_path),
+        input_bundle_sha256: bundle_sha256.clone(),
+    };
+    let mut control = open_control_with_guard(collaboration_path, clock.clone(), guard);
+    let leased = advance_through_lease(&mut control);
+    let dispatch = dispatch_command_with_bundle(&leased, &bundle_sha256);
+    control
+        .execute(&dispatch, &attempt_supervisor())
+        .expect("commit scripted dispatch intent");
+    let envelope = control
+        .pending_dispatches(&harness_adapter())
+        .expect("read scripted pending dispatch")
+        .into_iter()
+        .next()
+        .expect("scripted dispatch envelope")
+        .envelope;
+    let mut adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(adapter_path),
+        LoopMaterialResolver {
+            bundle: bundle.clone(),
+            workspace_root: workspace_root.to_owned(),
+        },
+        ScriptedCountingDriver::new(DriverCallCounts::default(), events),
+        clock,
+    );
+    let dispatched = dispatch_pending(&mut control, &mut adapter, &harness_adapter())
+        .await
+        .expect("persist scripted Delivered receipt");
+    assert_eq!(dispatched.dispatches_delivered, 1);
+    assert_eq!(dispatched.observations_seen, 0);
+    let mut observations = Vec::new();
+    for _ in 0..pump_count {
+        observations.push(
+            adapter
+                .pump_one(&envelope)
+                .await
+                .expect("append scripted durable observation")
+                .expect("scripted observation"),
+        );
+    }
+    (envelope, observations, bundle)
 }
 
 fn run_plan() -> RunPlan {
@@ -2310,8 +2610,13 @@ async fn task_activation_runner_leaves_other_routes_pending_and_dispatches_its_m
         .run_once()
         .await
         .expect("resume activation runner cycle");
-    assert_eq!(resumed.terminal_observations, 1);
-    assert_eq!(resumed.terminal_dispatch_ids, [dispatch_id]);
+    assert_eq!(resumed.terminal_observations, 0);
+    let terminal = runner
+        .run_once()
+        .await
+        .expect("resume deferred terminal activation cycle");
+    assert_eq!(terminal.terminal_observations, 1);
+    assert_eq!(terminal.terminal_dispatch_ids, [dispatch_id]);
     assert_eq!(
         source
             .acknowledged
@@ -2622,6 +2927,10 @@ async fn task_activation_runner_retries_verification_gated_return_before_ack() {
         .run_once()
         .await
         .expect("produce durable terminal Harness candidate");
+    runner
+        .run_once()
+        .await
+        .expect("resume deferred terminal Harness candidate");
     artifact_source
         .pending
         .lock()
@@ -2687,6 +2996,391 @@ async fn task_activation_runner_retries_verification_gated_return_before_ack() {
 }
 
 #[tokio::test]
+async fn c2b_generic_restart_drains_durable_ack_before_native_poll_without_resend() {
+    let collaboration_store = IsolatedStore::new("c2b-generic-restart-collaboration");
+    let adapter_store = IsolatedStore::new("c2b-generic-restart-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let (envelope, observations, bundle) = persist_scripted_delivered_dispatch(
+        &collaboration_store.database_path(),
+        &adapter_database,
+        &adapter_store.root,
+        vec![scripted_ack_event("c2b-old-ack")],
+        1,
+    )
+    .await;
+    let durable_ack = &observations[0];
+    assert_eq!(
+        open_loop_adapter_edge(&adapter_database)
+            .normal_observation_recovery_view(&envelope.dispatch_id, "single-harness-capability")
+            .expect("read pending durable ACK")
+            .pending,
+        observations
+    );
+
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+    };
+    let control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let counts = DriverCallCounts::default();
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(counts.clone(), Vec::new()).requiring_consumed(
+            &adapter_database,
+            &envelope.dispatch_id,
+            &durable_ack.observation_id,
+        ),
+        clock,
+    );
+    let runner = GovernedHarnessDispatchRunner::new(control, adapter, harness_adapter());
+    let report = runner
+        .run_once()
+        .await
+        .expect("restart durable-first cycle");
+    assert_eq!(report.observations_seen, 1);
+    assert_eq!(report.observations_consumed, 1);
+    assert_eq!(counts.send.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.next.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.reconcile.load(Ordering::SeqCst), 0);
+    drop(runner);
+
+    let control = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    );
+    assert_eq!(
+        load_snapshot(&control).attempts[0].status,
+        AttemptStatus::Acknowledged as i32
+    );
+    let view = open_loop_adapter_edge(&adapter_database)
+        .normal_observation_recovery_view(&envelope.dispatch_id, "single-harness-capability")
+        .expect("reopen consumed ACK view");
+    assert!(view.pending.is_empty());
+}
+
+#[tokio::test]
+async fn c2b_new_dispatch_is_sent_without_poll_and_rehydrates_delivered_next_cycle() {
+    let collaboration_store = IsolatedStore::new("c2b-new-dispatch-collaboration");
+    let adapter_store = IsolatedStore::new("c2b-new-dispatch-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let bundle = br#"{"input":"c2b-new-dispatch"}"#.to_vec();
+    let bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: bundle_sha256.clone(),
+    };
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let leased = advance_through_lease(&mut control);
+    control
+        .execute(
+            &dispatch_command_with_bundle(&leased, &bundle_sha256),
+            &attempt_supervisor(),
+        )
+        .expect("record C2b new dispatch intent");
+    let counts = DriverCallCounts::default();
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(
+            counts.clone(),
+            vec![scripted_ack_event("c2b-next-cycle-ack")],
+        ),
+        clock,
+    );
+    let runner = GovernedHarnessDispatchRunner::new(control, adapter, harness_adapter());
+    let first = runner.run_once().await.expect("send new dispatch");
+    assert_eq!(first.dispatches_delivered, 1);
+    assert_eq!(first.observations_seen, 0);
+    assert_eq!(counts.send.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.next.load(Ordering::SeqCst), 0);
+
+    let second = runner
+        .run_once()
+        .await
+        .expect("rehydrate delivered dispatch");
+    assert_eq!(second.dispatches_seen, 0);
+    assert_eq!(second.observations_seen, 1);
+    assert_eq!(second.observations_consumed, 1);
+    assert_eq!(counts.send.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.next.load(Ordering::SeqCst), 2);
+    assert_eq!(counts.reconcile.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn c2b_task_runner_consumes_old_durable_ack_before_new_activation_send() {
+    let collaboration_store = IsolatedStore::new("c2b-task-order-collaboration");
+    let adapter_store = IsolatedStore::new("c2b-task-order-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let (old_envelope, old_observations, bundle) = persist_scripted_delivered_dispatch(
+        &collaboration_store.database_path(),
+        &adapter_database,
+        &adapter_store.root,
+        vec![scripted_ack_event("c2b-task-old-ack")],
+        1,
+    )
+    .await;
+    let old_ack = &old_observations[0];
+
+    let mut plan = run_plan();
+    plan.steps[0].step_id = "step-c2b-task-new".to_owned();
+    let mut material = dispatch_material();
+    material.input_bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+    let config = SingleHarnessWorkConfig {
+        run_id: "run-c2b-task-new".to_owned(),
+        attempt_id: "attempt-c2b-task-new".to_owned(),
+        dispatch_id: "dispatch-c2b-task-new".to_owned(),
+        plan,
+        harness_id: "codex".to_owned(),
+        capability_profile_ref: contract_ref("single-harness-capability", '3'),
+        workspace_ref: "workspace-c2b-task-new".to_owned(),
+        lease_policy_ref: contract_ref("v01-attempt-lease", 'a'),
+        owner_instance_id: "attempt-supervisor-c2b-task-new".to_owned(),
+        material,
+        task_authority_principal_id: "task-authority:c2b-task-new".to_owned(),
+        collaboration_principal_id: "collaboration-control:c2b-task-new".to_owned(),
+        attempt_supervisor_principal_id: "attempt-supervisor:c2b-task-new".to_owned(),
+        harness_adapter_principal_id: "adapter:codex".to_owned(),
+    };
+    let task = TaskSnapshot {
+        task_id: "task-c2b-task-new".to_owned(),
+        revision: 2,
+        work_revision: 1,
+        status: TaskStatus::Active as i32,
+        current_run_id: Some(config.run_id.clone()),
+        ..TaskSnapshot::default()
+    };
+    let source = Arc::new(FixtureActivationSource {
+        pending: Mutex::new(vec![TaskActivationHandoff {
+            message_id: "task-outbox-c2b-task-new".to_owned(),
+            payload_digest_sha256: "e".repeat(64),
+            task,
+        }]),
+        acknowledged: Mutex::new(Vec::new()),
+    });
+    let (guard, binding) = TaskActivationGuardSet::new(AdapterBackedHarnessEvidenceResolver::new(
+        open_loop_adapter_edge(&adapter_database),
+    ));
+    let clock = FixedClock::new(FIXED_TIME);
+    let control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let counts = DriverCallCounts::default();
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(counts.clone(), Vec::new()).requiring_consumed(
+            &adapter_database,
+            &old_envelope.dispatch_id,
+            &old_ack.observation_id,
+        ),
+        clock,
+    );
+    let runner = GovernedTaskActivationRunner::new(
+        control,
+        adapter,
+        Arc::clone(&source),
+        FixtureWorkflowResolver(config.clone()),
+        harness_adapter(),
+        binding,
+        30,
+    );
+    let report = runner
+        .run_once()
+        .await
+        .expect("drain old ACK before new activation dispatch");
+    assert_eq!(report.observations_seen, 1);
+    assert_eq!(report.observations_consumed, 1);
+    assert_eq!(report.activations_started, 1);
+    assert_eq!(report.dispatches_delivered, 1);
+    assert_eq!(counts.next.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.send.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.reconcile.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        counts.order.lock().expect("driver order mutex").as_slice(),
+        [
+            "next:dispatch-001".to_owned(),
+            format!("send:{}", config.dispatch_id)
+        ]
+    );
+    assert_eq!(
+        source
+            .acknowledged
+            .lock()
+            .expect("activation acknowledgement mutex")
+            .as_slice(),
+        ["task-outbox-c2b-task-new"]
+    );
+}
+
+#[tokio::test]
+async fn c2b_retained_and_deferred_observations_do_not_cross_later_sequence() {
+    for (label, first) in [
+        (
+            "retained",
+            scripted_lifecycle_event(
+                "c2b-retained",
+                ObservationCriticality::Control,
+                LifecycleKind::ExecutionInterrupted,
+            ),
+        ),
+        (
+            "deferred",
+            scripted_lifecycle_event(
+                "c2b-deferred",
+                ObservationCriticality::Control,
+                LifecycleKind::ExecutionCompleted,
+            ),
+        ),
+    ] {
+        let collaboration_store = IsolatedStore::new(&format!("c2b-{label}-collaboration"));
+        let adapter_store = IsolatedStore::new(&format!("c2b-{label}-adapter"));
+        let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+        let (envelope, observations, bundle) = persist_scripted_delivered_dispatch(
+            &collaboration_store.database_path(),
+            &adapter_database,
+            &adapter_store.root,
+            vec![first, scripted_ack_event(&format!("c2b-{label}-later"))],
+            2,
+        )
+        .await;
+        let clock = FixedClock::new(FIXED_TIME);
+        let guard = AdapterBackedFixtureGuard {
+            edge: open_loop_adapter_edge(&adapter_database),
+            input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+        };
+        let control =
+            open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+        let counts = DriverCallCounts::default();
+        let adapter = GovernedHarnessAdapter::new(
+            "adapter:codex",
+            "single-harness-capability",
+            codex_protocol_fingerprint(),
+            open_loop_adapter_edge(&adapter_database),
+            LoopMaterialResolver {
+                bundle,
+                workspace_root: adapter_store.root.clone(),
+            },
+            ScriptedCountingDriver::new(counts.clone(), Vec::new()),
+            clock,
+        );
+        let runner = GovernedHarnessDispatchRunner::new(control, adapter, harness_adapter());
+        let report = runner.run_once().await.expect("durable replay barrier");
+        assert_eq!(report.observations_seen, 1, "{label}");
+        assert_eq!(report.observations_retained, 1, "{label}");
+        assert_eq!(counts.next.load(Ordering::SeqCst), 0, "{label}");
+        assert_eq!(counts.send.load(Ordering::SeqCst), 0, "{label}");
+        drop(runner);
+
+        let view = open_loop_adapter_edge(&adapter_database)
+            .normal_observation_recovery_view(&envelope.dispatch_id, "single-harness-capability")
+            .expect("reopen blocked observation view");
+        assert_eq!(view.pending, observations, "{label}");
+    }
+}
+
+#[tokio::test]
+async fn c2b_earliest_terminal_barrier_survives_reopen_pending_or_consumed() {
+    for terminal_consumed in [false, true] {
+        let label = if terminal_consumed {
+            "consumed"
+        } else {
+            "pending"
+        };
+        let collaboration_store =
+            IsolatedStore::new(&format!("c2b-terminal-{label}-collaboration"));
+        let adapter_store = IsolatedStore::new(&format!("c2b-terminal-{label}-adapter"));
+        let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+        let (envelope, observations, bundle) = persist_scripted_delivered_dispatch(
+            &collaboration_store.database_path(),
+            &adapter_database,
+            &adapter_store.root,
+            vec![
+                scripted_lifecycle_event(
+                    &format!("c2b-terminal-{label}"),
+                    ObservationCriticality::Terminal,
+                    LifecycleKind::ExecutionCompleted,
+                ),
+                scripted_ack_event(&format!("c2b-after-terminal-{label}")),
+            ],
+            2,
+        )
+        .await;
+        if terminal_consumed {
+            let mut edge = open_loop_adapter_edge(&adapter_database);
+            edge.mark_observation_consumed(&observations[0].observation_id)
+                .expect("fault fixture consumes terminal before restart");
+        }
+
+        let clock = FixedClock::new(FIXED_TIME);
+        let guard = AdapterBackedFixtureGuard {
+            edge: open_loop_adapter_edge(&adapter_database),
+            input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+        };
+        let control =
+            open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+        let counts = DriverCallCounts::default();
+        let adapter = GovernedHarnessAdapter::new(
+            "adapter:codex",
+            "single-harness-capability",
+            codex_protocol_fingerprint(),
+            open_loop_adapter_edge(&adapter_database),
+            LoopMaterialResolver {
+                bundle,
+                workspace_root: adapter_store.root.clone(),
+            },
+            ScriptedCountingDriver::new(counts.clone(), Vec::new()),
+            clock,
+        );
+        let runner = GovernedHarnessDispatchRunner::new(control, adapter, harness_adapter());
+        let report = runner.run_once().await.expect("terminal durable barrier");
+        assert_eq!(
+            report.observations_seen,
+            u64::from(!terminal_consumed),
+            "{label}"
+        );
+        assert_eq!(counts.next.load(Ordering::SeqCst), 0, "{label}");
+        assert_eq!(counts.reconcile.load(Ordering::SeqCst), 0, "{label}");
+        drop(runner);
+
+        let view = open_loop_adapter_edge(&adapter_database)
+            .normal_observation_recovery_view(&envelope.dispatch_id, "single-harness-capability")
+            .expect("reopen terminal barrier");
+        assert_eq!(
+            view.durable_terminal_sequence,
+            Some(observations[0].observation_sequence)
+        );
+        assert!(
+            view.pending
+                .iter()
+                .any(|observation| observation.observation_id == observations[1].observation_id),
+            "later observation crossed the terminal barrier"
+        );
+    }
+}
+
+#[tokio::test]
 async fn fake_adapter_consumes_collaboration_outbox_and_settles_durable_candidates() {
     let collaboration_store = IsolatedStore::new("collaboration-adapter-loop-authority");
     let adapter_store = IsolatedStore::new("collaboration-adapter-loop-edge");
@@ -2731,8 +3425,13 @@ async fn fake_adapter_consumes_collaboration_outbox_and_settles_durable_candidat
         .expect("run provider-neutral dispatch cycle");
     assert_eq!(cycle.dispatches_seen, 1);
     assert_eq!(cycle.dispatches_delivered, 1);
-    assert_eq!(cycle.observations_seen, 3);
-    assert_eq!(cycle.observations_deferred, 1);
+    assert_eq!(cycle.observations_seen, 0);
+    let observation_cycle =
+        pump_observations(&mut control, &mut adapter, &envelope, &harness_adapter())
+            .await
+            .expect("replay and poll delivered observations");
+    assert_eq!(observation_cycle.observations_seen, 3);
+    assert_eq!(observation_cycle.observations_deferred, 1);
 
     let snapshot = load_snapshot(&control);
     assert_eq!(
@@ -2765,25 +3464,290 @@ async fn fake_adapter_consumes_collaboration_outbox_and_settles_durable_candidat
         )
         .await
         .expect("deliver cancellation by dispatch ID");
-    let cancellation_cycle =
-        pump_observations(&mut control, &mut adapter, &envelope, &harness_adapter())
-            .await
-            .expect("confirm cancellation from durable Adapter interruption");
-    assert_eq!(cancellation_cycle.observations_seen, 1);
-    assert_eq!(cancellation_cycle.observations_consumed, 1);
-    let cancelled_snapshot = load_snapshot(&control);
     assert_eq!(
-        cancelled_snapshot.attempts[0].status,
-        AttemptStatus::Cancelled as i32
-    );
-    assert!(
-        adapter
-            .pending_observations()
-            .expect("pending observations")
-            .is_empty()
+        load_snapshot(&control).attempts[0].status,
+        AttemptStatus::CancellationPending as i32
     );
     assert_eq!(adapter.driver().dispatch_count(), 1);
     assert_eq!(adapter.driver().cancel_count(), 1);
+    assert_eq!(
+        open_loop_adapter_edge(&adapter_database)
+            .inspect()
+            .expect("inspect durable cancellation transport")
+            .cancellation_count,
+        1
+    );
+}
+
+#[tokio::test]
+async fn c2b_cancellation_held_is_drain_only_and_interruption_disappears_after_settlement() {
+    let collaboration_store = IsolatedStore::new("c2b-cancellation-collaboration");
+    let adapter_store = IsolatedStore::new("c2b-cancellation-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let (envelope, _, bundle) = persist_scripted_delivered_dispatch(
+        &collaboration_store.database_path(),
+        &adapter_database,
+        &adapter_store.root,
+        Vec::new(),
+        0,
+    )
+    .await;
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+    };
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let cancellation = committed_snapshot(
+        &control
+            .execute(
+                &cancellation_request(&load_snapshot(&control)),
+                &attempt_supervisor(),
+            )
+            .expect("request C2b cancellation"),
+    );
+    assert_eq!(
+        cancellation.attempts[0].status,
+        AttemptStatus::CancellationPending as i32
+    );
+    let held = control
+        .held_dispatches_for_recovery(&recovery_worker())
+        .expect("read cancellation held candidate");
+    assert_eq!(held.len(), 1);
+    assert_eq!(
+        held[0].state,
+        HeldDispatchRecoveryState::CancellationPending
+    );
+    drop(control);
+
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+    };
+    let control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let empty_counts = DriverCallCounts::default();
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle: bundle.clone(),
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(empty_counts.clone(), Vec::new()),
+        clock.clone(),
+    );
+    let runner = GovernedHarnessDispatchRunner::new(control, adapter, harness_adapter());
+    let empty = runner
+        .run_once()
+        .await
+        .expect("drain empty cancellation hold");
+    assert_eq!(empty.observations_seen, 0);
+    assert_eq!(empty_counts.next.load(Ordering::SeqCst), 0);
+    assert_eq!(empty_counts.reconcile.load(Ordering::SeqCst), 0);
+    drop(runner);
+    let control = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    );
+    assert_eq!(
+        load_snapshot(&control).attempts[0].status,
+        AttemptStatus::CancellationPending as i32
+    );
+    drop(control);
+
+    let append_counts = DriverCallCounts::default();
+    let mut adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle: bundle.clone(),
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(
+            append_counts,
+            vec![scripted_lifecycle_event(
+                "c2b-cancellation-interrupted",
+                ObservationCriticality::Terminal,
+                LifecycleKind::ExecutionInterrupted,
+            )],
+        ),
+        clock.clone(),
+    );
+    adapter
+        .pump_one(&envelope)
+        .await
+        .expect("append cancellation interruption")
+        .expect("durable cancellation interruption");
+    drop(adapter);
+
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+    };
+    let control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let drain_counts = DriverCallCounts::default();
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(drain_counts.clone(), Vec::new()),
+        clock,
+    );
+    let runner = GovernedHarnessDispatchRunner::new(control, adapter, harness_adapter());
+    let settled = runner
+        .run_once()
+        .await
+        .expect("settle durable cancellation interruption");
+    assert_eq!(settled.observations_seen, 1);
+    assert_eq!(settled.observations_consumed, 1);
+    assert_eq!(drain_counts.next.load(Ordering::SeqCst), 0);
+    assert_eq!(drain_counts.reconcile.load(Ordering::SeqCst), 0);
+    drop(runner);
+
+    let control = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    );
+    assert_eq!(
+        load_snapshot(&control).attempts[0].status,
+        AttemptStatus::Cancelled as i32
+    );
+    assert!(
+        control
+            .held_dispatches_for_recovery(&recovery_worker())
+            .expect("cancellation candidate disappeared")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn c2b_adapter_proof_drift_and_stale_collaboration_candidate_never_poll_or_write() {
+    let collaboration_store = IsolatedStore::new("c2b-proof-drift-collaboration");
+    let adapter_store = IsolatedStore::new("c2b-proof-drift-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let (_envelope, _, bundle) = persist_scripted_delivered_dispatch(
+        &collaboration_store.database_path(),
+        &adapter_database,
+        &adapter_store.root,
+        Vec::new(),
+        0,
+    )
+    .await;
+    assert_eq!(
+        open_raw_adapter_store(&adapter_database)
+            .execute(
+                "UPDATE adapter_dispatches SET fencing_token = fencing_token + 1
+                 WHERE dispatch_id = 'dispatch-001'",
+                [],
+            )
+            .expect("tamper Adapter delivered proof"),
+        1
+    );
+    let before = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    )
+    .inspect_store()
+    .expect("inspect before Adapter proof rejection");
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+    };
+    let control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let drift_counts = DriverCallCounts::default();
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(drift_counts.clone(), Vec::new()),
+        clock,
+    );
+    let runner = GovernedHarnessDispatchRunner::new(control, adapter, harness_adapter());
+    assert!(runner.run_once().await.is_err());
+    assert_eq!(drift_counts.next.load(Ordering::SeqCst), 0);
+    assert_eq!(drift_counts.send.load(Ordering::SeqCst), 0);
+    assert_eq!(drift_counts.reconcile.load(Ordering::SeqCst), 0);
+    drop(runner);
+    assert_eq!(
+        open_control(
+            &collaboration_store.database_path(),
+            FixedClock::new(FIXED_TIME),
+        )
+        .inspect_store()
+        .expect("inspect after Adapter proof rejection"),
+        before
+    );
+
+    let collaboration_store = IsolatedStore::new("c2b-stale-candidate-collaboration");
+    let adapter_store = IsolatedStore::new("c2b-stale-candidate-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let (envelope, _, bundle) = persist_scripted_delivered_dispatch(
+        &collaboration_store.database_path(),
+        &adapter_database,
+        &adapter_store.root,
+        Vec::new(),
+        0,
+    )
+    .await;
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+    };
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let snapshot = load_snapshot(&control);
+    control
+        .execute(&cancellation_request(&snapshot), &attempt_supervisor())
+        .expect("make Collaboration delivered candidate stale");
+    let before = control
+        .inspect_store()
+        .expect("inspect stale candidate baseline");
+    let stale_counts = DriverCallCounts::default();
+    let mut adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(stale_counts.clone(), Vec::new()),
+        clock,
+    );
+    let report = pump_observations(&mut control, &mut adapter, &envelope, &harness_adapter())
+        .await
+        .expect("retire stale Collaboration candidate");
+    assert_eq!(report.observations_seen, 0);
+    assert_eq!(stale_counts.next.load(Ordering::SeqCst), 0);
+    assert_eq!(stale_counts.send.load(Ordering::SeqCst), 0);
+    assert_eq!(stale_counts.reconcile.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        control
+            .inspect_store()
+            .expect("inspect after stale candidate retirement"),
+        before
+    );
 }
 
 #[tokio::test]
@@ -2955,6 +3919,8 @@ async fn assert_runner_recovers_held_dispatch(
     expected_attempt_status: AttemptStatus,
     expected_task_finding: bool,
     prebegin_without_evidence: bool,
+    block_with_pending_observation: bool,
+    expected_reconcile_count: u64,
 ) {
     let collaboration_store = IsolatedStore::new("runner-held-recovery-collaboration");
     let adapter_store = IsolatedStore::new("runner-held-recovery-adapter");
@@ -3053,6 +4019,27 @@ async fn assert_runner_recovers_held_dispatch(
             )
             .expect("prebegin reconciliation");
     }
+    if block_with_pending_observation {
+        let mut edge = open_loop_adapter_edge(&adapter_database);
+        edge.append_observation(
+            &envelope.dispatch_id,
+            "c2b-held-retained-barrier",
+            b"c2b-held-retained-barrier",
+            adapter_observation(
+                &envelope,
+                ObservationCriticality::Control,
+                harness_observation::Payload::Lifecycle(LifecycleObservation {
+                    kind: LifecycleKind::ExecutionInterrupted as i32,
+                    native_item_ref: None,
+                    safe_status_code: Some("fixture:held-barrier".to_owned()),
+                    side_effect_certainty: SideEffectCertainty::Unknown as i32,
+                    native_will_retry: None,
+                }),
+            ),
+            FIXED_TIME,
+        )
+        .expect("append held durable replay barrier");
+    }
     drop(control);
 
     let (guard, _) = TaskActivationGuardSet::new(AdapterBackedHarnessEvidenceResolver::new(
@@ -3093,16 +4080,37 @@ async fn assert_runner_recovers_held_dispatch(
         first_cycle.held_dispatch_ids.as_slice(),
         std::slice::from_ref(&envelope.dispatch_id)
     );
-    assert_eq!(first_cycle.observations_seen, 0);
+    if block_with_pending_observation {
+        assert_eq!(first_cycle.observations_seen, u64::from(true));
+        assert_eq!(first_cycle.observations_retained, u64::from(true));
+    } else {
+        assert_eq!(first_cycle.observations_seen, u64::from(false));
+        assert_eq!(first_cycle.observations_retained, u64::from(false));
+    }
     assert_eq!(
         first_cycle.task_recovery_findings.len(),
         usize::from(expected_task_finding)
     );
     let second_cycle = runner.run_once().await.expect("replay held recovery");
     assert!(second_cycle.terminal_dispatch_ids.is_empty());
+    if block_with_pending_observation {
+        assert_eq!(
+            second_cycle.observations_seen,
+            u64::from(true),
+            "the retained normal barrier is retried once per recovery cycle"
+        );
+        assert_eq!(second_cycle.observations_retained, u64::from(true));
+    } else {
+        assert_eq!(
+            second_cycle.observations_seen,
+            u64::from(false),
+            "reconciliation:* evidence must not enter normal replay"
+        );
+        assert_eq!(second_cycle.observations_retained, u64::from(false));
+    }
     assert_eq!(
         reconcile_count.load(Ordering::SeqCst),
-        u64::from(!prebegin_without_evidence)
+        expected_reconcile_count
     );
     drop(runner);
 
@@ -3373,8 +4381,8 @@ async fn begin_delivery_without_receipt_recovers_unknown_without_resend_or_pump(
     );
     assert!(first.terminal_dispatch_ids.is_empty());
     assert_eq!(first.observations_seen, 0);
-    assert_eq!(first.task_recovery_findings.len(), 1);
-    assert_eq!(reconcile_count.load(Ordering::SeqCst), 1);
+    assert!(first.task_recovery_findings.is_empty());
+    assert_eq!(reconcile_count.load(Ordering::SeqCst), 0);
     let replay = runner
         .run_once()
         .await
@@ -3382,6 +4390,7 @@ async fn begin_delivery_without_receipt_recovers_unknown_without_resend_or_pump(
     assert_eq!(replay.dispatches_seen, 0);
     assert!(replay.terminal_dispatch_ids.is_empty());
     assert_eq!(replay.observations_seen, 0);
+    assert_eq!(replay.task_recovery_findings.len(), 1);
     assert_eq!(reconcile_count.load(Ordering::SeqCst), 1);
     drop(runner);
 
@@ -3429,6 +4438,8 @@ async fn runner_records_no_effect_without_task_interruption_or_redispatch() {
         AttemptStatus::Interrupted,
         false,
         false,
+        false,
+        1,
     )
     .await;
 }
@@ -3443,6 +4454,8 @@ async fn runner_maps_unknown_reconciliation_to_manual_hold_and_durable_task_find
         AttemptStatus::Held,
         true,
         false,
+        false,
+        1,
     )
     .await;
 }
@@ -3457,6 +4470,24 @@ async fn reconciling_without_durable_evidence_stays_held_without_native_reconcil
         AttemptStatus::Reconciling,
         true,
         true,
+        false,
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn held_outcome_unknown_with_pending_barrier_never_reconciles_or_polls() {
+    assert_runner_recovers_held_dispatch(
+        ReconciliationFinding::OutcomeUnknown {
+            evidence_ref: "unused-behind-durable-barrier".to_owned(),
+        },
+        RunStatus::Held,
+        AttemptStatus::OutcomeUnknown,
+        true,
+        false,
+        true,
+        0,
     )
     .await;
 }
