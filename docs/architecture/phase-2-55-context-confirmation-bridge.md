@@ -293,3 +293,51 @@ OutcomeUnknown/Reconciliation/Hold processing, drain pending observations,
 and restore Task recovery settlement without using runner memory or logs.
 R-8B.2 must never call `send_dispatch` again for a delivery-unknown or delivered
 dispatch, and it does not require a Proto change under the current contracts.
+
+## R-8B.2a/b governed delivery-unknown recovery checkpoint (2026-08-30)
+
+R-8B.2a freezes, and R-8B.2b implements, the internal recovery bridge for a
+dispatch whose external-delivery result is no longer safe to infer from process
+memory. The bridge does not change Proto and does not give Adapter Edge authority
+to mutate Collaboration state. Adapter Edge remains the durable owner of the
+dispatch envelope, delivery receipt, native reconciliation evidence and the
+Collaboration-owned Task lineage bound to that dispatch. Collaboration Control
+remains the single writer for Run, Step and Attempt recovery transitions.
+
+The production runner now reconstructs held work from durable Collaboration
+outbox facts and validates Adapter evidence through a typed resolver. An Unknown
+receipt is accepted only when Adapter identity, dispatch, attempt, fencing token,
+capability profile, envelope and Task/work lineage all match the current
+Collaboration snapshot. Unknown ingestion idempotently commits
+`OutcomeUnknown`; recovery begins reconciliation once, records a durable
+conservative disposition, and replays that evidence after restart. A
+`Reconciling` attempt without durable evidence remains held and does not repeat
+the native reconciliation call.
+
+The frozen disposition mapping is deliberately conservative:
+
+- `NoEffectProven` remains `NoEffectProven` and only makes a future governed
+  retry eligible; it neither redispatches nor creates an Attempt;
+- `NativeExecutionActive`, `TerminalObservationRecovered` and `OutcomeUnknown`
+  become `ManualOnly` holds;
+- `ResumeSafe`, `ReturnFound`, `RetryIdempotent` and `IrreversibleUnknown` are not
+  emitted by this slice.
+
+Only a durable `Delivered` receipt may enter observation polling. `Unknown`
+becomes held; a missing receipt, `Rejected`/`ProvenNotSent`, or any other
+non-Delivered value cannot call `next_event`. Receipt replay also cannot call
+`send_dispatch` again. Held and terminal dispatch identities are separate, and a
+stable Task recovery finding can interrupt the Task through Task Authority but
+can never complete, accept, verify or release it. `NoEffectProven` leaves the Run
+active and produces no Task interruption.
+
+The local production-component evidence covers Unknown receipt creation from a
+`begin_delivery` record with no receipt, zero resend and zero observation pump,
+single native reconciliation with durable replay, conservative Task settlement,
+Rejected replay without resend/pump, and fail-closed Adapter-ID, fencing-token
+and Task-lineage tamper cases. This is not yet the complete R-8B.2 claim.
+R-8B.2c must still prove the same invariants with a real Windows daemon hard kill
+and same-root/same-instance restart, and must separately rebuild polling for a
+dispatch that already has a durable Delivered receipt. Canonical outbox-payload
+and receipt-digest recomputation remain integrity hardening beyond the current
+controlled Adapter/Collaboration store trust boundary.

@@ -133,9 +133,23 @@ pub struct ResolvedHarnessEvidence {
     pub evidence_refs: Vec<String>,
 }
 
+pub const DELIVERY_OUTCOME_UNKNOWN_REASON_CODE: &str = "HARNESS_DELIVERY_OUTCOME_UNKNOWN";
+
 /// Provider-neutral read port for immutable evidence owned by a Harness Adapter.
 /// Collaboration never reads an Adapter database and never receives provider-private types.
 pub trait HarnessEvidenceResolver {
+    /// Proves that an Adapter-owned durable delivery receipt records an
+    /// unknown outcome for the exact Collaboration attempt. The default is
+    /// fail-closed so a reference guard cannot authorize recovery by itself.
+    fn validate_delivery_unknown(
+        &self,
+        command: &MarkAttemptOutcomeUnknownCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        let _ = (command, snapshot);
+        Err(ReferenceGuardRejection::UnverifiedReference)
+    }
+
     fn resolve_delivery_receipt(
         &self,
         command: &RecordDeliveryReceiptCommand,
@@ -293,6 +307,22 @@ pub struct PendingDispatch {
     pub source_event_id: String,
     pub canonical_payload_digest_sha256: String,
     pub envelope: DispatchEnvelope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeldDispatchRecoveryState {
+    OutcomeUnknown,
+    Reconciling { reconciliation_id: String },
+    Held,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeldDispatchForRecovery {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub canonical_payload_digest_sha256: String,
+    pub envelope: DispatchEnvelope,
+    pub state: HeldDispatchRecoveryState,
 }
 
 /// Typed, digest-checked evidence handed from Task Authority to the
@@ -596,6 +626,82 @@ where
                 })
             })
             .collect()
+    }
+
+    pub fn held_dispatches_for_recovery(
+        &self,
+        principal: &AuthenticatedCollaborationPrincipal,
+    ) -> Result<Vec<HeldDispatchForRecovery>, CollaborationControlError> {
+        if !principal.authenticated
+            || !matches!(
+                principal.kind,
+                CollaborationPrincipalKind::RecoveryWorker
+                    | CollaborationPrincipalKind::CollaborationControl
+            )
+            || principal.principal_id.trim().is_empty()
+        {
+            return Err(CollaborationControlError::DispatchPollNotAuthorized);
+        }
+        let mut recovery = Vec::new();
+        for record in self.store.held_dispatches()? {
+            let envelope = DispatchEnvelope::decode(record.payload.as_slice())?;
+            let Some(snapshot) = self.load_snapshot(&envelope.run_id)? else {
+                return Err(CollaborationControlError::Persistence);
+            };
+            let run = snapshot
+                .run
+                .as_ref()
+                .filter(|run| run.run_id == envelope.run_id)
+                .ok_or(CollaborationControlError::Persistence)?;
+            let attempt = snapshot
+                .attempts
+                .iter()
+                .find(|attempt| attempt.attempt_id == envelope.attempt_id)
+                .ok_or(CollaborationControlError::Persistence)?;
+            if attempt.dispatch_id.as_deref() != Some(envelope.dispatch_id.as_str()) {
+                return Err(CollaborationControlError::Persistence);
+            }
+            let state = match AttemptStatus::try_from(attempt.status) {
+                Ok(AttemptStatus::OutcomeUnknown) => HeldDispatchRecoveryState::OutcomeUnknown,
+                Ok(AttemptStatus::Reconciling) => {
+                    let event = self
+                        .store
+                        .latest_event_blob(&envelope.run_id)?
+                        .ok_or(CollaborationControlError::Persistence)?;
+                    let event = CollaborationEvent::decode(event.as_slice())?;
+                    if event.kind != CollaborationEventKind::ReconciliationStarted as i32
+                        || event.attempt_id.as_deref() != Some(attempt.attempt_id.as_str())
+                    {
+                        return Err(CollaborationControlError::Persistence);
+                    }
+                    let mut ids = event.evidence_refs.iter().filter_map(|value| {
+                        value
+                            .strip_prefix("reconciliation:")
+                            .filter(|id| !id.trim().is_empty())
+                    });
+                    let reconciliation_id = ids
+                        .next()
+                        .ok_or(CollaborationControlError::Persistence)?
+                        .to_owned();
+                    if ids.next().is_some() {
+                        return Err(CollaborationControlError::Persistence);
+                    }
+                    HeldDispatchRecoveryState::Reconciling { reconciliation_id }
+                }
+                Ok(AttemptStatus::Held) if run.status == RunStatus::Held as i32 => {
+                    HeldDispatchRecoveryState::Held
+                }
+                _ => continue,
+            };
+            recovery.push(HeldDispatchForRecovery {
+                message_id: record.message_id,
+                source_event_id: record.source_event_id,
+                canonical_payload_digest_sha256: record.canonical_payload_digest_sha256,
+                envelope,
+                state,
+            });
+        }
+        Ok(recovery)
     }
 
     pub fn pending_projection_messages(

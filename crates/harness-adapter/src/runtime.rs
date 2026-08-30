@@ -804,6 +804,13 @@ where
             .transpose()
     }
 
+    pub fn stored_dispatch_receipt(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<DispatchReceipt>, GovernedAdapterError> {
+        Ok(self.edge.dispatch_receipt(dispatch_id)?)
+    }
+
     pub fn observations_after(
         &self,
         sequence: u64,

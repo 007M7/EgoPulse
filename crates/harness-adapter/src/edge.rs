@@ -228,6 +228,13 @@ pub struct AdapterObservationEvidence {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchTaskLineage {
+    pub task_id: String,
+    pub task_revision: u64,
+    pub work_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingAdapterApprovalProjection {
     pub message_id: String,
     pub source_observation_id: String,
@@ -359,6 +366,11 @@ impl AdapterEdge {
             connection,
             adapter_id: config.adapter_id,
         })
+    }
+
+    #[must_use]
+    pub fn adapter_id(&self) -> &str {
+        &self.adapter_id
     }
 
     pub fn prepare_dispatch(
@@ -531,6 +543,37 @@ impl AdapterEdge {
         } else {
             Err(AdapterEdgeError::DispatchConflict)
         }
+    }
+
+    pub fn dispatch_task_lineage(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<DispatchTaskLineage>, AdapterEdgeError> {
+        let value: Option<(String, i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT task_id, task_revision, work_revision
+                 FROM adapter_dispatch_task_lineage WHERE dispatch_id = ?1",
+                [dispatch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        value
+            .map(|(task_id, task_revision, work_revision)| {
+                let task_revision =
+                    u64::try_from(task_revision).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+                let work_revision =
+                    u64::try_from(work_revision).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+                if task_id.trim().is_empty() || task_revision == 0 || work_revision == 0 {
+                    return Err(AdapterEdgeError::IntegrityFailure);
+                }
+                Ok(DispatchTaskLineage {
+                    task_id,
+                    task_revision,
+                    work_revision,
+                })
+            })
+            .transpose()
     }
 
     pub fn append_observation_with_terminal_output(

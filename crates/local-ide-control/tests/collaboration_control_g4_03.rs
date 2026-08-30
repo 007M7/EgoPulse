@@ -14,23 +14,28 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    AckDisposition, DeliveryDisposition, DispatchEnvelope, DispatchReceipt, HarnessAckObservation,
-    HarnessObservation, LifecycleKind, LifecycleObservation, NativeSessionStrategy,
-    ObservationCriticality, SideEffectCertainty, dispatch_result, harness_observation,
+    AckDisposition, ApprovalDecisionEnvelope, CancelExecutionEnvelope, DeliveryDisposition,
+    DispatchEnvelope, DispatchReceipt, HarnessAckObservation, HarnessErrorCode, HarnessObservation,
+    LifecycleKind, LifecycleObservation, NativeSessionStrategy, ObservationCriticality,
+    ProbeHarnessRequest, ProbeHarnessResult, SideEffectCertainty, dispatch_result,
+    harness_observation,
 };
 use egopulse_domain_contracts::v01::egopulse::task::v1::{TaskSnapshot, TaskStatus};
 use egopulse_harness_adapter::{
     AdapterClock, AdapterEdge, AdapterEdgeConfig, AdapterEdgeKey, DispatchMaterialResolver,
-    GovernedHarnessAdapter, ReconciliationFinding, ResolvedDispatchMaterial,
+    DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, GovernedHarnessAdapter,
+    NativeHarnessDriver, NativeHarnessFuture, ReconciliationContext, ReconciliationFinding,
+    ResolvedDispatchMaterial,
 };
 use egopulse_local_ide_control::collaboration_control::{
     AdapterBackedHarnessEvidenceResolver, ArtifactReturnSource,
     AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
     CollaborationControlConfig, CollaborationControlError, CollaborationPrincipalKind,
     CollaborationReferenceGuard, CollaborationSqlCipherKey, CompositeCollaborationGuard,
-    DispatchMaterial, GovernedTaskActivationRunner, HarnessDispatchRunner, HarnessEvidenceResolver,
-    HarnessFactIngestionDisposition, LeaseAuthorization, PendingArtifactReturn,
-    ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
+    DELIVERY_OUTCOME_UNKNOWN_REASON_CODE, DispatchMaterial, GovernedHarnessDispatchRunner,
+    GovernedTaskActivationRunner, HarnessDispatchRunner, HarnessEvidenceResolver,
+    HarnessFactIngestionDisposition, HeldDispatchRecoveryState, LeaseAuthorization,
+    PendingArtifactReturn, ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
     ResolvedHarnessEvidence, ResolvedStepReturn, SingleHarnessWorkConfig,
     SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
     SingleHarnessWorkflowResolverError, TaskActivationGuardSet, TaskActivationHandoff,
@@ -44,6 +49,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -76,6 +82,113 @@ impl AuthorityClock for FixedClock {
 impl AdapterClock for FixedClock {
     fn now(&self) -> Timestamp {
         *self.0.lock().expect("clock mutex")
+    }
+}
+
+struct CountingRecoveryDriver {
+    reconcile_count: Arc<AtomicU64>,
+    finding: ReconciliationFinding,
+}
+
+impl NativeHarnessDriver for CountingRecoveryDriver {
+    fn probe<'a>(
+        &'a mut self,
+        _request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        Box::pin(async { panic!("probe not expected") })
+    }
+    fn send_dispatch<'a>(
+        &'a mut self,
+        _envelope: &'a DispatchEnvelope,
+        _material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        Box::pin(async { panic!("held dispatch must never be sent") })
+    }
+    fn next_event<'a>(
+        &'a mut self,
+        _envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        Box::pin(async { panic!("held dispatch must never pump native observations") })
+    }
+    fn decide_approval<'a>(
+        &'a mut self,
+        _envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async { panic!("approval not expected") })
+    }
+    fn cancel<'a>(
+        &'a mut self,
+        _envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async { panic!("cancel not expected") })
+    }
+    fn reconcile<'a>(
+        &'a mut self,
+        _context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        self.reconcile_count.fetch_add(1, Ordering::SeqCst);
+        let finding = self.finding.clone();
+        Box::pin(async move { Ok(finding) })
+    }
+}
+
+struct ProvenNotSentDriver {
+    send_count: Arc<AtomicU64>,
+    next_event_count: Arc<AtomicU64>,
+}
+
+impl NativeHarnessDriver for ProvenNotSentDriver {
+    fn probe<'a>(
+        &'a mut self,
+        _request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        Box::pin(async { panic!("probe not expected") })
+    }
+
+    fn send_dispatch<'a>(
+        &'a mut self,
+        _envelope: &'a DispatchEnvelope,
+        _material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        self.send_count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(DriverError {
+                certainty: DriverErrorCertainty::ProvenNotSent,
+                code: HarnessErrorCode::DependencyUnavailable,
+                safe_detail_code: "FIXTURE_PROVEN_NOT_SENT".to_owned(),
+                error_fingerprint: None,
+                raw_evidence: b"fixture-proven-not-sent".to_vec(),
+            })
+        })
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        _envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        self.next_event_count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(None) })
+    }
+
+    fn decide_approval<'a>(
+        &'a mut self,
+        _envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async { panic!("approval not expected") })
+    }
+
+    fn cancel<'a>(
+        &'a mut self,
+        _envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async { panic!("cancel not expected") })
+    }
+
+    fn reconcile<'a>(
+        &'a mut self,
+        _context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        Box::pin(async { panic!("reconciliation not expected") })
     }
 }
 
@@ -2393,6 +2506,538 @@ async fn durable_adapter_reconciliation_evidence_recovers_outcome_unknown_author
     assert!(replayed.replayed);
     assert_eq!(replayed.evidence_id, evidence.evidence_id);
     assert_eq!(adapter.driver().reconcile_count(), 1);
+}
+
+fn unknown_dispatch_receipt(envelope: &DispatchEnvelope, receipt_id: &str) -> DispatchReceipt {
+    DispatchReceipt {
+        receipt_id: receipt_id.to_owned(),
+        disposition: DeliveryDisposition::Unknown as i32,
+        attempt_id: envelope.attempt_id.clone(),
+        dispatch_id: envelope.dispatch_id.clone(),
+        fencing_token: envelope.fencing_token,
+        adapter_id: "adapter:codex".to_owned(),
+        capability_profile_id: "single-harness-capability".to_owned(),
+        observed_protocol: Some(codex_protocol_fingerprint()),
+        receipt_digest_sha256: "9".repeat(64),
+        evidence_ref: "fixture://delivery-unknown".to_owned(),
+        delivered_at: Some(Timestamp {
+            seconds: FIXED_TIME,
+            nanos: 0,
+        }),
+        ..Default::default()
+    }
+}
+
+async fn assert_runner_recovers_held_dispatch(
+    finding: ReconciliationFinding,
+    expected_run_status: RunStatus,
+    expected_attempt_status: AttemptStatus,
+    expected_task_finding: bool,
+    prebegin_without_evidence: bool,
+) {
+    let collaboration_store = IsolatedStore::new("runner-held-recovery-collaboration");
+    let adapter_store = IsolatedStore::new("runner-held-recovery-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut setup = open_control(&collaboration_store.database_path(), clock.clone());
+    let (pending, _) = advance_through_dispatch(&mut setup);
+    let envelope = setup
+        .pending_dispatches(&harness_adapter())
+        .expect("pending dispatch")
+        .into_iter()
+        .next()
+        .expect("dispatch envelope")
+        .envelope;
+    let run = pending.run.as_ref().expect("run");
+    let mut edge = open_loop_adapter_edge(&adapter_database);
+    edge.prepare_dispatch(&envelope, FIXED_TIME)
+        .expect("prepare unknown dispatch");
+    edge.begin_delivery(&envelope.dispatch_id, FIXED_TIME)
+        .expect("begin unknown dispatch");
+    edge.bind_dispatch_task_lineage(
+        &envelope.dispatch_id,
+        &run.task_id,
+        run.task_revision_at_creation,
+        run.work_revision,
+        FIXED_TIME,
+    )
+    .expect("bind task lineage");
+    let receipt = unknown_dispatch_receipt(&envelope, "receipt-runner-delivery-unknown");
+    edge.record_dispatch_receipt(&receipt, b"delivery-unknown", FIXED_TIME)
+        .expect("persist unknown receipt");
+    drop(edge);
+    drop(setup);
+
+    let verifier =
+        AdapterBackedHarnessEvidenceResolver::new(open_loop_adapter_edge(&adapter_database));
+    let mut forged = CollaborationCommand {
+        command: Some(collaboration_command::Command::MarkAttemptOutcomeUnknown(
+            MarkAttemptOutcomeUnknownCommand {
+                base: Some(attempt_base(&pending, "forged-delivery-unknown")),
+                reason_code: DELIVERY_OUTCOME_UNKNOWN_REASON_CODE.to_owned(),
+                uncertainty_evidence_id: "forged-receipt".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut forged);
+    let forged = match forged.command.as_ref().expect("forged command") {
+        collaboration_command::Command::MarkAttemptOutcomeUnknown(value) => value,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        verifier.validate_delivery_unknown(forged, &pending),
+        Err(ReferenceGuardRejection::UnverifiedReference)
+    );
+    drop(verifier);
+
+    let (guard, _) = TaskActivationGuardSet::new(AdapterBackedHarnessEvidenceResolver::new(
+        open_loop_adapter_edge(&adapter_database),
+    ));
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let first = control
+        .ingest_dispatch_receipt(&receipt, &harness_adapter())
+        .expect("mark unknown delivery");
+    assert!(
+        first
+            .authority_result
+            .as_ref()
+            .is_some_and(|result| result.committed_event.is_some())
+    );
+    let replay = control
+        .ingest_dispatch_receipt(&receipt, &harness_adapter())
+        .expect("replay unknown delivery");
+    assert!(
+        replay
+            .authority_result
+            .as_ref()
+            .is_some_and(|result| result.replayed)
+    );
+    let held = control
+        .held_dispatches_for_recovery(&recovery_worker())
+        .expect("held dispatches");
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].state, HeldDispatchRecoveryState::OutcomeUnknown);
+    assert!(
+        control
+            .held_dispatches_for_recovery(&harness_adapter())
+            .is_err()
+    );
+    if prebegin_without_evidence {
+        let unknown = load_snapshot(&control);
+        control
+            .execute(
+                &begin_reconciliation(&unknown, "adapter-reconciliation:dispatch-001"),
+                &recovery_worker(),
+            )
+            .expect("prebegin reconciliation");
+    }
+    drop(control);
+
+    let (guard, _) = TaskActivationGuardSet::new(AdapterBackedHarnessEvidenceResolver::new(
+        open_loop_adapter_edge(&adapter_database),
+    ));
+    let control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let reopened = control
+        .held_dispatches_for_recovery(&recovery_worker())
+        .expect("reopen held dispatches");
+    assert_eq!(reopened.len(), 1);
+    if prebegin_without_evidence {
+        assert!(matches!(
+            reopened[0].state,
+            HeldDispatchRecoveryState::Reconciling { .. }
+        ));
+    }
+    let reconcile_count = Arc::new(AtomicU64::new(0));
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle: Vec::new(),
+            workspace_root: adapter_store.root.clone(),
+        },
+        CountingRecoveryDriver {
+            reconcile_count: Arc::clone(&reconcile_count),
+            finding,
+        },
+        clock,
+    );
+    let runner = GovernedHarnessDispatchRunner::new(control, adapter, harness_adapter());
+    let first_cycle = runner.run_once().await.expect("recover held dispatch");
+    assert!(first_cycle.terminal_dispatch_ids.is_empty());
+    assert_eq!(
+        first_cycle.held_dispatch_ids.as_slice(),
+        std::slice::from_ref(&envelope.dispatch_id)
+    );
+    assert_eq!(first_cycle.observations_seen, 0);
+    assert_eq!(
+        first_cycle.task_recovery_findings.len(),
+        usize::from(expected_task_finding)
+    );
+    let second_cycle = runner.run_once().await.expect("replay held recovery");
+    assert!(second_cycle.terminal_dispatch_ids.is_empty());
+    assert_eq!(
+        reconcile_count.load(Ordering::SeqCst),
+        u64::from(!prebegin_without_evidence)
+    );
+    drop(runner);
+
+    let reopened = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    );
+    let snapshot = load_snapshot(&reopened);
+    assert_eq!(
+        snapshot.run.as_ref().expect("run").status,
+        expected_run_status as i32
+    );
+    assert_eq!(snapshot.attempts[0].status, expected_attempt_status as i32);
+}
+
+#[derive(Clone, Copy)]
+enum UnknownEvidenceTamper {
+    AdapterId,
+    FencingToken,
+    TaskLineage,
+}
+
+fn assert_unknown_evidence_tamper_is_zero_authority_write(
+    label: &str,
+    tamper: UnknownEvidenceTamper,
+) {
+    let collaboration_store = IsolatedStore::new(label);
+    let adapter_store = IsolatedStore::new(&format!("{label}-adapter"));
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut setup = open_control(&collaboration_store.database_path(), clock.clone());
+    let (pending, _) = advance_through_dispatch(&mut setup);
+    let envelope = setup
+        .pending_dispatches(&harness_adapter())
+        .expect("pending dispatch")
+        .into_iter()
+        .next()
+        .expect("dispatch envelope")
+        .envelope;
+    let run = pending.run.as_ref().expect("run");
+    let mut edge = open_loop_adapter_edge(&adapter_database);
+    edge.prepare_dispatch(&envelope, FIXED_TIME)
+        .expect("prepare unknown dispatch");
+    edge.begin_delivery(&envelope.dispatch_id, FIXED_TIME)
+        .expect("begin unknown dispatch");
+    let lineage_task_id = if matches!(tamper, UnknownEvidenceTamper::TaskLineage) {
+        "task-wrong"
+    } else {
+        &run.task_id
+    };
+    edge.bind_dispatch_task_lineage(
+        &envelope.dispatch_id,
+        lineage_task_id,
+        run.task_revision_at_creation,
+        run.work_revision,
+        FIXED_TIME,
+    )
+    .expect("bind task lineage fixture");
+    let mut receipt = unknown_dispatch_receipt(&envelope, "receipt-tampered-delivery-unknown");
+    match tamper {
+        UnknownEvidenceTamper::AdapterId => receipt.adapter_id = "adapter:wrong".to_owned(),
+        UnknownEvidenceTamper::FencingToken => receipt.fencing_token += 1,
+        UnknownEvidenceTamper::TaskLineage => {}
+    }
+    edge.record_dispatch_receipt(&receipt, b"tampered-delivery-unknown", FIXED_TIME)
+        .expect("persist tampered receipt fixture");
+    drop(edge);
+    drop(setup);
+
+    let (guard, _) = TaskActivationGuardSet::new(AdapterBackedHarnessEvidenceResolver::new(
+        open_loop_adapter_edge(&adapter_database),
+    ));
+    let mut control = open_control_with_guard(&collaboration_store.database_path(), clock, guard);
+    let before = control.inspect_store().expect("inspect before rejection");
+    let rejected = control
+        .ingest_dispatch_receipt(&receipt, &harness_adapter())
+        .expect("reject tampered unknown evidence");
+    let authority_result = rejected
+        .authority_result
+        .as_ref()
+        .expect("authority rejection");
+    assert_eq!(
+        error_code(authority_result),
+        CollaborationErrorCode::RecoveryRequired
+    );
+    assert!(authority_result.committed_event.is_none());
+    assert_eq!(
+        control.inspect_store().expect("inspect after rejection"),
+        before,
+        "unverified Adapter evidence must perform zero Authority writes"
+    );
+}
+
+#[test]
+fn delivery_unknown_with_wrong_adapter_id_is_zero_authority_write() {
+    assert_unknown_evidence_tamper_is_zero_authority_write(
+        "unknown-wrong-adapter",
+        UnknownEvidenceTamper::AdapterId,
+    );
+}
+
+#[test]
+fn delivery_unknown_with_wrong_fencing_token_is_zero_authority_write() {
+    assert_unknown_evidence_tamper_is_zero_authority_write(
+        "unknown-wrong-fence",
+        UnknownEvidenceTamper::FencingToken,
+    );
+}
+
+#[test]
+fn delivery_unknown_with_wrong_task_lineage_is_zero_authority_write() {
+    assert_unknown_evidence_tamper_is_zero_authority_write(
+        "unknown-wrong-task-lineage",
+        UnknownEvidenceTamper::TaskLineage,
+    );
+}
+
+#[tokio::test]
+async fn proven_not_sent_receipt_never_pumps_or_forges_terminal_or_held_state() {
+    let collaboration_store = IsolatedStore::new("runner-proven-not-sent-collaboration");
+    let adapter_store = IsolatedStore::new("runner-proven-not-sent-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let clock = FixedClock::new(FIXED_TIME);
+    let bundle = br#"{"input":"proven-not-sent"}"#.to_vec();
+    let bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: bundle_sha256.clone(),
+    };
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let leased = advance_through_lease(&mut control);
+    let dispatch = dispatch_command_with_bundle(&leased, &bundle_sha256);
+    let before = committed_snapshot(
+        &control
+            .execute(&dispatch, &attempt_supervisor())
+            .expect("record dispatch intent"),
+    );
+    let envelope = control
+        .pending_dispatches(&harness_adapter())
+        .expect("pending dispatch")
+        .into_iter()
+        .next()
+        .expect("dispatch envelope")
+        .envelope;
+    let send_count = Arc::new(AtomicU64::new(0));
+    let next_event_count = Arc::new(AtomicU64::new(0));
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        ProvenNotSentDriver {
+            send_count: Arc::clone(&send_count),
+            next_event_count: Arc::clone(&next_event_count),
+        },
+        clock,
+    );
+    let runner = GovernedHarnessDispatchRunner::new(control, adapter, harness_adapter());
+
+    let first = runner.run_once().await.expect("reject initial dispatch");
+    assert_eq!(first.dispatches_seen, 1);
+    assert_eq!(first.dispatches_delivered, 0);
+    assert_eq!(first.dispatches_rejected, 1);
+    assert_eq!(first.observations_seen, 0);
+    assert!(first.terminal_dispatch_ids.is_empty());
+    assert!(first.held_dispatch_ids.is_empty());
+    assert_eq!(send_count.load(Ordering::SeqCst), 1);
+    assert_eq!(next_event_count.load(Ordering::SeqCst), 0);
+
+    let replay = runner.run_once().await.expect("replay rejected receipt");
+    assert_eq!(replay.dispatches_seen, 1);
+    assert_eq!(replay.dispatches_delivered, 0);
+    assert_eq!(replay.dispatches_rejected, 1);
+    assert_eq!(replay.observations_seen, 0);
+    assert!(replay.terminal_dispatch_ids.is_empty());
+    assert!(replay.held_dispatch_ids.is_empty());
+    assert_eq!(send_count.load(Ordering::SeqCst), 1);
+    assert_eq!(next_event_count.load(Ordering::SeqCst), 0);
+    drop(runner);
+
+    let edge = open_loop_adapter_edge(&adapter_database);
+    let receipt = edge
+        .dispatch_receipt(&envelope.dispatch_id)
+        .expect("read rejected receipt")
+        .expect("durable rejected receipt");
+    assert_eq!(
+        DeliveryDisposition::try_from(receipt.disposition),
+        Ok(DeliveryDisposition::Rejected)
+    );
+    assert_eq!(
+        edge.inspect().expect("inspect Adapter edge").dispatch_count,
+        1
+    );
+    drop(edge);
+
+    let control = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    );
+    assert_eq!(load_snapshot(&control), before);
+}
+
+#[tokio::test]
+async fn begin_delivery_without_receipt_recovers_unknown_without_resend_or_pump() {
+    let collaboration_store = IsolatedStore::new("runner-begin-only-collaboration");
+    let adapter_store = IsolatedStore::new("runner-begin-only-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut setup = open_control(&collaboration_store.database_path(), clock.clone());
+    advance_through_dispatch(&mut setup);
+    let envelope = setup
+        .pending_dispatches(&harness_adapter())
+        .expect("pending dispatch")
+        .into_iter()
+        .next()
+        .expect("dispatch envelope")
+        .envelope;
+    let mut edge = open_loop_adapter_edge(&adapter_database);
+    edge.prepare_dispatch(&envelope, FIXED_TIME)
+        .expect("prepare dispatch before crash");
+    edge.begin_delivery(&envelope.dispatch_id, FIXED_TIME)
+        .expect("begin delivery before crash");
+    assert!(
+        edge.dispatch_receipt(&envelope.dispatch_id)
+            .expect("read absent receipt")
+            .is_none()
+    );
+    drop(edge);
+    drop(setup);
+
+    let (guard, _) = TaskActivationGuardSet::new(AdapterBackedHarnessEvidenceResolver::new(
+        open_loop_adapter_edge(&adapter_database),
+    ));
+    let control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let reconcile_count = Arc::new(AtomicU64::new(0));
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle: Vec::new(),
+            workspace_root: adapter_store.root.clone(),
+        },
+        CountingRecoveryDriver {
+            reconcile_count: Arc::clone(&reconcile_count),
+            finding: ReconciliationFinding::OutcomeUnknown {
+                evidence_ref: "fixture://begin-only-still-unknown".to_owned(),
+            },
+        },
+        clock,
+    );
+    let runner = GovernedHarnessDispatchRunner::new(control, adapter, harness_adapter());
+    let first = runner
+        .run_once()
+        .await
+        .expect("recover begin-only dispatch");
+    assert_eq!(first.dispatches_seen, 1);
+    assert_eq!(
+        first.held_dispatch_ids.as_slice(),
+        std::slice::from_ref(&envelope.dispatch_id)
+    );
+    assert!(first.terminal_dispatch_ids.is_empty());
+    assert_eq!(first.observations_seen, 0);
+    assert_eq!(first.task_recovery_findings.len(), 1);
+    assert_eq!(reconcile_count.load(Ordering::SeqCst), 1);
+    let replay = runner
+        .run_once()
+        .await
+        .expect("replay recovered begin-only dispatch");
+    assert_eq!(replay.dispatches_seen, 0);
+    assert!(replay.terminal_dispatch_ids.is_empty());
+    assert_eq!(replay.observations_seen, 0);
+    assert_eq!(reconcile_count.load(Ordering::SeqCst), 1);
+    drop(runner);
+
+    let edge = open_loop_adapter_edge(&adapter_database);
+    let receipt = edge
+        .dispatch_receipt(&envelope.dispatch_id)
+        .expect("read recovered receipt")
+        .expect("recovered Unknown receipt");
+    assert_eq!(
+        DeliveryDisposition::try_from(receipt.disposition),
+        Ok(DeliveryDisposition::Unknown)
+    );
+    assert_eq!(receipt.adapter_id, edge.adapter_id());
+    let inspection = edge.inspect().expect("inspect recovered Adapter edge");
+    assert_eq!(inspection.dispatch_count, 1);
+    assert_eq!(inspection.delivery_unknown_count, 1);
+    drop(edge);
+
+    let control = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    );
+    let snapshot = load_snapshot(&control);
+    assert_eq!(
+        snapshot.run.as_ref().expect("run").status,
+        RunStatus::Held as i32
+    );
+    assert_eq!(snapshot.attempts[0].status, AttemptStatus::Held as i32);
+    assert_eq!(
+        control
+            .held_dispatches_for_recovery(&recovery_worker())
+            .expect("durable held dispatches")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn runner_records_no_effect_without_task_interruption_or_redispatch() {
+    assert_runner_recovers_held_dispatch(
+        ReconciliationFinding::NoEffectProven {
+            evidence_ref: "fixture://no-effect".to_owned(),
+        },
+        RunStatus::Active,
+        AttemptStatus::Interrupted,
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn runner_maps_unknown_reconciliation_to_manual_hold_and_durable_task_finding() {
+    assert_runner_recovers_held_dispatch(
+        ReconciliationFinding::OutcomeUnknown {
+            evidence_ref: "fixture://still-unknown".to_owned(),
+        },
+        RunStatus::Held,
+        AttemptStatus::Held,
+        true,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reconciling_without_durable_evidence_stays_held_without_native_reconcile() {
+    assert_runner_recovers_held_dispatch(
+        ReconciliationFinding::OutcomeUnknown {
+            evidence_ref: "unused".to_owned(),
+        },
+        RunStatus::Held,
+        AttemptStatus::Reconciling,
+        true,
+        true,
+    )
+    .await;
 }
 
 #[test]

@@ -271,3 +271,34 @@ outbox acknowledgement, or reconstruction of observation polling after a
 delivered receipt. Those remain R-8B.2 work. In particular, no result in this
 checkpoint permits blind redispatch when an external side effect may already
 have occurred.
+
+## 10. R-8B.2a/b governed delivery-unknown checkpoint (2026-08-30)
+
+The next recovery slice now has a frozen disposition contract and a production
+component implementation. When Adapter delivery has started but no safe delivery
+answer remains, the daemon no longer relies on runner memory or logs. It rebuilds
+the held dispatch from durable Adapter and Collaboration facts, validates the
+exact Adapter/dispatch/attempt/fence/capability/Task lineage, and lets
+Collaboration Control commit the recovery transition as its single writer.
+
+The user-visible meaning is fail-closed:
+
+- only a durable Delivered receipt may produce Harness observations;
+- Unknown delivery is held and reconciled without sending the dispatch again;
+- Rejected/ProvenNotSent, a missing receipt and invalid receipt values neither
+  resend nor enter observation polling;
+- proof that no external effect occurred only creates future governed retry
+  eligibility; it does not retry automatically or create another Attempt;
+- all still-uncertain or externally active outcomes become ManualOnly holds;
+- a recovery finding may interrupt the Task through Task Authority, but no
+  receipt, finding or Harness observation may complete the Task.
+
+Local tests now prove the production runner and stores across Unknown creation,
+held reconstruction, single reconciliation plus replay, zero resend, zero false
+observation polling, Rejected replay, held/terminal separation and tamper
+rejection. This is a component-level checkpoint, not the final restart claim.
+R-8B.2c still requires a real Windows daemon hard-kill test between
+`begin_delivery` and receipt persistence, followed by same-root/same-instance
+restart. It must also reconstruct observation polling for a dispatch whose
+Delivered receipt was already persisted. Until those pass, full crash recovery
+and resumable user-visible streaming remain open.

@@ -97,7 +97,10 @@ impl<E> TaskActivationGuardSet<E> {
     }
 }
 
-impl<E> CollaborationReferenceGuard for TaskActivationGuardSet<E> {
+impl<E> CollaborationReferenceGuard for TaskActivationGuardSet<E>
+where
+    E: HarnessEvidenceResolver,
+{
     fn validate_create_run(
         &self,
         command: &CreateRunCommand,
@@ -148,8 +151,7 @@ impl<E> CollaborationReferenceGuard for TaskActivationGuardSet<E> {
         command: &MarkAttemptOutcomeUnknownCommand,
         snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
-        self.reference
-            .with_guard(|guard| guard.validate_unknown_outcome(command, snapshot))
+        self.evidence.validate_delivery_unknown(command, snapshot)
     }
 
     fn validate_cancellation_request(
@@ -166,6 +168,14 @@ impl<E> HarnessEvidenceResolver for TaskActivationGuardSet<E>
 where
     E: HarnessEvidenceResolver,
 {
+    fn validate_delivery_unknown(
+        &self,
+        command: &MarkAttemptOutcomeUnknownCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.evidence.validate_delivery_unknown(command, snapshot)
+    }
+
     fn resolve_delivery_receipt(
         &self,
         command: &RecordDeliveryReceiptCommand,

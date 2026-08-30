@@ -10,7 +10,7 @@ pub use capability::{
 };
 pub use edge::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeInspection, AdapterEdgeKey,
-    AdapterObservationEvidence, DispatchPreparation, DurableWritePreparation,
+    AdapterObservationEvidence, DispatchPreparation, DispatchTaskLineage, DurableWritePreparation,
     NativeExecutionBinding, ObservationAppend, PendingAdapterApprovalProjection,
     PendingTerminalOutputCandidate,
 };

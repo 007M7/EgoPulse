@@ -859,6 +859,28 @@ impl CollaborationStore {
             .map_err(StoreError::from)
     }
 
+    pub fn held_dispatches(&self) -> Result<Vec<PendingDispatchRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT message_id, source_event_id, canonical_payload_digest_sha256, payload
+             FROM collaboration_outbox
+             WHERE destination_domain = 'harness-adapter'
+               AND payload_kind = 'dispatch-envelope'
+               AND delivery_state = 'held'
+             ORDER BY rowid",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(PendingDispatchRecord {
+                    message_id: row.get(0)?,
+                    source_event_id: row.get(1)?,
+                    canonical_payload_digest_sha256: row.get(2)?,
+                    payload: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn pending_projection_messages(&self) -> Result<Vec<PendingProjectionRecord>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT message_id,source_event_id,source_revision,

@@ -5,9 +5,10 @@ use egopulse_domain_contracts::v01::egopulse::artifact::v1::{
     ArtifactSetStatus, HashAlgorithm, LineageBinding, ReturnHandoffStatus,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
-    CollaborationSnapshot, RecordAttemptCancellationOutcomeCommand,
-    RecordAttemptReconciliationCommand, RecordAttemptReturnCommand, RecordDeliveryReceiptCommand,
-    RecordHarnessAckCommand, RecordRunningObservationCommand,
+    CollaborationSnapshot, MarkAttemptOutcomeUnknownCommand,
+    RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
+    RecordAttemptReturnCommand, RecordDeliveryReceiptCommand, RecordHarnessAckCommand,
+    RecordRunningObservationCommand,
 };
 use egopulse_domain_contracts::v01::egopulse::verification::v1::{
     CriterionOutcome, CriterionRequirement, EvidenceCoverage, VerificationArtifact,
@@ -154,6 +155,14 @@ where
     G: ArtifactAdmissionGuard + Send + 'static,
     C: ArtifactClock + Send + 'static,
 {
+    fn validate_delivery_unknown(
+        &self,
+        command: &MarkAttemptOutcomeUnknownCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        self.harness.validate_delivery_unknown(command, snapshot)
+    }
+
     fn resolve_delivery_receipt(
         &self,
         command: &RecordDeliveryReceiptCommand,
