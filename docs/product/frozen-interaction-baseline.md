@@ -248,3 +248,26 @@ restart/replay recovery, resumable user-visible streaming, the reverse
 TUI-prepare/CLI-confirm acceptance scenario, or the authenticated and audited
 Context revoke write contract. Those remain explicit R-8B and R-9 work, so the
 whole product path is still not declared normally usable.
+
+## 9. R-8B.1 pre-delivery restart checkpoint (2026-08-30)
+
+The first recovery slice now proves one real Windows process-termination
+window. After the production Harness runner has completed an empty cycle, CLI
+preparation and TUI confirmation commit an `Active` Task and its durable
+activation handoff while the next runner cycle is deliberately delayed. The
+daemon is then forcibly terminated before the runner consumes that activation
+handoff and therefore before Adapter delivery. A daemon using the same
+instance, roots, store epochs and reviewed workflow consumes that pending
+handoff after restart and reaches the native-driver boundary exactly once.
+
+The resumed path retains the original Context digest and Run, Step, Attempt and
+Dispatch identities. Adapter Edge contains one dispatch and one non-terminal
+acknowledgement, and the Task remains `Active`. This is a real subprocess and
+SQLCipher/WAL recovery proof; the first process is not shut down gracefully.
+
+R-8B.1 does not cover a crash after `begin_delivery`, delivery-unknown
+reconciliation, a crash between Collaboration workflow commit and activation
+outbox acknowledgement, or reconstruction of observation polling after a
+delivered receipt. Those remain R-8B.2 work. In particular, no result in this
+checkpoint permits blind redispatch when an external side effect may already
+have occurred.

@@ -4,8 +4,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    future::Future,
     io::Read,
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
@@ -80,7 +82,8 @@ use egopulse_local_api::{
     command_gateway::{CommandPortFailure, CommandPrincipal},
 };
 use egopulse_local_ide_control::collaboration_control::{
-    DispatchMaterial, SingleHarnessWorkConfig,
+    DispatchMaterial, HarnessDispatchCycleError, HarnessDispatchCycleReport, HarnessDispatchRunner,
+    SingleHarnessWorkConfig,
 };
 use egopulse_local_ipc_platform::LocalIpcAddress;
 use egopulse_policy_decision_authority::{
@@ -103,8 +106,46 @@ const FIXTURE_ROOT_ENV: &str = "EGOPULSE_C5_FIXTURE_ROOT";
 const FIXTURE_INSTANCE_ENV: &str = "EGOPULSE_C5_FIXTURE_INSTANCE";
 const FIXTURE_MODE_ENV: &str = "EGOPULSE_C5_FIXTURE_MODE";
 const R8A_FIXTURE_MODE: &str = "dynamic";
+const R8B_PAUSE_BEFORE_RUNNER_MODE: &str = "dynamic-pause-before-runner";
 const R8A_ACTIVATION_RUN_ID: &str = "r8a-activation-run";
 const R8A_DRIVER_RECORD: &str = "r8a-driver-record.json";
+const R8B_FIRST_RUNNER_CYCLE_RECORD: &str = "r8b-first-runner-cycle-complete";
+
+struct FirstRunnerCycleMarker {
+    inner: Arc<dyn HarnessDispatchRunner>,
+    marker_path: PathBuf,
+}
+
+impl FirstRunnerCycleMarker {
+    fn new(inner: Arc<dyn HarnessDispatchRunner>, root: &Path) -> Self {
+        Self {
+            inner,
+            marker_path: root.join(R8B_FIRST_RUNNER_CYCLE_RECORD),
+        }
+    }
+}
+
+impl HarnessDispatchRunner for FirstRunnerCycleMarker {
+    fn run_once(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let report = self.inner.run_once().await?;
+            fs::write(&self.marker_path, b"complete").map_err(|error| {
+                HarnessDispatchCycleError::TaskActivationWorkflow(format!(
+                    "R-8B first runner cycle marker failed: {error}"
+                ))
+            })?;
+            Ok(report)
+        })
+    }
+}
 
 struct RecordingFixtureDriver {
     inner: FakeCodexDriver,
@@ -614,6 +655,13 @@ fn fixture_mode() -> String {
     std::env::var(FIXTURE_MODE_ENV).unwrap_or_else(|_| "deny".to_owned())
 }
 
+fn dynamic_fixture_mode() -> bool {
+    matches!(
+        fixture_mode().as_str(),
+        R8A_FIXTURE_MODE | R8B_PAUSE_BEFORE_RUNNER_MODE
+    )
+}
+
 fn r8a_reference(contract_id: &str) -> ContractReference {
     ContractReference {
         contract_id: contract_id.to_owned(),
@@ -749,14 +797,21 @@ fn fixture_config(root: &Path, instance: &str) -> DaemonConfig {
         read_model_key: [0x41; 32],
         token_mac_key: [0x42; 32],
         session_ttl: Duration::from_secs(60),
-        harness_dispatch_interval: Duration::from_millis(25),
+        harness_dispatch_interval: if fixture_mode() == R8B_PAUSE_BEFORE_RUNNER_MODE {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_millis(25)
+        },
         verification_interval: Duration::from_millis(25),
         verdict_consumption_interval: Duration::from_millis(25),
     }
 }
 
 fn open_fixture_providers(root: &Path) -> DaemonProviders {
-    if matches!(fixture_mode().as_str(), "allow" | R8A_FIXTURE_MODE) {
+    if matches!(
+        fixture_mode().as_str(),
+        "allow" | R8A_FIXTURE_MODE | R8B_PAUSE_BEFORE_RUNNER_MODE
+    ) {
         open_fixture_providers_with_guards(
             root,
             AllowTaskReferences,
@@ -890,14 +945,14 @@ where
         },
     )
     .expect("fixture Work Preparation should configure");
-    if fixture_mode() == R8A_FIXTURE_MODE {
+    if dynamic_fixture_mode() {
         work_port = work_port
             .with_input_bundle_root(root.join("input-bundles"))
             .and_then(|port| port.with_activation_run_id(R8A_ACTIVATION_RUN_ID.to_owned()))
             .expect("R-8A Work Preparation dispatch binding");
     }
     let providers = providers.with_work_preparation_port(Arc::new(work_port));
-    if fixture_mode() != R8A_FIXTURE_MODE {
+    if !dynamic_fixture_mode() {
         return providers;
     }
 
@@ -905,7 +960,7 @@ where
     fs::create_dir_all(root.join(&native.workflow.workspace_ref))
         .expect("R-8A governed workspace should exist");
     let (artifact, verification) = r8a_authorities(root, &native.return_collector);
-    providers
+    let mut providers = providers
         .with_context_authority(context)
         .with_native_harness_driver(
             native,
@@ -913,7 +968,16 @@ where
             verification,
             RecordingFixtureDriver::new(root),
         )
-        .expect("R-8A native Harness composition")
+        .expect("R-8A native Harness composition");
+    if fixture_mode() == R8B_PAUSE_BEFORE_RUNNER_MODE {
+        let runner = providers
+            .harness_dispatch_runner
+            .take()
+            .expect("R-8B production Harness runner");
+        providers.harness_dispatch_runner =
+            Some(Arc::new(FirstRunnerCycleMarker::new(runner, root)));
+    }
+    providers
 }
 
 fn memory_worker_config() -> MemoryRetrievalCompositionConfig {
@@ -970,11 +1034,13 @@ async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Chi
         .env(FIXTURE_MODE_ENV, mode)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(if mode == R8A_FIXTURE_MODE {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        })
+        .stderr(
+            if matches!(mode, R8A_FIXTURE_MODE | R8B_PAUSE_BEFORE_RUNNER_MODE) {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            },
+        )
         .kill_on_drop(true);
     command.spawn().expect("spawn C5 fixture child")
 }
@@ -1704,6 +1770,222 @@ async fn r8a_cli_prepare_tui_confirm_dispatches_context_material_once() {
     ));
     drop(adapter);
     fs::remove_dir_all(&root).expect("remove R-8A fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r8b_activation_outbox_survives_daemon_kill_and_dispatches_once_after_restart() {
+    const SOURCE_TEXT: &str = "R-8B pending activation survives a daemon restart.";
+
+    let root = std::env::temp_dir().join(format!("egopulse-r8b-1-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create R-8B.1 fixture root");
+    fs::write(root.join("context.md"), SOURCE_TEXT).expect("write R-8B.1 context source");
+    let instance = format!("r8b-1-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, R8B_PAUSE_BEFORE_RUNNER_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut child).await;
+
+    let first_cycle_marker = root.join(R8B_FIRST_RUNNER_CYCLE_RECORD);
+    for _ in 0..100 {
+        if first_cycle_marker.is_file() {
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("R-8B.1 fixture daemon exited before its first empty runner cycle: {status}");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        first_cycle_marker.is_file(),
+        "R-8B.1 must observe the first empty production runner cycle before activation"
+    );
+
+    let prepare = run_cli(
+        &instance,
+        &[
+            "work",
+            "prepare",
+            "--intent",
+            "dispatch the pending R-8B context after restart",
+            "--scope",
+            "scope:r8a",
+            "--work-type",
+            "governed_repository_change",
+            "--context-ref",
+            "context.md",
+            "--idempotency-key",
+            "r8b-1-prepare",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        prepare.status.success(),
+        "R-8B.1 CLI prepare failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&prepare.stdout),
+        String::from_utf8_lossy(&prepare.stderr)
+    );
+    let prepare_json: serde_json::Value =
+        serde_json::from_slice(&prepare.stdout).expect("R-8B.1 prepare JSON envelope");
+    let snapshot_id = prepare_json["data"]["snapshotId"]
+        .as_str()
+        .expect("R-8B.1 snapshot id")
+        .to_owned();
+    let compiled_digest = prepare_json["data"]["compiledContextSha256"]
+        .as_str()
+        .expect("R-8B.1 compiled context digest")
+        .to_owned();
+    let confirmation_binding = prepare_json["data"]["confirmationBindingSha256"]
+        .as_str()
+        .expect("R-8B.1 confirmation binding")
+        .to_owned();
+    assert_eq!(snapshot_id, format!("ctx:{compiled_digest}"));
+
+    let confirm = run_tui(
+        &instance,
+        &[
+            "--instance",
+            &instance,
+            "work-confirm",
+            snapshot_id.as_str(),
+            "--confirmation-binding-sha256",
+            confirmation_binding.as_str(),
+            "--idempotency-key",
+            "r8b-1-confirm",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        confirm.status.success(),
+        "R-8B.1 TUI confirm failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&confirm.stdout),
+        String::from_utf8_lossy(&confirm.stderr)
+    );
+    let confirm_json: serde_json::Value =
+        serde_json::from_slice(&confirm.stdout).expect("R-8B.1 confirm JSON envelope");
+    let task_id = confirm_json["data"]["taskId"]
+        .as_str()
+        .expect("R-8B.1 confirmed task id")
+        .to_owned();
+    assert_eq!(
+        confirm_json["data"]["status"],
+        TaskStatus::Active.as_str_name()
+    );
+
+    let mut active_before_restart = None;
+    for _ in 0..80 {
+        let output = run_cli(&instance, &["task", "get", task_id.as_str(), "--json"]).await;
+        if output.status.success()
+            && let Ok(view) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            && view["data"]["status"] == TaskStatus::Active.as_str_name()
+        {
+            active_before_restart = Some(view);
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let active_before_restart =
+        active_before_restart.expect("R-8B.1 Task must be Active before daemon termination");
+    assert_eq!(
+        active_before_restart["data"]["currentRunId"],
+        R8A_ACTIVATION_RUN_ID
+    );
+    let driver_record_path = root.join(R8A_DRIVER_RECORD);
+    assert!(
+        !driver_record_path.exists(),
+        "the paused runner must not call the native driver before termination"
+    );
+
+    child
+        .kill()
+        .await
+        .expect("force-stop R-8B.1 fixture daemon");
+    let killed = child.wait().await.expect("observe R-8B.1 forced stop");
+    assert!(!killed.success(), "R-8B.1 first daemon must be killed");
+
+    let mut restarted = spawn_fixture_with_mode(&root, &instance, R8A_FIXTURE_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut restarted).await;
+
+    let mut driver_record = None;
+    for _ in 0..100 {
+        if let Ok(bytes) = fs::read(&driver_record_path)
+            && let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        {
+            driver_record = Some(record);
+            break;
+        }
+        if let Ok(Some(status)) = restarted.try_wait() {
+            panic!("R-8B.1 restarted daemon exited before dispatch evidence: {status}");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let driver_record = driver_record.expect("R-8B.1 restart must dispatch the pending activation");
+    assert_eq!(driver_record["dispatchCount"], 1);
+    assert_eq!(driver_record["runId"], R8A_ACTIVATION_RUN_ID);
+    assert_eq!(driver_record["stepId"], "r8a-step");
+    assert_eq!(driver_record["attemptId"], "r8a-attempt");
+    assert_eq!(driver_record["dispatchId"], "r8a-dispatch");
+    assert_eq!(
+        driver_record["inputBundleRef"],
+        format!("ctx-{compiled_digest}.json")
+    );
+    assert_eq!(driver_record["envelopeInputBundleSha256"], compiled_digest);
+
+    sleep(Duration::from_millis(150)).await;
+    let stable_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(&driver_record_path).expect("read stable R-8B.1 driver record"),
+    )
+    .expect("parse stable R-8B.1 driver record");
+    assert_eq!(stable_record["dispatchCount"], 1);
+
+    let mut active_after_restart = None;
+    for _ in 0..80 {
+        let output = run_cli(&instance, &["task", "get", task_id.as_str(), "--json"]).await;
+        if output.status.success()
+            && let Ok(view) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            && view["data"]["status"] == TaskStatus::Active.as_str_name()
+        {
+            active_after_restart = Some(view);
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let active_after_restart =
+        active_after_restart.expect("R-8B.1 Task must remain Active after dispatch");
+    assert_eq!(active_after_restart["data"]["taskId"], task_id);
+    assert_eq!(
+        active_after_restart["data"]["currentRunId"],
+        R8A_ACTIVATION_RUN_ID
+    );
+
+    drop(restarted.stdin.take());
+    let status = restarted
+        .wait()
+        .await
+        .expect("R-8B.1 restarted fixture child exit");
+    assert!(status.success(), "R-8B.1 restarted daemon failed: {status}");
+
+    let adapter = AdapterEdge::open(AdapterEdgeConfig {
+        database_path: root.join("r8a-adapter.db"),
+        adapter_id: CODEX_ADAPTER_ID.to_owned(),
+        store_epoch: "r8a-adapter-epoch".to_owned(),
+        key: AdapterEdgeKey::new([0x32; 32]),
+    })
+    .expect("reopen R-8B.1 Adapter Edge evidence");
+    let inspection = adapter.inspect().expect("inspect R-8B.1 Adapter Edge");
+    assert_eq!(inspection.dispatch_count, 1);
+    assert_eq!(inspection.observation_count, 1);
+    let observations = adapter
+        .observations_after(0)
+        .expect("read R-8B.1 non-terminal observation evidence");
+    assert!(matches!(
+        observations.as_slice(),
+        [HarnessObservation {
+            payload: Some(harness_observation::Payload::Ack(_)),
+            ..
+        }]
+    ));
+    drop(adapter);
+    fs::remove_dir_all(&root).expect("remove R-8B.1 fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -269,3 +269,27 @@ resume and no duplicate external delivery across daemon termination, and the
 formal Context revoke write contract remains R-9. User-visible resumable
 streaming and the later Artifact/Verification/Founder-verdict closure also
 remain open.
+
+## R-8B.1 pre-delivery crash replay checkpoint (2026-08-30)
+
+R-8B.1 adds a real daemon crash/restart acceptance path without changing the
+public contracts. A test-only wrapper around the existing production
+`HarnessDispatchRunner` records completion of its first empty cycle; it does
+not alter the cycle result or any Authority fact. The fixture then delays the
+next cycle, commits the normal CLI Prepare -> TUI Confirm -> daemon activation
+path, proves that no driver call occurred, and force-terminates the process.
+
+Reopening the same Task, Context, Collaboration, Adapter and read-model stores
+with the same reviewed configuration consumes the durable activation handoff
+and produces one original dispatch. The E2E verifies stable Run/Step/Attempt/
+Dispatch identity, one Adapter dispatch, one governed non-terminal Ack and a
+still-`Active` Task.
+
+This closes only the unconsumed activation-handoff restart window proven
+here. R-8B.2 must still rebuild recovery work from durable Adapter and
+Collaboration facts when delivery is unknown or already recorded. It must
+bridge `delivery_unknown` into typed
+OutcomeUnknown/Reconciliation/Hold processing, drain pending observations,
+and restore Task recovery settlement without using runner memory or logs.
+R-8B.2 must never call `send_dispatch` again for a delivery-unknown or delivered
+dispatch, and it does not require a Proto change under the current contracts.
