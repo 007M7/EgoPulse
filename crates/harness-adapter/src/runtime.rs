@@ -54,6 +54,122 @@ pub trait DispatchMaterialResolver {
     ) -> Result<ResolvedDispatchMaterial, HarnessError>;
 }
 
+/// Canonical classification of the dispatch input reference at the Adapter
+/// boundary. Context-backed references are intentionally recognized here so a
+/// malformed `ctx-`/`ctx:` value can never fall through to a static resolver.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DispatchContextReference {
+    NotContextBound,
+    ContextSnapshot { snapshot_id: String },
+    InvalidContextBinding,
+}
+
+#[must_use]
+pub fn classify_dispatch_context_reference(reference: &str) -> DispatchContextReference {
+    if let Some(context_reference) = reference.strip_prefix("ctx-") {
+        let Some(digest) = context_reference.strip_suffix(".json") else {
+            return DispatchContextReference::InvalidContextBinding;
+        };
+        if canonical_sha256_is_valid(digest) {
+            return DispatchContextReference::ContextSnapshot {
+                snapshot_id: format!("ctx:{digest}"),
+            };
+        }
+        return DispatchContextReference::InvalidContextBinding;
+    }
+    if reference.starts_with("ctx:") {
+        return DispatchContextReference::InvalidContextBinding;
+    }
+    DispatchContextReference::NotContextBound
+}
+
+/// Immutable Context Authority binding independently compared with the
+/// dispatch envelope, resolved bytes and authorization receipt by the Adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchContextBinding {
+    pub snapshot_id: String,
+    pub snapshot_revision: u64,
+    pub content_digest_sha256: String,
+    pub expected_scope_ref: String,
+}
+
+/// Complete durable Context dispatch-consumption receipt. Keeping every field
+/// at this boundary prevents a gate implementation from reducing Authority
+/// evidence to a boolean decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchContextAuthorizationReceipt {
+    pub authorization_id: String,
+    pub snapshot_id: String,
+    pub snapshot_revision: u64,
+    pub observed_state_revision: u64,
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub input_digest_sha256: String,
+    pub expected_scope_ref: String,
+    pub request_digest_sha256: String,
+    pub event_id: String,
+    pub committed_at_seconds: i64,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedDispatchContext {
+    pub binding: DispatchContextBinding,
+    pub receipt: DispatchContextAuthorizationReceipt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DispatchContextAuthorization {
+    NotContextBound,
+    Authorized(Box<AuthorizedDispatchContext>),
+}
+
+/// Authority-owned Context authorization seam used by normal dispatch. The
+/// existing-dispatch entry is contractually read-only: Replay and
+/// DeliveryUnknown must never mint authorization after the native boundary may
+/// already have been crossed.
+pub trait DispatchContextAuthorizationGate: Send {
+    fn authorize_ready_dispatch(
+        &self,
+        envelope: &DispatchEnvelope,
+    ) -> Result<DispatchContextAuthorization, HarnessError>;
+
+    fn verify_existing_dispatch(
+        &self,
+        envelope: &DispatchEnvelope,
+    ) -> Result<DispatchContextAuthorization, HarnessError>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RejectContextAuthorizationGate;
+
+impl DispatchContextAuthorizationGate for RejectContextAuthorizationGate {
+    fn authorize_ready_dispatch(
+        &self,
+        envelope: &DispatchEnvelope,
+    ) -> Result<DispatchContextAuthorization, HarnessError> {
+        reject_context_authorization(&envelope.input_bundle_ref)
+    }
+
+    fn verify_existing_dispatch(
+        &self,
+        envelope: &DispatchEnvelope,
+    ) -> Result<DispatchContextAuthorization, HarnessError> {
+        reject_context_authorization(&envelope.input_bundle_ref)
+    }
+}
+
+struct AuthorizedDispatchMaterial {
+    material: ResolvedDispatchMaterial,
+    _context: Option<AuthorizedDispatchContext>,
+}
+
+impl AuthorizedDispatchMaterial {
+    fn material(&self) -> &ResolvedDispatchMaterial {
+        &self.material
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DriverErrorCertainty {
     ProvenNotSent,
@@ -273,6 +389,8 @@ pub struct GovernedHarnessAdapter<R, D, C> {
     resolver: R,
     driver: D,
     clock: C,
+    context_authorization_gate: Box<dyn DispatchContextAuthorizationGate>,
+    context_authorization_gate_installed: bool,
 }
 
 impl<R, D, C> GovernedHarnessAdapter<R, D, C>
@@ -299,7 +417,21 @@ where
             resolver,
             driver,
             clock,
+            context_authorization_gate: Box::new(RejectContextAuthorizationGate),
+            context_authorization_gate_installed: false,
         }
+    }
+
+    /// Installs the production Context Authority bridge. Static dispatches are
+    /// still admitted only when the gate explicitly returns NotContextBound.
+    #[must_use]
+    pub fn with_dispatch_context_authorization_gate(
+        mut self,
+        gate: impl DispatchContextAuthorizationGate + 'static,
+    ) -> Self {
+        self.context_authorization_gate = Box::new(gate);
+        self.context_authorization_gate_installed = true;
+        self
     }
 
     pub async fn probe(&mut self, request: &ProbeHarnessRequest) -> ProbeHarnessResult {
@@ -345,8 +477,16 @@ where
         }
         let now = self.clock.now();
         match self.edge.prepare_dispatch(envelope, now.seconds)? {
-            DispatchPreparation::Replay(receipt) => return Ok(dispatch_receipt(*receipt)),
+            DispatchPreparation::Replay(receipt) => {
+                if let Err(error) = self.verify_existing_context_authorization(envelope) {
+                    return Ok(dispatch_error(error));
+                }
+                return Ok(dispatch_receipt(*receipt));
+            }
             DispatchPreparation::DeliveryUnknown => {
+                if let Err(error) = self.verify_existing_context_authorization(envelope) {
+                    return Ok(dispatch_error(error));
+                }
                 let receipt =
                     self.delivery_unknown_receipt(envelope, "RECOVERED_UNCERTAIN_DELIVERY", &now);
                 self.edge.record_dispatch_receipt(
@@ -357,6 +497,25 @@ where
                 return Ok(dispatch_receipt(receipt));
             }
             DispatchPreparation::Ready => {}
+        }
+        let context_reference = classify_dispatch_context_reference(&envelope.input_bundle_ref);
+        if context_reference == DispatchContextReference::InvalidContextBinding {
+            return Ok(dispatch_error(context_binding_error(
+                HarnessErrorCode::ConfigInvalid,
+                "CONTEXT_BINDING_INVALID",
+                false,
+            )));
+        }
+        if matches!(
+            context_reference,
+            DispatchContextReference::ContextSnapshot { .. }
+        ) && !self.context_authorization_gate_installed
+        {
+            return Ok(dispatch_error(context_binding_error(
+                HarnessErrorCode::DependencyUnavailable,
+                "CONTEXT_GATE_UNAVAILABLE",
+                true,
+            )));
         }
         let material = match self.resolver.resolve(envelope) {
             Ok(value) => value,
@@ -372,9 +531,30 @@ where
             )));
         }
 
+        let context_authorization = match self
+            .context_authorization_gate
+            .authorize_ready_dispatch(envelope)
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(dispatch_error(error)),
+        };
+        let material = match authorize_dispatch_material(
+            envelope,
+            context_reference,
+            material,
+            context_authorization,
+        ) {
+            Ok(value) => value,
+            Err(error) => return Ok(dispatch_error(error)),
+        };
+
         self.edge
             .begin_delivery(&envelope.dispatch_id, now.seconds)?;
-        let (receipt, raw_evidence) = match self.driver.send_dispatch(envelope, &material).await {
+        let (receipt, raw_evidence) = match self
+            .driver
+            .send_dispatch(envelope, material.material())
+            .await
+        {
             Ok(delivery) => {
                 let evidence = delivery.raw_evidence.clone();
                 (
@@ -1028,8 +1208,22 @@ where
         &self.driver
     }
 
-    pub fn driver_mut(&mut self) -> &mut D {
-        &mut self.driver
+    fn verify_existing_context_authorization(
+        &self,
+        envelope: &DispatchEnvelope,
+    ) -> Result<(), HarnessError> {
+        let reference = classify_dispatch_context_reference(&envelope.input_bundle_ref);
+        if reference == DispatchContextReference::InvalidContextBinding {
+            return Err(context_binding_error(
+                HarnessErrorCode::ConfigInvalid,
+                "CONTEXT_BINDING_INVALID",
+                false,
+            ));
+        }
+        let authorization = self
+            .context_authorization_gate
+            .verify_existing_dispatch(envelope)?;
+        validate_context_authorization(envelope, &reference, authorization).map(|_| ())
     }
 
     fn validate_dispatch(&self, envelope: &DispatchEnvelope) -> Option<HarnessError> {
@@ -1235,6 +1429,128 @@ fn dispatch_error(error: HarnessError) -> DispatchResult {
     DispatchResult {
         outcome: Some(dispatch_result::Outcome::Error(error)),
     }
+}
+
+fn reject_context_authorization(
+    input_bundle_ref: &str,
+) -> Result<DispatchContextAuthorization, HarnessError> {
+    match classify_dispatch_context_reference(input_bundle_ref) {
+        DispatchContextReference::NotContextBound => {
+            Ok(DispatchContextAuthorization::NotContextBound)
+        }
+        DispatchContextReference::ContextSnapshot { .. } => Err(context_binding_error(
+            HarnessErrorCode::DependencyUnavailable,
+            "CONTEXT_GATE_UNAVAILABLE",
+            true,
+        )),
+        DispatchContextReference::InvalidContextBinding => Err(context_binding_error(
+            HarnessErrorCode::ConfigInvalid,
+            "CONTEXT_BINDING_INVALID",
+            false,
+        )),
+    }
+}
+
+fn authorize_dispatch_material(
+    envelope: &DispatchEnvelope,
+    reference: DispatchContextReference,
+    material: ResolvedDispatchMaterial,
+    authorization: DispatchContextAuthorization,
+) -> Result<AuthorizedDispatchMaterial, HarnessError> {
+    let context = validate_context_authorization(envelope, &reference, authorization)?;
+    if let Some(context) = context.as_ref()
+        && sha256(&material.canonical_input_bundle) != context.binding.content_digest_sha256
+    {
+        return Err(context_binding_error(
+            HarnessErrorCode::IntegrityFailure,
+            "CONTEXT_AUTHORIZATION_INVALID",
+            false,
+        ));
+    }
+    Ok(AuthorizedDispatchMaterial {
+        material,
+        _context: context,
+    })
+}
+
+fn validate_context_authorization(
+    envelope: &DispatchEnvelope,
+    reference: &DispatchContextReference,
+    authorization: DispatchContextAuthorization,
+) -> Result<Option<AuthorizedDispatchContext>, HarnessError> {
+    match (reference, authorization) {
+        (
+            DispatchContextReference::NotContextBound,
+            DispatchContextAuthorization::NotContextBound,
+        ) => Ok(None),
+        (
+            DispatchContextReference::ContextSnapshot { snapshot_id },
+            DispatchContextAuthorization::Authorized(context),
+        ) => {
+            let binding = &context.binding;
+            let receipt = &context.receipt;
+            let valid = binding.snapshot_id == *snapshot_id
+                && binding.snapshot_revision > 0
+                && canonical_sha256_is_valid(&binding.content_digest_sha256)
+                && binding.content_digest_sha256 == envelope.input_bundle_sha256
+                && snapshot_id
+                    .strip_prefix("ctx:")
+                    .is_some_and(|digest| digest == binding.content_digest_sha256)
+                && opaque_reference_is_valid(&binding.expected_scope_ref)
+                && opaque_reference_is_valid(&receipt.authorization_id)
+                && receipt.snapshot_id == binding.snapshot_id
+                && receipt.snapshot_revision == binding.snapshot_revision
+                && receipt.observed_state_revision > 0
+                && receipt.attempt_id == envelope.attempt_id
+                && receipt.dispatch_id == envelope.dispatch_id
+                && receipt.input_digest_sha256 == binding.content_digest_sha256
+                && receipt.expected_scope_ref == binding.expected_scope_ref
+                && canonical_sha256_is_valid(&receipt.input_digest_sha256)
+                && canonical_sha256_is_valid(&receipt.request_digest_sha256)
+                && opaque_reference_is_valid(&receipt.event_id)
+                && receipt.committed_at_seconds > 0;
+            if !valid {
+                return Err(context_binding_error(
+                    HarnessErrorCode::IntegrityFailure,
+                    "CONTEXT_AUTHORIZATION_INVALID",
+                    false,
+                ));
+            }
+            Ok(Some(*context))
+        }
+        (DispatchContextReference::InvalidContextBinding, _) => Err(context_binding_error(
+            HarnessErrorCode::ConfigInvalid,
+            "CONTEXT_BINDING_INVALID",
+            false,
+        )),
+        _ => Err(context_binding_error(
+            HarnessErrorCode::IntegrityFailure,
+            "CONTEXT_AUTHORIZATION_INVALID",
+            false,
+        )),
+    }
+}
+
+fn context_binding_error(
+    code: HarnessErrorCode,
+    detail: &str,
+    retryable_delivery: bool,
+) -> HarnessError {
+    HarnessError {
+        code: code as i32,
+        safe_detail_code: detail.to_owned(),
+        retryable_delivery,
+        recovery_required: true,
+        error_fingerprint: Some(sha256(detail.as_bytes())),
+        audit_ref: Some("harness-adapter:context-authorization".to_owned()),
+    }
+}
+
+fn opaque_reference_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && value.len() <= 4 * 1024
+        && !value.chars().any(char::is_control)
 }
 
 fn approval_receipt(receipt: ApprovalDecisionReceipt) -> ApprovalDecisionResult {
@@ -1480,6 +1796,13 @@ fn sha256_is_valid(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|value| value.is_ascii_hexdigit())
 }
 
+fn canonical_sha256_is_valid(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+}
+
 #[allow(dead_code)]
 fn _unimplemented_resume_boundary(_: &ResumeExecutionEnvelope) -> ResumeExecutionResult {
     ResumeExecutionResult {
@@ -1589,6 +1912,614 @@ mod probe_tests {
             validate_probe_result(&request(), &result, &expected),
             Err(ProbeValidationError::ReadinessInvalid)
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_context_gate_tests {
+    use super::*;
+    use crate::{AdapterEdgeConfig, AdapterEdgeKey};
+    use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    const ADAPTER_ID: &str = "adapter:context-gate-test";
+    const PROFILE_ID: &str = "profile:context-gate-test";
+
+    struct FixtureRoot(PathBuf);
+
+    impl FixtureRoot {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "egopulse-harness-context-{label}-{}",
+                Uuid::now_v7()
+            ));
+            fs::create_dir_all(&path).expect("create context gate fixture");
+            Self(path)
+        }
+
+        fn database(&self) -> PathBuf {
+            self.0.join("adapter.sqlcipher")
+        }
+    }
+
+    impl Drop for FixtureRoot {
+        fn drop(&mut self) {
+            let temp = std::env::temp_dir();
+            assert!(self.0.starts_with(temp));
+            if self.0.exists() {
+                fs::remove_dir_all(&self.0).expect("remove context gate fixture");
+            }
+        }
+    }
+
+    fn open_edge(path: &Path) -> AdapterEdge {
+        AdapterEdge::open(AdapterEdgeConfig {
+            database_path: path.to_owned(),
+            adapter_id: ADAPTER_ID.to_owned(),
+            store_epoch: "context-gate-test-v1".to_owned(),
+            key: AdapterEdgeKey::new([0x6d; 32]),
+        })
+        .expect("open context gate edge")
+    }
+
+    #[derive(Clone)]
+    struct FixtureResolver {
+        material: ResolvedDispatchMaterial,
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl DispatchMaterialResolver for FixtureResolver {
+        fn resolve(
+            &self,
+            _envelope: &DispatchEnvelope,
+        ) -> Result<ResolvedDispatchMaterial, HarnessError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(harness_error(
+                    HarnessErrorCode::DependencyUnavailable,
+                    "FIXTURE_RESOLVER_FAILURE",
+                    true,
+                    false,
+                    None,
+                ));
+            }
+            Ok(self.material.clone())
+        }
+    }
+
+    struct CountingDriver {
+        sends: Arc<AtomicUsize>,
+    }
+
+    impl NativeHarnessDriver for CountingDriver {
+        fn probe<'a>(
+            &'a mut self,
+            _request: &'a ProbeHarnessRequest,
+        ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+            Box::pin(async { panic!("probe is not used") })
+        }
+
+        fn send_dispatch<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+            _material: &'a ResolvedDispatchMaterial,
+        ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(DriverDelivery {
+                    native_request_ref: "native-request:context-test".to_owned(),
+                    native_session_ref: "native-session:context-test".to_owned(),
+                    native_execution_ref: Some("native-execution:context-test".to_owned()),
+                    raw_evidence: b"context-gate-delivered".to_vec(),
+                })
+            })
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+            Box::pin(async { panic!("next_event is not used") })
+        }
+
+        fn decide_approval<'a>(
+            &'a mut self,
+            _envelope: &'a ApprovalDecisionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            Box::pin(async { panic!("approval is not used") })
+        }
+
+        fn cancel<'a>(
+            &'a mut self,
+            _envelope: &'a CancelExecutionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            Box::pin(async { panic!("cancel is not used") })
+        }
+
+        fn reconcile<'a>(
+            &'a mut self,
+            _context: &'a ReconciliationContext,
+        ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+            Box::pin(async { panic!("reconcile is not used") })
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingGate {
+        authorization: DispatchContextAuthorization,
+        ready_calls: Arc<AtomicUsize>,
+        existing_calls: Arc<AtomicUsize>,
+    }
+
+    impl DispatchContextAuthorizationGate for CountingGate {
+        fn authorize_ready_dispatch(
+            &self,
+            _envelope: &DispatchEnvelope,
+        ) -> Result<DispatchContextAuthorization, HarnessError> {
+            self.ready_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.authorization.clone())
+        }
+
+        fn verify_existing_dispatch(
+            &self,
+            _envelope: &DispatchEnvelope,
+        ) -> Result<DispatchContextAuthorization, HarnessError> {
+            self.existing_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.authorization.clone())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixedClock;
+
+    impl AdapterClock for FixedClock {
+        fn now(&self) -> Timestamp {
+            Timestamp {
+                seconds: 1_787_488_000,
+                nanos: 0,
+            }
+        }
+    }
+
+    fn protocol() -> NativeProtocolFingerprint {
+        NativeProtocolFingerprint {
+            protocol_name: "fixture".to_owned(),
+            protocol_version: "v1".to_owned(),
+            schema_sha256: "a".repeat(64),
+            adapter_version: "test".to_owned(),
+            native_executable_version: "test".to_owned(),
+            native_binary_sha256: None,
+        }
+    }
+
+    fn material() -> ResolvedDispatchMaterial {
+        ResolvedDispatchMaterial {
+            canonical_input_bundle: br#"{"prompt":"context gate"}"#.to_vec(),
+            prompt: "context gate".to_owned(),
+            workspace_root: std::env::temp_dir(),
+            model: None,
+        }
+    }
+
+    fn envelope(material: &ResolvedDispatchMaterial, dispatch_id: &str) -> DispatchEnvelope {
+        let digest = sha256(&material.canonical_input_bundle);
+        DispatchEnvelope {
+            run_id: "run-context-001".to_owned(),
+            run_revision: 1,
+            step_id: "step-context-001".to_owned(),
+            step_revision: 1,
+            attempt_id: format!("attempt-{dispatch_id}"),
+            attempt_revision: 1,
+            dispatch_id: dispatch_id.to_owned(),
+            dispatch_fingerprint: "b".repeat(64),
+            fencing_token: 1,
+            capability_profile_ref: Some(ContractReference {
+                contract_id: PROFILE_ID.to_owned(),
+                version: "1".to_owned(),
+                sha256: "c".repeat(64),
+            }),
+            input_bundle_ref: format!("ctx-{digest}.json"),
+            input_bundle_sha256: digest,
+            workspace_ref: "workspace".to_owned(),
+            ..DispatchEnvelope::default()
+        }
+    }
+
+    fn authorization(envelope: &DispatchEnvelope) -> DispatchContextAuthorization {
+        let snapshot_id = match classify_dispatch_context_reference(&envelope.input_bundle_ref) {
+            DispatchContextReference::ContextSnapshot { snapshot_id } => snapshot_id,
+            other => panic!("expected context reference, got {other:?}"),
+        };
+        DispatchContextAuthorization::Authorized(Box::new(AuthorizedDispatchContext {
+            binding: DispatchContextBinding {
+                snapshot_id: snapshot_id.clone(),
+                snapshot_revision: 1,
+                content_digest_sha256: envelope.input_bundle_sha256.clone(),
+                expected_scope_ref: "scope:repo".to_owned(),
+            },
+            receipt: DispatchContextAuthorizationReceipt {
+                authorization_id: "ctxauth:test".to_owned(),
+                snapshot_id,
+                snapshot_revision: 1,
+                observed_state_revision: 1,
+                attempt_id: envelope.attempt_id.clone(),
+                dispatch_id: envelope.dispatch_id.clone(),
+                input_digest_sha256: envelope.input_bundle_sha256.clone(),
+                expected_scope_ref: "scope:repo".to_owned(),
+                request_digest_sha256: "d".repeat(64),
+                event_id: "event:context-auth".to_owned(),
+                committed_at_seconds: 1_787_488_000,
+                replayed: false,
+            },
+        }))
+    }
+
+    fn result_error(result: DispatchResult) -> HarnessError {
+        match result.outcome.expect("dispatch outcome") {
+            dispatch_result::Outcome::Error(error) => error,
+            dispatch_result::Outcome::Receipt(receipt) => {
+                panic!("expected error, got receipt {receipt:?}")
+            }
+        }
+    }
+
+    fn assert_prepared(path: &Path, envelope: &DispatchEnvelope) {
+        let mut edge = open_edge(path);
+        assert_eq!(
+            edge.prepare_dispatch(envelope, 1_787_488_001)
+                .expect("inspect prepared dispatch"),
+            DispatchPreparation::Ready
+        );
+        let inspection = edge.inspect().expect("inspect edge");
+        assert_eq!(inspection.dispatch_count, 1);
+        assert_eq!(inspection.delivery_unknown_count, 0);
+    }
+
+    fn adapter(
+        path: &Path,
+        material: ResolvedDispatchMaterial,
+        sends: Arc<AtomicUsize>,
+    ) -> GovernedHarnessAdapter<FixtureResolver, CountingDriver, FixedClock> {
+        adapter_with_resolver(path, material, sends, Arc::new(AtomicUsize::new(0)), false)
+    }
+
+    fn adapter_with_resolver(
+        path: &Path,
+        material: ResolvedDispatchMaterial,
+        sends: Arc<AtomicUsize>,
+        resolver_calls: Arc<AtomicUsize>,
+        resolver_fails: bool,
+    ) -> GovernedHarnessAdapter<FixtureResolver, CountingDriver, FixedClock> {
+        GovernedHarnessAdapter::new(
+            ADAPTER_ID,
+            PROFILE_ID,
+            protocol(),
+            open_edge(path),
+            FixtureResolver {
+                material,
+                calls: resolver_calls,
+                fail: resolver_fails,
+            },
+            CountingDriver { sends },
+            FixedClock,
+        )
+    }
+
+    #[tokio::test]
+    async fn default_gate_rejects_context_and_malformed_bindings_before_begin_or_send() {
+        for (label, reference, expected_detail) in [
+            ("valid", None, "CONTEXT_GATE_UNAVAILABLE"),
+            (
+                "malformed-prefix",
+                Some("ctx:not-a-bundle".to_owned()),
+                "CONTEXT_BINDING_INVALID",
+            ),
+            (
+                "malformed-case",
+                Some(format!("ctx-{}.json", "AB".repeat(32))),
+                "CONTEXT_BINDING_INVALID",
+            ),
+        ] {
+            let root = FixtureRoot::new(label);
+            let resolved = material();
+            let mut dispatch = envelope(&resolved, &format!("dispatch-{label}"));
+            if let Some(reference) = reference {
+                dispatch.input_bundle_ref = reference;
+            }
+            let sends = Arc::new(AtomicUsize::new(0));
+            let resolver_calls = Arc::new(AtomicUsize::new(0));
+            let mut governed = adapter_with_resolver(
+                &root.database(),
+                resolved,
+                Arc::clone(&sends),
+                Arc::clone(&resolver_calls),
+                true,
+            );
+
+            let error = result_error(
+                governed
+                    .dispatch(&dispatch)
+                    .await
+                    .expect("dispatch is represented as a typed result"),
+            );
+            assert_eq!(error.safe_detail_code, expected_detail);
+            assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(sends.load(Ordering::SeqCst), 0);
+            drop(governed);
+            assert_prepared(&root.database(), &dispatch);
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_context_authorization_is_the_only_ready_path_that_can_send() {
+        let root = FixtureRoot::new("matching");
+        let resolved = material();
+        let dispatch = envelope(&resolved, "dispatch-matching");
+        let sends = Arc::new(AtomicUsize::new(0));
+        let ready_calls = Arc::new(AtomicUsize::new(0));
+        let existing_calls = Arc::new(AtomicUsize::new(0));
+        let mut governed = adapter(&root.database(), resolved, Arc::clone(&sends))
+            .with_dispatch_context_authorization_gate(CountingGate {
+                authorization: authorization(&dispatch),
+                ready_calls: Arc::clone(&ready_calls),
+                existing_calls: Arc::clone(&existing_calls),
+            });
+
+        let result = governed
+            .dispatch(&dispatch)
+            .await
+            .expect("authorized dispatch");
+        assert!(matches!(
+            result.outcome,
+            Some(dispatch_result::Outcome::Receipt(receipt))
+                if receipt.disposition == DeliveryDisposition::Delivered as i32
+        ));
+        assert_eq!(ready_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(existing_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn every_context_binding_and_receipt_tuple_tamper_stops_before_begin_or_send() {
+        let base_material = material();
+        let base_envelope = envelope(&base_material, "dispatch-tamper-base");
+        let DispatchContextAuthorization::Authorized(base) = authorization(&base_envelope) else {
+            panic!("fixture authorization")
+        };
+        let mut cases = Vec::new();
+
+        let mut binding = base.clone();
+        binding.binding.snapshot_revision += 1;
+        cases.push((
+            "binding",
+            binding,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut receipt = base.clone();
+        receipt.receipt.authorization_id.clear();
+        cases.push((
+            "receipt",
+            receipt,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut attempt = base.clone();
+        attempt.receipt.attempt_id = "attempt-tampered".to_owned();
+        cases.push((
+            "attempt",
+            attempt,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut dispatch = base.clone();
+        dispatch.receipt.dispatch_id = "dispatch-tampered".to_owned();
+        cases.push((
+            "dispatch",
+            dispatch,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut scope = base.clone();
+        scope.receipt.expected_scope_ref = "scope:other".to_owned();
+        cases.push((
+            "scope",
+            scope,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut digest = base.clone();
+        digest.binding.content_digest_sha256 = "e".repeat(64);
+        cases.push((
+            "digest",
+            digest,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut receipt_snapshot_id = base.clone();
+        receipt_snapshot_id.receipt.snapshot_id = format!("ctx:{}", "e".repeat(64));
+        cases.push((
+            "receipt-snapshot-id",
+            receipt_snapshot_id,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut receipt_snapshot_revision = base.clone();
+        receipt_snapshot_revision.receipt.snapshot_revision += 1;
+        cases.push((
+            "receipt-snapshot-revision",
+            receipt_snapshot_revision,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut observed_state_revision = base.clone();
+        observed_state_revision.receipt.observed_state_revision = 0;
+        cases.push((
+            "receipt-observed-state-revision",
+            observed_state_revision,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut receipt_input_digest = base.clone();
+        receipt_input_digest.receipt.input_digest_sha256 = "e".repeat(64);
+        cases.push((
+            "receipt-input-digest",
+            receipt_input_digest,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut request_digest = base.clone();
+        request_digest.receipt.request_digest_sha256 = "D".repeat(64);
+        cases.push((
+            "receipt-request-digest",
+            request_digest,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut event_id = base.clone();
+        event_id.receipt.event_id.clear();
+        cases.push((
+            "receipt-event-id",
+            event_id,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut committed_at = base.clone();
+        committed_at.receipt.committed_at_seconds = 0;
+        cases.push((
+            "receipt-committed-at",
+            committed_at,
+            base_material.clone(),
+            "CONTEXT_AUTHORIZATION_INVALID",
+        ));
+        let mut bytes_mismatch = base_material.clone();
+        bytes_mismatch.canonical_input_bundle = b"different owned bytes".to_vec();
+        cases.push((
+            "bytes-envelope-digest",
+            base,
+            bytes_mismatch,
+            "INPUT_BUNDLE_DIGEST_MISMATCH",
+        ));
+
+        for (label, mut context, resolved_material, expected_detail) in cases {
+            let root = FixtureRoot::new(label);
+            let mut dispatch = base_envelope.clone();
+            dispatch.dispatch_id = format!("dispatch-tamper-{label}");
+            dispatch.attempt_id = format!("attempt-tamper-{label}");
+            context.receipt.attempt_id = match label {
+                "attempt" => context.receipt.attempt_id,
+                _ => dispatch.attempt_id.clone(),
+            };
+            context.receipt.dispatch_id = match label {
+                "dispatch" => context.receipt.dispatch_id,
+                _ => dispatch.dispatch_id.clone(),
+            };
+            let sends = Arc::new(AtomicUsize::new(0));
+            let mut governed = adapter(&root.database(), resolved_material, Arc::clone(&sends))
+                .with_dispatch_context_authorization_gate(CountingGate {
+                    authorization: DispatchContextAuthorization::Authorized(context),
+                    ready_calls: Arc::new(AtomicUsize::new(0)),
+                    existing_calls: Arc::new(AtomicUsize::new(0)),
+                });
+
+            let error = result_error(
+                governed
+                    .dispatch(&dispatch)
+                    .await
+                    .expect("tamper is a typed dispatch error"),
+            );
+            assert_eq!(error.safe_detail_code, expected_detail);
+            assert_eq!(sends.load(Ordering::SeqCst), 0);
+            drop(governed);
+            assert_prepared(&root.database(), &dispatch);
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_and_delivery_unknown_use_existing_lookup_only_and_never_send() {
+        for replay in [false, true] {
+            let label = if replay { "replay" } else { "delivery-unknown" };
+            let root = FixtureRoot::new(label);
+            let resolved = material();
+            let dispatch = envelope(&resolved, &format!("dispatch-{label}"));
+            let mut seeded = open_edge(&root.database());
+            assert_eq!(
+                seeded
+                    .prepare_dispatch(&dispatch, 1_787_487_999)
+                    .expect("seed prepare"),
+                DispatchPreparation::Ready
+            );
+            seeded
+                .begin_delivery(&dispatch.dispatch_id, 1_787_487_999)
+                .expect("seed native boundary");
+            if replay {
+                let mut receipt = DispatchReceipt {
+                    receipt_id: "receipt:seeded".to_owned(),
+                    disposition: DeliveryDisposition::Delivered as i32,
+                    attempt_id: dispatch.attempt_id.clone(),
+                    dispatch_id: dispatch.dispatch_id.clone(),
+                    fencing_token: dispatch.fencing_token,
+                    adapter_id: ADAPTER_ID.to_owned(),
+                    capability_profile_id: PROFILE_ID.to_owned(),
+                    evidence_ref: "evidence:seeded".to_owned(),
+                    delivered_at: Some(Timestamp {
+                        seconds: 1_787_487_999,
+                        nanos: 0,
+                    }),
+                    ..DispatchReceipt::default()
+                };
+                receipt.receipt_digest_sha256 = canonical_digest(&receipt);
+                seeded
+                    .record_dispatch_receipt(&receipt, b"seeded", 1_787_487_999)
+                    .expect("seed receipt");
+            }
+            drop(seeded);
+
+            let ready_calls = Arc::new(AtomicUsize::new(0));
+            let existing_calls = Arc::new(AtomicUsize::new(0));
+            let sends = Arc::new(AtomicUsize::new(0));
+            let mut governed = adapter(&root.database(), resolved, Arc::clone(&sends))
+                .with_dispatch_context_authorization_gate(CountingGate {
+                    authorization: authorization(&dispatch),
+                    ready_calls: Arc::clone(&ready_calls),
+                    existing_calls: Arc::clone(&existing_calls),
+                });
+            let result = governed
+                .dispatch(&dispatch)
+                .await
+                .expect("recover existing dispatch");
+            assert!(matches!(
+                result.outcome,
+                Some(dispatch_result::Outcome::Receipt(_))
+            ));
+            assert_eq!(ready_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(existing_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(sends.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn static_dispatches_remain_compatible_with_the_default_gate() {
+        let root = FixtureRoot::new("static");
+        let resolved = material();
+        let mut dispatch = envelope(&resolved, "dispatch-static");
+        dispatch.input_bundle_ref = "static-bundle.json".to_owned();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut governed = adapter(&root.database(), resolved, Arc::clone(&sends));
+
+        let result = governed.dispatch(&dispatch).await.expect("static dispatch");
+        assert!(matches!(
+            result.outcome,
+            Some(dispatch_result::Outcome::Receipt(receipt))
+                if receipt.disposition == DeliveryDisposition::Delivered as i32
+        ));
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
     }
 }
 
