@@ -360,6 +360,26 @@ impl CollaborationReferenceGuard for TaskActivationReferenceGuard {
         if !self.run_matches_task(run) {
             return Err(ReferenceGuardRejection::StaleTaskReference);
         }
+        if let Some(digest) = self.task.input_snapshot_id.strip_prefix("ctx:") {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || self.plan.steps.is_empty()
+            {
+                return Err(ReferenceGuardRejection::StaleTaskReference);
+            }
+            let expected_ref = format!("ctx-{digest}.json");
+            if self.material.input_bundle_sha256 != digest
+                || self
+                    .plan
+                    .steps
+                    .iter()
+                    .any(|step| step.input_bundle_ref != expected_ref)
+            {
+                return Err(ReferenceGuardRejection::StaleTaskReference);
+            }
+        }
         Ok(self.material.clone())
     }
 
@@ -383,7 +403,7 @@ impl CollaborationReferenceGuard for TaskActivationReferenceGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egopulse_domain_contracts::v01::egopulse::collaboration::v1::CreateRunCommand;
+    use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{CreateRunCommand, StepPlan};
     use egopulse_domain_contracts::v01::egopulse::harness::v1::NativeSessionStrategy;
 
     fn contract_ref(id: &str) -> ContractReference {
@@ -449,6 +469,53 @@ mod tests {
         stale.task_revision = 1;
         assert_eq!(
             guard.validate_create_run(&stale),
+            Err(ReferenceGuardRejection::StaleTaskReference)
+        );
+    }
+
+    #[test]
+    fn context_dispatch_material_must_match_task_snapshot_and_plan() {
+        let digest = "ab".repeat(32);
+        let mut config = config();
+        config.material.input_bundle_sha256 = digest.clone();
+        config.plan.steps = vec![StepPlan {
+            step_id: "step-001".to_owned(),
+            input_bundle_ref: format!("ctx-{digest}.json"),
+            ..Default::default()
+        }];
+        let task = TaskSnapshot {
+            task_id: "task-001".to_owned(),
+            revision: 2,
+            work_revision: 1,
+            status: TaskStatus::Active as i32,
+            current_run_id: Some(config.run_id.clone()),
+            input_snapshot_id: format!("ctx:{digest}"),
+            ..Default::default()
+        };
+        let guard = TaskActivationReferenceGuard::new(task, &config, 30);
+        let snapshot = CollaborationSnapshot {
+            run: Some(RunSnapshot {
+                run_id: config.run_id.clone(),
+                task_id: "task-001".to_owned(),
+                task_revision_at_creation: 2,
+                work_revision: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            guard
+                .resolve_dispatch_material(&RecordDispatchIntentCommand::default(), &snapshot)
+                .is_ok()
+        );
+
+        let mut stale_config = config;
+        stale_config.material.input_bundle_sha256 = "cd".repeat(32);
+        let stale_guard =
+            TaskActivationReferenceGuard::new(guard.task().clone(), &stale_config, 30);
+        assert_eq!(
+            stale_guard
+                .resolve_dispatch_material(&RecordDispatchIntentCommand::default(), &snapshot),
             Err(ReferenceGuardRejection::StaleTaskReference)
         );
     }

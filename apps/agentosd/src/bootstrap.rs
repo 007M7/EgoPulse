@@ -579,7 +579,8 @@ impl ProductionBootstrapConfig {
                         &verification,
                     ))),
                 ],
-            });
+            })
+            .with_context_authority(Arc::clone(&context));
         if let Some(worker_config) = self.verification_worker {
             let worker = ConfiguredVerificationWorker::new(
                 Arc::clone(&task),
@@ -604,6 +605,7 @@ impl ProductionBootstrapConfig {
             task_guard_config.acceptance_contract_ref,
             task_guard_config.budget_profile_ref,
         )
+        .and_then(|port| port.with_input_bundle_root(self.codex.native.input_bundle_root.clone()))
         .and_then(|port| port.with_activation_run_id(self.codex.native.workflow.run_id.clone()))
         .map_err(|_| ProductionBootstrapError::WorkPreparation)?;
         providers = providers.with_work_preparation_port(Arc::new(work_port));

@@ -206,3 +206,35 @@ and the existing invariant that Harness observations never complete a Task.
 Until this evidence exists, `work plan` is a valid preview capability and
 `task create` remains a diagnostic/acceptance command, not the normal product
 入口.
+
+## R-7 read-side dispatch binding checkpoint (2026-08-30)
+
+The candidate implementation now carries the Authority-owned context binding
+across the existing frozen seams without adding Provider, Memory/RAG or Desktop
+scope:
+
+1. work preparation publishes immutable, content-addressed JSON input bundles
+   using write, flush, file sync and no-overwrite final publication;
+2. workflow resolution accepts only canonical `ctx:<sha256>` Task snapshot
+   references, proves current scope and Authority state, and binds every
+   planned step plus dispatch material to `ctx-<sha256>.json`;
+3. the Task activation reference guard proves that the Task, plan and material
+   still carry that exact binding;
+4. immediately before native Harness dispatch, the material resolver rechecks
+   Authority existence, expiry, revoked state and compiled-byte integrity;
+5. malformed `ctx-*` references fail closed and never fall back to static file
+   material, while ordinary reviewed static bundles remain compatible.
+
+The reviewed `RunPlan.digest_sha256` is retained when a Context-backed Task is
+instantiated. In the current repository it is a complete SHA-256-shaped
+identity for the reviewed plan/configuration artifact; no contract defines or
+validates it as a canonical hash over mutable `RunPlan` fields. The dynamic
+instance is instead sealed by the Context/Task bindings, reference guard,
+material digest and canonical command request digest. Reinterpreting the plan
+digest as an instance-content hash would require a separately frozen
+canonicalization, calculation and validation contract.
+
+R-7 is therefore a read-side governance closure, not the whole interaction
+closure. A formal Context Authority revoke write operation and a real dynamic
+prepare-to-native-driver CLI/TUI E2E remain required before the product path
+can be declared normally usable.

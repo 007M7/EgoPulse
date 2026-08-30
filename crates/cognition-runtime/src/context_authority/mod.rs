@@ -355,6 +355,41 @@ impl ContextAuthority {
         })
     }
 
+    /// Revalidates an immutable snapshot at a dispatch-consumption boundary.
+    /// Scope was already bound to the Task activation and cannot be changed
+    /// for this content-addressed snapshot; this method repeats the state,
+    /// expiry and byte-integrity checks without a new client contract.
+    pub fn resolve_for_consumption(
+        &self,
+        snapshot_id: &str,
+        now_seconds: i64,
+    ) -> Result<ResolvedContextSnapshot, ContextAuthorityFailure> {
+        validate_routing(snapshot_id, "snapshot_id")?;
+        if now_seconds < 0 {
+            return Err(ContextAuthorityFailure::Clock);
+        }
+        let stored = self
+            .store
+            .snapshot_with_bytes(snapshot_id)?
+            .ok_or(ContextAuthorityFailure::NotFound)?;
+        if stored.state == "revoked" {
+            return Err(ContextAuthorityFailure::Revoked);
+        }
+        if stored.snapshot.expires_at_seconds <= now_seconds {
+            return Err(ContextAuthorityFailure::Expired);
+        }
+        if sha256(&stored.compiled_context) != stored.snapshot.compiled_context_sha256
+            || stored.snapshot.snapshot_id
+                != format!("ctx:{}", stored.snapshot.compiled_context_sha256)
+        {
+            return Err(ContextAuthorityFailure::IntegrityFailure);
+        }
+        Ok(ResolvedContextSnapshot {
+            snapshot: stored.snapshot,
+            compiled_context: stored.compiled_context,
+        })
+    }
+
     /// Records the immutable Memory revision consumed by one model dispatch.
     /// The daemon must obtain the revision and pack digest from Memory
     /// Authority before calling this method; this owner only records and
@@ -813,6 +848,13 @@ mod tests {
             br#"{"prompt":"inspect","scope":"scope:repo"}"#
         );
         assert_eq!(
+            authority
+                .resolve_for_consumption(&snapshot.snapshot_id, current_timestamp().expect("clock"))
+                .expect("dispatch consumption resolve")
+                .compiled_context,
+            resolved.compiled_context
+        );
+        assert_eq!(
             authority.resolve(
                 &snapshot.snapshot_id,
                 "scope:other",
@@ -828,6 +870,83 @@ mod tests {
             ),
             Err(ContextAuthorityFailure::Expired)
         );
+        assert_eq!(
+            authority.resolve_for_consumption(&snapshot.snapshot_id, snapshot.expires_at_seconds),
+            Err(ContextAuthorityFailure::Expired)
+        );
+    }
+
+    #[test]
+    fn dispatch_consumption_fails_closed_when_stored_snapshot_is_revoked() {
+        let root =
+            std::env::temp_dir().join(format!("egopulse-context-revoked-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("context test root");
+        let database_path = root.join("context.sqlcipher");
+        let key = [41; 32];
+        let mut authority = ContextAuthority::open(ContextAuthorityConfig {
+            database_path: database_path.clone(),
+            store_epoch: "context-revoked-test".to_owned(),
+            key: SqlCipherKey::new(key),
+        })
+        .expect("context authority");
+        let (_, snapshot) = authority
+            .issue(&input("revoked-dispatch"), &compiler())
+            .expect("issue");
+        drop(authority);
+
+        let connection = rusqlite::Connection::open(&database_path).expect("open context store");
+        connection
+            .pragma_update(None, "key", format!("x'{}'", hex::encode(key)))
+            .expect("apply context store key");
+        connection
+            .execute(
+                "UPDATE context_snapshots SET state = 'revoked' WHERE snapshot_id = ?1",
+                [&snapshot.snapshot_id],
+            )
+            .expect("simulate an already-governed revoked snapshot");
+        drop(connection);
+
+        let authority = ContextAuthority::open(ContextAuthorityConfig {
+            database_path: database_path.clone(),
+            store_epoch: "context-revoked-test".to_owned(),
+            key: SqlCipherKey::new(key),
+        })
+        .expect("reopen context authority");
+        assert_eq!(
+            authority.resolve_for_consumption(
+                &snapshot.snapshot_id,
+                current_timestamp().expect("clock")
+            ),
+            Err(ContextAuthorityFailure::Revoked)
+        );
+        drop(authority);
+
+        let connection = rusqlite::Connection::open(&database_path).expect("reopen context store");
+        connection
+            .pragma_update(None, "key", format!("x'{}'", hex::encode(key)))
+            .expect("apply context store key");
+        connection
+            .execute(
+                "UPDATE context_snapshots SET state = 'issued', compiled_context = ?1 WHERE snapshot_id = ?2",
+                rusqlite::params![b"tampered".as_slice(), &snapshot.snapshot_id],
+            )
+            .expect("simulate corrupted stored bytes");
+        drop(connection);
+        let authority = ContextAuthority::open(ContextAuthorityConfig {
+            database_path,
+            store_epoch: "context-revoked-test".to_owned(),
+            key: SqlCipherKey::new(key),
+        })
+        .expect("reopen corrupted context authority");
+        assert_eq!(
+            authority.resolve_for_consumption(
+                &snapshot.snapshot_id,
+                current_timestamp().expect("clock")
+            ),
+            Err(ContextAuthorityFailure::IntegrityFailure)
+        );
+        drop(authority);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

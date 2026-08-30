@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeSet,
     fs,
+    fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -40,6 +42,7 @@ pub struct ConfiguredWorkPreparationPort {
     allowed_work_types: BTreeSet<String>,
     acceptance_contract_ref: ContractReference,
     budget_profile_ref: ContractReference,
+    input_bundle_root: Option<PathBuf>,
     /// Reviewed daemon-owned workflow instance used for post-confirmation
     /// activation. None is retained by foundation/unit-test compositions.
     activation_run_id: Option<String>,
@@ -70,8 +73,17 @@ impl ConfiguredWorkPreparationPort {
             allowed_work_types,
             acceptance_contract_ref,
             budget_profile_ref,
+            input_bundle_root: None,
             activation_run_id: None,
         })
+    }
+
+    pub fn with_input_bundle_root(mut self, root: PathBuf) -> Result<Self, CommandPortFailure> {
+        if root.as_os_str().is_empty() {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        self.input_bundle_root = Some(root);
+        Ok(self)
     }
 
     pub fn with_activation_run_id(mut self, run_id: String) -> Result<Self, CommandPortFailure> {
@@ -88,12 +100,7 @@ impl ConfiguredWorkPreparationPort {
     ) -> (Vec<ContextSourceFact>, Vec<WorkGateNotice>, Vec<u8>) {
         let mut facts = Vec::new();
         let mut excluded = Vec::new();
-        let mut compiled = Vec::new();
-        compiled.extend_from_slice(request.intent.trim().as_bytes());
-        compiled.push(b'\n');
-        compiled.extend_from_slice(request.work_type.trim().as_bytes());
-        compiled.push(b'\n');
-        compiled.extend_from_slice(request.target_scope_ref.trim().as_bytes());
+        let mut source_prompt = String::new();
 
         for source in &request.sources {
             let source_ref = source.source_ref.trim();
@@ -130,10 +137,10 @@ impl ConfiguredWorkPreparationPort {
                 continue;
             }
             let digest = sha256(&bytes);
-            compiled.extend_from_slice(b"\n--SOURCE ");
-            compiled.extend_from_slice(source_ref.as_bytes());
-            compiled.extend_from_slice(b"--\n");
-            compiled.extend_from_slice(&bytes);
+            source_prompt.push_str("\n\n--- SOURCE ");
+            source_prompt.push_str(source_ref);
+            source_prompt.push_str(" ---\n");
+            source_prompt.push_str(&String::from_utf8_lossy(&bytes));
             facts.push(ContextSourceFact {
                 source_ref: source_ref.to_owned(),
                 label: if source.label.trim().is_empty() {
@@ -146,6 +153,13 @@ impl ConfiguredWorkPreparationPort {
                 included: true,
             });
         }
+        let compiled = serde_json::to_vec(&serde_json::json!({
+            "prompt": format!("{}{}", request.intent.trim(), source_prompt),
+            "work_type": request.work_type.trim(),
+            "target_scope_ref": request.target_scope_ref.trim(),
+            "sources": facts,
+        }))
+        .expect("compiled input bundle is serializable");
         (facts, excluded, compiled)
     }
 
@@ -208,6 +222,11 @@ impl ConfiguredWorkPreparationPort {
             .map_err(|_| CommandPortFailure::IntegrityFailure)?
             .issue(&input, &principal)
             .map_err(context_failure)?;
+        persist_input_bundle(
+            self.input_bundle_root.as_deref(),
+            &snapshot.compiled_context_sha256,
+            &input.compiled_context,
+        )?;
         let gate_ready = excluded_sources.is_empty() && !snapshot.sources.is_empty();
         let preview = WorkPreparationPreview {
             snapshot_id: snapshot.snapshot_id.clone(),
@@ -401,6 +420,60 @@ fn safe_source_path(root: &Path, source_ref: &str) -> Option<PathBuf> {
     }
     let path = root.join(candidate).canonicalize().ok()?;
     path.starts_with(root).then_some(path)
+}
+
+fn persist_input_bundle(
+    root: Option<&Path>,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<(), CommandPortFailure> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    fs::create_dir_all(root).map_err(|_| CommandPortFailure::Unavailable)?;
+    let path = root.join(format!("ctx-{digest}.json"));
+    if path.exists() {
+        let existing = fs::read(&path).map_err(|_| CommandPortFailure::Unavailable)?;
+        return if existing == bytes {
+            Ok(())
+        } else {
+            Err(CommandPortFailure::IntegrityFailure)
+        };
+    }
+
+    let temporary = root.join(format!(".ctx-{digest}-{}.tmp", Uuid::now_v7()));
+    let publish_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| CommandPortFailure::Unavailable)?;
+        file.write_all(bytes)
+            .map_err(|_| CommandPortFailure::Unavailable)?;
+        file.flush().map_err(|_| CommandPortFailure::Unavailable)?;
+        file.sync_all()
+            .map_err(|_| CommandPortFailure::Unavailable)?;
+        drop(file);
+
+        match fs::hard_link(&temporary, &path) {
+            Ok(()) => Ok(()),
+            Err(_) if path.exists() => {
+                let existing = fs::read(&path).map_err(|_| CommandPortFailure::Unavailable)?;
+                if existing == bytes {
+                    Ok(())
+                } else {
+                    Err(CommandPortFailure::IntegrityFailure)
+                }
+            }
+            Err(_) => Err(CommandPortFailure::Unavailable),
+        }
+    })();
+    let cleanup_result = fs::remove_file(&temporary);
+    match (publish_result, cleanup_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(_)) => Err(CommandPortFailure::Unavailable),
+    }
 }
 
 fn source_fact(source: ContextSourceFact) -> WorkSourceFact {
@@ -597,7 +670,9 @@ mod tests {
                 contract("acceptance"),
                 contract("budget"),
             )
-            .expect("work preparation port");
+            .expect("work preparation port")
+            .with_input_bundle_root(root.join("input-bundles"))
+            .expect("input bundle root");
             Self {
                 root,
                 context,
@@ -705,6 +780,24 @@ mod tests {
         assert!(preview.gate_ready);
         assert_eq!(preview.included_sources.len(), 1);
         assert!(!preview.confirmation_binding_sha256.is_empty());
+        let digest = preview
+            .snapshot_id
+            .strip_prefix("ctx:")
+            .expect("content-addressed snapshot id");
+        let bundle = fs::read(
+            fixture
+                .root
+                .join("input-bundles")
+                .join(format!("ctx-{digest}.json")),
+        )
+        .expect("compiled input bundle");
+        assert_eq!(sha256(&bundle), digest);
+        let compiled: serde_json::Value =
+            serde_json::from_slice(&bundle).expect("compiled bundle JSON");
+        assert_eq!(
+            compiled.get("prompt").and_then(serde_json::Value::as_str),
+            Some("update the governed source\n\n--- SOURCE intent.md ---\nfounder-owned source")
+        );
 
         let result = fixture
             .port
@@ -723,6 +816,31 @@ mod tests {
         ));
         drop(commands);
         fixture.finish();
+    }
+
+    #[test]
+    fn input_bundle_publish_is_atomic_idempotent_and_rejects_existing_drift() {
+        let root = std::env::temp_dir().join(format!("egopulse-bundle-publish-{}", Uuid::now_v7()));
+        let bytes = br#"{"prompt":"atomic bundle"}"#;
+        let digest = sha256(bytes);
+        persist_input_bundle(Some(&root), &digest, bytes).expect("first publish");
+        persist_input_bundle(Some(&root), &digest, bytes).expect("idempotent publish");
+        assert_eq!(
+            fs::read(root.join(format!("ctx-{digest}.json"))).expect("published bundle"),
+            bytes
+        );
+        assert!(fs::read_dir(&root).expect("bundle directory").all(|entry| {
+            !entry
+                .expect("bundle entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        assert!(matches!(
+            persist_input_bundle(Some(&root), &digest, br#"{"prompt":"drift"}"#),
+            Err(CommandPortFailure::IntegrityFailure)
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

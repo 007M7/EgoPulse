@@ -187,3 +187,33 @@ CLI/TUI natural language
   -> projection await/watch
   -> Harness observation and governed evidence
 ```
+
+## 7. Implementation checkpoint: 2026-08-30
+
+The next read-side Context-to-Harness binding slice is implemented as a
+candidate and has passed its targeted local gates. A confirmed Task whose
+`input_snapshot_id` is a canonical `ctx:<sha256>` is resolved again through
+Context Authority with the Task scope before workflow activation. The resolved
+digest binds both `StepPlan.input_bundle_ref` and dispatch material to the
+immutable `ctx-<sha256>.json` bundle. Immediately before native Harness
+dispatch, the daemon resolves the snapshot again and rejects missing,
+malformed, expired, revoked, scope-inconsistent or byte-inconsistent context.
+Static reviewed input bundles remain compatible and cannot be reached as a
+fallback from a malformed `ctx-*` reference.
+
+`RunPlan.digest_sha256` continues to identify the reviewed plan template or
+configuration artifact. The current contract does not define it as a canonical
+hash of an instantiated `RunPlan` message and provides no canonicalization or
+content-consistency oracle. Dynamic Context binding is therefore protected by
+the Authority snapshot, Task/Run reference guards, dispatch-material digest,
+and the sealed `CreateRunCommand` request digest; this slice does not invent a
+new plan-digest algorithm. Any future instance-content digest requires a
+separately frozen calculation and verification contract.
+
+This checkpoint does not declare the normal product path complete. Context
+Authority still lacks a formal authenticated, idempotent and audited revoke
+write command; current evidence only proves that dispatch rejects a snapshot
+already governed into the revoked state. A real dynamic product E2E covering
+CLI/TUI prepare -> confirm -> activation -> Collaboration dispatch -> native
+driver is also still required. Those two gaps remain explicit subsequent
+closure work.

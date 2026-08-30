@@ -4,14 +4,16 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use egopulse_codex_adapter::{
     CODEX_ADAPTER_ID, CODEX_CAPABILITY_PROFILE_ID, CodexAppServerConfig, CodexAppServerDriver,
     FileDispatchMaterialResolver, codex_protocol_fingerprint,
 };
-use egopulse_cognition_runtime::memory_authority::MemoryAuthority;
+use egopulse_cognition_runtime::{
+    context_authority::ContextAuthority, memory_authority::MemoryAuthority,
+};
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::ContractReference,
     harness::v1::{CapabilityProfile, NativeProtocolFingerprint},
@@ -67,6 +69,7 @@ use tonic::transport::Server;
 
 mod artifact;
 mod bootstrap;
+mod context_material;
 mod memory_mutation;
 mod memory_retrieval;
 mod owners;
@@ -333,21 +336,33 @@ pub struct DaemonProviders {
     /// separate from the public Local API mutation port.
     pub memory_candidate_producers: Arc<MemoryCandidateProducerRegistry>,
     pub work_preparation_port: Arc<dyn WorkPreparationPort>,
+    context_authority: Option<Arc<Mutex<ContextAuthority>>>,
 }
 
-/// Explicit workflow configuration boundary for the first vertical. It does
-/// not derive a plan, model, workspace, or material from a Task payload; all
-/// of those are injected as one reviewed configuration and only the activated
-/// run id is checked against the handoff.
-#[derive(Clone, Debug)]
+/// Explicit workflow configuration boundary for the first vertical. Reviewed
+/// policy, workspace and provider facts remain injected configuration. For a
+/// ContextSnapshot-backed Task, only the content-addressed input bundle
+/// reference and matching material digest are rebound from the Authority-owned
+/// `input_snapshot_id` carried by the activation handoff.
+#[derive(Clone)]
 pub struct ConfiguredSingleHarnessWorkflow {
     config: SingleHarnessWorkConfig,
+    context_authority: Option<Arc<Mutex<ContextAuthority>>>,
 }
 
 impl ConfiguredSingleHarnessWorkflow {
     #[must_use]
     pub fn new(config: SingleHarnessWorkConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            context_authority: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_context_authority(mut self, context: Arc<Mutex<ContextAuthority>>) -> Self {
+        self.context_authority = Some(context);
+        self
     }
 }
 
@@ -359,16 +374,74 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
         if activation.task.current_run_id.as_deref() != Some(self.config.run_id.as_str()) {
             return Ok(SingleHarnessWorkflowResolution::NotApplicable);
         }
-        Ok(SingleHarnessWorkflowResolution::Resolved(Box::new(
-            self.config.clone(),
-        )))
+        let mut config = self.config.clone();
+        if let Some(digest) = context_snapshot_digest(&activation.task.input_snapshot_id)? {
+            let now_seconds = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| SingleHarnessWorkflowResolverError::Unavailable)?
+                .as_secs()
+                .try_into()
+                .map_err(|_| SingleHarnessWorkflowResolverError::Unavailable)?;
+            let context = self
+                .context_authority
+                .as_ref()
+                .ok_or(SingleHarnessWorkflowResolverError::Unavailable)?;
+            let resolved = context
+                .lock()
+                .map_err(|_| SingleHarnessWorkflowResolverError::Unavailable)?
+                .resolve(
+                    &activation.task.input_snapshot_id,
+                    &activation.task.target_scope_ref,
+                    now_seconds,
+                )
+                .map_err(|error| match error {
+                    egopulse_cognition_runtime::context_authority::ContextAuthorityFailure::Storage => {
+                        SingleHarnessWorkflowResolverError::Unavailable
+                    }
+                    _ => SingleHarnessWorkflowResolverError::InvalidConfiguration,
+                })?;
+            if resolved.snapshot.compiled_context_sha256 != digest {
+                return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+            }
+            if config.plan.steps.is_empty() {
+                return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+            }
+            // The plan digest identifies the reviewed template artifact. The
+            // current contract does not define a canonical digest over an
+            // instantiated RunPlan, so the Authority-owned input binding is
+            // carried by the step reference, material digest and sealed
+            // CreateRun command rather than by inventing a new digest here.
+            let input_bundle_ref = format!("ctx-{digest}.json");
+            for step in &mut config.plan.steps {
+                step.input_bundle_ref.clone_from(&input_bundle_ref);
+            }
+            config.material.input_bundle_sha256 = digest.to_owned();
+        }
+        Ok(SingleHarnessWorkflowResolution::Resolved(Box::new(config)))
     }
 }
 
+fn context_snapshot_digest(
+    snapshot_id: &str,
+) -> Result<Option<&str>, SingleHarnessWorkflowResolverError> {
+    let Some(digest) = snapshot_id.strip_prefix("ctx:") else {
+        return Ok(None);
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+    }
+    Ok(Some(digest))
+}
+
 /// Provider-neutral composition input for one admitted native Harness. The
-/// workflow configuration is reviewed data; no value is inferred from a Task
-/// payload or from a provider response. Provider process configuration stays
-/// outside this type.
+/// workflow configuration is reviewed data; provider, workspace and policy
+/// values are not inferred from a Task payload or provider response. A ctx
+/// bundle binding may only be rebound from an Authority-resolved Task snapshot.
+/// Provider process configuration stays outside this type.
 pub struct NativeHarnessCompositionConfig {
     pub collaboration_database_path: PathBuf,
     pub collaboration_store_epoch: String,
@@ -574,6 +647,7 @@ impl DaemonProviders {
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
+            context_authority: None,
         }
     }
 
@@ -648,6 +722,7 @@ impl DaemonProviders {
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
+            context_authority: None,
         }
     }
 
@@ -696,7 +771,14 @@ impl DaemonProviders {
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
+            context_authority: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_context_authority(mut self, context: Arc<Mutex<ContextAuthority>>) -> Self {
+        self.context_authority = Some(context);
+        self
     }
 
     #[must_use]
@@ -1001,22 +1083,26 @@ impl DaemonProviders {
                 SystemAuthorityClock,
             )
             .map_err(DaemonCompositionError::Collaboration)?;
+            let file_material = match config.default_model {
+                Some(model) => FileDispatchMaterialResolver::new(
+                    config.input_bundle_root,
+                    config.workspace_root,
+                )
+                .with_default_model(model),
+                None => FileDispatchMaterialResolver::new(
+                    config.input_bundle_root,
+                    config.workspace_root,
+                ),
+            };
             let adapter = GovernedHarnessAdapter::new(
                 adapter_id,
                 capability_profile_id,
                 observed_protocol,
                 writer_edge,
-                match config.default_model {
-                    Some(model) => FileDispatchMaterialResolver::new(
-                        config.input_bundle_root,
-                        config.workspace_root,
-                    )
-                    .with_default_model(model),
-                    None => FileDispatchMaterialResolver::new(
-                        config.input_bundle_root,
-                        config.workspace_root,
-                    ),
-                },
+                context_material::ContextBoundDispatchMaterialResolver::new(
+                    file_material,
+                    self.context_authority.clone(),
+                ),
                 driver,
                 SystemAdapterClock,
             );
@@ -1027,6 +1113,10 @@ impl DaemonProviders {
             };
             let capability_profile_ref = config.workflow.capability_profile_ref.clone();
             let resolver = ConfiguredSingleHarnessWorkflow::new(config.workflow);
+            let resolver = match self.context_authority.as_ref() {
+                Some(context) => resolver.with_context_authority(Arc::clone(context)),
+                None => resolver,
+            };
             let artifact_return_principal = AuthenticatedCollaborationPrincipal {
                 kind: CollaborationPrincipalKind::ArtifactAuthority,
                 principal_id: config
@@ -1938,6 +2028,145 @@ mod tests {
                 "native Harness composition"
             ))
         ));
+    }
+
+    #[test]
+    fn context_task_rebinds_only_bundle_reference_and_material_digest() {
+        use egopulse_cognition_runtime::context_authority::{
+            AuthenticatedContextPrincipal, ContextAuthorityConfig, ContextPrincipalKind,
+            IssueContextSnapshot,
+        };
+        let root =
+            std::env::temp_dir().join(format!("egopulse-workflow-context-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("context test root");
+        let mut authority = ContextAuthority::open(ContextAuthorityConfig {
+            database_path: root.join("context.db"),
+            store_epoch: "workflow-context-test".to_owned(),
+            key: egopulse_cognition_runtime::task_authority::SqlCipherKey::new([0x71; 32]),
+        })
+        .expect("context authority");
+        let compiled = br#"{"prompt":"context task"}"#.to_vec();
+        let (_, context_snapshot) = authority
+            .issue(
+                &IssueContextSnapshot {
+                    owner_principal_id: "founder:test".to_owned(),
+                    intent: "context task".to_owned(),
+                    work_type: "governed_repository_change".to_owned(),
+                    target_scope_ref: "scope:repo".to_owned(),
+                    compiled_context: compiled,
+                    sources: Vec::new(),
+                    memory_pack: None,
+                    allowed_read_paths: vec!["workspace".to_owned()],
+                    allowed_write_paths: vec!["workspace".to_owned()],
+                    allowed_tools: Vec::new(),
+                    external_resources: Vec::new(),
+                    non_goals: Vec::new(),
+                    acceptance_contract_ref: "acceptance:v1".to_owned(),
+                    budget_profile_ref: "budget:v1".to_owned(),
+                    deadline_seconds: None,
+                    recovery_entry: "hold-and-reconcile".to_owned(),
+                    visibility: "founder-only".to_owned(),
+                    redactions: Vec::new(),
+                    expires_at_seconds: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("clock")
+                        .as_secs() as i64
+                        + 600,
+                    idempotency_key: "workflow-context-test".to_owned(),
+                },
+                &AuthenticatedContextPrincipal {
+                    kind: ContextPrincipalKind::ContextCompiler,
+                    principal_id: "context-compiler:test".to_owned(),
+                    authenticated: true,
+                },
+            )
+            .expect("issue context snapshot");
+        let context = Arc::new(Mutex::new(authority));
+        let mut config = multi_native_config(&root, "context").workflow;
+        config.plan.steps = vec![
+            egopulse_domain_contracts::v01::egopulse::collaboration::v1::StepPlan {
+                step_id: "step-1".to_owned(),
+                input_bundle_ref: "static.json".to_owned(),
+                ..Default::default()
+            },
+        ];
+        let digest = context_snapshot.compiled_context_sha256.clone();
+        let activation = egopulse_local_ide_control::collaboration_control::TaskActivationHandoff {
+            message_id: "message-1".to_owned(),
+            payload_digest_sha256: "payload".to_owned(),
+            task: egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
+                current_run_id: Some(config.run_id.clone()),
+                input_snapshot_id: context_snapshot.snapshot_id,
+                target_scope_ref: "scope:repo".to_owned(),
+                ..Default::default()
+            },
+        };
+        let resolved = ConfiguredSingleHarnessWorkflow::new(config.clone())
+            .with_context_authority(Arc::clone(&context))
+            .resolve(&activation)
+            .expect("resolve context workflow");
+        let SingleHarnessWorkflowResolution::Resolved(resolved) = resolved else {
+            panic!("context workflow must apply");
+        };
+        assert_eq!(resolved.material.input_bundle_sha256, digest);
+        assert_eq!(
+            resolved.plan.steps[0].input_bundle_ref,
+            format!("ctx-{digest}.json")
+        );
+        assert_eq!(resolved.workspace_ref, config.workspace_ref);
+        assert_eq!(
+            resolved.capability_profile_ref,
+            config.capability_profile_ref
+        );
+        assert_eq!(resolved.plan.digest_sha256, config.plan.digest_sha256);
+
+        let mut wrong_scope = activation.clone();
+        wrong_scope.task.target_scope_ref = "scope:other".to_owned();
+        assert_eq!(
+            ConfiguredSingleHarnessWorkflow::new(config.clone())
+                .with_context_authority(Arc::clone(&context))
+                .resolve(&wrong_scope),
+            Err(SingleHarnessWorkflowResolverError::InvalidConfiguration)
+        );
+        let mut empty_plan = config.clone();
+        empty_plan.plan.steps.clear();
+        assert_eq!(
+            ConfiguredSingleHarnessWorkflow::new(empty_plan)
+                .with_context_authority(Arc::clone(&context))
+                .resolve(&activation),
+            Err(SingleHarnessWorkflowResolverError::InvalidConfiguration)
+        );
+
+        let mut static_activation = activation;
+        static_activation.task.input_snapshot_id = "static-snapshot".to_owned();
+        let static_resolved = ConfiguredSingleHarnessWorkflow::new(config.clone())
+            .with_context_authority(Arc::clone(&context))
+            .resolve(&static_activation)
+            .expect("resolve static workflow");
+        let SingleHarnessWorkflowResolution::Resolved(static_resolved) = static_resolved else {
+            panic!("static workflow must apply");
+        };
+        assert_eq!(*static_resolved, config);
+        drop(context);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_context_task_does_not_fall_back_to_static_material() {
+        let config = multi_native_config(std::path::Path::new("."), "malformed").workflow;
+        let activation = egopulse_local_ide_control::collaboration_control::TaskActivationHandoff {
+            message_id: "message-1".to_owned(),
+            payload_digest_sha256: "payload".to_owned(),
+            task: egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
+                current_run_id: Some(config.run_id.clone()),
+                input_snapshot_id: "ctx:not-a-digest".to_owned(),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            ConfiguredSingleHarnessWorkflow::new(config).resolve(&activation),
+            Err(SingleHarnessWorkflowResolverError::InvalidConfiguration)
+        );
     }
 
     struct EmptyTaskActivationSource;
