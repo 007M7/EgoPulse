@@ -235,6 +235,37 @@ digest as an instance-content hash would require a separately frozen
 canonicalization, calculation and validation contract.
 
 R-7 is therefore a read-side governance closure, not the whole interaction
-closure. A formal Context Authority revoke write operation and a real dynamic
-prepare-to-native-driver CLI/TUI E2E remain required before the product path
-can be declared normally usable.
+closure. At the R-7 checkpoint, both a formal Context Authority revoke write
+operation and a real dynamic prepare-to-native-driver CLI/TUI E2E remained
+required. R-8A below closes only the latter single-process happy path.
+
+## R-8A real dynamic product E2E checkpoint (2026-08-30)
+
+R-8A now proves the existing architecture across a real daemon and Windows
+local IPC without adding Proto, Provider, Memory/RAG or Desktop scope. A CLI
+prepares an Authority-owned dynamic context; a TUI confirms the exact binding;
+Task Authority commits and activates the Task through the daemon-only system
+path; the durable activation handoff creates one Collaboration Run, Step,
+Attempt and DispatchIntent; and the production Context-bound material resolver
+revalidates the snapshot before one fake native driver is reached through the
+real Adapter Edge.
+
+The E2E asserts all dispatch identities, the content-addressed bundle name,
+the envelope and byte digests, the governed workspace reference, the compiled
+prompt, one-only delivery, and one persisted non-terminal acknowledgement.
+It also asserts that the Task remains `Active`. The fake driver implements the
+existing native-driver contract and does not bypass Collaboration Control,
+dispatch-material resolution or Adapter Edge.
+
+The test exposed and fixed a production integration defect: Work Preparation
+had copied Task Authority's canonical request-digest logic and its activation
+copy failed to clear correlation and causation metadata. Work Preparation now
+calls the Task Authority-owned `canonical_request_digest` oracle for both
+CreateTask and ActivateTask. Component evidence verifies that tracing metadata
+does not change either request identity, while semantic Task fields do.
+
+This is not a restart or recovery claim. R-8B must separately prove durable
+resume and no duplicate external delivery across daemon termination, and the
+formal Context revoke write contract remains R-9. User-visible resumable
+streaming and the later Artifact/Verification/Founder-verdict closure also
+remain open.

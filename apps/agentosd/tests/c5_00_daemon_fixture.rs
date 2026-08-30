@@ -7,17 +7,23 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use egopulse_agentosd::{
-    AuthorityCompositionInputs, AuthorityPrincipalResolver, ConfiguredTaskTransitionGuard,
+    AuthorityCompositionInputs, AuthorityPrincipalResolver, ConfiguredArtifactAdmissionGuard,
+    ConfiguredArtifactAdmissionGuardConfig, ConfiguredTaskTransitionGuard,
     ConfiguredWorkPreparationPort, DaemonComposition, DaemonConfig, DaemonProviders,
-    MemoryRetrievalCompositionConfig, OwnerProjectionSource, PendingOwnerProjection,
+    DenyVerificationReferences, GovernedReturnCollectorConfig, MemoryRetrievalCompositionConfig,
+    NativeHarnessCompositionConfig, OwnerProjectionSource, PendingOwnerProjection,
     ProjectionSourceFailure,
 };
+use egopulse_artifact_authority::{
+    ArtifactAuthority, ArtifactAuthorityConfig, ArtifactSqlCipherKey,
+};
 use egopulse_client_kernel::{ClientKernel, api_contract_ref, authorization_contract_ref};
+use egopulse_codex_adapter::{CODEX_ADAPTER_ID, CODEX_CAPABILITY_PROFILE_ID, FakeCodexDriver};
 use egopulse_cognition_runtime::{
     context_authority::{ContextAuthority, ContextAuthorityConfig},
     memory_authority::{
@@ -31,12 +37,14 @@ use egopulse_cognition_runtime::{
 };
 use egopulse_domain_contracts::v01::egopulse::{
     collaboration::v1::{
-        AttemptSnapshot, CollaborationEvent, CollaborationSnapshot, Lease, RunSnapshot, RunStatus,
-        StepSnapshot, StepStatus, collaboration_command_result,
+        AttemptSnapshot, CollaborationEvent, CollaborationSnapshot, Lease, RunPlan, RunSnapshot,
+        RunStatus, StepPlan, StepSnapshot, StepStatus, collaboration_command_result,
     },
+    common::v1::ContractReference,
     harness::v1::{
-        ApprovalKind, ApprovalRequestLifecycleKind, ApprovalRequestObservation, HarnessObservation,
-        harness_observation,
+        ApprovalDecisionEnvelope, ApprovalKind, ApprovalRequestLifecycleKind,
+        ApprovalRequestObservation, CancelExecutionEnvelope, DispatchEnvelope, HarnessObservation,
+        NativeSessionStrategy, ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
     },
     localapi::v1::{
         ClientSurface, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
@@ -59,6 +67,11 @@ use egopulse_founder_verdict_authority::{
     ResolvedVerdictContext, VerdictAuthorityConfig, VerdictPrincipalKind,
     VerdictReferenceRejection, VerdictSqlCipherKey,
 };
+use egopulse_harness_adapter::{
+    AdapterEdge, AdapterEdgeConfig, AdapterEdgeKey, DriverDelivery, DriverError, DriverEvent,
+    NativeHarnessDriver, NativeHarnessFuture, ReconciliationContext, ReconciliationFinding,
+    ResolvedDispatchMaterial,
+};
 use egopulse_local_api::session::{
     NoopSessionAuditSink, PrincipalGrant, PrincipalResolutionFailure, TrustedPrincipalResolver,
 };
@@ -66,11 +79,17 @@ use egopulse_local_api::{
     LocalApiClient,
     command_gateway::{CommandPortFailure, CommandPrincipal},
 };
+use egopulse_local_ide_control::collaboration_control::{
+    DispatchMaterial, SingleHarnessWorkConfig,
+};
 use egopulse_local_ipc_platform::LocalIpcAddress;
 use egopulse_policy_decision_authority::{
     AuthenticatedPolicyPrincipal, PolicyAuthorityConfig, PolicyDecisionAuthority,
     PolicyPrincipalKind, PolicyReferenceRejection, PolicySqlCipherKey,
     ResolvedApprovalAuthorization,
+};
+use egopulse_verification_authority::{
+    VerificationAuthority, VerificationAuthorityConfig, VerificationSqlCipherKey,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -83,6 +102,107 @@ use uuid::Uuid;
 const FIXTURE_ROOT_ENV: &str = "EGOPULSE_C5_FIXTURE_ROOT";
 const FIXTURE_INSTANCE_ENV: &str = "EGOPULSE_C5_FIXTURE_INSTANCE";
 const FIXTURE_MODE_ENV: &str = "EGOPULSE_C5_FIXTURE_MODE";
+const R8A_FIXTURE_MODE: &str = "dynamic";
+const R8A_ACTIVATION_RUN_ID: &str = "r8a-activation-run";
+const R8A_DRIVER_RECORD: &str = "r8a-driver-record.json";
+
+struct RecordingFixtureDriver {
+    inner: FakeCodexDriver,
+    record_path: PathBuf,
+    dispatch_count: u64,
+    observation_forwarded: bool,
+}
+
+impl RecordingFixtureDriver {
+    fn new(root: &Path) -> Self {
+        Self {
+            inner: FakeCodexDriver::default(),
+            record_path: root.join(R8A_DRIVER_RECORD),
+            dispatch_count: 0,
+            observation_forwarded: false,
+        }
+    }
+}
+
+impl NativeHarnessDriver for RecordingFixtureDriver {
+    fn probe<'a>(
+        &'a mut self,
+        request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        self.inner.probe(request)
+    }
+
+    fn send_dispatch<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+        material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        Box::pin(async move {
+            self.dispatch_count += 1;
+            let delivery = self.inner.send_dispatch(envelope, material).await?;
+            let compiled_bytes_sha256 = format!(
+                "{:x}",
+                Sha256::digest(material.canonical_input_bundle.as_slice())
+            );
+            let record = serde_json::json!({
+                "dispatchCount": self.dispatch_count,
+                "dispatchId": envelope.dispatch_id,
+                "runId": envelope.run_id,
+                "stepId": envelope.step_id,
+                "attemptId": envelope.attempt_id,
+                "inputBundleRef": envelope.input_bundle_ref,
+                "envelopeInputBundleSha256": envelope.input_bundle_sha256,
+                "workspaceRef": envelope.workspace_ref,
+                "compiledBytesSha256": compiled_bytes_sha256,
+                "canonicalInputBundleUtf8": String::from_utf8_lossy(&material.canonical_input_bundle),
+                "prompt": material.prompt,
+                "workspaceRoot": material.workspace_root.display().to_string(),
+                "model": material.model,
+            });
+            fs::write(
+                &self.record_path,
+                serde_json::to_vec(&record).expect("serialize R-8A driver record"),
+            )
+            .expect("persist R-8A driver record");
+            Ok(delivery)
+        })
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        Box::pin(async move {
+            if self.observation_forwarded {
+                return Ok(None);
+            }
+            let observation = self.inner.next_event(envelope).await?;
+            self.observation_forwarded = observation.is_some();
+            Ok(observation)
+        })
+    }
+
+    fn decide_approval<'a>(
+        &'a mut self,
+        envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        self.inner.decide_approval(envelope)
+    }
+
+    fn cancel<'a>(
+        &'a mut self,
+        envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        self.inner.cancel(envelope)
+    }
+
+    fn reconcile<'a>(
+        &'a mut self,
+        context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        self.inner.reconcile(context)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct DenyTaskReferences;
@@ -494,6 +614,133 @@ fn fixture_mode() -> String {
     std::env::var(FIXTURE_MODE_ENV).unwrap_or_else(|_| "deny".to_owned())
 }
 
+fn r8a_reference(contract_id: &str) -> ContractReference {
+    ContractReference {
+        contract_id: contract_id.to_owned(),
+        version: "v0.1".to_owned(),
+        sha256: "66".repeat(32),
+    }
+}
+
+fn r8a_native_config(root: &Path) -> NativeHarnessCompositionConfig {
+    let capability_profile_ref = r8a_reference(CODEX_CAPABILITY_PROFILE_ID);
+    let workspace_ref = "workspace-r8a".to_owned();
+    NativeHarnessCompositionConfig {
+        collaboration_database_path: root.join("r8a-collaboration.db"),
+        collaboration_store_epoch: "r8a-collaboration-epoch".to_owned(),
+        collaboration_key: [0x31; 32],
+        adapter_database_path: root.join("r8a-adapter.db"),
+        adapter_store_epoch: "r8a-adapter-epoch".to_owned(),
+        adapter_key: [0x32; 32],
+        input_bundle_root: root.join("input-bundles"),
+        workspace_root: root.to_owned(),
+        default_model: Some("fixture/model".to_owned()),
+        workflow: SingleHarnessWorkConfig {
+            run_id: R8A_ACTIVATION_RUN_ID.to_owned(),
+            attempt_id: "r8a-attempt".to_owned(),
+            dispatch_id: "r8a-dispatch".to_owned(),
+            plan: RunPlan {
+                plan_id: "r8a-reviewed-plan".to_owned(),
+                digest_sha256: "61".repeat(32),
+                max_active_attempts: 1,
+                steps: vec![StepPlan {
+                    step_id: "r8a-step".to_owned(),
+                    step_kind: "governed_repository_change".to_owned(),
+                    depends_on_step_ids: Vec::new(),
+                    input_bundle_ref: "static-r8a.json".to_owned(),
+                    expected_output_contract_ref: Some(r8a_reference("r8a-output")),
+                    required_capability_profile_ref: Some(capability_profile_ref.clone()),
+                    max_attempts: 2,
+                }],
+                budget_profile_ref: Some(ContractReference {
+                    contract_id: "c5-budget".to_owned(),
+                    version: "v0.1".to_owned(),
+                    sha256: "55".repeat(32),
+                }),
+            },
+            harness_id: "codex-r8a-fixture".to_owned(),
+            capability_profile_ref,
+            workspace_ref: workspace_ref.clone(),
+            lease_policy_ref: r8a_reference("r8a-lease"),
+            owner_instance_id: "r8a-owner".to_owned(),
+            material: DispatchMaterial {
+                input_bundle_sha256: "62".repeat(32),
+                sandbox_profile_ref: r8a_reference("r8a-sandbox"),
+                tool_policy_ref: r8a_reference("r8a-tool-policy"),
+                data_egress_policy_ref: r8a_reference("r8a-egress-policy"),
+                approval_policy_ref: r8a_reference("r8a-approval-policy"),
+                session_strategy: NativeSessionStrategy::CreateNew,
+                native_session_ref: None,
+                checkpoint_ref: None,
+                evidence_refs: vec!["fixture:r8a-reviewed-material".to_owned()],
+            },
+            task_authority_principal_id: "task-authority:r8a".to_owned(),
+            collaboration_principal_id: "collaboration-control:r8a".to_owned(),
+            attempt_supervisor_principal_id: "attempt-supervisor:r8a".to_owned(),
+            harness_adapter_principal_id: "harness-adapter:r8a".to_owned(),
+        },
+        lease_ttl_seconds: 30,
+        return_collector: GovernedReturnCollectorConfig {
+            artifact_type_ref: r8a_reference("r8a-artifact-type"),
+            transformation_contract_ref: r8a_reference("r8a-transformation"),
+            retention_profile_ref: r8a_reference("r8a-retention"),
+            claim_semantic_profile_ref: r8a_reference("r8a-claim-semantic"),
+            claim_acceptance_contract_ref: r8a_reference("r8a-claim-acceptance"),
+            evidence_profile_ref: r8a_reference("r8a-evidence-profile"),
+            workspace_ref,
+            collector_principal_id: "collector:r8a".to_owned(),
+            artifact_authority_principal_id: "artifact-authority:r8a".to_owned(),
+        },
+    }
+}
+
+fn r8a_authorities(
+    root: &Path,
+    collector: &GovernedReturnCollectorConfig,
+) -> (
+    Arc<Mutex<ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>>,
+    Arc<Mutex<VerificationAuthority>>,
+) {
+    let artifact_guard =
+        ConfiguredArtifactAdmissionGuard::new(ConfiguredArtifactAdmissionGuardConfig {
+            allowed_workspace_refs: [collector.workspace_ref.clone()].into_iter().collect(),
+            allowed_artifact_type_refs: vec![collector.artifact_type_ref.clone()],
+            allowed_transformation_contract_refs: vec![
+                collector.transformation_contract_ref.clone(),
+            ],
+            allowed_retention_profile_refs: vec![collector.retention_profile_ref.clone()],
+            allowed_claim_semantic_profile_refs: vec![collector.claim_semantic_profile_ref.clone()],
+            allowed_claim_acceptance_contract_refs: vec![
+                collector.claim_acceptance_contract_ref.clone(),
+            ],
+            allowed_evidence_profile_refs: vec![collector.evidence_profile_ref.clone()],
+        })
+        .expect("R-8A artifact admission guard");
+    let artifact = ArtifactAuthority::open(
+        ArtifactAuthorityConfig {
+            database_path: root.join("r8a-artifact-authority.db"),
+            blob_root: root.join("r8a-artifact-blobs"),
+            store_epoch: "r8a-artifact-epoch".to_owned(),
+            key: ArtifactSqlCipherKey::new([0x41; 32]),
+        },
+        artifact_guard,
+    )
+    .expect("R-8A Artifact Authority");
+    let verification = VerificationAuthority::open(
+        VerificationAuthorityConfig {
+            database_path: root.join("r8a-verification-authority.db"),
+            store_epoch: "r8a-verification-epoch".to_owned(),
+            key: VerificationSqlCipherKey::new([0x42; 32]),
+        },
+        DenyVerificationReferences,
+    )
+    .expect("R-8A Verification Authority");
+    (
+        Arc::new(Mutex::new(artifact)),
+        Arc::new(Mutex::new(verification)),
+    )
+}
+
 fn fixture_config(root: &Path, instance: &str) -> DaemonConfig {
     DaemonConfig {
         instance: instance.to_owned(),
@@ -509,7 +756,7 @@ fn fixture_config(root: &Path, instance: &str) -> DaemonConfig {
 }
 
 fn open_fixture_providers(root: &Path) -> DaemonProviders {
-    if fixture_mode() == "allow" {
+    if matches!(fixture_mode().as_str(), "allow" | R8A_FIXTURE_MODE) {
         open_fixture_providers_with_guards(
             root,
             AllowTaskReferences,
@@ -618,32 +865,55 @@ where
         .with_memory_retrieval(Arc::clone(&memory), memory_worker_config())
         .expect("fixture Memory retrieval should configure")
         .with_memory_mutation(memory, Arc::new(FixtureAuthorityPrincipalResolver));
-    let task_port = Arc::clone(&providers.task_port);
-    let context = ContextAuthority::open(ContextAuthorityConfig {
-        database_path: root.join("context-authority.db"),
-        store_epoch: "c5-context-epoch".to_owned(),
-        key: SqlCipherKey::new([0x15; 32]),
-    })
-    .expect("fixture Context Authority should open");
-    providers.with_work_preparation_port(Arc::new(
-        ConfiguredWorkPreparationPort::new(
-            Arc::new(std::sync::Mutex::new(context)),
-            task_port,
-            root.to_owned(),
-            BTreeSet::from(["governed_repository_change".to_owned()]),
-            egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference {
-                contract_id: "c5-acceptance".to_owned(),
-                version: "v0.1".to_owned(),
-                sha256: "44".repeat(32),
-            },
-            egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference {
-                contract_id: "c5-budget".to_owned(),
-                version: "v0.1".to_owned(),
-                sha256: "55".repeat(32),
-            },
+    let context = Arc::new(Mutex::new(
+        ContextAuthority::open(ContextAuthorityConfig {
+            database_path: root.join("context-authority.db"),
+            store_epoch: "c5-context-epoch".to_owned(),
+            key: SqlCipherKey::new([0x15; 32]),
+        })
+        .expect("fixture Context Authority should open"),
+    ));
+    let mut work_port = ConfiguredWorkPreparationPort::new(
+        Arc::clone(&context),
+        Arc::clone(&providers.task_port),
+        root.to_owned(),
+        BTreeSet::from(["governed_repository_change".to_owned()]),
+        ContractReference {
+            contract_id: "c5-acceptance".to_owned(),
+            version: "v0.1".to_owned(),
+            sha256: "44".repeat(32),
+        },
+        ContractReference {
+            contract_id: "c5-budget".to_owned(),
+            version: "v0.1".to_owned(),
+            sha256: "55".repeat(32),
+        },
+    )
+    .expect("fixture Work Preparation should configure");
+    if fixture_mode() == R8A_FIXTURE_MODE {
+        work_port = work_port
+            .with_input_bundle_root(root.join("input-bundles"))
+            .and_then(|port| port.with_activation_run_id(R8A_ACTIVATION_RUN_ID.to_owned()))
+            .expect("R-8A Work Preparation dispatch binding");
+    }
+    let providers = providers.with_work_preparation_port(Arc::new(work_port));
+    if fixture_mode() != R8A_FIXTURE_MODE {
+        return providers;
+    }
+
+    let native = r8a_native_config(root);
+    fs::create_dir_all(root.join(&native.workflow.workspace_ref))
+        .expect("R-8A governed workspace should exist");
+    let (artifact, verification) = r8a_authorities(root, &native.return_collector);
+    providers
+        .with_context_authority(context)
+        .with_native_harness_driver(
+            native,
+            artifact,
+            verification,
+            RecordingFixtureDriver::new(root),
         )
-        .expect("fixture Work Preparation should configure"),
-    ))
+        .expect("R-8A native Harness composition")
 }
 
 fn memory_worker_config() -> MemoryRetrievalCompositionConfig {
@@ -692,17 +962,21 @@ async fn spawn_fixture(root: &Path, instance: &str) -> Child {
 
 async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Child {
     let executable = std::env::current_exe().expect("test executable path");
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(["--exact", "c5_00_daemon_fixture_child", "--nocapture"])
         .env(FIXTURE_ROOT_ENV, root)
         .env(FIXTURE_INSTANCE_ENV, instance)
         .env(FIXTURE_MODE_ENV, mode)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn C5 fixture child")
+        .stderr(if mode == R8A_FIXTURE_MODE {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .kill_on_drop(true);
+    command.spawn().expect("spawn C5 fixture child")
 }
 
 fn cli_executable() -> PathBuf {
@@ -1247,6 +1521,189 @@ async fn c5_06_real_cli_prepare_confirm_creates_task_only_after_founder_binding(
     let status = child.wait().await.expect("C5-06 fixture child exit");
     assert!(status.success(), "C5-06 fixture child failed: {status}");
     fs::remove_dir_all(&root).expect("remove C5-06 fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r8a_cli_prepare_tui_confirm_dispatches_context_material_once() {
+    const SOURCE_TEXT: &str = "R-8A governed context reaches the native Harness prompt.";
+
+    let root = std::env::temp_dir().join(format!("egopulse-r8a-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create R-8A fixture root");
+    fs::write(root.join("context.md"), SOURCE_TEXT).expect("write R-8A context source");
+    let instance = format!("r8a-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, R8A_FIXTURE_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut child).await;
+
+    let prepare = run_cli(
+        &instance,
+        &[
+            "work",
+            "prepare",
+            "--intent",
+            "dispatch the reviewed R-8A context",
+            "--scope",
+            "scope:r8a",
+            "--work-type",
+            "governed_repository_change",
+            "--context-ref",
+            "context.md",
+            "--idempotency-key",
+            "r8a-prepare",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        prepare.status.success(),
+        "R-8A CLI prepare failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&prepare.stdout),
+        String::from_utf8_lossy(&prepare.stderr)
+    );
+    let prepare_json: serde_json::Value =
+        serde_json::from_slice(&prepare.stdout).expect("R-8A prepare JSON envelope");
+    let snapshot_id = prepare_json["data"]["snapshotId"]
+        .as_str()
+        .expect("R-8A snapshot id")
+        .to_owned();
+    let compiled_digest = prepare_json["data"]["compiledContextSha256"]
+        .as_str()
+        .expect("R-8A compiled context digest")
+        .to_owned();
+    let confirmation_binding = prepare_json["data"]["confirmationBindingSha256"]
+        .as_str()
+        .expect("R-8A confirmation binding")
+        .to_owned();
+    assert_eq!(snapshot_id, format!("ctx:{compiled_digest}"));
+
+    let confirm = run_tui(
+        &instance,
+        &[
+            "--instance",
+            &instance,
+            "work-confirm",
+            snapshot_id.as_str(),
+            "--confirmation-binding-sha256",
+            confirmation_binding.as_str(),
+            "--idempotency-key",
+            "r8a-confirm",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        confirm.status.success(),
+        "R-8A TUI confirm failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&confirm.stdout),
+        String::from_utf8_lossy(&confirm.stderr)
+    );
+    let confirm_json: serde_json::Value =
+        serde_json::from_slice(&confirm.stdout).expect("R-8A confirm JSON envelope");
+    assert_eq!(confirm_json["operation"], "work.confirm");
+    let task_id = confirm_json["data"]["taskId"]
+        .as_str()
+        .expect("R-8A confirmed task id")
+        .to_owned();
+    assert_eq!(
+        confirm_json["data"]["status"],
+        TaskStatus::Active.as_str_name()
+    );
+
+    let record_path = root.join(R8A_DRIVER_RECORD);
+    let mut driver_record = None;
+    for _ in 0..100 {
+        if let Ok(bytes) = fs::read(&record_path)
+            && let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        {
+            driver_record = Some(record);
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("R-8A fixture daemon exited before dispatch evidence: {status}");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let driver_record =
+        driver_record.expect("R-8A driver must receive a governed dispatch after activation");
+    let expected_bundle_ref = format!("ctx-{compiled_digest}.json");
+    assert_eq!(driver_record["dispatchCount"], 1);
+    assert_eq!(driver_record["runId"], R8A_ACTIVATION_RUN_ID);
+    assert_eq!(driver_record["stepId"], "r8a-step");
+    assert_eq!(driver_record["attemptId"], "r8a-attempt");
+    assert_eq!(driver_record["dispatchId"], "r8a-dispatch");
+    assert_eq!(driver_record["inputBundleRef"], expected_bundle_ref);
+    assert_eq!(driver_record["workspaceRef"], "workspace-r8a");
+    assert_eq!(driver_record["envelopeInputBundleSha256"], compiled_digest);
+    assert_eq!(driver_record["compiledBytesSha256"], compiled_digest);
+    assert!(
+        driver_record["canonicalInputBundleUtf8"]
+            .as_str()
+            .is_some_and(|value| value.contains(SOURCE_TEXT)),
+        "compiled bytes must contain the reviewed source"
+    );
+    assert!(
+        driver_record["prompt"]
+            .as_str()
+            .is_some_and(|value| value.contains(SOURCE_TEXT)),
+        "native prompt must contain the reviewed source"
+    );
+
+    sleep(Duration::from_millis(150)).await;
+    let stable_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("read stable R-8A driver record"))
+            .expect("parse stable R-8A driver record");
+    assert_eq!(stable_record["dispatchCount"], 1);
+
+    let mut task_view = None;
+    for _ in 0..80 {
+        let output = run_cli(&instance, &["task", "get", task_id.as_str(), "--json"]).await;
+        if output.status.success()
+            && let Ok(view) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        {
+            task_view = Some(view);
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let task_view = task_view.expect("R-8A active Task projection");
+    assert_eq!(task_view["data"]["taskId"], task_id);
+    assert_eq!(
+        task_view["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID,
+        "Task activation and governed dispatch must share the same run identity"
+    );
+    assert_eq!(
+        task_view["data"]["status"],
+        TaskStatus::Active.as_str_name(),
+        "no native terminal event means the Task must remain non-completed"
+    );
+
+    drop(child.stdin.take());
+    let status = child.wait().await.expect("R-8A fixture child exit");
+    assert!(status.success(), "R-8A fixture child failed: {status}");
+    let adapter = AdapterEdge::open(AdapterEdgeConfig {
+        database_path: root.join("r8a-adapter.db"),
+        adapter_id: CODEX_ADAPTER_ID.to_owned(),
+        store_epoch: "r8a-adapter-epoch".to_owned(),
+        key: AdapterEdgeKey::new([0x32; 32]),
+    })
+    .expect("reopen R-8A Adapter Edge evidence");
+    let adapter_inspection = adapter.inspect().expect("inspect R-8A Adapter Edge");
+    assert_eq!(adapter_inspection.dispatch_count, 1);
+    assert_eq!(
+        adapter_inspection.observation_count, 1,
+        "one non-terminal native acknowledgement must cross the governed observation edge"
+    );
+    let observations = adapter
+        .observations_after(0)
+        .expect("read R-8A governed observation evidence");
+    assert!(matches!(
+        observations.as_slice(),
+        [HarnessObservation {
+            payload: Some(harness_observation::Payload::Ack(_)),
+            ..
+        }]
+    ));
+    drop(adapter);
+    fs::remove_dir_all(&root).expect("remove R-8A fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

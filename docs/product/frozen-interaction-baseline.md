@@ -213,7 +213,38 @@ separately frozen calculation and verification contract.
 This checkpoint does not declare the normal product path complete. Context
 Authority still lacks a formal authenticated, idempotent and audited revoke
 write command; current evidence only proves that dispatch rejects a snapshot
-already governed into the revoked state. A real dynamic product E2E covering
-CLI/TUI prepare -> confirm -> activation -> Collaboration dispatch -> native
-driver is also still required. Those two gaps remain explicit subsequent
+already governed into the revoked state. At this checkpoint a real dynamic
+product E2E was also still required; the R-8A checkpoint below closes that
+single-process happy path only. Formal revoke and recovery remain subsequent
 closure work.
+
+## 8. R-8A dynamic interaction checkpoint (2026-08-30)
+
+The single-process dynamic happy path is now locally proven through the real
+product and governance seams:
+
+```text
+CLI work prepare
+  -> Local API / Context Authority snapshot
+  -> TUI Founder work-confirm
+  -> Task Authority Ready -> daemon-only Active
+  -> activation outbox
+  -> Collaboration Run / Step / Attempt / DispatchIntent
+  -> Context Authority dispatch-time revalidation
+  -> Adapter Edge
+  -> one native-driver dispatch and one governed non-terminal acknowledgement
+```
+
+The evidence binds the same `ctx:<sha256>` snapshot to the immutable bundle
+reference and bytes, the Task's activation run, and the resulting Run, Step,
+Attempt and dispatch identities. CLI and TUI use the shared ClientAttachment
+and Local API; neither surface constructs Task activation or dispatch fields.
+The Task remains `Active` after the Harness acknowledgement. A delivery or
+observation is not interpreted as Task completion, acceptance, verification,
+Founder verdict or release.
+
+R-8A closes only this single-process happy path. It does not close daemon
+restart/replay recovery, resumable user-visible streaming, the reverse
+TUI-prepare/CLI-confirm acceptance scenario, or the authenticated and audited
+Context revoke write contract. Those remain explicit R-8B and R-9 work, so the
+whole product path is still not declared normally usable.

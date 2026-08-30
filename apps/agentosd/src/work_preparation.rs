@@ -12,6 +12,7 @@ use egopulse_cognition_runtime::context_authority::{
     AuthenticatedContextPrincipal, ContextAuthority, ContextAuthorityFailure, ContextPrincipalKind,
     ContextSourceFact, IssueContextSnapshot,
 };
+use egopulse_cognition_runtime::task_authority::canonical_request_digest;
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::{CommandMetadata, ContractReference},
     localapi::v1::{
@@ -26,7 +27,6 @@ use egopulse_domain_contracts::v01::egopulse::{
 use egopulse_local_api::command_gateway::{
     CommandPortFailure, CommandPortResult, CommandPrincipal, TaskCommandPort, WorkPreparationPort,
 };
-use prost::Message;
 use prost_types::Timestamp;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -518,17 +518,7 @@ fn context_failure(error: ContextAuthorityFailure) -> CommandPortFailure {
 }
 
 fn set_task_digest(command: &mut TaskCommand) {
-    let mut canonical = command.clone();
-    if let Some(task_command::Command::CreateTask(create)) = canonical.command.as_mut() {
-        if let Some(metadata) = create.meta.as_mut() {
-            metadata.command_id.clear();
-            metadata.request_digest_sha256.clear();
-            metadata.issued_at = None;
-            metadata.correlation_id.clear();
-            metadata.causation_id = None;
-        }
-    }
-    let digest = sha256(&canonical.encode_to_vec());
+    let digest = canonical_request_digest(command).expect("canonical Task request digest");
     if let Some(task_command::Command::CreateTask(create)) = command.command.as_mut() {
         create
             .meta
@@ -539,15 +529,7 @@ fn set_task_digest(command: &mut TaskCommand) {
 }
 
 fn set_activation_digest(command: &mut TaskCommand) {
-    let mut canonical = command.clone();
-    if let Some(task_command::Command::ActivateTask(activate)) = canonical.command.as_mut() {
-        if let Some(metadata) = activate.meta.as_mut() {
-            metadata.command_id.clear();
-            metadata.request_digest_sha256.clear();
-            metadata.issued_at = None;
-        }
-    }
-    let digest = sha256(&canonical.encode_to_vec());
+    let digest = canonical_request_digest(command).expect("canonical Task activation digest");
     if let Some(task_command::Command::ActivateTask(activate)) = command.command.as_mut() {
         activate
             .meta
@@ -895,6 +877,71 @@ mod tests {
             commands[1].command,
             Some(task_command::Command::ActivateTask(_))
         ));
+        for command in commands.iter() {
+            let recorded = match command.command.as_ref().expect("recorded Task command") {
+                task_command::Command::CreateTask(value) => value
+                    .meta
+                    .as_ref()
+                    .expect("create metadata")
+                    .request_digest_sha256
+                    .clone(),
+                task_command::Command::ActivateTask(value) => value
+                    .meta
+                    .as_ref()
+                    .expect("activation metadata")
+                    .request_digest_sha256
+                    .clone(),
+                _ => unreachable!("work preparation records only create and activate"),
+            };
+            assert_eq!(
+                canonical_request_digest(command).expect("canonical recorded Task request"),
+                recorded,
+                "Work Preparation must use the Task Authority canonical digest oracle"
+            );
+
+            let mut tracing_variant = command.clone();
+            let metadata = match tracing_variant
+                .command
+                .as_mut()
+                .expect("recorded Task command")
+            {
+                task_command::Command::CreateTask(value) => {
+                    value.meta.as_mut().expect("create metadata")
+                }
+                task_command::Command::ActivateTask(value) => {
+                    value.meta.as_mut().expect("activation metadata")
+                }
+                _ => unreachable!("work preparation records only create and activate"),
+            };
+            metadata.command_id.push_str("-trace-variant");
+            metadata.correlation_id.push_str("-trace-variant");
+            metadata.causation_id = Some("trace-variant".to_owned());
+            metadata.issued_at = None;
+            assert_eq!(
+                canonical_request_digest(&tracing_variant).expect("canonical tracing Task request"),
+                recorded,
+                "tracing metadata must not change the canonical Task request identity"
+            );
+
+            let mut semantic_variant = command.clone();
+            match semantic_variant
+                .command
+                .as_mut()
+                .expect("recorded Task command")
+            {
+                task_command::Command::CreateTask(value) => {
+                    value.target_scope_ref.push_str(":changed")
+                }
+                task_command::Command::ActivateTask(value) => value.run_id.push_str("-changed"),
+                _ => unreachable!("work preparation records only create and activate"),
+            }
+            assert_ne!(
+                canonical_request_digest(&semantic_variant)
+                    .expect("canonical semantic Task request"),
+                recorded,
+                "semantic Task fields must change the canonical request identity"
+            );
+        }
         drop(commands);
         fixture.finish();
     }
