@@ -4,13 +4,18 @@
 // boundary; the process is short-lived and does not cross the kernel ABI.
 #![allow(clippy::result_large_err)]
 
-use std::{process::ExitCode, time::Duration};
+use std::{
+    io::{self, IsTerminal, Write},
+    process::ExitCode,
+    time::Duration,
+};
 
 use clap::{Parser, Subcommand};
-use egopulse_client_kernel::{SnapshotStreamTracker, StreamApply};
+use egopulse_client_kernel::{KernelError, SnapshotStreamTracker, StreamApply};
 use egopulse_client_operations::{
-    AttachError, ClientAttachment, ClientWorkError, attach as attach_client, command_metadata,
-    set_policy_digest, set_task_digest, set_verdict_digest, timestamp_after,
+    AttachError, ClientAttachment, ClientContextRevokeError, ClientWorkError, ContextRevokeInput,
+    attach as attach_client, command_metadata, set_policy_digest, set_task_digest,
+    set_verdict_digest, timestamp_after,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -21,13 +26,13 @@ use egopulse_domain_contracts::v01::egopulse::{
     common::v1::ContractReference,
     harness::v1::ApprovalDecision,
     localapi::v1::{
-        AwaitProjectionRequest, ClientSurface, DecideHarnessApprovalRequest,
-        ExecuteFounderVerdictRequest, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
-        GetEvidenceGraphRequest, GetHarnessApprovalViewRequest, GetProjectionStatusRequest,
-        GetTaskViewRequest, HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest,
-        ListTaskViewsRequest, LocalApiError, LocalApiErrorCode, MemoryMutationCommand,
-        MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth, ProjectionMetadata,
-        RetrieveMemoryRequest, SourceRevision, TaskView, TaskViewStreamFrame,
+        AwaitProjectionRequest, ClientSurface, ContextGovernanceState,
+        DecideHarnessApprovalRequest, ExecuteFounderVerdictRequest, ExecuteMemoryMutationRequest,
+        ExecuteTaskCommandRequest, GetEvidenceGraphRequest, GetHarnessApprovalViewRequest,
+        GetProjectionStatusRequest, GetTaskViewRequest, HarnessApprovalViewStreamFrame,
+        ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError, LocalApiErrorCode,
+        MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth,
+        ProjectionMetadata, RetrieveMemoryRequest, SourceRevision, TaskView, TaskViewStreamFrame,
         WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, await_projection_response,
         get_evidence_graph_response, get_harness_approval_view_response, get_task_view_response,
         memory_mutation_command, retrieve_memory_response,
@@ -105,6 +110,38 @@ enum Command {
     Work {
         #[command(subcommand)]
         command: WorkCommand,
+    },
+    /// Inspect or revoke one governed Context snapshot.
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ContextCommand {
+    /// Founder-revoke one Context snapshot after reviewing its full semantic digest.
+    Revoke {
+        snapshot_id: String,
+        #[arg(long)]
+        expected_state_revision: u64,
+        #[arg(long)]
+        reason_code: String,
+        /// Ordered evidence references. Repeat the flag to preserve evidence order.
+        #[arg(long = "evidence-ref", required = true)]
+        evidence_refs: Vec<String>,
+        #[arg(long)]
+        confirmation_proof_ref: String,
+        #[arg(long)]
+        idempotency_key: String,
+        /// Print the safe confirmation facts and full digest without issuing a mutation RPC.
+        #[arg(long, conflicts_with = "confirm_digest")]
+        preview: bool,
+        /// Exact 64-character lowercase digest printed by preview or the interactive prompt.
+        #[arg(long = "confirm-digest")]
+        confirm_digest: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -524,6 +561,16 @@ impl CliFailure {
                 | LocalApiErrorCode::ResourceExhausted,
             ) => (3, "unavailable"),
             Some(LocalApiErrorCode::InvalidArgument) => (2, "invalid_request"),
+            Some(
+                LocalApiErrorCode::NotFound
+                | LocalApiErrorCode::OwnerMismatch
+                | LocalApiErrorCode::ContextRevoked
+                | LocalApiErrorCode::StateRevisionConflict
+                | LocalApiErrorCode::IdempotencyConflict,
+            ) => (6, "domain_conflict"),
+            Some(
+                LocalApiErrorCode::IntegrityFailure | LocalApiErrorCode::UnknownCriticalSemantics,
+            ) => (8, "recovery"),
             _ => (70, "internal"),
         };
         Self {
@@ -536,6 +583,33 @@ impl CliFailure {
             safe_fingerprint: (!error.safe_fingerprint.is_empty())
                 .then_some(error.safe_fingerprint),
             operation: "status",
+        }
+    }
+
+    fn context_confirmation(message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 2,
+            reason_code: "CONTEXT_CONFIRMATION_REQUIRED",
+            message: message.into(),
+            category: "invalid_request",
+            retryable: false,
+            required_action_code: Some("SUPPLY_EXACT_CONTEXT_DIGEST".to_owned()),
+            safe_fingerprint: Some("context_confirmation_rejected".to_owned()),
+            operation: "context.revoke",
+        }
+    }
+
+    fn context_session_changed() -> Self {
+        Self {
+            exit_code: 5,
+            reason_code: "CONTEXT_SESSION_CHANGED",
+            message: "the authenticated session changed after Context revoke preparation"
+                .to_owned(),
+            category: "contract",
+            retryable: false,
+            required_action_code: Some("REPREPARE_CONTEXT_REVOKE".to_owned()),
+            safe_fingerprint: Some("context_session_binding_changed".to_owned()),
+            operation: "context.revoke",
         }
     }
 
@@ -701,6 +775,7 @@ async fn main() -> ExitCode {
         Command::Verdict { command } => verdict(command).await,
         Command::Memory { command } => memory(command).await,
         Command::Work { command } => work(command).await,
+        Command::Context { command } => context(command).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -753,6 +828,9 @@ fn command_json(command: &Command) -> bool {
                 WorkCommand::Plan { json, .. }
                 | WorkCommand::Prepare { json, .. }
                 | WorkCommand::Confirm { json, .. },
+        }
+        | Command::Context {
+            command: ContextCommand::Revoke { json, .. },
         } => *json,
     }
 }
@@ -813,6 +891,209 @@ async fn attach(operation: &'static str) -> Result<AttachedClient, CliFailure> {
         error.operation = operation;
         error
     })
+}
+
+async fn context(command: ContextCommand) -> Result<(), CliFailure> {
+    match command {
+        ContextCommand::Revoke {
+            snapshot_id,
+            expected_state_revision,
+            reason_code,
+            evidence_refs,
+            confirmation_proof_ref,
+            idempotency_key,
+            preview,
+            confirm_digest,
+            json,
+        } => {
+            context_revoke(
+                ContextRevokeInput {
+                    snapshot_id,
+                    expected_state_revision,
+                    reason_code,
+                    evidence_refs,
+                    confirmation_proof_ref,
+                    idempotency_key,
+                },
+                preview,
+                confirm_digest,
+                json,
+            )
+            .await
+        }
+    }
+}
+
+async fn context_revoke(
+    input: ContextRevokeInput,
+    preview: bool,
+    confirm_digest: Option<String>,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    let interactive_terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if !preview && confirm_digest.is_none() && (json_output || !interactive_terminal) {
+        return Err(CliFailure::context_confirmation(
+            "non-interactive Context revoke requires --confirm-digest; run --preview first",
+        ));
+    }
+
+    let attached = attach("context.revoke").await?;
+    let prepared = attached
+        .0
+        .prepare_context_revoke(input)
+        .map_err(client_context_revoke_failure)?;
+    if preview {
+        render_context_revoke_preview(&prepared, json_output);
+        return Ok(());
+    }
+
+    let supplied_digest = if let Some(digest) = confirm_digest {
+        digest
+    } else {
+        eprintln!(
+            "Context revoke confirmation\nSnapshot: {}\nExpected state revision: {}\nEvidence references: {}\nFull semantic digest: {}",
+            prepared.snapshot_id(),
+            prepared.expected_state_revision(),
+            prepared.evidence_count(),
+            prepared.request_digest_sha256(),
+        );
+        eprint!("Type the complete digest to confirm, or press Enter to cancel: ");
+        io::stderr().flush().map_err(|error| {
+            CliFailure::protocol(format!("confirmation prompt failed: {error}"))
+                .for_operation("context.revoke")
+        })?;
+        let mut confirmation = String::new();
+        let bytes_read = io::stdin().read_line(&mut confirmation).map_err(|error| {
+            CliFailure::protocol(format!("confirmation input failed: {error}"))
+                .for_operation("context.revoke")
+        })?;
+        let confirmation = remove_terminal_line_ending(confirmation);
+        if bytes_read == 0 || confirmation.is_empty() {
+            return Err(CliFailure::context_confirmation(
+                "Context revoke was cancelled before any mutation was sent",
+            ));
+        }
+        confirmation
+    };
+
+    let receipt = attached
+        .0
+        .execute_context_revoke(prepared, &supplied_digest)
+        .await
+        .map_err(client_context_revoke_failure)?;
+    render_context_revoke_receipt(&receipt, json_output);
+    Ok(())
+}
+
+fn remove_terminal_line_ending(mut value: String) -> String {
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') {
+            value.pop();
+        }
+    }
+    value
+}
+
+fn client_context_revoke_failure(error: ClientContextRevokeError) -> CliFailure {
+    match error {
+        ClientContextRevokeError::Api(error) => {
+            CliFailure::from_local_api_error(*error).for_operation("context.revoke")
+        }
+        ClientContextRevokeError::InvalidConfirmation => CliFailure::context_confirmation(
+            "confirmation digest must be the exact 64-character lowercase digest",
+        ),
+        ClientContextRevokeError::SessionChanged => CliFailure::context_session_changed(),
+        ClientContextRevokeError::Transport(detail) => {
+            CliFailure::daemon_unavailable(detail).for_operation("context.revoke")
+        }
+        ClientContextRevokeError::MalformedResponse(detail) => {
+            CliFailure::protocol(detail).for_operation("context.revoke")
+        }
+        ClientContextRevokeError::Kernel(error) => match error {
+            KernelError::PermissionDenied(_) | KernelError::SystemOnlyCommand { .. } => {
+                CliFailure::permission("context.revoke", error.to_string())
+            }
+            KernelError::SessionUnavailable | KernelError::SessionExpired => {
+                CliFailure::context_session_changed()
+            }
+            other => CliFailure::protocol(other.to_string()).for_operation("context.revoke"),
+        },
+    }
+}
+
+fn render_context_revoke_preview(
+    prepared: &egopulse_client_operations::PreparedContextRevoke,
+    json_output: bool,
+) {
+    let payload = json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": "context.revoke.preview",
+        "data": {
+            "snapshotId": prepared.snapshot_id(),
+            "expectedStateRevision": prepared.expected_state_revision(),
+            "evidenceCount": prepared.evidence_count(),
+            "requestDigestSha256": prepared.request_digest_sha256(),
+            "mutationSent": false,
+        },
+        "correlationId": Uuid::now_v7().to_string(),
+    });
+    if json_output {
+        println!("{}", serde_json::to_string(&payload).unwrap());
+    } else {
+        println!(
+            "Context revoke preview: snapshot={} expected_state_revision={} evidence_refs={}",
+            prepared.snapshot_id(),
+            prepared.expected_state_revision(),
+            prepared.evidence_count()
+        );
+        println!(
+            "Full confirmation digest: {}",
+            prepared.request_digest_sha256()
+        );
+        println!("No mutation was sent.");
+    }
+}
+
+fn render_context_revoke_receipt(
+    receipt: &egopulse_domain_contracts::v01::egopulse::localapi::v1::ContextRevokeReceipt,
+    json_output: bool,
+) {
+    let previous_state = ContextGovernanceState::try_from(receipt.previous_state)
+        .map(|value| value.as_str_name())
+        .unwrap_or("CONTEXT_GOVERNANCE_STATE_UNSPECIFIED");
+    let result_state = ContextGovernanceState::try_from(receipt.result_state)
+        .map(|value| value.as_str_name())
+        .unwrap_or("CONTEXT_GOVERNANCE_STATE_UNSPECIFIED");
+    let payload = json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": "context.revoke",
+        "data": {
+            "snapshotId": receipt.snapshot_id,
+            "snapshotRevision": receipt.snapshot_revision,
+            "contentDigestSha256": receipt.content_digest_sha256,
+            "previousStateRevision": receipt.previous_state_revision,
+            "resultStateRevision": receipt.result_state_revision,
+            "previousState": previous_state,
+            "resultState": result_state,
+            "requestDigestSha256": receipt.request_digest_sha256,
+            "eventId": receipt.event_id,
+            "committedAt": receipt.committed_at.as_ref().map(timestamp_json),
+            "replayed": receipt.replayed,
+            "acknowledgedAfterDurabilityBarrier": receipt.acknowledged_after_durability_barrier,
+        },
+        "correlationId": Uuid::now_v7().to_string(),
+    });
+    if json_output {
+        println!("{}", serde_json::to_string(&payload).unwrap());
+    } else {
+        println!(
+            "Context revoked: snapshot={} state_revision={} state={} replayed={}",
+            receipt.snapshot_id, receipt.result_state_revision, result_state, receipt.replayed
+        );
+    }
 }
 
 async fn work(command: WorkCommand) -> Result<(), CliFailure> {
@@ -916,8 +1197,9 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
                 println!("{}", serde_json::to_string(&payload).unwrap());
             } else {
                 println!(
-                    "Work prepared: snapshot={} gate_ready={} sources={} expires_at={}",
+                    "Work prepared: snapshot={} context_state_revision={} gate_ready={} sources={} expires_at={}",
                     preview.snapshot_id,
+                    preview.context_state_revision,
                     preview.gate_ready,
                     preview.included_sources.len(),
                     preview
@@ -1029,6 +1311,7 @@ fn work_preview_json(
         "budgetProfileRef": preview.budget_profile_ref.as_ref().map(contract_ref_json),
         "memoryAuthorityRevision": preview.memory_authority_revision,
         "memoryPackSnapshotSha256": preview.memory_pack_snapshot_sha256,
+        "contextStateRevision": preview.context_state_revision,
         "recoveryEntry": preview.recovery_entry,
         "visibility": preview.visibility,
         "expiresAt": preview.expires_at.as_ref().map(timestamp_json),
@@ -2974,6 +3257,115 @@ mod tests {
                 .unwrap()
                 .contains("private pipe path")
         );
+    }
+
+    #[test]
+    fn context_revoke_cli_preserves_evidence_order_and_exact_digest_mode() {
+        let cli = Cli::try_parse_from([
+            "egopulse",
+            "context",
+            "revoke",
+            "ctx:abc",
+            "--expected-state-revision",
+            "3",
+            "--reason-code",
+            "founder-withdrew-context",
+            "--evidence-ref",
+            "evidence:first",
+            "--evidence-ref",
+            "evidence:second",
+            "--confirmation-proof-ref",
+            "proof:founder-review",
+            "--idempotency-key",
+            "idem:context-revoke",
+            "--confirm-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--json",
+        ])
+        .expect("valid Context revoke CLI");
+        assert!(matches!(
+            cli.command,
+            Command::Context {
+                command: ContextCommand::Revoke {
+                    snapshot_id,
+                    expected_state_revision: 3,
+                    evidence_refs,
+                    preview: false,
+                    confirm_digest: Some(digest),
+                    json: true,
+                    ..
+                }
+            } if snapshot_id == "ctx:abc"
+                && evidence_refs == ["evidence:first", "evidence:second"]
+                && digest == "a".repeat(64)
+        ));
+    }
+
+    #[test]
+    fn context_revoke_preview_and_execution_digest_are_mutually_exclusive() {
+        let error = Cli::try_parse_from([
+            "egopulse",
+            "context",
+            "revoke",
+            "ctx:abc",
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "withdrawn",
+            "--evidence-ref",
+            "evidence:one",
+            "--confirmation-proof-ref",
+            "proof:one",
+            "--idempotency-key",
+            "idem:one",
+            "--preview",
+            "--confirm-digest",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .expect_err("preview must never also execute");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn interactive_context_confirmation_removes_only_the_terminal_line_ending() {
+        let digest = "a".repeat(64);
+        assert_eq!(remove_terminal_line_ending(format!("{digest}\r\n")), digest);
+        assert_eq!(
+            remove_terminal_line_ending(format!(" {digest} \n")),
+            format!(" {digest} ")
+        );
+        assert_eq!(remove_terminal_line_ending(" \n".to_owned()), " ");
+        assert_eq!(remove_terminal_line_ending(digest.clone()), digest);
+    }
+
+    #[test]
+    fn context_conflicts_map_to_stable_domain_failures() {
+        for code in [
+            LocalApiErrorCode::OwnerMismatch,
+            LocalApiErrorCode::ContextRevoked,
+            LocalApiErrorCode::StateRevisionConflict,
+            LocalApiErrorCode::IdempotencyConflict,
+        ] {
+            let failure = CliFailure::from_local_api_error(LocalApiError {
+                code: code as i32,
+                retryable: false,
+                required_action_code: Some("REVIEW_CONTEXT_STATE".to_owned()),
+                safe_fingerprint: "context-conflict".to_owned(),
+                ..Default::default()
+            })
+            .for_operation("context.revoke");
+            assert_eq!(failure.exit_code, 6, "{code:?}");
+            assert_eq!(failure.category, "domain_conflict", "{code:?}");
+            assert_eq!(failure.operation, "context.revoke", "{code:?}");
+            assert_eq!(
+                failure.required_action_code.as_deref(),
+                Some("REVIEW_CONTEXT_STATE")
+            );
+            assert_eq!(
+                failure.safe_fingerprint.as_deref(),
+                Some("context-conflict")
+            );
+        }
     }
 
     #[test]

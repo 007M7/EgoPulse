@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    future::Future,
     io::{self, stdout},
+    pin::Pin,
     process::ExitCode,
+    sync::Arc,
     time::Duration,
 };
 
@@ -13,7 +16,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use egopulse_client_operations::{
-    ClientAttachment, ClientReadError, ClientWorkError, attach as attach_client, command_metadata,
+    ClientAttachment, ClientContextRevokeError, ClientReadError, ClientWorkError,
+    ContextRevokeInput, PreparedContextRevoke, attach as attach_client, command_metadata,
     set_policy_digest, set_task_digest, set_verdict_digest, timestamp_after,
 };
 use egopulse_director_facade::{
@@ -345,10 +349,11 @@ enum CommandKind {
     MemoryCandidate,
     MemoryAccept,
     MemoryRevoke,
+    ContextRevoke,
 }
 
 impl CommandKind {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::WorkPlan,
         Self::WorkPrepare,
         Self::WorkConfirm,
@@ -364,6 +369,7 @@ impl CommandKind {
         Self::MemoryCandidate,
         Self::MemoryAccept,
         Self::MemoryRevoke,
+        Self::ContextRevoke,
     ];
 
     const fn label(self) -> &'static str {
@@ -383,6 +389,7 @@ impl CommandKind {
             Self::MemoryCandidate => "Submit Memory candidate",
             Self::MemoryAccept => "Accept Memory candidate",
             Self::MemoryRevoke => "Revoke Memory",
+            Self::ContextRevoke => "Revoke governed Context",
         }
     }
 }
@@ -392,6 +399,7 @@ struct FormField {
     label: &'static str,
     value: String,
     required: bool,
+    sensitive: bool,
 }
 
 impl FormField {
@@ -400,6 +408,7 @@ impl FormField {
             label,
             value: String::new(),
             required: true,
+            sensitive: false,
         }
     }
 
@@ -408,11 +417,17 @@ impl FormField {
             label,
             value: String::new(),
             required: false,
+            sensitive: false,
         }
     }
 
     fn with_value(mut self, value: &'static str) -> Self {
         self.value = value.to_owned();
+        self
+    }
+
+    fn sensitive(mut self) -> Self {
+        self.sensitive = true;
         self
     }
 }
@@ -530,6 +545,14 @@ impl CommandForm {
                 FormField::required("evidence-ref"),
                 FormField::required("idempotency-key"),
             ],
+            CommandKind::ContextRevoke => vec![
+                FormField::required("snapshot-id"),
+                FormField::required("expected-state-revision"),
+                FormField::required("reason-code").sensitive(),
+                FormField::required("evidence-ref").sensitive(),
+                FormField::required("confirmation-proof-ref").sensitive(),
+                FormField::required("idempotency-key"),
+            ],
         };
         Self {
             kind,
@@ -543,6 +566,40 @@ impl CommandForm {
         &mut self.fields[self.active]
     }
 
+    fn add_context_evidence_entry(&mut self) -> bool {
+        if self.kind != CommandKind::ContextRevoke {
+            return false;
+        }
+        let insertion = self
+            .fields
+            .iter()
+            .rposition(|field| field.label == "evidence-ref")
+            .map_or(3, |index| index + 1);
+        self.fields
+            .insert(insertion, FormField::required("evidence-ref").sensitive());
+        self.active = insertion;
+        self.error = None;
+        true
+    }
+
+    fn remove_active_context_evidence_entry(&mut self) -> bool {
+        if self.kind != CommandKind::ContextRevoke
+            || self.fields[self.active].label != "evidence-ref"
+            || self
+                .fields
+                .iter()
+                .filter(|field| field.label == "evidence-ref")
+                .count()
+                == 1
+        {
+            return false;
+        }
+        self.fields.remove(self.active);
+        self.active = self.active.min(self.fields.len().saturating_sub(1));
+        self.error = None;
+        true
+    }
+
     fn validate(&self) -> Result<(), String> {
         for field in &self.fields {
             if field.required && field.value.trim().is_empty() {
@@ -550,6 +607,56 @@ impl CommandForm {
             }
         }
         Ok(())
+    }
+
+    fn into_action(self) -> Result<InteractiveAction, String> {
+        if self.kind == CommandKind::ContextRevoke {
+            return self
+                .into_context_revoke_input()
+                .map(InteractiveAction::StageContextRevoke);
+        }
+        self.into_command()
+            .map(Box::new)
+            .map(InteractiveAction::Command)
+    }
+
+    fn into_context_revoke_input(self) -> Result<ContextRevokeInput, String> {
+        self.validate()?;
+        let mut snapshot_id = None;
+        let mut expected_state_revision = None;
+        let mut reason_code = None;
+        let mut evidence_refs = Vec::new();
+        let mut confirmation_proof_ref = None;
+        let mut idempotency_key = None;
+        for field in self.fields {
+            match field.label {
+                "snapshot-id" => snapshot_id = Some(field.value),
+                "expected-state-revision" => {
+                    expected_state_revision = Some(
+                        field
+                            .value
+                            .parse()
+                            .map_err(|_| "expected-state-revision must be an integer".to_owned())?,
+                    )
+                }
+                "reason-code" => reason_code = Some(field.value),
+                "evidence-ref" => evidence_refs.push(field.value),
+                "confirmation-proof-ref" => confirmation_proof_ref = Some(field.value),
+                "idempotency-key" => idempotency_key = Some(field.value),
+                label => return Err(format!("unexpected Context revoke field: {label}")),
+            }
+        }
+        Ok(ContextRevokeInput {
+            snapshot_id: snapshot_id.ok_or_else(|| "snapshot-id is missing".to_owned())?,
+            expected_state_revision: expected_state_revision
+                .ok_or_else(|| "expected-state-revision is missing".to_owned())?,
+            reason_code: reason_code.ok_or_else(|| "reason-code is missing".to_owned())?,
+            evidence_refs,
+            confirmation_proof_ref: confirmation_proof_ref
+                .ok_or_else(|| "confirmation-proof-ref is missing".to_owned())?,
+            idempotency_key: idempotency_key
+                .ok_or_else(|| "idempotency-key is missing".to_owned())?,
+        })
     }
 
     fn into_command(self) -> Result<TuiCommand, String> {
@@ -744,18 +851,105 @@ impl CommandForm {
                 idempotency_key: next(&mut values, "idempotency-key")?,
                 json: false,
             }),
+            CommandKind::ContextRevoke => Err(
+                "Context revoke must be staged through the interactive confirmation modal"
+                    .to_owned(),
+            ),
         }
     }
 }
 
-#[derive(Clone, Debug)]
 enum InteractiveMode {
     Dashboard,
     Palette { selected: usize },
     Form(CommandForm),
+    ContextRevokeConfirmation(PendingContextRevoke),
 }
 
-struct AttachedClient(ClientAttachment);
+enum InteractiveAction {
+    Command(Box<TuiCommand>),
+    StageContextRevoke(ContextRevokeInput),
+    ConfirmContextRevoke,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContextRevokeModalKeyAction {
+    Confirm,
+    Cancel,
+    Ignore,
+}
+
+fn context_revoke_modal_key_action(key: KeyCode) -> ContextRevokeModalKeyAction {
+    match key {
+        KeyCode::Enter => ContextRevokeModalKeyAction::Confirm,
+        KeyCode::Esc => ContextRevokeModalKeyAction::Cancel,
+        _ => ContextRevokeModalKeyAction::Ignore,
+    }
+}
+
+type ContextRevokeReceipt =
+    egopulse_domain_contracts::v01::egopulse::localapi::v1::ContextRevokeReceipt;
+type ContextRevokeCommitFuture =
+    Pin<Box<dyn Future<Output = Result<ContextRevokeReceipt, String>> + Send>>;
+type SnapshotFuture<'a> = Pin<Box<dyn Future<Output = Result<Snapshot, String>> + Send + 'a>>;
+
+trait ContextRevokeCommit: Send {
+    fn commit(self: Box<Self>) -> ContextRevokeCommitFuture;
+}
+
+struct ProductionContextRevokeCommit {
+    attachment: Arc<ClientAttachment>,
+    prepared: PreparedContextRevoke,
+}
+
+impl ContextRevokeCommit for ProductionContextRevokeCommit {
+    fn commit(self: Box<Self>) -> ContextRevokeCommitFuture {
+        Box::pin(async move {
+            let supplied_digest = self.prepared.request_digest_sha256().to_owned();
+            self.attachment
+                .execute_context_revoke(self.prepared, &supplied_digest)
+                .await
+                .map_err(tui_context_revoke_error)
+        })
+    }
+}
+
+struct PendingContextRevoke {
+    snapshot_id: String,
+    expected_state_revision: u64,
+    evidence_count: usize,
+    request_digest_sha256: String,
+    commit: Box<dyn ContextRevokeCommit>,
+}
+
+impl PendingContextRevoke {
+    fn production(attachment: Arc<ClientAttachment>, prepared: PreparedContextRevoke) -> Self {
+        Self {
+            snapshot_id: prepared.snapshot_id().to_owned(),
+            expected_state_revision: prepared.expected_state_revision(),
+            evidence_count: prepared.evidence_count(),
+            request_digest_sha256: prepared.request_digest_sha256().to_owned(),
+            commit: Box::new(ProductionContextRevokeCommit {
+                attachment,
+                prepared,
+            }),
+        }
+    }
+
+    async fn commit(self) -> Result<ContextRevokeReceipt, String> {
+        self.commit.commit().await
+    }
+}
+
+trait InteractiveClient: Send + Sync {
+    fn snapshot(&self) -> SnapshotFuture<'_>;
+    fn prepare_context_revoke(
+        &self,
+        input: ContextRevokeInput,
+    ) -> Result<PendingContextRevoke, String>;
+}
+
+struct AttachedClient(Arc<ClientAttachment>);
 
 impl AttachedClient {
     async fn open(instance: &str) -> Result<Self, String> {
@@ -766,7 +960,7 @@ impl AttachedClient {
         )
         .await
         .map_err(|error| error.to_string())?;
-        Ok(Self(attached))
+        Ok(Self(Arc::new(attached)))
     }
 
     fn metadata(
@@ -798,7 +992,7 @@ impl AttachedClient {
             .map_err(|error| format!("{operation}: {error}"))
     }
 
-    async fn snapshot(&self) -> Result<Snapshot, String> {
+    async fn read_snapshot(&self) -> Result<Snapshot, String> {
         let projection = self
             .0
             .read_projection_snapshot()
@@ -823,6 +1017,26 @@ impl AttachedClient {
     }
 }
 
+impl InteractiveClient for AttachedClient {
+    fn snapshot(&self) -> SnapshotFuture<'_> {
+        Box::pin(self.read_snapshot())
+    }
+
+    fn prepare_context_revoke(
+        &self,
+        input: ContextRevokeInput,
+    ) -> Result<PendingContextRevoke, String> {
+        let prepared = self
+            .0
+            .prepare_context_revoke(input)
+            .map_err(tui_context_revoke_error)?;
+        Ok(PendingContextRevoke::production(
+            Arc::clone(&self.0),
+            prepared,
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandOutput {
     Console,
@@ -835,13 +1049,22 @@ enum CommandResult {
 }
 
 async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> {
-    run_command_with_output(instance, command, CommandOutput::Console)
-        .await
-        .map(|_| ())
+    Box::pin(run_command_with_output(
+        instance,
+        command,
+        CommandOutput::Console,
+    ))
+    .await
+    .map(|_| ())
 }
 
 async fn run_command_quiet(instance: &str, command: TuiCommand) -> Result<CommandResult, String> {
-    run_command_with_output(instance, command, CommandOutput::Quiet).await
+    Box::pin(run_command_with_output(
+        instance,
+        command,
+        CommandOutput::Quiet,
+    ))
+    .await
 }
 
 async fn run_command_with_output(
@@ -945,6 +1168,7 @@ async fn run_command_with_output(
                         "data": {
                             "snapshotId": preview.snapshot_id,
                             "snapshotRevision": preview.snapshot_revision,
+                            "contextStateRevision": preview.context_state_revision,
                             "gateReady": preview.gate_ready,
                             "readyForFounderConfirmation": preview.ready_for_founder_confirmation,
                             "compiledContextSha256": preview.compiled_context_sha256,
@@ -958,8 +1182,9 @@ async fn run_command_with_output(
                 );
             } else {
                 println!(
-                    "Work prepared: snapshot={} gate_ready={} sources={}",
+                    "Work prepared: snapshot={} context_state_revision={} gate_ready={} sources={}",
                     preview.snapshot_id,
+                    preview.context_state_revision,
                     preview.gate_ready,
                     preview.included_sources.len()
                 );
@@ -1995,6 +2220,19 @@ fn tui_work_error(error: ClientWorkError) -> String {
     }
 }
 
+fn tui_context_revoke_error(error: ClientContextRevokeError) -> String {
+    match error {
+        ClientContextRevokeError::Api(error) => local_error_message(*error),
+        ClientContextRevokeError::InvalidConfirmation => {
+            "CONTEXT_CONFIRMATION_REQUIRED: supply the exact full lowercase digest".to_owned()
+        }
+        ClientContextRevokeError::SessionChanged => {
+            "CONTEXT_SESSION_CHANGED: reopen the form and prepare again".to_owned()
+        }
+        other => other.to_string(),
+    }
+}
+
 fn parse_approval_decision(value: &str) -> Result<i32, String> {
     match value {
         "allow-once" => Ok(ApprovalDecision::AllowOnce as i32),
@@ -2129,7 +2367,7 @@ struct Snapshot {
 
 struct App {
     instance: String,
-    client: Option<AttachedClient>,
+    client: Option<Arc<dyn InteractiveClient>>,
     snapshot: Option<Snapshot>,
     panel: Panel,
     message: String,
@@ -2157,16 +2395,23 @@ impl App {
 
     fn open_form(&mut self, kind: CommandKind) {
         self.mode = InteractiveMode::Form(CommandForm::new(kind));
-        self.message = format!(
-            "{}: type a value, Tab/Down advances, Enter submits, Esc cancels",
-            kind.label()
-        );
+        self.message = if kind == CommandKind::ContextRevoke {
+            format!(
+                "{}: Tab/Down advances, Ctrl+N adds an evidence entry, Ctrl+D removes one, Enter stages the modal, Esc cancels",
+                kind.label()
+            )
+        } else {
+            format!(
+                "{}: type a value, Tab/Down advances, Enter submits, Esc cancels",
+                kind.label()
+            )
+        };
     }
 
     fn handle_key(
         &mut self,
         key: crossterm::event::KeyEvent,
-    ) -> Result<Option<TuiCommand>, String> {
+    ) -> Result<Option<InteractiveAction>, String> {
         match &mut self.mode {
             InteractiveMode::Dashboard => match key.code {
                 KeyCode::Char('c') => {
@@ -2215,6 +2460,28 @@ impl App {
                     form.error = None;
                     Ok(None)
                 }
+                KeyCode::Char('n')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    if form.add_context_evidence_entry() {
+                        self.message =
+                            "Added an ordered evidence entry; its exact bytes will be preserved"
+                                .to_owned();
+                    }
+                    Ok(None)
+                }
+                KeyCode::Char('d')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    if form.remove_active_context_evidence_entry() {
+                        self.message = "Removed the selected evidence entry".to_owned();
+                    }
+                    Ok(None)
+                }
                 KeyCode::Backspace => {
                     form.active_field_mut().value.pop();
                     form.error = None;
@@ -2236,10 +2503,10 @@ impl App {
                         form.error = None;
                         return Ok(None);
                     }
-                    match form.clone().into_command() {
-                        Ok(command) => {
+                    match form.clone().into_action() {
+                        Ok(action) => {
                             self.mode = InteractiveMode::Dashboard;
-                            Ok(Some(command))
+                            Ok(Some(action))
                         }
                         Err(error) => {
                             form.error = Some(error.clone());
@@ -2250,13 +2517,55 @@ impl App {
                 }
                 _ => Ok(None),
             },
+            InteractiveMode::ContextRevokeConfirmation(_) => {
+                match context_revoke_modal_key_action(key.code) {
+                    ContextRevokeModalKeyAction::Cancel => {
+                        self.mode = InteractiveMode::Dashboard;
+                        self.message =
+                            "Context revoke cancelled before mutation; no command was sent"
+                                .to_owned();
+                        Ok(None)
+                    }
+                    ContextRevokeModalKeyAction::Confirm => {
+                        Ok(Some(InteractiveAction::ConfirmContextRevoke))
+                    }
+                    ContextRevokeModalKeyAction::Ignore => Ok(None),
+                }
+            }
         }
+    }
+
+    async fn stage_context_revoke(&mut self, input: ContextRevokeInput) -> Result<(), String> {
+        if self.client.is_none() {
+            self.client = Some(Arc::new(AttachedClient::open(&self.instance).await?));
+        }
+        let pending = self
+            .client
+            .as_ref()
+            .expect("Context revoke client is attached")
+            .prepare_context_revoke(input)?;
+        self.message =
+            "Review the complete digest; no mutation is sent until explicit confirmation"
+                .to_owned();
+        self.mode = InteractiveMode::ContextRevokeConfirmation(pending);
+        Ok(())
+    }
+
+    async fn confirm_context_revoke(
+        &mut self,
+    ) -> Result<egopulse_domain_contracts::v01::egopulse::localapi::v1::ContextRevokeReceipt, String>
+    {
+        let mode = std::mem::replace(&mut self.mode, InteractiveMode::Dashboard);
+        let InteractiveMode::ContextRevokeConfirmation(prepared) = mode else {
+            return Err("Context revoke confirmation state is unavailable".to_owned());
+        };
+        prepared.commit().await
     }
 
     async fn refresh(&mut self) {
         if self.client.is_none() {
             match AttachedClient::open(&self.instance).await {
-                Ok(client) => self.client = Some(client),
+                Ok(client) => self.client = Some(Arc::new(client)),
                 Err(error) => {
                     self.message = error;
                     return;
@@ -2359,6 +2668,9 @@ impl App {
                 render_command_palette(frame, body[1], *selected)
             }
             InteractiveMode::Form(form) => render_command_form(frame, body[1], form),
+            InteractiveMode::ContextRevokeConfirmation(prepared) => {
+                render_context_revoke_confirmation(frame, body[1], prepared)
+            }
         }
         frame.render_widget(
             Paragraph::new(self.footer_text())
@@ -2383,6 +2695,10 @@ impl App {
                 form.error
                     .as_deref()
                     .map_or(String::new(), |error| format!(" · error: {error}"))
+            ),
+            InteractiveMode::ContextRevokeConfirmation(_) => format!(
+                "{} · Enter confirms this exact full digest · Esc cancels with zero writes",
+                self.message
             ),
         }
     }
@@ -2425,11 +2741,7 @@ fn render_command_form(frame: &mut Frame<'_>, area: Rect, form: &CommandForm) {
             let actual = start + index;
             let marker = if actual == form.active { "▶" } else { " " };
             let required = if field.required { "*" } else { " " };
-            let value = if field.value.is_empty() {
-                "<empty>".to_owned()
-            } else {
-                field.value.clone()
-            };
+            let value = form_field_display_value(field);
             ListItem::new(format!("{marker} {required} {:<42} {}", field.label, value))
         })
         .collect::<Vec<_>>();
@@ -2444,6 +2756,54 @@ fn render_command_form(frame: &mut Frame<'_>, area: Rect, form: &CommandForm) {
             .highlight_style(Style::default().fg(Color::Yellow)),
         area,
     );
+}
+
+fn form_field_display_value(field: &FormField) -> String {
+    if field.value.is_empty() {
+        "<empty>".to_owned()
+    } else if field.sensitive {
+        "<redacted>".to_owned()
+    } else {
+        field.value.clone()
+    }
+}
+
+fn render_context_revoke_confirmation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    pending: &PendingContextRevoke,
+) {
+    let lines = context_revoke_confirmation_text(pending)
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Founder Context revoke confirmation"),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn context_revoke_confirmation_text(pending: &PendingContextRevoke) -> Vec<String> {
+    vec![
+        format!("Snapshot: {}", pending.snapshot_id),
+        format!(
+            "Expected state revision: {}",
+            pending.expected_state_revision
+        ),
+        format!("Evidence references: {}", pending.evidence_count),
+        String::new(),
+        "Full semantic confirmation digest:".to_owned(),
+        pending.request_digest_sha256.clone(),
+        String::new(),
+        "Press Enter to revoke, or Esc to cancel without sending a mutation.".to_owned(),
+    ]
 }
 
 fn render_tasks(frame: &mut Frame<'_>, area: Rect, tasks: &[TaskView]) {
@@ -2532,11 +2892,17 @@ fn local_error_message(
     let code = LocalApiErrorCode::try_from(error.code)
         .map(|value| value.as_str_name().to_owned())
         .unwrap_or_else(|_| "LOCAL_API_ERROR_UNKNOWN".to_owned());
+    let mut facts = vec![code];
     if error.retryable {
-        format!("{code} (retryable)")
-    } else {
-        code
+        facts.push("retryable".to_owned());
     }
+    if let Some(action) = error.required_action_code.filter(|value| !value.is_empty()) {
+        facts.push(format!("action={action}"));
+    }
+    if !error.safe_fingerprint.is_empty() {
+        facts.push(format!("fingerprint={}", error.safe_fingerprint));
+    }
+    facts.join(" | ")
 }
 
 async fn run_once(mut app: App) -> Result<(), String> {
@@ -2604,7 +2970,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
         terminal
             .draw(|frame| app.render(frame))
             .map_err(|error| error.to_string())?;
-        if tokio::time::Instant::now() >= next_refresh {
+        if tokio::time::Instant::now() >= next_refresh
+            && matches!(app.mode, InteractiveMode::Dashboard)
+        {
             if app.snapshot.is_some() {
                 app.refresh().await;
             }
@@ -2628,19 +2996,43 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
                 app.panel = app.panel.next();
                 continue;
             }
-            if let Some(command) = app.handle_key(key)? {
-                app.message = format!("Executing {}…", command_kind(&command));
-                let result = run_command_quiet(&app.instance, command).await;
-                app.message = match result {
-                    Ok(CommandResult::Completed) => {
-                        "Governed command committed; projection will refresh automatically"
-                            .to_owned()
+            if let Some(action) = app.handle_key(key)? {
+                match action {
+                    InteractiveAction::StageContextRevoke(input) => {
+                        let result = app.stage_context_revoke(input).await;
+                        if let Err(error) = result {
+                            app.mode = InteractiveMode::Dashboard;
+                            app.message =
+                                format!("Operation rejected before confirmation: {error}");
+                        }
                     }
-                    Ok(CommandResult::ReadView(view)) => view,
-                    Err(error) => format!("Operation rejected: {error}"),
-                };
-                app.refresh().await;
-                next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+                    InteractiveAction::Command(command) => {
+                        app.message = format!("Executing {}…", command_kind(&command));
+                        let result = run_command_quiet(&app.instance, *command).await;
+                        app.message = match result {
+                            Ok(CommandResult::Completed) => {
+                                "Governed command committed; projection will refresh automatically"
+                                    .to_owned()
+                            }
+                            Ok(CommandResult::ReadView(view)) => view,
+                            Err(error) => format!("Operation rejected: {error}"),
+                        };
+                        app.refresh().await;
+                        next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+                    }
+                    InteractiveAction::ConfirmContextRevoke => {
+                        app.message = "Submitting the confirmed Context revoke…".to_owned();
+                        app.message = match app.confirm_context_revoke().await {
+                            Ok(receipt) => format!(
+                                "Context revoked at state revision {} (replayed={})",
+                                receipt.result_state_revision, receipt.replayed
+                            ),
+                            Err(error) => format!("Operation rejected: {error}"),
+                        };
+                        app.refresh().await;
+                        next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+                    }
+                }
             }
         }
     }
@@ -2688,6 +3080,62 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct FakeContextRevokeCommit {
+        calls: Arc<AtomicUsize>,
+        receipt: ContextRevokeReceipt,
+    }
+
+    impl ContextRevokeCommit for FakeContextRevokeCommit {
+        fn commit(self: Box<Self>) -> ContextRevokeCommitFuture {
+            let Self { calls, receipt } = *self;
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(receipt)
+            })
+        }
+    }
+
+    struct FakeInteractiveClient {
+        prepare_calls: Arc<AtomicUsize>,
+        commit_calls: Arc<AtomicUsize>,
+        captured: Arc<Mutex<Vec<ContextRevokeInput>>>,
+    }
+
+    impl InteractiveClient for FakeInteractiveClient {
+        fn snapshot(&self) -> SnapshotFuture<'_> {
+            Box::pin(async { Err("snapshot not used by Context modal test".to_owned()) })
+        }
+
+        fn prepare_context_revoke(
+            &self,
+            input: ContextRevokeInput,
+        ) -> Result<PendingContextRevoke, String> {
+            self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+            self.captured
+                .lock()
+                .expect("capture Context input")
+                .push(input.clone());
+            Ok(PendingContextRevoke {
+                snapshot_id: input.snapshot_id,
+                expected_state_revision: input.expected_state_revision,
+                evidence_count: input.evidence_refs.len(),
+                request_digest_sha256: "d".repeat(64),
+                commit: Box::new(FakeContextRevokeCommit {
+                    calls: Arc::clone(&self.commit_calls),
+                    receipt: ContextRevokeReceipt {
+                        result_state_revision: 2,
+                        acknowledged_after_durability_barrier: true,
+                        ..Default::default()
+                    },
+                }),
+            })
+        }
+    }
 
     #[test]
     fn command_form_rejects_missing_required_values() {
@@ -2954,6 +3402,216 @@ mod tests {
             command_kind(&revoke.into_command().expect("valid revoke form")),
             "memory.revoke"
         );
+    }
+
+    #[test]
+    fn context_revoke_form_preserves_order_and_requires_modal_confirmation() {
+        let mut form = CommandForm::new(CommandKind::ContextRevoke);
+        assert!(form.add_context_evidence_entry());
+        for (field, value) in form.fields.iter_mut().zip([
+            "ctx:abc".to_owned(),
+            "7".to_owned(),
+            "founder-withdrew-context".to_owned(),
+            "evidence:first,with-comma".to_owned(),
+            " evidence:second ".to_owned(),
+            "proof:founder-review".to_owned(),
+            "idem:context-revoke".to_owned(),
+        ]) {
+            field.value = value;
+        }
+        let action = form.into_action().expect("valid Context revoke form");
+        let InteractiveAction::StageContextRevoke(input) = action else {
+            panic!("Context form must stage the modal, never produce a headless command");
+        };
+        assert_eq!(input.snapshot_id, "ctx:abc");
+        assert_eq!(input.expected_state_revision, 7);
+        assert_eq!(
+            input.evidence_refs,
+            ["evidence:first,with-comma", " evidence:second "]
+        );
+    }
+
+    #[test]
+    fn context_revoke_has_no_headless_tui_mutation_subcommand() {
+        assert!(Args::try_parse_from(["egopulse-tui", "context-revoke"]).is_err());
+    }
+
+    #[test]
+    fn context_revoke_form_keyboard_manages_independent_evidence_entries() {
+        let mut app = App::new("default".to_owned());
+        app.open_form(CommandKind::ContextRevoke);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .expect("add evidence entry");
+        let InteractiveMode::Form(form) = &app.mode else {
+            panic!("Context form should stay open");
+        };
+        assert_eq!(
+            form.fields
+                .iter()
+                .filter(|field| field.label == "evidence-ref")
+                .count(),
+            2
+        );
+        assert_eq!(form.fields[form.active].label, "evidence-ref");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .expect("remove evidence entry");
+        let InteractiveMode::Form(form) = &app.mode else {
+            panic!("Context form should stay open");
+        };
+        assert_eq!(
+            form.fields
+                .iter()
+                .filter(|field| field.label == "evidence-ref")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn context_revoke_form_redacts_private_governance_references() {
+        let mut form = CommandForm::new(CommandKind::ContextRevoke);
+        for field in &mut form.fields {
+            if matches!(
+                field.label,
+                "reason-code" | "evidence-ref" | "confirmation-proof-ref"
+            ) {
+                field.value = format!("private-{}-sentinel", field.label);
+                let displayed = form_field_display_value(field);
+                assert_eq!(displayed, "<redacted>");
+                assert!(!displayed.contains("private-"));
+            }
+        }
+    }
+
+    #[test]
+    fn context_revoke_modal_render_buffer_contains_the_complete_digest() {
+        let digest = "d".repeat(64);
+        let pending = PendingContextRevoke {
+            snapshot_id: "ctx:safe-display".to_owned(),
+            expected_state_revision: 7,
+            evidence_count: 2,
+            request_digest_sha256: digest.clone(),
+            commit: Box::new(FakeContextRevokeCommit {
+                calls: Arc::new(AtomicUsize::new(0)),
+                receipt: ContextRevokeReceipt::default(),
+            }),
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_context_revoke_confirmation(frame, area, &pending);
+            })
+            .expect("render Context confirmation modal");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(&digest));
+        assert!(!rendered.contains("reason"));
+        assert!(!rendered.contains("proof"));
+        assert!(!rendered.contains("evidence:first"));
+    }
+
+    #[tokio::test]
+    async fn context_revoke_modal_uses_one_attached_driver_and_has_zero_or_one_commit() {
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let commit_calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client: Arc<dyn InteractiveClient> = Arc::new(FakeInteractiveClient {
+            prepare_calls: Arc::clone(&prepare_calls),
+            commit_calls: Arc::clone(&commit_calls),
+            captured: Arc::clone(&captured),
+        });
+        let mut app = App::new("unused-test-instance".to_owned());
+        app.client = Some(Arc::clone(&client));
+        app.open_form(CommandKind::ContextRevoke);
+        let InteractiveMode::Form(form) = &mut app.mode else {
+            panic!("Context form should be open");
+        };
+        assert!(form.add_context_evidence_entry());
+        for (field, value) in form.fields.iter_mut().zip([
+            "ctx:modal".to_owned(),
+            "7".to_owned(),
+            "private-reason-sentinel".to_owned(),
+            "evidence:first,with-comma".to_owned(),
+            "evidence:second".to_owned(),
+            "private-proof-sentinel".to_owned(),
+            "idem:modal".to_owned(),
+        ]) {
+            field.value = value;
+        }
+        form.active = form.fields.len() - 1;
+        let action = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("submit Context form")
+            .expect("stage Context action");
+        let InteractiveAction::StageContextRevoke(input) = action else {
+            panic!("Context form must stage the confirmation modal");
+        };
+
+        app.stage_context_revoke(input.clone())
+            .await
+            .expect("stage Context revoke");
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(commit_calls.load(Ordering::SeqCst), 0);
+        let InteractiveMode::ContextRevokeConfirmation(pending) = &app.mode else {
+            panic!("prepared Context revoke must enter the modal");
+        };
+        let modal_text = context_revoke_confirmation_text(pending).join("\n");
+        assert!(modal_text.contains(&"d".repeat(64)));
+        assert!(!modal_text.contains("private-reason-sentinel"));
+        assert!(!modal_text.contains("private-proof-sentinel"));
+        assert!(!modal_text.contains("evidence:first"));
+
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .expect("cancel modal")
+                .is_none()
+        );
+        assert!(matches!(app.mode, InteractiveMode::Dashboard));
+        assert_eq!(commit_calls.load(Ordering::SeqCst), 0);
+
+        app.stage_context_revoke(input.clone())
+            .await
+            .expect("restage Context revoke");
+        let action = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("confirm modal")
+            .expect("confirmation action");
+        assert!(matches!(action, InteractiveAction::ConfirmContextRevoke));
+        let receipt = app
+            .confirm_context_revoke()
+            .await
+            .expect("commit confirmed Context revoke");
+        assert_eq!(receipt.result_state_revision, 2);
+        assert_eq!(commit_calls.load(Ordering::SeqCst), 1);
+        assert!(app.confirm_context_revoke().await.is_err());
+        assert_eq!(commit_calls.load(Ordering::SeqCst), 1);
+
+        let captured = captured.lock().expect("read captured Context inputs");
+        assert_eq!(captured.as_slice(), [input.clone(), input]);
+    }
+
+    #[test]
+    fn context_errors_keep_action_and_safe_fingerprint() {
+        let message = local_error_message(
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::LocalApiError {
+                code: LocalApiErrorCode::StateRevisionConflict as i32,
+                retryable: false,
+                required_action_code: Some("RELOAD_CONTEXT_STATE".to_owned()),
+                safe_fingerprint: "context-cas-conflict".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert!(message.contains("LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT"));
+        assert!(message.contains("action=RELOAD_CONTEXT_STATE"));
+        assert!(message.contains("fingerprint=context-cas-conflict"));
     }
 
     #[test]

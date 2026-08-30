@@ -16,10 +16,10 @@ use std::{
 use egopulse_agentosd::{
     AuthorityCompositionInputs, AuthorityPrincipalResolver, ConfiguredArtifactAdmissionGuard,
     ConfiguredArtifactAdmissionGuardConfig, ConfiguredTaskTransitionGuard,
-    ConfiguredWorkPreparationPort, DaemonComposition, DaemonConfig, DaemonProviders,
-    DenyVerificationReferences, GovernedReturnCollectorConfig, MemoryRetrievalCompositionConfig,
-    NativeHarnessCompositionConfig, OwnerProjectionSource, PendingOwnerProjection,
-    ProjectionSourceFailure, SharedAuthorityCompositionInputs,
+    ConfiguredWorkPreparationPort, ContextMutationPortAdapter, DaemonComposition, DaemonConfig,
+    DaemonProviders, DenyVerificationReferences, GovernedReturnCollectorConfig,
+    MemoryRetrievalCompositionConfig, NativeHarnessCompositionConfig, OwnerProjectionSource,
+    PendingOwnerProjection, ProjectionSourceFailure, SharedAuthorityCompositionInputs,
 };
 use egopulse_artifact_authority::{
     ArtifactAuthority, ArtifactAuthorityConfig, ArtifactSqlCipherKey,
@@ -27,7 +27,10 @@ use egopulse_artifact_authority::{
 use egopulse_client_kernel::{ClientKernel, api_contract_ref, authorization_contract_ref};
 use egopulse_codex_adapter::{CODEX_ADAPTER_ID, CODEX_CAPABILITY_PROFILE_ID, FakeCodexDriver};
 use egopulse_cognition_runtime::{
-    context_authority::{ContextAuthority, ContextAuthorityConfig},
+    context_authority::{
+        AuthenticatedContextPrincipal, ContextAuthority, ContextAuthorityConfig,
+        ContextPrincipalKind, IssueContextSnapshot,
+    },
     memory_authority::{
         AuthenticatedMemoryPrincipal, GovernMemory, MemoryAuthority, MemoryAuthorityConfig,
         MemoryPrincipalKind, SubmitMemoryCandidate,
@@ -124,6 +127,9 @@ const R8B2C_BEGIN_DELIVERY_PHASE: &str = "begin-delivery-before-receipt";
 const R8B2C_DELIVERED_BEFORE_POLL_PHASE: &str = "delivered-before-poll";
 const R8B2C_UNKNOWN_RECOVERED_PHASE: &str = "unknown-recovered";
 const R8B2C_ACK_REHYDRATED_PHASE: &str = "ack-rehydrated";
+const R9A2C_CLI_CONTEXT_BYTES: &[u8] =
+    br#"{"surface":"cli","private":"r9a2c-context-bytes-sentinel"}"#;
+const R9A2C_CONTEXT_EXPIRES_AT_SECONDS: i64 = 4_102_444_800;
 
 struct FirstRunnerCycleMarker {
     inner: Arc<dyn HarnessDispatchRunner>,
@@ -924,6 +930,13 @@ impl AuthorityPrincipalResolver for FixtureAuthorityPrincipalResolver {
     ) -> Result<MemoryPrincipalKind, CommandPortFailure> {
         Ok(MemoryPrincipalKind::Founder)
     }
+
+    fn resolve_context(
+        &self,
+        _principal: &CommandPrincipal,
+    ) -> Result<ContextPrincipalKind, CommandPortFailure> {
+        Ok(ContextPrincipalKind::Founder)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1126,6 +1139,49 @@ fn fixture_config(root: &Path, instance: &str) -> DaemonConfig {
     }
 }
 
+fn r9a2c_snapshot_id(compiled_context: &[u8]) -> String {
+    format!("ctx:{:x}", Sha256::digest(compiled_context))
+}
+
+fn issue_r9a2c_context_snapshot(
+    authority: &mut ContextAuthority,
+    compiled_context: &[u8],
+    idempotency_key: &str,
+) {
+    let (_, snapshot) = authority
+        .issue(
+            &IssueContextSnapshot {
+                owner_principal_id: "os-user:c5-fixture".to_owned(),
+                intent: "prove governed Context revoke through a real user surface".to_owned(),
+                work_type: "governed_repository_change".to_owned(),
+                target_scope_ref: "scope:r9a2c".to_owned(),
+                compiled_context: compiled_context.to_vec(),
+                sources: Vec::new(),
+                memory_pack: None,
+                allowed_read_paths: vec!["docs".to_owned()],
+                allowed_write_paths: Vec::new(),
+                allowed_tools: Vec::new(),
+                external_resources: Vec::new(),
+                non_goals: vec!["do not disclose private Context bytes".to_owned()],
+                acceptance_contract_ref: "acceptance:r9a2c".to_owned(),
+                budget_profile_ref: "budget:r9a2c".to_owned(),
+                deadline_seconds: None,
+                recovery_entry: "hold-and-reconcile".to_owned(),
+                visibility: "founder-only".to_owned(),
+                redactions: Vec::new(),
+                expires_at_seconds: R9A2C_CONTEXT_EXPIRES_AT_SECONDS,
+                idempotency_key: idempotency_key.to_owned(),
+            },
+            &AuthenticatedContextPrincipal {
+                kind: ContextPrincipalKind::ContextCompiler,
+                principal_id: "context-compiler:c5-fixture".to_owned(),
+                authenticated: true,
+            },
+        )
+        .expect("issue deterministic R9A.2c Context fixture");
+    assert_eq!(snapshot.snapshot_id, r9a2c_snapshot_id(compiled_context));
+}
+
 fn open_fixture_providers(root: &Path) -> DaemonProviders {
     if matches!(
         fixture_mode().as_str(),
@@ -1266,14 +1322,14 @@ where
         .with_memory_retrieval(Arc::clone(&memory), memory_worker_config())
         .expect("fixture Memory retrieval should configure")
         .with_memory_mutation(memory, Arc::new(FixtureAuthorityPrincipalResolver));
-    let context = Arc::new(Mutex::new(
-        ContextAuthority::open(ContextAuthorityConfig {
-            database_path: root.join("context-authority.db"),
-            store_epoch: "c5-context-epoch".to_owned(),
-            key: SqlCipherKey::new([0x15; 32]),
-        })
-        .expect("fixture Context Authority should open"),
-    ));
+    let mut context = ContextAuthority::open(ContextAuthorityConfig {
+        database_path: root.join("context-authority.db"),
+        store_epoch: "c5-context-epoch".to_owned(),
+        key: SqlCipherKey::new([0x15; 32]),
+    })
+    .expect("fixture Context Authority should open");
+    issue_r9a2c_context_snapshot(&mut context, R9A2C_CLI_CONTEXT_BYTES, "r9a2c-cli-issue");
+    let context = Arc::new(Mutex::new(context));
     let mut work_port = ConfiguredWorkPreparationPort::new(
         Arc::clone(&context),
         Arc::clone(&providers.task_port),
@@ -1297,7 +1353,13 @@ where
             .and_then(|port| port.with_activation_run_id(R8A_ACTIVATION_RUN_ID.to_owned()))
             .expect("R-8A Work Preparation dispatch binding");
     }
-    let providers = providers.with_work_preparation_port(Arc::new(work_port));
+    let providers = providers
+        .with_work_preparation_port(Arc::new(work_port))
+        .with_context_authority(Arc::clone(&context))
+        .with_context_mutation(Arc::new(ContextMutationPortAdapter::new(
+            Arc::clone(&context),
+            Arc::new(FixtureAuthorityPrincipalResolver),
+        )));
     if !dynamic_fixture_mode() {
         return providers;
     }
@@ -1307,7 +1369,6 @@ where
         .expect("R-8A governed workspace should exist");
     let (artifact, verification) = r8a_authorities(root, &native.return_collector);
     let mode = fixture_mode();
-    let providers = providers.with_context_authority(context);
     let providers = if r8b2c_fixture_mode() {
         let driver_mode = if mode == R8B2C_BEGIN_DELIVERY_MODE {
             R8b2cDriverMode::BeginDeliveryBlock
@@ -1942,6 +2003,186 @@ async fn c5_00_daemon_fixture_child() {
         .serve(shutdown)
         .await
         .expect("fixture daemon serve");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r9a2c_noninteractive_cli_requires_digest_before_daemon_attach() {
+    let absent_instance = format!("r9a2c-absent-{}", Uuid::now_v7());
+    let shared_arguments = [
+        "ctx:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--expected-state-revision",
+        "1",
+        "--reason-code",
+        "withdrawn",
+        "--evidence-ref",
+        "evidence:one",
+        "--confirmation-proof-ref",
+        "proof:one",
+        "--idempotency-key",
+        "idem:one",
+        "--json",
+    ];
+    let mut cli_arguments = vec!["context", "revoke"];
+    cli_arguments.extend(shared_arguments);
+    let cli = run_cli(&absent_instance, &cli_arguments).await;
+    assert_eq!(cli.status.code(), Some(2));
+    let cli_json: serde_json::Value =
+        serde_json::from_slice(&cli.stdout).expect("CLI pre-attach confirmation error JSON");
+    assert_eq!(cli_json["error"]["code"], "CONTEXT_CONFIRMATION_REQUIRED");
+    assert_eq!(
+        cli_json["error"]["requiredActionCode"],
+        "SUPPLY_EXACT_CONTEXT_DIGEST"
+    );
+    assert!(!String::from_utf8_lossy(&cli.stdout).contains("DAEMON_UNAVAILABLE"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r9a2c_real_cli_digest_confirmed_context_revoke_over_local_ipc() {
+    let root = std::env::temp_dir().join(format!("egopulse-r9a2c-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create R9A.2c fixture root");
+    let instance = format!("r9a2c-{}", Uuid::now_v7());
+    let mut child = spawn_fixture(&root, &instance).await;
+    wait_for_cli_status(&instance).await;
+
+    let cli_snapshot = r9a2c_snapshot_id(R9A2C_CLI_CONTEXT_BYTES);
+    let cli_preview = run_cli(
+        &instance,
+        &[
+            "context",
+            "revoke",
+            cli_snapshot.as_str(),
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "r9a2c-reason-sentinel",
+            "--evidence-ref",
+            "evidence:r9a2c-private-sentinel",
+            "--confirmation-proof-ref",
+            "proof:r9a2c-private-sentinel",
+            "--idempotency-key",
+            "r9a2c-cli-revoke",
+            "--preview",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        cli_preview.status.success(),
+        "CLI Context preview stdout={} stderr={}",
+        String::from_utf8_lossy(&cli_preview.stdout),
+        String::from_utf8_lossy(&cli_preview.stderr)
+    );
+    let cli_preview_json: serde_json::Value =
+        serde_json::from_slice(&cli_preview.stdout).expect("CLI Context preview JSON");
+    assert_eq!(cli_preview_json["operation"], "context.revoke.preview");
+    assert_eq!(cli_preview_json["data"]["mutationSent"], false);
+    let cli_digest = cli_preview_json["data"]["requestDigestSha256"]
+        .as_str()
+        .expect("CLI Context full digest")
+        .to_owned();
+    assert_eq!(cli_digest.len(), 64);
+    assert!(
+        cli_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+
+    let cli_revoke = run_cli(
+        &instance,
+        &[
+            "context",
+            "revoke",
+            cli_snapshot.as_str(),
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "r9a2c-reason-sentinel",
+            "--evidence-ref",
+            "evidence:r9a2c-private-sentinel",
+            "--confirmation-proof-ref",
+            "proof:r9a2c-private-sentinel",
+            "--idempotency-key",
+            "r9a2c-cli-revoke",
+            "--confirm-digest",
+            cli_digest.as_str(),
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        cli_revoke.status.success(),
+        "CLI Context revoke stdout={} stderr={}",
+        String::from_utf8_lossy(&cli_revoke.stdout),
+        String::from_utf8_lossy(&cli_revoke.stderr)
+    );
+    let cli_json: serde_json::Value =
+        serde_json::from_slice(&cli_revoke.stdout).expect("CLI Context receipt JSON");
+    assert_eq!(cli_json["operation"], "context.revoke");
+    assert_eq!(cli_json["data"]["previousStateRevision"], 1);
+    assert_eq!(cli_json["data"]["resultStateRevision"], 2);
+    assert_eq!(
+        cli_json["data"]["resultState"],
+        "CONTEXT_GOVERNANCE_STATE_REVOKED"
+    );
+    assert_eq!(cli_json["data"]["requestDigestSha256"], cli_digest);
+    assert_eq!(cli_json["data"]["acknowledgedAfterDurabilityBarrier"], true);
+    assert_eq!(cli_json["data"]["replayed"], false);
+
+    let cli_replay = run_cli(
+        &instance,
+        &[
+            "context",
+            "revoke",
+            cli_snapshot.as_str(),
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "r9a2c-reason-sentinel",
+            "--evidence-ref",
+            "evidence:r9a2c-private-sentinel",
+            "--confirmation-proof-ref",
+            "proof:r9a2c-private-sentinel",
+            "--idempotency-key",
+            "r9a2c-cli-revoke",
+            "--confirm-digest",
+            cli_digest.as_str(),
+            "--json",
+        ],
+    )
+    .await;
+    assert!(cli_replay.status.success());
+    let cli_replay_json: serde_json::Value =
+        serde_json::from_slice(&cli_replay.stdout).expect("CLI Context replay JSON");
+    let mut expected_replay_data = cli_json["data"].clone();
+    expected_replay_data["replayed"] = serde_json::Value::Bool(true);
+    assert_eq!(cli_replay_json["data"], expected_replay_data);
+
+    let all_cli_output = format!(
+        "{}{}{}{}{}{}",
+        String::from_utf8_lossy(&cli_preview.stdout),
+        String::from_utf8_lossy(&cli_preview.stderr),
+        String::from_utf8_lossy(&cli_revoke.stdout),
+        String::from_utf8_lossy(&cli_revoke.stderr),
+        String::from_utf8_lossy(&cli_replay.stdout),
+        String::from_utf8_lossy(&cli_replay.stderr),
+    );
+    for forbidden in [
+        "r9a2c-context-bytes-sentinel",
+        "r9a2c-reason-sentinel",
+        "evidence:r9a2c-private-sentinel",
+        "proof:r9a2c-private-sentinel",
+        "os-user:c5-fixture",
+    ] {
+        assert!(
+            !all_cli_output.contains(forbidden),
+            "sanitized Context output leaked {forbidden}"
+        );
+    }
+
+    drop(child.stdin.take());
+    let status = child.wait().await.expect("R9A.2c fixture child exit");
+    assert!(status.success(), "R9A.2c fixture child failed: {status}");
+    fs::remove_dir_all(&root).expect("remove R9A.2c fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

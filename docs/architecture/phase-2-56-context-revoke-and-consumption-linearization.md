@@ -1,8 +1,8 @@
 # R-9A Context revoke and dispatch-consumption linearization
 
-- Status: Founder-frozen architecture contract; R-9A.1, R-9A.2a and R-9A.2b
-  locally verified, R-9A.2c/R-9A.3 implementation pending
-- Date: 2026-08-30
+- Status: Founder-frozen architecture contract; R-9A.1 through R-9A.2c locally
+  verified, R-9A.3 implementation pending
+- Date: 2026-08-31
 - Decision owner: Founder
 - Runtime fact owner: Context Authority
 - Scope: R-9A only
@@ -432,10 +432,55 @@ R-9A.2b verification evidence:
 - independent architecture, build and test reviews report GO with no remaining
   R-9A.2b P0/P1 finding, and the complete local CI passes.
 
-This checkpoint does not add CLI/TUI revoke interaction, dispatch-consumption
-authorization, production recovery wiring, a daemon restart witness or an
-Adapter side-effect witness. Those remain R-9A.2c and R-9A.3 work and must not
-be inferred from same-process exact replay evidence.
+R-9A.2b by itself did not add CLI/TUI revoke interaction,
+dispatch-consumption authorization, production recovery wiring, a daemon
+restart witness or an Adapter side-effect witness. The first item is closed by
+R-9A.2c below; the remaining dispatch/recovery witnesses are still R-9A.3 work
+and must not be inferred from same-process exact replay evidence.
+
+R-9A.2c is implemented as the shared CLI/TUI confirmation checkpoint. One
+`client-operations` prepare path derives the Founder identifier only from the
+accepted kernel session, delegates canonicalization to the frozen domain
+oracle and returns an opaque prepared request with safe display getters. The
+execute path consumes that request, rechecks the exact session ID, principal,
+permission and complete lower-case digest before generating metadata or
+calling transport, then validates the sanitized Authority receipt. It never
+changes the caller's idempotency key and does not retry automatically.
+
+The CLI supports a zero-mutation preview, exact-digest non-interactive
+execution and a terminal-only prompt that requires typing the complete digest;
+JSON or redirected execution never prompts. The prompt removes only its CR/LF
+line ending, so padded confirmation is rejected instead of normalized. The TUI
+has no headless Context mutation subcommand: its form creates independent,
+ordered evidence entries, preserves each entry's exact bytes, and redacts the
+reason, evidence and proof values while they are edited. It stages an opaque
+pending commit through the already attached interactive client, displays only
+snapshot, CAS revision, evidence count and the complete digest, drops the
+pending commit on `Esc`, and consumes it at most once on `Enter`. Both
+work-preparation surfaces expose `contextStateRevision`, the governed CAS
+input.
+
+R-9A.2c verification evidence:
+
+- shared client-operation tests cover the independent fixed canonical bytes
+  and digest, CLI/TUI semantic-command byte equality, permission denial,
+  malformed and mismatching confirmation with zero send, session/principal
+  binding, exact request construction, typed errors and strict receipt
+  validation;
+- TUI component tests drive form to modal through one injected attached-client
+  seam and prove `Esc` sends zero commits, `Enter` consumes exactly one commit,
+  the full digest is visible, and private inputs are not rendered. A Windows
+  real-process CLI test crosses OS-authenticated IPC, the daemon gateway,
+  production Context adapter and SQLCipher Authority for first commit and
+  byte-equivalent replay while scanning stdout and stderr for private Context,
+  owner, reason, evidence and proof sentinels;
+- the real-process test exposed an existing Windows stack-overflow risk in the
+  large TUI async command dispatcher. The command future is now explicitly
+  heap-pinned at both console and quiet entry points. Existing real-process TUI
+  command regressions pass without increasing or overriding the process stack;
+  this is not presented as a Context-modal subprocess E2E;
+- this evidence proves user-surface confirmation and durable Context revoke,
+  not dispatch linearization, restart recovery or Adapter side-effect safety.
 
 ## Acceptance Gates
 
