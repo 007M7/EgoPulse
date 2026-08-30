@@ -3,14 +3,16 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     future::Future,
     io::{Read, Write},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     pin::Pin,
-    process::Stdio,
-    sync::{Arc, Mutex},
-    time::Duration,
+    process::{Command as StdCommand, Stdio},
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::{Duration, Instant},
 };
 
 use egopulse_agentosd::{
@@ -100,6 +102,14 @@ use egopulse_v01_fault_conformance::r8b2c::{
     R8b2cNativeEventRecord, R8b2cWitnessReader, R8b2cWitnessWriter, read_r8b2c_adapter_store,
     read_r8b2c_collaboration_store, read_r8b2c_task_store,
 };
+use egopulse_v01_fault_conformance::r9a3::{
+    PROTOCOL_VERSION as R9A3_PROTOCOL_VERSION, SendAck as R9a3SendAck,
+    SendRequest as R9a3SendRequest, SideEffectReader as R9a3SideEffectReader,
+    SideEffectWriter as R9a3SideEffectWriter, read_send_ack_frame as read_r9a3_send_ack_frame,
+    read_send_request_frame as read_r9a3_send_request_frame,
+    write_send_ack_frame as write_r9a3_send_ack_frame,
+    write_send_request_frame as write_r9a3_send_request_frame,
+};
 use egopulse_verification_authority::{
     VerificationAuthority, VerificationAuthorityConfig, VerificationSqlCipherKey,
 };
@@ -130,6 +140,351 @@ const R8B2C_ACK_REHYDRATED_PHASE: &str = "ack-rehydrated";
 const R9A2C_CLI_CONTEXT_BYTES: &[u8] =
     br#"{"surface":"cli","private":"r9a2c-context-bytes-sentinel"}"#;
 const R9A2C_CONTEXT_EXPIRES_AT_SECONDS: i64 = 4_102_444_800;
+const R9A3_WITNESS_ROOT_ENV: &str = "EGOPULSE_C5_R9A3_WITNESS_ROOT";
+const R9A3_WITNESS_INSTANCE_ENV: &str = "EGOPULSE_C5_R9A3_WITNESS_INSTANCE";
+const R9A3_WITNESS_WITHHOLD_ACK_ENV: &str = "EGOPULSE_C5_R9A3_WITHHOLD_ACK";
+const R9A3_WITNESS_READY_FILE: &str = "r9a3-witness-ready.json";
+const R9A3_WITNESS_CHECKPOINT_FILE: &str = "r9a3-effect-committed.json";
+const R9A3_WITNESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const R9A3_WITNESS_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct R9a3WitnessReady {
+    process_id: u32,
+    instance: String,
+    endpoint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct R9a3WitnessCheckpoint {
+    process_id: u32,
+    instance: String,
+    dispatch_id: String,
+    phase: String,
+}
+
+fn r9a3_witness_ready_path(root: &Path) -> PathBuf {
+    root.join(R9A3_WITNESS_READY_FILE)
+}
+
+fn r9a3_witness_checkpoint_path(root: &Path) -> PathBuf {
+    root.join(R9A3_WITNESS_CHECKPOINT_FILE)
+}
+
+fn publish_r9a3_json_atomically<T: serde::Serialize>(path: &Path, value: &T, label: &str) {
+    let payload = serde_json::to_vec(value).unwrap_or_else(|error| {
+        panic!("serialize {label}: {error}");
+    });
+    let temporary = path.with_extension(format!("tmp-{}-{}", std::process::id(), Uuid::now_v7()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .unwrap_or_else(|error| panic!("create temporary {label}: {error}"));
+    file.write_all(&payload)
+        .unwrap_or_else(|error| panic!("write temporary {label}: {error}"));
+    file.flush()
+        .unwrap_or_else(|error| panic!("flush temporary {label}: {error}"));
+    file.sync_all()
+        .unwrap_or_else(|error| panic!("sync temporary {label}: {error}"));
+    drop(file);
+    fs::rename(&temporary, path).unwrap_or_else(|error| panic!("publish {label}: {error}"));
+}
+
+struct R9a3WitnessTempRoot(PathBuf);
+
+impl R9a3WitnessTempRoot {
+    fn new() -> Self {
+        let root =
+            std::env::temp_dir().join(format!("egopulse-c5-r9a3-witness-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create R-9A.3 witness test root");
+        Self(root)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for R9a3WitnessTempRoot {
+    fn drop(&mut self) {
+        let temp_root = std::env::temp_dir();
+        let is_scoped = self.0.parent() == Some(temp_root.as_path())
+            && self
+                .0
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("egopulse-c5-r9a3-witness-"));
+        if is_scoped {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+struct R9a3WitnessProcess {
+    child: std::process::Child,
+}
+
+impl R9a3WitnessProcess {
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn bounded_reap(
+        &mut self,
+        deadline: Instant,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(Some(status));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            thread::sleep(remaining.min(R9A3_WITNESS_REAP_POLL_INTERVAL));
+        }
+    }
+
+    fn hard_kill(&mut self) -> std::process::ExitStatus {
+        assert!(
+            self.try_wait()
+                .expect("inspect R-9A.3 witness helper before kill")
+                .is_none(),
+            "R-9A.3 witness helper must be alive before hard kill"
+        );
+        self.child.kill().expect("hard-kill R-9A.3 witness helper");
+        self.bounded_reap(Instant::now() + R9A3_WITNESS_REAP_TIMEOUT)
+            .expect("reap hard-killed R-9A.3 witness helper")
+            .expect("hard-killed R-9A.3 witness helper must exit before reap deadline")
+    }
+}
+
+impl Drop for R9a3WitnessProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.bounded_reap(Instant::now() + R9A3_WITNESS_REAP_TIMEOUT);
+        }
+    }
+}
+
+fn spawn_r9a3_witness_helper(root: &Path, instance: &str) -> R9a3WitnessProcess {
+    let executable = std::env::current_exe().expect("R-9A.3 test executable path");
+    let child = StdCommand::new(executable)
+        .args([
+            "--exact",
+            "r9a3_external_side_effect_witness_helper_child",
+            "--nocapture",
+        ])
+        .env(R9A3_WITNESS_ROOT_ENV, root)
+        .env(R9A3_WITNESS_INSTANCE_ENV, instance)
+        .env(R9A3_WITNESS_WITHHOLD_ACK_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn independent R-9A.3 witness helper");
+    assert_ne!(
+        child.id(),
+        std::process::id(),
+        "R-9A.3 witness helper must be a distinct process"
+    );
+    R9a3WitnessProcess { child }
+}
+
+fn wait_for_r9a3_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    child: &mut R9a3WitnessProcess,
+    label: &str,
+) -> T {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(payload) = fs::read(path)
+            && let Ok(value) = serde_json::from_slice(&payload)
+        {
+            return value;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("inspect helper while waiting for {label}: {error}"))
+        {
+            panic!("R-9A.3 witness helper exited before {label}: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "R-9A.3 witness helper did not publish {label} within timeout"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn r9a3_external_side_effect_witness_helper_child() {
+    let Some(root) = std::env::var_os(R9A3_WITNESS_ROOT_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let instance =
+        std::env::var(R9A3_WITNESS_INSTANCE_ENV).expect("R-9A.3 witness helper instance");
+    let withhold_ack = std::env::var(R9A3_WITNESS_WITHHOLD_ACK_ENV).as_deref() == Ok("1");
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).expect("bind independent R-9A.3 witness helper");
+    let endpoint = listener
+        .local_addr()
+        .expect("read R-9A.3 witness helper endpoint");
+    let writer = R9a3SideEffectWriter::initialize(&root, &instance)
+        .expect("initialize exclusive R-9A.3 side-effect writer");
+    publish_r9a3_json_atomically(
+        &r9a3_witness_ready_path(&root),
+        &R9a3WitnessReady {
+            process_id: std::process::id(),
+            instance: instance.clone(),
+            endpoint: endpoint.to_string(),
+        },
+        "R-9A.3 witness ready file",
+    );
+
+    let (mut stream, _) = listener.accept().expect("accept R-9A.3 witness request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound helper read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("bound helper write timeout");
+    let request =
+        read_r9a3_send_request_frame(&mut stream).expect("read bounded R-9A.3 send request frame");
+    let ack = writer
+        .commit_effect(&request)
+        .expect("durably commit external R-9A.3 side effect");
+    publish_r9a3_json_atomically(
+        &r9a3_witness_checkpoint_path(&root),
+        &R9a3WitnessCheckpoint {
+            process_id: std::process::id(),
+            instance,
+            dispatch_id: request.dispatch_id,
+            phase: "effect-committed-before-ack".to_owned(),
+        },
+        "R-9A.3 durable effect checkpoint",
+    );
+    if withhold_ack {
+        loop {
+            thread::park();
+        }
+    }
+    write_r9a3_send_ack_frame(&mut stream, &ack).expect("write bounded R-9A.3 ACK frame");
+    stream.flush().expect("flush R-9A.3 ACK frame");
+}
+
+#[test]
+fn r9a3_external_side_effect_witness_is_durable_before_withheld_ack() {
+    let root = R9a3WitnessTempRoot::new();
+    let instance = format!("r9a3-witness-{}", Uuid::now_v7());
+    let mut helper = spawn_r9a3_witness_helper(root.path(), &instance);
+    let ready: R9a3WitnessReady = wait_for_r9a3_json(
+        &r9a3_witness_ready_path(root.path()),
+        &mut helper,
+        "ready file",
+    );
+    assert_eq!(ready.process_id, helper.id());
+    assert_ne!(ready.process_id, std::process::id());
+    assert_eq!(ready.instance, instance);
+    let endpoint: SocketAddr = ready.endpoint.parse().expect("parse helper endpoint");
+    assert_eq!(endpoint.ip().to_string(), "127.0.0.1");
+    assert_ne!(endpoint.port(), 0);
+
+    let request = R9a3SendRequest {
+        protocol_version: R9A3_PROTOCOL_VERSION,
+        operation_id: "operation-external-01".to_owned(),
+        dispatch_id: "dispatch-external-01".to_owned(),
+        attempt_id: "attempt-external-01".to_owned(),
+        fencing_token: 17,
+        request_digest_sha256: "a".repeat(64),
+        payload_digest_sha256: "b".repeat(64),
+    };
+    let client_request = request.clone();
+    let (result_sender, result_receiver) = mpsc::sync_channel::<Result<R9a3SendAck, String>>(1);
+    let client = thread::spawn(move || {
+        let result = (|| {
+            let mut stream = TcpStream::connect_timeout(&endpoint, Duration::from_secs(2))
+                .map_err(|error| format!("connect to R-9A.3 witness: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .map_err(|error| format!("set R-9A.3 client read timeout: {error}"))?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .map_err(|error| format!("set R-9A.3 client write timeout: {error}"))?;
+            write_r9a3_send_request_frame(&mut stream, &client_request)
+                .map_err(|error| format!("write R-9A.3 request: {error}"))?;
+            stream
+                .flush()
+                .map_err(|error| format!("flush R-9A.3 request: {error}"))?;
+            stream
+                .shutdown(Shutdown::Write)
+                .map_err(|error| format!("finish R-9A.3 request: {error}"))?;
+            read_r9a3_send_ack_frame(&mut stream)
+                .map_err(|error| format!("read withheld R-9A.3 ACK: {error}"))
+        })();
+        let _ = result_sender.send(result);
+    });
+
+    let checkpoint: R9a3WitnessCheckpoint = wait_for_r9a3_json(
+        &r9a3_witness_checkpoint_path(root.path()),
+        &mut helper,
+        "durable checkpoint",
+    );
+    assert_eq!(checkpoint.process_id, helper.id());
+    assert_eq!(checkpoint.instance, instance);
+    assert_eq!(checkpoint.dispatch_id, request.dispatch_id);
+    assert_eq!(checkpoint.phase, "effect-committed-before-ack");
+
+    let reader = R9a3SideEffectReader::open_existing(root.path(), &instance)
+        .expect("open independent R-9A.3 witness read-only");
+    assert_eq!(reader.effect_count().expect("read side-effect count"), 1);
+    let effect = reader
+        .effect_for_dispatch(&request.dispatch_id)
+        .expect("read external side effect")
+        .expect("external side effect must exist");
+    assert_eq!(effect.request, request);
+    let original_ack = effect.original_ack();
+    assert!(!original_ack.replayed);
+    assert!(!root.path().join(R8A_DRIVER_RECORD).exists());
+    assert!(!root.path().join("r8b2c-native-witness.db").exists());
+
+    let status = helper.hard_kill();
+    assert!(
+        !status.success(),
+        "hard-killed R-9A.3 witness helper must not report success: {status}"
+    );
+    let client_result = result_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("R-9A.3 client must exit after helper hard kill");
+    assert!(
+        client_result.is_err(),
+        "withheld ACK must not be fabricated after helper hard kill"
+    );
+    client.join().expect("join bounded R-9A.3 client");
+
+    drop(reader);
+    let reopened_reader = R9a3SideEffectReader::open_existing(root.path(), &instance)
+        .expect("reopen R-9A.3 witness read-only after helper hard kill");
+    assert_eq!(
+        reopened_reader
+            .effect_count()
+            .expect("read post-kill side-effect count"),
+        1
+    );
+    let reopened_effect = reopened_reader
+        .effect_for_dispatch(&request.dispatch_id)
+        .expect("read post-kill external side effect")
+        .expect("post-kill external side effect must exist");
+    assert_eq!(reopened_effect.request, request);
+    assert_eq!(reopened_effect.original_ack(), original_ack);
+    assert!(!reopened_effect.original_ack().replayed);
+}
 
 struct FirstRunnerCycleMarker {
     inner: Arc<dyn HarnessDispatchRunner>,
