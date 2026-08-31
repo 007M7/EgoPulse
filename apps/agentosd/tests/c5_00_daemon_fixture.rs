@@ -115,7 +115,8 @@ use egopulse_v01_fault_conformance::r9a3::{
     write_send_request_frame as write_r9a3_send_request_frame,
 };
 use egopulse_v01_fault_conformance::r9a3_context::{
-    R9a3ContextGovernanceState, read_r9a3_context_authority_store,
+    R9a3ContextGovernanceState, R9a3VerdictAuthorityCounts, read_r9a3_context_authority_store,
+    read_r9a3_verdict_authority_counts,
 };
 use egopulse_verification_authority::{
     VerificationAuthority, VerificationAuthorityConfig, VerificationSqlCipherKey,
@@ -139,6 +140,8 @@ const R8B2C_DELIVERED_BEFORE_POLL_MODE: &str = "dynamic-r8b2c-delivered-before-p
 const R8B2C_ACK_RECOVERY_MODE: &str = "dynamic-r8b2c-ack-recovery";
 const R9A3D_EXTERNAL_SEND_MODE: &str = "dynamic-r9a3d-external-send";
 const R9A3D_EXTERNAL_RECOVERY_MODE: &str = "dynamic-r9a3d-external-recovery";
+const R9A3E_PREAUTH_UNAVAILABLE_MODE: &str = "dynamic-r9a3e-preauth-unavailable";
+const R9A3E_REVOKED_READY_MODE: &str = "dynamic-r9a3e-revoked-ready";
 const R8A_ACTIVATION_RUN_ID: &str = "r8a-activation-run";
 const R8A_DRIVER_RECORD: &str = "r8a-driver-record.json";
 const R8B_FIRST_RUNNER_CYCLE_RECORD: &str = "r8b-first-runner-cycle-complete";
@@ -166,6 +169,8 @@ const R9A3D_FORBIDDEN_CONNECTION_FILE: &str = "r9a3d-forbidden-second-connection
 const R9A3D_FORBIDDEN_SEND_FILE: &str = "r9a3d-forbidden-second-send-request.json";
 const R9A3D_RECOVERY_CHECKPOINT_FILE: &str = "r9a3d-recovery-settled.json";
 const R9A3D_STABLE_CHECKPOINT_FILE: &str = "r9a3d-stable-cycle.json";
+const R9A3E_PREAUTH_UNAVAILABLE_PHASE: &str = "preauthorization-material-unavailable";
+const R9A3E_REVOKED_READY_PHASE: &str = "revoked-ready-rejected";
 const R9A3D_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const R9A3D_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1256,6 +1261,8 @@ enum R8b2cRunnerCheckpoint {
     DeliveredBeforePoll,
     UnknownRecovered,
     AckRehydrated,
+    PreAuthorizationUnavailable,
+    RevokedReadyRejected,
 }
 
 struct R8b2cCheckpointRunner {
@@ -1295,6 +1302,20 @@ impl HarnessDispatchRunner for R8b2cCheckpointRunner {
                     report.observations_consumed > 0,
                     R8B2C_ACK_REHYDRATED_PHASE,
                     false,
+                ),
+                R8b2cRunnerCheckpoint::PreAuthorizationUnavailable => (
+                    report.dispatches_seen > 0
+                        && report.dispatches_rejected > 0
+                        && report.dispatches_delivered == 0,
+                    R9A3E_PREAUTH_UNAVAILABLE_PHASE,
+                    true,
+                ),
+                R8b2cRunnerCheckpoint::RevokedReadyRejected => (
+                    report.dispatches_seen > 0
+                        && report.dispatches_rejected > 0
+                        && report.dispatches_delivered == 0,
+                    R9A3E_REVOKED_READY_PHASE,
+                    true,
                 ),
             };
             if reached {
@@ -1845,6 +1866,8 @@ fn dynamic_fixture_mode() -> bool {
             | R8B2C_ACK_RECOVERY_MODE
             | R9A3D_EXTERNAL_SEND_MODE
             | R9A3D_EXTERNAL_RECOVERY_MODE
+            | R9A3E_PREAUTH_UNAVAILABLE_MODE
+            | R9A3E_REVOKED_READY_MODE
     )
 }
 
@@ -1861,7 +1884,10 @@ fn r8b2c_fixture_mode() -> bool {
 fn r9a3d_fixture_mode() -> bool {
     matches!(
         fixture_mode().as_str(),
-        R9A3D_EXTERNAL_SEND_MODE | R9A3D_EXTERNAL_RECOVERY_MODE
+        R9A3D_EXTERNAL_SEND_MODE
+            | R9A3D_EXTERNAL_RECOVERY_MODE
+            | R9A3E_PREAUTH_UNAVAILABLE_MODE
+            | R9A3E_REVOKED_READY_MODE
     )
 }
 
@@ -2065,6 +2091,8 @@ fn open_fixture_providers(root: &Path) -> DaemonProviders {
             | R8B2C_ACK_RECOVERY_MODE
             | R9A3D_EXTERNAL_SEND_MODE
             | R9A3D_EXTERNAL_RECOVERY_MODE
+            | R9A3E_PREAUTH_UNAVAILABLE_MODE
+            | R9A3E_REVOKED_READY_MODE
     ) {
         open_fixture_providers_with_guards(
             root,
@@ -2291,6 +2319,8 @@ where
         R8B2C_DELIVERED_BEFORE_POLL_MODE => Some(R8b2cRunnerCheckpoint::DeliveredBeforePoll),
         R8B2C_UNKNOWN_RECOVERY_MODE => Some(R8b2cRunnerCheckpoint::UnknownRecovered),
         R8B2C_ACK_RECOVERY_MODE => Some(R8b2cRunnerCheckpoint::AckRehydrated),
+        R9A3E_PREAUTH_UNAVAILABLE_MODE => Some(R8b2cRunnerCheckpoint::PreAuthorizationUnavailable),
+        R9A3E_REVOKED_READY_MODE => Some(R8b2cRunnerCheckpoint::RevokedReadyRejected),
         _ => None,
     } {
         let runner = providers
@@ -2385,6 +2415,8 @@ async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Chi
                     | R8B2C_ACK_RECOVERY_MODE
                     | R9A3D_EXTERNAL_SEND_MODE
                     | R9A3D_EXTERNAL_RECOVERY_MODE
+                    | R9A3E_PREAUTH_UNAVAILABLE_MODE
+                    | R9A3E_REVOKED_READY_MODE
             ) {
                 Stdio::inherit()
             } else {
@@ -2754,7 +2786,16 @@ async fn wait_for_r9a3d_task(
     }
 }
 
-async fn prepare_and_confirm_r8b2c_work(root: &Path, instance: &str, label: &str) -> String {
+struct R8b2cPreparedWork {
+    task_id: String,
+    snapshot_id: String,
+}
+
+async fn prepare_and_confirm_r8b2c_work(
+    root: &Path,
+    instance: &str,
+    label: &str,
+) -> R8b2cPreparedWork {
     fs::write(
         root.join("context.md"),
         format!("R-8B.2c governed crash-window context for {label}."),
@@ -2824,10 +2865,14 @@ async fn prepare_and_confirm_r8b2c_work(root: &Path, instance: &str, label: &str
         confirmed["data"]["status"],
         TaskStatus::Active.as_str_name()
     );
-    confirmed["data"]["taskId"]
+    let task_id = confirmed["data"]["taskId"]
         .as_str()
         .expect("R-8B.2c Task id")
-        .to_owned()
+        .to_owned();
+    R8b2cPreparedWork {
+        task_id,
+        snapshot_id,
+    }
 }
 
 async fn wait_for_r8b2c_task_status(
@@ -2928,6 +2973,25 @@ fn read_r8b2c_task_oracle(root: &Path, task_id: &str) -> R8b2cTaskOracle {
         snapshot,
         event_count: stored.event_count,
     }
+}
+
+fn read_empty_r9a3_verdict_oracle(root: &Path) -> R9a3VerdictAuthorityCounts {
+    let counts = read_r9a3_verdict_authority_counts(
+        &root.join("verdict-authority.db"),
+        &[0x13; 32],
+        "c5-00-verdict-epoch",
+    )
+    .expect("read R-9A Verdict Authority through conformance boundary");
+    assert_eq!(counts.last_event_sequence, 0);
+    assert_eq!(counts.verdict_count, 0);
+    assert_eq!(counts.state_count, 0);
+    assert_eq!(counts.event_count, 0);
+    assert_eq!(counts.idempotency_count, 0);
+    assert_eq!(counts.outbox_count, 0);
+    assert_eq!(counts.consumption_receipt_count, 0);
+    assert_eq!(counts.commit_receipt_count, 0);
+    assert_eq!(counts.projection_outbox_count, 0);
+    counts
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4062,6 +4126,399 @@ async fn r8b_activation_outbox_survives_daemon_kill_and_dispatches_once_after_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without_writes() {
+    const SOURCE_TEXT: &str =
+        "R-9A.3e revoke-first must reject a durable prepared dispatch without side effects.";
+
+    let root = std::env::temp_dir().join(format!("egopulse-r9a3e-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create R-9A.3e fixture root");
+    fs::write(root.join("context.md"), SOURCE_TEXT).expect("write R-9A.3e Context source");
+    let instance = format!("r9a3e-daemon-{}", Uuid::now_v7());
+    let witness_instance = format!("r9a3e-witness-{}", Uuid::now_v7());
+    let parent_pid = std::process::id();
+    let mut witness = spawn_r9a3d_witness_helper(&root, &witness_instance);
+    let ready: R9a3dWitnessReady = wait_for_r9a3_json(
+        &r9a3d_path(&root, R9A3D_READY_FILE),
+        &mut witness,
+        "R-9A.3e witness ready",
+    );
+    assert_eq!(ready.process_id, witness.id());
+    assert_ne!(ready.process_id, parent_pid);
+    assert_eq!(ready.fixture_root, root.display().to_string());
+    assert_eq!(ready.fixture_instance, witness_instance);
+    let send_endpoint: SocketAddr = ready
+        .send_endpoint
+        .parse()
+        .expect("parse R-9A.3e send endpoint");
+    let send_endpoint = send_endpoint.to_string();
+
+    let mut daemon_zero =
+        spawn_fixture_with_mode(&root, &instance, R8B_PAUSE_BEFORE_RUNNER_MODE).await;
+    let daemon_zero_pid = daemon_zero.id().expect("R-9A.3e daemon D0 PID");
+    assert_ne!(daemon_zero_pid, parent_pid);
+    assert_ne!(daemon_zero_pid, ready.process_id);
+    wait_for_cli_status_with_child(&instance, &mut daemon_zero).await;
+    let first_cycle_marker = root.join(R8B_FIRST_RUNNER_CYCLE_RECORD);
+    for _ in 0..120 {
+        if first_cycle_marker.is_file() {
+            break;
+        }
+        assert!(
+            daemon_zero
+                .try_wait()
+                .expect("inspect R-9A.3e D0")
+                .is_none(),
+            "R-9A.3e D0 exited before the initial empty runner cycle"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(first_cycle_marker.is_file());
+
+    let prepare = run_cli(
+        &instance,
+        &[
+            "work",
+            "prepare",
+            "--intent",
+            "prove revoke-first dispatch consumption",
+            "--scope",
+            "scope:r8a",
+            "--work-type",
+            "governed_repository_change",
+            "--context-ref",
+            "context.md",
+            "--idempotency-key",
+            "r9a3e-prepare",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        prepare.status.success(),
+        "R-9A.3e prepare failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&prepare.stdout),
+        String::from_utf8_lossy(&prepare.stderr)
+    );
+    let prepared: serde_json::Value =
+        serde_json::from_slice(&prepare.stdout).expect("decode R-9A.3e prepare response");
+    let snapshot_id = prepared["data"]["snapshotId"]
+        .as_str()
+        .expect("R-9A.3e snapshot id")
+        .to_owned();
+    let compiled_digest = prepared["data"]["compiledContextSha256"]
+        .as_str()
+        .expect("R-9A.3e compiled digest")
+        .to_owned();
+    let confirmation_binding = prepared["data"]["confirmationBindingSha256"]
+        .as_str()
+        .expect("R-9A.3e confirmation binding")
+        .to_owned();
+    assert_eq!(snapshot_id, format!("ctx:{compiled_digest}"));
+    let bundle_path = root
+        .join("input-bundles")
+        .join(format!("ctx-{compiled_digest}.json"));
+    let bundle_bytes = fs::read(&bundle_path).expect("read prepared R-9A.3e input bundle");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bundle_bytes)),
+        compiled_digest
+    );
+    let withheld_bundle_path = root
+        .join("input-bundles")
+        .join(format!(".r9a3e-{compiled_digest}.withheld"));
+    fs::rename(&bundle_path, &withheld_bundle_path)
+        .expect("atomically withhold R-9A.3e input bundle before confirm");
+    assert!(!bundle_path.exists());
+
+    let confirm = run_tui(
+        &instance,
+        &[
+            "--instance",
+            &instance,
+            "work-confirm",
+            &snapshot_id,
+            "--confirmation-binding-sha256",
+            &confirmation_binding,
+            "--idempotency-key",
+            "r9a3e-confirm",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        confirm.status.success(),
+        "R-9A.3e confirm failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&confirm.stdout),
+        String::from_utf8_lossy(&confirm.stderr)
+    );
+    let confirmed: serde_json::Value =
+        serde_json::from_slice(&confirm.stdout).expect("decode R-9A.3e confirm response");
+    let task_id = confirmed["data"]["taskId"]
+        .as_str()
+        .expect("R-9A.3e task id")
+        .to_owned();
+    assert_eq!(
+        confirmed["data"]["status"],
+        TaskStatus::Active.as_str_name()
+    );
+    assert!(!root.join(R8A_DRIVER_RECORD).exists());
+    hard_kill_r8b2c_child(&mut daemon_zero, "R-9A.3e pre-runner pause").await;
+
+    let mut daemon_one = spawn_r9a3d_fixture(
+        &root,
+        &instance,
+        R9A3E_PREAUTH_UNAVAILABLE_MODE,
+        &witness_instance,
+        &send_endpoint,
+    )
+    .await;
+    let daemon_one_pid = daemon_one.id().expect("R-9A.3e daemon D1 PID");
+    assert_ne!(daemon_one_pid, parent_pid);
+    assert_ne!(daemon_one_pid, ready.process_id);
+    assert_ne!(daemon_one_pid, daemon_zero_pid);
+    wait_for_cli_status_with_child(&instance, &mut daemon_one).await;
+    wait_for_r8b2c_checkpoint(
+        &root,
+        &instance,
+        "r8a-dispatch",
+        R9A3E_PREAUTH_UNAVAILABLE_PHASE,
+        &mut daemon_one,
+    )
+    .await;
+    assert!(!bundle_path.exists());
+    assert!(!root.join(R8A_DRIVER_RECORD).exists());
+
+    let adapter_before_revoke = read_r8b2c_adapter_oracle(&root);
+    assert_eq!(adapter_before_revoke.dispatch_count, 1);
+    assert_eq!(adapter_before_revoke.dispatch_state, "prepared");
+    assert_eq!(adapter_before_revoke.delivery_unknown_count, 0);
+    assert_eq!(adapter_before_revoke.observation_count, 0);
+    assert_eq!(adapter_before_revoke.pending_observation_count, 0);
+    assert!(adapter_before_revoke.receipt.is_none());
+    assert!(adapter_before_revoke.receipt_bytes.is_none());
+    let collaboration_before_revoke = read_r8b2c_collaboration_oracle(&root);
+    assert_eq!(collaboration_before_revoke.outbox_state, "pending");
+    assert_eq!(
+        collaboration_before_revoke.attempt.status,
+        AttemptStatus::DispatchPending as i32
+    );
+    let task_before_revoke = read_r8b2c_task_oracle(&root, &task_id);
+    assert_eq!(
+        task_before_revoke.snapshot.status,
+        TaskStatus::Active as i32
+    );
+    assert_eq!(
+        task_before_revoke.snapshot.current_run_id.as_deref(),
+        Some(R8A_ACTIVATION_RUN_ID)
+    );
+    let verdict_before_revoke = read_empty_r9a3_verdict_oracle(&root);
+    let context_before_revoke = read_r9a3_context_authority_store(
+        &root.join("context-authority.db"),
+        &[0x15; 32],
+        "c5-context-epoch",
+        &snapshot_id,
+        "r8a-dispatch",
+    )
+    .expect("read R-9A.3e Context before revoke");
+    assert_eq!(
+        context_before_revoke.snapshot.governance_state,
+        R9a3ContextGovernanceState::Issued
+    );
+    assert_eq!(context_before_revoke.snapshot.state_revision, 1);
+    assert!(context_before_revoke.dispatch_authorization.is_none());
+    assert_eq!(context_before_revoke.counts.authorization_count, 0);
+    let side_effects_before_revoke = R9a3SideEffectReader::open_existing(&root, &witness_instance)
+        .expect("open R-9A.3e external oracle before revoke");
+    assert_eq!(
+        side_effects_before_revoke
+            .effect_count()
+            .expect("effect count"),
+        0
+    );
+    drop(side_effects_before_revoke);
+    assert!(!r9a3d_path(&root, R9A3D_COMMITTED_FILE).exists());
+    assert!(!r9a3d_path(&root, R9A3D_FORBIDDEN_CONNECTION_FILE).exists());
+    assert!(!r9a3d_path(&root, R9A3D_FORBIDDEN_SEND_FILE).exists());
+
+    let preview = run_cli(
+        &instance,
+        &[
+            "context",
+            "revoke",
+            &snapshot_id,
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "dispatch-material-withheld",
+            "--evidence-ref",
+            "evidence:r9a3e:prepared-dispatch",
+            "--confirmation-proof-ref",
+            "proof:r9a3e:founder-confirmation",
+            "--idempotency-key",
+            "r9a3e-revoke",
+            "--preview",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(preview.status.success());
+    let preview_json: serde_json::Value =
+        serde_json::from_slice(&preview.stdout).expect("decode R-9A.3e revoke preview");
+    let revoke_digest = preview_json["data"]["requestDigestSha256"]
+        .as_str()
+        .expect("R-9A.3e revoke digest")
+        .to_owned();
+    let revoke = run_cli(
+        &instance,
+        &[
+            "context",
+            "revoke",
+            &snapshot_id,
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "dispatch-material-withheld",
+            "--evidence-ref",
+            "evidence:r9a3e:prepared-dispatch",
+            "--confirmation-proof-ref",
+            "proof:r9a3e:founder-confirmation",
+            "--idempotency-key",
+            "r9a3e-revoke",
+            "--confirm-digest",
+            &revoke_digest,
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        revoke.status.success(),
+        "R-9A.3e revoke failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&revoke.stdout),
+        String::from_utf8_lossy(&revoke.stderr)
+    );
+    let context_after_revoke = read_r9a3_context_authority_store(
+        &root.join("context-authority.db"),
+        &[0x15; 32],
+        "c5-context-epoch",
+        &snapshot_id,
+        "r8a-dispatch",
+    )
+    .expect("read R-9A.3e Context after revoke");
+    assert_eq!(
+        context_after_revoke.snapshot.governance_state,
+        R9a3ContextGovernanceState::Revoked
+    );
+    assert_eq!(context_after_revoke.snapshot.state_revision, 2);
+    assert_eq!(
+        context_after_revoke
+            .revoke
+            .as_ref()
+            .expect("R-9A.3e revoke fact")
+            .request_digest_sha256,
+        revoke_digest
+    );
+    assert!(context_after_revoke.dispatch_authorization.is_none());
+    assert_eq!(context_after_revoke.counts.authorization_count, 0);
+    assert_eq!(read_r8b2c_adapter_oracle(&root), adapter_before_revoke);
+    assert_eq!(
+        read_r8b2c_collaboration_oracle(&root),
+        collaboration_before_revoke
+    );
+    assert_eq!(read_r8b2c_task_oracle(&root, &task_id), task_before_revoke);
+    assert_eq!(read_empty_r9a3_verdict_oracle(&root), verdict_before_revoke);
+    assert!(!root.join(R8A_DRIVER_RECORD).exists());
+    let side_effects_after_revoke = R9a3SideEffectReader::open_existing(&root, &witness_instance)
+        .expect("open R-9A.3e external oracle after revoke");
+    assert_eq!(
+        side_effects_after_revoke
+            .effect_count()
+            .expect("effect count"),
+        0
+    );
+    drop(side_effects_after_revoke);
+    assert!(!r9a3d_path(&root, R9A3D_COMMITTED_FILE).exists());
+    assert!(!r9a3d_path(&root, R9A3D_FORBIDDEN_CONNECTION_FILE).exists());
+    assert!(!r9a3d_path(&root, R9A3D_FORBIDDEN_SEND_FILE).exists());
+    hard_kill_r8b2c_child(&mut daemon_one, R9A3E_PREAUTH_UNAVAILABLE_PHASE).await;
+
+    fs::rename(&withheld_bundle_path, &bundle_path)
+        .expect("atomically restore exact R-9A.3e input bundle");
+    assert_eq!(
+        fs::read(&bundle_path).expect("read restored bundle"),
+        bundle_bytes
+    );
+    let mut daemon_two = spawn_r9a3d_fixture(
+        &root,
+        &instance,
+        R9A3E_REVOKED_READY_MODE,
+        &witness_instance,
+        &send_endpoint,
+    )
+    .await;
+    let daemon_two_pid = daemon_two.id().expect("R-9A.3e daemon D2 PID");
+    assert_ne!(daemon_two_pid, parent_pid);
+    assert_ne!(daemon_two_pid, ready.process_id);
+    assert_ne!(daemon_two_pid, daemon_zero_pid);
+    assert_ne!(daemon_two_pid, daemon_one_pid);
+    wait_for_cli_status_with_child(&instance, &mut daemon_two).await;
+    wait_for_r8b2c_checkpoint(
+        &root,
+        &instance,
+        "r8a-dispatch",
+        R9A3E_REVOKED_READY_PHASE,
+        &mut daemon_two,
+    )
+    .await;
+
+    assert_eq!(
+        read_r9a3_context_authority_store(
+            &root.join("context-authority.db"),
+            &[0x15; 32],
+            "c5-context-epoch",
+            &snapshot_id,
+            "r8a-dispatch",
+        )
+        .expect("read R-9A.3e Context after D2 Ready rejection"),
+        context_after_revoke
+    );
+    assert_eq!(read_r8b2c_adapter_oracle(&root), adapter_before_revoke);
+    assert_eq!(
+        read_r8b2c_collaboration_oracle(&root),
+        collaboration_before_revoke
+    );
+    let task_after_ready_rejection = read_r8b2c_task_oracle(&root, &task_id);
+    assert_eq!(task_after_ready_rejection, task_before_revoke);
+    assert_ne!(
+        task_after_ready_rejection.snapshot.status,
+        TaskStatus::Completed as i32
+    );
+    assert_eq!(read_empty_r9a3_verdict_oracle(&root), verdict_before_revoke);
+    assert!(!root.join(R8A_DRIVER_RECORD).exists());
+    let side_effects_after_ready = R9a3SideEffectReader::open_existing(&root, &witness_instance)
+        .expect("open R-9A.3e external oracle after D2 Ready rejection");
+    assert_eq!(
+        side_effects_after_ready
+            .effect_count()
+            .expect("effect count"),
+        0
+    );
+    drop(side_effects_after_ready);
+    assert!(!r9a3d_path(&root, R9A3D_COMMITTED_FILE).exists());
+    assert!(!r9a3d_path(&root, R9A3D_FORBIDDEN_CONNECTION_FILE).exists());
+    assert!(!r9a3d_path(&root, R9A3D_FORBIDDEN_SEND_FILE).exists());
+
+    hard_kill_r8b2c_child(&mut daemon_two, R9A3E_REVOKED_READY_PHASE).await;
+    assert!(
+        witness
+            .try_wait()
+            .expect("inspect R-9A.3e witness before cleanup")
+            .is_none()
+    );
+    let witness_status = witness.hard_kill();
+    assert!(!witness_status.success());
+    fs::remove_dir_all(root).expect("remove R-9A.3e fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
     const SOURCE_TEXT: &str = "R-9A.3d authorized Context survives revoke and crash recovery.";
 
@@ -4416,6 +4873,7 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         task_after_kill.snapshot.status,
         TaskStatus::Completed as i32
     );
+    let verdict_after_kill = read_empty_r9a3_verdict_oracle(root.path());
 
     let mut daemon_two = spawn_r9a3d_fixture(
         root.path(),
@@ -4524,6 +4982,10 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         task_after_recovery.snapshot.status,
         TaskStatus::Completed as i32
     );
+    assert_eq!(
+        read_empty_r9a3_verdict_oracle(root.path()),
+        verdict_after_kill
+    );
 
     let context_after_recovery = read_r9a3_context_authority_store(
         &root.path().join("context-authority.db"),
@@ -4591,6 +5053,10 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
     )
     .expect("read R-9A.3d Context authority after stable recovery cycle");
     assert_eq!(context_after_stable, context_after_recovery);
+    assert_eq!(
+        read_empty_r9a3_verdict_oracle(root.path()),
+        verdict_after_kill
+    );
     assert!(
         !r9a3d_path(root.path(), R9A3D_FORBIDDEN_CONNECTION_FILE).exists(),
         "D2 must not open any second native send connection"
@@ -4629,7 +5095,8 @@ async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll(
     let instance = format!("r8b2c-begin-{}", Uuid::now_v7());
     let mut child = spawn_fixture_with_mode(&root, &instance, R8B2C_BEGIN_DELIVERY_MODE).await;
     wait_for_cli_status_with_child(&instance, &mut child).await;
-    let task_id = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-begin").await;
+    let prepared = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-begin").await;
+    let task_id = prepared.task_id;
 
     wait_for_r8b2c_checkpoint(
         &root,
@@ -4797,7 +5264,9 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     let mut child =
         spawn_fixture_with_mode(&root, &instance, R8B2C_DELIVERED_BEFORE_POLL_MODE).await;
     wait_for_cli_status_with_child(&instance, &mut child).await;
-    let task_id = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-delivered").await;
+    let prepared = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-delivered").await;
+    let task_id = prepared.task_id;
+    let snapshot_id = prepared.snapshot_id;
 
     wait_for_r8b2c_checkpoint(
         &root,
@@ -4821,13 +5290,17 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
         Some(("pending".to_owned(), 0))
     );
 
-    let adapter = read_r8b2c_adapter_oracle(&root);
-    assert_eq!(adapter.dispatch_count, 1);
-    assert_eq!(adapter.delivery_unknown_count, 0);
-    assert_eq!(adapter.observation_count, 0);
-    assert_eq!(adapter.pending_observation_count, 0);
-    assert_eq!(adapter.dispatch_state, "delivered");
-    let receipt_before_kill = adapter
+    let adapter_before_revoke = read_r8b2c_adapter_oracle(&root);
+    assert_eq!(adapter_before_revoke.dispatch_count, 1);
+    assert_eq!(adapter_before_revoke.delivery_unknown_count, 0);
+    assert_eq!(adapter_before_revoke.observation_count, 0);
+    assert_eq!(adapter_before_revoke.pending_observation_count, 0);
+    assert_eq!(adapter_before_revoke.dispatch_state, "delivered");
+    let receipt_bytes_before_revoke = adapter_before_revoke
+        .receipt_bytes
+        .clone()
+        .expect("Delivered receipt bytes must exist before Context revoke");
+    let receipt_before_kill = adapter_before_revoke
         .receipt
         .clone()
         .expect("Delivered receipt must exist before checkpoint");
@@ -4835,14 +5308,91 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
         DeliveryDisposition::try_from(receipt_before_kill.disposition),
         Ok(DeliveryDisposition::Delivered)
     );
-    let collaboration = read_r8b2c_collaboration_oracle(&root);
-    assert_eq!(collaboration.outbox_state, "delivered");
-    assert_eq!(collaboration.run.status, RunStatus::Active as i32);
-    assert_eq!(collaboration.step.status, StepStatus::Active as i32);
+    let collaboration_before_revoke = read_r8b2c_collaboration_oracle(&root);
+    assert_eq!(collaboration_before_revoke.outbox_state, "delivered");
     assert_eq!(
-        collaboration.attempt.status,
+        collaboration_before_revoke.run.status,
+        RunStatus::Active as i32
+    );
+    assert_eq!(
+        collaboration_before_revoke.step.status,
+        StepStatus::Active as i32
+    );
+    assert_eq!(
+        collaboration_before_revoke.attempt.status,
         AttemptStatus::Dispatched as i32
     );
+    let task_before_revoke = read_r8b2c_task_oracle(&root, &task_id);
+    let verdict_before_revoke = read_empty_r9a3_verdict_oracle(&root);
+
+    let preview = run_cli(
+        &instance,
+        &[
+            "context",
+            "revoke",
+            &snapshot_id,
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "delivered-dispatch-revoked",
+            "--evidence-ref",
+            "evidence:r9a:delivered-before-poll",
+            "--confirmation-proof-ref",
+            "proof:r9a:founder-confirmation",
+            "--idempotency-key",
+            "r9a-gate7-delivered-revoke",
+            "--preview",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(preview.status.success());
+    let preview_json: serde_json::Value =
+        serde_json::from_slice(&preview.stdout).expect("decode Gate 7 revoke preview");
+    let revoke_digest = preview_json["data"]["requestDigestSha256"]
+        .as_str()
+        .expect("Gate 7 revoke digest")
+        .to_owned();
+    let revoke = run_cli(
+        &instance,
+        &[
+            "context",
+            "revoke",
+            &snapshot_id,
+            "--expected-state-revision",
+            "1",
+            "--reason-code",
+            "delivered-dispatch-revoked",
+            "--evidence-ref",
+            "evidence:r9a:delivered-before-poll",
+            "--confirmation-proof-ref",
+            "proof:r9a:founder-confirmation",
+            "--idempotency-key",
+            "r9a-gate7-delivered-revoke",
+            "--confirm-digest",
+            &revoke_digest,
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        revoke.status.success(),
+        "Gate 7 revoke failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&revoke.stdout),
+        String::from_utf8_lossy(&revoke.stderr)
+    );
+    let adapter_after_revoke = read_r8b2c_adapter_oracle(&root);
+    assert_eq!(adapter_after_revoke, adapter_before_revoke);
+    assert_eq!(
+        adapter_after_revoke.receipt_bytes.as_deref(),
+        Some(receipt_bytes_before_revoke.as_slice())
+    );
+    assert_eq!(
+        read_r8b2c_collaboration_oracle(&root),
+        collaboration_before_revoke
+    );
+    assert_eq!(read_r8b2c_task_oracle(&root, &task_id), task_before_revoke);
+    assert_eq!(read_empty_r9a3_verdict_oracle(&root), verdict_before_revoke);
 
     hard_kill_r8b2c_child(&mut child, R8B2C_DELIVERED_BEFORE_POLL_PHASE).await;
 
@@ -4927,6 +5477,7 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
         task_before_stable.snapshot.current_run_id,
         Some(R8A_ACTIVATION_RUN_ID.to_string())
     );
+    assert_eq!(read_empty_r9a3_verdict_oracle(&root), verdict_before_revoke);
     let stable_counts = (
         witness.ledger_count("send_dispatch"),
         witness.ledger_count("reconcile"),
@@ -4939,6 +5490,7 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     assert_eq!(adapter_after_stable, adapter);
     assert_eq!(collaboration_after_stable, collaboration);
     assert_eq!(task_after_stable, task_before_stable);
+    assert_eq!(read_empty_r9a3_verdict_oracle(&root), verdict_before_revoke);
     assert_eq!(
         (
             witness.ledger_count("send_dispatch"),

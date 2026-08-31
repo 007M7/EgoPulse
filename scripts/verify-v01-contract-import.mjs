@@ -7,12 +7,12 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
 const contractsRoot = join(repositoryRoot, "contracts");
 const manifestPath = join(contractsRoot, "manifest.json");
-const expectedManifestSha256 = "c1e497f37d4385002bc151299c04a04821173dcc62b48568def4a573fe9d5d19";
-const expectedArtifactCount = 246;
-const expectedFixtureCount = 184;
+const expectedManifestSha256 = "afbcec1a24fb9cdeb5a0a7008d9518ea26c8ede08baf64107cd7cb1763d4dc7a";
+const expectedArtifactCount = 247;
+const expectedFixtureCount = 185;
 const expectedClientKernelProfileSha256 = "c729726c718a6f49c45e74a0f7435aa0974748661461f4be0e1315b838b17fa4";
 const expectedAuthorizationProfileSha256 = "e44e1cee143b35173372b75fa7ce4efb5732be58bb787d59e961450599d612ab";
-const expectedContextRevokeProfileSha256 = "b76c42ca6de53e7140de707f4700def5a8d2e5ca29912930607fd2125a169573";
+const expectedContextRevokeProfileSha256 = "ee77f4894dfd64394f674d37634a29383bf453dc68494f3d75268e85df2590e4";
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -38,11 +38,12 @@ const manifestSha256 = sha256(manifestBytes);
 assert(manifestSha256 === expectedManifestSha256, `manifest digest mismatch: ${manifestSha256}`);
 
 const manifest = JSON.parse(manifestBytes.toString("utf8"));
-assert(manifest.candidateVersion === "0.1.0-draft.18", "unexpected V-01 implementation contract version");
+assert(manifest.candidateVersion === "0.1.0-draft.19", "unexpected V-01 implementation contract version");
 assert(manifest.targetedRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3", "missing Founder authority for targeted revision");
 assert(manifest.approvalReadModelRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a", "missing Founder authority for approval read model revision");
 assert(manifest.g408cSupportProfilesAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3", "missing Founder authority for G4-08C support profiles");
 assert(manifest.contextRevokeLinearizationAuthorityRef === "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze", "missing Founder authority for R-9A Context revoke linearization");
+assert(manifest.contextRevokeSchemeCAuthorityRef === "conversation:2026-08-31:founder-r9a-gate11-scheme-c", "missing Founder authority for R-9A Scheme C validation and historical replay");
 assert(manifest.artifacts.length === expectedArtifactCount, "unexpected V-01 artifact count");
 
 let fixtureCount = 0;

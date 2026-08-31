@@ -182,6 +182,8 @@ pub(super) enum StoreError {
     IdempotencyConflict,
     #[error("context dispatch authorization tuple conflicts")]
     AuthorizationTupleConflict,
+    #[error("context authority input is invalid: {0}")]
+    InvalidArgument(&'static str),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -311,6 +313,17 @@ pub(super) struct ContextStore {
     connection: Connection,
     #[cfg(test)]
     test_write_hook: Option<TestWriteHook>,
+}
+
+#[cfg(test)]
+pub(super) struct LegacyRevokeFixture<'a> {
+    pub(super) principal_id: &'a str,
+    pub(super) idempotency_key: &'a str,
+    pub(super) event_id: &'a str,
+    pub(super) request_digest_sha256: &'a str,
+    pub(super) reason_code: &'a str,
+    pub(super) evidence_refs: &'a [String],
+    pub(super) confirmation_proof_ref: &'a str,
 }
 
 impl ContextStore {
@@ -726,6 +739,16 @@ impl ContextStore {
             return Ok(receipt);
         }
 
+        // The current structured syntax applies only to a new commit. An
+        // exact durable replay above must continue to return its original
+        // receipt even when it predates the syntax tightening.
+        super::validate_new_revoke_semantics(
+            commit.reason_code,
+            commit.evidence_refs,
+            commit.confirmation_proof_ref,
+        )
+        .map_err(StoreError::InvalidArgument)?;
+
         let stored = snapshot_in_transaction(&transaction, commit.snapshot_id)?
             .ok_or(StoreError::NotFound)?;
         if stored.snapshot.owner_principal_id != commit.principal_id {
@@ -1107,6 +1130,57 @@ impl ContextStore {
             )?,
             last_event_sequence,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn rewrite_revoke_semantics_as_legacy_fixture(
+        &mut self,
+        fixture: LegacyRevokeFixture<'_>,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let evidence_refs = serde_json::to_string(fixture.evidence_refs)
+            .map_err(|_| StoreError::DescriptorDecode)?;
+        let receipt_changed = transaction.execute(
+            "UPDATE context_revoke_receipts
+             SET request_digest_sha256=?2,reason_code=?3,evidence_refs=?4,
+                 confirmation_proof_ref=?5
+             WHERE event_id=?1",
+            params![
+                fixture.event_id,
+                fixture.request_digest_sha256,
+                fixture.reason_code,
+                evidence_refs,
+                fixture.confirmation_proof_ref,
+            ],
+        )?;
+        let idempotency_changed = transaction.execute(
+            "UPDATE context_revoke_idempotency SET request_digest_sha256=?3
+             WHERE principal_id=?1 AND idempotency_key=?2 AND event_id=?4",
+            params![
+                fixture.principal_id,
+                fixture.idempotency_key,
+                fixture.request_digest_sha256,
+                fixture.event_id,
+            ],
+        )?;
+        let event_changed = transaction.execute(
+            "UPDATE context_events SET request_digest_sha256=?4
+             WHERE event_id=?1 AND operation='revoke' AND principal_id=?2
+                   AND idempotency_key=?3",
+            params![
+                fixture.event_id,
+                fixture.principal_id,
+                fixture.idempotency_key,
+                fixture.request_digest_sha256,
+            ],
+        )?;
+        if receipt_changed != 1 || idempotency_changed != 1 || event_changed != 1 {
+            return Err(StoreError::IntegrityFailure);
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub(super) fn integrity_is_ok(&self) -> Result<bool, StoreError> {

@@ -9,7 +9,7 @@ pub const CONTEXT_REVOKE_SEMANTIC_CONTRACT_ID: &str = "egopulse.context-revoke-c
 pub const CONTEXT_REVOKE_SEMANTIC_CONTRACT_VERSION: &str = "0.1.0";
 pub const CONTEXT_REVOKE_SEMANTIC_DOMAIN_SEPARATOR: &str = "egopulse/context-revoke/v1";
 pub const CONTEXT_REVOKE_SEMANTIC_PROFILE_DIGEST_SHA256: &str =
-    "b76c42ca6de53e7140de707f4700def5a8d2e5ca29912930607fd2125a169573";
+    "ee77f4894dfd64394f674d37634a29383bf453dc68494f3d75268e85df2590e4";
 
 #[derive(Clone, Copy, Debug)]
 pub struct ContextRevokeSemanticRequest<'a> {

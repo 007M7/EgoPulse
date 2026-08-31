@@ -4,12 +4,12 @@
   "title": "EgoPulse Context Revoke Semantic Confirmation Profile",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "contractId", "contractVersion", "authorityRef", "domainSeparator", "digest", "canonicalEncoding", "semanticFieldOrder", "excludedFields", "confirmation", "fixtureRefs"],
+  "required": ["schemaVersion", "contractId", "contractVersion", "authorityRef", "domainSeparator", "digest", "canonicalEncoding", "semanticFieldOrder", "excludedFields", "confirmation", "newCommitValidation", "historicalReplay", "fixtureRefs"],
   "properties": {
     "schemaVersion": { "const": "egopulse.context-revoke-semantic-profile/v0.1" },
     "contractId": { "const": "egopulse.context-revoke-confirmation.v1" },
     "contractVersion": { "const": "0.1.0" },
-    "authorityRef": { "type": "string", "minLength": 1 },
+    "authorityRef": { "const": "conversation:2026-08-31:founder-r9a-gate11-scheme-c" },
     "domainSeparator": { "const": "egopulse/context-revoke/v1" },
     "digest": {
       "type": "object",
@@ -51,9 +51,66 @@
         "missingOrInvalidRule": { "const": "reject_before_context_authority_zero_calls" }
       }
     },
+    "newCommitValidation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reasonCode", "evidenceRefs", "confirmationProofRef", "normalization", "rawOrEncodedContextProviderContent"],
+      "properties": {
+        "reasonCode": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["syntax", "pattern", "minBytes", "maxBytes"],
+          "properties": {
+            "syntax": { "const": "lowercase_ascii_slug" },
+            "pattern": { "const": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+            "minBytes": { "const": 1 },
+            "maxBytes": { "const": 128 }
+          }
+        },
+        "evidenceRefs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["syntax", "pattern", "minItems", "maxItems", "maxItemBytes", "maxTotalBytes", "preserveRequestOrder"],
+          "properties": {
+            "syntax": { "const": "lowercase_ascii_namespaced_ref" },
+            "pattern": { "const": "^[a-z0-9]+(?:-[a-z0-9]+)*(?::[a-z0-9]+(?:-[a-z0-9]+)*)+$" },
+            "minItems": { "const": 1 },
+            "maxItems": { "const": 16 },
+            "maxItemBytes": { "const": 512 },
+            "maxTotalBytes": { "const": 4096 },
+            "preserveRequestOrder": { "const": true }
+          }
+        },
+        "confirmationProofRef": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["syntax", "pattern", "minBytes", "maxBytes"],
+          "properties": {
+            "syntax": { "const": "lowercase_ascii_namespaced_ref" },
+            "pattern": { "const": "^[a-z0-9]+(?:-[a-z0-9]+)*(?::[a-z0-9]+(?:-[a-z0-9]+)*)+$" },
+            "minBytes": { "const": 1 },
+            "maxBytes": { "const": 512 }
+          }
+        },
+        "normalization": { "const": "reject_not_normalize" },
+        "rawOrEncodedContextProviderContent": { "const": "forbidden" }
+      }
+    },
+    "historicalReplay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["matchFields", "exactMatchResult", "changedSemanticsResult"],
+      "properties": {
+        "matchFields": {
+          "const": ["authenticated_principal_id", "idempotency_key", "full_semantic_request_digest_sha256"]
+        },
+        "exactMatchResult": { "const": "return_original_receipt_with_replayed_true_zero_writes" },
+        "changedSemanticsResult": { "const": "idempotency_conflict_before_new_commit_validation" }
+      }
+    },
     "fixtureRefs": {
       "type": "array",
-      "minItems": 2,
+      "minItems": 3,
       "uniqueItems": true,
       "items": { "type": "string", "minLength": 1 }
     }

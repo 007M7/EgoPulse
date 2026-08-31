@@ -1,8 +1,8 @@
 {
   "schemaVersion": "v01-gate3-contract-candidate-manifest/v0.1",
   "candidateId": "v01-gate3-contracts",
-  "candidateVersion": "0.1.0-draft.18",
-  "status": "targeted_revision_context_revoke_contract_toolchain_reverified_implementation_pending",
+  "candidateVersion": "0.1.0-draft.19",
+  "status": "targeted_revision_r9a_complete_locally_verified",
   "ssotRole": "implementation_contract_ssot",
   "featureId": "v01-governed-single-harness-work-loop",
   "architectureAuthorityRef": "conversation:2026-08-23:founder-v01-feature-adr-a01",
@@ -27,6 +27,7 @@
   "memoryRetrievalAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m07-m10-freeze",
   "workPrepareConfirmAuthorityRef": "conversation:2026-08-28:founder-work-prepare-confirm-candidate",
   "contextRevokeLinearizationAuthorityRef": "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze",
+  "contextRevokeSchemeCAuthorityRef": "conversation:2026-08-31:founder-r9a-gate11-scheme-c",
   "implementationAuthorized": true,
   "handoffRule": {
     "gate": "Gate 4",
@@ -122,13 +123,13 @@
     {
       "id": "R-9A.2",
       "name": "Context Revoke Local API and Shared Semantic Confirmation",
-      "status": "founder_confirmed_contract_toolchain_reverified_implementation_pending",
+      "status": "founder_confirmed_locally_verified",
       "founderDecisionRequired": true
     }
   ],
   "validation": {
     "localCandidateValidator": "scripts/validate-candidate.js",
-    "localCandidateStatus": "passed_183_domain_fixtures_plus_1_foundation_fixture",
+    "localCandidateStatus": "passed_184_domain_fixtures_plus_1_foundation_fixture",
     "bufLint": "passed_buf_1.72.0_draft18_with_two_documented_rpc_naming_exceptions",
     "bufBuild": "passed_draft18_proto_descriptor",
     "bufBreaking": "passed_no_new_wire_breaks_against_draft13_and_exact_founder_authorized_two_field_breaks_against_draft11",
@@ -138,7 +139,8 @@
     "qualityBudgetProfile": "passed_33_d03_rules_exactly_once_with_gate3_design_gate6_verification_binding",
     "clientKernelProfile": "passed_versioned_surface_neutral_rust_shared_kernel_profile_with_context_revoke_confirmation",
     "authorizationCapabilityProfile": "passed_exact_permission_rpc_command_oneof_catalog_with_context_authority_binding",
-    "contextRevokeSemanticProfile": "passed_exact_canonical_bytes_fixed_digest_and_fail_closed_fixture_matrix"
+    "contextRevokeSemanticProfile": "passed_exact_canonical_bytes_fixed_digest_scheme_c_and_historical_replay_fixture_matrix",
+    "r9aAcceptanceGates": "passed_gate7_existing_adapter_receipt_and_task_run_step_attempt_unchanged_after_revoke;gate9_authorization_first_and_revoke_first_restart_paths_use_independent_external_side_effect_witness;gate10_context_paths_do_not_create_or_advance_founder_verdict;gate11_scheme_c_new_commit_validation_and_exact_historical_replay_zero_writes_with_changed_semantics_conflict"
   },
   "artifacts": [
     {
@@ -187,7 +189,7 @@
     },
     {
       "path": "context-revoke-semantic-profile.schema.json",
-      "sha256": "4c306d80898d1c7b0c3a36148aac591a0626877e5fd0d90089d3be3b586a6bc4"
+      "sha256": "6e51a4933f81a35c067386ece05b06e9f5cc1b4b4948be948b2c022a5de595f0"
     },
     {
       "path": "fixture-envelope.schema.json",
@@ -394,6 +396,10 @@
       "sha256": "9dd6db604530eb2d4fb13c09d0f2318a8ce14265ae7d7d8a7d1a5aa39441605d"
     },
     {
+      "path": "fixtures/localapi/v1/context-revoke-scheme-c-boundaries-and-history.json",
+      "sha256": "d9ac9350481b84123a005a51f760ccba8b19de9e89e64beea7f9faa07edb3fe6"
+    },
+    {
       "path": "fixtures/localapi/v1/duplicate-harness-approval-observation-projection.json",
       "sha256": "1cf47dc00a86ca7af3bee1056fc6538fc60f981bac1ce7f0eaa9136a1a87f139"
     },
@@ -547,7 +553,7 @@
     },
     {
       "path": "fixtures/localapi/v1/valid-open-desktop-session.json",
-      "sha256": "36cc05ecd3380a669e7372e5ece398ed01257cd50f38c562697a0c8d6a09a6f4"
+      "sha256": "2eb5c6b2209c87a6fbb39bbf9b7eae49692ee56f3a7674990a21146f4239ee41"
     },
     {
       "path": "fixtures/localapi/v1/valid-task-command-authority-result.json",
@@ -935,11 +941,11 @@
     },
     {
       "path": "IMPLEMENTATION-SSOT.json",
-      "sha256": "1f4a7bfea72d8bb0858331ea4f70b19387e7393808952c8863707354c90bd9ae"
+      "sha256": "06aa6a2777245b72a2f3dc6c9783abc4ba4222326ff99243c02f982572c038de"
     },
     {
       "path": "IMPLEMENTATION-SSOT.md",
-      "sha256": "687d1b5681e2eeeab7649e722a6df4bdcf6f4614725eefbefef4fe46a9371698"
+      "sha256": "31ee6f406a7fa97b02e76e5ac9dae73780e38779f40d4dded8933f7eb077731c"
     },
     {
       "path": "json-schema/foundation-health.schema.json",
@@ -967,7 +973,7 @@
     },
     {
       "path": "profiles/context-revoke/v1/v01-default.json",
-      "sha256": "b76c42ca6de53e7140de707f4700def5a8d2e5ca29912930607fd2125a169573"
+      "sha256": "ee77f4894dfd64394f674d37634a29383bf453dc68494f3d75268e85df2590e4"
     },
     {
       "path": "profiles/quality-budget/v1/v01-default.json",
@@ -1035,7 +1041,7 @@
     },
     {
       "path": "scripts/validate-candidate.js",
-      "sha256": "9c9226bddd5cad6789a599b262750511741afc34ac443f099e0c879726726072"
+      "sha256": "0cdab8a80f1f9dfb939c961230bcb53bbd70599bea4055f3468937f27cdb0376"
     },
     {
       "path": "scripts/verify-faults.ps1",
@@ -1066,12 +1072,12 @@
       "sha256": "cc12b3f9f4248e81c577603fc8a222f165ebfea7dc102d206aab28d7fd9f1ceb"
     },
     {
-      "path": "toolchain/fault-conformance/src/r9a3.rs",
-      "sha256": "c5405236b55f44a33978ad04ac5d41ab20d3ff93680244a74373b4469a481ffa"
+      "path": "toolchain/fault-conformance/src/r9a3_context.rs",
+      "sha256": "f92152a156e1506b2ba4a0eea51d379e57143bc43ace106dd9d245d7ffdc807a"
     },
     {
-      "path": "toolchain/fault-conformance/src/r9a3_context.rs",
-      "sha256": "7903cd703a37f156b82a2ac0bc7911607679ec04fb12f1171cdca3761c8b9b10"
+      "path": "toolchain/fault-conformance/src/r9a3.rs",
+      "sha256": "c5405236b55f44a33978ad04ac5d41ab20d3ff93680244a74373b4469a481ffa"
     },
     {
       "path": "toolchain/fault-conformance/tests/crash_recovery.rs",

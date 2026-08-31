@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const API_CONTRACT_ID: &str = "egopulse.localapi.v1";
-pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.18";
+pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.19";
 pub const API_CONTRACT_DIGEST_SHA256: &str =
     "63cb39b13ca4fdce5b0cca524c8cc6496edf18758bbe5066cd920bdca9848460";
 pub const CLIENT_KERNEL_CONTRACT_ID: &str = "egopulse.client-kernel.v1";

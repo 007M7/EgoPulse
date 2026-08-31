@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const CONTEXT_STORE_PROFILE_ID: &str = "egopulse/context-authority-store/v1";
+const VERDICT_STORE_PROFILE_ID: &str = "egopulse/founder-verdict-authority-store/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum R9a3ContextGovernanceState {
@@ -71,6 +72,95 @@ pub struct R9a3ContextAuthoritySnapshot {
     pub revoke: Option<R9a3ContextRevokeFact>,
     pub dispatch_authorization: Option<R9a3DispatchAuthorizationReceipt>,
     pub counts: R9a3ContextAuthorityCounts,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct R9a3VerdictAuthorityCounts {
+    pub last_event_sequence: u64,
+    pub verdict_count: u64,
+    pub state_count: u64,
+    pub event_count: u64,
+    pub idempotency_count: u64,
+    pub outbox_count: u64,
+    pub consumption_receipt_count: u64,
+    pub commit_receipt_count: u64,
+    pub projection_outbox_count: u64,
+}
+
+pub fn read_r9a3_verdict_authority_counts(
+    path: &Path,
+    key: &[u8; 32],
+    expected_store_epoch: &str,
+) -> FaultConformanceResult<R9a3VerdictAuthorityCounts> {
+    validate_identity("expected_store_epoch", expected_store_epoch)?;
+    let mut connection = open_sqlcipher_store_read_only(path, key, "Verdict Authority")?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let metadata: (i64, String, String, String, i64) = transaction.query_row(
+        "SELECT count(*), min(store_epoch), min(schema_profile_id),
+                min(schema_profile_sha256), min(last_event_sequence)
+         FROM verdict_store_metadata WHERE singleton = 1",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    if metadata.0 != 1
+        || metadata.1 != expected_store_epoch
+        || metadata.2 != VERDICT_STORE_PROFILE_ID
+        || !is_sha256(&metadata.3)
+    {
+        return Err(FaultConformanceError::invariant(
+            "Verdict Authority store metadata is invalid",
+        ));
+    }
+    let raw: (i64, i64, i64, i64, i64, i64, i64, i64) = transaction.query_row(
+        "SELECT
+           (SELECT count(*) FROM founder_verdicts),
+           (SELECT count(*) FROM founder_verdict_states),
+           (SELECT count(*) FROM verdict_events),
+           (SELECT count(*) FROM verdict_idempotency_results),
+           (SELECT count(*) FROM verdict_outbox),
+           (SELECT count(*) FROM verdict_consumption_receipts),
+           (SELECT count(*) FROM verdict_commit_receipts),
+           (SELECT count(*) FROM verdict_projection_outbox)",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
+    )?;
+    let counts = R9a3VerdictAuthorityCounts {
+        last_event_sequence: non_negative(metadata.4, "last verdict event sequence")?,
+        verdict_count: non_negative(raw.0, "verdict count")?,
+        state_count: non_negative(raw.1, "verdict state count")?,
+        event_count: non_negative(raw.2, "verdict event count")?,
+        idempotency_count: non_negative(raw.3, "verdict idempotency count")?,
+        outbox_count: non_negative(raw.4, "verdict outbox count")?,
+        consumption_receipt_count: non_negative(raw.5, "verdict consumption count")?,
+        commit_receipt_count: non_negative(raw.6, "verdict commit count")?,
+        projection_outbox_count: non_negative(raw.7, "verdict projection outbox count")?,
+    };
+    if counts.last_event_sequence != counts.event_count {
+        return Err(FaultConformanceError::invariant(
+            "Verdict Authority event sequence is inconsistent",
+        ));
+    }
+    transaction.commit()?;
+    Ok(counts)
 }
 
 type RawSnapshot = (i64, Vec<u8>, String, String, i64, i64, i64);
@@ -207,6 +297,14 @@ pub fn read_r9a3_context_authority_store(
 }
 
 fn open_context_store_read_only(path: &Path, key: &[u8; 32]) -> FaultConformanceResult<Connection> {
+    open_sqlcipher_store_read_only(path, key, "Context Authority")
+}
+
+fn open_sqlcipher_store_read_only(
+    path: &Path,
+    key: &[u8; 32],
+    authority: &str,
+) -> FaultConformanceResult<Connection> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -216,16 +314,16 @@ fn open_context_store_read_only(path: &Path, key: &[u8; 32]) -> FaultConformance
     let cipher_version: String =
         connection.query_row("PRAGMA cipher_version", [], |row| row.get(0))?;
     if cipher_version.trim().is_empty() {
-        return Err(FaultConformanceError::invariant(
-            "Context Authority conformance reader did not report SQLCipher",
-        ));
+        return Err(FaultConformanceError::invariant(format!(
+            "{authority} conformance reader did not report SQLCipher"
+        )));
     }
     connection.pragma_update(None, "query_only", "ON")?;
     let query_only: i64 = connection.query_row("PRAGMA query_only", [], |row| row.get(0))?;
     if query_only != 1 {
-        return Err(FaultConformanceError::invariant(
-            "Context Authority conformance reader did not enter query-only mode",
-        ));
+        return Err(FaultConformanceError::invariant(format!(
+            "{authority} conformance reader did not enter query-only mode"
+        )));
     }
     Ok(connection)
 }

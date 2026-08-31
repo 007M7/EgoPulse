@@ -1,7 +1,6 @@
 # R-9A Context revoke and dispatch-consumption linearization
 
-- Status: Founder-frozen architecture contract; R-9A.1 through R-9A.2c locally
-  verified, R-9A.3 implementation pending
+- Status: R-9A complete; Founder-frozen contract and Gates 1 through 12 locally verified
 - Date: 2026-08-31
 - Decision owner: Founder
 - Runtime fact owner: Context Authority
@@ -189,8 +188,9 @@ lease/fence and Adapter delivery facts instead.
     observation never complete a Task. Task status remains Task Authority
     owned.
 13. Capability-profile status and revocation remain outside R-9A.
-14. Revoke reason, evidence and confirmation proof values are bounded opaque
-    governance references, not content payloads. They remain in the local
+14. New revoke commits use a lowercase ASCII reason slug and lowercase ASCII
+    namespaced evidence/proof references under Scheme C, not content payloads.
+    They remain in the local
     Context Authority audit store for the same lifecycle as their event and
     are never echoed as raw references by Local API.
 15. CLI, TUI and gateway use one shared Rust semantic request-digest oracle.
@@ -209,18 +209,25 @@ R-9A.2 revision.
 | command metadata | Command ID, idempotency key, canonical request digest, correlation ID and optional causation ID. Authenticated principal ID/kind and Authority reference are server-derived. |
 | `snapshot_id` | Canonical `ctx:<sha256>` only. |
 | `expected_state_revision` | Non-zero CAS value for the current governance state. |
-| `reason_code` | One opaque stable governance identifier, 1 to 128 UTF-8 bytes. |
-| `evidence_refs` | One to 16 opaque references, each 1 to 512 UTF-8 bytes and no more than 4,096 UTF-8 bytes in aggregate. |
-| `confirmation_proof_ref` | One opaque proof reference, 1 to 512 UTF-8 bytes, binding the Founder owner to this exact revoke request. |
+| `reason_code` | One lowercase ASCII slug matching `^[a-z0-9]+(?:-[a-z0-9]+)*$`, 1 to 128 bytes. |
+| `evidence_refs` | One to 16 lowercase ASCII namespaced references matching `^[a-z0-9]+(?:-[a-z0-9]+)*(?::[a-z0-9]+(?:-[a-z0-9]+)*)+$`, each 1 to 512 bytes and no more than 4,096 bytes in aggregate. |
+| `confirmation_proof_ref` | One lowercase ASCII namespaced reference matching the same reference expression, 1 to 512 bytes, binding the Founder owner to this exact revoke request. |
 
-Every reason/evidence/proof value must equal its own trimmed form and contain
-no Unicode control character. The Authority rejects rather than normalizes a
-value that violates these rules. These fields carry identifiers only; raw or
+Every new-commit reason/evidence/proof value must satisfy Scheme C exactly.
+The Authority rejects rather than normalizes a value that violates these
+rules. These fields carry identifiers only; raw or
 encoded Context bytes, Provider output, prompts, credentials and native
 evidence payloads are forbidden. They are stored transactionally in the local
 Context Authority audit database and retained whenever the corresponding
 Authority event is retained. They are not copied to a new service, general
 log, telemetry sink or public projection.
+
+Historical records created before Scheme C remain replayable only when the
+authenticated principal, idempotency key and full semantic request digest all
+match the durable record. Exact replay returns the original receipt with
+`replayed=true` and zero writes. Changed semantics under the same key return
+idempotency conflict before new-commit Scheme C validation, also with zero
+writes. Historical compatibility never normalizes or rewrites stored facts.
 
 The result contains `replayed`, snapshot ID, unchanged snapshot revision and
 content digest, previous/resulting governance state, previous/resulting
@@ -372,9 +379,8 @@ Verification evidence at this checkpoint:
 - SQL transaction and architecture-contract reviews report GO with no open
   R-9A.1 P0/P1 finding.
 
-This checkpoint does not mark R-9A complete. The overall document status stays
-implementation pending until R-9A.2c, R-9A.3 and all applicable Acceptance
-Gates are closed with durable evidence.
+This was the R-9A.1 checkpoint only. Complete R-9A closure is recorded after
+the later R-9A.2 and R-9A.3 checkpoints below.
 
 R-9A.2a is also implemented as the contract-first checkpoint. Draft.18 adds the
 typed `ExecuteContextMutation`/`revoke_context_snapshot` operation,
@@ -482,6 +488,26 @@ R-9A.2c verification evidence:
 - this evidence proves user-surface confirmation and durable Context revoke,
   not dispatch linearization, restart recovery or Adapter side-effect safety.
 
+### R-9A Gate 1-12 closure checkpoint
+
+R-9A.3 is implemented and all twelve gates below are locally verified. Gates
+1-6 retain the immutable migration, Founder ownership, deterministic dual
+connection linearization, tuple integrity and shared CLI/TUI digest evidence.
+Gate 7 proves a successful prospective revoke leaves the complete existing
+Adapter receipt bytes and Task/Run/Step/Attempt facts unchanged. Gate 8 proves
+historical recovery uses immutable material without authorization or resend.
+Gate 9 covers both authorization-first and revoke-first daemon restart orders
+with a durable independent external-side-effect witness rather than process
+memory or Recording driver logs. Gate 10 proves those paths create or advance
+no Founder Verdict. Gate 11 freezes Scheme C for new commits and exact
+principal/key/full-digest historical replay with zero writes; changed
+semantics conflict before new validation. Gate 12 proves production recovery
+and reconciliation cannot become a send path.
+
+This closure changes no Proto field, tag or RPC, no Context Authority SQL
+schema or migration, and no semantic digest algorithm, canonical field order
+or fixed vector. It does not claim any R-9B/R-9C capability.
+
 ## Acceptance Gates
 
 1. **Immutable migration:** existing snapshots acquire a valid initial
@@ -525,9 +551,11 @@ R-9A.2c verification evidence:
     Founder verdict.
 11. **Bounded private audit input:** boundary tests cover empty, over-limit,
     padded and control-character reason/evidence/proof values and reject raw
-    Context/Provider payloads. Store evidence proves valid opaque references
-    share the event lifecycle; Local API, projection, logs and telemetry expose
-    none of the raw references.
+    or encoded Context/Provider payloads. New commits require the exact Scheme
+    C lowercase slug/namespaced-reference syntax. Exact historical replay is
+    bound to principal, key and full digest with zero writes; changed semantics
+    conflict before new validation. Local API, projection, logs and telemetry
+    expose none of the raw references.
 12. **Recovery staging:** R-9A.1 exposes only the typed Authority read entry and
     has no production caller. R-9A.3 separately proves production wiring can
     reconcile an existing dispatch while the native dispatch-send counter and
@@ -559,10 +587,12 @@ R-9A.2c verification evidence:
    checks expiry when authorization commits. After commit, later expiry or
    revoke cannot overturn that exact grant; existing Attempt lease/fencing and
    Adapter at-most-once delivery remain mandatory.
-3. Reason, evidence and proof inputs use the bounded opaque-reference rules in
-   this document. The Context Authority local audit database retains them for
-   the corresponding event lifecycle. Local API, projections and general
-   telemetry never echo the raw references, and R-9A adds no external system.
+3. New reason, evidence and proof inputs use the bounded Scheme C rules in this
+   document. The Context Authority local audit database retains them for the
+   corresponding event lifecycle. Exact historical replay remains bound to
+   principal, idempotency key and full digest without rewriting the record.
+   Local API, projections and general telemetry never echo the raw references,
+   and R-9A adds no external system.
 4. CLI and TUI confirm one shared semantic request digest: interactive CLI or
    non-interactive complete digest, TUI modal, and mandatory gateway full-digest
    verification before the Authority call. Wording is not frozen.
