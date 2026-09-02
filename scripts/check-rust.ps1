@@ -41,6 +41,12 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $cargo build -p egopulse-tui --bin egopulse-tui --locked
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+& $cargo build -p egopulse-agentosd --bin agentosd --locked
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+& (Join-Path $PSScriptRoot 'test-install-egopulse.ps1')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 & $cargo test --workspace --exclude egopulse-agentosd --locked
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

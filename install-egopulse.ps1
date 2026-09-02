@@ -1,6 +1,7 @@
 param(
     [string]$PackageRoot = (Split-Path -Parent $MyInvocation.MyCommand.Path),
     [string]$DataRoot = (Join-Path $env:LOCALAPPDATA 'EgoPulse'),
+    [string]$IpcInstance = 'default',
     [switch]$Force,
     [switch]$SkipMemoryWorker,
     [switch]$Launch,
@@ -9,6 +10,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if ([string]::IsNullOrWhiteSpace($IpcInstance) -or $IpcInstance -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z') {
+    throw 'IpcInstance must be a 1..64 character ASCII token beginning with an alphanumeric character and containing only alphanumeric, dot, underscore, or hyphen characters.'
+}
 
 function New-RandomHex {
     param([int]$ByteCount = 32)
@@ -80,11 +85,6 @@ foreach ($binary in @('agentosd.exe', 'egopulse.exe', 'egopulse-tui.exe')) {
     }
 }
 
-$uv = Get-Command uv -ErrorAction SilentlyContinue
-if (-not $uv) {
-    throw 'uv is required. Install uv from https://docs.astral.sh/uv/ and rerun install-egopulse.ps1.'
-}
-
 $data = (New-Item -ItemType Directory -Force -Path $DataRoot).FullName
 $configPath = Join-Path $data 'agentos-config.json'
 $templatePath = Join-Path $root 'config/agentos-config.example.json'
@@ -149,16 +149,24 @@ $authorityKeys = @(
     'EGOPULSE_TOKEN_MAC_KEY_HEX'
 )
 foreach ($keyName in $authorityKeys) {
-    $existing = [Environment]::GetEnvironmentVariable($keyName, 'User')
-    if ([string]::IsNullOrWhiteSpace($existing)) {
-        Set-UserEnvironment -Name $keyName -Value (New-RandomHex)
+    if ($NoPersistEnvironment) {
+        $existing = [Environment]::GetEnvironmentVariable($keyName, 'Process')
+        if ([string]::IsNullOrWhiteSpace($existing)) {
+            Set-Item -Path "Env:$keyName" -Value (New-RandomHex)
+        }
     }
     else {
-        Set-Item -Path "Env:$keyName" -Value $existing
+        $existing = [Environment]::GetEnvironmentVariable($keyName, 'User')
+        if ([string]::IsNullOrWhiteSpace($existing)) {
+            Set-UserEnvironment -Name $keyName -Value (New-RandomHex)
+        }
+        else {
+            Set-Item -Path "Env:$keyName" -Value $existing
+        }
     }
 }
 Set-UserEnvironment -Name 'EGOPULSE_USER_CONFIG' -Value $configPath
-Set-UserEnvironment -Name 'EGOPULSE_IPC_INSTANCE' -Value 'default'
+Set-UserEnvironment -Name 'EGOPULSE_IPC_INSTANCE' -Value $IpcInstance
 $runtimeConfig = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $taskEpoch = [string]$runtimeConfig.stores.task.store_epoch
 if ([string]::IsNullOrWhiteSpace($taskEpoch)) {
@@ -169,6 +177,10 @@ Set-UserEnvironment -Name 'EGOPULSE_READ_MODEL_DB' -Value (Join-Path $data 'read
 Set-UserEnvironment -Name 'EGOPULSE_READ_MODEL_EPOCH' -Value $readModelEpoch
 
 if (-not $SkipMemoryWorker) {
+    $uv = Get-Command uv -ErrorAction SilentlyContinue
+    if (-not $uv) {
+        throw 'uv is required. Install uv from https://docs.astral.sh/uv/ and rerun install-egopulse.ps1.'
+    }
     & (Join-Path $root 'setup-memory-worker.ps1') -PackageRoot $root
     if ($LASTEXITCODE -ne 0) {
         throw "Memory Worker setup failed with exit code $LASTEXITCODE"
@@ -200,11 +212,19 @@ foreach ($profile in @($providerReport.provider_profiles)) {
 }
 
 if ($Launch) {
-    Start-Process -FilePath $daemon -WorkingDirectory $root
-    Write-Output 'agentosd=launched'
+    $daemonProcess = Start-Process -FilePath $daemon -WorkingDirectory $root -WindowStyle Hidden -PassThru
+    Write-Output "agentosd=launched pid=$($daemonProcess.Id)"
 }
 
+$environmentMode = if ($NoPersistEnvironment) { 'process-only' } else { 'persisted' }
 Write-Output 'egopulse_installation=passed'
 Write-Output "package_root=$root"
 Write-Output "data_root=$data"
-Write-Output 'next=Open a new PowerShell window, then run egopulse.exe status or egopulse-tui.exe'
+Write-Output "environment=$environmentMode"
+Write-Output "ipc_instance=$IpcInstance"
+if ($NoPersistEnvironment) {
+    Write-Output 'next=Process-only values are not persisted beyond the installer process; use -Launch for immediate daemon startup or explicitly provide the environment to a later process.'
+}
+else {
+    Write-Output 'next=Open a new PowerShell window, then run egopulse.exe status or egopulse-tui.exe'
+}
