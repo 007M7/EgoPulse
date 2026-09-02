@@ -2,7 +2,7 @@
 
 use std::{future::Future, time::SystemTime};
 
-use egopulse_client_kernel::{ClientKernel, KernelError};
+use egopulse_client_kernel::{ClientKernel, KernelError, SnapshotStreamTracker, StreamApply};
 use egopulse_domain_contracts::{
     context_revoke::ContextRevokeSemanticRequest,
     v01::egopulse::{
@@ -13,7 +13,8 @@ use egopulse_domain_contracts::{
             ExecuteContextMutationRequest, ExecuteContextMutationResponse,
             GetProjectionStatusRequest, HarnessApprovalView, ListHarnessApprovalViewsRequest,
             ListTaskViewsRequest, LocalApiError, PrepareWorkRequest, ProjectionMetadata,
-            RevokeContextSnapshotCommand, TaskView, WorkPreparationPreview, WorkSourceRequest,
+            ProjectionPosition, RevokeContextSnapshotCommand, StreamFrameKind, TaskView,
+            TaskViewStreamFrame, WatchTaskViewsRequest, WorkPreparationPreview, WorkSourceRequest,
             context_mutation_command, execute_context_mutation_response,
         },
         policy::v1::{PolicyDecisionCommand, policy_decision_command},
@@ -31,6 +32,7 @@ use uuid::Uuid;
 const EXECUTE_CONTEXT_MUTATION_RPC: &str = "LocalCommandGatewayService/ExecuteContextMutation";
 const REVOKE_CONTEXT_SNAPSHOT_COMMAND: &str = "revoke_context_snapshot";
 const CONTEXT_REVOKE_IDEMPOTENCY_SCOPE: &str = "context-revoke";
+const WATCH_TASK_VIEWS_RPC: &str = "LocalReadModelService/WatchTaskViews";
 
 /// A local client that has completed the frozen session and contract handshake.
 ///
@@ -58,6 +60,172 @@ pub enum ClientReadError {
     Api(Box<LocalApiError>),
     #[error("local API returned an incomplete response: {0}")]
     Protocol(&'static str),
+}
+
+#[derive(Debug, Error)]
+pub enum ClientTaskWatchError {
+    #[error("client kernel rejected the Task watch: {0}")]
+    Kernel(#[from] KernelError),
+    #[error("Task watch resume epoch and sequence must be supplied together")]
+    InvalidResumePair,
+    #[error("local API Task watch transport failed: {0}")]
+    Transport(String),
+    #[error("Task watch reached a reset barrier and requires projection refetch")]
+    ResetBarrier,
+    #[error("Task watch ended after {received} frames before the requested {expected}")]
+    PrematureEof { expected: u32, received: u32 },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TaskWatchRequest {
+    pub resume_epoch: Option<String>,
+    pub resume_sequence: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskWatchClassification {
+    Applied,
+    Replay,
+    Heartbeat,
+    ResetRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskWatchFrameKind {
+    Snapshot,
+    Heartbeat,
+    ResetRequired,
+}
+
+impl TaskWatchFrameKind {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::Snapshot => "STREAM_FRAME_KIND_SNAPSHOT",
+            Self::Heartbeat => "STREAM_FRAME_KIND_HEARTBEAT",
+            Self::ResetRequired => "STREAM_FRAME_KIND_RESET_REQUIRED",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskWatchUpdate {
+    pub classification: TaskWatchClassification,
+    pub kind: TaskWatchFrameKind,
+    pub position: ProjectionPosition,
+    pub view: Option<TaskView>,
+    pub reset_reason_code: Option<String>,
+}
+
+#[derive(Default)]
+struct TaskWatchProcessor {
+    tracker: SnapshotStreamTracker,
+    reset_barrier: bool,
+}
+
+impl TaskWatchProcessor {
+    fn process(
+        &mut self,
+        frame: TaskViewStreamFrame,
+    ) -> Result<TaskWatchUpdate, ClientTaskWatchError> {
+        if self.reset_barrier {
+            return Err(ClientTaskWatchError::ResetBarrier);
+        }
+        let frame_kind = StreamFrameKind::try_from(frame.kind)
+            .map_err(|_| ClientTaskWatchError::Kernel(KernelError::UnknownStreamFrame))?;
+        match frame_kind {
+            StreamFrameKind::Snapshot | StreamFrameKind::Heartbeat
+                if frame.reset_reason_code.is_some() =>
+            {
+                return Err(ClientTaskWatchError::Kernel(
+                    KernelError::IncompleteStreamFrame,
+                ));
+            }
+            StreamFrameKind::ResetRequired
+                if frame.reset_reason_code.as_deref().is_none_or(|reason| {
+                    reason.is_empty()
+                        || reason.len() > 128
+                        || !reason.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'.' | b'_' | b':' | b'-')
+                        })
+                }) =>
+            {
+                return Err(ClientTaskWatchError::Kernel(
+                    KernelError::IncompleteStreamFrame,
+                ));
+            }
+            _ => {}
+        }
+        let applied = self.tracker.apply_task_frame(&frame)?;
+        let kind = match frame_kind {
+            StreamFrameKind::Snapshot => TaskWatchFrameKind::Snapshot,
+            StreamFrameKind::Heartbeat => TaskWatchFrameKind::Heartbeat,
+            StreamFrameKind::ResetRequired => TaskWatchFrameKind::ResetRequired,
+            StreamFrameKind::Unspecified => {
+                return Err(ClientTaskWatchError::Kernel(
+                    KernelError::UnknownStreamFrame,
+                ));
+            }
+        };
+        let classification = match applied {
+            StreamApply::Applied => TaskWatchClassification::Applied,
+            StreamApply::Replay => TaskWatchClassification::Replay,
+            StreamApply::Heartbeat => TaskWatchClassification::Heartbeat,
+            StreamApply::ResetRequired => {
+                self.reset_barrier = true;
+                TaskWatchClassification::ResetRequired
+            }
+        };
+        let position = frame.position.ok_or(ClientTaskWatchError::Kernel(
+            KernelError::StreamPositionInvalid,
+        ))?;
+        Ok(TaskWatchUpdate {
+            classification,
+            kind,
+            position,
+            view: frame.snapshot,
+            reset_reason_code: frame.reset_reason_code,
+        })
+    }
+}
+
+/// An attached Task projection watch. The tonic stream and stream tracker are
+/// private to the shared operation so CLI/TUI surfaces cannot bypass replay or
+/// reset-barrier validation.
+pub struct TaskWatch {
+    stream: tonic::Streaming<TaskViewStreamFrame>,
+    processor: TaskWatchProcessor,
+}
+
+impl TaskWatch {
+    pub async fn next_update(&mut self) -> Result<Option<TaskWatchUpdate>, ClientTaskWatchError> {
+        let Self { stream, processor } = self;
+        next_task_watch_update_via(processor, || async {
+            stream.message().await.map_err(|error| error.to_string())
+        })
+        .await
+    }
+}
+
+async fn next_task_watch_update_via<F, Fut>(
+    processor: &mut TaskWatchProcessor,
+    next_message: F,
+) -> Result<Option<TaskWatchUpdate>, ClientTaskWatchError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Option<TaskViewStreamFrame>, String>>,
+{
+    if processor.reset_barrier {
+        return Err(ClientTaskWatchError::ResetBarrier);
+    }
+    let Some(frame) = next_message()
+        .await
+        .map_err(ClientTaskWatchError::Transport)?
+    else {
+        return Ok(None);
+    };
+    processor.process(frame).map(Some)
 }
 
 #[derive(Debug, Error)]
@@ -174,6 +342,30 @@ impl ClientAttachment {
             .profiles()
             .authorize_command(rpc, oneof, &session.granted_permission_codes)
             .map(|_| ())
+    }
+
+    pub async fn open_task_watch(
+        &self,
+        request: TaskWatchRequest,
+    ) -> Result<TaskWatch, ClientTaskWatchError> {
+        let mut client = self.connection.read_model_service();
+        let stream = open_task_watch_via(
+            &self.kernel,
+            request,
+            SystemTime::now(),
+            move |wire_request| async move {
+                client
+                    .watch_task_views(wire_request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await?;
+        Ok(TaskWatch {
+            stream,
+            processor: TaskWatchProcessor::default(),
+        })
     }
 
     /// Prepares the single confirmation digest shared by CLI and TUI without
@@ -335,6 +527,47 @@ impl ClientAttachment {
             None => Err(ClientWorkError::Protocol("confirm outcome missing")),
         }
     }
+}
+
+fn task_watch_resume_after(
+    request: TaskWatchRequest,
+) -> Result<Option<ProjectionPosition>, ClientTaskWatchError> {
+    if request.resume_epoch.is_some() != request.resume_sequence.is_some() {
+        return Err(ClientTaskWatchError::InvalidResumePair);
+    }
+    Ok(request.resume_epoch.map(|epoch| ProjectionPosition {
+        epoch,
+        sequence: request
+            .resume_sequence
+            .expect("validated Task watch resume sequence"),
+        projected_at: None,
+    }))
+}
+
+async fn open_task_watch_via<T, F, Fut>(
+    kernel: &ClientKernel,
+    request: TaskWatchRequest,
+    now: SystemTime,
+    dispatch: F,
+) -> Result<T, ClientTaskWatchError>
+where
+    F: FnOnce(WatchTaskViewsRequest) -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel
+        .profiles()
+        .authorize_rpc(WATCH_TASK_VIEWS_RPC, &session.granted_permission_codes)?;
+    let resume_after = task_watch_resume_after(request)?;
+    let client = kernel.request_metadata(Uuid::now_v7().to_string(), None, now)?;
+    dispatch(WatchTaskViewsRequest {
+        client: Some(client),
+        resume_after,
+        task_ids: Vec::new(),
+        status_filter: Vec::new(),
+    })
+    .await
+    .map_err(ClientTaskWatchError::Transport)
 }
 
 fn prepare_context_revoke_with_kernel(
@@ -679,7 +912,11 @@ mod tests {
         api_contract_ref, authorization_contract_ref, client_kernel_contract_ref,
     };
     use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
-        LocalApiErrorCode, OpenSessionResponse, ProjectionPosition,
+        LocalApiErrorCode, OpenSessionResponse, ProjectionPosition, SourceDomain, SourceRevision,
+        StreamFrameKind,
+    };
+    use egopulse_domain_contracts::v01::egopulse::{
+        common::v1::ContractReference, localapi::v1::ProjectionMetadata, task::v1::TaskSnapshot,
     };
 
     use super::*;
@@ -816,6 +1053,425 @@ mod tests {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("test future unexpectedly pending"),
         }
+    }
+
+    fn watch_position(epoch: &str, sequence: u64) -> ProjectionPosition {
+        ProjectionPosition {
+            epoch: epoch.to_owned(),
+            sequence,
+            projected_at: Some(Timestamp {
+                seconds: sequence as i64,
+                nanos: 0,
+            }),
+        }
+    }
+
+    fn watch_view(position: &ProjectionPosition, task_id: &str, revision: u64) -> TaskView {
+        TaskView {
+            metadata: Some(ProjectionMetadata {
+                schema_ref: Some(ContractReference {
+                    contract_id: "egopulse.localapi.v1/TaskView".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    sha256: "a".repeat(64),
+                }),
+                position: Some(position.clone()),
+                source_revisions: vec![SourceRevision {
+                    domain: SourceDomain::Task as i32,
+                    aggregate_id: task_id.to_owned(),
+                    revision,
+                    last_event_id: format!("event:{task_id}:{revision}"),
+                }],
+                health: 1,
+                stale: false,
+                safe_health_reason_code: None,
+            }),
+            task: Some(TaskSnapshot {
+                task_id: task_id.to_owned(),
+                revision,
+                ..TaskSnapshot::default()
+            }),
+            ..TaskView::default()
+        }
+    }
+
+    fn watch_frame(
+        kind: StreamFrameKind,
+        position: ProjectionPosition,
+        view: Option<TaskView>,
+        reset_reason_code: Option<&str>,
+    ) -> TaskViewStreamFrame {
+        TaskViewStreamFrame {
+            kind: kind as i32,
+            position: Some(position),
+            snapshot: view,
+            reset_reason_code: reset_reason_code.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn task_watch_processor_classifies_replay_and_enforces_reset_barrier() {
+        let mut processor = TaskWatchProcessor::default();
+        let position = watch_position("epoch:watch", 7);
+        let first = watch_frame(
+            StreamFrameKind::Snapshot,
+            position.clone(),
+            Some(watch_view(&position, "task:one", 1)),
+            None,
+        );
+        assert_eq!(
+            processor.process(first.clone()).unwrap().classification,
+            TaskWatchClassification::Applied
+        );
+        assert_eq!(
+            processor.process(first).unwrap().classification,
+            TaskWatchClassification::Replay
+        );
+        let second = watch_frame(
+            StreamFrameKind::Snapshot,
+            position.clone(),
+            Some(watch_view(&position, "task:two", 1)),
+            None,
+        );
+        assert_eq!(
+            processor.process(second).unwrap().classification,
+            TaskWatchClassification::Applied
+        );
+        assert_eq!(
+            processor
+                .process(watch_frame(
+                    StreamFrameKind::Heartbeat,
+                    position.clone(),
+                    None,
+                    None,
+                ))
+                .unwrap()
+                .classification,
+            TaskWatchClassification::Heartbeat
+        );
+        let reset_position = watch_position("epoch:watch", 8);
+        let reset = processor
+            .process(watch_frame(
+                StreamFrameKind::ResetRequired,
+                reset_position,
+                None,
+                Some("projection_compacted"),
+            ))
+            .unwrap();
+        assert_eq!(reset.classification, TaskWatchClassification::ResetRequired);
+        assert_eq!(
+            reset.reset_reason_code.as_deref(),
+            Some("projection_compacted")
+        );
+        assert!(matches!(
+            processor.process(watch_frame(
+                StreamFrameKind::Heartbeat,
+                position,
+                None,
+                None,
+            )),
+            Err(ClientTaskWatchError::ResetBarrier)
+        ));
+    }
+
+    #[test]
+    fn task_watch_next_seam_blocks_message_after_reset_and_types_eof_and_transport() {
+        let calls = Cell::new(0_u64);
+        let mut processor = TaskWatchProcessor::default();
+        let reset = watch_frame(
+            StreamFrameKind::ResetRequired,
+            watch_position("epoch:watch", 30),
+            None,
+            Some("projection_reset"),
+        );
+        let update = block_on_ready(next_task_watch_update_via(&mut processor, || {
+            calls.set(calls.get() + 1);
+            std::future::ready(Ok(Some(reset)))
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            update.classification,
+            TaskWatchClassification::ResetRequired
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(
+            block_on_ready(next_task_watch_update_via(&mut processor, || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(None))
+            })),
+            Err(ClientTaskWatchError::ResetBarrier)
+        ));
+        assert_eq!(calls.get(), 1, "reset barrier polled the underlying stream");
+
+        let mut processor = TaskWatchProcessor::default();
+        assert!(
+            block_on_ready(next_task_watch_update_via(&mut processor, || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(None))
+            }))
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(calls.get(), 2);
+
+        let mut processor = TaskWatchProcessor::default();
+        assert!(matches!(
+            block_on_ready(next_task_watch_update_via(&mut processor, || {
+                calls.set(calls.get() + 1);
+                std::future::ready(Err("tonic-status-unavailable".to_owned()))
+            })),
+            Err(ClientTaskWatchError::Transport(detail))
+                if detail == "tonic-status-unavailable"
+        ));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn task_watch_processor_rejects_invalid_shapes_and_tracker_drift() {
+        let position = watch_position("epoch:watch", 10);
+        let view = watch_view(&position, "task:one", 1);
+        for invalid in [
+            watch_frame(
+                StreamFrameKind::Snapshot,
+                position.clone(),
+                Some(view.clone()),
+                Some("unexpected"),
+            ),
+            watch_frame(
+                StreamFrameKind::Heartbeat,
+                position.clone(),
+                None,
+                Some("unexpected"),
+            ),
+            watch_frame(StreamFrameKind::ResetRequired, position.clone(), None, None),
+            watch_frame(
+                StreamFrameKind::ResetRequired,
+                position.clone(),
+                None,
+                Some("unsafe reason"),
+            ),
+            watch_frame(
+                StreamFrameKind::ResetRequired,
+                position.clone(),
+                Some(view.clone()),
+                Some("projection_reset"),
+            ),
+        ] {
+            assert!(matches!(
+                TaskWatchProcessor::default().process(invalid),
+                Err(ClientTaskWatchError::Kernel(
+                    KernelError::IncompleteStreamFrame
+                ))
+            ));
+        }
+        for unsafe_reason in [
+            "x".repeat(129),
+            "line\nbreak".to_owned(),
+            "reset-原因".to_owned(),
+        ] {
+            assert!(matches!(
+                TaskWatchProcessor::default().process(watch_frame(
+                    StreamFrameKind::ResetRequired,
+                    position.clone(),
+                    None,
+                    Some(&unsafe_reason),
+                )),
+                Err(ClientTaskWatchError::Kernel(
+                    KernelError::IncompleteStreamFrame
+                ))
+            ));
+        }
+
+        let mut missing_position =
+            watch_frame(StreamFrameKind::Heartbeat, position.clone(), None, None);
+        missing_position.position = None;
+        assert!(matches!(
+            TaskWatchProcessor::default().process(missing_position),
+            Err(ClientTaskWatchError::Kernel(
+                KernelError::StreamPositionInvalid
+            ))
+        ));
+
+        let mut unknown = watch_frame(StreamFrameKind::Heartbeat, position.clone(), None, None);
+        unknown.kind = 999;
+        assert!(matches!(
+            TaskWatchProcessor::default().process(unknown),
+            Err(ClientTaskWatchError::Kernel(
+                KernelError::UnknownStreamFrame
+            ))
+        ));
+
+        let mut processor = TaskWatchProcessor::default();
+        processor
+            .process(watch_frame(
+                StreamFrameKind::Snapshot,
+                position.clone(),
+                Some(view.clone()),
+                None,
+            ))
+            .unwrap();
+        let changed = watch_view(&position, "task:one", 2);
+        assert!(matches!(
+            processor.process(watch_frame(
+                StreamFrameKind::Snapshot,
+                position.clone(),
+                Some(changed),
+                None,
+            )),
+            Err(ClientTaskWatchError::Kernel(
+                KernelError::ConflictingStreamReplay
+            ))
+        ));
+
+        let mut processor = TaskWatchProcessor::default();
+        processor
+            .process(watch_frame(
+                StreamFrameKind::Snapshot,
+                position.clone(),
+                Some(view),
+                None,
+            ))
+            .unwrap();
+        let other_epoch = watch_position("epoch:other", 11);
+        assert!(matches!(
+            processor.process(watch_frame(
+                StreamFrameKind::Heartbeat,
+                other_epoch,
+                None,
+                None,
+            )),
+            Err(ClientTaskWatchError::Kernel(
+                KernelError::StreamResetMissing
+            ))
+        ));
+
+        let mut processor = TaskWatchProcessor::default();
+        processor
+            .process(watch_frame(
+                StreamFrameKind::Heartbeat,
+                watch_position("epoch:watch", 20),
+                None,
+                None,
+            ))
+            .unwrap();
+        assert!(matches!(
+            processor.process(watch_frame(
+                StreamFrameKind::Heartbeat,
+                watch_position("epoch:watch", 19),
+                None,
+                None,
+            )),
+            Err(ClientTaskWatchError::Kernel(KernelError::StreamOutOfOrder))
+        ));
+    }
+
+    #[test]
+    fn task_watch_resume_pair_is_all_or_nothing() {
+        assert_eq!(
+            task_watch_resume_after(TaskWatchRequest::default()).unwrap(),
+            None
+        );
+        assert_eq!(
+            task_watch_resume_after(TaskWatchRequest {
+                resume_epoch: Some("epoch:watch".to_owned()),
+                resume_sequence: Some(12),
+            })
+            .unwrap(),
+            Some(ProjectionPosition {
+                epoch: "epoch:watch".to_owned(),
+                sequence: 12,
+                projected_at: None,
+            })
+        );
+        for request in [
+            TaskWatchRequest {
+                resume_epoch: Some("epoch:watch".to_owned()),
+                resume_sequence: None,
+            },
+            TaskWatchRequest {
+                resume_epoch: None,
+                resume_sequence: Some(12),
+            },
+        ] {
+            assert!(matches!(
+                task_watch_resume_after(request),
+                Err(ClientTaskWatchError::InvalidResumePair)
+            ));
+        }
+    }
+
+    #[test]
+    fn task_watch_open_seam_authorizes_once_and_dispatches_complete_session_request() {
+        use std::cell::RefCell;
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let kernel = authenticated_kernel_for_surface(
+            "founder:watch",
+            "session:watch",
+            "local.task.read",
+            ClientSurface::Tui,
+            now,
+        );
+        let calls = Cell::new(0_u64);
+        let captured = RefCell::new(None);
+        let opened = block_on_ready(open_task_watch_via(
+            &kernel,
+            TaskWatchRequest {
+                resume_epoch: Some("epoch:resume".to_owned()),
+                resume_sequence: Some(44),
+            },
+            now,
+            |request| {
+                calls.set(calls.get() + 1);
+                captured.replace(Some(request));
+                std::future::ready(Ok("opened"))
+            },
+        ))
+        .unwrap();
+        assert_eq!(opened, "opened");
+        assert_eq!(calls.get(), 1);
+        let request = captured.borrow_mut().take().unwrap();
+        let client = request.client.unwrap();
+        assert!(!client.request_id.is_empty());
+        assert_eq!(client.client_instance_id, "client:context-revoke");
+        assert_eq!(client.surface, ClientSurface::Tui as i32);
+        assert_eq!(client.session_id, "session:watch");
+        assert_eq!(client.api_contract_ref, Some(api_contract_ref()));
+        assert!(client.correlation_id.is_none());
+        assert_eq!(
+            request.resume_after,
+            Some(ProjectionPosition {
+                epoch: "epoch:resume".to_owned(),
+                sequence: 44,
+                projected_at: None,
+            })
+        );
+        assert!(request.task_ids.is_empty());
+        assert!(request.status_filter.is_empty());
+
+        let denied = authenticated_kernel_for_surface(
+            "founder:watch",
+            "session:watch-denied",
+            "local.context.revoke",
+            ClientSurface::Cli,
+            now,
+        );
+        let denied_calls = Cell::new(0_u64);
+        assert!(matches!(
+            block_on_ready(open_task_watch_via(
+                &denied,
+                TaskWatchRequest::default(),
+                now,
+                |_request| {
+                    denied_calls.set(denied_calls.get() + 1);
+                    std::future::ready(Ok(()))
+                },
+            )),
+            Err(ClientTaskWatchError::Kernel(
+                KernelError::PermissionDenied(permission)
+            )) if permission == "local.task.read"
+        ));
+        assert_eq!(denied_calls.get(), 0);
     }
 
     #[test]

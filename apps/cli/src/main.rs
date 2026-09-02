@@ -5,7 +5,9 @@
 #![allow(clippy::result_large_err)]
 
 use std::{
+    future::Future,
     io::{self, IsTerminal, Write},
+    pin::Pin,
     process::ExitCode,
     time::Duration,
 };
@@ -13,7 +15,8 @@ use std::{
 use clap::{Parser, Subcommand};
 use egopulse_client_kernel::{KernelError, SnapshotStreamTracker, StreamApply};
 use egopulse_client_operations::{
-    AttachError, ClientAttachment, ClientContextRevokeError, ClientWorkError, ContextRevokeInput,
+    AttachError, ClientAttachment, ClientContextRevokeError, ClientTaskWatchError, ClientWorkError,
+    ContextRevokeInput, TaskWatch, TaskWatchClassification, TaskWatchRequest, TaskWatchUpdate,
     attach as attach_client, command_metadata, set_policy_digest, set_task_digest,
     set_verdict_digest, timestamp_after,
 };
@@ -32,10 +35,10 @@ use egopulse_domain_contracts::v01::egopulse::{
         GetProjectionStatusRequest, GetTaskViewRequest, HarnessApprovalViewStreamFrame,
         ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError, LocalApiErrorCode,
         MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth,
-        ProjectionMetadata, RetrieveMemoryRequest, SourceRevision, TaskView, TaskViewStreamFrame,
-        WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, await_projection_response,
-        get_evidence_graph_response, get_harness_approval_view_response, get_task_view_response,
-        memory_mutation_command, retrieve_memory_response,
+        ProjectionMetadata, RetrieveMemoryRequest, SourceRevision, TaskView,
+        WatchHarnessApprovalViewsRequest, await_projection_response, get_evidence_graph_response,
+        get_harness_approval_view_response, get_task_view_response, memory_mutation_command,
+        retrieve_memory_response,
     },
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, PolicyDecisionErrorCode,
@@ -1877,10 +1880,79 @@ async fn task_watch(
     resume_sequence: Option<u64>,
     json: bool,
 ) -> Result<(), CliFailure> {
+    validate_task_watch_request(frames, &resume_epoch, resume_sequence)?;
+    let attached = attach("task.watch").await?;
+    let watch = attached
+        .0
+        .open_task_watch(TaskWatchRequest {
+            resume_epoch,
+            resume_sequence,
+        })
+        .await
+        .map_err(task_watch_failure)?;
+    consume_task_watch(watch, frames, |update| {
+        render_task_watch_update(update, json);
+    })
+    .await
+}
+
+trait CliTaskWatchSource {
+    fn next_update(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<TaskWatchUpdate>, ClientTaskWatchError>> + '_>>;
+}
+
+impl CliTaskWatchSource for TaskWatch {
+    fn next_update(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<TaskWatchUpdate>, ClientTaskWatchError>> + '_>>
+    {
+        Box::pin(TaskWatch::next_update(self))
+    }
+}
+
+async fn consume_task_watch<S, R>(
+    mut watch: S,
+    frames: u32,
+    mut render: R,
+) -> Result<(), CliFailure>
+where
+    S: CliTaskWatchSource,
+    R: FnMut(&TaskWatchUpdate),
+{
+    validate_task_watch_request(frames, &None, None)?;
+    let mut emitted = 0_u32;
+    while emitted < frames {
+        let Some(update) = watch.next_update().await.map_err(task_watch_failure)? else {
+            return ensure_task_watch_complete(frames, emitted);
+        };
+        if update.classification == TaskWatchClassification::ResetRequired {
+            return Err(CliFailure::stream_recovery(
+                "task.watch",
+                update
+                    .reset_reason_code
+                    .as_deref()
+                    .unwrap_or("stream reset required"),
+            ));
+        }
+        render(&update);
+        emitted += 1;
+    }
+    Ok(())
+}
+
+fn validate_task_watch_request(
+    frames: u32,
+    resume_epoch: &Option<String>,
+    resume_sequence: Option<u64>,
+) -> Result<(), CliFailure> {
     if frames == 0 {
         return Err(
             CliFailure::protocol("frames must be greater than zero").for_operation("task.watch")
         );
+    }
+    if frames > 1000 {
+        return Err(CliFailure::protocol("frames must not exceed 1000").for_operation("task.watch"));
     }
     if resume_epoch.is_some() != resume_sequence.is_some() {
         return Err(CliFailure::protocol(
@@ -1888,98 +1960,79 @@ async fn task_watch(
         )
         .for_operation("task.watch"));
     }
-    let attached = attach("task.watch").await?;
-    attached.require_rpc("LocalReadModelService/WatchTaskViews", "task.watch")?;
-    let resume_after = resume_epoch.map(|epoch| {
-        egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition {
-            epoch,
-            sequence: resume_sequence.expect("validated resume sequence"),
-            projected_at: None,
-        }
-    });
-    let metadata = attached.metadata(None)?;
-    let mut stream = attached
-        .0
-        .connection
-        .read_model_service()
-        .watch_task_views(WatchTaskViewsRequest {
-            client: Some(metadata),
-            resume_after,
-            task_ids: Vec::new(),
-            status_filter: Vec::new(),
-        })
-        .await
-        .map_err(|error| {
-            CliFailure::daemon_unavailable(error.to_string()).for_operation("task.watch")
-        })?
-        .into_inner();
-    let mut tracker = SnapshotStreamTracker::default();
-    let mut emitted = 0_u32;
-    while let Some(frame) = stream.message().await.map_err(|error| {
-        CliFailure::daemon_unavailable(error.to_string()).for_operation("task.watch")
-    })? {
-        let applied = tracker
-            .apply_task_frame(&frame)
-            .map_err(|error| CliFailure::stream_recovery("task.watch", error.to_string()))?;
-        if applied == StreamApply::ResetRequired {
-            return Err(CliFailure::stream_recovery(
-                "task.watch",
-                frame
-                    .reset_reason_code
-                    .as_deref()
-                    .unwrap_or("stream reset required"),
-            ));
-        }
-        let payload = task_stream_frame_json(&frame, applied);
-        if json {
-            println!("{}", serde_json::to_string(&payload).unwrap());
-        } else {
-            println!(
-                "Task watch: kind={} apply={} position={}",
-                payload["data"]["kind"].as_str().unwrap_or("unknown"),
-                payload["data"]["apply"].as_str().unwrap_or("unknown"),
-                payload["projection"]["position"]
-            );
-        }
-        emitted += 1;
-        if emitted >= frames.min(1000) {
-            break;
-        }
-    }
-    if emitted == 0 {
-        return Err(CliFailure::stream_recovery(
-            "task.watch",
-            "stream ended without frames",
-        ));
+    Ok(())
+}
+
+fn ensure_task_watch_complete(requested: u32, received: u32) -> Result<(), CliFailure> {
+    if received < requested {
+        return Err(task_watch_failure(ClientTaskWatchError::PrematureEof {
+            expected: requested,
+            received,
+        }));
     }
     Ok(())
 }
 
-fn task_stream_frame_json(frame: &TaskViewStreamFrame, applied: StreamApply) -> serde_json::Value {
-    let kind = egopulse_domain_contracts::v01::egopulse::localapi::v1::StreamFrameKind::try_from(
-        frame.kind,
-    )
-    .map(|value| value.as_str_name())
-    .unwrap_or("STREAM_FRAME_KIND_UNKNOWN");
-    let apply = match applied {
-        StreamApply::Applied => "applied",
-        StreamApply::Replay => "replay",
-        StreamApply::Heartbeat => "heartbeat",
-        StreamApply::ResetRequired => "reset_required",
+fn task_watch_failure(error: ClientTaskWatchError) -> CliFailure {
+    match error {
+        ClientTaskWatchError::Transport(detail) => {
+            CliFailure::daemon_unavailable(detail).for_operation("task.watch")
+        }
+        ClientTaskWatchError::Kernel(KernelError::PermissionDenied(permission)) => {
+            CliFailure::permission("task.watch", permission)
+        }
+        invalid @ ClientTaskWatchError::InvalidResumePair => {
+            CliFailure::protocol(invalid.to_string()).for_operation("task.watch")
+        }
+        recovery @ (ClientTaskWatchError::Kernel(_)
+        | ClientTaskWatchError::ResetBarrier
+        | ClientTaskWatchError::PrematureEof { .. }) => {
+            CliFailure::stream_recovery("task.watch", recovery.to_string())
+        }
+    }
+}
+
+fn task_watch_update_json(update: &TaskWatchUpdate) -> serde_json::Value {
+    let apply = match update.classification {
+        TaskWatchClassification::Applied => "applied",
+        TaskWatchClassification::Replay => "replay",
+        TaskWatchClassification::Heartbeat => "heartbeat",
+        TaskWatchClassification::ResetRequired => "reset_required",
     };
     json!({
         "schemaVersion": "egopulse.cli-result/v0.1",
         "ok": true,
         "operation": "task.watch",
         "data": {
-            "kind": kind,
+            "kind": update.kind.contract_name(),
             "apply": apply,
-            "view": frame.snapshot.as_ref().map(task_summary),
-            "resetReasonCode": frame.reset_reason_code,
+            "view": update.view.as_ref().map(task_summary),
+            "resetReasonCode": update.reset_reason_code,
         },
-        "projection": projection_position_json(frame.position.as_ref()),
+        "projection": projection_position_json(Some(&update.position)),
         "correlationId": Uuid::now_v7().to_string(),
     })
+}
+
+fn task_watch_update_text(update: &TaskWatchUpdate) -> String {
+    let payload = task_watch_update_json(update);
+    format!(
+        "Task watch: kind={} apply={} position={}",
+        payload["data"]["kind"].as_str().unwrap_or("unknown"),
+        payload["data"]["apply"].as_str().unwrap_or("unknown"),
+        payload["projection"]["position"]
+    )
+}
+
+fn render_task_watch_update(update: &TaskWatchUpdate, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&task_watch_update_json(update)).unwrap()
+        );
+    } else {
+        println!("{}", task_watch_update_text(update));
+    }
 }
 
 async fn evidence(command: EvidenceCommand) -> Result<(), CliFailure> {
@@ -3217,7 +3270,63 @@ fn parse_await_token(input: &str) -> Result<ProjectionAwaitToken, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, collections::VecDeque, rc::Rc};
+
     use super::*;
+
+    struct ScriptedTaskWatchSource {
+        outcomes: VecDeque<Result<Option<TaskWatchUpdate>, ClientTaskWatchError>>,
+        polls: Rc<Cell<u64>>,
+        drops: Rc<Cell<u64>>,
+    }
+
+    impl CliTaskWatchSource for ScriptedTaskWatchSource {
+        fn next_update(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<TaskWatchUpdate>, ClientTaskWatchError>> + '_>>
+        {
+            self.polls.set(self.polls.get() + 1);
+            let outcome = self.outcomes.pop_front().unwrap_or(Ok(None));
+            Box::pin(std::future::ready(outcome))
+        }
+    }
+
+    impl Drop for ScriptedTaskWatchSource {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    fn scripted_watch(
+        outcomes: Vec<Result<Option<TaskWatchUpdate>, ClientTaskWatchError>>,
+    ) -> (ScriptedTaskWatchSource, Rc<Cell<u64>>, Rc<Cell<u64>>) {
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        (
+            ScriptedTaskWatchSource {
+                outcomes: outcomes.into(),
+                polls: Rc::clone(&polls),
+                drops: Rc::clone(&drops),
+            },
+            polls,
+            drops,
+        )
+    }
+
+    fn task_watch_update(classification: TaskWatchClassification) -> TaskWatchUpdate {
+        TaskWatchUpdate {
+            classification,
+            kind: egopulse_client_operations::TaskWatchFrameKind::Heartbeat,
+            position: egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition {
+                epoch: "epoch:watch".to_owned(),
+                sequence: 9,
+                projected_at: None,
+            },
+            view: None,
+            reset_reason_code: (classification == TaskWatchClassification::ResetRequired)
+                .then(|| "projection_reset".to_owned()),
+        }
+    }
 
     #[test]
     fn status_text_and_json_share_the_same_projection_facts() {
@@ -3257,6 +3366,140 @@ mod tests {
                 .unwrap()
                 .contains("private pipe path")
         );
+    }
+
+    #[test]
+    fn task_watch_cli_preserves_bounds_resume_pair_and_premature_eof_failures() {
+        assert!(validate_task_watch_request(1, &None, None).is_ok());
+        for frames in [0, 1001] {
+            let failure = validate_task_watch_request(frames, &None, None).unwrap_err();
+            assert_eq!(failure.operation, "task.watch");
+            assert_eq!(failure.reason_code, "LOCAL_API_PROTOCOL_ERROR");
+        }
+        assert!(validate_task_watch_request(1000, &Some("epoch:one".to_owned()), Some(4)).is_ok());
+        for (epoch, sequence) in [(Some("epoch:one".to_owned()), None), (None, Some(4))] {
+            let failure = validate_task_watch_request(1, &epoch, sequence).unwrap_err();
+            assert_eq!(failure.reason_code, "LOCAL_API_PROTOCOL_ERROR");
+        }
+        assert!(ensure_task_watch_complete(2, 2).is_ok());
+        let failure = ensure_task_watch_complete(2, 1).unwrap_err();
+        assert_eq!(failure.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
+        assert!(failure.message.contains("after 1 frames"));
+        assert!(failure.message.contains("requested 2"));
+    }
+
+    #[test]
+    fn task_watch_cli_keeps_json_schema_and_error_categories_stable() {
+        let update = TaskWatchUpdate {
+            classification: TaskWatchClassification::Replay,
+            kind: egopulse_client_operations::TaskWatchFrameKind::Snapshot,
+            position: egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition {
+                epoch: "epoch:watch".to_owned(),
+                sequence: 9,
+                projected_at: None,
+            },
+            view: Some(TaskView::default()),
+            reset_reason_code: None,
+        };
+        let payload = task_watch_update_json(&update);
+        assert_eq!(payload["schemaVersion"], "egopulse.cli-result/v0.1");
+        assert_eq!(payload["operation"], "task.watch");
+        assert_eq!(payload["data"]["kind"], "STREAM_FRAME_KIND_SNAPSHOT");
+        assert_eq!(payload["data"]["apply"], "replay");
+        assert_eq!(payload["projection"]["position"]["epoch"], "epoch:watch");
+        assert_eq!(payload["projection"]["position"]["sequence"], 9);
+
+        let transport = task_watch_failure(ClientTaskWatchError::Transport("closed".to_owned()));
+        assert_eq!(transport.reason_code, "DAEMON_UNAVAILABLE");
+        let protocol = task_watch_failure(ClientTaskWatchError::Kernel(
+            KernelError::UnknownStreamFrame,
+        ));
+        assert_eq!(protocol.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
+        let reset = task_watch_failure(ClientTaskWatchError::ResetBarrier);
+        assert_eq!(reset.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
+        assert_ne!(transport.message, protocol.message);
+        assert_ne!(protocol.message, reset.message);
+
+        let permission = task_watch_failure(ClientTaskWatchError::Kernel(
+            KernelError::PermissionDenied("local.task.read".to_owned()),
+        ));
+        assert_eq!(permission.reason_code, "PERMISSION_DENIED");
+        assert_eq!(permission.operation, "task.watch");
+
+        let text = task_watch_update_text(&task_watch_update(TaskWatchClassification::Heartbeat));
+        assert_eq!(
+            text,
+            "Task watch: kind=STREAM_FRAME_KIND_HEARTBEAT apply=heartbeat position={\"epoch\":\"epoch:watch\",\"sequence\":9}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_watch_consume_loop_polls_exactly_n_and_drops_source() {
+        let (source, polls, drops) = scripted_watch(vec![
+            Ok(Some(task_watch_update(TaskWatchClassification::Applied))),
+            Ok(Some(task_watch_update(TaskWatchClassification::Replay))),
+            Err(ClientTaskWatchError::Transport(
+                "must-not-poll-third".to_owned(),
+            )),
+        ]);
+        let rendered = Rc::new(Cell::new(0_u64));
+        let rendered_witness = Rc::clone(&rendered);
+        consume_task_watch(source, 2, move |_update| {
+            rendered_witness.set(rendered_witness.get() + 1);
+        })
+        .await
+        .unwrap();
+        assert_eq!(polls.get(), 2);
+        assert_eq!(rendered.get(), 2);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_watch_consume_loop_fails_closed_without_extra_polls() {
+        let (zero_source, zero_polls, zero_drops) = scripted_watch(vec![Ok(Some(
+            task_watch_update(TaskWatchClassification::Applied),
+        ))]);
+        assert!(consume_task_watch(zero_source, 0, |_| {}).await.is_err());
+        assert_eq!(zero_polls.get(), 0);
+        assert_eq!(zero_drops.get(), 1);
+
+        let (partial_source, partial_polls, partial_drops) = scripted_watch(vec![
+            Ok(Some(task_watch_update(TaskWatchClassification::Applied))),
+            Ok(None),
+        ]);
+        let partial = consume_task_watch(partial_source, 2, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(partial.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
+        assert!(partial.message.contains("after 1 frames"));
+        assert_eq!(partial_polls.get(), 2);
+        assert_eq!(partial_drops.get(), 1);
+
+        let (transport_source, transport_polls, transport_drops) = scripted_watch(vec![Err(
+            ClientTaskWatchError::Transport("tonic-status".to_owned()),
+        )]);
+        let transport = consume_task_watch(transport_source, 1, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(transport.reason_code, "DAEMON_UNAVAILABLE");
+        assert_eq!(transport_polls.get(), 1);
+        assert_eq!(transport_drops.get(), 1);
+
+        let (reset_source, reset_polls, reset_drops) = scripted_watch(vec![
+            Ok(Some(task_watch_update(
+                TaskWatchClassification::ResetRequired,
+            ))),
+            Err(ClientTaskWatchError::Transport(
+                "must-not-poll-after-reset".to_owned(),
+            )),
+        ]);
+        let reset = consume_task_watch(reset_source, 2, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(reset.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
+        assert!(reset.message.contains("projection_reset"));
+        assert_eq!(reset_polls.get(), 1);
+        assert_eq!(reset_drops.get(), 1);
     }
 
     #[test]
