@@ -102,6 +102,7 @@ use egopulse_policy_decision_authority::{
     PolicyPrincipalKind, PolicyReferenceRejection, PolicySqlCipherKey,
     ResolvedApprovalAuthorization,
 };
+use egopulse_v01_fault_conformance::memory_restart_oracle::MemoryRestartOracle;
 use egopulse_v01_fault_conformance::r8b2c::{
     R8b2cNativeEventRecord, R8b2cWitnessReader, R8b2cWitnessWriter, read_r8b2c_adapter_store,
     read_r8b2c_collaboration_store, read_r8b2c_task_store,
@@ -124,8 +125,9 @@ use egopulse_verification_authority::{
 use prost::Message;
 use sha2::{Digest, Sha256};
 use tokio::{
+    io::AsyncReadExt,
     process::{Child, Command},
-    time::sleep,
+    time::{sleep, timeout},
 };
 use uuid::Uuid;
 
@@ -2507,6 +2509,104 @@ async fn run_tui(instance: &str, arguments: &[&str]) -> std::process::Output {
         .expect("run real egopulse TUI command")
 }
 
+async fn run_bounded_fixture_command(
+    executable: PathBuf,
+    instance: &str,
+    arguments: &[&str],
+    label: &str,
+) -> std::process::Output {
+    let mut command = Command::new(executable);
+    command
+        .env("EGOPULSE_IPC_INSTANCE", instance)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {label}: {error}"));
+    let mut stdout = child
+        .stdout
+        .take()
+        .unwrap_or_else(|| panic!("capture {label} stdout"));
+    let mut stderr = child
+        .stderr
+        .take()
+        .unwrap_or_else(|| panic!("capture {label} stderr"));
+    let stdout_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stderr_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let status = match timeout(R9A3D_IO_TIMEOUT, child.wait()).await {
+        Ok(result) => result.unwrap_or_else(|error| panic!("wait for {label}: {error}")),
+        Err(_) => {
+            child
+                .start_kill()
+                .unwrap_or_else(|error| panic!("kill timed-out {label}: {error}"));
+            let _ = bounded_reap_fixture_child(
+                &mut child,
+                label,
+                Instant::now() + R9A3_WITNESS_REAP_TIMEOUT,
+            )
+            .await;
+            panic!("{label} exceeded hard timeout");
+        }
+    };
+    let stdout = stdout_reader
+        .await
+        .unwrap_or_else(|error| panic!("join {label} stdout reader: {error}"))
+        .unwrap_or_else(|error| panic!("read {label} stdout: {error}"));
+    let stderr = stderr_reader
+        .await
+        .unwrap_or_else(|error| panic!("join {label} stderr reader: {error}"))
+        .unwrap_or_else(|error| panic!("read {label} stderr: {error}"));
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+async fn run_m12_cli(instance: &str, arguments: &[&str]) -> std::process::Output {
+    run_bounded_fixture_command(cli_executable(), instance, arguments, "M-12 CLI subprocess").await
+}
+
+async fn run_m12_tui(instance: &str, arguments: &[&str]) -> std::process::Output {
+    run_bounded_fixture_command(tui_executable(), instance, arguments, "M-12 TUI subprocess").await
+}
+
+async fn wait_for_m12_daemon(instance: &str, child: &mut Child, label: &str) {
+    let deadline = Instant::now() + R9A3D_PHASE_TIMEOUT;
+    loop {
+        let output = run_m12_cli(instance, &["status", "--json"]).await;
+        if output.status.success() {
+            return;
+        }
+        let failure = format!(
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("inspect {label} during startup: {error}"))
+        {
+            panic!("{label} exited before IPC became ready: {status}; {failure}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label} IPC did not become ready before deadline: {failure}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn wait_for_cli_status(instance: &str) -> std::process::Output {
     let mut last_failure = String::new();
     for _ in 0..80 {
@@ -2599,27 +2699,23 @@ async fn hard_kill_r8b2c_child(child: &mut Child, phase: &str) {
 }
 
 async fn run_r9a3d_cli(instance: &str, arguments: &[&str]) -> std::process::Output {
-    let mut command = Command::new(cli_executable());
-    command
-        .env("EGOPULSE_IPC_INSTANCE", instance)
-        .args(arguments)
-        .kill_on_drop(true);
-    tokio::time::timeout(R9A3D_IO_TIMEOUT, command.output())
-        .await
-        .expect("R-9A.3d CLI subprocess exceeded deadline")
-        .expect("run bounded R-9A.3d CLI subprocess")
+    run_bounded_fixture_command(
+        cli_executable(),
+        instance,
+        arguments,
+        "R-9A.3d CLI subprocess",
+    )
+    .await
 }
 
 async fn run_r9a3d_tui(instance: &str, arguments: &[&str]) -> std::process::Output {
-    let mut command = Command::new(tui_executable());
-    command
-        .env("EGOPULSE_IPC_INSTANCE", instance)
-        .args(arguments)
-        .kill_on_drop(true);
-    tokio::time::timeout(R9A3D_IO_TIMEOUT, command.output())
-        .await
-        .expect("R-9A.3d TUI subprocess exceeded deadline")
-        .expect("run bounded R-9A.3d TUI subprocess")
+    run_bounded_fixture_command(
+        tui_executable(),
+        instance,
+        arguments,
+        "R-9A.3d TUI subprocess",
+    )
+    .await
 }
 
 async fn wait_for_r9a3d_daemon(instance: &str, child: &mut Child) {
@@ -2682,20 +2778,21 @@ async fn wait_for_r9a3d_json<T: serde::de::DeserializeOwned>(
     }
 }
 
-async fn bounded_reap_r9a3d_child(
+async fn bounded_reap_fixture_child(
     child: &mut Child,
+    label: &str,
     deadline: Instant,
 ) -> std::process::ExitStatus {
     loop {
         if let Some(status) = child
             .try_wait()
-            .expect("inspect R-9A.3d daemon while reaping")
+            .unwrap_or_else(|error| panic!("inspect {label} while reaping: {error}"))
         {
             return status;
         }
         assert!(
             Instant::now() < deadline,
-            "R-9A.3d daemon was not reaped before deadline"
+            "{label} was not reaped before deadline"
         );
         sleep(Duration::from_millis(10)).await;
     }
@@ -2712,7 +2809,12 @@ async fn hard_kill_r9a3d_child(child: &mut Child, phase: &str) -> std::process::
     child
         .start_kill()
         .unwrap_or_else(|error| panic!("hard-kill R-9A.3d daemon at {phase}: {error}"));
-    let status = bounded_reap_r9a3d_child(child, Instant::now() + R9A3_WITNESS_REAP_TIMEOUT).await;
+    let status = bounded_reap_fixture_child(
+        child,
+        "R-9A.3d daemon",
+        Instant::now() + R9A3_WITNESS_REAP_TIMEOUT,
+    )
+    .await;
     assert!(
         !status.success(),
         "hard-killed R-9A.3d daemon at {phase} must not report success: {status}"
@@ -2720,17 +2822,17 @@ async fn hard_kill_r9a3d_child(child: &mut Child, phase: &str) -> std::process::
     status
 }
 
-async fn shutdown_r9a3d_child(child: &mut Child) -> std::process::ExitStatus {
+async fn shutdown_fixture_child(child: &mut Child, label: &str) -> std::process::ExitStatus {
     drop(child.stdin.take());
     let graceful_deadline = Instant::now() + R9A3D_IO_TIMEOUT;
     loop {
         if let Some(status) = child
             .try_wait()
-            .expect("inspect R-9A.3d daemon during graceful shutdown")
+            .unwrap_or_else(|error| panic!("inspect {label} during graceful shutdown: {error}"))
         {
             assert!(
                 status.success(),
-                "R-9A.3d daemon graceful shutdown failed: {status}"
+                "{label} graceful shutdown failed: {status}"
             );
             return status;
         }
@@ -2742,11 +2844,12 @@ async fn shutdown_r9a3d_child(child: &mut Child) -> std::process::ExitStatus {
 
     child
         .start_kill()
-        .expect("kill R-9A.3d daemon after graceful shutdown deadline");
-    let status = bounded_reap_r9a3d_child(child, Instant::now() + R9A3_WITNESS_REAP_TIMEOUT).await;
+        .unwrap_or_else(|error| panic!("kill {label} after graceful shutdown deadline: {error}"));
+    let status =
+        bounded_reap_fixture_child(child, label, Instant::now() + R9A3_WITNESS_REAP_TIMEOUT).await;
     assert!(
         !status.success(),
-        "R-9A.3d daemon killed after graceful shutdown timeout must not report success: {status}"
+        "{label} killed after graceful shutdown timeout must not report success: {status}"
     );
     status
 }
@@ -3612,6 +3715,487 @@ async fn m11_real_cli_and_tui_share_governed_memory_mutations_over_local_ipc() {
     let status = child.wait().await.expect("M-11 fixture child exit");
     assert!(status.success(), "M-11 fixture child failed: {status}");
     fs::remove_dir_all(&root).expect("remove M-11 fixture root");
+}
+
+fn m12_memory_json(output: &std::process::Output, label: &str) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "{label} stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("decode {label} JSON envelope: {error}"))
+}
+
+struct M12RootGuard(Option<PathBuf>);
+
+impl M12RootGuard {
+    fn new(path: PathBuf) -> Self {
+        fs::create_dir_all(&path).expect("create M-12 fixture root");
+        Self(Some(path))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("M-12 root remains available")
+    }
+
+    fn remove(mut self) {
+        let path = self.0.take().expect("M-12 root remains available");
+        fs::remove_dir_all(path).expect("remove M-12 fixture root");
+    }
+}
+
+impl Drop for M12RootGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+struct M12DaemonGuard {
+    child: Child,
+    label: &'static str,
+}
+
+impl M12DaemonGuard {
+    fn new(child: Child, label: &'static str) -> Self {
+        Self { child, label }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for M12DaemonGuard {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        let _ = self.child.start_kill();
+        let deadline = Instant::now() + R9A3_WITNESS_REAP_TIMEOUT;
+        loop {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                eprintln!("{} could not be reaped during panic cleanup", self.label);
+                return;
+            }
+            thread::sleep(R9A3_WITNESS_REAP_POLL_INTERVAL);
+        }
+    }
+}
+
+fn assert_m12_retrieval(
+    output: &std::process::Output,
+    label: &str,
+    kept_memory_id: &str,
+    revoked_memory_id: &str,
+    kept_content: &str,
+    revoked_content: &str,
+) -> serde_json::Value {
+    let value = m12_memory_json(output, label);
+    assert_eq!(value["operation"], "memory.retrieve");
+    let evidence_ref = value["data"]["evidenceRef"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{label} evidence reference"));
+    assert!(
+        evidence_ref.starts_with("memory-rag-evidence-sha256:"),
+        "{label} must retain governed retrieval evidence"
+    );
+    let snapshot_sha256 = value["data"]["snapshotSha256"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{label} snapshot digest"));
+    assert!(
+        snapshot_sha256.len() == 64
+            && snapshot_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{label} snapshot digest must be lowercase SHA-256"
+    );
+    let candidates = value["data"]["candidates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{label} candidates"));
+    let kept = candidates
+        .iter()
+        .find(|candidate| candidate["memoryId"] == kept_memory_id)
+        .unwrap_or_else(|| panic!("{label} must include kept Memory"));
+    assert!(
+        kept.get("content").is_none(),
+        "{label} leaked Memory content"
+    );
+    assert!(
+        !candidates
+            .iter()
+            .any(|candidate| candidate["memoryId"] == revoked_memory_id),
+        "{label} exposed revoked Memory"
+    );
+    let serialized = serde_json::to_string(&value).expect("serialize M-12 retrieval response");
+    assert!(!serialized.contains(kept_content));
+    assert!(!serialized.contains(revoked_content));
+    value
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m12_memory_survives_daemon_restart_with_revocation_replay_and_read_only_retrieval() {
+    const SCOPE: &str = "scope:founder";
+    const KEPT_ID: &str = "memory-m12-kept";
+    const REVOKED_ID: &str = "memory-m12-revoked";
+    const KEPT_CONTENT: &str = "m12 durable kept memory sentinel";
+    const REVOKED_CONTENT: &str = "m12 durable revoked memory sentinel";
+
+    let root =
+        M12RootGuard::new(std::env::temp_dir().join(format!("egopulse-m12-{}", Uuid::now_v7())));
+    let instance = format!("m12-{}", Uuid::now_v7());
+    let mut daemon_one = M12DaemonGuard::new(
+        spawn_fixture(root.path(), &instance).await,
+        "M-12 D1 daemon",
+    );
+    let daemon_one_pid = daemon_one.child.id().expect("M-12 D1 PID");
+    assert_ne!(daemon_one_pid, std::process::id());
+    wait_for_m12_daemon(&instance, daemon_one.child_mut(), "M-12 D1 daemon").await;
+
+    let kept_candidate = run_m12_cli(
+        &instance,
+        &[
+            "memory",
+            "candidate",
+            "--memory-id",
+            KEPT_ID,
+            "--content",
+            KEPT_CONTENT,
+            "--source-ref",
+            "source:m12-kept",
+            "--scope",
+            SCOPE,
+            "--idempotency-key",
+            "m12-kept-candidate",
+            "--json",
+        ],
+    )
+    .await;
+    let kept_candidate_json = m12_memory_json(&kept_candidate, "M-12 kept candidate");
+    assert_eq!(kept_candidate_json["data"]["memoryId"], KEPT_ID);
+    assert_eq!(kept_candidate_json["data"]["revision"], 1);
+    assert_eq!(kept_candidate_json["data"]["state"], "candidate");
+
+    let kept_accept = run_m12_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "memory-accept",
+            KEPT_ID,
+            "--expected-revision",
+            "1",
+            "--evidence-ref",
+            "evidence:m12-kept-acceptance",
+            "--idempotency-key",
+            "m12-kept-accept",
+            "--json",
+        ],
+    )
+    .await;
+    let kept_accept_json = m12_memory_json(&kept_accept, "M-12 kept acceptance");
+    assert_eq!(kept_accept_json["data"]["revision"], 2);
+    assert_eq!(kept_accept_json["data"]["state"], "accepted");
+    assert_eq!(
+        kept_accept_json["data"]["acknowledgedAfterDurabilityBarrier"],
+        true
+    );
+
+    let revoked_candidate = run_m12_cli(
+        &instance,
+        &[
+            "memory",
+            "candidate",
+            "--memory-id",
+            REVOKED_ID,
+            "--content",
+            REVOKED_CONTENT,
+            "--source-ref",
+            "source:m12-revoked",
+            "--scope",
+            SCOPE,
+            "--idempotency-key",
+            "m12-revoked-candidate",
+            "--json",
+        ],
+    )
+    .await;
+    let revoked_candidate_json = m12_memory_json(&revoked_candidate, "M-12 revoked candidate");
+    assert_eq!(revoked_candidate_json["data"]["memoryId"], REVOKED_ID);
+    assert_eq!(revoked_candidate_json["data"]["revision"], 1);
+
+    let revoked_accept = run_m12_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "memory-accept",
+            REVOKED_ID,
+            "--expected-revision",
+            "1",
+            "--evidence-ref",
+            "evidence:m12-revoked-acceptance",
+            "--idempotency-key",
+            "m12-revoked-accept",
+            "--json",
+        ],
+    )
+    .await;
+    let revoked_accept_json = m12_memory_json(&revoked_accept, "M-12 revoked acceptance");
+    assert_eq!(revoked_accept_json["data"]["revision"], 2);
+    assert_eq!(revoked_accept_json["data"]["state"], "accepted");
+
+    let revoked = run_m12_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "memory-revoke",
+            REVOKED_ID,
+            "--expected-revision",
+            "2",
+            "--evidence-ref",
+            "evidence:m12-revocation",
+            "--idempotency-key",
+            "m12-revoke",
+            "--json",
+        ],
+    )
+    .await;
+    let revoked_json = m12_memory_json(&revoked, "M-12 revocation");
+    assert_eq!(revoked_json["data"]["revision"], 3);
+    assert_eq!(revoked_json["data"]["state"], "revoked");
+    assert_eq!(
+        revoked_json["data"]["acknowledgedAfterDurabilityBarrier"],
+        true
+    );
+
+    let mut memory_oracle = MemoryRestartOracle::open_existing(
+        &root.path().join("memory-authority.db"),
+        &[0x14; 32],
+        "c5-memory-epoch",
+    )
+    .expect("open M-12 Memory conformance oracle");
+    let before_d1_retrieval = memory_oracle
+        .snapshot(KEPT_ID, REVOKED_ID)
+        .expect("read M-12 D1 durable snapshot");
+    assert_eq!(before_d1_retrieval.kept.memory_id, KEPT_ID);
+    assert_eq!(before_d1_retrieval.kept.revision, 2);
+    assert_eq!(before_d1_retrieval.kept.content, KEPT_CONTENT);
+    assert_eq!(
+        before_d1_retrieval.kept.content_sha256,
+        hex::encode(Sha256::digest(KEPT_CONTENT.as_bytes()))
+    );
+    assert_eq!(before_d1_retrieval.kept.source_ref, "source:m12-kept");
+    assert_eq!(before_d1_retrieval.kept.scope_ref, SCOPE);
+    assert_eq!(before_d1_retrieval.kept.state, "accepted");
+    assert_eq!(before_d1_retrieval.revoked.memory_id, REVOKED_ID);
+    assert_eq!(before_d1_retrieval.revoked.revision, 3);
+    assert_eq!(before_d1_retrieval.revoked.content, REVOKED_CONTENT);
+    assert_eq!(
+        before_d1_retrieval.revoked.content_sha256,
+        hex::encode(Sha256::digest(REVOKED_CONTENT.as_bytes()))
+    );
+    assert_eq!(before_d1_retrieval.revoked.source_ref, "source:m12-revoked");
+    assert_eq!(before_d1_retrieval.revoked.scope_ref, SCOPE);
+    assert_eq!(before_d1_retrieval.revoked.state, "revoked");
+
+    let d1_retrieval = run_m12_cli(
+        &instance,
+        &[
+            "memory",
+            "retrieve",
+            "--query",
+            "m12 durable memory sentinel",
+            "--scope",
+            SCOPE,
+            "--max-results",
+            "8",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    )
+    .await;
+    let d1_retrieval_json = assert_m12_retrieval(
+        &d1_retrieval,
+        "M-12 D1 CLI retrieval",
+        KEPT_ID,
+        REVOKED_ID,
+        KEPT_CONTENT,
+        REVOKED_CONTENT,
+    );
+    assert_eq!(
+        memory_oracle
+            .snapshot(KEPT_ID, REVOKED_ID)
+            .expect("read M-12 D1 post-retrieval durable snapshot"),
+        before_d1_retrieval,
+        "D1 retrieval must not write Memory state, events or idempotency records"
+    );
+    drop(memory_oracle);
+
+    let d1_status = shutdown_fixture_child(daemon_one.child_mut(), "M-12 D1 daemon").await;
+    assert!(d1_status.success());
+    assert!(
+        daemon_one
+            .child
+            .try_wait()
+            .expect("confirm M-12 D1 reap")
+            .is_some()
+    );
+
+    let mut daemon_two = M12DaemonGuard::new(
+        spawn_fixture(root.path(), &instance).await,
+        "M-12 D2 daemon",
+    );
+    let daemon_two_pid = daemon_two.child.id().expect("M-12 D2 PID");
+    assert_ne!(daemon_two_pid, std::process::id());
+    assert_ne!(
+        daemon_two_pid, daemon_one_pid,
+        "D2 must be a new daemon process"
+    );
+    wait_for_m12_daemon(&instance, daemon_two.child_mut(), "M-12 D2 daemon").await;
+
+    let mut memory_oracle = MemoryRestartOracle::open_existing(
+        &root.path().join("memory-authority.db"),
+        &[0x14; 32],
+        "c5-memory-epoch",
+    )
+    .expect("reopen M-12 Memory conformance oracle after daemon restart");
+    assert_eq!(
+        memory_oracle
+            .snapshot(KEPT_ID, REVOKED_ID)
+            .expect("read M-12 D2 initial durable snapshot"),
+        before_d1_retrieval,
+        "daemon restart and fixture seed replay must not grow durable Memory facts"
+    );
+    let before_d2_retrieval = memory_oracle
+        .snapshot(KEPT_ID, REVOKED_ID)
+        .expect("read M-12 D2 pre-retrieval durable snapshot");
+
+    let d2_cli = run_m12_cli(
+        &instance,
+        &[
+            "memory",
+            "retrieve",
+            "--query",
+            "m12 durable memory sentinel",
+            "--scope",
+            SCOPE,
+            "--max-results",
+            "8",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    )
+    .await;
+    let d2_cli_json = assert_m12_retrieval(
+        &d2_cli,
+        "M-12 D2 CLI retrieval",
+        KEPT_ID,
+        REVOKED_ID,
+        KEPT_CONTENT,
+        REVOKED_CONTENT,
+    );
+    let d2_tui = run_m12_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "memory-retrieve",
+            "--query",
+            "m12 durable memory sentinel",
+            "--scope",
+            SCOPE,
+            "--max-results",
+            "8",
+            "--min-score",
+            "0",
+            "--json",
+        ],
+    )
+    .await;
+    let d2_tui_json = assert_m12_retrieval(
+        &d2_tui,
+        "M-12 D2 TUI retrieval",
+        KEPT_ID,
+        REVOKED_ID,
+        KEPT_CONTENT,
+        REVOKED_CONTENT,
+    );
+    assert_eq!(
+        d2_tui_json["data"]["snapshotSha256"],
+        d2_cli_json["data"]["snapshotSha256"]
+    );
+    assert_eq!(
+        d2_cli_json["data"]["snapshotSha256"],
+        d1_retrieval_json["data"]["snapshotSha256"]
+    );
+    assert_eq!(
+        d2_cli_json["data"]["evidenceRef"],
+        d1_retrieval_json["data"]["evidenceRef"]
+    );
+    assert_eq!(
+        d2_tui_json["data"]["evidenceRef"],
+        d1_retrieval_json["data"]["evidenceRef"]
+    );
+    assert_eq!(
+        memory_oracle
+            .snapshot(KEPT_ID, REVOKED_ID)
+            .expect("read M-12 D2 post-retrieval durable snapshot"),
+        before_d2_retrieval,
+        "CLI/TUI retrieval after restart must remain read-only"
+    );
+
+    let replay = run_m12_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "memory-revoke",
+            REVOKED_ID,
+            "--expected-revision",
+            "2",
+            "--evidence-ref",
+            "evidence:m12-revocation",
+            "--idempotency-key",
+            "m12-revoke",
+            "--json",
+        ],
+    )
+    .await;
+    let replay_json = m12_memory_json(&replay, "M-12 restart exact revoke replay");
+    assert_eq!(replay_json["data"], revoked_json["data"]);
+    assert_eq!(
+        memory_oracle
+            .snapshot(KEPT_ID, REVOKED_ID)
+            .expect("read M-12 D2 post-replay durable snapshot"),
+        before_d2_retrieval,
+        "exact replay after restart must not grow durable Memory facts"
+    );
+    drop(memory_oracle);
+
+    let d2_status = shutdown_fixture_child(daemon_two.child_mut(), "M-12 D2 daemon").await;
+    assert!(d2_status.success());
+    assert!(
+        daemon_two
+            .child
+            .try_wait()
+            .expect("confirm M-12 D2 reap")
+            .is_some()
+    );
+    let unavailable = run_m12_cli(&instance, &["status", "--json"]).await;
+    assert_eq!(unavailable.status.code(), Some(3));
+    drop(daemon_two);
+    drop(daemon_one);
+    root.remove();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5066,7 +5650,7 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         "D2 must not emit any second complete send request"
     );
 
-    shutdown_r9a3d_child(&mut daemon_two).await;
+    shutdown_fixture_child(&mut daemon_two, "R-9A.3d D2 daemon").await;
     assert!(
         witness
             .try_wait()

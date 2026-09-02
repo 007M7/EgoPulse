@@ -166,12 +166,17 @@ Worker result
 ```
 
 Current disposition: **governance boundary and lexical production baseline
-closed; semantic RAG admission incomplete**. M-01–M-11 and the current
-evaluation gate are locally verified. The first real semantic/hybrid candidate
-was evaluated and rejected for Recall/NDCG regression; a semantic candidate
-may become opt-in only after a passing evaluation, Founder selection of the
-profile, and acceptance of package/runtime costs, provenance and rollback
-behavior.
+closed; semantic RAG admission incomplete**. M-01–M-12 and the current
+evaluation gate are locally verified. M-12 proves that accepted and revoked
+Memory facts, read-only lexical retrieval and exact revoke replay survive a
+graceful C5 fixture-daemon restart with the same DataRoot and IPC instance; it
+does not claim packaged-install, hard-kill or Provider recovery. The detailed
+evidence is recorded in
+`phase-2-57-memory-daemon-restart-evidence-20260902.md`. The first real
+semantic/hybrid candidate was evaluated and rejected for Recall/NDCG
+regression; a semantic candidate may become opt-in only after a passing
+evaluation, Founder selection of the profile, and acceptance of
+package/runtime costs, provenance and rollback behavior.
 
 ### Stage 5 — complete product surfaces
 

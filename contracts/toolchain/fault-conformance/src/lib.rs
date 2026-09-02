@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod memory_restart_oracle;
 pub mod r8b2c;
 pub mod r9a3;
 pub mod r9a3_context;

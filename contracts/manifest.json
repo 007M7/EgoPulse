@@ -1061,11 +1061,15 @@
     },
     {
       "path": "toolchain/fault-conformance/src/lib.rs",
-      "sha256": "94747910f1bb1f62c1ff819eac51a371c0db7f48a0ac316a1404acae3c37c1e0"
+      "sha256": "e6c09a187d15d0cd70ab06e8ccac3b2b7c5d3c6d18c1f7d64bb6f8e376fd947e"
     },
     {
       "path": "toolchain/fault-conformance/src/main.rs",
       "sha256": "aa1300d58b1d574f17a38effd6502fcd860ca5c41450477643813534da690e69"
+    },
+    {
+      "path": "toolchain/fault-conformance/src/memory_restart_oracle.rs",
+      "sha256": "a197ac39c8e605d77378e2011b8a200f05fe4a0b1596fd4485b5168af434cca3"
     },
     {
       "path": "toolchain/fault-conformance/src/r8b2c.rs",
