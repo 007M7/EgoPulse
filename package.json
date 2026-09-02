@@ -8,12 +8,13 @@
     "pnpm": "11.x"
   },
   "scripts": {
-    "check": "pnpm run check:public-boundary && pnpm run check:boundaries && pnpm run check:contracts && pnpm run check:v01-contract-import && pnpm run check:contract-codegen && node scripts/check-typescript.mjs",
+    "check": "pnpm run check:public-boundary && pnpm run check:boundaries && pnpm run check:contracts && pnpm run check:v01-contract-import && pnpm run check:contract-codegen && pnpm run check:package-integrity && node scripts/check-typescript.mjs",
     "check:public-boundary": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-public-boundary.ps1",
     "check:boundaries": "node scripts/check-boundaries.mjs",
     "check:contracts": "node scripts/check-proto.mjs && node scripts/check-approved-contract-change.mjs && node scripts/check-contract-breaking.mjs && node scripts/check-json-schema.mjs",
     "check:v01-contract-import": "node scripts/verify-v01-contract-import.mjs",
     "check:contract-codegen": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/contract-codegen.ps1 -Mode Check",
+    "check:package-integrity": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-package-integrity.ps1",
     "generate:contracts": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/contract-codegen.ps1 -Mode Write",
     "check:typescript": "node scripts/check-typescript.mjs",
     "desktop:dev": "pnpm --filter @egopulse/desktop tauri dev",

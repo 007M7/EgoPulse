@@ -9,6 +9,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot 'windows-package-integrity.ps1')
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location -LiteralPath $repoRoot
 $env:CI = 'true'
@@ -24,42 +26,6 @@ function Invoke-External {
     if ($LASTEXITCODE -ne 0) {
         throw "Command failed with exit code $LASTEXITCODE`: $Command $($Arguments -join ' ')"
     }
-}
-
-function Get-Sha256Hex {
-    param([Parameter(Mandatory = $true)][string]$LiteralPath)
-
-    $stream = [IO.File]::OpenRead($LiteralPath)
-    try {
-        $sha256 = [Security.Cryptography.SHA256]::Create()
-        try {
-            return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
-        }
-        finally {
-            $sha256.Dispose()
-        }
-    }
-    finally {
-        $stream.Dispose()
-    }
-}
-
-function Copy-PublicTree {
-    param(
-        [Parameter(Mandatory = $true)][string]$SourceRoot,
-        [Parameter(Mandatory = $true)][string]$DestinationRoot
-    )
-
-    $resolvedSource = (Resolve-Path -LiteralPath $SourceRoot).Path
-    New-Item -ItemType Directory -Force -Path $DestinationRoot | Out-Null
-    Get-ChildItem -LiteralPath $resolvedSource -Recurse -File |
-        Where-Object { $_.FullName -notmatch '\\.venv\\|\\__pycache__\\|\\.pytest_cache\\' } |
-        ForEach-Object {
-            $relative = $_.FullName.Substring($resolvedSource.Length + 1)
-            $destination = Join-Path $DestinationRoot $relative
-            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-            Copy-Item -LiteralPath $_.FullName -Destination $destination
-        }
 }
 
 $cargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
@@ -124,10 +90,21 @@ $version = (Get-Content -LiteralPath 'apps/desktop/src-tauri/tauri.conf.json' -R
 $stamp = [DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssZ')
 $shortHead = $head.Substring(0, 12)
 $candidateName = "egopulse-$version-$shortHead-windows-x86_64-$stamp"
-$candidateRoot = Join-Path (Join-Path $repoRoot $ArtifactRoot) $candidateName
+$artifactDirectory = Join-Path $repoRoot $ArtifactRoot
+$null = New-Item -ItemType Directory -Force -Path $artifactDirectory
+$candidateRoot = Join-Path $artifactDirectory $candidateName
+$zipPath = "$candidateRoot.zip"
+$zipHashPath = "$zipPath.sha256"
+foreach ($target in @($candidateRoot, $zipPath, $zipHashPath)) {
+    if (Test-Path -LiteralPath $target) {
+        throw "Windows package target already exists: $target"
+    }
+}
 $binRoot = Join-Path $candidateRoot 'bin'
 $manifestRoot = Join-Path $candidateRoot 'manifests'
-New-Item -ItemType Directory -Force -Path $binRoot, $manifestRoot | Out-Null
+$null = New-EgoPulseExclusiveDirectory -LiteralPath $candidateRoot
+$null = New-EgoPulseExclusiveDirectory -LiteralPath $binRoot
+$null = New-EgoPulseExclusiveDirectory -LiteralPath $manifestRoot
 
 $binaries = @(
     'agentosd.exe',
@@ -142,35 +119,46 @@ foreach ($binary in $binaries) {
     if (-not (Test-Path -LiteralPath $source)) {
         throw "Expected release binary is missing: $source"
     }
-    Copy-Item -LiteralPath $source -Destination $binRoot
+    Copy-EgoPulseFileExclusively -SourcePath $source -DestinationPath (Join-Path $binRoot $binary)
 }
 
-Copy-Item -LiteralPath 'README.md', 'SECURITY.md' -Destination $candidateRoot
-Copy-Item -LiteralPath 'WINDOWS-EARLY-ACCESS.md', 'setup-memory-worker.ps1', 'install-egopulse.ps1' -Destination $candidateRoot
+foreach ($source in @('README.md', 'SECURITY.md', 'WINDOWS-EARLY-ACCESS.md', 'setup-memory-worker.ps1', 'install-egopulse.ps1')) {
+    Copy-EgoPulseFileExclusively -SourcePath $source -DestinationPath (Join-Path $candidateRoot (Split-Path -Leaf $source))
+}
 $configRoot = Join-Path $candidateRoot 'config'
-New-Item -ItemType Directory -Force -Path $configRoot | Out-Null
-Copy-Item -LiteralPath @(
+$null = New-EgoPulseExclusiveDirectory -LiteralPath $configRoot
+foreach ($source in @(
     'config/agentos-config.example.json',
     'config/README.md',
     'config/artifact-authority.md',
     'config/memory-authority.md',
     'config/verification-worker.example.json'
-) -Destination $configRoot
-Copy-Item -LiteralPath 'Cargo.lock', 'pnpm-lock.yaml' -Destination $manifestRoot
-Copy-Item -LiteralPath 'workers/foundation-probe/uv.lock' -Destination (Join-Path $manifestRoot 'foundation-probe.uv.lock')
-Copy-Item -LiteralPath 'workers/contract-bindings/uv.lock' -Destination (Join-Path $manifestRoot 'contract-bindings.uv.lock')
+)) {
+    Copy-EgoPulseFileExclusively -SourcePath $source -DestinationPath (Join-Path $configRoot (Split-Path -Leaf $source))
+}
+foreach ($source in @('Cargo.lock', 'pnpm-lock.yaml')) {
+    Copy-EgoPulseFileExclusively -SourcePath $source -DestinationPath (Join-Path $manifestRoot (Split-Path -Leaf $source))
+}
+Copy-EgoPulseFileExclusively -SourcePath 'workers/foundation-probe/uv.lock' -DestinationPath (Join-Path $manifestRoot 'foundation-probe.uv.lock')
+Copy-EgoPulseFileExclusively -SourcePath 'workers/contract-bindings/uv.lock' -DestinationPath (Join-Path $manifestRoot 'contract-bindings.uv.lock')
 
 # Memory retrieval is part of the first CLI/TUI release. Ship the locked,
 # read-only Worker source and generated Python contract consumer beside the
 # binaries; the end user's CPython/uv installation creates the isolated .venv.
+$workersRoot = Join-Path $candidateRoot 'workers'
+$null = New-EgoPulseExclusiveDirectory -LiteralPath $workersRoot
 foreach ($workerName in @('memory-rag', 'contract-bindings')) {
-    $workerRoot = Join-Path $candidateRoot "workers/$workerName"
-    New-Item -ItemType Directory -Force -Path $workerRoot | Out-Null
-    Copy-Item -LiteralPath "workers/$workerName/pyproject.toml", "workers/$workerName/uv.lock" -Destination $workerRoot
-    Copy-PublicTree -SourceRoot "workers/$workerName/src" -DestinationRoot (Join-Path $workerRoot 'src')
+    $workerRoot = Join-Path $workersRoot $workerName
+    $null = New-EgoPulseExclusiveDirectory -LiteralPath $workerRoot
+    foreach ($source in @("workers/$workerName/pyproject.toml", "workers/$workerName/uv.lock")) {
+        Copy-EgoPulseFileExclusively -SourcePath $source -DestinationPath (Join-Path $workerRoot (Split-Path -Leaf $source))
+    }
+    $null = Copy-EgoPulsePublicTreeExclusively `
+        -SourceRoot "workers/$workerName/src" `
+        -DestinationRoot (Join-Path $workerRoot 'src')
 }
 if ($resolvedEvidencePath) {
-    Copy-Item -LiteralPath $resolvedEvidencePath -Destination (Join-Path $manifestRoot 'local-ci-evidence.json')
+    Copy-EgoPulseFileExclusively -SourcePath $resolvedEvidencePath -DestinationPath (Join-Path $manifestRoot 'local-ci-evidence.json')
 }
 
 $metadata = [ordered]@{
@@ -188,21 +176,31 @@ $metadata = [ordered]@{
     memory_worker = 'packaged-source-locked-python'
     python_runtime = 'external-cpython-3.14-and-uv'
 }
-$metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $candidateRoot 'BUILD-METADATA.json') -Encoding utf8
+Write-EgoPulseTextFileExclusively `
+    -LiteralPath (Join-Path $candidateRoot 'BUILD-METADATA.json') `
+    -Value (($metadata | ConvertTo-Json -Depth 5) + [Environment]::NewLine) `
+    -Encoding ([Text.UTF8Encoding]::new($false))
 
-$hashLines = Get-ChildItem -LiteralPath $candidateRoot -Recurse -File |
-    Sort-Object FullName |
+$packageInventory = @(Get-EgoPulsePackageFileInventory -PackageRoot $candidateRoot)
+$hashLines = $packageInventory |
     ForEach-Object {
-        $relative = $_.FullName.Substring($candidateRoot.Length + 1).Replace('\', '/')
-        $hash = Get-Sha256Hex -LiteralPath $_.FullName
-        "$hash  $relative"
+        $hash = Get-EgoPulseSha256Hex -LiteralPath $_.FullPath
+        "$hash  $($_.Path)"
     }
-$hashLines | Set-Content -LiteralPath (Join-Path $candidateRoot 'SHA256SUMS') -Encoding ascii
+Write-EgoPulseTextFileExclusively `
+    -LiteralPath (Join-Path $candidateRoot 'SHA256SUMS') `
+    -Value (($hashLines -join [Environment]::NewLine) + [Environment]::NewLine) `
+    -Encoding ([Text.Encoding]::ASCII)
+$null = Test-EgoPulsePackageManifest -PackageRoot $candidateRoot -RequiredFiles @(
+    'config/agentos-config.example.json'
+)
 
-$zipPath = "$candidateRoot.zip"
-Compress-Archive -LiteralPath $candidateRoot -DestinationPath $zipPath -CompressionLevel Optimal
-$zipHash = Get-Sha256Hex -LiteralPath $zipPath
-Set-Content -LiteralPath "$zipPath.sha256" -Value "$zipHash  $([IO.Path]::GetFileName($zipPath))" -Encoding ascii
+$null = New-EgoPulsePackageArchiveExclusively -PackageRoot $candidateRoot -ArchivePath $zipPath
+$zipHash = Get-EgoPulseSha256Hex -LiteralPath $zipPath
+Write-EgoPulseTextFileExclusively `
+    -LiteralPath $zipHashPath `
+    -Value ("$zipHash  $([IO.Path]::GetFileName($zipPath))" + [Environment]::NewLine) `
+    -Encoding ([Text.Encoding]::ASCII)
 
 Write-Output "windows_package=passed classification=unsigned-release-candidate commit=$head ci_provider=$CiProvider"
 Write-Output "candidate_directory=$candidateRoot"
