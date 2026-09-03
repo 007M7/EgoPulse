@@ -28,6 +28,7 @@ pub enum GovernedStateReason {
     RecoveryExhausted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GovernedRecoverableCause {
     RetryableApiRejected,
     TransportUnavailable,
@@ -44,6 +45,7 @@ impl GovernedRecoverableCause {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GovernedFatalCause {
     InitialSessionUnavailable,
     PermissionDenied,

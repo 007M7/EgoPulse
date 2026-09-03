@@ -6,6 +6,12 @@
 )]
 mod governed_state;
 
+#[allow(
+    dead_code,
+    reason = "R9B.2a source/session conversion follows the shared driver classifiers"
+)]
+mod governed_state_driver;
+
 pub use governed_state::{
     GovernedApprovalDomainPosition, GovernedApprovalDomainState, GovernedApprovalState,
     GovernedStateComposite, GovernedStateDomain, GovernedStateDomainPhase, GovernedStateReason,
