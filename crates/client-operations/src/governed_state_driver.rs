@@ -21,6 +21,7 @@ use crate::{
 };
 
 const GOVERNED_STATE_REQUEST_CAPACITY: usize = 1;
+const GOVERNED_STATE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -516,9 +517,14 @@ impl GovernedStateSession {
         }
     }
 
-    pub async fn shutdown(mut self) -> GovernedStateShutdown {
+    pub async fn shutdown(self) -> GovernedStateShutdown {
+        self.shutdown_with_timeout(GOVERNED_STATE_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn shutdown_with_timeout(mut self, timeout: Duration) -> GovernedStateShutdown {
         let _ = self.cancellation.send(true);
-        let joined = tokio::time::timeout(Duration::from_secs(2), async {
+        let joined = tokio::time::timeout(timeout, async {
             match (&mut self.task_worker, &mut self.approval_worker) {
                 (Some(task_worker), Some(approval_worker)) => {
                     let _ = tokio::join!(task_worker, approval_worker);
@@ -1346,13 +1352,14 @@ mod tests {
     };
 
     use super::{
-        ApprovalRequest, DomainAck, DriverFailure, DriverStage, GovernedStateSessionCore, Opened,
-        TaskRequest, WorkerDirective, WorkerExit, approval_complete_input_from_parts,
-        approval_failure_input, approval_live_input_from_parts, approval_live_input_from_result,
-        classify_approval_error, classify_task_error, clone_shared_pair, directive_from_ack,
+        ApprovalRequest, DomainAck, DriverFailure, DriverStage, GOVERNED_STATE_SHUTDOWN_TIMEOUT,
+        GovernedStateSession, GovernedStateSessionCore, Opened, TaskRequest, WorkerDirective,
+        WorkerExit, approval_complete_input_from_parts, approval_failure_input,
+        approval_live_input_from_parts, approval_live_input_from_result, classify_approval_error,
+        classify_task_error, clone_shared_pair, directive_from_ack,
         governed_state_request_channels, open_source_via, submit_approval_input, submit_task_input,
         task_complete_input_from_parts, task_failure_input, task_live_input_from_result,
-        task_live_input_from_update,
+        task_live_input_from_update, wait_for_cancellation,
     };
     use crate::governed_state::{
         GovernedApprovalDomainState, GovernedApprovalReducerInput, GovernedApprovalState,
@@ -1390,6 +1397,24 @@ mod tests {
             current_position: None,
             correlation_id: "correlation:governed-state-driver".to_owned(),
         }
+    }
+
+    struct WorkerDropWitness(Arc<AtomicUsize>);
+
+    impl Drop for WorkerDropWitness {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn require_worker_drops(drop_count: &AtomicUsize, expected: usize) {
+        for _ in 0..8 {
+            if drop_count.load(Ordering::SeqCst) == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(drop_count.load(Ordering::SeqCst), expected);
     }
 
     fn kernel_server_error(code: LocalApiErrorCode, retryable: bool) -> KernelError {
@@ -3761,5 +3786,157 @@ mod tests {
                 recovery_remaining: approval.recovery_remaining(),
             }
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_exhausted_core_waits_for_yielding_workers_without_spinning() {
+        let (core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+        drop(task_sender);
+        drop(approval_sender);
+        let (cancellation, _cancellation_receiver) = tokio::sync::watch::channel(false);
+        let task_worker = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            WorkerExit::DomainFatal
+        });
+        let approval_worker = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            WorkerExit::DomainFatal
+        });
+        let mut session = GovernedStateSession {
+            core,
+            cancellation,
+            task_worker: Some(task_worker),
+            approval_worker: Some(approval_worker),
+        };
+
+        assert!(session.next_update().await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_shutdown_cancels_and_joins_both_pending_workers() {
+        let (core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+        drop(task_sender);
+        drop(approval_sender);
+        let (cancellation, cancellation_receiver) = tokio::sync::watch::channel(false);
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let (task_started, task_started_rx) = tokio::sync::oneshot::channel();
+        let (approval_started, approval_started_rx) = tokio::sync::oneshot::channel();
+        let mut task_cancellation = cancellation_receiver.clone();
+        let task_drop_count = Arc::clone(&drop_count);
+        let task_worker = tokio::spawn(async move {
+            let _drop_witness = WorkerDropWitness(task_drop_count);
+            let _ = task_started.send(());
+            wait_for_cancellation(&mut task_cancellation).await;
+            WorkerExit::Cancelled
+        });
+        let mut approval_cancellation = cancellation_receiver;
+        let approval_drop_count = Arc::clone(&drop_count);
+        let approval_worker = tokio::spawn(async move {
+            let _drop_witness = WorkerDropWitness(approval_drop_count);
+            let _ = approval_started.send(());
+            wait_for_cancellation(&mut approval_cancellation).await;
+            WorkerExit::Cancelled
+        });
+        let session = GovernedStateSession {
+            core,
+            cancellation,
+            task_worker: Some(task_worker),
+            approval_worker: Some(approval_worker),
+        };
+        let (task_started_result, approval_started_result) =
+            tokio::join!(task_started_rx, approval_started_rx);
+        task_started_result.expect("task worker must start");
+        approval_started_result.expect("approval worker must start");
+
+        let _shutdown = session.shutdown().await;
+        assert_eq!(drop_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_zero_shutdown_timeout_aborts_both_started_workers() {
+        assert_eq!(
+            GOVERNED_STATE_SHUTDOWN_TIMEOUT,
+            std::time::Duration::from_secs(2)
+        );
+        let (core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+        drop(task_sender);
+        drop(approval_sender);
+        let (cancellation, _cancellation_receiver) = tokio::sync::watch::channel(false);
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let (task_started, task_started_rx) = tokio::sync::oneshot::channel();
+        let (approval_started, approval_started_rx) = tokio::sync::oneshot::channel();
+        let task_drop_count = Arc::clone(&drop_count);
+        let task_worker = tokio::spawn(async move {
+            let _drop_witness = WorkerDropWitness(task_drop_count);
+            let _ = task_started.send(());
+            std::future::pending::<()>().await;
+            WorkerExit::Cancelled
+        });
+        let approval_drop_count = Arc::clone(&drop_count);
+        let approval_worker = tokio::spawn(async move {
+            let _drop_witness = WorkerDropWitness(approval_drop_count);
+            let _ = approval_started.send(());
+            std::future::pending::<()>().await;
+            WorkerExit::Cancelled
+        });
+        let session = GovernedStateSession {
+            core,
+            cancellation,
+            task_worker: Some(task_worker),
+            approval_worker: Some(approval_worker),
+        };
+        let (task_started_result, approval_started_result) =
+            tokio::join!(task_started_rx, approval_started_rx);
+        task_started_result.expect("task worker must start");
+        approval_started_result.expect("approval worker must start");
+
+        let _shutdown = session
+            .shutdown_with_timeout(std::time::Duration::ZERO)
+            .await;
+        require_worker_drops(&drop_count, 2).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_drop_cancels_and_aborts_both_started_workers() {
+        let (core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+        drop(task_sender);
+        drop(approval_sender);
+        let (cancellation, _cancellation_receiver) = tokio::sync::watch::channel(false);
+        let mut cancellation_observer = cancellation.subscribe();
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let (task_started, task_started_rx) = tokio::sync::oneshot::channel();
+        let (approval_started, approval_started_rx) = tokio::sync::oneshot::channel();
+        let task_drop_count = Arc::clone(&drop_count);
+        let task_worker = tokio::spawn(async move {
+            let _drop_witness = WorkerDropWitness(task_drop_count);
+            let _ = task_started.send(());
+            std::future::pending::<()>().await;
+            WorkerExit::Cancelled
+        });
+        let approval_drop_count = Arc::clone(&drop_count);
+        let approval_worker = tokio::spawn(async move {
+            let _drop_witness = WorkerDropWitness(approval_drop_count);
+            let _ = approval_started.send(());
+            std::future::pending::<()>().await;
+            WorkerExit::Cancelled
+        });
+        let session = GovernedStateSession {
+            core,
+            cancellation,
+            task_worker: Some(task_worker),
+            approval_worker: Some(approval_worker),
+        };
+        let (task_started_result, approval_started_result) =
+            tokio::join!(task_started_rx, approval_started_rx);
+        task_started_result.expect("task worker must start");
+        approval_started_result.expect("approval worker must start");
+
+        drop(session);
+        cancellation_observer
+            .changed()
+            .await
+            .expect("drop must publish cancellation before sender closes");
+        assert!(*cancellation_observer.borrow());
+        require_worker_drops(&drop_count, 2).await;
     }
 }
