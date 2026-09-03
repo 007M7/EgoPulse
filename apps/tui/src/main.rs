@@ -17,7 +17,8 @@ use crossterm::{
 };
 use egopulse_client_operations::{
     ClientAttachment, ClientContextRevokeError, ClientReadError, ClientWorkError,
-    ContextRevokeInput, GuidedApprovalDecision, GuidedApprovalDecisionInput, PreparedContextRevoke,
+    ContextRevokeInput, GovernedHoldReason, GovernedProjectionReason, GovernedTaskState,
+    GuidedApprovalDecision, GuidedApprovalDecisionInput, PreparedContextRevoke,
     attach as attach_client, command_metadata, set_task_digest, set_verdict_digest,
     timestamp_after,
 };
@@ -58,7 +59,8 @@ use egopulse_tui::result_review::{
     TaskResultReviewFuture,
 };
 use egopulse_tui::task_watch::{
-    TaskWatchClient, TaskWatchController, TaskWatchOpenFuture, TaskWatchPageModel,
+    TaskWatchBaselineFuture, TaskWatchClient, TaskWatchController, TaskWatchOpenFuture,
+    TaskWatchPageModel, TaskWatchPhase,
 };
 use egopulse_tui::work_start::{WorkStartController, WorkStartStage, render_work_start_page};
 use ratatui::{
@@ -1218,8 +1220,6 @@ impl AttachedClient {
                 .as_ref()
                 .map(|value| format!("{}:{}", value.epoch, value.sequence))
                 .unwrap_or_else(|| "unknown".to_owned()),
-            resume_epoch: position.as_ref().map(|value| value.epoch.clone()),
-            resume_sequence: position.map(|value| value.sequence),
             tasks: projection.tasks,
             approvals: projection.approvals,
         })
@@ -1251,21 +1251,15 @@ impl InteractiveClient for AttachedClient {
 }
 
 impl TaskWatchClient for AttachedClient {
-    fn task_watch_baseline(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<TaskWatchPageModel, String>> + Send + '_>> {
-        Box::pin(async move {
-            self.read_snapshot()
-                .await
-                .map(snapshot_into_task_watch_model)
-        })
+    fn read_task_watch_baseline(&self) -> TaskWatchBaselineFuture<'_> {
+        TaskWatchClient::read_task_watch_baseline(self.0.as_ref())
     }
 
-    fn open_task_watch(
+    fn open_task_watch_session(
         &self,
-        request: egopulse_client_operations::TaskWatchRequest,
+        baseline: egopulse_tui::task_watch::TaskWatchBaseline,
     ) -> TaskWatchOpenFuture<'_> {
-        TaskWatchClient::open_task_watch(self.0.as_ref(), request)
+        TaskWatchClient::open_task_watch_session(self.0.as_ref(), baseline)
     }
 }
 
@@ -2570,36 +2564,8 @@ struct Snapshot {
     health: String,
     stale: bool,
     position: String,
-    resume_epoch: Option<String>,
-    resume_sequence: Option<u64>,
     tasks: Vec<TaskView>,
     approvals: Vec<HarnessApprovalView>,
-}
-
-fn snapshot_into_task_watch_model(snapshot: Snapshot) -> TaskWatchPageModel {
-    TaskWatchPageModel {
-        health: snapshot.health,
-        stale: snapshot.stale,
-        position: snapshot.position,
-        resume_epoch: snapshot.resume_epoch,
-        resume_sequence: snapshot.resume_sequence,
-        tasks: snapshot.tasks,
-        approvals: snapshot.approvals,
-        selected_task_id: None,
-        message: "Task Watch live; Esc returns, r refetches, q quits".to_owned(),
-    }
-}
-
-fn snapshot_from_task_watch_model(model: &TaskWatchPageModel) -> Snapshot {
-    Snapshot {
-        health: model.health.clone(),
-        stale: model.stale,
-        position: model.position.clone(),
-        resume_epoch: model.resume_epoch.clone(),
-        resume_sequence: model.resume_sequence,
-        tasks: model.tasks.clone(),
-        approvals: model.approvals.clone(),
-    }
 }
 
 struct App {
@@ -2762,6 +2728,18 @@ impl App {
                 KeyCode::Down => {
                     if let Some(controller) = &mut self.task_watch {
                         controller.select_next();
+                    }
+                    Ok(None)
+                }
+                KeyCode::PageUp => {
+                    if let Some(controller) = &mut self.task_watch {
+                        controller.scroll_detail_up();
+                    }
+                    Ok(None)
+                }
+                KeyCode::PageDown => {
+                    if let Some(controller) = &mut self.task_watch {
+                        controller.scroll_detail_down();
                     }
                     Ok(None)
                 }
@@ -3260,7 +3238,6 @@ impl App {
         let model = controller
             .model()
             .ok_or_else(|| "Task Watch controller omitted its baseline".to_owned())?;
-        self.snapshot = Some(snapshot_from_task_watch_model(model));
         self.message = model.message.clone();
         self.task_watch = Some(controller);
         self.mode = InteractiveMode::TaskWatch;
@@ -3279,14 +3256,18 @@ impl App {
             .task_watch
             .as_mut()
             .ok_or_else(|| "Task Watch controller is unavailable".to_owned())?;
-        controller.pump().await?;
+        controller.pump()?;
         let model = controller
             .model()
             .ok_or_else(|| "Task Watch controller omitted its page model".to_owned())?;
-        self.snapshot = Some(snapshot_from_task_watch_model(model));
         self.message = model.message.clone();
         self.apply_pending_task_watch_selection();
         Ok(())
+    }
+
+    async fn handle_task_watch_failure(&mut self, error: String) {
+        self.stop_task_watch().await;
+        self.message = format!("Task Watch stopped fail-closed: {error}");
     }
 
     fn apply_pending_task_watch_selection(&mut self) {
@@ -3531,12 +3512,9 @@ impl App {
                     .and_then(TaskWatchController::model)
                 {
                     render_task_watch(frame, body[1], model);
-                } else if let Some(snapshot) = snapshot {
-                    let model = snapshot_into_task_watch_model(snapshot.clone());
-                    render_task_watch(frame, body[1], &model);
                 } else {
                     frame.render_widget(
-                        Paragraph::new("Task Watch has no baseline snapshot.")
+                        Paragraph::new("Task Watch has no complete governed baseline.")
                             .block(Block::default().borders(Borders::ALL))
                             .wrap(Wrap { trim: true }),
                         body[1],
@@ -3841,35 +3819,47 @@ fn context_revoke_confirmation_text(pending: &PendingContextRevoke) -> Vec<Strin
 fn render_task_watch(frame: &mut Frame<'_>, area: Rect, model: &TaskWatchPageModel) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
         .split(area);
     frame.render_widget(
         Paragraph::new(format!(
-            "position {} - {} - {} tasks",
-            model.position,
-            if model.stale { "stale" } else { "live" },
+            "position {}:{} - {} - {} tasks",
+            model.position.epoch,
+            model.position.sequence,
+            match model.phase {
+                TaskWatchPhase::Connecting => "connecting",
+                TaskWatchPhase::Live => "live",
+                TaskWatchPhase::Stale => "stale/refetching",
+                TaskWatchPhase::FatalStopped => "stopped fail-closed",
+            },
             model.tasks.len()
         ))
         .block(Block::default().borders(Borders::ALL).title("Task Watch")),
         sections[0],
     );
     render_task_watch_tasks(frame, sections[1], model);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} | Up/Down select  PageUp/PageDown details  Enter review  r refetch  Esc dashboard  q quit",
+            model.message
+        ))
+        .wrap(Wrap { trim: false }),
+        sections[2],
+    );
 }
 
 fn render_task_watch_tasks(frame: &mut Frame<'_>, area: Rect, model: &TaskWatchPageModel) {
-    let rows = model.tasks.iter().map(|view| {
-        let task = view.task.as_ref();
-        let task_id = task.map_or("-", |value| value.task_id.as_str());
-        let selected = model.selected_task_id.as_deref() == Some(task_id);
+    let rows = model.tasks.iter().map(|task| {
+        let selected = model.selected_task_id.as_deref() == Some(task.task_id.as_str());
         Row::new([
             Cell::from(if selected { ">" } else { " " }),
-            Cell::from(task_id.to_owned()),
-            Cell::from(
-                task.and_then(|value| TaskStatus::try_from(value.status).ok())
-                    .map(|value| value.as_str_name())
-                    .unwrap_or("TASK_STATUS_UNSPECIFIED"),
-            ),
-            Cell::from(task.map_or("-".to_owned(), |value| value.revision.to_string())),
+            Cell::from(task.task_id.clone()),
+            Cell::from(task.status.as_str_name()),
+            Cell::from(task.revision.to_string()),
         ])
         .style(if selected {
             Style::default().fg(Color::Yellow)
@@ -3877,26 +3867,140 @@ fn render_task_watch_tasks(frame: &mut Frame<'_>, area: Rect, model: &TaskWatchP
             Style::default()
         })
     });
-    frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(2),
-                Constraint::Percentage(55),
-                Constraint::Percentage(30),
-                Constraint::Length(12),
-            ],
-        )
-        .header(
-            Row::new(["", "Task", "Status", "Revision"]).style(Style::default().fg(Color::Yellow)),
-        )
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(2),
+            Constraint::Percentage(50),
+            Constraint::Percentage(32),
+            Constraint::Length(10),
+        ],
+    )
+    .header(Row::new(["", "Task", "Status", "Revision"]).style(Style::default().fg(Color::Yellow)))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Projected Tasks"),
+    );
+
+    let details = model
+        .selected_task_id
+        .as_deref()
+        .and_then(|selected| model.tasks.iter().find(|task| task.task_id == selected))
+        .map(governed_task_detail_lines)
+        .unwrap_or_else(|| vec![Line::from("No Task selected")]);
+    let detail = Paragraph::new(details)
+        .scroll((model.detail_scroll, 0))
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Projected Tasks"),
-        ),
-        area,
-    );
+                .title("Execution / Recovery Facts"),
+        );
+
+    if area.width >= 100 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(area);
+        frame.render_widget(table, columns[0]);
+        frame.render_widget(detail, columns[1]);
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(area);
+        frame.render_widget(table, rows[0]);
+        frame.render_widget(detail, rows[1]);
+    }
+}
+
+fn governed_task_detail_lines(task: &GovernedTaskState) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(format!("Task {}", task.task_id)),
+        Line::from(format!(
+            "  revision={} status={} resume={} hold={}",
+            task.revision,
+            task.status.as_str_name(),
+            task.resume_status
+                .map_or("-", |status| status.as_str_name()),
+            governed_hold_reason(task.hold_reason)
+        )),
+        Line::from(format!(
+            "  projection={} stale={} reason={}",
+            task.projection.health.as_str_name(),
+            task.projection.stale,
+            governed_projection_reason(task.projection.reason)
+        )),
+    ];
+    match task.run.as_ref() {
+        Some(run) => {
+            lines.push(Line::from(format!(
+                "Run {} revision={} status={} work_revision={} hold={}",
+                run.run_id,
+                run.revision,
+                run.status.as_str_name(),
+                run.work_revision,
+                governed_hold_reason(run.hold_reason)
+            )));
+            for step in &run.steps {
+                lines.push(Line::from(format!(
+                    "  Step {} revision={} status={} current_attempt={} hold={}",
+                    step.step_id,
+                    step.revision,
+                    step.status.as_str_name(),
+                    step.current_attempt_id.as_deref().unwrap_or("-"),
+                    governed_hold_reason(step.hold_reason)
+                )));
+                for attempt in &step.attempts {
+                    lines.push(Line::from(format!(
+                        "    Attempt {} #{} revision={} status={} recovery={} hold={}",
+                        attempt.attempt_id,
+                        attempt.attempt_number,
+                        attempt.revision,
+                        attempt.status.as_str_name(),
+                        attempt.recovery_class.as_str_name(),
+                        governed_hold_reason(attempt.hold_reason)
+                    )));
+                    lines.push(Line::from(format!(
+                        "      last_harness_sequence={} checkpoint_reference_recorded={}",
+                        attempt.last_harness_sequence, attempt.checkpoint_reference_recorded
+                    )));
+                }
+            }
+        }
+        None if task.projection.reason
+            == Some(GovernedProjectionReason::DependencyProjectionPending) =>
+        {
+            lines.push(Line::from("Run facts pending dependency projection"));
+        }
+        None => lines.push(Line::from("No current Run facts")),
+    }
+    lines.push(Line::from("Governance evidence does not complete the Task"));
+    lines
+}
+
+const fn governed_hold_reason(reason: Option<GovernedHoldReason>) -> &'static str {
+    match reason {
+        None => "-",
+        Some(GovernedHoldReason::CancellationOutcomeUnknown) => "cancellation-outcome-unknown",
+        Some(GovernedHoldReason::CompensationRequired) => "compensation-required",
+        Some(GovernedHoldReason::ManualRecoveryRequired) => "manual-recovery-required",
+        Some(GovernedHoldReason::IrreversibleOutcomeUnknown) => "irreversible-outcome-unknown",
+        Some(GovernedHoldReason::Unclassified) => "unclassified",
+    }
+}
+
+const fn governed_projection_reason(reason: Option<GovernedProjectionReason>) -> &'static str {
+    match reason {
+        None => "-",
+        Some(GovernedProjectionReason::DependencyProjectionPending) => {
+            "dependency-projection-pending"
+        }
+        Some(GovernedProjectionReason::ProjectionNotReady) => "projection-not-ready",
+        Some(GovernedProjectionReason::TaskProjectionInvalid) => "task-projection-invalid",
+        Some(GovernedProjectionReason::Unclassified) => "unclassified",
+    }
 }
 
 fn render_result_review(frame: &mut Frame<'_>, area: Rect, model: &ResultReviewPageModel) {
@@ -4345,11 +4449,7 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
         if matches!(app.mode, InteractiveMode::TaskWatch)
             && let Err(error) = app.apply_task_watch_events().await
         {
-            app.stop_task_watch().await;
-            if let Some(snapshot) = &mut app.snapshot {
-                snapshot.stale = true;
-            }
-            app.message = format!("Task Watch stopped fail-closed: {error}");
+            app.handle_task_watch_failure(error).await;
         }
         if matches!(app.mode, InteractiveMode::ResultReview) {
             app.pump_result_review_fail_closed().await;
@@ -4442,14 +4542,14 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
     use egopulse_client_operations::{
-        ApprovalWatchClassification, ClientTaskResultReviewError, ClientTaskWatchError,
-        TaskResultReview, TaskWatchRequest,
+        ApprovalWatchClassification, ClientGovernedTaskError, ClientTaskResultReviewError,
+        GovernedProjectionPosition, GovernedProjectionState, TaskResultReview,
     };
     use egopulse_tui::approval_queue::{
         ApprovalQueueItem, ApprovalQueueNextFuture, ApprovalQueueOpened, ApprovalQueueStream,
         ApprovalQueueStreamUpdate,
     };
-    use egopulse_tui::task_watch::{TaskWatchNextFuture, TaskWatchStream};
+    use egopulse_tui::task_watch::{TaskWatchBaseline, TaskWatchNextFuture, TaskWatchStream};
     use std::{
         collections::VecDeque,
         sync::{
@@ -4461,6 +4561,10 @@ mod tests {
     #[derive(Clone)]
     enum ScriptedWatchStep {
         Pending,
+        WaitUpdate(
+            Arc<tokio::sync::Notify>,
+            Box<egopulse_client_operations::GovernedTaskUpdate>,
+        ),
     }
 
     struct ScriptedTaskWatch {
@@ -4541,6 +4645,10 @@ mod tests {
             Box::pin(async move {
                 match step {
                     ScriptedWatchStep::Pending => std::future::pending().await,
+                    ScriptedWatchStep::WaitUpdate(notify, update) => {
+                        notify.notified().await;
+                        Ok(*update)
+                    }
                 }
             })
         }
@@ -4549,34 +4657,25 @@ mod tests {
     struct WatchInteractiveClient {
         snapshots: Arc<Mutex<VecDeque<Snapshot>>>,
         sessions: Arc<Mutex<VecDeque<VecDeque<ScriptedWatchStep>>>>,
-        requests: Arc<Mutex<Vec<TaskWatchRequest>>>,
         snapshot_calls: Arc<AtomicUsize>,
         open_calls: Arc<AtomicUsize>,
         next_calls: Arc<AtomicUsize>,
     }
 
     impl TaskWatchClient for WatchInteractiveClient {
-        fn task_watch_baseline(
-            &self,
-        ) -> Pin<Box<dyn Future<Output = Result<TaskWatchPageModel, String>> + Send + '_>> {
+        fn read_task_watch_baseline(&self) -> TaskWatchBaselineFuture<'_> {
             self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
             let result = self
                 .snapshots
                 .lock()
                 .expect("read scripted baselines")
                 .pop_front()
-                .ok_or_else(|| "no scripted baseline".to_owned());
-            Box::pin(std::future::ready(
-                result.map(snapshot_into_task_watch_model),
-            ))
+                .ok_or(ClientGovernedTaskError::Protocol("no scripted baseline"));
+            Box::pin(std::future::ready(result.map(safe_task_watch_baseline)))
         }
 
-        fn open_task_watch(&self, request: TaskWatchRequest) -> TaskWatchOpenFuture<'_> {
+        fn open_task_watch_session(&self, _baseline: TaskWatchBaseline) -> TaskWatchOpenFuture<'_> {
             self.open_calls.fetch_add(1, Ordering::SeqCst);
-            self.requests
-                .lock()
-                .expect("capture Task watch request")
-                .push(request);
             let steps = self
                 .sessions
                 .lock()
@@ -4737,15 +4836,13 @@ mod tests {
     }
 
     impl TaskWatchClient for CombinedInteractiveClient {
-        fn task_watch_baseline(
-            &self,
-        ) -> Pin<Box<dyn Future<Output = Result<TaskWatchPageModel, String>> + Send + '_>> {
-            Box::pin(std::future::ready(Ok(snapshot_into_task_watch_model(
+        fn read_task_watch_baseline(&self) -> TaskWatchBaselineFuture<'_> {
+            Box::pin(std::future::ready(Ok(safe_task_watch_baseline(
                 watch_snapshot("task:mutual", 1, 10),
             ))))
         }
 
-        fn open_task_watch(&self, _request: TaskWatchRequest) -> TaskWatchOpenFuture<'_> {
+        fn open_task_watch_session(&self, _baseline: TaskWatchBaseline) -> TaskWatchOpenFuture<'_> {
             self.task_open_calls.fetch_add(1, Ordering::SeqCst);
             self.task_stream_dropped.store(false, Ordering::SeqCst);
             let dropped = Arc::clone(&self.task_stream_dropped);
@@ -4856,6 +4953,7 @@ mod tests {
                 egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
                     task_id: task_id.to_owned(),
                     revision,
+                    status: TaskStatus::Active as i32,
                     ..Default::default()
                 },
             ),
@@ -4868,10 +4966,108 @@ mod tests {
             health: "PROJECTION_HEALTH_READY".to_owned(),
             stale: false,
             position: format!("epoch:watch:{sequence}"),
-            resume_epoch: Some("epoch:watch".to_owned()),
-            resume_sequence: Some(sequence),
             tasks: vec![watch_task(task_id, revision)],
             approvals: Vec::new(),
+        }
+    }
+
+    fn safe_task_watch_baseline(snapshot: Snapshot) -> TaskWatchBaseline {
+        let (epoch, sequence) = snapshot
+            .position
+            .rsplit_once(':')
+            .map(|(epoch, sequence)| {
+                (
+                    epoch.to_owned(),
+                    sequence.parse::<u64>().expect("test baseline sequence"),
+                )
+            })
+            .expect("test baseline position");
+        let position = GovernedProjectionPosition { epoch, sequence };
+        let tasks = snapshot
+            .tasks
+            .into_iter()
+            .map(|view| {
+                let task = view.task.expect("test Task snapshot");
+                watch_governed_task(
+                    &task.task_id,
+                    task.revision,
+                    TaskStatus::try_from(task.status).expect("test Task status"),
+                    &position,
+                )
+            })
+            .collect();
+        TaskWatchBaseline::from_safe_projection_adapter(position, tasks)
+    }
+
+    fn watch_governed_task(
+        task_id: &str,
+        revision: u64,
+        status: TaskStatus,
+        position: &GovernedProjectionPosition,
+    ) -> GovernedTaskState {
+        GovernedTaskState {
+            task_id: task_id.to_owned(),
+            revision,
+            status,
+            resume_status: None,
+            hold_reason: None,
+            projection: GovernedProjectionState {
+                position: position.clone(),
+                health: ProjectionHealth::Ready,
+                stale: false,
+                reason: None,
+            },
+            run: None,
+        }
+    }
+
+    fn watch_detailed_governed_task(
+        task_id: &str,
+        position: &GovernedProjectionPosition,
+    ) -> GovernedTaskState {
+        let mut task = watch_governed_task(task_id, 3, TaskStatus::Active, position);
+        task.hold_reason = Some(GovernedHoldReason::ManualRecoveryRequired);
+        task.run = Some(egopulse_client_operations::GovernedRunState {
+            run_id: "run:safe-review".to_owned(),
+            revision: 4,
+            status: RunStatus::Returned,
+            work_revision: 2,
+            hold_reason: Some(GovernedHoldReason::CompensationRequired),
+            steps: vec![egopulse_client_operations::GovernedStepState {
+                step_id: "step:safe-review".to_owned(),
+                revision: 5,
+                status: egopulse_domain_contracts::v01::egopulse::collaboration::v1::StepStatus::Held,
+                hold_reason: Some(GovernedHoldReason::ManualRecoveryRequired),
+                current_attempt_id: Some("attempt:safe-review".to_owned()),
+                attempts: vec![egopulse_client_operations::GovernedAttemptState {
+                    attempt_id: "attempt:safe-review".to_owned(),
+                    revision: 6,
+                    attempt_number: 1,
+                    status: egopulse_domain_contracts::v01::egopulse::collaboration::v1::AttemptStatus::Held,
+                    recovery_class: egopulse_domain_contracts::v01::egopulse::collaboration::v1::RecoveryClass::ManualOnly,
+                    hold_reason: Some(GovernedHoldReason::IrreversibleOutcomeUnknown),
+                    last_harness_sequence: 9,
+                    checkpoint_reference_recorded: true,
+                }],
+            }],
+        });
+        task
+    }
+
+    fn watch_governed_update(
+        classification: egopulse_client_operations::TaskWatchClassification,
+        task_id: Option<&str>,
+        sequence: u64,
+    ) -> egopulse_client_operations::GovernedTaskUpdate {
+        let position = GovernedProjectionPosition {
+            epoch: "epoch:watch".to_owned(),
+            sequence,
+        };
+        egopulse_client_operations::GovernedTaskUpdate {
+            classification,
+            position: position.clone(),
+            task: task_id
+                .map(|task_id| watch_governed_task(task_id, 1, TaskStatus::Active, &position)),
         }
     }
 
@@ -4951,15 +5147,17 @@ mod tests {
     }
 
     impl TaskWatchClient for FakeInteractiveClient {
-        fn task_watch_baseline(
-            &self,
-        ) -> Pin<Box<dyn Future<Output = Result<TaskWatchPageModel, String>> + Send + '_>> {
-            Box::pin(async { Err("Task watch not used by Context modal test".to_owned()) })
+        fn read_task_watch_baseline(&self) -> TaskWatchBaselineFuture<'_> {
+            Box::pin(async {
+                Err(ClientGovernedTaskError::Protocol(
+                    "Task watch not used by Context modal test",
+                ))
+            })
         }
 
-        fn open_task_watch(&self, _request: TaskWatchRequest) -> TaskWatchOpenFuture<'_> {
+        fn open_task_watch_session(&self, _baseline: TaskWatchBaseline) -> TaskWatchOpenFuture<'_> {
             Box::pin(async {
-                Err(ClientTaskWatchError::Transport(
+                Err(ClientGovernedTaskError::Transport(
                     "Task watch not used by Context modal test".to_owned(),
                 ))
             })
@@ -5852,32 +6050,47 @@ mod tests {
 
     #[test]
     fn task_watch_page_renders_explicit_live_and_stale_state() {
-        let mut app = App::new("watch-render".to_owned());
-        app.mode = InteractiveMode::TaskWatch;
-        assert!(
-            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-                .unwrap()
-                .is_none(),
-            "Task review cannot start without a selected Task"
+        let position = GovernedProjectionPosition {
+            epoch: "epoch:watch".to_owned(),
+            sequence: 14,
+        };
+        let model = TaskWatchPageModel::from_safe_projection_adapter(
+            position.clone(),
+            vec![watch_detailed_governed_task("task:render", &position)],
         );
-        app.snapshot = Some(watch_snapshot("task:render", 3, 14));
-        app.message = "Task Watch live".to_owned();
-        let backend = ratatui::backend::TestBackend::new(110, 24);
-        let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
-        terminal
-            .draw(|frame| app.render(frame))
-            .expect("render Task Watch page");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("Task Watch"));
-        assert!(rendered.contains("task:render"));
-        assert!(rendered.contains("live"));
-        assert!(rendered.contains("Esc dashboard"));
+        for width in [70, 120] {
+            let backend = ratatui::backend::TestBackend::new(width, 36);
+            let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| render_task_watch(frame, frame.area(), &model))
+                .expect("render Task Watch page");
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("Task Watch"));
+            assert!(rendered.contains("task:render"));
+            assert!(rendered.contains("TASK_STATUS_ACTIVE"));
+            assert!(rendered.contains("RUN_STATUS_RETURNED"));
+            assert!(rendered.contains("last_harness_sequence=9"));
+            assert!(rendered.contains("checkpoint_reference_recorded=true"));
+            assert!(rendered.contains("does not complete the Task"));
+            assert!(rendered.contains("Esc"), "rendered={rendered}");
+            assert!(rendered.contains("dashboard"), "rendered={rendered}");
+            for forbidden in [
+                "workspace-canary",
+                "provider-canary",
+                "dispatch-canary",
+                "checkpoint-id-canary",
+                "sensitive-integrity-canary",
+            ] {
+                assert!(!rendered.contains(forbidden), "forbidden={forbidden}");
+            }
+            assert!(!rendered.contains("TASK_STATUS_COMPLETED"));
+        }
     }
 
     #[tokio::test]
@@ -5888,7 +6101,6 @@ mod tests {
                 sessions: Arc::new(Mutex::new(VecDeque::from_iter(
                     (0..session_count).map(|_| VecDeque::from([ScriptedWatchStep::Pending])),
                 ))),
-                requests: Arc::new(Mutex::new(Vec::new())),
                 snapshot_calls: Arc::new(AtomicUsize::new(0)),
                 open_calls: Arc::new(AtomicUsize::new(0)),
                 next_calls: Arc::new(AtomicUsize::new(0)),
@@ -5917,7 +6129,10 @@ mod tests {
         );
         assert!(matches!(escaped.mode, InteractiveMode::Dashboard));
         assert!(escaped.task_watch.is_none());
-        assert_eq!(escaped.snapshot.as_ref().unwrap().resume_sequence, Some(61));
+        assert_eq!(
+            escaped.snapshot.as_ref().unwrap().position,
+            "epoch:watch:61"
+        );
 
         let mut refetched = App::new("watch-refetch".to_owned());
         refetched.client = Some(make_client(
@@ -5940,7 +6155,11 @@ mod tests {
         );
         assert!(matches!(refetched.mode, InteractiveMode::TaskWatch));
         assert_eq!(
-            refetched.snapshot.as_ref().unwrap().resume_sequence,
+            refetched
+                .task_watch
+                .as_ref()
+                .and_then(TaskWatchController::model)
+                .map(|model| model.position.sequence),
             Some(71)
         );
 
@@ -5965,6 +6184,40 @@ mod tests {
         let result = finish_interactive_session(&mut failed, Err::<(), _>("boom".to_owned())).await;
         assert_eq!(result.unwrap_err(), "boom");
         assert!(failed.task_watch.is_none());
+    }
+
+    #[tokio::test]
+    async fn task_watch_failure_handler_never_mutates_the_dashboard_snapshot() {
+        let dashboard = watch_snapshot("task:dashboard-authority-fact", 9, 79);
+        let client = Arc::new(WatchInteractiveClient {
+            snapshots: Arc::new(Mutex::new(VecDeque::from([watch_snapshot(
+                "task:watch-baseline",
+                1,
+                80,
+            )]))),
+            sessions: Arc::new(Mutex::new(VecDeque::from([VecDeque::from([
+                ScriptedWatchStep::Pending,
+            ])]))),
+            snapshot_calls: Arc::new(AtomicUsize::new(0)),
+            open_calls: Arc::new(AtomicUsize::new(0)),
+            next_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut app = App::new("watch-failure-snapshot".to_owned());
+        app.snapshot = Some(dashboard.clone());
+        app.client = Some(client as Arc<dyn InteractiveClient>);
+        app.start_task_watch().await.unwrap();
+
+        app.handle_task_watch_failure("projection integrity failure".to_owned())
+            .await;
+
+        let after = app.snapshot.as_ref().expect("dashboard snapshot retained");
+        assert_eq!(after.health, dashboard.health);
+        assert_eq!(after.stale, dashboard.stale);
+        assert_eq!(after.position, dashboard.position);
+        assert_eq!(after.tasks, dashboard.tasks);
+        assert_eq!(after.approvals, dashboard.approvals);
+        assert!(app.task_watch.is_none());
+        assert!(app.message.contains("stopped fail-closed"));
     }
 
     #[test]
@@ -6001,6 +6254,16 @@ mod tests {
                 .unwrap(),
             Some(InteractiveAction::Quit)
         ));
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -6207,21 +6470,50 @@ mod tests {
 
     #[tokio::test]
     async fn confirmed_task_projection_lag_blocks_wrong_review_and_keeps_exact_selection() {
-        let mut first = watch_snapshot("task:other", 1, 90);
-        first.tasks[0].task.as_mut().unwrap().status = TaskStatus::Active as i32;
-        let mut second = watch_snapshot("task:confirmed", 1, 91);
-        second.tasks[0].task.as_mut().unwrap().status = TaskStatus::Active as i32;
-        let client = Arc::new(WatchInteractiveClient {
-            snapshots: Arc::new(Mutex::new(VecDeque::from([first, second]))),
-            sessions: Arc::new(Mutex::new(VecDeque::from([
-                VecDeque::from([ScriptedWatchStep::Pending]),
-                VecDeque::from([ScriptedWatchStep::Pending]),
+        let unrelated = Arc::new(tokio::sync::Notify::new());
+        let reset = Arc::new(tokio::sync::Notify::new());
+        let target = Arc::new(tokio::sync::Notify::new());
+        let typed_client = Arc::new(WatchInteractiveClient {
+            snapshots: Arc::new(Mutex::new(VecDeque::from([
+                watch_snapshot("task:other", 1, 90),
+                watch_snapshot("task:other", 2, 91),
             ]))),
-            requests: Arc::new(Mutex::new(Vec::new())),
+            sessions: Arc::new(Mutex::new(VecDeque::from([
+                VecDeque::from([
+                    ScriptedWatchStep::WaitUpdate(
+                        Arc::clone(&unrelated),
+                        Box::new(watch_governed_update(
+                            egopulse_client_operations::TaskWatchClassification::Applied,
+                            Some("task:unrelated"),
+                            91,
+                        )),
+                    ),
+                    ScriptedWatchStep::WaitUpdate(
+                        Arc::clone(&reset),
+                        Box::new(watch_governed_update(
+                            egopulse_client_operations::TaskWatchClassification::ResetRequired,
+                            None,
+                            91,
+                        )),
+                    ),
+                ]),
+                VecDeque::from([
+                    ScriptedWatchStep::WaitUpdate(
+                        Arc::clone(&target),
+                        Box::new(watch_governed_update(
+                            egopulse_client_operations::TaskWatchClassification::Applied,
+                            Some("task:confirmed"),
+                            92,
+                        )),
+                    ),
+                    ScriptedWatchStep::Pending,
+                ]),
+            ]))),
             snapshot_calls: Arc::new(AtomicUsize::new(0)),
             open_calls: Arc::new(AtomicUsize::new(0)),
             next_calls: Arc::new(AtomicUsize::new(0)),
-        }) as Arc<dyn InteractiveClient>;
+        });
+        let client = Arc::clone(&typed_client) as Arc<dyn InteractiveClient>;
         let mut app = App::new("work-projection-lag".to_owned());
         app.client = Some(client);
         app.pending_task_watch_selection = Some("task:confirmed".to_owned());
@@ -6245,15 +6537,79 @@ mod tests {
         );
         assert!(app.message.contains("exact projection has not arrived"));
         assert_ne!(
-            app.snapshot.as_ref().unwrap().tasks[0]
-                .task
-                .as_ref()
-                .unwrap()
-                .status,
-            TaskStatus::Completed as i32
+            app.task_watch.as_ref().unwrap().model().unwrap().tasks[0].status,
+            TaskStatus::Completed
         );
 
-        app.start_task_watch().await.unwrap();
+        unrelated.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                app.apply_task_watch_events().await.unwrap();
+                if app
+                    .task_watch
+                    .as_ref()
+                    .unwrap()
+                    .model()
+                    .unwrap()
+                    .position
+                    .sequence
+                    == 91
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.task_watch
+                .as_ref()
+                .unwrap()
+                .model()
+                .unwrap()
+                .selected_task_id,
+            None,
+            "an unrelated Applied update cannot consume the confirmed Task target"
+        );
+
+        reset.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                app.apply_task_watch_events().await.unwrap();
+                if typed_client.snapshot_calls.load(Ordering::SeqCst) >= 2
+                    && typed_client.open_calls.load(Ordering::SeqCst) >= 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.task_watch
+                .as_ref()
+                .unwrap()
+                .model()
+                .unwrap()
+                .selected_task_id,
+            None,
+            "reset/rebaseline cannot select a different Task while the exact target is pending"
+        );
+
+        target.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                app.apply_task_watch_events().await.unwrap();
+                if app.pending_task_watch_selection.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(app.pending_task_watch_selection.is_none());
         assert_eq!(
             app.task_watch
