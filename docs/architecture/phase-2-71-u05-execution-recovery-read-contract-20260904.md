@@ -15,20 +15,34 @@ a resume, retry, recover or other mutation operation.
 The public projection is deliberately smaller than `TaskView`. It contains
 only safe identity and state facts:
 
-- Task identity, revision and typed status;
+- Task identity, revision, typed status, optional Authority-recorded resume
+  status and classified hold reason;
 - Run identity, revision, typed status, work revision and classified hold
   reason;
 - ordered Step identities, revisions, typed statuses, safe hold reasons and
   current Attempt identity;
 - ordered Attempt identities, revisions, numbers, typed statuses, recovery
-  classes, safe hold reasons and a checkpoint-available boolean; and
-- projection epoch/sequence, health and stale state.
+  classes, safe hold reasons, last Harness sequence and a
+  checkpoint-reference-recorded boolean; and
+- projection epoch/sequence, health, stale state and classified safe reason.
 
 Hold reasons are represented only by the closed `GovernedHoldReason` enum:
 CancellationOutcomeUnknown, CompensationRequired, ManualRecoveryRequired,
 IrreversibleOutcomeUnknown or Unclassified. An absent reason remains absent;
 any other raw system value maps to Unclassified and is never copied into the
 safe DTO or its debug representation.
+
+Projection reasons are similarly represented only by the closed
+`GovernedProjectionReason` enum: DependencyProjectionPending,
+ProjectionNotReady, TaskProjectionInvalid or Unclassified. Unknown raw reason
+text is not retained. `resume_status=UNSPECIFIED` is represented as absent;
+known non-unspecified values are preserved and unknown enum values fail
+closed. No resume value or hold reason is synthesized when Authority did not
+record one.
+
+`checkpoint_reference_recorded` says only that the Attempt snapshot contains
+a checkpoint reference. It does not assert that checkpoint contents are
+readable, intact, compatible or sufficient for recovery.
 
 The projection does not retain or expose raw `TaskView`, metadata blobs,
 workspace or Harness references, capability profiles, dispatch identities or
@@ -49,11 +63,12 @@ and item 1,001 fail closed before a baseline is published. The component
 evidence exercises exactly 1,000 items successfully and rejects item 1,001;
 it does not rely on a smaller three-page sample as capacity evidence.
 
-`GovernedTaskBaseline` owns its private snapshot position and is consumed by
-`ClientAttachment::open_governed_task_session`. A caller cannot replace that
-resume cursor. The session reuses `TaskWatchProcessor` and therefore the
-existing `SnapshotStreamTracker`; it does not implement a second stream
-ordering algorithm.
+`GovernedTaskBaseline` owns an internally non-replaceable, consume-bound
+snapshot position. The position remains visible through a read-only getter,
+but `ClientAttachment::open_governed_task_session` consumes the baseline and a
+caller cannot substitute another resume cursor. The session reuses
+`TaskWatchProcessor` and therefore the existing `SnapshotStreamTracker`; it
+does not implement a second stream ordering algorithm.
 
 Applied frames update the safe Task map. Distinct Tasks at the same projection
 position remain valid. Replay and Heartbeat frames do not duplicate or mutate
@@ -85,11 +100,11 @@ For a projected Collaboration snapshot it verifies:
 - `current_attempt_id`, when present, names an Attempt in that Step; and
 - every Attempt is unique and binds to the same Run and Step.
 
-A missing Collaboration projection is represented as unavailable only when
-the Task projection explicitly reports stale or non-ready health. It is not
-interpreted as no Run, successful execution or Task completion. A ready,
-non-stale Task that names a current Run but omits Collaboration facts fails
-closed.
+A Task that names a current Run may omit Collaboration facts only for the
+exact production dependency state `stale=true` plus
+DependencyProjectionPending. Non-stale views and stale views carrying another
+or absent reason fail closed. The allowed dependency state is not interpreted
+as no Run, successful execution or Task completion.
 
 ## Automated evidence
 
@@ -114,9 +129,12 @@ git diff --check
 
 The focused tests cover normal execution plus OutcomeUnknown, Reconciling,
 Held and Interrupted facts; closed hold-reason classification and sensitive
-hold canaries; two ordered Steps with historical and current Attempts;
-zero-work-revision, unknown/unspecified enum, source-metadata and
-Task/Run/Step/Attempt lineage failures; fixed-position multipage reads;
+hold canaries; absent/valid/unknown resume status; closed projection reasons
+and unknown-reason canaries; zero and positive last Harness sequence;
+checkpoint-reference presence semantics; two ordered Steps with historical
+and current Attempts; zero-work-revision, unknown/unspecified enum,
+source-metadata and Task/Run/Step/Attempt lineage failures; fixed-position
+multipage reads;
 exactly 1,000 items, item 1,001, blank/control/empty-page cursors and premature
 pagination completion; permission-before-dispatch; and Applied, Replay,
 Heartbeat and ResetRequired session behavior. Windows linking emitted the

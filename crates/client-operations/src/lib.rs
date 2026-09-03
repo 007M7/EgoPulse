@@ -281,6 +281,15 @@ pub struct GovernedProjectionState {
     pub position: GovernedProjectionPosition,
     pub health: ProjectionHealth,
     pub stale: bool,
+    pub reason: Option<GovernedProjectionReason>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GovernedProjectionReason {
+    DependencyProjectionPending,
+    ProjectionNotReady,
+    TaskProjectionInvalid,
+    Unclassified,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -300,7 +309,8 @@ pub struct GovernedAttemptState {
     pub status: AttemptStatus,
     pub recovery_class: RecoveryClass,
     pub hold_reason: Option<GovernedHoldReason>,
-    pub checkpoint_available: bool,
+    pub last_harness_sequence: u64,
+    pub checkpoint_reference_recorded: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -328,6 +338,8 @@ pub struct GovernedTaskState {
     pub task_id: String,
     pub revision: u64,
     pub status: DomainTaskStatus,
+    pub resume_status: Option<DomainTaskStatus>,
+    pub hold_reason: Option<GovernedHoldReason>,
     pub projection: GovernedProjectionState,
     pub run: Option<GovernedRunState>,
 }
@@ -357,8 +369,9 @@ pub enum ClientGovernedTaskError {
     ResetBarrier,
 }
 
-/// A complete governed Task snapshot. The exact projection position is private
-/// and is consumed when opening the corresponding live session.
+/// A complete governed Task snapshot. Its projection position is read-only,
+/// internally non-replaceable and consumed with the snapshot when opening the
+/// corresponding live session.
 pub struct GovernedTaskBaseline {
     tasks: BTreeMap<String, GovernedTaskState>,
     position: GovernedProjectionPosition,
@@ -377,7 +390,7 @@ impl GovernedTaskBaseline {
 }
 
 /// A governed Task baseline plus a live watch that starts at exactly that
-/// baseline's private projection position.
+/// baseline's internally bound projection position.
 pub struct GovernedTaskSession {
     watch: TaskWatch,
     tasks: BTreeMap<String, GovernedTaskState>,
@@ -3466,6 +3479,7 @@ fn governed_task_state_from_view(
         position: governed_position(position)?,
         health,
         stale: metadata.stale,
+        reason: governed_projection_reason(metadata.safe_health_reason_code.as_deref()),
     };
     let task = view.task.as_ref().ok_or(ClientGovernedTaskError::Protocol(
         "governed Task snapshot is missing",
@@ -3483,6 +3497,10 @@ fn governed_task_state_from_view(
             "governed Task status is unspecified",
         ));
     }
+    let resume_status = DomainTaskStatus::try_from(task.resume_status)
+        .map_err(|_| ClientGovernedTaskError::Protocol("governed Task resume status is unknown"))?;
+    let resume_status = (resume_status != DomainTaskStatus::Unspecified).then_some(resume_status);
+    let hold_reason = governed_hold_reason(task.hold_reason_code.as_deref());
     let current_run_id = validate_optional_governed_identifier(
         task.current_run_id.as_deref(),
         "governed Task current Run identity is invalid",
@@ -3495,9 +3513,13 @@ fn governed_task_state_from_view(
             current_run_id.as_deref(),
         )?),
         None => {
-            if current_run_id.is_some() && health == ProjectionHealth::Ready && !metadata.stale {
+            if current_run_id.is_some()
+                && !(metadata.stale
+                    && projection.reason
+                        == Some(GovernedProjectionReason::DependencyProjectionPending))
+            {
                 return Err(ClientGovernedTaskError::Protocol(
-                    "ready governed Task omitted its current Run projection",
+                    "governed Task omitted its current Run without dependency-pending state",
                 ));
             }
             None
@@ -3508,6 +3530,8 @@ fn governed_task_state_from_view(
         task_id: task.task_id.clone(),
         revision: task.revision,
         status,
+        resume_status,
+        hold_reason,
         projection,
         run,
     })
@@ -3662,7 +3686,7 @@ fn governed_attempt_state(
         ));
     }
     let hold_reason = governed_hold_reason(attempt.hold_reason_code.as_deref());
-    let checkpoint_available = match attempt.latest_checkpoint_id.as_deref() {
+    let checkpoint_reference_recorded = match attempt.latest_checkpoint_id.as_deref() {
         Some(value) => {
             validate_governed_identifier(value, "governed checkpoint identity is invalid")?;
             true
@@ -3676,7 +3700,17 @@ fn governed_attempt_state(
         status,
         recovery_class,
         hold_reason,
-        checkpoint_available,
+        last_harness_sequence: attempt.last_harness_sequence,
+        checkpoint_reference_recorded,
+    })
+}
+
+fn governed_projection_reason(value: Option<&str>) -> Option<GovernedProjectionReason> {
+    value.map(|value| match value {
+        "DEPENDENCY_PROJECTION_PENDING" => GovernedProjectionReason::DependencyProjectionPending,
+        "PROJECTION_NOT_READY" => GovernedProjectionReason::ProjectionNotReady,
+        "TASK_PROJECTION_INVALID" => GovernedProjectionReason::TaskProjectionInvalid,
+        _ => GovernedProjectionReason::Unclassified,
     })
 }
 
@@ -5455,7 +5489,9 @@ mod tests {
             dispatch_id: Some("sensitive-dispatch-canary".to_owned()),
             dispatch_fingerprint: Some("c".repeat(64)),
             harness_session_ref: Some("sensitive-session-canary".to_owned()),
-            latest_checkpoint_id: Some("sensitive-checkpoint-canary".to_owned()),
+            last_harness_sequence: if attempt_number == 1 { 0 } else { 42 },
+            latest_checkpoint_id: (attempt_number > 1)
+                .then(|| "sensitive-checkpoint-canary".to_owned()),
             recovery_class: recovery as i32,
             hold_reason_code: (matches!(
                 status,
@@ -5495,6 +5531,8 @@ mod tests {
                 revision: 4,
                 work_revision: 2,
                 status: task_status as i32,
+                hold_reason_code: (task_status == TaskStatus::Held)
+                    .then(|| "MANUAL_RECOVERY_REQUIRED".to_owned()),
                 current_run_id: Some(run_id.clone()),
                 ..TaskSnapshot::default()
             }),
@@ -5686,8 +5724,15 @@ mod tests {
             );
             let state = governed_task_state_from_view(&view).expect("valid governed state");
             assert_eq!(state.status, task_status);
+            assert_eq!(state.resume_status, None);
+            assert_eq!(
+                state.hold_reason,
+                (task_status == TaskStatus::Held)
+                    .then_some(GovernedHoldReason::ManualRecoveryRequired)
+            );
             assert_eq!(state.projection.health, ProjectionHealth::Ready);
             assert!(!state.projection.stale);
+            assert_eq!(state.projection.reason, None);
             let run = state.run.as_ref().expect("run state");
             assert_eq!(run.status, run_status);
             assert_eq!(run.work_revision, 2);
@@ -5699,6 +5744,8 @@ mod tests {
                 assert_eq!(historical.attempt_number, 1);
                 assert_eq!(historical.status, AttemptStatus::Interrupted);
                 assert_eq!(historical.recovery_class, RecoveryClass::RetryIdempotent);
+                assert_eq!(historical.last_harness_sequence, 0);
+                assert!(!historical.checkpoint_reference_recorded);
                 let current = &step.attempts[1];
                 assert_eq!(
                     step.current_attempt_id.as_deref(),
@@ -5707,7 +5754,8 @@ mod tests {
                 assert_eq!(current.attempt_number, 2);
                 assert_eq!(current.status, attempt_status);
                 assert_eq!(current.recovery_class, recovery_class);
-                assert!(current.checkpoint_available);
+                assert_eq!(current.last_harness_sequence, 42);
+                assert!(current.checkpoint_reference_recorded);
             }
             let safe_debug = format!("{state:?}");
             for sensitive in [
@@ -5732,6 +5780,8 @@ mod tests {
             RecoveryClass::ManualOnly,
         );
         let collaboration = unclassified.collaboration.as_mut().expect("collaboration");
+        unclassified.task.as_mut().expect("task").hold_reason_code =
+            Some("sensitive-hold-reason-canary".to_owned());
         collaboration.run.as_mut().expect("run").hold_reason_code =
             Some("sensitive-hold-reason-canary".to_owned());
         for step in &mut collaboration.steps {
@@ -5741,6 +5791,7 @@ mod tests {
             attempt.hold_reason_code = Some("sensitive-hold-reason-canary".to_owned());
         }
         let safe = governed_task_state_from_view(&unclassified).expect("unclassified hold");
+        assert_eq!(safe.hold_reason, Some(GovernedHoldReason::Unclassified));
         let run = safe.run.as_ref().expect("run");
         assert_eq!(run.hold_reason, Some(GovernedHoldReason::Unclassified));
         assert!(run.steps.iter().all(|step| {
@@ -5751,6 +5802,59 @@ mod tests {
                     .all(|attempt| attempt.hold_reason == Some(GovernedHoldReason::Unclassified))
         }));
         assert!(!format!("{safe:?}").contains("sensitive-hold-reason-canary"));
+
+        let mut resumable = governed_test_view(
+            &position,
+            "resumable",
+            TaskStatus::Interrupted,
+            RunStatus::Active,
+            StepStatus::Active,
+            AttemptStatus::Interrupted,
+            RecoveryClass::ResumeSafe,
+        );
+        resumable.task.as_mut().expect("task").resume_status = TaskStatus::Active as i32;
+        assert_eq!(
+            governed_task_state_from_view(&resumable)
+                .expect("valid resume status")
+                .resume_status,
+            Some(TaskStatus::Active)
+        );
+
+        for (raw, expected) in [
+            (
+                "DEPENDENCY_PROJECTION_PENDING",
+                GovernedProjectionReason::DependencyProjectionPending,
+            ),
+            (
+                "PROJECTION_NOT_READY",
+                GovernedProjectionReason::ProjectionNotReady,
+            ),
+            (
+                "TASK_PROJECTION_INVALID",
+                GovernedProjectionReason::TaskProjectionInvalid,
+            ),
+            (
+                "sensitive-projection-reason-canary",
+                GovernedProjectionReason::Unclassified,
+            ),
+        ] {
+            let mut view = governed_test_view(
+                &position,
+                "projection-reason",
+                TaskStatus::Active,
+                RunStatus::Active,
+                StepStatus::Active,
+                AttemptStatus::Running,
+                RecoveryClass::ResumeSafe,
+            );
+            view.metadata
+                .as_mut()
+                .expect("metadata")
+                .safe_health_reason_code = Some(raw.to_owned());
+            let state = governed_task_state_from_view(&view).expect("safe projection reason");
+            assert_eq!(state.projection.reason, Some(expected));
+            assert!(!format!("{state:?}").contains("sensitive-projection-reason-canary"));
+        }
 
         let mut stale = governed_test_view(
             &position,
@@ -5764,19 +5868,38 @@ mod tests {
         stale.collaboration = None;
         let metadata = stale.metadata.as_mut().expect("metadata");
         metadata.stale = true;
+        metadata.safe_health_reason_code = Some("DEPENDENCY_PROJECTION_PENDING".to_owned());
         metadata
             .source_revisions
             .retain(|source| source.domain != SourceDomain::Collaboration as i32);
         let state = governed_task_state_from_view(&stale).expect("stale dependency is explicit");
         assert!(state.projection.stale);
+        assert_eq!(
+            state.projection.reason,
+            Some(GovernedProjectionReason::DependencyProjectionPending)
+        );
         assert!(state.run.is_none());
         assert_eq!(state.status, TaskStatus::Active);
 
-        stale.metadata.as_mut().expect("metadata").stale = false;
+        stale
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .safe_health_reason_code = Some("PROJECTION_NOT_READY".to_owned());
         assert!(matches!(
             governed_task_state_from_view(&stale),
             Err(ClientGovernedTaskError::Protocol(
-                "ready governed Task omitted its current Run projection"
+                "governed Task omitted its current Run without dependency-pending state"
+            ))
+        ));
+
+        let metadata = stale.metadata.as_mut().expect("metadata");
+        metadata.safe_health_reason_code = Some("DEPENDENCY_PROJECTION_PENDING".to_owned());
+        metadata.stale = false;
+        assert!(matches!(
+            governed_task_state_from_view(&stale),
+            Err(ClientGovernedTaskError::Protocol(
+                "governed Task omitted its current Run without dependency-pending state"
             ))
         ));
     }
@@ -5804,6 +5927,9 @@ mod tests {
         }
         let mut value = valid();
         value.task.as_mut().expect("task").work_revision = 0;
+        invalid.push(value);
+        let mut value = valid();
+        value.task.as_mut().expect("task").resume_status = i32::MAX;
         invalid.push(value);
         for status in [i32::MAX, RunStatus::Unspecified as i32] {
             let mut value = valid();
