@@ -20,18 +20,27 @@ use std::{
 };
 
 use egopulse_agentosd::{
-    AuthorityCompositionInputs, AuthorityPrincipalResolver, ConfiguredArtifactAdmissionGuard,
+    ArtifactAuthorityReferenceSource, ArtifactProjectionSource, AuthorityCompositionInputs,
+    AuthorityPrincipalResolver, CollaborationProjectionSource, ConfiguredArtifactAdmissionGuard,
     ConfiguredArtifactAdmissionGuardConfig, ConfiguredTaskTransitionGuard,
     ConfiguredWorkPreparationPort, ContextMutationPortAdapter, DaemonComposition, DaemonConfig,
     DaemonProviders, DenyVerificationReferences, GovernedReturnCollectorConfig,
     MemoryRetrievalCompositionConfig, NativeHarnessCompositionConfig, OwnerProjectionSource,
     PendingOwnerProjection, ProjectionSourceFailure, SharedAuthorityCompositionInputs,
+    VerificationProjectionSource,
 };
 use egopulse_artifact_authority::{
-    ArtifactAuthority, ArtifactAuthorityConfig, ArtifactSqlCipherKey,
+    ArtifactAuthority, ArtifactAuthorityConfig, ArtifactPrincipalKind, ArtifactSqlCipherKey,
+    AuthenticatedArtifactPrincipal, canonical_artifact_set_manifest,
+    canonical_request_digest as canonical_artifact_request_digest, content_address,
 };
-use egopulse_client_kernel::{ClientKernel, api_contract_ref, authorization_contract_ref};
-use egopulse_client_operations::{GuidedApprovalDecision, attach as attach_client_operation};
+use egopulse_client_kernel::{
+    ClientKernel, KernelError, api_contract_ref, authorization_contract_ref,
+};
+use egopulse_client_operations::{
+    ClientTaskResultReviewError, GuidedApprovalDecision, TaskResultReviewStage,
+    attach as attach_client_operation,
+};
 use egopulse_codex_adapter::{CODEX_ADAPTER_ID, CODEX_CAPABILITY_PROFILE_ID, FakeCodexDriver};
 use egopulse_cognition_runtime::{
     context_authority::{
@@ -43,17 +52,29 @@ use egopulse_cognition_runtime::{
         MemoryPrincipalKind, SubmitMemoryCandidate,
     },
     task_authority::{
-        CreationAuthorization, CreationGuardRejection, PrincipalKind as TaskPrincipalKind,
-        SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCreationGuard, TaskProjectionMessage,
+        AuthenticatedPrincipal as AuthenticatedTaskPrincipal, CreationAuthorization,
+        CreationGuardRejection, PrincipalKind as TaskPrincipalKind, SqlCipherKey, TaskAuthority,
+        TaskAuthorityConfig, TaskCreationGuard, TaskProjectionMessage,
     },
 };
 use egopulse_domain_contracts::v01::egopulse::{
+    artifact::v1::{
+        ArtifactCommand, ArtifactDescriptor, ArtifactSemanticClass, ArtifactSet, ArtifactSetStatus,
+        ArtifactStatus, Claim, ClaimSourceType, ClaimStatus, Evidence, EvidenceProducerClass,
+        EvidenceRelation, EvidenceStatus, IntegrityStatus, LineageBinding, ProducerIdentity,
+        Provenance, ReturnHandoff, ReturnHandoffStatus, SealArtifactCommand,
+        SealArtifactSetCommand, StageArtifactCommand, SubmitReturnHandoffCommand, artifact_command,
+    },
     collaboration::v1::{
-        AttemptSnapshot, AttemptStatus, CollaborationEvent, CollaborationSnapshot, Lease,
-        RecoveryClass, RunPlan, RunSnapshot, RunStatus, StepPlan, StepSnapshot, StepStatus,
+        AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptCommandBase, AttemptSnapshot,
+        AttemptStatus, CollaborationCommand, CollaborationEvent, CollaborationSnapshot,
+        CommitStepReturnCommand, CreateAttemptCommand, CreateRunCommand, Lease,
+        RecordAttemptReturnCommand, RecordDeliveryReceiptCommand, RecordDispatchIntentCommand,
+        RecordHarnessAckCommand, RecordRunningObservationCommand, RecoveryClass, RunCommandBase,
+        RunPlan, RunSnapshot, RunStatus, StepPlan, StepSnapshot, StepStatus, collaboration_command,
         collaboration_command_result,
     },
-    common::v1::ContractReference,
+    common::v1::{CommandMetadata, ContractReference},
     harness::v1::{
         ApprovalDecisionEnvelope, ApprovalKind, ApprovalRequestLifecycleKind,
         ApprovalRequestObservation, CancelExecutionEnvelope, DeliveryDisposition, DispatchEnvelope,
@@ -61,7 +82,7 @@ use egopulse_domain_contracts::v01::egopulse::{
         ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
     },
     localapi::v1::{
-        ClientSurface, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
+        ClientSurface, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest, LocalApiErrorCode,
         MemoryMutationCommand, OpenSessionRequest, RetrieveMemoryRequest,
         local_session_service_client::LocalSessionServiceClient, memory_mutation_command,
         retrieve_memory_response,
@@ -71,10 +92,24 @@ use egopulse_domain_contracts::v01::egopulse::{
         IssueHarnessApprovalDecisionCommand,
     },
     task::v1::{
-        CreateTaskCommand, RequestTaskCancellationCommand, TaskCommand, TaskEvent, TaskSnapshot,
-        TaskStatus, task_command,
+        ActivateTaskCommand, ApplyFounderVerdictCommand, CreateTaskCommand,
+        RecordTaskVerificationCommand, RequestTaskCancellationCommand, SubmitTaskEvidenceCommand,
+        TaskCommand, TaskEvent, TaskSnapshot, TaskStatus, task_command,
     },
-    verdict::v1::{ConsumeFounderVerdictCommand, IssueFounderVerdictCommand},
+    verdict::v1::{
+        ConfirmationClass, ConsumeFounderVerdictCommand, FounderVerdictDecision,
+        FounderVerdictState, FounderVerdictStateKind, IssueFounderVerdictCommand, ReworkDirective,
+        RiskAcceptance, RiskCategory, VerdictCommand, VerdictScope, verdict_command,
+    },
+    verification::v1::{
+        AttestCheckerProfileCommand, CheckerAssuranceClass, CheckerProfile, CheckerProfileStatus,
+        CompleteVerificationCommand, CreateVerificationRequestCommand, CriterionOutcome,
+        CriterionRequirement, CriterionResult, Discrepancy, DiscrepancySeverity, EvidenceCoverage,
+        RecordCriterionResultCommand, StartVerificationRunCommand, UnverifiedItem,
+        UnverifiedReason, VerificationArtifact, VerificationBinding, VerificationCommand,
+        VerificationConclusion, VerificationProvenance, VerificationRequest, VerificationStatus,
+        verification_command,
+    },
 };
 use egopulse_founder_verdict_authority::{
     AuthenticatedVerdictPrincipal, FounderAuthorization, FounderVerdictAuthority,
@@ -94,8 +129,13 @@ use egopulse_local_api::{
     command_gateway::{CommandPortFailure, CommandPrincipal},
 };
 use egopulse_local_ide_control::collaboration_control::{
-    DispatchMaterial, HarnessDispatchCycleError, HarnessDispatchCycleReport, HarnessDispatchRunner,
-    SingleHarnessWorkConfig,
+    AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
+    CollaborationControlConfig, CollaborationPrincipalKind, CollaborationReferenceGuard,
+    CollaborationSqlCipherKey, DispatchMaterial, HarnessDispatchCycleError,
+    HarnessDispatchCycleReport, HarnessDispatchRunner, HarnessEvidenceResolver, LeaseAuthorization,
+    ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
+    ResolvedHarnessEvidence, ResolvedStepReturn, SingleHarnessWorkConfig,
+    canonical_dispatch_fingerprint,
 };
 use egopulse_local_ipc_platform::LocalIpcAddress;
 use egopulse_policy_decision_authority::{
@@ -103,7 +143,10 @@ use egopulse_policy_decision_authority::{
     PolicyPrincipalKind, PolicyReferenceRejection, PolicySqlCipherKey,
     ResolvedApprovalAuthorization,
 };
-use egopulse_tui::{approval_queue::ApprovalQueueController, task_watch::TaskWatchController};
+use egopulse_tui::{
+    approval_queue::ApprovalQueueController, result_review::ResultReviewController,
+    task_watch::TaskWatchController,
+};
 use egopulse_v01_fault_conformance::memory_restart_oracle::MemoryRestartOracle;
 use egopulse_v01_fault_conformance::r8b2c::{
     R8b2cNativeEventRecord, R8b2cWitnessReader, R8b2cWitnessWriter, read_r8b2c_adapter_store,
@@ -121,8 +164,15 @@ use egopulse_v01_fault_conformance::r9a3_context::{
     R9a3ContextGovernanceState, R9a3VerdictAuthorityCounts, read_r9a3_context_authority_store,
     read_r9a3_verdict_authority_counts,
 };
+use egopulse_v01_fault_conformance::u03c_result_review::{
+    ExpectedStoreProfile, GovernedResultDurabilitySnapshot, GovernedResultOracleRequest,
+    read_governed_result_durability,
+};
 use egopulse_verification_authority::{
-    VerificationAuthority, VerificationAuthorityConfig, VerificationSqlCipherKey,
+    ArtifactBackedReferenceResolver, AuthenticatedVerificationPrincipal, CriterionPolicySnapshot,
+    VerificationAuthority, VerificationAuthorityConfig, VerificationPrincipalKind,
+    VerificationSqlCipherKey, canonical_checker_profile_digest,
+    canonical_request_digest as canonical_verification_request_digest,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -146,6 +196,36 @@ const R9A3D_EXTERNAL_SEND_MODE: &str = "dynamic-r9a3d-external-send";
 const R9A3D_EXTERNAL_RECOVERY_MODE: &str = "dynamic-r9a3d-external-recovery";
 const R9A3E_PREAUTH_UNAVAILABLE_MODE: &str = "dynamic-r9a3e-preauth-unavailable";
 const R9A3E_REVOKED_READY_MODE: &str = "dynamic-r9a3e-revoked-ready";
+const U03C_RESULT_REVIEW_MODE: &str = "u03c-result-review";
+const U03C_RESULT_REVIEW_DENY_MODE: &str = "u03c-result-review-deny";
+const U03C_RESULT_REVIEW_STALE_MODE: &str = "u03c-result-review-stale";
+const U03C_RUN_ID: &str = "run-u03c-result";
+const U03C_STEP_ID: &str = "step-u03c-result";
+const U03C_ATTEMPT_ID: &str = "attempt-u03c-result";
+const U03C_DISPATCH_ID: &str = "dispatch-u03c-result";
+const U03C_ARTIFACT_ID: &str = "artifact-u03c-result";
+const U03C_CLAIM_ID: &str = "claim-u03c-result";
+const U03C_EVIDENCE_ID: &str = "evidence-u03c-result";
+const U03C_ARTIFACT_SET_ID: &str = "artifact-set-u03c-result";
+const U03C_RETURN_HANDOFF_ID: &str = "return-handoff-u03c-result";
+const U03C_VERIFICATION_ID: &str = "verification-u03c-result";
+const U03C_VERIFICATION_REQUEST_ID: &str = "verification-request-u03c-result";
+const U03C_VERIFICATION_RUN_ID: &str = "verification-run-u03c-result";
+const U03C_CHECKER_PROFILE_ID: &str = "checker-u03c-result";
+const U03C_SENSITIVE_PRINCIPAL: &str = "sensitive-principal-u03c-never-render";
+const U03C_SENSITIVE_PROOF: &str = "proof:u03c:never-render";
+const U03C_SENSITIVE_WORKSPACE: &str = "workspace-u03c-never-render";
+const U03C_SENSITIVE_RAW: &str = "raw-u03c-provider-harness-never-render";
+const U03C_TASK_SCHEMA_SHA256: &str =
+    "468a3d02b5c0703eb1e7626fb70f1067905a603a98f959aabdf6c4b5961b0e32";
+const U03C_COLLABORATION_SCHEMA_SHA256: &str =
+    "c57c09247f94762b3a931d43c1e4db8b321abfea308e0493d729ecee771d1873";
+const U03C_ARTIFACT_SCHEMA_SHA256: &str =
+    "45f3045e75eb1bd44e234dd0e6bb09c3125916f650d72cc88e233422e3995f8e";
+const U03C_VERIFICATION_SCHEMA_SHA256: &str =
+    "dc1244bdbb588fe3d00cebe43bf7d8ad9178a07d10a5ae6f5add8c70628c01f6";
+const U03C_VERDICT_SCHEMA_SHA256: &str =
+    "05eee228072a7a81353bb952ab4b8799fa3432503cc3a20c93f20c8057931f59";
 const R8A_ACTIVATION_RUN_ID: &str = "r8a-activation-run";
 const R8A_DRIVER_RECORD: &str = "r8a-driver-record.json";
 const R8B_FIRST_RUNNER_CYCLE_RECORD: &str = "r8b-first-runner-cycle-complete";
@@ -1615,6 +1695,255 @@ impl egopulse_founder_verdict_authority::VerdictReferenceResolver for AllowVerdi
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct U03cVerdictReferences;
+
+impl egopulse_founder_verdict_authority::VerdictReferenceResolver for U03cVerdictReferences {
+    fn resolve_issue(
+        &self,
+        command: &IssueFounderVerdictCommand,
+        principal: &AuthenticatedVerdictPrincipal,
+    ) -> Result<(ResolvedVerdictContext, FounderAuthorization), VerdictReferenceRejection> {
+        Ok((
+            ResolvedVerdictContext {
+                scope: command
+                    .scope
+                    .clone()
+                    .ok_or(VerdictReferenceRejection::NotFound)?,
+                verification_conclusion: egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationConclusion::Passed,
+                open_discrepancy_ids: vec!["discrepancy-u03c".to_owned()],
+                open_unverified_item_ids: vec!["unverified-u03c".to_owned()],
+                non_overridable_gate_ids: Vec::new(),
+            },
+            FounderAuthorization {
+                authenticated_founder_principal_id: principal.principal_id.clone(),
+                authority_ref: "founder-authority:u03c-fixture".to_owned(),
+                confirmation_class: ConfirmationClass::Explicit,
+                confirmation_proof_ref: command.confirmation_proof_ref.clone(),
+                verified_at: prost_types::Timestamp {
+                    seconds: 1_788_220_800,
+                    nanos: 0,
+                },
+                valid_until: prost_types::Timestamp {
+                    seconds: 4_102_444_800,
+                    nanos: 0,
+                },
+                authority_policy_ref: ContractReference {
+                    contract_id: "u03c-founder-policy".to_owned(),
+                    version: "v0.1".to_owned(),
+                    sha256: "44".repeat(32),
+                },
+                evidence_refs: vec!["evidence:u03c:founder-confirmation".to_owned()],
+            },
+        ))
+    }
+
+    fn validate_task_commit(
+        &self,
+        _command: &ConsumeFounderVerdictCommand,
+        _scope: &VerdictScope,
+    ) -> Result<(), VerdictReferenceRejection> {
+        Ok(())
+    }
+
+    fn validate_revoke(
+        &self,
+        _command: &egopulse_domain_contracts::v01::egopulse::verdict::v1::RevokeFounderVerdictCommand,
+        _principal: &AuthenticatedVerdictPrincipal,
+    ) -> Result<Vec<String>, VerdictReferenceRejection> {
+        Ok(vec!["evidence:u03c:founder-revoke".to_owned()])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct U03cCollaborationGuard;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct U03cAuthorityClock;
+
+impl AuthorityClock for U03cAuthorityClock {
+    fn now(&self) -> prost_types::Timestamp {
+        prost_types::Timestamp {
+            seconds: 1_788_220_800,
+            nanos: 0,
+        }
+    }
+}
+
+impl CollaborationReferenceGuard for U03cCollaborationGuard {
+    fn validate_create_run(
+        &self,
+        command: &CreateRunCommand,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        (!command.task_id.is_empty() && command.task_revision == 2 && command.work_revision == 1)
+            .then_some(ReferenceAuthorization {
+                evidence_refs: vec!["task-authority:u03c@revision:2".to_owned()],
+            })
+            .ok_or(ReferenceGuardRejection::StaleTaskReference)
+    }
+
+    fn validate_activate_run(
+        &self,
+        command: &ActivateRunCommand,
+        run: &RunSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        (command.confirmed_task_revision == 2 && !run.task_id.is_empty())
+            .then_some(ReferenceAuthorization {
+                evidence_refs: vec!["task-authority:u03c@active".to_owned()],
+            })
+            .ok_or(ReferenceGuardRejection::StaleTaskReference)
+    }
+
+    fn validate_create_attempt(
+        &self,
+        command: &CreateAttemptCommand,
+        _run: &RunSnapshot,
+        _step: &StepSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        (command.attempt_id == U03C_ATTEMPT_ID
+            && command.harness_id == "codex-u03c"
+            && command.workspace_ref == U03C_SENSITIVE_WORKSPACE)
+            .then_some(ReferenceAuthorization {
+                evidence_refs: vec!["capability:u03c@verified".to_owned()],
+            })
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)
+    }
+
+    fn authorize_lease(
+        &self,
+        command: &AcquireAttemptLeaseCommand,
+        _attempt: &AttemptSnapshot,
+    ) -> Result<LeaseAuthorization, ReferenceGuardRejection> {
+        (command.owner_instance_id == "attempt-supervisor:u03c")
+            .then_some(LeaseAuthorization {
+                ttl_seconds: 300,
+                evidence_refs: vec!["lease-policy:u03c@reviewed".to_owned()],
+            })
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)
+    }
+
+    fn resolve_dispatch_material(
+        &self,
+        _command: &RecordDispatchIntentCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<DispatchMaterial, ReferenceGuardRejection> {
+        Ok(DispatchMaterial {
+            input_bundle_sha256: "71".repeat(32),
+            sandbox_profile_ref: r8a_reference("u03c-sandbox"),
+            tool_policy_ref: r8a_reference("u03c-tools"),
+            data_egress_policy_ref: r8a_reference("u03c-egress"),
+            approval_policy_ref: r8a_reference("u03c-approval"),
+            session_strategy: NativeSessionStrategy::CreateNew,
+            native_session_ref: None,
+            checkpoint_ref: None,
+            evidence_refs: vec!["dispatch-material:u03c@reviewed".to_owned()],
+        })
+    }
+
+    fn validate_unknown_outcome(
+        &self,
+        _command: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::MarkAttemptOutcomeUnknownCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        Err(ReferenceGuardRejection::UnverifiedReference)
+    }
+
+    fn validate_cancellation_request(
+        &self,
+        _command: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::RequestAttemptCancellationCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        Err(ReferenceGuardRejection::UnverifiedReference)
+    }
+}
+
+impl HarnessEvidenceResolver for U03cCollaborationGuard {
+    fn resolve_delivery_receipt(
+        &self,
+        command: &RecordDeliveryReceiptCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+        (command.delivery_receipt_id == "delivery-u03c")
+            .then_some(ResolvedHarnessEvidence {
+                harness_session_ref: Some("session-u03c-never-render".to_owned()),
+                evidence_refs: vec!["adapter-receipt:u03c@durable".to_owned()],
+            })
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)
+    }
+
+    fn resolve_harness_ack(
+        &self,
+        command: &RecordHarnessAckCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+        (command.ack_receipt_id == "ack-u03c")
+            .then_some(ResolvedHarnessEvidence {
+                harness_session_ref: Some("session-u03c-never-render".to_owned()),
+                evidence_refs: vec!["adapter-ack:u03c@durable".to_owned()],
+            })
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)
+    }
+
+    fn validate_running_observation(
+        &self,
+        command: &RecordRunningObservationCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        (command.lifecycle_event_id == "running-u03c")
+            .then_some(ReferenceAuthorization {
+                evidence_refs: vec!["adapter-observation:u03c@durable".to_owned()],
+            })
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)
+    }
+
+    fn validate_cancellation_outcome(
+        &self,
+        _command: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::RecordAttemptCancellationOutcomeCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        Err(ReferenceGuardRejection::UnverifiedReference)
+    }
+
+    fn validate_reconciliation(
+        &self,
+        _command: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::RecordAttemptReconciliationCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        Err(ReferenceGuardRejection::UnverifiedReference)
+    }
+
+    fn resolve_attempt_return(
+        &self,
+        command: &RecordAttemptReturnCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
+        (command.artifact_return_receipt_id == "return-receipt-u03c")
+            .then_some(ResolvedArtifactReturn {
+                artifact_set_id: U03C_ARTIFACT_SET_ID.to_owned(),
+                return_handoff_id: U03C_RETURN_HANDOFF_ID.to_owned(),
+                dispatch_id: U03C_DISPATCH_ID.to_owned(),
+                evidence_refs: vec!["artifact-return:u03c@durable".to_owned()],
+            })
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)
+    }
+
+    fn resolve_step_return(
+        &self,
+        command: &CommitStepReturnCommand,
+        _snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedStepReturn, ReferenceGuardRejection> {
+        (command.artifact_set_id == U03C_ARTIFACT_SET_ID
+            && command.return_handoff_id == U03C_RETURN_HANDOFF_ID)
+            .then_some(ResolvedStepReturn {
+                artifact_set_id: U03C_ARTIFACT_SET_ID.to_owned(),
+                return_handoff_id: U03C_RETURN_HANDOFF_ID.to_owned(),
+                verification_artifact_id: U03C_VERIFICATION_ID.to_owned(),
+                evidence_refs: vec!["verification:u03c@durable".to_owned()],
+            })
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)
+    }
+}
+
 struct StaticApprovalProjectionSource {
     messages: std::sync::Mutex<Vec<PendingOwnerProjection>>,
 }
@@ -1844,6 +2173,26 @@ impl TrustedPrincipalResolver for FixtureSessionResolver {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct U03cDenyResultReadSessionResolver;
+
+impl TrustedPrincipalResolver for U03cDenyResultReadSessionResolver {
+    fn resolve(
+        &self,
+        _principal: &egopulse_local_ipc_platform::OsPrincipal,
+    ) -> Result<PrincipalGrant, PrincipalResolutionFailure> {
+        let profiles = egopulse_client_kernel::ContractProfiles::embedded()
+            .map_err(|_| PrincipalResolutionFailure::PolicyUnavailable)?;
+        let mut permissions = profiles.permission_codes().clone();
+        permissions.remove("local.evidence.read");
+        Ok(PrincipalGrant {
+            authenticated_principal_id: "os-user:c5-fixture".to_owned(),
+            permission_codes: permissions,
+            authorization_policy_ref: authorization_contract_ref(),
+        })
+    }
+}
+
 fn fixture_root() -> PathBuf {
     std::env::var_os(FIXTURE_ROOT_ENV)
         .map(PathBuf::from)
@@ -2022,6 +2371,1088 @@ fn r8a_authorities(
     )
 }
 
+fn u03c_metadata(operation: &str) -> CommandMetadata {
+    CommandMetadata {
+        command_id: format!("u03c-command-{operation}"),
+        idempotency_key: format!("u03c-idempotency-{operation}"),
+        idempotency_scope: "u03c-result-review".to_owned(),
+        request_digest_sha256: String::new(),
+        issued_at: Some(prost_types::Timestamp {
+            seconds: 1_788_220_800,
+            nanos: 0,
+        }),
+        correlation_id: "u03c-result-review".to_owned(),
+        causation_id: None,
+    }
+}
+
+fn u03c_task_principal(kind: TaskPrincipalKind, principal_id: &str) -> AuthenticatedTaskPrincipal {
+    AuthenticatedTaskPrincipal {
+        kind,
+        principal_id: principal_id.to_owned(),
+        authenticated: true,
+    }
+}
+
+fn u03c_execute_task(
+    authority: &mut TaskAuthority,
+    mut command: TaskCommand,
+    principal: &AuthenticatedTaskPrincipal,
+) -> TaskSnapshot {
+    egopulse_client_operations::set_task_digest(&mut command);
+    let result = authority
+        .execute(&command, principal)
+        .expect("U-03c Task Authority command");
+    match result.outcome.expect("U-03c Task command outcome") {
+        egopulse_domain_contracts::v01::egopulse::task::v1::task_command_result::Outcome::Task(
+            snapshot,
+        ) => snapshot,
+        egopulse_domain_contracts::v01::egopulse::task::v1::task_command_result::Outcome::Error(
+            error,
+        ) => panic!("U-03c Task command rejected: {}", error.safe_detail_code),
+    }
+}
+
+fn u03c_seed_task_ready(authority: &mut TaskAuthority) -> TaskSnapshot {
+    let mut snapshot = u03c_execute_task(
+        authority,
+        TaskCommand {
+            command: Some(task_command::Command::CreateTask(CreateTaskCommand {
+                meta: Some(u03c_metadata("create-task")),
+                work_type: "governed_repository_change".to_owned(),
+                input_snapshot_id: "input-u03c-result".to_owned(),
+                target_scope_ref: "scope:u03c-result".to_owned(),
+                acceptance_contract_ref: Some(r8a_reference("u03c-acceptance")),
+                budget_profile_ref: Some(r8a_reference("u03c-budget")),
+            })),
+        },
+        &u03c_task_principal(TaskPrincipalKind::Founder, "founder:u03c"),
+    );
+    snapshot = u03c_execute_task(
+        authority,
+        TaskCommand {
+            command: Some(task_command::Command::ActivateTask(ActivateTaskCommand {
+                meta: Some(u03c_metadata("activate-task")),
+                task_id: snapshot.task_id.clone(),
+                expected_revision: snapshot.revision,
+                work_revision: snapshot.work_revision,
+                run_id: U03C_RUN_ID.to_owned(),
+            })),
+        },
+        &u03c_task_principal(
+            TaskPrincipalKind::CollaborationControl,
+            "collaboration-control:u03c",
+        ),
+    );
+    assert_eq!(snapshot.status, TaskStatus::Active as i32);
+    snapshot
+}
+
+fn u03c_collaboration_principal(
+    kind: CollaborationPrincipalKind,
+    id: &str,
+) -> AuthenticatedCollaborationPrincipal {
+    AuthenticatedCollaborationPrincipal {
+        kind,
+        principal_id: id.to_owned(),
+        authenticated: true,
+    }
+}
+
+fn u03c_collaboration_snapshot(
+    control: &mut CollaborationControl<U03cCollaborationGuard, U03cAuthorityClock>,
+    mut command: CollaborationCommand,
+    principal: &AuthenticatedCollaborationPrincipal,
+) -> CollaborationSnapshot {
+    egopulse_local_ide_control::collaboration_control::seal_request_digest(&mut command)
+        .expect("seal U-03c Collaboration command");
+    let result = control
+        .execute(&command, principal)
+        .expect("U-03c Collaboration command");
+    match result.outcome.expect("U-03c Collaboration outcome") {
+        collaboration_command_result::Outcome::Snapshot(snapshot) => snapshot,
+        collaboration_command_result::Outcome::Error(error) => {
+            panic!(
+                "U-03c Collaboration command rejected: {}",
+                error.safe_detail_code
+            )
+        }
+    }
+}
+
+fn u03c_run_plan() -> RunPlan {
+    RunPlan {
+        plan_id: "plan-u03c-result".to_owned(),
+        digest_sha256: "61".repeat(32),
+        max_active_attempts: 1,
+        steps: vec![StepPlan {
+            step_id: U03C_STEP_ID.to_owned(),
+            step_kind: "governed_repository_change".to_owned(),
+            depends_on_step_ids: Vec::new(),
+            input_bundle_ref: "input-u03c-result.json".to_owned(),
+            expected_output_contract_ref: Some(r8a_reference("u03c-output")),
+            required_capability_profile_ref: Some(r8a_reference("u03c-capability")),
+            max_attempts: 2,
+        }],
+        budget_profile_ref: Some(r8a_reference("u03c-budget")),
+    }
+}
+
+fn u03c_attempt_base(snapshot: &CollaborationSnapshot, operation: &str) -> AttemptCommandBase {
+    let run = snapshot.run.as_ref().expect("U-03c run");
+    let step = snapshot.steps.first().expect("U-03c step");
+    let attempt = snapshot.attempts.first().expect("U-03c attempt");
+    AttemptCommandBase {
+        meta: Some(u03c_metadata(operation)),
+        run_id: run.run_id.clone(),
+        expected_run_revision: run.revision,
+        step_id: step.step_id.clone(),
+        expected_step_revision: step.revision,
+        attempt_id: attempt.attempt_id.clone(),
+        expected_attempt_revision: attempt.revision,
+    }
+}
+
+fn u03c_seed_collaboration(
+    root: &Path,
+    task: &TaskSnapshot,
+) -> (
+    CollaborationControl<U03cCollaborationGuard, U03cAuthorityClock>,
+    CollaborationSnapshot,
+) {
+    let mut control = CollaborationControl::open(
+        CollaborationControlConfig {
+            database_path: root.join("u03c-collaboration.db"),
+            store_epoch: "u03c-collaboration-epoch".to_owned(),
+            key: CollaborationSqlCipherKey::new([0x73; 32]),
+        },
+        U03cCollaborationGuard,
+        U03cAuthorityClock,
+    )
+    .expect("open U-03c Collaboration Control");
+    let task_principal = u03c_collaboration_principal(
+        CollaborationPrincipalKind::TaskAuthority,
+        "task-authority:u03c",
+    );
+    let control_principal = u03c_collaboration_principal(
+        CollaborationPrincipalKind::CollaborationControl,
+        "collaboration-control:u03c",
+    );
+    let adapter_principal = u03c_collaboration_principal(
+        CollaborationPrincipalKind::HarnessAdapter,
+        "harness-adapter:u03c",
+    );
+    let artifact_principal = u03c_collaboration_principal(
+        CollaborationPrincipalKind::ArtifactAuthority,
+        "artifact-authority:u03c",
+    );
+    let mut snapshot = u03c_collaboration_snapshot(
+        &mut control,
+        CollaborationCommand {
+            command: Some(collaboration_command::Command::CreateRun(
+                CreateRunCommand {
+                    meta: Some(u03c_metadata("create-run")),
+                    run_id: U03C_RUN_ID.to_owned(),
+                    task_id: task.task_id.clone(),
+                    task_revision: task.revision,
+                    work_revision: task.work_revision,
+                    plan: Some(u03c_run_plan()),
+                },
+            )),
+        },
+        &task_principal,
+    );
+    snapshot = u03c_collaboration_snapshot(
+        &mut control,
+        CollaborationCommand {
+            command: Some(collaboration_command::Command::ActivateRun(
+                ActivateRunCommand {
+                    base: Some(RunCommandBase {
+                        meta: Some(u03c_metadata("activate-run")),
+                        run_id: U03C_RUN_ID.to_owned(),
+                        expected_run_revision: snapshot.run.as_ref().expect("run").revision,
+                    }),
+                    confirmed_task_revision: task.revision,
+                },
+            )),
+        },
+        &task_principal,
+    );
+    let run_revision = snapshot.run.as_ref().expect("run").revision;
+    let step_revision = snapshot.steps.first().expect("step").revision;
+    snapshot = u03c_collaboration_snapshot(
+        &mut control,
+        CollaborationCommand {
+            command: Some(collaboration_command::Command::CreateAttempt(
+                CreateAttemptCommand {
+                    base: Some(RunCommandBase {
+                        meta: Some(u03c_metadata("create-attempt")),
+                        run_id: U03C_RUN_ID.to_owned(),
+                        expected_run_revision: run_revision,
+                    }),
+                    step_id: U03C_STEP_ID.to_owned(),
+                    expected_step_revision: step_revision,
+                    attempt_id: U03C_ATTEMPT_ID.to_owned(),
+                    harness_id: "codex-u03c".to_owned(),
+                    capability_profile_ref: Some(r8a_reference("u03c-capability")),
+                    workspace_ref: U03C_SENSITIVE_WORKSPACE.to_owned(),
+                },
+            )),
+        },
+        &control_principal,
+    );
+    snapshot = u03c_collaboration_snapshot(
+        &mut control,
+        CollaborationCommand {
+            command: Some(collaboration_command::Command::AcquireAttemptLease(
+                AcquireAttemptLeaseCommand {
+                    base: Some(u03c_attempt_base(&snapshot, "acquire-lease")),
+                    owner_instance_id: "attempt-supervisor:u03c".to_owned(),
+                    lease_policy_ref: Some(r8a_reference("u03c-lease")),
+                },
+            )),
+        },
+        &control_principal,
+    );
+    let lease = snapshot.attempts[0]
+        .lease
+        .as_ref()
+        .expect("U-03c lease")
+        .clone();
+    let run = snapshot.run.as_ref().expect("run");
+    let step = &snapshot.steps[0];
+    let attempt = &snapshot.attempts[0];
+    let source_meta = u03c_metadata("record-dispatch");
+    let mut envelope = DispatchEnvelope {
+        meta: Some(CommandMetadata {
+            command_id: U03C_DISPATCH_ID.to_owned(),
+            idempotency_key: U03C_DISPATCH_ID.to_owned(),
+            idempotency_scope: attempt.attempt_id.clone(),
+            request_digest_sha256: String::new(),
+            issued_at: Some(U03cAuthorityClock.now()),
+            correlation_id: source_meta.correlation_id.clone(),
+            causation_id: Some(source_meta.command_id.clone()),
+        }),
+        run_id: run.run_id.clone(),
+        run_revision: run.revision + 1,
+        step_id: step.step_id.clone(),
+        step_revision: step.revision + 1,
+        attempt_id: attempt.attempt_id.clone(),
+        attempt_revision: attempt.revision + 1,
+        dispatch_id: U03C_DISPATCH_ID.to_owned(),
+        dispatch_fingerprint: String::new(),
+        fencing_token: lease.fencing_token,
+        capability_profile_ref: attempt.capability_profile_ref.clone(),
+        input_bundle_ref: "input-u03c-result.json".to_owned(),
+        input_bundle_sha256: "71".repeat(32),
+        workspace_ref: attempt.workspace_ref.clone(),
+        budget_profile_ref: run.plan.as_ref().expect("plan").budget_profile_ref.clone(),
+        sandbox_profile_ref: Some(r8a_reference("u03c-sandbox")),
+        tool_policy_ref: Some(r8a_reference("u03c-tools")),
+        data_egress_policy_ref: Some(r8a_reference("u03c-egress")),
+        approval_policy_ref: Some(r8a_reference("u03c-approval")),
+        session_strategy: NativeSessionStrategy::CreateNew as i32,
+        native_session_ref: None,
+        checkpoint_ref: None,
+    };
+    envelope.dispatch_fingerprint = canonical_dispatch_fingerprint(&envelope);
+    snapshot = u03c_collaboration_snapshot(
+        &mut control,
+        CollaborationCommand {
+            command: Some(collaboration_command::Command::RecordDispatchIntent(
+                RecordDispatchIntentCommand {
+                    base: Some(u03c_attempt_base(&snapshot, "record-dispatch")),
+                    lease_id: lease.lease_id.clone(),
+                    fencing_token: lease.fencing_token,
+                    dispatch_id: U03C_DISPATCH_ID.to_owned(),
+                    dispatch_fingerprint: envelope.dispatch_fingerprint.clone(),
+                },
+            )),
+        },
+        &control_principal,
+    );
+    snapshot = u03c_collaboration_snapshot(
+        &mut control,
+        CollaborationCommand {
+            command: Some(collaboration_command::Command::RecordDeliveryReceipt(
+                RecordDeliveryReceiptCommand {
+                    base: Some(u03c_attempt_base(&snapshot, "record-delivery")),
+                    dispatch_id: U03C_DISPATCH_ID.to_owned(),
+                    fencing_token: lease.fencing_token,
+                    delivery_receipt_id: "delivery-u03c".to_owned(),
+                    receipt_digest_sha256: "72".repeat(32),
+                },
+            )),
+        },
+        &adapter_principal,
+    );
+    snapshot = u03c_collaboration_snapshot(
+        &mut control,
+        CollaborationCommand {
+            command: Some(collaboration_command::Command::RecordHarnessAck(
+                RecordHarnessAckCommand {
+                    base: Some(u03c_attempt_base(&snapshot, "record-ack")),
+                    dispatch_id: U03C_DISPATCH_ID.to_owned(),
+                    fencing_token: lease.fencing_token,
+                    harness_sequence: 1,
+                    ack_receipt_id: "ack-u03c".to_owned(),
+                    receipt_digest_sha256: "73".repeat(32),
+                },
+            )),
+        },
+        &adapter_principal,
+    );
+    snapshot = u03c_collaboration_snapshot(
+        &mut control,
+        CollaborationCommand {
+            command: Some(collaboration_command::Command::RecordRunningObservation(
+                RecordRunningObservationCommand {
+                    base: Some(u03c_attempt_base(&snapshot, "record-running")),
+                    fencing_token: lease.fencing_token,
+                    harness_sequence: 2,
+                    lifecycle_event_id: "running-u03c".to_owned(),
+                    event_digest_sha256: "74".repeat(32),
+                },
+            )),
+        },
+        &adapter_principal,
+    );
+    assert_eq!(snapshot.attempts[0].status, AttemptStatus::Running as i32);
+    let _ = artifact_principal;
+    (control, snapshot)
+}
+
+fn u03c_artifact_principal(
+    kind: ArtifactPrincipalKind,
+    principal_id: &str,
+) -> AuthenticatedArtifactPrincipal {
+    AuthenticatedArtifactPrincipal {
+        kind,
+        principal_id: principal_id.to_owned(),
+        authenticated: true,
+    }
+}
+
+fn u03c_artifact_command(command: artifact_command::Command) -> ArtifactCommand {
+    let mut command = ArtifactCommand {
+        command: Some(command),
+    };
+    let digest = canonical_artifact_request_digest(&command)
+        .expect("canonical U-03c Artifact request digest");
+    let metadata = match command.command.as_mut().expect("Artifact command") {
+        artifact_command::Command::StageArtifact(value) => value.metadata.as_mut(),
+        artifact_command::Command::SealArtifact(value) => value.metadata.as_mut(),
+        artifact_command::Command::ProposeClaim(value) => value.metadata.as_mut(),
+        artifact_command::Command::RecordEvidence(value) => value.metadata.as_mut(),
+        artifact_command::Command::CreateArtifactSet(value) => value.metadata.as_mut(),
+        artifact_command::Command::SealArtifactSet(value) => value.metadata.as_mut(),
+        artifact_command::Command::SubmitReturnHandoff(value) => value.metadata.as_mut(),
+        _ => None,
+    }
+    .expect("U-03c Artifact command metadata");
+    metadata.request_digest_sha256 = digest;
+    command
+}
+
+fn u03c_execute_artifact(
+    authority: &mut ArtifactAuthority<ConfiguredArtifactAdmissionGuard>,
+    command: artifact_command::Command,
+    principal: &AuthenticatedArtifactPrincipal,
+) {
+    let operation = match &command {
+        artifact_command::Command::StageArtifact(_) => "stage_artifact",
+        artifact_command::Command::SealArtifact(_) => "seal_artifact",
+        artifact_command::Command::ProposeClaim(_) => "propose_claim",
+        artifact_command::Command::RecordEvidence(_) => "record_evidence",
+        artifact_command::Command::CreateArtifactSet(_) => "create_artifact_set",
+        artifact_command::Command::SealArtifactSet(_) => "seal_artifact_set",
+        artifact_command::Command::SubmitReturnHandoff(_) => "submit_return_handoff",
+        _ => "other",
+    };
+    let result = authority
+        .execute(&u03c_artifact_command(command), principal)
+        .expect("U-03c Artifact Authority command");
+    assert!(
+        result.committed || result.replayed,
+        "U-03c Artifact {operation} must commit or exact-replay: code={} fingerprint={:?}",
+        result.error_code,
+        result.safe_error_fingerprint
+    );
+}
+
+fn u03c_lineage(task: &TaskSnapshot, collaboration: &CollaborationSnapshot) -> LineageBinding {
+    let run = collaboration.run.as_ref().expect("U-03c run");
+    let step = collaboration.steps.first().expect("U-03c step");
+    let attempt = collaboration.attempts.first().expect("U-03c attempt");
+    LineageBinding {
+        task_id: task.task_id.clone(),
+        task_revision: task.revision,
+        work_revision: task.work_revision,
+        run_id: run.run_id.clone(),
+        run_revision: run.revision,
+        step_id: step.step_id.clone(),
+        step_revision: step.revision,
+        attempt_id: attempt.attempt_id.clone(),
+        attempt_revision: attempt.revision,
+        dispatch_id: attempt.dispatch_id.clone().expect("U-03c dispatch"),
+        fencing_token: attempt
+            .lease
+            .as_ref()
+            .expect("U-03c attempt lease")
+            .fencing_token,
+    }
+}
+
+fn u03c_seed_artifact(
+    authority: &mut ArtifactAuthority<ConfiguredArtifactAdmissionGuard>,
+    task: &TaskSnapshot,
+    collaboration: &CollaborationSnapshot,
+) -> (ArtifactSet, ReturnHandoff) {
+    let lineage = u03c_lineage(task, collaboration);
+    let producer = ProducerIdentity {
+        principal_kind: ArtifactPrincipalKind::Harness.as_str().to_owned(),
+        principal_id: U03C_SENSITIVE_PRINCIPAL.to_owned(),
+        component_name: "u03c-governed-harness".to_owned(),
+        component_version: "1".to_owned(),
+        capability_profile_id: Some("u03c-capability".to_owned()),
+        native_execution_ref: Some("native-u03c-never-render".to_owned()),
+    };
+    let content_bytes = format!("U-03c governed artifact bytes {U03C_SENSITIVE_RAW}").into_bytes();
+    let content = content_address(&content_bytes);
+    authority
+        .put_blob(&content_bytes, &content)
+        .expect("persist U-03c Artifact blob");
+    u03c_execute_artifact(
+        authority,
+        artifact_command::Command::StageArtifact(StageArtifactCommand {
+            metadata: Some(u03c_metadata("stage-artifact")),
+            candidate: Some(ArtifactDescriptor {
+                artifact_id: U03C_ARTIFACT_ID.to_owned(),
+                revision: 1,
+                status: ArtifactStatus::Staged as i32,
+                semantic_class: ArtifactSemanticClass::FinalMessage as i32,
+                type_contract_ref: Some(r8a_reference("r8a-artifact-type")),
+                media_type: "text/plain; charset=utf-8".to_owned(),
+                content: Some(content.clone()),
+                integrity_status: IntegrityStatus::Unverified as i32,
+                provenance: Some(Provenance {
+                    lineage: Some(lineage.clone()),
+                    producer: Some(producer.clone()),
+                    input_artifact_ids: vec!["input-artifact-u03c".to_owned()],
+                    transformation_contract_ref: Some(r8a_reference("r8a-transformation")),
+                    workspace_ref: U03C_SENSITIVE_WORKSPACE.to_owned(),
+                    observed_at: Some(prost_types::Timestamp {
+                        seconds: 1_788_220_801,
+                        nanos: 0,
+                    }),
+                    captured_at: Some(prost_types::Timestamp {
+                        seconds: 1_788_220_802,
+                        nanos: 0,
+                    }),
+                    raw_source_ref: Some(U03C_SENSITIVE_RAW.to_owned()),
+                }),
+                sensitivity_class: "internal".to_owned(),
+                retention_profile_ref: Some(r8a_reference("r8a-retention")),
+                created_at: None,
+                sealed_at: None,
+                supersedes_artifact_id: None,
+                quarantine_reason_code: None,
+            }),
+        }),
+        &u03c_artifact_principal(ArtifactPrincipalKind::Harness, U03C_SENSITIVE_PRINCIPAL),
+    );
+    u03c_execute_artifact(
+        authority,
+        artifact_command::Command::SealArtifact(SealArtifactCommand {
+            metadata: Some(u03c_metadata("seal-artifact")),
+            artifact_id: U03C_ARTIFACT_ID.to_owned(),
+            expected_revision: 1,
+            observed_content: Some(content),
+        }),
+        &u03c_artifact_principal(
+            ArtifactPrincipalKind::ArtifactAuthority,
+            "artifact-authority:u03c",
+        ),
+    );
+
+    let statement_bytes = b"U-03c safe claim statement".to_vec();
+    let statement = content_address(&statement_bytes);
+    authority
+        .put_blob(&statement_bytes, &statement)
+        .expect("persist U-03c Claim statement");
+    u03c_execute_artifact(
+        authority,
+        artifact_command::Command::ProposeClaim(
+            egopulse_domain_contracts::v01::egopulse::artifact::v1::ProposeClaimCommand {
+                metadata: Some(u03c_metadata("propose-claim")),
+                claim: Some(Claim {
+                    claim_id: U03C_CLAIM_ID.to_owned(),
+                    revision: 1,
+                    status: ClaimStatus::Proposed as i32,
+                    source_type: ClaimSourceType::CodeChange as i32,
+                    semantic_profile_ref: Some(r8a_reference("r8a-claim-semantic")),
+                    lineage: Some(lineage.clone()),
+                    subject_artifact_ids: vec![U03C_ARTIFACT_ID.to_owned()],
+                    acceptance_contract_ref: task.acceptance_contract_ref.clone(),
+                    statement: Some(statement),
+                    proposer: Some(producer.clone()),
+                    proposed_at: None,
+                    supersedes_claim_id: None,
+                }),
+            },
+        ),
+        &u03c_artifact_principal(ArtifactPrincipalKind::Harness, U03C_SENSITIVE_PRINCIPAL),
+    );
+
+    let coverage_bytes = b"U-03c complete governed evidence coverage".to_vec();
+    let coverage = content_address(&coverage_bytes);
+    authority
+        .put_blob(&coverage_bytes, &coverage)
+        .expect("persist U-03c Evidence coverage");
+    u03c_execute_artifact(
+        authority,
+        artifact_command::Command::RecordEvidence(
+            egopulse_domain_contracts::v01::egopulse::artifact::v1::RecordEvidenceCommand {
+                metadata: Some(u03c_metadata("record-evidence")),
+                evidence: Some(Evidence {
+                    evidence_id: U03C_EVIDENCE_ID.to_owned(),
+                    revision: 1,
+                    status: EvidenceStatus::Recorded as i32,
+                    relation: EvidenceRelation::Supports as i32,
+                    claim_id: U03C_CLAIM_ID.to_owned(),
+                    artifact_ids: vec![U03C_ARTIFACT_ID.to_owned()],
+                    evidence_profile_ref: Some(r8a_reference("r8a-evidence-profile")),
+                    lineage: Some(lineage.clone()),
+                    producer: Some(producer.clone()),
+                    producer_class: EvidenceProducerClass::Harness as i32,
+                    independent_of_claim_proposer: false,
+                    integrity_status: IntegrityStatus::DigestVerified as i32,
+                    coverage_descriptor: Some(coverage),
+                    limitation_codes: vec!["SAFE_LIMITATION_U03C".to_owned()],
+                    recorded_at: None,
+                    supersedes_evidence_id: None,
+                }),
+            },
+        ),
+        &u03c_artifact_principal(ArtifactPrincipalKind::Harness, U03C_SENSITIVE_PRINCIPAL),
+    );
+
+    let mut set = ArtifactSet {
+        artifact_set_id: U03C_ARTIFACT_SET_ID.to_owned(),
+        revision: 1,
+        status: ArtifactSetStatus::Draft as i32,
+        lineage: Some(lineage.clone()),
+        artifact_ids: vec![U03C_ARTIFACT_ID.to_owned()],
+        claim_ids: vec![U03C_CLAIM_ID.to_owned()],
+        evidence_ids: vec![U03C_EVIDENCE_ID.to_owned()],
+        canonical_manifest: None,
+        created_at: None,
+        sealed_at: None,
+        supersedes_artifact_set_id: None,
+    };
+    let manifest_bytes = canonical_artifact_set_manifest(&set);
+    let manifest = content_address(&manifest_bytes);
+    set.canonical_manifest = Some(manifest.clone());
+    authority
+        .put_blob(&manifest_bytes, &manifest)
+        .expect("persist U-03c ArtifactSet manifest");
+    u03c_execute_artifact(
+        authority,
+        artifact_command::Command::CreateArtifactSet(
+            egopulse_domain_contracts::v01::egopulse::artifact::v1::CreateArtifactSetCommand {
+                metadata: Some(u03c_metadata("create-artifact-set")),
+                artifact_set: Some(set.clone()),
+            },
+        ),
+        &u03c_artifact_principal(ArtifactPrincipalKind::GovernedCollector, "collector:u03c"),
+    );
+    u03c_execute_artifact(
+        authority,
+        artifact_command::Command::SealArtifactSet(SealArtifactSetCommand {
+            metadata: Some(u03c_metadata("seal-artifact-set")),
+            artifact_set_id: U03C_ARTIFACT_SET_ID.to_owned(),
+            expected_revision: 1,
+            observed_manifest: Some(manifest.clone()),
+        }),
+        &u03c_artifact_principal(
+            ArtifactPrincipalKind::ArtifactAuthority,
+            "artifact-authority:u03c",
+        ),
+    );
+    set.revision = 2;
+    set.status = ArtifactSetStatus::Sealed as i32;
+    let handoff = ReturnHandoff {
+        return_handoff_id: U03C_RETURN_HANDOFF_ID.to_owned(),
+        revision: 1,
+        status: ReturnHandoffStatus::Submitted as i32,
+        lineage: Some(lineage),
+        artifact_set_id: U03C_ARTIFACT_SET_ID.to_owned(),
+        artifact_set_manifest: Some(manifest),
+        primary_claim_ids: vec![U03C_CLAIM_ID.to_owned()],
+        evidence_ids: vec![U03C_EVIDENCE_ID.to_owned()],
+        limitation_artifact_ids: Vec::new(),
+        unknown_artifact_ids: Vec::new(),
+        final_message_artifact_id: Some(U03C_ARTIFACT_ID.to_owned()),
+        submitted_by: Some(ProducerIdentity {
+            principal_kind: ArtifactPrincipalKind::GovernedCollector.as_str().to_owned(),
+            principal_id: "collector:u03c".to_owned(),
+            component_name: "u03c-governed-collector".to_owned(),
+            component_version: "1".to_owned(),
+            capability_profile_id: None,
+            native_execution_ref: None,
+        }),
+        submitted_at: None,
+        supersedes_return_handoff_id: None,
+    };
+    u03c_execute_artifact(
+        authority,
+        artifact_command::Command::SubmitReturnHandoff(SubmitReturnHandoffCommand {
+            metadata: Some(u03c_metadata("submit-return-handoff")),
+            return_handoff: Some(handoff.clone()),
+            expected_artifact_set_revision: 2,
+        }),
+        &u03c_artifact_principal(ArtifactPrincipalKind::GovernedCollector, "collector:u03c"),
+    );
+    (set, handoff)
+}
+
+fn u03c_verification_principal(
+    kind: VerificationPrincipalKind,
+    principal_id: &str,
+    checker_profile_id: Option<&str>,
+) -> AuthenticatedVerificationPrincipal {
+    AuthenticatedVerificationPrincipal {
+        kind,
+        principal_id: principal_id.to_owned(),
+        authenticated: true,
+        checker_profile_id: checker_profile_id.map(str::to_owned),
+    }
+}
+
+fn u03c_verification_command(command: verification_command::Command) -> VerificationCommand {
+    let mut command = VerificationCommand {
+        command: Some(command),
+    };
+    let digest = canonical_verification_request_digest(&command)
+        .expect("canonical U-03c Verification request digest");
+    let metadata = match command.command.as_mut().expect("Verification command") {
+        verification_command::Command::AttestCheckerProfile(value) => value.metadata.as_mut(),
+        verification_command::Command::CreateVerificationRequest(value) => value.metadata.as_mut(),
+        verification_command::Command::StartVerificationRun(value) => value.metadata.as_mut(),
+        verification_command::Command::RecordCriterionResult(value) => value.metadata.as_mut(),
+        verification_command::Command::CompleteVerification(value) => value.metadata.as_mut(),
+        _ => None,
+    }
+    .expect("U-03c Verification command metadata");
+    metadata.request_digest_sha256 = digest;
+    command
+}
+
+fn u03c_execute_verification(
+    authority: &mut VerificationAuthority,
+    command: verification_command::Command,
+    principal: &AuthenticatedVerificationPrincipal,
+) -> egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationCommandResult {
+    let operation = match &command {
+        verification_command::Command::AttestCheckerProfile(_) => "attest_checker_profile",
+        verification_command::Command::CreateVerificationRequest(_) => "create_request",
+        verification_command::Command::StartVerificationRun(_) => "start_run",
+        verification_command::Command::RecordCriterionResult(_) => "record_criterion",
+        verification_command::Command::CompleteVerification(_) => "complete_verification",
+        _ => "other",
+    };
+    let result = authority
+        .execute(&u03c_verification_command(command), principal)
+        .expect("U-03c Verification Authority command");
+    assert!(
+        result.committed || result.replayed,
+        "U-03c Verification {operation} rejected: {:?}",
+        result.safe_error_fingerprint
+    );
+    result
+}
+
+fn u03c_seed_verification(
+    authority: &mut VerificationAuthority,
+    task: &TaskSnapshot,
+    set: &ArtifactSet,
+) -> VerificationArtifact {
+    let binding = VerificationBinding {
+        lineage: set.lineage.clone(),
+        artifact_set_id: set.artifact_set_id.clone(),
+        artifact_set_manifest: set.canonical_manifest.clone(),
+        claim_id: U03C_CLAIM_ID.to_owned(),
+        claim_semantic_profile_ref: Some(r8a_reference("r8a-claim-semantic")),
+        acceptance_contract_ref: task.acceptance_contract_ref.clone(),
+    };
+    let mut profile = CheckerProfile {
+        checker_profile_id: U03C_CHECKER_PROFILE_ID.to_owned(),
+        revision: 1,
+        status: CheckerProfileStatus::Active as i32,
+        checker_id: "deterministic:u03c".to_owned(),
+        checker_version: "1".to_owned(),
+        input_contract_ref: Some(r8a_reference("u03c-verification-input")),
+        output_contract_ref: Some(r8a_reference("u03c-verification-output")),
+        supported_criterion_types: vec!["criterion-u03c".to_owned()],
+        assurance_class: CheckerAssuranceClass::Deterministic as i32,
+        sandbox_profile_ref: Some(r8a_reference("u03c-verification-sandbox")),
+        tool_policy_ref: Some(r8a_reference("u03c-verification-tools")),
+        data_egress_policy_ref: Some(r8a_reference("u03c-verification-egress")),
+        timeout_ms: 1_000,
+        network_allowed: false,
+        profile_digest_sha256: String::new(),
+        attestation_evidence_artifact_ids: vec![U03C_ARTIFACT_ID.to_owned()],
+        attested_at: None,
+    };
+    profile.profile_digest_sha256 = canonical_checker_profile_digest(&profile);
+    let profile_ref = ContractReference {
+        contract_id: profile.checker_profile_id.clone(),
+        version: profile.checker_version.clone(),
+        sha256: profile.profile_digest_sha256.clone(),
+    };
+    let authority_principal = u03c_verification_principal(
+        VerificationPrincipalKind::VerificationAuthority,
+        U03C_SENSITIVE_PRINCIPAL,
+        None,
+    );
+    u03c_execute_verification(
+        authority,
+        verification_command::Command::AttestCheckerProfile(AttestCheckerProfileCommand {
+            metadata: Some(u03c_metadata("attest-checker")),
+            profile: Some(profile),
+        }),
+        &authority_principal,
+    );
+    let request = VerificationRequest {
+        verification_request_id: U03C_VERIFICATION_REQUEST_ID.to_owned(),
+        revision: 1,
+        status: VerificationStatus::Queued as i32,
+        verification_type: "task_acceptance".to_owned(),
+        binding: Some(binding.clone()),
+        criterion_ids: vec!["criterion-u03c".to_owned()],
+        checker_profile_refs: vec![profile_ref.clone()],
+        created_at: None,
+        hold_reason_code: None,
+    };
+    u03c_execute_verification(
+        authority,
+        verification_command::Command::CreateVerificationRequest(
+            CreateVerificationRequestCommand {
+                metadata: Some(u03c_metadata("create-verification-request")),
+                request: Some(request.clone()),
+            },
+        ),
+        &u03c_verification_principal(
+            VerificationPrincipalKind::TaskAuthority,
+            "task-authority:u03c",
+            None,
+        ),
+    );
+    u03c_execute_verification(
+        authority,
+        verification_command::Command::StartVerificationRun(StartVerificationRunCommand {
+            metadata: Some(u03c_metadata("start-verification-run")),
+            verification_request_id: request.verification_request_id.clone(),
+            expected_request_revision: 1,
+            verification_run_id: U03C_VERIFICATION_RUN_ID.to_owned(),
+        }),
+        &authority_principal,
+    );
+    let result = CriterionResult {
+        criterion_result_id: "criterion-result-u03c".to_owned(),
+        criterion_id: "criterion-u03c".to_owned(),
+        requirement: CriterionRequirement::MustPass as i32,
+        outcome: CriterionOutcome::Passed as i32,
+        assurance_class: CheckerAssuranceClass::Deterministic as i32,
+        checker_profile_ref: Some(profile_ref.clone()),
+        evidence_coverage: EvidenceCoverage::Complete as i32,
+        evidence_ids: vec![U03C_EVIDENCE_ID.to_owned()],
+        discrepancy_ids: vec!["discrepancy-u03c".to_owned()],
+        unverified_item_ids: vec!["unverified-u03c".to_owned()],
+        duration_ms: 17,
+        safe_detail_artifact_id: Some(U03C_ARTIFACT_ID.to_owned()),
+    };
+    let checker_principal = u03c_verification_principal(
+        VerificationPrincipalKind::DeterministicChecker,
+        U03C_SENSITIVE_PRINCIPAL,
+        Some(U03C_CHECKER_PROFILE_ID),
+    );
+    u03c_execute_verification(
+        authority,
+        verification_command::Command::RecordCriterionResult(RecordCriterionResultCommand {
+            metadata: Some(u03c_metadata("record-criterion")),
+            verification_run_id: U03C_VERIFICATION_RUN_ID.to_owned(),
+            expected_run_revision: 1,
+            result: Some(result.clone()),
+        }),
+        &checker_principal,
+    );
+    let candidate = VerificationArtifact {
+        verification_artifact_id: U03C_VERIFICATION_ID.to_owned(),
+        version: 1,
+        verification_request_id: request.verification_request_id,
+        verification_run_id: U03C_VERIFICATION_RUN_ID.to_owned(),
+        verification_type: request.verification_type,
+        binding: Some(binding),
+        conclusion: VerificationConclusion::Passed as i32,
+        overall_evidence_coverage: EvidenceCoverage::Complete as i32,
+        criterion_results: vec![result],
+        discrepancies: vec![Discrepancy {
+            discrepancy_id: "discrepancy-u03c".to_owned(),
+            criterion_id: "criterion-u03c".to_owned(),
+            severity: DiscrepancySeverity::Info as i32,
+            evidence_ids: vec![U03C_EVIDENCE_ID.to_owned()],
+            description_artifact_id: U03C_ARTIFACT_ID.to_owned(),
+            suggested_fix_artifact_id: Some(U03C_ARTIFACT_ID.to_owned()),
+        }],
+        unverified_items: vec![UnverifiedItem {
+            unverified_item_id: "unverified-u03c".to_owned(),
+            criterion_id: "criterion-u03c".to_owned(),
+            reason: UnverifiedReason::RequiresJudgement as i32,
+            evidence_ids: vec![U03C_EVIDENCE_ID.to_owned()],
+            context_artifact_id: Some(U03C_ARTIFACT_ID.to_owned()),
+        }],
+        provenance: Some(VerificationProvenance {
+            verifier_principal_id: U03C_SENSITIVE_PRINCIPAL.to_owned(),
+            checker_profile_refs: vec![profile_ref],
+            tool_receipt_artifact_ids: vec![U03C_ARTIFACT_ID.to_owned()],
+            model_call_receipt_artifact_ids: vec![U03C_ARTIFACT_ID.to_owned()],
+            raw_output_artifact_ids: vec![U03C_ARTIFACT_ID.to_owned()],
+            duration_ms: 17,
+            cost_receipt_artifact_id: Some(U03C_ARTIFACT_ID.to_owned()),
+        }),
+        canonical_payload: None,
+        completed_at: None,
+        supersedes_verification_artifact_id: None,
+    };
+    let completed = u03c_execute_verification(
+        authority,
+        verification_command::Command::CompleteVerification(CompleteVerificationCommand {
+            metadata: Some(u03c_metadata("complete-verification")),
+            verification_run_id: U03C_VERIFICATION_RUN_ID.to_owned(),
+            expected_run_revision: 2,
+            artifact: Some(candidate),
+        }),
+        &authority_principal,
+    );
+    completed
+        .artifact
+        .expect("U-03c committed Verification artifact")
+}
+
+fn u03c_submit_task_evidence(
+    authority: &mut TaskAuthority,
+    current: &TaskSnapshot,
+) -> TaskSnapshot {
+    u03c_execute_task(
+        authority,
+        TaskCommand {
+            command: Some(task_command::Command::SubmitTaskEvidence(
+                SubmitTaskEvidenceCommand {
+                    meta: Some(u03c_metadata("submit-task-evidence")),
+                    task_id: current.task_id.clone(),
+                    expected_revision: current.revision,
+                    work_revision: current.work_revision,
+                    return_handoff_id: U03C_RETURN_HANDOFF_ID.to_owned(),
+                    artifact_set_id: U03C_ARTIFACT_SET_ID.to_owned(),
+                },
+            )),
+        },
+        &u03c_task_principal(
+            TaskPrincipalKind::CollaborationControl,
+            "collaboration-control:u03c",
+        ),
+    )
+}
+
+fn u03c_record_task_verification(
+    authority: &mut TaskAuthority,
+    current: &TaskSnapshot,
+) -> TaskSnapshot {
+    u03c_execute_task(
+        authority,
+        TaskCommand {
+            command: Some(task_command::Command::RecordTaskVerification(
+                RecordTaskVerificationCommand {
+                    meta: Some(u03c_metadata("record-task-verification")),
+                    task_id: current.task_id.clone(),
+                    expected_revision: current.revision,
+                    work_revision: current.work_revision,
+                    verification_artifact_id: U03C_VERIFICATION_ID.to_owned(),
+                },
+            )),
+        },
+        &u03c_task_principal(
+            TaskPrincipalKind::SegoVerification,
+            "verification-authority:u03c",
+        ),
+    )
+}
+
+fn u03c_issue_rework_verdict(
+    authority: &mut FounderVerdictAuthority,
+    task: &TaskSnapshot,
+    set: &ArtifactSet,
+    verification: &VerificationArtifact,
+) -> (
+    egopulse_domain_contracts::v01::egopulse::verdict::v1::FounderVerdict,
+    FounderVerdictState,
+) {
+    let mut command = VerdictCommand {
+        command: Some(verdict_command::Command::IssueFounderVerdict(
+            IssueFounderVerdictCommand {
+                metadata: Some(u03c_metadata("issue-rework-verdict")),
+                scope: Some(VerdictScope {
+                    task_id: task.task_id.clone(),
+                    task_revision: task.revision,
+                    work_revision: task.work_revision,
+                    artifact_set_id: set.artifact_set_id.clone(),
+                    artifact_set_manifest: set.canonical_manifest.clone(),
+                    verification_artifact_id: verification.verification_artifact_id.clone(),
+                    verification_payload: verification.canonical_payload.clone(),
+                    acceptance_contract_ref: task.acceptance_contract_ref.clone(),
+                }),
+                decision: FounderVerdictDecision::Rework as i32,
+                observed_verification_conclusion: verification.conclusion,
+                risk_acceptances: vec![RiskAcceptance {
+                    risk_acceptance_id: "risk-u03c".to_owned(),
+                    category: RiskCategory::QualityResidual as i32,
+                    discrepancy_ids: vec!["discrepancy-u03c".to_owned()],
+                    unverified_item_ids: vec!["unverified-u03c".to_owned()],
+                    rationale_artifact_id: U03C_ARTIFACT_ID.to_owned(),
+                    compensating_control_artifact_ids: vec![U03C_ARTIFACT_ID.to_owned()],
+                    review_trigger_code: Some("review:u03c".to_owned()),
+                }],
+                rework_directive: Some(ReworkDirective {
+                    directive_id: "rework-u03c".to_owned(),
+                    reason_code: "acceptance-followup-required".to_owned(),
+                    required_changes_artifact_id: U03C_ARTIFACT_ID.to_owned(),
+                    target_discrepancy_ids: vec!["discrepancy-u03c".to_owned()],
+                    target_unverified_item_ids: vec!["unverified-u03c".to_owned()],
+                }),
+                reason_code: "review-rework".to_owned(),
+                rationale_artifact_id: Some(U03C_ARTIFACT_ID.to_owned()),
+                required_confirmation_class: ConfirmationClass::Explicit as i32,
+                confirmation_proof_ref: U03C_SENSITIVE_PROOF.to_owned(),
+                expires_at: Some(prost_types::Timestamp {
+                    seconds: 4_102_444_800,
+                    nanos: 0,
+                }),
+                supersedes_founder_verdict_id: None,
+            },
+        )),
+    };
+    let digest = egopulse_founder_verdict_authority::canonical_request_digest(&command);
+    if let Some(verdict_command::Command::IssueFounderVerdict(issue)) = command.command.as_mut() {
+        issue
+            .metadata
+            .as_mut()
+            .expect("U-03c verdict metadata")
+            .request_digest_sha256 = digest;
+    }
+    let result = authority
+        .execute(
+            &command,
+            &AuthenticatedVerdictPrincipal {
+                kind: VerdictPrincipalKind::FounderAuthority,
+                principal_id: U03C_SENSITIVE_PRINCIPAL.to_owned(),
+                authenticated: true,
+            },
+        )
+        .expect("issue U-03c Founder REWORK verdict");
+    assert!(
+        result.committed || result.replayed,
+        "U-03c verdict rejected: code={} fingerprint={:?}",
+        result.error_code,
+        result.safe_error_fingerprint
+    );
+    (
+        result.verdict.expect("U-03c Founder verdict"),
+        result.state.expect("U-03c Founder verdict state"),
+    )
+}
+
+fn u03c_apply_rework_verdict(
+    authority: &mut TaskAuthority,
+    current: &TaskSnapshot,
+    founder_verdict_id: &str,
+) -> TaskSnapshot {
+    let snapshot = u03c_execute_task(
+        authority,
+        TaskCommand {
+            command: Some(task_command::Command::ApplyFounderVerdict(
+                ApplyFounderVerdictCommand {
+                    meta: Some(u03c_metadata("apply-rework-verdict")),
+                    task_id: current.task_id.clone(),
+                    expected_revision: current.revision,
+                    work_revision: current.work_revision,
+                    founder_verdict_id: founder_verdict_id.to_owned(),
+                },
+            )),
+        },
+        &u03c_task_principal(
+            TaskPrincipalKind::FounderAuthority,
+            "founder-authority:u03c",
+        ),
+    );
+    assert_eq!(snapshot.status, TaskStatus::Rework as i32);
+    assert_eq!(
+        snapshot.founder_verdict_id.as_deref(),
+        Some(founder_verdict_id)
+    );
+    snapshot
+}
+
+fn u03c_complete_collaboration_return(
+    control: &mut CollaborationControl<U03cCollaborationGuard, U03cAuthorityClock>,
+    mut snapshot: CollaborationSnapshot,
+) -> CollaborationSnapshot {
+    let attempt = snapshot.attempts.first().expect("U-03c attempt").clone();
+    let returned = u03c_collaboration_snapshot(
+        control,
+        CollaborationCommand {
+            command: Some(collaboration_command::Command::RecordAttemptReturn(
+                RecordAttemptReturnCommand {
+                    base: Some(u03c_attempt_base(&snapshot, "record-return")),
+                    fencing_token: attempt.lease.as_ref().expect("U-03c lease").fencing_token,
+                    harness_sequence: 3,
+                    artifact_return_receipt_id: "return-receipt-u03c".to_owned(),
+                    receipt_digest_sha256: "93".repeat(32),
+                },
+            )),
+        },
+        &u03c_collaboration_principal(
+            CollaborationPrincipalKind::ArtifactAuthority,
+            "artifact-authority:u03c",
+        ),
+    );
+    snapshot = returned;
+    let step = snapshot.steps.first().expect("U-03c step");
+    u03c_collaboration_snapshot(
+        control,
+        CollaborationCommand {
+            command: Some(collaboration_command::Command::CommitStepReturn(
+                CommitStepReturnCommand {
+                    base: Some(RunCommandBase {
+                        meta: Some(u03c_metadata("commit-step-return")),
+                        run_id: snapshot.run.as_ref().expect("U-03c run").run_id.clone(),
+                        expected_run_revision: snapshot.run.as_ref().expect("U-03c run").revision,
+                    }),
+                    step_id: step.step_id.clone(),
+                    expected_step_revision: step.revision,
+                    attempt_id: U03C_ATTEMPT_ID.to_owned(),
+                    artifact_set_id: U03C_ARTIFACT_SET_ID.to_owned(),
+                    return_handoff_id: U03C_RETURN_HANDOFF_ID.to_owned(),
+                },
+            )),
+        },
+        &u03c_collaboration_principal(
+            CollaborationPrincipalKind::CollaborationControl,
+            "collaboration-control:u03c",
+        ),
+    )
+}
+
 fn fixture_config(root: &Path, instance: &str) -> DaemonConfig {
     DaemonConfig {
         instance: instance.to_owned(),
@@ -2083,7 +3514,167 @@ fn issue_r9a2c_context_snapshot(
     assert_eq!(snapshot.snapshot_id, r9a2c_snapshot_id(compiled_context));
 }
 
+fn open_u03c_fixture_providers(root: &Path) -> DaemonProviders {
+    let verdict_handle = Arc::new(Mutex::new(None));
+    let task_guard =
+        ConfiguredTaskTransitionGuard::with_founder_verdict(Arc::clone(&verdict_handle));
+    let mut task = TaskAuthority::open_with_transition_guard(
+        TaskAuthorityConfig {
+            database_path: root.join("task-authority.db"),
+            store_epoch: "c5-00-task-epoch".to_owned(),
+            key: SqlCipherKey::new([0x11; 32]),
+        },
+        AllowTaskReferences,
+        task_guard,
+    )
+    .expect("open U-03c Task Authority");
+    let active_task = u03c_seed_task_ready(&mut task);
+    let (mut collaboration, running_collaboration) = u03c_seed_collaboration(root, &active_task);
+
+    let collector = r8a_native_config(root).return_collector;
+    let artifact_guard =
+        ConfiguredArtifactAdmissionGuard::new(ConfiguredArtifactAdmissionGuardConfig {
+            allowed_workspace_refs: [
+                collector.workspace_ref.clone(),
+                U03C_SENSITIVE_WORKSPACE.to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+            allowed_artifact_type_refs: vec![collector.artifact_type_ref.clone()],
+            allowed_transformation_contract_refs: vec![
+                collector.transformation_contract_ref.clone(),
+            ],
+            allowed_retention_profile_refs: vec![collector.retention_profile_ref.clone()],
+            allowed_claim_semantic_profile_refs: vec![collector.claim_semantic_profile_ref.clone()],
+            allowed_claim_acceptance_contract_refs: vec![
+                collector.claim_acceptance_contract_ref.clone(),
+                active_task
+                    .acceptance_contract_ref
+                    .clone()
+                    .expect("U-03c Task acceptance contract"),
+            ],
+            allowed_evidence_profile_refs: vec![collector.evidence_profile_ref.clone()],
+        })
+        .expect("U-03c Artifact admission guard");
+    let mut artifact = ArtifactAuthority::open(
+        ArtifactAuthorityConfig {
+            database_path: root.join("u03c-artifact-authority.db"),
+            blob_root: root.join("u03c-artifact-blobs"),
+            store_epoch: "u03c-artifact-epoch".to_owned(),
+            key: ArtifactSqlCipherKey::new([0x74; 32]),
+        },
+        artifact_guard,
+    )
+    .expect("open U-03c Artifact Authority");
+    let (artifact_set, _handoff) =
+        u03c_seed_artifact(&mut artifact, &active_task, &running_collaboration);
+    let evidence_pending = u03c_submit_task_evidence(&mut task, &active_task);
+
+    let artifact = Arc::new(Mutex::new(artifact));
+    let verification_resolver = ArtifactBackedReferenceResolver::new(
+        ArtifactAuthorityReferenceSource::new_shared(Arc::clone(&artifact)),
+        vec![CriterionPolicySnapshot {
+            criterion_id: "criterion-u03c".to_owned(),
+            requirement: CriterionRequirement::MustPass as i32,
+            minimum_assurance: CheckerAssuranceClass::Deterministic as i32,
+            not_applicable_allowed: false,
+            checker_profile_ids: vec![U03C_CHECKER_PROFILE_ID.to_owned()],
+        }],
+    )
+    .expect("U-03c Verification resolver");
+    let mut verification = VerificationAuthority::open(
+        VerificationAuthorityConfig {
+            database_path: root.join("u03c-verification-authority.db"),
+            store_epoch: "u03c-verification-epoch".to_owned(),
+            key: VerificationSqlCipherKey::new([0x75; 32]),
+        },
+        verification_resolver,
+    )
+    .expect("open U-03c Verification Authority");
+    let verification_artifact =
+        u03c_seed_verification(&mut verification, &evidence_pending, &artifact_set);
+    let verdict_pending = u03c_record_task_verification(&mut task, &evidence_pending);
+    assert_eq!(verdict_pending.status, TaskStatus::VerdictPending as i32);
+    assert!(verdict_pending.founder_verdict_id.is_none());
+
+    let mut verdict = FounderVerdictAuthority::open(
+        VerdictAuthorityConfig {
+            database_path: root.join("verdict-authority.db"),
+            store_epoch: "c5-00-verdict-epoch".to_owned(),
+            key: VerdictSqlCipherKey::new([0x13; 32]),
+        },
+        U03cVerdictReferences,
+    )
+    .expect("open U-03c Founder Verdict Authority");
+    let (founder_verdict, _founder_state) = u03c_issue_rework_verdict(
+        &mut verdict,
+        &verdict_pending,
+        &artifact_set,
+        &verification_artifact,
+    );
+    *verdict_handle.lock().expect("U-03c verdict handle") = Some(verdict);
+    let rework = u03c_apply_rework_verdict(
+        &mut task,
+        &verdict_pending,
+        &founder_verdict.founder_verdict_id,
+    );
+    assert_eq!(rework.status, TaskStatus::Rework as i32);
+
+    let returned_collaboration =
+        u03c_complete_collaboration_return(&mut collaboration, running_collaboration);
+    assert_eq!(
+        returned_collaboration
+            .run
+            .as_ref()
+            .expect("U-03c run")
+            .status,
+        RunStatus::Returned as i32
+    );
+
+    let verification = Arc::new(Mutex::new(verification));
+    let mut additional_projection_sources: Vec<Arc<dyn OwnerProjectionSource>> = vec![
+        Arc::new(CollaborationProjectionSource::new(collaboration)),
+        Arc::new(ArtifactProjectionSource::new_shared(Arc::clone(&artifact))),
+    ];
+    if fixture_mode() != U03C_RESULT_REVIEW_STALE_MODE {
+        additional_projection_sources.push(Arc::new(VerificationProjectionSource::new_shared(
+            Arc::clone(&verification),
+        )));
+    }
+    let policy = PolicyDecisionAuthority::open(
+        PolicyAuthorityConfig {
+            database_path: root.join("policy-authority.db"),
+            store_epoch: "c5-00-policy-epoch".to_owned(),
+            key: PolicySqlCipherKey::new([0x12; 32]),
+        },
+        AllowPolicyReferences,
+    )
+    .expect("open U-03c Policy Authority");
+    let session_principal_resolver: Arc<dyn TrustedPrincipalResolver> =
+        if fixture_mode() == U03C_RESULT_REVIEW_DENY_MODE {
+            Arc::new(U03cDenyResultReadSessionResolver)
+        } else {
+            Arc::new(FixtureSessionResolver)
+        };
+    DaemonProviders::from_shared_authority_inputs(SharedAuthorityCompositionInputs {
+        task: Arc::new(Mutex::new(task)),
+        policy,
+        verdict: verdict_handle,
+        principal_resolver: Arc::new(FixtureAuthorityPrincipalResolver),
+        session_principal_resolver,
+        session_clock: Arc::new(egopulse_local_api::session::SystemSessionClock),
+        session_audit: Arc::new(NoopSessionAuditSink),
+        additional_projection_sources,
+    })
+}
+
 fn open_fixture_providers(root: &Path) -> DaemonProviders {
+    if matches!(
+        fixture_mode().as_str(),
+        U03C_RESULT_REVIEW_MODE | U03C_RESULT_REVIEW_DENY_MODE | U03C_RESULT_REVIEW_STALE_MODE
+    ) {
+        return open_u03c_fixture_providers(root);
+    }
     if matches!(
         fixture_mode().as_str(),
         "allow"
@@ -2421,6 +4012,9 @@ async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Chi
                     | R9A3D_EXTERNAL_RECOVERY_MODE
                     | R9A3E_PREAUTH_UNAVAILABLE_MODE
                     | R9A3E_REVOKED_READY_MODE
+                    | U03C_RESULT_REVIEW_MODE
+                    | U03C_RESULT_REVIEW_DENY_MODE
+                    | U03C_RESULT_REVIEW_STALE_MODE
             ) {
                 Stdio::inherit()
             } else {
@@ -3202,6 +4796,471 @@ fn read_r8b2c_adapter_oracle(root: &Path) -> R8b2cAdapterOracle {
     }
 }
 
+fn u03c_oracle_request<'a>(root: &'a Path, task_id: &'a str) -> GovernedResultOracleRequest<'a> {
+    GovernedResultOracleRequest {
+        root,
+        task_id,
+        run_id: U03C_RUN_ID,
+        step_id: U03C_STEP_ID,
+        attempt_id: U03C_ATTEMPT_ID,
+        artifact_id: U03C_ARTIFACT_ID,
+        claim_id: U03C_CLAIM_ID,
+        evidence_id: U03C_EVIDENCE_ID,
+        artifact_set_id: U03C_ARTIFACT_SET_ID,
+        return_handoff_id: U03C_RETURN_HANDOFF_ID,
+        checker_profile_id: U03C_CHECKER_PROFILE_ID,
+        verification_request_id: U03C_VERIFICATION_REQUEST_ID,
+        verification_run_id: U03C_VERIFICATION_RUN_ID,
+        verification_artifact_id: U03C_VERIFICATION_ID,
+        task_profile: ExpectedStoreProfile {
+            schema_profile_id: "egopulse/task-authority-store/v1",
+            schema_profile_sha256: U03C_TASK_SCHEMA_SHA256,
+        },
+        collaboration_profile: ExpectedStoreProfile {
+            schema_profile_id: "egopulse/collaboration-control-store/v1",
+            schema_profile_sha256: U03C_COLLABORATION_SCHEMA_SHA256,
+        },
+        artifact_profile: ExpectedStoreProfile {
+            schema_profile_id: "egopulse/artifact-authority-store/v1",
+            schema_profile_sha256: U03C_ARTIFACT_SCHEMA_SHA256,
+        },
+        verification_profile: ExpectedStoreProfile {
+            schema_profile_id: "egopulse/verification-authority-store/v1",
+            schema_profile_sha256: U03C_VERIFICATION_SCHEMA_SHA256,
+        },
+        verdict_profile: ExpectedStoreProfile {
+            schema_profile_id: "egopulse/founder-verdict-authority-store/v1",
+            schema_profile_sha256: U03C_VERDICT_SCHEMA_SHA256,
+        },
+    }
+}
+
+fn u03c_durability_oracle(root: &Path, task_id: &str) -> GovernedResultDurabilitySnapshot {
+    let snapshot = read_governed_result_durability(&u03c_oracle_request(root, task_id))
+        .expect("read U-03c Authorities through the strict conformance oracle");
+    assert_eq!(snapshot.task.metadata.table_digests.len(), 9);
+    assert_eq!(snapshot.collaboration.metadata.table_digests.len(), 11);
+    assert_eq!(snapshot.artifact.metadata.table_digests.len(), 12);
+    assert_eq!(snapshot.verification.metadata.table_digests.len(), 11);
+    assert_eq!(snapshot.verdict.metadata.table_digests.len(), 10);
+    let task = TaskSnapshot::decode(snapshot.task.task_snapshot.as_slice())
+        .expect("decode U-03c durable Task");
+    assert_eq!(task.task_id, task_id);
+    assert_eq!(task.status, TaskStatus::Rework as i32);
+    assert_eq!(task.artifact_set_id.as_deref(), Some(U03C_ARTIFACT_SET_ID));
+    assert_eq!(
+        task.verification_artifact_id.as_deref(),
+        Some(U03C_VERIFICATION_ID)
+    );
+    assert!(
+        task.founder_verdict_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+    );
+
+    let run = RunSnapshot::decode(snapshot.collaboration.run_snapshot.as_slice())
+        .expect("decode U-03c durable Run");
+    let step = StepSnapshot::decode(snapshot.collaboration.step_snapshot.as_slice())
+        .expect("decode U-03c durable Step");
+    let attempt = AttemptSnapshot::decode(snapshot.collaboration.attempt_snapshot.as_slice())
+        .expect("decode U-03c durable Attempt");
+    assert_eq!(run.task_id, task_id);
+    assert_eq!(run.status, RunStatus::Returned as i32);
+    assert_eq!(step.status, StepStatus::Returned as i32);
+    assert_eq!(attempt.status, AttemptStatus::Returned as i32);
+    assert_eq!(attempt.dispatch_id.as_deref(), Some(U03C_DISPATCH_ID));
+    let fence = attempt
+        .lease
+        .as_ref()
+        .expect("U-03c durable lease")
+        .fencing_token;
+
+    let artifact = ArtifactDescriptor::decode(snapshot.artifact.artifact_snapshot.as_slice())
+        .expect("decode U-03c durable Artifact");
+    let claim = Claim::decode(snapshot.artifact.claim_snapshot.as_slice())
+        .expect("decode U-03c durable Claim");
+    let evidence = Evidence::decode(snapshot.artifact.evidence_snapshot.as_slice())
+        .expect("decode U-03c durable Evidence");
+    let set = ArtifactSet::decode(snapshot.artifact.artifact_set_snapshot.as_slice())
+        .expect("decode U-03c durable ArtifactSet");
+    let handoff = ReturnHandoff::decode(snapshot.artifact.return_handoff_snapshot.as_slice())
+        .expect("decode U-03c durable ReturnHandoff");
+    assert_eq!(artifact.artifact_id, U03C_ARTIFACT_ID);
+    assert_eq!(claim.claim_id, U03C_CLAIM_ID);
+    assert_eq!(evidence.evidence_id, U03C_EVIDENCE_ID);
+    assert!(artifact.revision > 0);
+    assert_eq!(artifact.status, ArtifactStatus::Sealed as i32);
+    assert!(
+        artifact
+            .content
+            .as_ref()
+            .is_some_and(|value| { value.digest.len() == 64 && value.byte_length > 0 })
+    );
+    assert_eq!(claim.status, ClaimStatus::Proposed as i32);
+    assert_eq!(claim.subject_artifact_ids, [U03C_ARTIFACT_ID]);
+    assert_eq!(evidence.status, EvidenceStatus::Recorded as i32);
+    assert_eq!(evidence.claim_id, U03C_CLAIM_ID);
+    assert_eq!(evidence.artifact_ids, [U03C_ARTIFACT_ID]);
+    assert_eq!(set.status, ArtifactSetStatus::Sealed as i32);
+    assert_eq!(set.artifact_ids, [U03C_ARTIFACT_ID]);
+    assert_eq!(set.claim_ids, [U03C_CLAIM_ID]);
+    assert_eq!(set.evidence_ids, [U03C_EVIDENCE_ID]);
+    assert_eq!(handoff.status, ReturnHandoffStatus::Receipted as i32);
+    let lineage = set.lineage.as_ref().expect("U-03c ArtifactSet lineage");
+    assert_eq!(lineage.task_id, task_id);
+    assert_eq!(lineage.run_id, U03C_RUN_ID);
+    assert_eq!(lineage.step_id, U03C_STEP_ID);
+    assert_eq!(lineage.attempt_id, U03C_ATTEMPT_ID);
+    assert_eq!(lineage.dispatch_id, U03C_DISPATCH_ID);
+    assert_eq!(lineage.fencing_token, fence);
+    assert_eq!(
+        Some(lineage),
+        artifact
+            .provenance
+            .as_ref()
+            .and_then(|value| value.lineage.as_ref())
+    );
+    assert_eq!(claim.lineage.as_ref(), Some(lineage));
+    assert_eq!(evidence.lineage.as_ref(), Some(lineage));
+
+    let verification =
+        VerificationArtifact::decode(snapshot.verification.artifact_snapshot.as_slice())
+            .expect("decode U-03c durable Verification artifact");
+    assert_eq!(verification.verification_artifact_id, U03C_VERIFICATION_ID);
+    assert_eq!(
+        verification.conclusion,
+        VerificationConclusion::Passed as i32
+    );
+    assert_eq!(verification.criterion_results.len(), 1);
+    assert_eq!(verification.discrepancies.len(), 1);
+    assert_eq!(verification.unverified_items.len(), 1);
+    assert_eq!(
+        verification.criterion_results[0].criterion_id,
+        "criterion-u03c"
+    );
+    assert_eq!(
+        verification.criterion_results[0].outcome,
+        CriterionOutcome::Passed as i32
+    );
+    assert_eq!(
+        verification.discrepancies[0].discrepancy_id,
+        "discrepancy-u03c"
+    );
+    assert_eq!(
+        verification.unverified_items[0].unverified_item_id,
+        "unverified-u03c"
+    );
+    assert_eq!(
+        verification
+            .binding
+            .as_ref()
+            .map(|binding| binding.artifact_set_id.as_str()),
+        Some(U03C_ARTIFACT_SET_ID)
+    );
+
+    let verdict = egopulse_domain_contracts::v01::egopulse::verdict::v1::FounderVerdict::decode(
+        snapshot.verdict.verdict_snapshot.as_slice(),
+    )
+    .expect("decode U-03c durable Founder Verdict");
+    let state = FounderVerdictState::decode(snapshot.verdict.state_snapshot.as_slice())
+        .expect("decode U-03c durable Founder Verdict state");
+    assert!(verdict.version > 0);
+    assert_eq!(verdict.decision, FounderVerdictDecision::Rework as i32);
+    assert_eq!(verdict.founder_verdict_id, state.founder_verdict_id);
+    assert_eq!(state.state, FounderVerdictStateKind::Consumed as i32);
+    assert_eq!(state.revision, 2);
+    assert_eq!(snapshot.verdict.consumption_receipt_count, 1);
+    assert_eq!(
+        task.founder_verdict_id.as_deref(),
+        Some(verdict.founder_verdict_id.as_str())
+    );
+    assert_eq!(
+        verdict.scope.as_ref().map(|scope| scope.task_id.as_str()),
+        Some(task_id)
+    );
+    snapshot
+}
+
+async fn wait_for_u03c_ready(instance: &str, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let output = run_bounded_fixture_command(
+            cli_executable(),
+            instance,
+            &["status", "--json"],
+            "U-03c CLI readiness",
+        )
+        .await;
+        if output.status.success() {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("inspect U-03c daemon") {
+            panic!(
+                "U-03c daemon exited before readiness: {status}; stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "U-03c daemon readiness timed out"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn u03c_selected_task(
+    instance: &str,
+) -> Result<
+    (
+        Arc<egopulse_client_operations::ClientAttachment>,
+        TaskWatchController<egopulse_client_operations::ClientAttachment>,
+        String,
+    ),
+    String,
+> {
+    timeout(Duration::from_secs(5), async {
+        let attachment = Arc::new(
+            attach_client_operation(
+                instance,
+                ClientSurface::Tui,
+                format!("egopulse-tui-u03c-{}", Uuid::now_v7()),
+            )
+            .await
+            .map_err(|error| format!("attach production U-03c TUI client: {error}"))?,
+        );
+        let mut controller = TaskWatchController::new(Arc::clone(&attachment));
+        controller
+            .start()
+            .await
+            .map_err(|error| format!("start U-03c Task Watch baseline: {error}"))?;
+        loop {
+            controller
+                .pump()
+                .await
+                .map_err(|error| format!("pump U-03c Task Watch: {error}"))?;
+            if let Some(task_id) = controller
+                .model()
+                .and_then(|model| model.selected_task_id.clone())
+            {
+                assert!(controller.select_task(&task_id));
+                break Ok((attachment, controller, task_id));
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| "U-03c attach and Task Watch baseline timed out".to_owned())?
+}
+
+async fn u03c_selected_task_or_reap(
+    instance: &str,
+    child: &mut Child,
+) -> (
+    Arc<egopulse_client_operations::ClientAttachment>,
+    TaskWatchController<egopulse_client_operations::ClientAttachment>,
+    String,
+) {
+    match u03c_selected_task(instance).await {
+        Ok(selected) => selected,
+        Err(error) => {
+            let _ = shutdown_fixture_child(child, "U-03c daemon after Task Watch failure").await;
+            panic!("{error}");
+        }
+    }
+}
+
+async fn wait_for_u03c_projection(
+    attachment: &egopulse_client_operations::ClientAttachment,
+    task_id: &str,
+    require_complete_review: bool,
+) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let projection = attachment
+                .read_projection_snapshot()
+                .await
+                .expect("read U-03c projection convergence");
+            if projection.tasks.iter().any(|view| {
+                view.task.as_ref().is_some_and(|task| {
+                    task.task_id == task_id && task.status == TaskStatus::Rework as i32
+                }) && view.founder_verdict_state.as_ref().is_some_and(|state| {
+                    state.state == FounderVerdictStateKind::Consumed as i32 && state.revision == 2
+                }) && (!require_complete_review
+                    || (view.artifact_set.is_some()
+                        && view.verification.is_some()
+                        && view.founder_verdict.is_some()))
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("U-03c governed projection converges");
+}
+
+async fn u03c_cli_review_json(instance: &str, task_id: &str) -> serde_json::Value {
+    let output = run_bounded_fixture_command(
+        cli_executable(),
+        instance,
+        &["task", "review", task_id, "--json"],
+        "U-03c CLI task review",
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "U-03c CLI review failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("U-03c CLI review JSON")
+}
+
+fn normalized_u03c_cli_review(mut value: serde_json::Value) -> serde_json::Value {
+    value
+        .as_object_mut()
+        .expect("U-03c CLI review object")
+        .remove("correlationId");
+    value
+}
+
+async fn assert_u03c_tui_review_fails(
+    attachment: Arc<egopulse_client_operations::ClientAttachment>,
+    task_id: &str,
+    expected_safe_error: &str,
+) {
+    let mut controller = ResultReviewController::new(attachment, task_id.to_owned());
+    controller
+        .start()
+        .await
+        .expect("start fail-closed U-03c TUI review");
+    let failure = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Err(error) = controller.pump().await {
+                break error;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("U-03c TUI failure is bounded");
+    assert_eq!(failure, expected_safe_error);
+    assert!(controller.model().is_none());
+    assert!(!controller.is_running());
+    controller.stop().await;
+}
+
+async fn assert_u03c_shared_review_failure(
+    attachment: &egopulse_client_operations::ClientAttachment,
+    task_id: &str,
+    scenario: &str,
+) {
+    let error = attachment
+        .read_task_result_review(task_id)
+        .await
+        .expect_err("U-03c shared review operation must fail closed");
+    match (scenario, error) {
+        (
+            "missing",
+            ClientTaskResultReviewError::Api {
+                stage: TaskResultReviewStage::Task,
+                error,
+            },
+        ) => {
+            assert_eq!(error.code, LocalApiErrorCode::NotFound as i32);
+            assert!(!error.retryable);
+        }
+        (
+            "permission",
+            ClientTaskResultReviewError::Kernel {
+                stage: TaskResultReviewStage::Evidence,
+                source: KernelError::PermissionDenied(permission),
+            },
+        ) => assert_eq!(permission, "local.evidence.read"),
+        (
+            "stale",
+            ClientTaskResultReviewError::Integrity {
+                stage: TaskResultReviewStage::Task,
+                detail: "projection is not ready and current",
+            },
+        ) => {}
+        (scenario, error) => panic!("unexpected U-03c {scenario} shared failure: {error:?}"),
+    }
+}
+
+fn assert_u03c_cli_review_failure(scenario: &str, output: &std::process::Output) {
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("U-03c fail-closed CLI JSON envelope");
+    let (operation, category, code) = match scenario {
+        "missing" => ("task.review.task", "domain_conflict", "LOCAL_API_ERROR"),
+        "permission" => (
+            "task.review.evidence",
+            "authentication",
+            "PERMISSION_DENIED",
+        ),
+        "stale" => ("task.review.task", "internal", "LOCAL_API_PROTOCOL_ERROR"),
+        other => panic!("unknown U-03c failure scenario: {other}"),
+    };
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["operation"], operation);
+    assert_eq!(value["error"]["category"], category);
+    assert_eq!(value["error"]["code"], code);
+    assert_eq!(value["error"]["retryable"], false);
+    assert!(value.get("data").is_none() || value["data"].is_null());
+}
+
+fn u03c_expected_tui_failure(scenario: &str) -> String {
+    match scenario {
+        "missing" => format!(
+            "task review API rejected code={} retryable=false",
+            LocalApiErrorCode::NotFound as i32
+        ),
+        "permission" => "evidence review permission or session rejected".to_owned(),
+        "stale" => "task review integrity failed".to_owned(),
+        other => panic!("unknown U-03c failure scenario: {other}"),
+    }
+}
+
+async fn u03c_tui_review_lines(
+    attachment: Arc<egopulse_client_operations::ClientAttachment>,
+    task_watch: &mut TaskWatchController<egopulse_client_operations::ClientAttachment>,
+    task_id: &str,
+) -> Vec<String> {
+    assert_eq!(
+        task_watch
+            .model()
+            .and_then(|model| model.selected_task_id.as_deref()),
+        Some(task_id)
+    );
+    task_watch.stop().await;
+    let mut controller = ResultReviewController::new(attachment, task_id.to_owned());
+    controller
+        .start()
+        .await
+        .expect("start production U-03c result review");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            controller.pump().await.expect("pump U-03c result review");
+            if controller.model().is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("U-03c result review becomes ready");
+    let mut model = controller.model().expect("U-03c TUI review model").clone();
+    assert_eq!(model.task_id, task_id);
+    assert_eq!(model.task_status, "Rework");
+    let mut lines = Vec::new();
+    for _ in 0..egopulse_tui::result_review::ResultReviewSection::ALL.len() {
+        lines.extend(model.lines().iter().cloned());
+        model.next_section();
+    }
+    controller.stop().await;
+    lines
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c5_00_real_daemon_fixture_opens_session_over_local_ipc() {
     let root = std::env::temp_dir().join(format!("egopulse-c5-00-{}", Uuid::now_v7()));
@@ -3254,6 +5313,268 @@ async fn c5_00_real_daemon_fixture_opens_session_over_local_ipc() {
         .await
         .expect("fixture child exit after timeout");
     panic!("{last_error}; child status: {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u03c_real_daemon_cli_and_tui_review_complete_governed_result_without_authority_writes() {
+    let root = std::env::temp_dir().join(format!("egopulse-u03c-review-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create U-03c fixture root");
+    let instance = format!("u03c-review-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, U03C_RESULT_REVIEW_MODE).await;
+    assert_ne!(child.id(), Some(std::process::id()));
+    wait_for_u03c_ready(&instance, &mut child).await;
+
+    let (discovery_attachment, mut discovery_watch, task_id) =
+        u03c_selected_task_or_reap(&instance, &mut child).await;
+    wait_for_u03c_projection(&discovery_attachment, &task_id, true).await;
+    discovery_watch.stop().await;
+    drop(discovery_watch);
+    drop(discovery_attachment);
+    let baseline = u03c_durability_oracle(&root, &task_id);
+    let mut wrong_profile = u03c_oracle_request(&root, &task_id);
+    wrong_profile.task_profile.schema_profile_sha256 =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    assert!(
+        read_governed_result_durability(&wrong_profile).is_err(),
+        "U-03c oracle must fail closed on an unexpected owner schema profile"
+    );
+
+    let cli = run_bounded_fixture_command(
+        cli_executable(),
+        &instance,
+        &["task", "review", task_id.as_str(), "--json"],
+        "U-03c CLI task review",
+    )
+    .await;
+    assert!(
+        cli.status.success(),
+        "U-03c CLI review failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&cli.stdout),
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_text = String::from_utf8(cli.stdout).expect("U-03c CLI UTF-8");
+    let cli_json: serde_json::Value =
+        serde_json::from_str(&cli_text).expect("U-03c CLI review JSON");
+    assert_eq!(cli_json["operation"], "task.review");
+    assert_eq!(cli_json["data"]["taskId"], task_id);
+    assert_eq!(cli_json["data"]["taskStatus"], "TASK_STATUS_REWORK");
+    assert_eq!(
+        cli_json["data"]["artifactSet"]["artifactSetId"],
+        U03C_ARTIFACT_SET_ID
+    );
+    assert_eq!(
+        cli_json["data"]["verification"]["verificationArtifactId"],
+        U03C_VERIFICATION_ID
+    );
+    assert_eq!(
+        cli_json["data"]["founderVerdict"]["decision"],
+        "FOUNDER_VERDICT_DECISION_REWORK"
+    );
+    assert_eq!(
+        cli_json["data"]["verification"]["criterionResults"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        cli_json["data"]["verification"]["discrepancies"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        cli_json["data"]["verification"]["unverifiedItems"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    for sentinel in [
+        U03C_SENSITIVE_PRINCIPAL,
+        U03C_SENSITIVE_PROOF,
+        U03C_SENSITIVE_WORKSPACE,
+        U03C_SENSITIVE_RAW,
+        "native-u03c-never-render",
+        "session-u03c-never-render",
+    ] {
+        assert!(!cli_text.contains(sentinel), "CLI leaked {sentinel}");
+    }
+
+    let (attachment, mut task_watch, selected_task_id) =
+        u03c_selected_task_or_reap(&instance, &mut child).await;
+    assert_eq!(selected_task_id, task_id);
+    let tui_lines = u03c_tui_review_lines(Arc::clone(&attachment), &mut task_watch, &task_id).await;
+    let tui_text = tui_lines.join("\n");
+    for expected in [
+        task_id.as_str(),
+        U03C_ARTIFACT_SET_ID,
+        U03C_VERIFICATION_ID,
+        "Rework",
+        "discrepancy-u03c",
+        "unverified-u03c",
+    ] {
+        assert!(tui_text.contains(expected), "TUI omitted {expected}");
+    }
+    for sentinel in [
+        U03C_SENSITIVE_PRINCIPAL,
+        U03C_SENSITIVE_PROOF,
+        U03C_SENSITIVE_WORKSPACE,
+        U03C_SENSITIVE_RAW,
+        "native-u03c-never-render",
+        "session-u03c-never-render",
+    ] {
+        assert!(!tui_text.contains(sentinel), "TUI leaked {sentinel}");
+    }
+    assert_eq!(u03c_durability_oracle(&root, &task_id), baseline);
+
+    task_watch.stop().await;
+    drop(task_watch);
+    drop(attachment);
+    let status = shutdown_fixture_child(&mut child, "U-03c result review daemon").await;
+    assert!(status.success(), "U-03c daemon shutdown failed: {status}");
+    fs::remove_dir_all(&root).expect("remove U-03c fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u03c_same_root_restart_preserves_result_review_and_authority_snapshots() {
+    let root = std::env::temp_dir().join(format!("egopulse-u03c-restart-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create U-03c restart root");
+    let instance = format!("u03c-restart-{}", Uuid::now_v7());
+
+    let mut first = spawn_fixture_with_mode(&root, &instance, U03C_RESULT_REVIEW_MODE).await;
+    let first_pid = first.id().expect("U-03c D1 PID");
+    assert_ne!(first_pid, std::process::id());
+    wait_for_u03c_ready(&instance, &mut first).await;
+    let (first_discovery_attachment, mut first_discovery_watch, task_id) =
+        u03c_selected_task_or_reap(&instance, &mut first).await;
+    wait_for_u03c_projection(&first_discovery_attachment, &task_id, true).await;
+    first_discovery_watch.stop().await;
+    drop(first_discovery_watch);
+    drop(first_discovery_attachment);
+    let baseline = u03c_durability_oracle(&root, &task_id);
+    let first_cli = normalized_u03c_cli_review(u03c_cli_review_json(&instance, &task_id).await);
+    assert_eq!(u03c_durability_oracle(&root, &task_id), baseline);
+    let (first_attachment, mut first_watch, first_selected_task_id) =
+        u03c_selected_task_or_reap(&instance, &mut first).await;
+    assert_eq!(first_selected_task_id, task_id);
+    let first_tui =
+        u03c_tui_review_lines(Arc::clone(&first_attachment), &mut first_watch, &task_id).await;
+    assert_eq!(u03c_durability_oracle(&root, &task_id), baseline);
+    first_watch.stop().await;
+    drop(first_watch);
+    drop(first_attachment);
+    let first_status = shutdown_fixture_child(&mut first, "U-03c D1").await;
+    assert!(
+        first_status.success(),
+        "U-03c D1 shutdown failed: {first_status}"
+    );
+
+    // D2 deliberately executes the same production seeding commands again. Authority exact
+    // replay, proven by the unchanged fixed-table digests below, prevents any additional write.
+    let mut second = spawn_fixture_with_mode(&root, &instance, U03C_RESULT_REVIEW_MODE).await;
+    let second_pid = second.id().expect("U-03c D2 PID");
+    assert_ne!(second_pid, std::process::id());
+    assert_ne!(
+        first_pid, second_pid,
+        "U-03c restart must use a new process"
+    );
+    wait_for_u03c_ready(&instance, &mut second).await;
+    let (second_discovery_attachment, mut second_discovery_watch, second_task_id) =
+        u03c_selected_task_or_reap(&instance, &mut second).await;
+    assert_eq!(second_task_id, task_id);
+    wait_for_u03c_projection(&second_discovery_attachment, &task_id, true).await;
+    second_discovery_watch.stop().await;
+    drop(second_discovery_watch);
+    drop(second_discovery_attachment);
+    assert_eq!(u03c_durability_oracle(&root, &task_id), baseline);
+    let second_cli = normalized_u03c_cli_review(u03c_cli_review_json(&instance, &task_id).await);
+    assert_eq!(second_cli, first_cli);
+    assert_eq!(u03c_durability_oracle(&root, &task_id), baseline);
+    let (second_attachment, mut second_watch, second_selected_task_id) =
+        u03c_selected_task_or_reap(&instance, &mut second).await;
+    assert_eq!(second_selected_task_id, task_id);
+    let second_tui =
+        u03c_tui_review_lines(Arc::clone(&second_attachment), &mut second_watch, &task_id).await;
+    assert_eq!(second_tui, first_tui);
+    assert_eq!(u03c_durability_oracle(&root, &task_id), baseline);
+    second_watch.stop().await;
+    drop(second_watch);
+    drop(second_attachment);
+    let second_status = shutdown_fixture_child(&mut second, "U-03c D2").await;
+    assert!(
+        second_status.success(),
+        "U-03c D2 shutdown failed: {second_status}"
+    );
+    fs::remove_dir_all(&root).expect("remove U-03c restart root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u03c_real_clients_fail_closed_for_missing_permission_and_stale_review() {
+    for (label, mode) in [
+        ("missing", U03C_RESULT_REVIEW_MODE),
+        ("permission", U03C_RESULT_REVIEW_DENY_MODE),
+        ("stale", U03C_RESULT_REVIEW_STALE_MODE),
+    ] {
+        let root = std::env::temp_dir().join(format!("egopulse-u03c-{label}-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create U-03c failure root");
+        let instance = format!("u03c-{label}-{}", Uuid::now_v7());
+        let mut child = spawn_fixture_with_mode(&root, &instance, mode).await;
+        assert_ne!(child.id(), Some(std::process::id()));
+        wait_for_u03c_ready(&instance, &mut child).await;
+        let (attachment, mut watch, task_id) =
+            u03c_selected_task_or_reap(&instance, &mut child).await;
+        wait_for_u03c_projection(&attachment, &task_id, mode != U03C_RESULT_REVIEW_STALE_MODE)
+            .await;
+        let baseline = u03c_durability_oracle(&root, &task_id);
+        let requested_task_id = if label == "missing" {
+            "task:u03c-missing"
+        } else {
+            task_id.as_str()
+        };
+        assert_u03c_shared_review_failure(&attachment, requested_task_id, label).await;
+        let cli = run_bounded_fixture_command(
+            cli_executable(),
+            &instance,
+            &["task", "review", requested_task_id, "--json"],
+            "U-03c fail-closed CLI review",
+        )
+        .await;
+        assert!(
+            !cli.status.success(),
+            "U-03c {label} CLI review unexpectedly succeeded"
+        );
+        assert_u03c_cli_review_failure(label, &cli);
+        let cli_stdout = String::from_utf8_lossy(&cli.stdout);
+        let cli_stderr = String::from_utf8_lossy(&cli.stderr);
+        let failure_output = format!("{cli_stdout}\n{cli_stderr}");
+        for forbidden in [
+            U03C_ARTIFACT_SET_ID,
+            U03C_VERIFICATION_RUN_ID,
+            U03C_SENSITIVE_PRINCIPAL,
+            U03C_SENSITIVE_PROOF,
+            U03C_SENSITIVE_WORKSPACE,
+            U03C_SENSITIVE_RAW,
+            "native-u03c-never-render",
+        ] {
+            assert!(
+                !failure_output.contains(forbidden),
+                "U-03c {label} failure response leaked governed review data: {forbidden}"
+            );
+        }
+        assert_eq!(u03c_durability_oracle(&root, &task_id), baseline);
+        watch.stop().await;
+        assert_u03c_tui_review_fails(
+            Arc::clone(&attachment),
+            requested_task_id,
+            &u03c_expected_tui_failure(label),
+        )
+        .await;
+        assert_eq!(u03c_durability_oracle(&root, &task_id), baseline);
+        drop(watch);
+        drop(attachment);
+        let status = shutdown_fixture_child(&mut child, "U-03c fail-closed daemon").await;
+        assert!(status.success(), "U-03c {label} daemon failed: {status}");
+        fs::remove_dir_all(&root).expect("remove U-03c failure root");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

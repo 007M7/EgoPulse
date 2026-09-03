@@ -1576,7 +1576,7 @@ fn validate_task_result_view(
                 return Err(review_integrity(stage, "Founder Verdict binding mismatch"));
             }
             let source = exact_source(metadata, SourceDomain::FounderVerdict, id, stage)?;
-            if source.revision != state.revision || source.revision != verdict.version {
+            if source.revision != state.revision {
                 return Err(review_integrity(
                     stage,
                     "Founder Verdict source revision mismatch",
@@ -5228,6 +5228,53 @@ mod tests {
                     .unwrap()
                     .sequence
         );
+    }
+
+    #[test]
+    fn task_result_review_distinguishes_verdict_issue_version_from_state_revision() {
+        let (mut view, _) = task_result_fixture();
+        view.founder_verdict_state.as_mut().unwrap().revision = 2;
+        view.metadata
+            .as_mut()
+            .unwrap()
+            .source_revisions
+            .iter_mut()
+            .find(|source| source.domain == SourceDomain::FounderVerdict as i32)
+            .unwrap()
+            .revision = 2;
+        assert!(validate_task_result_view(&view, "task:review").is_ok());
+
+        let mut stale_source = view.clone();
+        stale_source
+            .metadata
+            .as_mut()
+            .unwrap()
+            .source_revisions
+            .iter_mut()
+            .find(|source| source.domain == SourceDomain::FounderVerdict as i32)
+            .unwrap()
+            .revision = 1;
+        assert!(matches!(
+            validate_task_result_view(&stale_source, "task:review"),
+            Err(ClientTaskResultReviewError::Integrity {
+                stage: TaskResultReviewStage::Task,
+                detail: "Founder Verdict source revision mismatch",
+            })
+        ));
+
+        let mut missing_issue_version = view;
+        missing_issue_version
+            .founder_verdict
+            .as_mut()
+            .unwrap()
+            .version = 0;
+        assert!(matches!(
+            validate_task_result_view(&missing_issue_version, "task:review"),
+            Err(ClientTaskResultReviewError::Integrity {
+                stage: TaskResultReviewStage::Task,
+                detail: "Founder Verdict binding mismatch",
+            })
+        ));
     }
 
     #[test]
