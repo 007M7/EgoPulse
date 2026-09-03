@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, future::Future, num::NonZeroU32, sync::Arc};
 use egopulse_client_kernel::KernelError;
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::LocalApiErrorCode;
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition;
-use tokio::sync::{mpsc, mpsc::error::TryRecvError, oneshot};
+use tokio::sync::{mpsc, mpsc::error::TryRecvError, oneshot, watch};
 
 use crate::governed_state::{
     GovernedApprovalDomainPosition, GovernedApprovalDomainState, GovernedApprovalReducerInput,
@@ -37,6 +37,13 @@ struct ApprovalRequest {
     ack: oneshot::Sender<DomainAck>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerDirective {
+    ContinueLive { generation: u64 },
+    Recover { generation: u64 },
+    Stop,
+}
+
 type TaskRequestSender = mpsc::Sender<TaskRequest>;
 type TaskRequestReceiver = mpsc::Receiver<TaskRequest>;
 type ApprovalRequestSender = mpsc::Sender<ApprovalRequest>;
@@ -56,6 +63,83 @@ fn governed_state_request_channels() -> (
         approval_sender,
         approval_receiver,
     )
+}
+
+async fn wait_for_cancellation(cancellation: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancellation.borrow() {
+            return;
+        }
+        if cancellation.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn cancellation_requested(cancellation: &watch::Receiver<bool>) -> bool {
+    *cancellation.borrow() || cancellation.has_changed().is_err()
+}
+
+async fn submit_with_ack<T, F>(
+    sender: &mpsc::Sender<T>,
+    cancellation: &mut watch::Receiver<bool>,
+    make_request: F,
+) -> Option<DomainAck>
+where
+    F: FnOnce(oneshot::Sender<DomainAck>) -> T,
+{
+    if cancellation_requested(cancellation) {
+        return None;
+    }
+    let permit = tokio::select! {
+        biased;
+        _ = wait_for_cancellation(cancellation) => return None,
+        permit = sender.reserve() => permit.ok()?,
+    };
+    if cancellation_requested(cancellation) {
+        return None;
+    }
+
+    let (ack_sender, ack_receiver) = oneshot::channel();
+    permit.send(make_request(ack_sender));
+    tokio::select! {
+        biased;
+        _ = wait_for_cancellation(cancellation) => None,
+        ack = ack_receiver => ack.ok(),
+    }
+}
+
+async fn submit_task_input(
+    sender: &TaskRequestSender,
+    cancellation: &mut watch::Receiver<bool>,
+    input: GovernedTaskReducerInput,
+) -> Option<DomainAck> {
+    submit_with_ack(sender, cancellation, |ack| TaskRequest { input, ack }).await
+}
+
+async fn submit_approval_input(
+    sender: &ApprovalRequestSender,
+    cancellation: &mut watch::Receiver<bool>,
+    input: GovernedApprovalReducerInput,
+) -> Option<DomainAck> {
+    submit_with_ack(sender, cancellation, |ack| ApprovalRequest { input, ack }).await
+}
+
+fn directive_from_ack(captured_generation: u64, ack: DomainAck) -> WorkerDirective {
+    match ack.phase {
+        GovernedStateDomainPhase::Fatal => WorkerDirective::Stop,
+        GovernedStateDomainPhase::Live if ack.generation == captured_generation => {
+            WorkerDirective::ContinueLive {
+                generation: ack.generation,
+            }
+        }
+        GovernedStateDomainPhase::Connecting
+        | GovernedStateDomainPhase::Live
+        | GovernedStateDomainPhase::Stale
+        | GovernedStateDomainPhase::ResetRequired => WorkerDirective::Recover {
+            generation: ack.generation,
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -774,10 +858,12 @@ mod tests {
 
     use super::{
         ApprovalRequest, DomainAck, DriverFailure, DriverStage, GovernedStateSessionCore, Opened,
-        TaskRequest, approval_complete_input_from_parts, approval_failure_input,
+        TaskRequest, WorkerDirective, approval_complete_input_from_parts, approval_failure_input,
         approval_live_input_from_parts, approval_live_input_from_result, classify_approval_error,
-        classify_task_error, clone_shared_pair, open_source_via, task_complete_input_from_parts,
-        task_failure_input, task_live_input_from_result, task_live_input_from_update,
+        classify_task_error, clone_shared_pair, directive_from_ack,
+        governed_state_request_channels, open_source_via, submit_approval_input, submit_task_input,
+        task_complete_input_from_parts, task_failure_input, task_live_input_from_result,
+        task_live_input_from_update,
     };
     use crate::governed_state::{
         GovernedApprovalDomainState, GovernedApprovalReducerInput, GovernedApprovalState,
@@ -1056,6 +1142,212 @@ mod tests {
             GovernedApprovalReducerInput::Reset { generation: 14 }
         ));
         assert_eq!(lookup_calls.get(), 0);
+    }
+
+    #[test]
+    fn r9b2b_worker_directive_uses_only_ack_phase_and_generation() {
+        let ack = |phase, generation| DomainAck {
+            phase,
+            generation,
+            recovery_remaining: 2,
+        };
+
+        assert_eq!(
+            directive_from_ack(7, ack(GovernedStateDomainPhase::Live, 7)),
+            WorkerDirective::ContinueLive { generation: 7 }
+        );
+        assert_eq!(
+            directive_from_ack(7, ack(GovernedStateDomainPhase::Live, 8)),
+            WorkerDirective::Recover { generation: 8 }
+        );
+        for phase in [
+            GovernedStateDomainPhase::Connecting,
+            GovernedStateDomainPhase::Stale,
+            GovernedStateDomainPhase::ResetRequired,
+        ] {
+            assert_eq!(
+                directive_from_ack(7, ack(phase, 9)),
+                WorkerDirective::Recover { generation: 9 }
+            );
+        }
+        assert_eq!(
+            directive_from_ack(7, ack(GovernedStateDomainPhase::Fatal, 10)),
+            WorkerDirective::Stop
+        );
+    }
+
+    #[test]
+    fn r9b2b_submit_returns_normal_ack_after_one_delivered_request() {
+        let (task_sender, mut task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        let (_cancel_sender, mut cancellation) = tokio::sync::watch::channel(false);
+        let mut submit = pin!(submit_task_input(
+            &task_sender,
+            &mut cancellation,
+            GovernedTaskReducerInput::Heartbeat { generation: 4 },
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(submit.as_mut().poll(&mut context), Poll::Pending));
+        let request = task_receiver
+            .try_recv()
+            .expect("one reserved task request must be delivered");
+        assert!(matches!(
+            request.input,
+            GovernedTaskReducerInput::Heartbeat { generation: 4 }
+        ));
+        let expected = DomainAck {
+            phase: GovernedStateDomainPhase::Live,
+            generation: 4,
+            recovery_remaining: 3,
+        };
+        assert!(request.ack.send(expected).is_ok());
+        assert!(matches!(
+            submit.as_mut().poll(&mut context),
+            Poll::Ready(Some(actual)) if actual == expected
+        ));
+    }
+
+    #[test]
+    fn r9b2b_submit_cancels_while_waiting_for_capacity_one_reserve() {
+        let (task_sender, mut task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        let (prefill_ack, _prefill_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            task_sender
+                .try_send(TaskRequest {
+                    input: GovernedTaskReducerInput::Replay { generation: 1 },
+                    ack: prefill_ack,
+                })
+                .is_ok()
+        );
+        let (cancel_sender, mut cancellation) = tokio::sync::watch::channel(false);
+        let mut submit = pin!(submit_task_input(
+            &task_sender,
+            &mut cancellation,
+            GovernedTaskReducerInput::Heartbeat { generation: 1 },
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(submit.as_mut().poll(&mut context), Poll::Pending));
+        assert!(cancel_sender.send(true).is_ok());
+        assert!(matches!(
+            submit.as_mut().poll(&mut context),
+            Poll::Ready(None)
+        ));
+        let _prefilled = task_receiver
+            .try_recv()
+            .expect("the original capacity-filling request must remain");
+        assert!(matches!(
+            task_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn r9b2b_submit_cancels_after_delivery_while_ack_is_pending() {
+        let (_task_sender, _task_receiver, approval_sender, mut approval_receiver) =
+            governed_state_request_channels();
+        let (cancel_sender, mut cancellation) = tokio::sync::watch::channel(false);
+        let mut submit = pin!(submit_approval_input(
+            &approval_sender,
+            &mut cancellation,
+            GovernedApprovalReducerInput::Heartbeat { generation: 6 },
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(submit.as_mut().poll(&mut context), Poll::Pending));
+        let request = approval_receiver
+            .try_recv()
+            .expect("one reserved approval request must be delivered");
+        assert!(matches!(
+            request.input,
+            GovernedApprovalReducerInput::Heartbeat { generation: 6 }
+        ));
+        drop(cancel_sender);
+        assert!(matches!(
+            submit.as_mut().poll(&mut context),
+            Poll::Ready(None)
+        ));
+        assert!(
+            request
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Live,
+                    generation: 6,
+                    recovery_remaining: 3,
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn r9b2b_submit_prefers_cancellation_when_ack_is_simultaneously_ready() {
+        let (task_sender, mut task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        let (cancel_sender, mut cancellation) = tokio::sync::watch::channel(false);
+        let mut submit = pin!(submit_task_input(
+            &task_sender,
+            &mut cancellation,
+            GovernedTaskReducerInput::Heartbeat { generation: 7 },
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(submit.as_mut().poll(&mut context), Poll::Pending));
+        let request = task_receiver
+            .try_recv()
+            .expect("the request must be delivered before awaiting its ack");
+        assert!(
+            request
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Live,
+                    generation: 7,
+                    recovery_remaining: 3,
+                })
+                .is_ok()
+        );
+        assert!(cancel_sender.send(true).is_ok());
+        assert!(matches!(
+            submit.as_mut().poll(&mut context),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
+    fn r9b2b_submit_treats_cancellation_sender_drop_during_full_reserve_as_cancel() {
+        let (task_sender, mut task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        let (prefill_ack, _prefill_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            task_sender
+                .try_send(TaskRequest {
+                    input: GovernedTaskReducerInput::Replay { generation: 1 },
+                    ack: prefill_ack,
+                })
+                .is_ok()
+        );
+        let (cancel_sender, mut cancellation) = tokio::sync::watch::channel(false);
+        let mut submit = pin!(submit_task_input(
+            &task_sender,
+            &mut cancellation,
+            GovernedTaskReducerInput::Heartbeat { generation: 1 },
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(submit.as_mut().poll(&mut context), Poll::Pending));
+        drop(cancel_sender);
+        assert!(matches!(
+            submit.as_mut().poll(&mut context),
+            Poll::Ready(None)
+        ));
+        let _prefilled = task_receiver
+            .try_recv()
+            .expect("the original capacity-filling request must remain");
+        assert!(matches!(
+            task_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
