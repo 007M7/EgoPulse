@@ -2792,6 +2792,91 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_worker_exit_projects_own_domain_fatal_and_approval_still_advances() {
+        for exit in [
+            WorkerExit::RequestChannelClosed,
+            WorkerExit::AcknowledgementLost,
+        ] {
+            let (core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+            let (cancellation, _cancellation_receiver) = tokio::sync::watch::channel(false);
+            let (gate_sender, gate_receiver) = tokio::sync::oneshot::channel::<()>();
+            let task_worker: tokio::task::JoinHandle<WorkerExit> = tokio::spawn(async move {
+                let _ = gate_receiver.await;
+                exit
+            });
+            let mut session = GovernedStateSession {
+                core,
+                cancellation,
+                task_worker: Some(task_worker),
+                approval_worker: None,
+            };
+
+            // With both core queues empty, the biased select can only settle the
+            // released worker join, so the exit is deterministic.
+            let _ = gate_sender.send(());
+            let fatal_update = session
+                .next_update()
+                .await
+                .expect("released worker exit must settle");
+            assert_eq!(fatal_update.domain(), GovernedStateDomain::Task);
+            assert_eq!(
+                session.state().task().phase(),
+                GovernedStateDomainPhase::Fatal
+            );
+            assert_eq!(
+                session.state().task().reason(),
+                Some(GovernedStateReason::ProjectionIntegrityFailure)
+            );
+            assert_eq!(
+                session.state().approval().phase(),
+                GovernedStateDomainPhase::Connecting
+            );
+
+            // The other domain keeps advancing through the same public session.
+            let (approval_ack, approval_ack_receiver) = tokio::sync::oneshot::channel();
+            assert!(
+                approval_sender
+                    .try_send(ApprovalRequest {
+                        input: GovernedApprovalReducerInput::RecoverableFailure {
+                            generation: 1,
+                            cause: GovernedRecoverableCause::TransportUnavailable,
+                        },
+                        ack: approval_ack,
+                    })
+                    .is_ok()
+            );
+            let approval_update = session
+                .next_update()
+                .await
+                .expect("approval domain must advance after the task exit");
+            assert_eq!(approval_update.domain(), GovernedStateDomain::Approval);
+            let approval_ack = approval_ack_receiver
+                .await
+                .expect("approval acknowledgement");
+            assert_eq!(approval_ack.phase, GovernedStateDomainPhase::Stale);
+            assert_eq!(approval_ack.generation, 2);
+            assert_eq!(
+                session.state().approval().phase(),
+                GovernedStateDomainPhase::Stale
+            );
+            assert_eq!(session.state().approval().generation(), 2);
+            assert_eq!(
+                session.state().task().phase(),
+                GovernedStateDomainPhase::Fatal
+            );
+
+            // Draining the closed channels yields None: the exited task domain
+            // can never produce a second update.
+            drop(task_sender);
+            drop(approval_sender);
+            assert!(
+                session.next_update().await.is_none(),
+                "no further update may follow the drained domains"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn r9b2b_single_domain_apply_and_ack_leave_other_domain_unchanged() {
         let recovery_limit = NonZeroU32::new(2).expect("non-zero recovery limit");
         let (mut core, task_sender, _approval_sender) =
