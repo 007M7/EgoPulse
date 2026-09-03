@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::{future::Future, time::SystemTime};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    time::SystemTime,
+};
 
 use egopulse_client_kernel::{ClientKernel, KernelError, SnapshotStreamTracker, StreamApply};
 use egopulse_domain_contracts::{
@@ -8,14 +12,16 @@ use egopulse_domain_contracts::{
     v01::egopulse::{
         common::v1::CommandMetadata,
         localapi::v1::{
-            ClientRequestMetadata, ClientSurface, ConfirmWorkRequest, ConfirmWorkResponse,
-            ContextGovernanceState, ContextMutationCommand, ContextRevokeReceipt,
-            ExecuteContextMutationRequest, ExecuteContextMutationResponse,
-            GetProjectionStatusRequest, HarnessApprovalView, ListHarnessApprovalViewsRequest,
+            AvailableActionKind, ClientRequestMetadata, ClientSurface, ConfirmWorkRequest,
+            ConfirmWorkResponse, ContextGovernanceState, ContextMutationCommand,
+            ContextRevokeReceipt, ExecuteContextMutationRequest, ExecuteContextMutationResponse,
+            GetProjectionStatusRequest, HarnessApprovalView, HarnessApprovalViewStreamFrame,
+            ListHarnessApprovalViewsRequest, ListHarnessApprovalViewsResponse,
             ListTaskViewsRequest, LocalApiError, PrepareWorkRequest, ProjectionMetadata,
             ProjectionPosition, RevokeContextSnapshotCommand, StreamFrameKind, TaskView,
-            TaskViewStreamFrame, WatchTaskViewsRequest, WorkPreparationPreview, WorkSourceRequest,
-            context_mutation_command, execute_context_mutation_response,
+            TaskViewStreamFrame, WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest,
+            WorkPreparationPreview, WorkSourceRequest, context_mutation_command,
+            execute_context_mutation_response,
         },
         policy::v1::{PolicyDecisionCommand, policy_decision_command},
         task::v1::{TaskCommand, task_command},
@@ -33,6 +39,11 @@ const EXECUTE_CONTEXT_MUTATION_RPC: &str = "LocalCommandGatewayService/ExecuteCo
 const REVOKE_CONTEXT_SNAPSHOT_COMMAND: &str = "revoke_context_snapshot";
 const CONTEXT_REVOKE_IDEMPOTENCY_SCOPE: &str = "context-revoke";
 const WATCH_TASK_VIEWS_RPC: &str = "LocalReadModelService/WatchTaskViews";
+const LIST_HARNESS_APPROVAL_VIEWS_RPC: &str = "LocalReadModelService/ListHarnessApprovalViews";
+const WATCH_HARNESS_APPROVAL_VIEWS_RPC: &str = "LocalReadModelService/WatchHarnessApprovalViews";
+const APPROVAL_WATCH_BASELINE_PAGE_SIZE: u32 = 100;
+const APPROVAL_WATCH_BASELINE_MAX_PAGES: usize = 100;
+const APPROVAL_WATCH_BASELINE_MAX_VIEWS: usize = 1_000;
 
 /// A local client that has completed the frozen session and contract handshake.
 ///
@@ -196,6 +207,364 @@ impl TaskWatchProcessor {
 pub struct TaskWatch {
     stream: tonic::Streaming<TaskViewStreamFrame>,
     processor: TaskWatchProcessor,
+}
+
+#[derive(Debug, Error)]
+pub enum ClientApprovalWatchError {
+    #[error("client kernel rejected the approval watch: {0}")]
+    Kernel(#[from] KernelError),
+    #[error("local API approval watch transport failed: {0}")]
+    Transport(String),
+    #[error("local API approval watch ended unexpectedly")]
+    UnexpectedEof,
+    #[error("local API rejected the approval baseline: {0:?}")]
+    Api(Box<LocalApiError>),
+    #[error("approval baseline exceeded the 1000 item integrity limit")]
+    BaselineLimitExceeded,
+    #[error("approval watch protocol integrity failed: {0}")]
+    Protocol(&'static str),
+    #[error("approval watch reached a reset barrier and requires baseline refetch")]
+    ResetBarrier,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalWatchCursor {
+    pub epoch: String,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalWatchClassification {
+    Applied,
+    Replay,
+    Heartbeat,
+    ResetRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalWatchFrameKind {
+    Snapshot,
+    Heartbeat,
+    ResetRequired,
+}
+
+impl ApprovalWatchFrameKind {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::Snapshot => "STREAM_FRAME_KIND_SNAPSHOT",
+            Self::Heartbeat => "STREAM_FRAME_KIND_HEARTBEAT",
+            Self::ResetRequired => "STREAM_FRAME_KIND_RESET_REQUIRED",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApprovalWatchUpdate {
+    pub classification: ApprovalWatchClassification,
+    pub kind: ApprovalWatchFrameKind,
+    pub position: ProjectionPosition,
+    pub view: Option<HarnessApprovalView>,
+    pub reset_reason_code: Option<String>,
+}
+
+/// One daemon-authored approval that is currently actionable. Construction is
+/// private so presentation surfaces cannot forge the decision binding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActionableApproval {
+    view: HarnessApprovalView,
+}
+
+impl ActionableApproval {
+    #[must_use]
+    pub fn view(&self) -> &HarnessApprovalView {
+        &self.view
+    }
+
+    #[must_use]
+    pub fn approval_request_id(&self) -> &str {
+        &self.view.approval_request_id
+    }
+
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        &self.view.task_id
+    }
+
+    #[must_use]
+    pub fn action_digest_sha256(&self) -> &str {
+        &self.view.action_digest_sha256
+    }
+
+    #[must_use]
+    pub fn request_observation_id(&self) -> &str {
+        &self.view.request_observation_id
+    }
+
+    #[must_use]
+    pub const fn request_observation_sequence(&self) -> u64 {
+        self.view.request_observation_sequence
+    }
+
+    #[must_use]
+    pub const fn request_revision(&self) -> u64 {
+        self.view.request_revision
+    }
+}
+
+#[derive(Default)]
+struct ApprovalWatchProcessor {
+    tracker: SnapshotStreamTracker,
+    reset_barrier: bool,
+}
+
+impl ApprovalWatchProcessor {
+    fn process(
+        &mut self,
+        frame: HarnessApprovalViewStreamFrame,
+    ) -> Result<ApprovalWatchUpdate, ClientApprovalWatchError> {
+        if self.reset_barrier {
+            return Err(ClientApprovalWatchError::ResetBarrier);
+        }
+        let frame_kind = StreamFrameKind::try_from(frame.kind)
+            .map_err(|_| ClientApprovalWatchError::Kernel(KernelError::UnknownStreamFrame))?;
+        match frame_kind {
+            StreamFrameKind::Snapshot | StreamFrameKind::Heartbeat
+                if frame.reset_reason_code.is_some() =>
+            {
+                return Err(ClientApprovalWatchError::Kernel(
+                    KernelError::IncompleteStreamFrame,
+                ));
+            }
+            StreamFrameKind::ResetRequired
+                if frame.reset_reason_code.as_deref().is_none_or(|reason| {
+                    reason.is_empty()
+                        || reason.len() > 128
+                        || !reason.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'.' | b'_' | b':' | b'-')
+                        })
+                }) =>
+            {
+                return Err(ClientApprovalWatchError::Kernel(
+                    KernelError::IncompleteStreamFrame,
+                ));
+            }
+            _ => {}
+        }
+        let applied = self.tracker.apply_harness_approval_frame(&frame)?;
+        let kind = match frame_kind {
+            StreamFrameKind::Snapshot => ApprovalWatchFrameKind::Snapshot,
+            StreamFrameKind::Heartbeat => ApprovalWatchFrameKind::Heartbeat,
+            StreamFrameKind::ResetRequired => ApprovalWatchFrameKind::ResetRequired,
+            StreamFrameKind::Unspecified => {
+                return Err(ClientApprovalWatchError::Kernel(
+                    KernelError::UnknownStreamFrame,
+                ));
+            }
+        };
+        let classification = match applied {
+            StreamApply::Applied => ApprovalWatchClassification::Applied,
+            StreamApply::Replay => ApprovalWatchClassification::Replay,
+            StreamApply::Heartbeat => ApprovalWatchClassification::Heartbeat,
+            StreamApply::ResetRequired => {
+                self.reset_barrier = true;
+                ApprovalWatchClassification::ResetRequired
+            }
+        };
+        Ok(ApprovalWatchUpdate {
+            classification,
+            kind,
+            position: frame.position.ok_or(ClientApprovalWatchError::Kernel(
+                KernelError::StreamPositionInvalid,
+            ))?,
+            view: frame.snapshot,
+            reset_reason_code: frame.reset_reason_code,
+        })
+    }
+}
+
+/// A stream-only approval watch. It classifies frames but never claims or
+/// mutates a complete actionable queue.
+pub struct ApprovalWatch {
+    stream: tonic::Streaming<HarnessApprovalViewStreamFrame>,
+    processor: ApprovalWatchProcessor,
+}
+
+/// A complete actionable queue snapshot. Its position and contents are
+/// private and it is consumed when opening the corresponding live session.
+pub struct ApprovalQueueBaseline {
+    actionable: BTreeMap<String, ActionableApproval>,
+    position: ProjectionPosition,
+}
+
+impl ApprovalQueueBaseline {
+    #[must_use]
+    pub fn position(&self) -> &ProjectionPosition {
+        &self.position
+    }
+
+    #[must_use]
+    pub fn actionable_approvals(&self) -> Vec<&ActionableApproval> {
+        self.actionable.values().collect()
+    }
+}
+
+/// A complete baseline plus updates that started at exactly that baseline's
+/// private position.
+pub struct ApprovalQueueSession {
+    watch: ApprovalWatch,
+    actionable: BTreeMap<String, ActionableApproval>,
+    last_position: ProjectionPosition,
+}
+
+impl ApprovalWatch {
+    pub async fn next_update(
+        &mut self,
+    ) -> Result<Option<ApprovalWatchUpdate>, ClientApprovalWatchError> {
+        let Self { stream, processor } = self;
+        next_approval_watch_frame_via(processor, || async {
+            stream.message().await.map_err(|error| error.to_string())
+        })
+        .await
+    }
+}
+
+impl ApprovalQueueSession {
+    #[must_use]
+    pub fn actionable_approvals(&self) -> Vec<&ActionableApproval> {
+        self.actionable.values().collect()
+    }
+
+    pub async fn next_update(
+        &mut self,
+    ) -> Result<Option<ApprovalWatchUpdate>, ClientApprovalWatchError> {
+        let update = self.watch.next_update().await?;
+        if let Some(update) = &update
+            && let Err(error) = apply_approval_queue_session_update(
+                &mut self.actionable,
+                &mut self.last_position,
+                update,
+            )
+        {
+            self.watch.processor.reset_barrier = true;
+            return Err(error);
+        }
+        Ok(update)
+    }
+}
+
+fn apply_approval_queue_session_update(
+    actionable: &mut BTreeMap<String, ActionableApproval>,
+    last_position: &mut ProjectionPosition,
+    update: &ApprovalWatchUpdate,
+) -> Result<(), ClientApprovalWatchError> {
+    if update.classification != ApprovalWatchClassification::ResetRequired
+        && update.position.epoch != last_position.epoch
+    {
+        return Err(ClientApprovalWatchError::Kernel(
+            KernelError::StreamResetMissing,
+        ));
+    }
+    if update.classification == ApprovalWatchClassification::ResetRequired {
+        return Ok(());
+    }
+    if update.position.sequence < last_position.sequence {
+        return Err(ClientApprovalWatchError::Kernel(
+            KernelError::StreamOutOfOrder,
+        ));
+    }
+    if update.position.sequence == last_position.sequence {
+        return match update.classification {
+            ApprovalWatchClassification::Applied => apply_approval_watch_update(actionable, update),
+            ApprovalWatchClassification::Replay | ApprovalWatchClassification::Heartbeat => Ok(()),
+            ApprovalWatchClassification::ResetRequired => unreachable!("handled above"),
+        };
+    }
+    apply_approval_watch_update(actionable, update)?;
+    *last_position = update.position.clone();
+    Ok(())
+}
+
+async fn next_approval_watch_frame_via<F, Fut>(
+    processor: &mut ApprovalWatchProcessor,
+    next_message: F,
+) -> Result<Option<ApprovalWatchUpdate>, ClientApprovalWatchError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Option<HarnessApprovalViewStreamFrame>, String>>,
+{
+    if processor.reset_barrier {
+        return Err(ClientApprovalWatchError::ResetBarrier);
+    }
+    let Some(frame) = next_message()
+        .await
+        .map_err(ClientApprovalWatchError::Transport)?
+    else {
+        return Err(ClientApprovalWatchError::UnexpectedEof);
+    };
+    processor.process(frame).map(Some)
+}
+
+#[cfg(test)]
+async fn next_approval_queue_update_via<F, Fut>(
+    processor: &mut ApprovalWatchProcessor,
+    actionable: &mut BTreeMap<String, ActionableApproval>,
+    next_message: F,
+) -> Result<Option<ApprovalWatchUpdate>, ClientApprovalWatchError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Option<HarnessApprovalViewStreamFrame>, String>>,
+{
+    let update = next_approval_watch_frame_via(processor, next_message).await?;
+    if let Some(update) = &update {
+        apply_approval_watch_update(actionable, update)?;
+    }
+    Ok(update)
+}
+
+fn is_actionable_approval(view: &HarnessApprovalView) -> Result<bool, ClientApprovalWatchError> {
+    let mut actionable = false;
+    for action in &view.available_actions {
+        let kind = AvailableActionKind::try_from(action.kind)
+            .map_err(|_| ClientApprovalWatchError::Protocol("approval action kind is unknown"))?;
+        if kind == AvailableActionKind::Unspecified {
+            return Err(ClientApprovalWatchError::Protocol(
+                "approval action kind is unspecified",
+            ));
+        }
+        actionable |= kind == AvailableActionKind::DecideHarnessApproval;
+    }
+    Ok(actionable)
+}
+
+fn apply_approval_watch_update(
+    actionable: &mut BTreeMap<String, ActionableApproval>,
+    update: &ApprovalWatchUpdate,
+) -> Result<(), ClientApprovalWatchError> {
+    if update.classification != ApprovalWatchClassification::Applied {
+        return Ok(());
+    }
+    let view = update
+        .view
+        .as_ref()
+        .ok_or(ClientApprovalWatchError::Protocol(
+            "applied approval frame missing view",
+        ))?;
+    if view.approval_request_id.is_empty() {
+        return Err(ClientApprovalWatchError::Protocol(
+            "approval request id missing",
+        ));
+    }
+    if is_actionable_approval(view)? {
+        actionable.insert(
+            view.approval_request_id.clone(),
+            ActionableApproval { view: view.clone() },
+        );
+    } else {
+        actionable.remove(&view.approval_request_id);
+    }
+    Ok(())
 }
 
 impl TaskWatch {
@@ -368,6 +737,86 @@ impl ClientAttachment {
         })
     }
 
+    pub async fn read_actionable_approval_queue(
+        &self,
+    ) -> Result<ApprovalQueueBaseline, ClientApprovalWatchError> {
+        let client = self.connection.read_model_service();
+        read_actionable_approval_queue_via(&self.kernel, SystemTime::now(), move |request| {
+            let mut client = client.clone();
+            async move {
+                client
+                    .list_harness_approval_views(request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| error.to_string())
+            }
+        })
+        .await
+    }
+
+    pub async fn open_approval_queue_from(
+        &self,
+        baseline: ApprovalQueueBaseline,
+    ) -> Result<ApprovalQueueSession, ClientApprovalWatchError> {
+        let ApprovalQueueBaseline {
+            actionable,
+            position,
+        } = baseline;
+        let watch = self.open_approval_stream(Some(position.clone())).await?;
+        Ok(ApprovalQueueSession {
+            watch,
+            actionable,
+            last_position: position,
+        })
+    }
+
+    pub async fn open_approval_watch_resume(
+        &self,
+        cursor: ApprovalWatchCursor,
+    ) -> Result<ApprovalWatch, ClientApprovalWatchError> {
+        if cursor.epoch.is_empty() {
+            return Err(ClientApprovalWatchError::Protocol(
+                "approval watch resume epoch missing",
+            ));
+        }
+        self.open_approval_stream(Some(ProjectionPosition {
+            epoch: cursor.epoch,
+            sequence: cursor.sequence,
+            projected_at: None,
+        }))
+        .await
+    }
+
+    pub async fn open_approval_watch_current(
+        &self,
+    ) -> Result<ApprovalWatch, ClientApprovalWatchError> {
+        self.open_approval_stream(None).await
+    }
+
+    async fn open_approval_stream(
+        &self,
+        resume_after: Option<ProjectionPosition>,
+    ) -> Result<ApprovalWatch, ClientApprovalWatchError> {
+        let mut client = self.connection.read_model_service();
+        let stream = open_approval_stream_via(
+            &self.kernel,
+            resume_after,
+            SystemTime::now(),
+            move |request| async move {
+                client
+                    .watch_harness_approval_views(request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await?;
+        Ok(ApprovalWatch {
+            stream,
+            processor: ApprovalWatchProcessor::default(),
+        })
+    }
+
     /// Prepares the single confirmation digest shared by CLI and TUI without
     /// sending a request. The authenticated Founder identity comes only from
     /// the accepted local session and is frozen into the semantic digest.
@@ -527,6 +976,208 @@ impl ClientAttachment {
             None => Err(ClientWorkError::Protocol("confirm outcome missing")),
         }
     }
+}
+
+async fn open_approval_stream_via<F, Fut, S>(
+    kernel: &ClientKernel,
+    resume_after: Option<ProjectionPosition>,
+    now: SystemTime,
+    dispatch: F,
+) -> Result<S, ClientApprovalWatchError>
+where
+    F: FnOnce(WatchHarnessApprovalViewsRequest) -> Fut,
+    Fut: Future<Output = Result<S, String>>,
+{
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel.profiles().authorize_rpc(
+        WATCH_HARNESS_APPROVAL_VIEWS_RPC,
+        &session.granted_permission_codes,
+    )?;
+    let metadata = kernel.request_metadata(Uuid::now_v7().to_string(), None, now)?;
+    dispatch(approval_watch_wire_request(metadata, resume_after))
+        .await
+        .map_err(ClientApprovalWatchError::Transport)
+}
+
+async fn read_actionable_approval_queue_via<F, Fut>(
+    kernel: &ClientKernel,
+    now: SystemTime,
+    mut dispatch: F,
+) -> Result<ApprovalQueueBaseline, ClientApprovalWatchError>
+where
+    F: FnMut(ListHarnessApprovalViewsRequest) -> Fut,
+    Fut: Future<Output = Result<ListHarnessApprovalViewsResponse, String>>,
+{
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel.profiles().authorize_rpc(
+        LIST_HARNESS_APPROVAL_VIEWS_RPC,
+        &session.granted_permission_codes,
+    )?;
+    let metadata = kernel.request_metadata(Uuid::now_v7().to_string(), None, now)?;
+    let mut pages = Vec::new();
+    let mut page_cursor = None;
+    let mut cursors = BTreeSet::new();
+    let mut baseline_views = 0_usize;
+    loop {
+        if pages.len() >= APPROVAL_WATCH_BASELINE_MAX_PAGES {
+            return Err(ClientApprovalWatchError::Protocol(
+                "approval baseline page limit exceeded",
+            ));
+        }
+        let response = dispatch(approval_baseline_wire_request(
+            metadata.clone(),
+            page_cursor.clone(),
+        ))
+        .await
+        .map_err(ClientApprovalWatchError::Transport)?;
+        if let Some(error) = response.error.as_ref() {
+            return Err(ClientApprovalWatchError::Api(Box::new(error.clone())));
+        }
+        baseline_views = baseline_views
+            .checked_add(response.views.len())
+            .ok_or(ClientApprovalWatchError::BaselineLimitExceeded)?;
+        if baseline_views > APPROVAL_WATCH_BASELINE_MAX_VIEWS {
+            return Err(ClientApprovalWatchError::BaselineLimitExceeded);
+        }
+        let next_cursor = response.next_page_cursor.clone();
+        if let Some(next) = next_cursor.as_deref()
+            && (next.is_empty() || response.views.is_empty() || !cursors.insert(next.to_owned()))
+        {
+            return Err(ClientApprovalWatchError::Protocol(
+                "approval baseline cursor did not advance",
+            ));
+        }
+        pages.push(response);
+        let Some(next) = next_cursor else {
+            break;
+        };
+        page_cursor = Some(next);
+    }
+    let (position, actionable) = compile_approval_baseline(pages)?;
+    Ok(ApprovalQueueBaseline {
+        actionable,
+        position,
+    })
+}
+
+fn approval_baseline_wire_request(
+    metadata: ClientRequestMetadata,
+    page_cursor: Option<String>,
+) -> ListHarnessApprovalViewsRequest {
+    ListHarnessApprovalViewsRequest {
+        client: Some(metadata),
+        request_lifecycle_filter: Vec::new(),
+        decision_state_filter: Vec::new(),
+        task_ids: Vec::new(),
+        actionable_only: true,
+        page_size: APPROVAL_WATCH_BASELINE_PAGE_SIZE,
+        page_cursor,
+        minimum_position: None,
+    }
+}
+
+fn approval_watch_wire_request(
+    metadata: ClientRequestMetadata,
+    resume_after: Option<ProjectionPosition>,
+) -> WatchHarnessApprovalViewsRequest {
+    WatchHarnessApprovalViewsRequest {
+        client: Some(metadata),
+        resume_after,
+        approval_request_ids: Vec::new(),
+        task_ids: Vec::new(),
+        request_lifecycle_filter: Vec::new(),
+        decision_state_filter: Vec::new(),
+        actionable_only: false,
+    }
+}
+
+fn compile_approval_baseline(
+    pages: Vec<ListHarnessApprovalViewsResponse>,
+) -> Result<(ProjectionPosition, BTreeMap<String, ActionableApproval>), ClientApprovalWatchError> {
+    if pages.is_empty() {
+        return Err(ClientApprovalWatchError::Protocol(
+            "approval baseline returned no page",
+        ));
+    }
+    let mut position: Option<ProjectionPosition> = None;
+    let mut actionable = BTreeMap::new();
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_cursors = BTreeSet::new();
+    let mut total = 0_usize;
+    let page_count = pages.len();
+    for (page_index, page) in pages.into_iter().enumerate() {
+        if let Some(error) = page.error {
+            return Err(ClientApprovalWatchError::Api(Box::new(error)));
+        }
+        let page_position = page
+            .snapshot_position
+            .ok_or(ClientApprovalWatchError::Protocol(
+                "approval baseline position missing",
+            ))?;
+        if page_position.epoch.is_empty() {
+            return Err(ClientApprovalWatchError::Protocol(
+                "approval baseline epoch missing",
+            ));
+        }
+        if let Some(expected) = &position {
+            if expected != &page_position {
+                return Err(ClientApprovalWatchError::Protocol(
+                    "approval baseline position changed across pages",
+                ));
+            }
+        } else {
+            position = Some(page_position.clone());
+        }
+        total = total
+            .checked_add(page.views.len())
+            .ok_or(ClientApprovalWatchError::BaselineLimitExceeded)?;
+        if total > APPROVAL_WATCH_BASELINE_MAX_VIEWS {
+            return Err(ClientApprovalWatchError::BaselineLimitExceeded);
+        }
+        if let Some(cursor) = page.next_page_cursor.as_deref() {
+            if cursor.is_empty() || page.views.is_empty() || !seen_cursors.insert(cursor.to_owned())
+            {
+                return Err(ClientApprovalWatchError::Protocol(
+                    "approval baseline cursor did not advance",
+                ));
+            }
+            if page_index + 1 == page_count {
+                return Err(ClientApprovalWatchError::Protocol(
+                    "approval baseline pagination incomplete",
+                ));
+            }
+        } else if page_index + 1 != page_count {
+            return Err(ClientApprovalWatchError::Protocol(
+                "approval baseline contained pages after completion",
+            ));
+        }
+        let mut tracker = SnapshotStreamTracker::default();
+        for view in page.views {
+            if view.approval_request_id.is_empty()
+                || !seen_ids.insert(view.approval_request_id.clone())
+            {
+                return Err(ClientApprovalWatchError::Protocol(
+                    "approval baseline identity missing or duplicated",
+                ));
+            }
+            tracker.apply_harness_approval_frame(&HarnessApprovalViewStreamFrame {
+                kind: StreamFrameKind::Snapshot as i32,
+                position: Some(page_position.clone()),
+                snapshot: Some(view.clone()),
+                reset_reason_code: None,
+            })?;
+            if is_actionable_approval(&view)? {
+                actionable.insert(
+                    view.approval_request_id.clone(),
+                    ActionableApproval { view },
+                );
+            }
+        }
+    }
+    Ok((
+        position.expect("non-empty pages establish a position"),
+        actionable,
+    ))
 }
 
 fn task_watch_resume_after(
@@ -903,6 +1554,7 @@ fn task_metadata_mut(command: &mut TaskCommand) -> Option<&mut CommandMetadata> 
 mod tests {
     use std::{
         cell::Cell,
+        collections::VecDeque,
         pin::pin,
         task::{Context, Poll, Waker},
         time::Duration,
@@ -912,8 +1564,8 @@ mod tests {
         api_contract_ref, authorization_contract_ref, client_kernel_contract_ref,
     };
     use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
-        LocalApiErrorCode, OpenSessionResponse, ProjectionPosition, SourceDomain, SourceRevision,
-        StreamFrameKind,
+        AvailableAction, LocalApiErrorCode, OpenSessionResponse, ProjectionHealth,
+        ProjectionPosition, SourceDomain, SourceRevision, StreamFrameKind,
     };
     use egopulse_domain_contracts::v01::egopulse::{
         common::v1::ContractReference, localapi::v1::ProjectionMetadata, task::v1::TaskSnapshot,
@@ -1043,6 +1695,84 @@ mod tests {
             }),
             replayed: false,
             acknowledged_after_durability_barrier: true,
+        }
+    }
+
+    fn approval_position(sequence: u64) -> ProjectionPosition {
+        ProjectionPosition {
+            epoch: "epoch:approval-watch".to_owned(),
+            sequence,
+            projected_at: Some(Timestamp {
+                seconds: sequence as i64,
+                nanos: 0,
+            }),
+        }
+    }
+
+    fn approval_view(
+        approval_request_id: impl Into<String>,
+        position: &ProjectionPosition,
+        action_kind: Option<i32>,
+    ) -> HarnessApprovalView {
+        let approval_request_id = approval_request_id.into();
+        HarnessApprovalView {
+            metadata: Some(ProjectionMetadata {
+                schema_ref: Some(ContractReference {
+                    contract_id: "egopulse.localapi.v1.HarnessApprovalView".to_owned(),
+                    version: "v0.1".to_owned(),
+                    sha256: "a".repeat(64),
+                }),
+                position: Some(position.clone()),
+                source_revisions: vec![SourceRevision {
+                    domain: SourceDomain::PolicyDecision as i32,
+                    aggregate_id: approval_request_id.clone(),
+                    revision: 1,
+                    last_event_id: format!("event:{approval_request_id}"),
+                }],
+                health: ProjectionHealth::Ready as i32,
+                stale: false,
+                safe_health_reason_code: None,
+            }),
+            approval_request_id: approval_request_id.clone(),
+            task_id: format!("task:{approval_request_id}"),
+            run_id: format!("run:{approval_request_id}"),
+            step_id: format!("step:{approval_request_id}"),
+            attempt_id: format!("attempt:{approval_request_id}"),
+            dispatch_id: format!("dispatch:{approval_request_id}"),
+            fencing_token: 1,
+            kind: 1,
+            action_digest_sha256: "b".repeat(64),
+            requested_scope_ref: "scope:test".to_owned(),
+            display_summary_ref: "summary:test".to_owned(),
+            request_observation_id: format!("observation:{approval_request_id}"),
+            request_observation_sequence: 1,
+            request_lifecycle: 1,
+            request_revision: 1,
+            policy_decision: None,
+            available_actions: action_kind
+                .map(|kind| AvailableAction {
+                    kind,
+                    owning_authority: "PolicyDecisionAuthority".to_owned(),
+                    derivation_rule_ref: "rule:approval-actionability".to_owned(),
+                    explicit_confirmation_required: true,
+                    reason_code: None,
+                })
+                .into_iter()
+                .collect(),
+            redactions: Vec::new(),
+        }
+    }
+
+    fn approval_page(
+        position: &ProjectionPosition,
+        views: Vec<HarnessApprovalView>,
+        next_page_cursor: Option<&str>,
+    ) -> ListHarnessApprovalViewsResponse {
+        ListHarnessApprovalViewsResponse {
+            views,
+            next_page_cursor: next_page_cursor.map(str::to_owned),
+            snapshot_position: Some(position.clone()),
+            error: None,
         }
     }
 
@@ -1807,5 +2537,768 @@ mod tests {
                 "outcome missing"
             ))
         ));
+    }
+
+    #[test]
+    fn approval_baseline_is_complete_actionable_sorted_and_capped() {
+        let position = approval_position(7);
+        let decide = AvailableActionKind::DecideHarnessApproval as i32;
+        let (actual_position, approvals) = compile_approval_baseline(vec![
+            approval_page(
+                &position,
+                vec![
+                    approval_view("approval:z", &position, Some(decide)),
+                    approval_view("approval:closed", &position, None),
+                ],
+                Some("cursor:2"),
+            ),
+            approval_page(
+                &position,
+                vec![approval_view("approval:a", &position, Some(decide))],
+                None,
+            ),
+        ])
+        .expect("complete approval baseline");
+        assert_eq!(actual_position, position);
+        assert_eq!(
+            approvals.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["approval:a", "approval:z"]
+        );
+
+        let views: Vec<_> = (0..=APPROVAL_WATCH_BASELINE_MAX_VIEWS)
+            .map(|index| approval_view(format!("approval:{index:04}"), &position, Some(decide)))
+            .collect();
+        let pages = views
+            .chunks(APPROVAL_WATCH_BASELINE_PAGE_SIZE as usize)
+            .enumerate()
+            .map(|(index, chunk)| {
+                let next = (index + 1
+                    < views
+                        .len()
+                        .div_ceil(APPROVAL_WATCH_BASELINE_PAGE_SIZE as usize))
+                .then(|| format!("cursor:{}", index + 1));
+                approval_page(&position, chunk.to_vec(), next.as_deref())
+            })
+            .collect();
+        assert!(matches!(
+            compile_approval_baseline(pages),
+            Err(ClientApprovalWatchError::BaselineLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn approval_baseline_rejects_position_cursor_and_identity_drift() {
+        let position = approval_position(7);
+        let other_position = approval_position(8);
+        let decide = AvailableActionKind::DecideHarnessApproval as i32;
+        let valid = || approval_view("approval:1", &position, Some(decide));
+
+        let cases = [
+            vec![
+                approval_page(&position, vec![valid()], Some("cursor:2")),
+                approval_page(
+                    &other_position,
+                    vec![approval_view("approval:2", &other_position, Some(decide))],
+                    None,
+                ),
+            ],
+            vec![approval_page(&position, Vec::new(), Some("cursor:2"))],
+            vec![
+                approval_page(&position, vec![valid()], Some("cursor:same")),
+                approval_page(
+                    &position,
+                    vec![approval_view("approval:2", &position, Some(decide))],
+                    Some("cursor:same"),
+                ),
+            ],
+            vec![approval_page(
+                &position,
+                vec![
+                    valid(),
+                    approval_view("approval:1", &position, Some(decide)),
+                ],
+                None,
+            )],
+            vec![approval_page(
+                &position,
+                vec![approval_view("", &position, Some(decide))],
+                None,
+            )],
+        ];
+        for pages in cases {
+            assert!(compile_approval_baseline(pages).is_err());
+        }
+
+        let unknown_action = approval_view("approval:unknown", &position, Some(i32::MAX));
+        assert!(matches!(
+            compile_approval_baseline(vec![approval_page(&position, vec![unknown_action], None,)]),
+            Err(ClientApprovalWatchError::Protocol(
+                "approval action kind is unknown"
+            ))
+        ));
+    }
+
+    #[test]
+    fn approval_baseline_read_seam_authorizes_once_and_follows_the_cursor_chain() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(11_000);
+        let kernel = authenticated_kernel_for_surface(
+            "founder:approval-baseline",
+            "session:approval-baseline",
+            "local.approval.read",
+            ClientSurface::Cli,
+            now,
+        );
+        let position = approval_position(100);
+        let decide = AvailableActionKind::DecideHarnessApproval as i32;
+        let mut replies = VecDeque::from([
+            Ok(approval_page(
+                &position,
+                vec![approval_view("approval:b", &position, Some(decide))],
+                Some("cursor:2"),
+            )),
+            Ok(approval_page(
+                &position,
+                vec![approval_view("approval:a", &position, Some(decide))],
+                None,
+            )),
+        ]);
+        let mut requests = Vec::new();
+        let baseline = block_on_ready(read_actionable_approval_queue_via(
+            &kernel,
+            now,
+            |request| {
+                requests.push(request);
+                std::future::ready(replies.pop_front().expect("scripted page"))
+            },
+        ))
+        .expect("complete production pagination seam");
+        assert!(replies.is_empty());
+        assert_eq!(baseline.position(), &position);
+        assert_eq!(
+            baseline
+                .actionable_approvals()
+                .into_iter()
+                .map(ActionableApproval::approval_request_id)
+                .collect::<Vec<_>>(),
+            ["approval:a", "approval:b"]
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].page_cursor, None);
+        assert_eq!(requests[1].page_cursor.as_deref(), Some("cursor:2"));
+        for request in &requests {
+            assert!(request.actionable_only);
+            assert_eq!(request.page_size, 100);
+            assert!(request.minimum_position.is_none());
+            assert!(request.task_ids.is_empty());
+        }
+        assert_eq!(requests[0].client, requests[1].client);
+        let metadata = requests[0].client.as_ref().expect("session metadata");
+        assert_eq!(metadata.session_id, "session:approval-baseline");
+        assert_eq!(metadata.surface, ClientSurface::Cli as i32);
+
+        let denied = authenticated_kernel_for_surface(
+            "founder:approval-baseline",
+            "session:approval-baseline-denied",
+            "local.context.revoke",
+            ClientSurface::Cli,
+            now,
+        );
+        let dispatches = Cell::new(0_u64);
+        let denied = block_on_ready(read_actionable_approval_queue_via(
+            &denied,
+            now,
+            |_request| {
+                dispatches.set(dispatches.get() + 1);
+                std::future::ready(Err("must-not-dispatch".to_owned()))
+            },
+        ));
+        assert!(matches!(
+            denied,
+            Err(ClientApprovalWatchError::Kernel(
+                KernelError::PermissionDenied(permission)
+            )) if permission == "local.approval.read"
+        ));
+        assert_eq!(dispatches.get(), 0);
+    }
+
+    #[test]
+    fn approval_baseline_read_seam_fails_atomically_for_remote_and_pagination_drift() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(12_000);
+        let kernel = authenticated_kernel_for_surface(
+            "founder:approval-baseline-failure",
+            "session:approval-baseline-failure",
+            "local.approval.read",
+            ClientSurface::Tui,
+            now,
+        );
+        let position = approval_position(100);
+        let other_position = approval_position(101);
+        let decide = AvailableActionKind::DecideHarnessApproval as i32;
+        let one = || approval_view("approval:1", &position, Some(decide));
+
+        let mut position_drift = VecDeque::from([
+            Ok(approval_page(&position, vec![one()], Some("cursor:2"))),
+            Ok(approval_page(
+                &other_position,
+                vec![approval_view("approval:2", &other_position, Some(decide))],
+                None,
+            )),
+        ]);
+        assert!(matches!(
+            block_on_ready(read_actionable_approval_queue_via(
+                &kernel,
+                now,
+                |_request| std::future::ready(
+                    position_drift.pop_front().expect("position drift page")
+                ),
+            )),
+            Err(ClientApprovalWatchError::Protocol(
+                "approval baseline position changed across pages"
+            ))
+        ));
+
+        let mut repeated_cursor = VecDeque::from([
+            Ok(approval_page(&position, vec![one()], Some("cursor:same"))),
+            Ok(approval_page(
+                &position,
+                vec![approval_view("approval:2", &position, Some(decide))],
+                Some("cursor:same"),
+            )),
+        ]);
+        assert!(matches!(
+            block_on_ready(read_actionable_approval_queue_via(
+                &kernel,
+                now,
+                |_request| std::future::ready(
+                    repeated_cursor.pop_front().expect("repeated cursor page")
+                ),
+            )),
+            Err(ClientApprovalWatchError::Protocol(
+                "approval baseline cursor did not advance"
+            ))
+        ));
+
+        let mut empty_with_cursor = VecDeque::from([Ok(approval_page(
+            &position,
+            Vec::new(),
+            Some("cursor:next"),
+        ))]);
+        assert!(matches!(
+            block_on_ready(read_actionable_approval_queue_via(
+                &kernel,
+                now,
+                |_request| std::future::ready(
+                    empty_with_cursor.pop_front().expect("empty cursor page")
+                ),
+            )),
+            Err(ClientApprovalWatchError::Protocol(
+                "approval baseline cursor did not advance"
+            ))
+        ));
+
+        let mut oversized_pages = VecDeque::new();
+        for page_index in 0..=10 {
+            let item_count = if page_index == 10 { 1 } else { 100 };
+            let views = (0..item_count)
+                .map(|item_index| {
+                    approval_view(
+                        format!("approval:{page_index:02}:{item_index:03}"),
+                        &position,
+                        Some(decide),
+                    )
+                })
+                .collect();
+            let next = (page_index < 10).then(|| format!("cursor:{}", page_index + 1));
+            oversized_pages.push_back(Ok(approval_page(&position, views, next.as_deref())));
+        }
+        let oversized_dispatches = Cell::new(0_u64);
+        assert!(matches!(
+            block_on_ready(read_actionable_approval_queue_via(
+                &kernel,
+                now,
+                |_request| {
+                    oversized_dispatches.set(oversized_dispatches.get() + 1);
+                    std::future::ready(oversized_pages.pop_front().expect("oversized page"))
+                },
+            )),
+            Err(ClientApprovalWatchError::BaselineLimitExceeded)
+        ));
+        assert_eq!(oversized_dispatches.get(), 11);
+
+        let api_error = LocalApiError {
+            code: LocalApiErrorCode::StateRevisionConflict as i32,
+            safe_fingerprint: "approval-baseline/unavailable/v1".to_owned(),
+            retryable: true,
+            required_action_code: Some("retry-read".to_owned()),
+            current_position: None,
+            correlation_id: "correlation:approval-baseline".to_owned(),
+        };
+        let api_dispatches = Cell::new(0_u64);
+        let api_result = block_on_ready(read_actionable_approval_queue_via(
+            &kernel,
+            now,
+            |_request| {
+                api_dispatches.set(api_dispatches.get() + 1);
+                std::future::ready(Ok(ListHarnessApprovalViewsResponse {
+                    views: vec![one()],
+                    next_page_cursor: None,
+                    snapshot_position: Some(position.clone()),
+                    error: Some(api_error.clone()),
+                }))
+            },
+        ));
+        assert!(matches!(api_result, Err(ClientApprovalWatchError::Api(_))));
+        assert_eq!(api_dispatches.get(), 1);
+
+        let transport_dispatches = Cell::new(0_u64);
+        let transport = block_on_ready(read_actionable_approval_queue_via(
+            &kernel,
+            now,
+            |_request| {
+                transport_dispatches.set(transport_dispatches.get() + 1);
+                std::future::ready(Err("tonic-status".to_owned()))
+            },
+        ));
+        assert!(matches!(
+            transport,
+            Err(ClientApprovalWatchError::Transport(detail)) if detail == "tonic-status"
+        ));
+        assert_eq!(transport_dispatches.get(), 1);
+    }
+
+    #[test]
+    fn approval_watch_wire_requests_freeze_baseline_and_live_filters() {
+        let metadata = ClientRequestMetadata {
+            client_instance_id: "client:approval-watch".to_owned(),
+            surface: ClientSurface::Cli as i32,
+            session_id: "session:approval-watch".to_owned(),
+            request_id: "request:approval-watch".to_owned(),
+            api_contract_ref: Some(api_contract_ref()),
+            correlation_id: None,
+        };
+        let baseline =
+            approval_baseline_wire_request(metadata.clone(), Some("cursor:next".to_owned()));
+        assert_eq!(baseline.client, Some(metadata.clone()));
+        assert!(baseline.actionable_only);
+        assert_eq!(baseline.page_size, 100);
+        assert_eq!(baseline.page_cursor.as_deref(), Some("cursor:next"));
+        assert!(baseline.minimum_position.is_none());
+        assert!(baseline.task_ids.is_empty());
+        assert!(baseline.request_lifecycle_filter.is_empty());
+        assert!(baseline.decision_state_filter.is_empty());
+
+        let position = approval_position(11);
+        let watch = approval_watch_wire_request(metadata.clone(), Some(position.clone()));
+        assert_eq!(watch.client, Some(metadata));
+        assert_eq!(watch.resume_after, Some(position));
+        assert!(!watch.actionable_only);
+        assert!(watch.approval_request_ids.is_empty());
+        assert!(watch.task_ids.is_empty());
+        assert!(watch.request_lifecycle_filter.is_empty());
+        assert!(watch.decision_state_filter.is_empty());
+    }
+
+    #[test]
+    fn approval_watch_open_seam_authorizes_before_stream_dispatch() {
+        use std::cell::RefCell;
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let kernel = authenticated_kernel_for_surface(
+            "founder:approval-watch",
+            "session:approval-watch",
+            "local.approval.read",
+            ClientSurface::Cli,
+            now,
+        );
+        let calls = Cell::new(0_u64);
+        let captured = RefCell::new(None);
+        let position = approval_position(80);
+        let opened = block_on_ready(open_approval_stream_via(
+            &kernel,
+            Some(position.clone()),
+            now,
+            |request| {
+                calls.set(calls.get() + 1);
+                captured.replace(Some(request));
+                std::future::ready(Ok("opened"))
+            },
+        ))
+        .expect("authorized approval stream");
+        assert_eq!(opened, "opened");
+        assert_eq!(calls.get(), 1);
+        let request = captured.borrow_mut().take().expect("captured request");
+        assert_eq!(request.resume_after, Some(position));
+        assert!(!request.actionable_only);
+        let client = request.client.expect("session metadata");
+        assert_eq!(client.session_id, "session:approval-watch");
+        assert_eq!(client.surface, ClientSurface::Cli as i32);
+        assert_eq!(client.api_contract_ref, Some(api_contract_ref()));
+
+        let denied = authenticated_kernel_for_surface(
+            "founder:approval-watch",
+            "session:approval-watch-denied",
+            "local.context.revoke",
+            ClientSurface::Cli,
+            now,
+        );
+        let denied_calls = Cell::new(0_u64);
+        assert!(matches!(
+            block_on_ready(open_approval_stream_via(&denied, None, now, |_request| {
+                denied_calls.set(denied_calls.get() + 1);
+                std::future::ready(Ok(()))
+            })),
+            Err(ClientApprovalWatchError::Kernel(
+                KernelError::PermissionDenied(permission)
+            )) if permission == "local.approval.read"
+        ));
+        assert_eq!(denied_calls.get(), 0);
+    }
+
+    #[test]
+    fn approval_watch_applied_upserts_and_removes_without_fake_remove() {
+        let position = approval_position(8);
+        let decide = AvailableActionKind::DecideHarnessApproval as i32;
+        let original = approval_view("approval:1", &position, Some(decide));
+        let mut actionable = BTreeMap::from([(
+            original.approval_request_id.clone(),
+            ActionableApproval {
+                view: original.clone(),
+            },
+        )]);
+        let mut processor = ApprovalWatchProcessor::default();
+
+        let unknown = approval_view("approval:1", &position, Some(i32::MAX));
+        let error = processor
+            .process(HarnessApprovalViewStreamFrame {
+                kind: StreamFrameKind::Snapshot as i32,
+                position: Some(position.clone()),
+                snapshot: Some(unknown),
+                reset_reason_code: None,
+            })
+            .and_then(|update| apply_approval_watch_update(&mut actionable, &update));
+        assert!(matches!(error, Err(ClientApprovalWatchError::Protocol(_))));
+        assert_eq!(actionable["approval:1"].view(), &original);
+
+        let later = approval_position(9);
+        let closed = approval_view("approval:1", &later, None);
+        let update = processor
+            .process(HarnessApprovalViewStreamFrame {
+                kind: StreamFrameKind::Snapshot as i32,
+                position: Some(later),
+                snapshot: Some(closed),
+                reset_reason_code: None,
+            })
+            .expect("valid leaving-filter update");
+        apply_approval_watch_update(&mut actionable, &update).expect("remove by authoritative id");
+        assert!(actionable.is_empty());
+        assert_eq!(original.task_id, "task:approval:1");
+    }
+
+    #[test]
+    fn approval_queue_session_uses_only_its_consumed_baseline_floor() {
+        let floor = approval_position(100);
+        let mut last_position = floor.clone();
+        let decide = AvailableActionKind::DecideHarnessApproval as i32;
+        let current = approval_view("approval:current", &floor, Some(decide));
+        let mut actionable = BTreeMap::from([(
+            current.approval_request_id.clone(),
+            ActionableApproval {
+                view: current.clone(),
+            },
+        )]);
+
+        let old_position = approval_position(80);
+        let old = ApprovalWatchUpdate {
+            classification: ApprovalWatchClassification::Applied,
+            kind: ApprovalWatchFrameKind::Snapshot,
+            position: old_position.clone(),
+            view: Some(approval_view("approval:old", &old_position, Some(decide))),
+            reset_reason_code: None,
+        };
+        assert!(matches!(
+            apply_approval_queue_session_update(&mut actionable, &mut last_position, &old),
+            Err(ClientApprovalWatchError::Kernel(
+                KernelError::StreamOutOfOrder
+            ))
+        ));
+        assert_eq!(actionable.len(), 1);
+        assert_eq!(actionable["approval:current"].view(), &current);
+
+        let same_position_applied = ApprovalWatchUpdate {
+            classification: ApprovalWatchClassification::Applied,
+            kind: ApprovalWatchFrameKind::Snapshot,
+            position: floor.clone(),
+            view: Some(approval_view("approval:same", &floor, Some(decide))),
+            reset_reason_code: None,
+        };
+        apply_approval_queue_session_update(
+            &mut actionable,
+            &mut last_position,
+            &same_position_applied,
+        )
+        .expect("processor-classified same-position identity is applied");
+
+        let next_position = approval_position(101);
+        let next = ApprovalWatchUpdate {
+            classification: ApprovalWatchClassification::Applied,
+            kind: ApprovalWatchFrameKind::Snapshot,
+            position: next_position.clone(),
+            view: Some(approval_view("approval:next", &next_position, Some(decide))),
+            reset_reason_code: None,
+        };
+        apply_approval_queue_session_update(&mut actionable, &mut last_position, &next)
+            .expect("post-baseline update");
+        assert_eq!(
+            actionable.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["approval:current", "approval:next", "approval:same"]
+        );
+
+        let other_epoch = ApprovalWatchUpdate {
+            classification: ApprovalWatchClassification::Applied,
+            kind: ApprovalWatchFrameKind::Snapshot,
+            position: ProjectionPosition {
+                epoch: "epoch:other".to_owned(),
+                sequence: 101,
+                projected_at: None,
+            },
+            view: None,
+            reset_reason_code: None,
+        };
+        assert!(matches!(
+            apply_approval_queue_session_update(&mut actionable, &mut last_position, &other_epoch,),
+            Err(ClientApprovalWatchError::Kernel(
+                KernelError::StreamResetMissing
+            ))
+        ));
+        assert_eq!(actionable.len(), 3);
+
+        let back_to_floor = ApprovalWatchUpdate {
+            classification: ApprovalWatchClassification::Replay,
+            kind: ApprovalWatchFrameKind::Snapshot,
+            position: floor,
+            view: Some(current),
+            reset_reason_code: None,
+        };
+        assert!(matches!(
+            apply_approval_queue_session_update(
+                &mut actionable,
+                &mut last_position,
+                &back_to_floor,
+            ),
+            Err(ClientApprovalWatchError::Kernel(
+                KernelError::StreamOutOfOrder
+            ))
+        ));
+    }
+
+    #[test]
+    fn approval_queue_session_accepts_distinct_same_position_entities_and_rejects_conflicts() {
+        let position = approval_position(101);
+        let decide = AvailableActionKind::DecideHarnessApproval as i32;
+        let mut processor = ApprovalWatchProcessor::default();
+        let mut actionable = BTreeMap::new();
+        let mut last_position = approval_position(100);
+
+        for approval_request_id in ["approval:101:a", "approval:101:b"] {
+            let update = processor
+                .process(HarnessApprovalViewStreamFrame {
+                    kind: StreamFrameKind::Snapshot as i32,
+                    position: Some(position.clone()),
+                    snapshot: Some(approval_view(approval_request_id, &position, Some(decide))),
+                    reset_reason_code: None,
+                })
+                .expect("distinct same-position approval is valid");
+            assert_eq!(update.classification, ApprovalWatchClassification::Applied);
+            apply_approval_queue_session_update(&mut actionable, &mut last_position, &update)
+                .expect("session trusts processor classification");
+        }
+        assert_eq!(last_position, position);
+        assert_eq!(
+            actionable.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["approval:101:a", "approval:101:b"]
+        );
+
+        let mut conflicting = approval_view("approval:101:a", &position, Some(decide));
+        conflicting.action_digest_sha256 = "c".repeat(64);
+        assert!(matches!(
+            processor.process(HarnessApprovalViewStreamFrame {
+                kind: StreamFrameKind::Snapshot as i32,
+                position: Some(position),
+                snapshot: Some(conflicting),
+                reset_reason_code: None,
+            }),
+            Err(ClientApprovalWatchError::Kernel(
+                KernelError::ConflictingStreamReplay
+            ))
+        ));
+        assert_eq!(actionable.len(), 2);
+    }
+
+    #[test]
+    fn approval_watch_replay_heartbeat_reset_eof_and_transport_are_non_destructive() {
+        let position = approval_position(8);
+        let decide = AvailableActionKind::DecideHarnessApproval as i32;
+        let original = approval_view("approval:1", &position, Some(decide));
+        let mut actionable = BTreeMap::new();
+        let mut processor = ApprovalWatchProcessor::default();
+        let frame = HarnessApprovalViewStreamFrame {
+            kind: StreamFrameKind::Snapshot as i32,
+            position: Some(position.clone()),
+            snapshot: Some(original.clone()),
+            reset_reason_code: None,
+        };
+        let first = block_on_ready(next_approval_queue_update_via(
+            &mut processor,
+            &mut actionable,
+            || std::future::ready(Ok(Some(frame.clone()))),
+        ))
+        .expect("first update")
+        .expect("frame");
+        assert_eq!(first.classification, ApprovalWatchClassification::Applied);
+        let replay = block_on_ready(next_approval_queue_update_via(
+            &mut processor,
+            &mut actionable,
+            || std::future::ready(Ok(Some(frame))),
+        ))
+        .expect("replay")
+        .expect("frame");
+        assert_eq!(replay.classification, ApprovalWatchClassification::Replay);
+
+        let heartbeat_position = approval_position(9);
+        let heartbeat = block_on_ready(next_approval_queue_update_via(
+            &mut processor,
+            &mut actionable,
+            || {
+                std::future::ready(Ok(Some(HarnessApprovalViewStreamFrame {
+                    kind: StreamFrameKind::Heartbeat as i32,
+                    position: Some(heartbeat_position),
+                    snapshot: None,
+                    reset_reason_code: None,
+                })))
+            },
+        ))
+        .expect("heartbeat")
+        .expect("frame");
+        assert_eq!(
+            heartbeat.classification,
+            ApprovalWatchClassification::Heartbeat
+        );
+        assert_eq!(actionable["approval:1"].view(), &original);
+
+        let eof = block_on_ready(next_approval_queue_update_via(
+            &mut processor,
+            &mut actionable,
+            || std::future::ready(Ok(None)),
+        ));
+        assert!(matches!(eof, Err(ClientApprovalWatchError::UnexpectedEof)));
+        let transport = block_on_ready(next_approval_queue_update_via(
+            &mut processor,
+            &mut actionable,
+            || std::future::ready(Err("tonic-status".to_owned())),
+        ));
+        assert!(matches!(
+            transport,
+            Err(ClientApprovalWatchError::Transport(_))
+        ));
+        assert_eq!(actionable["approval:1"].view(), &original);
+
+        let reset = HarnessApprovalViewStreamFrame {
+            kind: StreamFrameKind::ResetRequired as i32,
+            position: Some(approval_position(10)),
+            snapshot: None,
+            reset_reason_code: Some("projection_reset".to_owned()),
+        };
+        let reset = block_on_ready(next_approval_queue_update_via(
+            &mut processor,
+            &mut actionable,
+            || std::future::ready(Ok(Some(reset))),
+        ))
+        .expect("reset frame")
+        .expect("frame");
+        assert_eq!(
+            reset.classification,
+            ApprovalWatchClassification::ResetRequired
+        );
+        let polls = Cell::new(0);
+        let blocked = block_on_ready(next_approval_queue_update_via(
+            &mut processor,
+            &mut actionable,
+            || {
+                polls.set(polls.get() + 1);
+                std::future::ready(Ok(None))
+            },
+        ));
+        assert!(matches!(
+            blocked,
+            Err(ClientApprovalWatchError::ResetBarrier)
+        ));
+        assert_eq!(polls.get(), 0);
+        assert_eq!(actionable["approval:1"].view(), &original);
+    }
+
+    #[test]
+    fn approval_watch_rejects_out_of_order_and_same_position_conflicts() {
+        let position = approval_position(101);
+        let decide = AvailableActionKind::DecideHarnessApproval as i32;
+        let mut processor = ApprovalWatchProcessor::default();
+        let mut view = approval_view("approval:1", &position, Some(decide));
+        processor
+            .process(HarnessApprovalViewStreamFrame {
+                kind: StreamFrameKind::Snapshot as i32,
+                position: Some(position.clone()),
+                snapshot: Some(view.clone()),
+                reset_reason_code: None,
+            })
+            .expect("first frame");
+        view.action_digest_sha256 = "c".repeat(64);
+        assert!(matches!(
+            processor.process(HarnessApprovalViewStreamFrame {
+                kind: StreamFrameKind::Snapshot as i32,
+                position: Some(position),
+                snapshot: Some(view),
+                reset_reason_code: None,
+            }),
+            Err(ClientApprovalWatchError::Kernel(
+                KernelError::ConflictingStreamReplay
+            ))
+        ));
+
+        let older = approval_position(100);
+        assert!(matches!(
+            processor.process(HarnessApprovalViewStreamFrame {
+                kind: StreamFrameKind::Heartbeat as i32,
+                position: Some(older),
+                snapshot: None,
+                reset_reason_code: None,
+            }),
+            Err(ClientApprovalWatchError::Kernel(
+                KernelError::StreamOutOfOrder
+            ))
+        ));
+
+        for reason in ["epoch_changed", "cursor_before_retention", "cursor_ahead"] {
+            let mut reset_processor = ApprovalWatchProcessor::default();
+            let reset = reset_processor
+                .process(HarnessApprovalViewStreamFrame {
+                    kind: StreamFrameKind::ResetRequired as i32,
+                    position: Some(approval_position(102)),
+                    snapshot: None,
+                    reset_reason_code: Some(reason.to_owned()),
+                })
+                .expect("well-formed reset barrier");
+            assert_eq!(
+                reset.classification,
+                ApprovalWatchClassification::ResetRequired
+            );
+            assert!(matches!(
+                reset_processor.process(HarnessApprovalViewStreamFrame {
+                    kind: StreamFrameKind::Heartbeat as i32,
+                    position: Some(approval_position(103)),
+                    snapshot: None,
+                    reset_reason_code: None,
+                }),
+                Err(ClientApprovalWatchError::ResetBarrier)
+            ));
+        }
     }
 }

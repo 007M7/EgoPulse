@@ -13,12 +13,13 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
-use egopulse_client_kernel::{KernelError, SnapshotStreamTracker, StreamApply};
+use egopulse_client_kernel::KernelError;
 use egopulse_client_operations::{
-    AttachError, ClientAttachment, ClientContextRevokeError, ClientTaskWatchError, ClientWorkError,
-    ContextRevokeInput, TaskWatch, TaskWatchClassification, TaskWatchRequest, TaskWatchUpdate,
-    attach as attach_client, command_metadata, set_policy_digest, set_task_digest,
-    set_verdict_digest, timestamp_after,
+    ApprovalWatch, ApprovalWatchClassification, ApprovalWatchCursor, ApprovalWatchUpdate,
+    AttachError, ClientApprovalWatchError, ClientAttachment, ClientContextRevokeError,
+    ClientTaskWatchError, ClientWorkError, ContextRevokeInput, TaskWatch, TaskWatchClassification,
+    TaskWatchRequest, TaskWatchUpdate, attach as attach_client, command_metadata,
+    set_policy_digest, set_task_digest, set_verdict_digest, timestamp_after,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -32,13 +33,12 @@ use egopulse_domain_contracts::v01::egopulse::{
         AwaitProjectionRequest, ClientSurface, ContextGovernanceState,
         DecideHarnessApprovalRequest, ExecuteFounderVerdictRequest, ExecuteMemoryMutationRequest,
         ExecuteTaskCommandRequest, GetEvidenceGraphRequest, GetHarnessApprovalViewRequest,
-        GetProjectionStatusRequest, GetTaskViewRequest, HarnessApprovalViewStreamFrame,
-        ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError, LocalApiErrorCode,
-        MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth,
-        ProjectionMetadata, RetrieveMemoryRequest, SourceRevision, TaskView,
-        WatchHarnessApprovalViewsRequest, await_projection_response, get_evidence_graph_response,
-        get_harness_approval_view_response, get_task_view_response, memory_mutation_command,
-        retrieve_memory_response,
+        GetProjectionStatusRequest, GetTaskViewRequest, ListHarnessApprovalViewsRequest,
+        ListTaskViewsRequest, LocalApiError, LocalApiErrorCode, MemoryMutationCommand,
+        MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth, ProjectionMetadata,
+        RetrieveMemoryRequest, SourceRevision, TaskView, await_projection_response,
+        get_evidence_graph_response, get_harness_approval_view_response, get_task_view_response,
+        memory_mutation_command, retrieve_memory_response,
     },
     policy::v1::{
         IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, PolicyDecisionErrorCode,
@@ -2285,54 +2285,19 @@ async fn approval_watch(
         .for_operation("approval.watch"));
     }
     let attached = attach("approval.watch").await?;
-    attached.require_rpc(
-        "LocalReadModelService/WatchHarnessApprovalViews",
-        "approval.watch",
-    )?;
-    let resume_after = resume_epoch.map(|epoch| {
-        egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition {
-            epoch,
-            sequence: resume_sequence.expect("validated resume sequence"),
-            projected_at: None,
+    let mut watch = match (resume_epoch, resume_sequence) {
+        (Some(epoch), Some(sequence)) => {
+            attached
+                .0
+                .open_approval_watch_resume(ApprovalWatchCursor { epoch, sequence })
+                .await
         }
-    });
-    let metadata = attached.metadata(None)?;
-    let mut stream = attached
-        .0
-        .connection
-        .read_model_service()
-        .watch_harness_approval_views(WatchHarnessApprovalViewsRequest {
-            client: Some(metadata),
-            resume_after,
-            approval_request_ids: Vec::new(),
-            task_ids: Vec::new(),
-            request_lifecycle_filter: Vec::new(),
-            decision_state_filter: Vec::new(),
-            actionable_only: false,
-        })
-        .await
-        .map_err(|error| {
-            CliFailure::daemon_unavailable(error.to_string()).for_operation("approval.watch")
-        })?
-        .into_inner();
-    let mut tracker = SnapshotStreamTracker::default();
-    let mut emitted = 0_u32;
-    while let Some(frame) = stream.message().await.map_err(|error| {
-        CliFailure::daemon_unavailable(error.to_string()).for_operation("approval.watch")
-    })? {
-        let applied = tracker
-            .apply_harness_approval_frame(&frame)
-            .map_err(|error| CliFailure::stream_recovery("approval.watch", error.to_string()))?;
-        if applied == StreamApply::ResetRequired {
-            return Err(CliFailure::stream_recovery(
-                "approval.watch",
-                frame
-                    .reset_reason_code
-                    .as_deref()
-                    .unwrap_or("stream reset required"),
-            ));
-        }
-        let payload = approval_stream_frame_json(&frame, applied);
+        (None, None) => attached.0.open_approval_watch_current().await,
+        _ => unreachable!("approval watch resume pair was validated"),
+    }
+    .map_err(approval_watch_failure)?;
+    consume_approval_watch(&mut watch, frames, |update| {
+        let payload = approval_stream_frame_json(update);
         if json {
             println!("{}", serde_json::to_string(&payload).unwrap());
         } else {
@@ -2343,48 +2308,108 @@ async fn approval_watch(
                 payload["projection"]["position"]
             );
         }
-        emitted += 1;
-        if emitted >= frames.min(1000) {
-            break;
-        }
+    })
+    .await
+}
+
+trait CliApprovalWatchSource {
+    fn next_update(
+        &mut self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<ApprovalWatchUpdate>, ClientApprovalWatchError>> + '_,
+        >,
+    >;
+}
+
+impl CliApprovalWatchSource for ApprovalWatch {
+    fn next_update(
+        &mut self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<ApprovalWatchUpdate>, ClientApprovalWatchError>> + '_,
+        >,
+    > {
+        Box::pin(ApprovalWatch::next_update(self))
     }
-    if emitted == 0 {
-        return Err(CliFailure::stream_recovery(
-            "approval.watch",
-            "stream ended without frames",
-        ));
+}
+
+async fn consume_approval_watch<S, R>(
+    watch: &mut S,
+    frames: u32,
+    mut render: R,
+) -> Result<(), CliFailure>
+where
+    S: CliApprovalWatchSource,
+    R: FnMut(&ApprovalWatchUpdate),
+{
+    let mut emitted = 0_u32;
+    while emitted < frames.min(1000) {
+        let update = watch
+            .next_update()
+            .await
+            .map_err(approval_watch_failure)?
+            .ok_or_else(|| {
+                CliFailure::stream_recovery("approval.watch", "stream ended unexpectedly")
+            })?;
+        if update.classification == ApprovalWatchClassification::ResetRequired {
+            return Err(CliFailure::stream_recovery(
+                "approval.watch",
+                update
+                    .reset_reason_code
+                    .as_deref()
+                    .unwrap_or("stream reset required"),
+            ));
+        }
+        render(&update);
+        emitted += 1;
     }
     Ok(())
 }
 
-fn approval_stream_frame_json(
-    frame: &HarnessApprovalViewStreamFrame,
-    applied: StreamApply,
-) -> serde_json::Value {
-    let kind = egopulse_domain_contracts::v01::egopulse::localapi::v1::StreamFrameKind::try_from(
-        frame.kind,
-    )
-    .map(|value| value.as_str_name())
-    .unwrap_or("STREAM_FRAME_KIND_UNKNOWN");
-    let apply = match applied {
-        StreamApply::Applied => "applied",
-        StreamApply::Replay => "replay",
-        StreamApply::Heartbeat => "heartbeat",
-        StreamApply::ResetRequired => "reset_required",
+fn approval_stream_frame_json(update: &ApprovalWatchUpdate) -> serde_json::Value {
+    let apply = match update.classification {
+        ApprovalWatchClassification::Applied => "applied",
+        ApprovalWatchClassification::Replay => "replay",
+        ApprovalWatchClassification::Heartbeat => "heartbeat",
+        ApprovalWatchClassification::ResetRequired => "reset_required",
     };
     json!({
         "schemaVersion": "egopulse.cli-result/v0.1",
         "ok": true,
         "operation": "approval.watch",
         "data": {
-            "kind": kind,
+            "kind": update.kind.contract_name(),
             "apply": apply,
-            "view": frame.snapshot.as_ref().map(|view| approval_json(view, "approval.watch")["data"].clone()),
-            "resetReasonCode": frame.reset_reason_code,
+            "view": update.view.as_ref().map(|view| approval_json(view, "approval.watch")["data"].clone()),
+            "resetReasonCode": update.reset_reason_code,
         },
-        "projection": projection_position_json(frame.position.as_ref()),
+        "projection": projection_position_json(Some(&update.position)),
         "correlationId": Uuid::now_v7().to_string(),
     })
+}
+
+fn approval_watch_failure(error: ClientApprovalWatchError) -> CliFailure {
+    match error {
+        ClientApprovalWatchError::Transport(detail) => {
+            CliFailure::daemon_unavailable(detail).for_operation("approval.watch")
+        }
+        ClientApprovalWatchError::Kernel(KernelError::PermissionDenied(permission)) => {
+            CliFailure::permission("approval.watch", permission)
+        }
+        ClientApprovalWatchError::Api(error) => {
+            CliFailure::from_local_api_error(*error).for_operation("approval.watch")
+        }
+        ClientApprovalWatchError::BaselineLimitExceeded | ClientApprovalWatchError::Protocol(_) => {
+            CliFailure::protocol(error.to_string()).for_operation("approval.watch")
+        }
+        ClientApprovalWatchError::Kernel(_) | ClientApprovalWatchError::ResetBarrier => {
+            CliFailure::stream_recovery("approval.watch", error.to_string())
+        }
+        ClientApprovalWatchError::UnexpectedEof => {
+            CliFailure::stream_recovery("approval.watch", error.to_string())
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3297,6 +3322,46 @@ mod tests {
         }
     }
 
+    struct ScriptedApprovalWatchSource {
+        outcomes: VecDeque<Result<Option<ApprovalWatchUpdate>, ClientApprovalWatchError>>,
+        polls: Rc<Cell<u64>>,
+    }
+
+    impl CliApprovalWatchSource for ScriptedApprovalWatchSource {
+        fn next_update(
+            &mut self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Option<ApprovalWatchUpdate>, ClientApprovalWatchError>>
+                    + '_,
+            >,
+        > {
+            self.polls.set(self.polls.get() + 1);
+            Box::pin(std::future::ready(
+                self.outcomes.pop_front().unwrap_or(Ok(None)),
+            ))
+        }
+    }
+
+    fn approval_watch_update(classification: ApprovalWatchClassification) -> ApprovalWatchUpdate {
+        ApprovalWatchUpdate {
+            classification,
+            kind: if classification == ApprovalWatchClassification::ResetRequired {
+                egopulse_client_operations::ApprovalWatchFrameKind::ResetRequired
+            } else {
+                egopulse_client_operations::ApprovalWatchFrameKind::Heartbeat
+            },
+            position: egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition {
+                epoch: "epoch:approval-watch".to_owned(),
+                sequence: 9,
+                projected_at: None,
+            },
+            view: None,
+            reset_reason_code: (classification == ApprovalWatchClassification::ResetRequired)
+                .then(|| "projection_reset".to_owned()),
+        }
+    }
+
     fn scripted_watch(
         outcomes: Vec<Result<Option<TaskWatchUpdate>, ClientTaskWatchError>>,
     ) -> (ScriptedTaskWatchSource, Rc<Cell<u64>>, Rc<Cell<u64>>) {
@@ -3500,6 +3565,100 @@ mod tests {
         assert!(reset.message.contains("projection_reset"));
         assert_eq!(reset_polls.get(), 1);
         assert_eq!(reset_drops.get(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_watch_cli_consumes_shared_updates_and_stops_at_reset() {
+        let polls = Rc::new(Cell::new(0));
+        let mut source = ScriptedApprovalWatchSource {
+            outcomes: vec![
+                Ok(Some(approval_watch_update(
+                    ApprovalWatchClassification::Heartbeat,
+                ))),
+                Ok(Some(approval_watch_update(
+                    ApprovalWatchClassification::Replay,
+                ))),
+            ]
+            .into(),
+            polls: Rc::clone(&polls),
+        };
+        let rendered = Rc::new(Cell::new(0));
+        let rendered_witness = Rc::clone(&rendered);
+        consume_approval_watch(&mut source, 2, move |_| {
+            rendered_witness.set(rendered_witness.get() + 1);
+        })
+        .await
+        .expect("bounded approval watch");
+        assert_eq!(polls.get(), 2);
+        assert_eq!(rendered.get(), 2);
+
+        let reset_polls = Rc::new(Cell::new(0));
+        let mut reset = ScriptedApprovalWatchSource {
+            outcomes: vec![
+                Ok(Some(approval_watch_update(
+                    ApprovalWatchClassification::ResetRequired,
+                ))),
+                Err(ClientApprovalWatchError::Transport(
+                    "must-not-poll".to_owned(),
+                )),
+            ]
+            .into(),
+            polls: Rc::clone(&reset_polls),
+        };
+        let error = consume_approval_watch(&mut reset, 2, |_| {})
+            .await
+            .expect_err("reset is a recovery barrier");
+        assert_eq!(error.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
+        assert_eq!(reset_polls.get(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_watch_cli_types_eof_and_transport_failures() {
+        let partial_polls = Rc::new(Cell::new(0));
+        let mut partial = ScriptedApprovalWatchSource {
+            outcomes: vec![
+                Ok(Some(approval_watch_update(
+                    ApprovalWatchClassification::Heartbeat,
+                ))),
+                Ok(None),
+            ]
+            .into(),
+            polls: Rc::clone(&partial_polls),
+        };
+        let eof = consume_approval_watch(&mut partial, 2, |_| {})
+            .await
+            .expect_err("approval EOF requires recovery");
+        assert_eq!(eof.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
+        assert_eq!(partial_polls.get(), 2);
+
+        let transport_polls = Rc::new(Cell::new(0));
+        let mut transport = ScriptedApprovalWatchSource {
+            outcomes: vec![Err(ClientApprovalWatchError::Transport(
+                "tonic-status".to_owned(),
+            ))]
+            .into(),
+            polls: Rc::clone(&transport_polls),
+        };
+        let error = consume_approval_watch(&mut transport, 1, |_| {})
+            .await
+            .expect_err("transport remains distinct");
+        assert_eq!(error.reason_code, "DAEMON_UNAVAILABLE");
+        assert_eq!(transport_polls.get(), 1);
+    }
+
+    #[test]
+    fn approval_watch_json_schema_remains_compatible() {
+        let update = approval_watch_update(ApprovalWatchClassification::Replay);
+        let payload = approval_stream_frame_json(&update);
+        assert_eq!(payload["operation"], "approval.watch");
+        assert_eq!(payload["data"]["kind"], "STREAM_FRAME_KIND_HEARTBEAT");
+        assert_eq!(payload["data"]["apply"], "replay");
+        assert!(payload["data"]["view"].is_null());
+        assert_eq!(
+            payload["projection"]["position"]["epoch"],
+            "epoch:approval-watch"
+        );
+        assert_eq!(payload["projection"]["position"]["sequence"], 9);
     }
 
     #[test]
