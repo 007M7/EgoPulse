@@ -17,9 +17,10 @@ use egopulse_client_kernel::KernelError;
 use egopulse_client_operations::{
     ApprovalWatch, ApprovalWatchClassification, ApprovalWatchCursor, ApprovalWatchUpdate,
     AttachError, ClientApprovalWatchError, ClientAttachment, ClientContextRevokeError,
-    ClientTaskWatchError, ClientWorkError, ContextRevokeInput, TaskWatch, TaskWatchClassification,
-    TaskWatchRequest, TaskWatchUpdate, attach as attach_client, command_metadata,
-    set_policy_digest, set_task_digest, set_verdict_digest, timestamp_after,
+    ClientGuidedApprovalDecisionError, ClientTaskWatchError, ClientWorkError, ContextRevokeInput,
+    GuidedApprovalDecision, GuidedApprovalDecisionInput, TaskWatch, TaskWatchClassification,
+    TaskWatchRequest, TaskWatchUpdate, attach as attach_client, command_metadata, set_task_digest,
+    set_verdict_digest, timestamp_after,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -28,22 +29,17 @@ use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
     collaboration::v1::{RunStatus, StepStatus},
     common::v1::ContractReference,
-    harness::v1::ApprovalDecision,
     localapi::v1::{
         AwaitProjectionRequest, ClientSurface, ContextGovernanceState,
-        DecideHarnessApprovalRequest, ExecuteFounderVerdictRequest, ExecuteMemoryMutationRequest,
-        ExecuteTaskCommandRequest, GetEvidenceGraphRequest, GetHarnessApprovalViewRequest,
-        GetProjectionStatusRequest, GetTaskViewRequest, ListHarnessApprovalViewsRequest,
-        ListTaskViewsRequest, LocalApiError, LocalApiErrorCode, MemoryMutationCommand,
-        MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth, ProjectionMetadata,
-        RetrieveMemoryRequest, SourceRevision, TaskView, await_projection_response,
-        get_evidence_graph_response, get_harness_approval_view_response, get_task_view_response,
-        memory_mutation_command, retrieve_memory_response,
+        ExecuteFounderVerdictRequest, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
+        GetEvidenceGraphRequest, GetHarnessApprovalViewRequest, GetProjectionStatusRequest,
+        GetTaskViewRequest, ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError,
+        LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken,
+        ProjectionHealth, ProjectionMetadata, RetrieveMemoryRequest, SourceRevision, TaskView,
+        await_projection_response, get_evidence_graph_response, get_harness_approval_view_response,
+        get_task_view_response, memory_mutation_command, retrieve_memory_response,
     },
-    policy::v1::{
-        IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, PolicyDecisionErrorCode,
-        policy_decision_command,
-    },
+    policy::v1::PolicyDecisionErrorCode,
     task::v1::{
         ApplyFounderVerdictCommand, CreateTaskCommand, RequestTaskCancellationCommand, TaskCommand,
         TaskErrorCode, TaskStatus, task_command, task_command_result,
@@ -369,14 +365,6 @@ enum ApprovalCommand {
     /// Submit the user-owned issue_harness_approval_decision branch.
     Decide {
         approval_request_id: String,
-        #[arg(long)]
-        expected_action_digest_sha256: String,
-        #[arg(long)]
-        expected_request_observation_id: String,
-        #[arg(long)]
-        expected_request_observation_sequence: u64,
-        #[arg(long)]
-        expected_request_revision: u64,
         #[arg(long)]
         decision: String,
         #[arg(long)]
@@ -2132,10 +2120,6 @@ async fn approval(command: ApprovalCommand) -> Result<(), CliFailure> {
         } => approval_watch(frames, resume_epoch, resume_sequence, json).await,
         ApprovalCommand::Decide {
             approval_request_id,
-            expected_action_digest_sha256,
-            expected_request_observation_id,
-            expected_request_observation_sequence,
-            expected_request_revision,
             decision,
             reason_code,
             confirmation_proof_ref,
@@ -2143,10 +2127,6 @@ async fn approval(command: ApprovalCommand) -> Result<(), CliFailure> {
         } => {
             approval_decide(
                 approval_request_id,
-                expected_action_digest_sha256,
-                expected_request_observation_id,
-                expected_request_observation_sequence,
-                expected_request_revision,
                 decision,
                 reason_code,
                 confirmation_proof_ref,
@@ -2412,13 +2392,43 @@ fn approval_watch_failure(error: ClientApprovalWatchError) -> CliFailure {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn guided_approval_failure(error: ClientGuidedApprovalDecisionError) -> CliFailure {
+    match error {
+        ClientGuidedApprovalDecisionError::Kernel(KernelError::PermissionDenied(permission)) => {
+            CliFailure::permission("approval.decide", permission)
+        }
+        ClientGuidedApprovalDecisionError::Kernel(error) => {
+            CliFailure::protocol(error.to_string()).for_operation("approval.decide")
+        }
+        ClientGuidedApprovalDecisionError::InvalidInput(detail)
+        | ClientGuidedApprovalDecisionError::Protocol(detail) => {
+            CliFailure::protocol(detail).for_operation("approval.decide")
+        }
+        ClientGuidedApprovalDecisionError::NotFound => CliFailure::policy_authority(
+            PolicyDecisionErrorCode::NotFound as i32,
+            Some("approval_view_not_found".to_owned()),
+            "approval.decide",
+        ),
+        ClientGuidedApprovalDecisionError::NonActionable => CliFailure::policy_authority(
+            PolicyDecisionErrorCode::PolicyDenied as i32,
+            Some("approval_not_actionable".to_owned()),
+            "approval.decide",
+        ),
+        ClientGuidedApprovalDecisionError::Transport(detail) => {
+            CliFailure::daemon_unavailable(detail).for_operation("approval.decide")
+        }
+        ClientGuidedApprovalDecisionError::Api(error) => {
+            CliFailure::from_local_api_error(*error).for_operation("approval.decide")
+        }
+        ClientGuidedApprovalDecisionError::Authority {
+            error_code,
+            safe_error_fingerprint,
+        } => CliFailure::policy_authority(error_code, safe_error_fingerprint, "approval.decide"),
+    }
+}
+
 async fn approval_decide(
     approval_request_id: String,
-    expected_action_digest_sha256: String,
-    expected_request_observation_id: String,
-    expected_request_observation_sequence: u64,
-    expected_request_revision: u64,
     decision: String,
     reason_code: String,
     confirmation_proof_ref: Option<String>,
@@ -2427,78 +2437,35 @@ async fn approval_decide(
     let decision = parse_approval_decision(&decision)
         .map_err(|message| CliFailure::protocol(message).for_operation("approval.decide"))?;
     let attached = attach("approval.decide").await?;
-    attached.require_command(
-        "LocalCommandGatewayService/DecideHarnessApproval",
-        "issue_harness_approval_decision",
-        "approval.decide",
-    )?;
-    let correlation_id = Uuid::now_v7().to_string();
-    let mut command = PolicyDecisionCommand {
-        command: Some(
-            policy_decision_command::Command::IssueHarnessApprovalDecision(
-                IssueHarnessApprovalDecisionCommand {
-                    metadata: Some(command_metadata(
-                        &correlation_id,
-                        "egopulse-cli/approval-decide",
-                    )),
-                    approval_request_id,
-                    expected_action_digest_sha256,
-                    expected_request_observation_id,
-                    expected_request_observation_sequence,
-                    decision,
-                    reason_code,
-                    confirmation_proof_ref,
-                    expected_request_revision,
-                },
-            ),
-        ),
-    };
-    set_policy_digest(&mut command);
-    let metadata = attached.metadata(Some(correlation_id.clone()))?;
-    let response = attached
+    let result = attached
         .0
-        .connection
-        .command_gateway_service()
-        .decide_harness_approval(DecideHarnessApprovalRequest {
-            client: Some(metadata),
-            command: Some(match command.command {
-                Some(policy_decision_command::Command::IssueHarnessApprovalDecision(command)) => {
-                    command
-                }
-                _ => unreachable!("CLI always constructs issue approval decision"),
-            }),
+        .decide_guided_approval(GuidedApprovalDecisionInput {
+            approval_request_id,
+            decision,
+            reason_code,
+            confirmation_proof_ref,
         })
         .await
-        .map_err(|error| {
-            CliFailure::daemon_unavailable(error.to_string()).for_operation("approval.decide")
-        })?
-        .into_inner();
-    if let Some(error) = response.gateway_error {
-        return Err(CliFailure::from_local_api_error(error).for_operation("approval.decide"));
-    }
-    let result = response.sanitized_authority_result.ok_or_else(|| {
-        CliFailure::protocol("sanitized approval result missing").for_operation("approval.decide")
-    })?;
-    if result.error_code != 0 {
-        return Err(CliFailure::policy_authority(
-            result.error_code,
-            result.safe_error_fingerprint,
-            "approval.decide",
-        ));
-    }
+        .map_err(guided_approval_failure)?;
     let payload = json!({
         "schemaVersion": "egopulse.cli-result/v0.1",
         "ok": true,
         "operation": "approval.decide",
         "data": {
-            "committed": result.committed,
-            "replayed": result.replayed,
-            "authorityDecisionRef": result.authority_decision_ref,
-            "decision": ApprovalDecision::try_from(result.decision).map(|value| value.as_str_name()).unwrap_or("APPROVAL_DECISION_UNSPECIFIED"),
-            "stateRevision": result.state_revision,
-            "awaitToken": await_token_json(response.await_token),
+            "committed": result.committed(),
+            "replayed": result.replayed(),
+            "authorityDecisionRef": result.authority_decision_ref(),
+            "decision": result.decision().contract_name(),
+            "stateRevision": result.state_revision(),
+            "awaitToken": await_token_json(result.await_token().cloned()),
+            "projectionWarning": result.projection_warning().map(|warning| json!({
+                "code": LocalApiErrorCode::try_from(warning.code).map(|code| code.as_str_name()).unwrap_or("LOCAL_API_ERROR_UNKNOWN"),
+                "retryable": warning.retryable,
+                "requiredActionCode": warning.required_action_code,
+                "safeFingerprint": warning.safe_fingerprint,
+            })),
         },
-        "correlationId": correlation_id,
+        "correlationId": result.correlation_id(),
     });
     if json {
         println!("{}", serde_json::to_string(&payload).unwrap());
@@ -3063,11 +3030,11 @@ async fn task_cancel(
     Ok(())
 }
 
-fn parse_approval_decision(value: &str) -> Result<i32, String> {
+fn parse_approval_decision(value: &str) -> Result<GuidedApprovalDecision, String> {
     match value {
-        "allow-once" => Ok(ApprovalDecision::AllowOnce as i32),
-        "deny" => Ok(ApprovalDecision::Deny as i32),
-        "cancel-attempt" => Ok(ApprovalDecision::CancelAttempt as i32),
+        "allow-once" => Ok(GuidedApprovalDecision::AllowOnce),
+        "deny" => Ok(GuidedApprovalDecision::Deny),
+        "cancel-attempt" => Ok(GuidedApprovalDecision::CancelAttempt),
         _ => Err("decision must be allow-once, deny, or cancel-attempt".to_owned()),
     }
 }
@@ -3659,6 +3626,91 @@ mod tests {
             "epoch:approval-watch"
         );
         assert_eq!(payload["projection"]["position"]["sequence"], 9);
+    }
+
+    #[test]
+    fn approval_decide_cli_accepts_only_guided_surface_inputs() {
+        let cli = Cli::try_parse_from([
+            "egopulse",
+            "approval",
+            "decide",
+            "approval:guided:1",
+            "--decision",
+            "cancel-attempt",
+            "--reason-code",
+            "founder-reviewed",
+            "--confirmation-proof-ref",
+            "proof:approval:1",
+            "--json",
+        ])
+        .expect("guided approval CLI");
+        let Command::Approval {
+            command:
+                ApprovalCommand::Decide {
+                    approval_request_id,
+                    decision,
+                    reason_code,
+                    confirmation_proof_ref,
+                    json,
+                },
+        } = cli.command
+        else {
+            panic!("expected approval decide command")
+        };
+        assert_eq!(approval_request_id, "approval:guided:1");
+        assert_eq!(
+            parse_approval_decision(&decision),
+            Ok(GuidedApprovalDecision::CancelAttempt)
+        );
+        assert_eq!(reason_code, "founder-reviewed");
+        assert_eq!(confirmation_proof_ref.as_deref(), Some("proof:approval:1"));
+        assert!(json);
+
+        assert!(
+            Cli::try_parse_from([
+                "egopulse",
+                "approval",
+                "decide",
+                "approval:guided:1",
+                "--decision",
+                "deny",
+                "--reason-code",
+                "founder-reviewed",
+                "--expected-action-digest-sha256",
+                &"a".repeat(64),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn approval_decide_cli_preserves_typed_failure_categories() {
+        for (value, expected) in [
+            ("allow-once", GuidedApprovalDecision::AllowOnce),
+            ("deny", GuidedApprovalDecision::Deny),
+            ("cancel-attempt", GuidedApprovalDecision::CancelAttempt),
+        ] {
+            assert_eq!(parse_approval_decision(value), Ok(expected));
+        }
+        assert!(parse_approval_decision("allow-always").is_err());
+
+        let permission = guided_approval_failure(ClientGuidedApprovalDecisionError::Kernel(
+            KernelError::PermissionDenied("local.approval.decide".to_owned()),
+        ));
+        assert_eq!(permission.reason_code, "PERMISSION_DENIED");
+        let authority = guided_approval_failure(ClientGuidedApprovalDecisionError::Authority {
+            error_code: PolicyDecisionErrorCode::RevisionConflict as i32,
+            safe_error_fingerprint: Some("approval/revision-conflict/v1".to_owned()),
+        });
+        assert_eq!(authority.reason_code, "POLICY_AUTHORITY_REJECTED");
+        let transport = guided_approval_failure(ClientGuidedApprovalDecisionError::Transport(
+            "tonic-status".to_owned(),
+        ));
+        assert_eq!(transport.reason_code, "DAEMON_UNAVAILABLE");
+        let protocol = guided_approval_failure(ClientGuidedApprovalDecisionError::Protocol(
+            "sanitized approval result missing",
+        ));
+        assert_eq!(protocol.reason_code, "LOCAL_API_PROTOCOL_ERROR");
     }
 
     #[test]

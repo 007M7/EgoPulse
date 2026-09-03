@@ -11,19 +11,26 @@ use egopulse_domain_contracts::{
     context_revoke::ContextRevokeSemanticRequest,
     v01::egopulse::{
         common::v1::CommandMetadata,
+        harness::v1::ApprovalDecision,
         localapi::v1::{
             AvailableActionKind, ClientRequestMetadata, ClientSurface, ConfirmWorkRequest,
             ConfirmWorkResponse, ContextGovernanceState, ContextMutationCommand,
-            ContextRevokeReceipt, ExecuteContextMutationRequest, ExecuteContextMutationResponse,
-            GetProjectionStatusRequest, HarnessApprovalView, HarnessApprovalViewStreamFrame,
-            ListHarnessApprovalViewsRequest, ListHarnessApprovalViewsResponse,
-            ListTaskViewsRequest, LocalApiError, PrepareWorkRequest, ProjectionMetadata,
-            ProjectionPosition, RevokeContextSnapshotCommand, StreamFrameKind, TaskView,
-            TaskViewStreamFrame, WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest,
-            WorkPreparationPreview, WorkSourceRequest, context_mutation_command,
-            execute_context_mutation_response,
+            ContextRevokeReceipt, DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
+            ExecuteContextMutationRequest, ExecuteContextMutationResponse,
+            GetHarnessApprovalViewRequest, GetHarnessApprovalViewResponse,
+            GetProjectionStatusRequest, HarnessApprovalAuthorityResult, HarnessApprovalView,
+            HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest,
+            ListHarnessApprovalViewsResponse, ListTaskViewsRequest, LocalApiError,
+            PrepareWorkRequest, ProjectionAwaitToken, ProjectionMetadata, ProjectionPosition,
+            RevokeContextSnapshotCommand, StreamFrameKind, TaskView, TaskViewStreamFrame,
+            WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, WorkPreparationPreview,
+            WorkSourceRequest, context_mutation_command, execute_context_mutation_response,
+            get_harness_approval_view_response,
         },
-        policy::v1::{PolicyDecisionCommand, policy_decision_command},
+        policy::v1::{
+            HarnessApprovalDecisionStateKind, IssueHarnessApprovalDecisionCommand,
+            PolicyDecisionCommand, PolicyDecisionErrorCode, policy_decision_command,
+        },
         task::v1::{TaskCommand, task_command},
         verdict::v1::{VerdictCommand, verdict_command},
     },
@@ -41,6 +48,11 @@ const CONTEXT_REVOKE_IDEMPOTENCY_SCOPE: &str = "context-revoke";
 const WATCH_TASK_VIEWS_RPC: &str = "LocalReadModelService/WatchTaskViews";
 const LIST_HARNESS_APPROVAL_VIEWS_RPC: &str = "LocalReadModelService/ListHarnessApprovalViews";
 const WATCH_HARNESS_APPROVAL_VIEWS_RPC: &str = "LocalReadModelService/WatchHarnessApprovalViews";
+const GET_HARNESS_APPROVAL_VIEW_RPC: &str = "LocalReadModelService/GetHarnessApprovalView";
+const DECIDE_HARNESS_APPROVAL_RPC: &str = "LocalCommandGatewayService/DecideHarnessApproval";
+const ISSUE_HARNESS_APPROVAL_DECISION_COMMAND: &str = "issue_harness_approval_decision";
+const APPROVAL_DECISION_IDEMPOTENCY_SCOPE: &str = "approval-decision";
+const GUIDED_APPROVAL_IDEMPOTENCY_DOMAIN: &[u8] = b"egopulse/guided-approval/v1\0";
 const APPROVAL_WATCH_BASELINE_PAGE_SIZE: u32 = 100;
 const APPROVAL_WATCH_BASELINE_MAX_PAGES: usize = 100;
 const APPROVAL_WATCH_BASELINE_MAX_VIEWS: usize = 1_000;
@@ -52,6 +64,120 @@ const APPROVAL_WATCH_BASELINE_MAX_VIEWS: usize = 1_000;
 pub struct ClientAttachment {
     pub connection: LocalApiConnection,
     pub kernel: ClientKernel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuidedApprovalDecision {
+    AllowOnce,
+    Deny,
+    CancelAttempt,
+}
+
+impl GuidedApprovalDecision {
+    fn wire_value(self) -> i32 {
+        match self {
+            Self::AllowOnce => ApprovalDecision::AllowOnce as i32,
+            Self::Deny => ApprovalDecision::Deny as i32,
+            Self::CancelAttempt => ApprovalDecision::CancelAttempt as i32,
+        }
+    }
+
+    #[must_use]
+    pub fn contract_name(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "APPROVAL_DECISION_ALLOW_ONCE",
+            Self::Deny => "APPROVAL_DECISION_DENY",
+            Self::CancelAttempt => "APPROVAL_DECISION_CANCEL_ATTEMPT",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuidedApprovalDecisionInput {
+    pub approval_request_id: String,
+    pub decision: GuidedApprovalDecision,
+    pub reason_code: String,
+    pub confirmation_proof_ref: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum ClientGuidedApprovalDecisionError {
+    #[error("client kernel rejected the guided approval decision: {0}")]
+    Kernel(#[from] KernelError),
+    #[error("guided approval decision input is invalid: {0}")]
+    InvalidInput(&'static str),
+    #[error("the requested Harness approval was not found")]
+    NotFound,
+    #[error("the latest Harness approval is not actionable")]
+    NonActionable,
+    #[error("local API guided approval transport failed: {0}")]
+    Transport(String),
+    #[error("local API rejected the guided approval decision: {0:?}")]
+    Api(Box<LocalApiError>),
+    #[error("Policy Decision Authority rejected the guided approval decision")]
+    Authority {
+        error_code: i32,
+        safe_error_fingerprint: Option<String>,
+    },
+    #[error("guided approval protocol integrity failed: {0}")]
+    Protocol(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuidedApprovalDecisionResult {
+    authority: HarnessApprovalAuthorityResult,
+    await_token: Option<ProjectionAwaitToken>,
+    projection_warning: Option<LocalApiError>,
+    correlation_id: String,
+}
+
+impl GuidedApprovalDecisionResult {
+    #[must_use]
+    pub fn committed(&self) -> bool {
+        self.authority.committed
+    }
+
+    #[must_use]
+    pub fn replayed(&self) -> bool {
+        self.authority.replayed
+    }
+
+    #[must_use]
+    pub fn authority_decision_ref(&self) -> &str {
+        &self.authority.authority_decision_ref
+    }
+
+    #[must_use]
+    pub fn decision(&self) -> GuidedApprovalDecision {
+        match ApprovalDecision::try_from(self.authority.decision)
+            .expect("validated guided approval decision")
+        {
+            ApprovalDecision::AllowOnce => GuidedApprovalDecision::AllowOnce,
+            ApprovalDecision::Deny => GuidedApprovalDecision::Deny,
+            ApprovalDecision::CancelAttempt => GuidedApprovalDecision::CancelAttempt,
+            ApprovalDecision::Unspecified => unreachable!("validated guided approval decision"),
+        }
+    }
+
+    #[must_use]
+    pub fn state_revision(&self) -> u64 {
+        self.authority.state_revision
+    }
+
+    #[must_use]
+    pub fn await_token(&self) -> Option<&ProjectionAwaitToken> {
+        self.await_token.as_ref()
+    }
+
+    #[must_use]
+    pub fn projection_warning(&self) -> Option<&LocalApiError> {
+        self.projection_warning.as_ref()
+    }
+
+    #[must_use]
+    pub fn correlation_id(&self) -> &str {
+        &self.correlation_id
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -754,6 +880,34 @@ impl ClientAttachment {
         .await
     }
 
+    pub async fn decide_guided_approval(
+        &self,
+        input: GuidedApprovalDecisionInput,
+    ) -> Result<GuidedApprovalDecisionResult, ClientGuidedApprovalDecisionError> {
+        let mut read_client = self.connection.read_model_service();
+        let mut command_client = self.connection.command_gateway_service();
+        decide_guided_approval_via(
+            &self.kernel,
+            input,
+            SystemTime::now(),
+            move |request| async move {
+                read_client
+                    .get_harness_approval_view(request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| error.to_string())
+            },
+            move |request| async move {
+                command_client
+                    .decide_harness_approval(request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
     pub async fn open_approval_queue_from(
         &self,
         baseline: ApprovalQueueBaseline,
@@ -1057,6 +1211,232 @@ where
     Ok(ApprovalQueueBaseline {
         actionable,
         position,
+    })
+}
+
+async fn decide_guided_approval_via<Get, GetFuture, Decide, DecideFuture>(
+    kernel: &ClientKernel,
+    input: GuidedApprovalDecisionInput,
+    now: SystemTime,
+    get_latest: Get,
+    decide: Decide,
+) -> Result<GuidedApprovalDecisionResult, ClientGuidedApprovalDecisionError>
+where
+    Get: FnOnce(GetHarnessApprovalViewRequest) -> GetFuture,
+    GetFuture: Future<Output = Result<GetHarnessApprovalViewResponse, String>>,
+    Decide: FnOnce(DecideHarnessApprovalRequest) -> DecideFuture,
+    DecideFuture: Future<Output = Result<DecideHarnessApprovalResponse, String>>,
+{
+    if input.approval_request_id.trim().is_empty() {
+        return Err(ClientGuidedApprovalDecisionError::InvalidInput(
+            "approval request id missing",
+        ));
+    }
+    if input.reason_code.trim().is_empty() {
+        return Err(ClientGuidedApprovalDecisionError::InvalidInput(
+            "reason code missing",
+        ));
+    }
+    if input
+        .confirmation_proof_ref
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(ClientGuidedApprovalDecisionError::InvalidInput(
+            "confirmation proof reference empty",
+        ));
+    }
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel.profiles().authorize_rpc(
+        GET_HARNESS_APPROVAL_VIEW_RPC,
+        &session.granted_permission_codes,
+    )?;
+    kernel.profiles().authorize_command(
+        DECIDE_HARNESS_APPROVAL_RPC,
+        ISSUE_HARNESS_APPROVAL_DECISION_COMMAND,
+        &session.granted_permission_codes,
+    )?;
+
+    let read_metadata = kernel.request_metadata(Uuid::now_v7().to_string(), None, now)?;
+    let response = get_latest(GetHarnessApprovalViewRequest {
+        client: Some(read_metadata),
+        approval_request_id: input.approval_request_id.clone(),
+        minimum_position: None,
+    })
+    .await
+    .map_err(ClientGuidedApprovalDecisionError::Transport)?;
+    let view = match response.outcome {
+        Some(get_harness_approval_view_response::Outcome::View(view)) => view,
+        Some(get_harness_approval_view_response::Outcome::Error(error))
+            if error.code == egopulse_domain_contracts::v01::egopulse::localapi::v1::LocalApiErrorCode::NotFound as i32 =>
+        {
+            return Err(ClientGuidedApprovalDecisionError::NotFound);
+        }
+        Some(get_harness_approval_view_response::Outcome::Error(error)) => {
+            return Err(ClientGuidedApprovalDecisionError::Api(Box::new(error)));
+        }
+        None => {
+            return Err(ClientGuidedApprovalDecisionError::Protocol(
+                "approval view outcome missing",
+            ));
+        }
+    };
+    validate_guided_approval_view(&view, &input.approval_request_id)?;
+    if !is_actionable_approval(&view).map_err(|error| match error {
+        ClientApprovalWatchError::Kernel(error) => ClientGuidedApprovalDecisionError::Kernel(error),
+        ClientApprovalWatchError::Protocol(detail) => {
+            ClientGuidedApprovalDecisionError::Protocol(detail)
+        }
+        _ => ClientGuidedApprovalDecisionError::Protocol("approval actionability invalid"),
+    })? {
+        return Err(ClientGuidedApprovalDecisionError::NonActionable);
+    }
+
+    let correlation_id = Uuid::now_v7().to_string();
+    let mut command = PolicyDecisionCommand {
+        command: Some(
+            policy_decision_command::Command::IssueHarnessApprovalDecision(
+                IssueHarnessApprovalDecisionCommand {
+                    metadata: Some(CommandMetadata {
+                        command_id: Uuid::now_v7().to_string(),
+                        idempotency_key: guided_approval_idempotency_key(
+                            &input.approval_request_id,
+                        ),
+                        idempotency_scope: APPROVAL_DECISION_IDEMPOTENCY_SCOPE.to_owned(),
+                        request_digest_sha256: String::new(),
+                        issued_at: Some(timestamp_from_system_time(now)?),
+                        correlation_id: correlation_id.clone(),
+                        causation_id: None,
+                    }),
+                    approval_request_id: view.approval_request_id,
+                    expected_action_digest_sha256: view.action_digest_sha256,
+                    expected_request_observation_id: view.request_observation_id,
+                    expected_request_observation_sequence: view.request_observation_sequence,
+                    decision: input.decision.wire_value(),
+                    reason_code: input.reason_code,
+                    confirmation_proof_ref: input.confirmation_proof_ref,
+                    expected_request_revision: view.request_revision,
+                },
+            ),
+        ),
+    };
+    set_policy_digest(&mut command);
+    let policy_decision_command::Command::IssueHarnessApprovalDecision(command) =
+        command.command.expect("guided approval command")
+    else {
+        unreachable!("guided approval constructs the issue branch")
+    };
+    let response = decide(DecideHarnessApprovalRequest {
+        client: Some(kernel.request_metadata(
+            Uuid::now_v7().to_string(),
+            Some(correlation_id.clone()),
+            now,
+        )?),
+        command: Some(command),
+    })
+    .await
+    .map_err(ClientGuidedApprovalDecisionError::Transport)?;
+    parse_guided_approval_response(response, input.decision, correlation_id)
+}
+
+fn guided_approval_idempotency_key(approval_request_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(GUIDED_APPROVAL_IDEMPOTENCY_DOMAIN);
+    hasher.update(approval_request_id.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn validate_guided_approval_view(
+    view: &HarnessApprovalView,
+    expected_approval_request_id: &str,
+) -> Result<(), ClientGuidedApprovalDecisionError> {
+    if view.approval_request_id != expected_approval_request_id
+        || !is_canonical_sha256(&view.action_digest_sha256)
+        || view.request_observation_id.is_empty()
+        || view.request_observation_sequence == 0
+        || view.request_revision == 0
+    {
+        return Err(ClientGuidedApprovalDecisionError::Protocol(
+            "approval view binding invalid",
+        ));
+    }
+    let position = view
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.position.clone())
+        .ok_or(ClientGuidedApprovalDecisionError::Protocol(
+            "approval view position missing",
+        ))?;
+    SnapshotStreamTracker::default().apply_harness_approval_frame(
+        &HarnessApprovalViewStreamFrame {
+            kind: StreamFrameKind::Snapshot as i32,
+            position: Some(position),
+            snapshot: Some(view.clone()),
+            reset_reason_code: None,
+        },
+    )?;
+    Ok(())
+}
+
+#[allow(deprecated)]
+fn parse_guided_approval_response(
+    response: DecideHarnessApprovalResponse,
+    expected_decision: GuidedApprovalDecision,
+    correlation_id: String,
+) -> Result<GuidedApprovalDecisionResult, ClientGuidedApprovalDecisionError> {
+    if response.policy_authority_result.is_some() {
+        return Err(ClientGuidedApprovalDecisionError::Protocol(
+            "unsanitized authority result exposed",
+        ));
+    }
+    let Some(authority) = response.sanitized_authority_result else {
+        return match response.gateway_error {
+            Some(error) => Err(ClientGuidedApprovalDecisionError::Api(Box::new(error))),
+            None => Err(ClientGuidedApprovalDecisionError::Protocol(
+                "sanitized approval result missing",
+            )),
+        };
+    };
+    let error_code = PolicyDecisionErrorCode::try_from(authority.error_code)
+        .map_err(|_| ClientGuidedApprovalDecisionError::Protocol("authority error code unknown"))?;
+    if error_code != PolicyDecisionErrorCode::Unspecified {
+        return Err(ClientGuidedApprovalDecisionError::Authority {
+            error_code: authority.error_code,
+            safe_error_fingerprint: authority.safe_error_fingerprint,
+        });
+    }
+    let decision = ApprovalDecision::try_from(authority.decision)
+        .map_err(|_| ClientGuidedApprovalDecisionError::Protocol("authority decision unknown"))?;
+    let state = HarnessApprovalDecisionStateKind::try_from(authority.state)
+        .map_err(|_| ClientGuidedApprovalDecisionError::Protocol("authority state unknown"))?;
+    if !authority.committed
+        || authority.authority_decision_ref.is_empty()
+        || decision == ApprovalDecision::Unspecified
+        || authority.decision != expected_decision.wire_value()
+        || state != HarnessApprovalDecisionStateKind::Issued
+        || authority.state_revision == 0
+    {
+        return Err(ClientGuidedApprovalDecisionError::Protocol(
+            "sanitized approval result invalid",
+        ));
+    }
+    Ok(GuidedApprovalDecisionResult {
+        authority,
+        await_token: response.await_token,
+        projection_warning: response.gateway_error,
+        correlation_id,
+    })
+}
+
+fn timestamp_from_system_time(
+    value: SystemTime,
+) -> Result<Timestamp, ClientGuidedApprovalDecisionError> {
+    let duration = value.duration_since(std::time::UNIX_EPOCH).map_err(|_| {
+        ClientGuidedApprovalDecisionError::Protocol("client clock before Unix epoch")
+    })?;
+    Ok(Timestamp {
+        seconds: duration.as_secs() as i64,
+        nanos: duration.subsec_nanos() as i32,
     })
 }
 
@@ -1631,6 +2011,22 @@ mod tests {
         surface: ClientSurface,
         now: SystemTime,
     ) -> ClientKernel {
+        authenticated_kernel_with_permissions(
+            principal_id,
+            session_id,
+            &[permission_code],
+            surface,
+            now,
+        )
+    }
+
+    fn authenticated_kernel_with_permissions(
+        principal_id: &str,
+        session_id: &str,
+        permission_codes: &[&str],
+        surface: ClientSurface,
+        now: SystemTime,
+    ) -> ClientKernel {
         let expires_at = now
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("test clock after epoch")
@@ -1643,7 +2039,10 @@ mod tests {
                     session_id: session_id.to_owned(),
                     authenticated_principal_id: principal_id.to_owned(),
                     negotiated_contract_ref: Some(api_contract_ref()),
-                    granted_permission_codes: vec![permission_code.to_owned()],
+                    granted_permission_codes: permission_codes
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect(),
                     expires_at: Some(Timestamp {
                         seconds: expires_at.as_secs() as i64,
                         nanos: expires_at.subsec_nanos() as i32,
@@ -1774,6 +2173,88 @@ mod tests {
             snapshot_position: Some(position.clone()),
             error: None,
         }
+    }
+
+    fn guided_approval_input(decision: GuidedApprovalDecision) -> GuidedApprovalDecisionInput {
+        GuidedApprovalDecisionInput {
+            approval_request_id: "approval:guided:1".to_owned(),
+            decision,
+            reason_code: "  founder-reviewed  ".to_owned(),
+            confirmation_proof_ref: Some("proof:approval:1".to_owned()),
+        }
+    }
+
+    fn local_api_error(code: LocalApiErrorCode) -> LocalApiError {
+        LocalApiError {
+            code: code as i32,
+            safe_fingerprint: "approval/guided/test/v1".to_owned(),
+            retryable: false,
+            required_action_code: Some("REFRESH_APPROVAL".to_owned()),
+            current_position: None,
+            correlation_id: "correlation:approval:guided".to_owned(),
+        }
+    }
+
+    #[allow(deprecated)]
+    fn guided_approval_response(
+        decision: GuidedApprovalDecision,
+        replayed: bool,
+        gateway_error: Option<LocalApiError>,
+    ) -> DecideHarnessApprovalResponse {
+        DecideHarnessApprovalResponse {
+            await_token: None,
+            gateway_error,
+            policy_authority_result: None,
+            sanitized_authority_result: Some(HarnessApprovalAuthorityResult {
+                committed: true,
+                replayed,
+                authority_decision_ref: "policy-decision:guided:1".to_owned(),
+                decision: decision.wire_value(),
+                state: HarnessApprovalDecisionStateKind::Issued as i32,
+                state_revision: 1,
+                expires_at: None,
+                error_code: PolicyDecisionErrorCode::Unspecified as i32,
+                safe_error_fingerprint: None,
+            }),
+        }
+    }
+
+    fn sealed_guided_approval_command(
+        kernel: &ClientKernel,
+        position: &ProjectionPosition,
+        input: GuidedApprovalDecisionInput,
+        now: SystemTime,
+    ) -> IssueHarnessApprovalDecisionCommand {
+        use std::cell::RefCell;
+
+        let decision = input.decision;
+        let request = RefCell::new(None);
+        block_on_ready(decide_guided_approval_via(
+            kernel,
+            input,
+            now,
+            |_request| {
+                std::future::ready(Ok(GetHarnessApprovalViewResponse {
+                    outcome: Some(get_harness_approval_view_response::Outcome::View(
+                        approval_view(
+                            "approval:guided:1",
+                            position,
+                            Some(AvailableActionKind::DecideHarnessApproval as i32),
+                        ),
+                    )),
+                }))
+            },
+            |value| {
+                request.replace(Some(value));
+                std::future::ready(Ok(guided_approval_response(decision, false, None)))
+            },
+        ))
+        .expect("guided approval command");
+        request
+            .into_inner()
+            .expect("Decide request")
+            .command
+            .expect("sealed command")
     }
 
     fn block_on_ready<F: Future>(future: F) -> F::Output {
@@ -2583,6 +3064,473 @@ mod tests {
         assert!(matches!(
             compile_approval_baseline(pages),
             Err(ClientApprovalWatchError::BaselineLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn guided_approval_reads_latest_view_and_seals_all_three_decisions() {
+        use std::cell::RefCell;
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(13_000);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-approval",
+            "session:guided-approval",
+            &["local.approval.read", "local.approval.decide"],
+            ClientSurface::Cli,
+            now,
+        );
+        let position = approval_position(12);
+        for (decision, replayed) in [
+            (GuidedApprovalDecision::AllowOnce, false),
+            (GuidedApprovalDecision::Deny, false),
+            (GuidedApprovalDecision::CancelAttempt, true),
+        ] {
+            let get_request = RefCell::new(None);
+            let decide_request = RefCell::new(None);
+            let warning = (decision == GuidedApprovalDecision::CancelAttempt)
+                .then(|| local_api_error(LocalApiErrorCode::ProjectionBehind));
+            let result = block_on_ready(decide_guided_approval_via(
+                &kernel,
+                guided_approval_input(decision),
+                now,
+                |request| {
+                    get_request.replace(Some(request));
+                    std::future::ready(Ok(GetHarnessApprovalViewResponse {
+                        outcome: Some(get_harness_approval_view_response::Outcome::View(
+                            approval_view(
+                                "approval:guided:1",
+                                &position,
+                                Some(AvailableActionKind::DecideHarnessApproval as i32),
+                            ),
+                        )),
+                    }))
+                },
+                |request| {
+                    decide_request.replace(Some(request));
+                    std::future::ready(Ok(guided_approval_response(
+                        decision,
+                        replayed,
+                        warning.clone(),
+                    )))
+                },
+            ))
+            .expect("guided approval decision");
+            assert!(result.committed());
+            assert_eq!(result.replayed(), replayed);
+            assert_eq!(result.decision(), decision);
+            assert_eq!(result.authority_decision_ref(), "policy-decision:guided:1");
+            assert_eq!(result.projection_warning(), warning.as_ref());
+
+            let get = get_request.into_inner().expect("Get request");
+            assert_eq!(get.approval_request_id, "approval:guided:1");
+            assert!(get.minimum_position.is_none());
+            let request = decide_request.into_inner().expect("Decide request");
+            let client = request.client.expect("command client metadata");
+            assert_eq!(client.session_id, "session:guided-approval");
+            assert_eq!(
+                client.correlation_id.as_deref(),
+                Some(result.correlation_id())
+            );
+            let command = request.command.expect("sealed approval command");
+            assert_eq!(command.approval_request_id, "approval:guided:1");
+            assert_eq!(command.expected_action_digest_sha256, "b".repeat(64));
+            assert_eq!(
+                command.expected_request_observation_id,
+                "observation:approval:guided:1"
+            );
+            assert_eq!(command.expected_request_observation_sequence, 1);
+            assert_eq!(command.expected_request_revision, 1);
+            assert_eq!(command.decision, decision.wire_value());
+            assert_eq!(command.reason_code, "  founder-reviewed  ");
+            assert_eq!(
+                command.confirmation_proof_ref.as_deref(),
+                Some("proof:approval:1")
+            );
+            let sealed_digest = command
+                .metadata
+                .as_ref()
+                .expect("command metadata")
+                .request_digest_sha256
+                .clone();
+            assert!(is_canonical_sha256(&sealed_digest));
+            let mut wrapped = PolicyDecisionCommand {
+                command: Some(
+                    policy_decision_command::Command::IssueHarnessApprovalDecision(command),
+                ),
+            };
+            set_policy_digest(&mut wrapped);
+            let policy_decision_command::Command::IssueHarnessApprovalDecision(recomputed) =
+                wrapped.command.expect("issue command")
+            else {
+                unreachable!("test command branch")
+            };
+            assert_eq!(
+                recomputed
+                    .metadata
+                    .expect("recomputed metadata")
+                    .request_digest_sha256,
+                sealed_digest
+            );
+        }
+    }
+
+    #[test]
+    fn guided_approval_uses_stable_idempotency_and_semantic_digest() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(13_500);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-idempotency",
+            "session:guided-idempotency",
+            &["local.approval.read", "local.approval.decide"],
+            ClientSurface::Cli,
+            now,
+        );
+        let position = approval_position(13);
+        let base = guided_approval_input(GuidedApprovalDecision::AllowOnce);
+        let first = sealed_guided_approval_command(&kernel, &position, base.clone(), now);
+        let replay = sealed_guided_approval_command(
+            &kernel,
+            &position,
+            base.clone(),
+            now + Duration::from_secs(1),
+        );
+        let changed_decision = sealed_guided_approval_command(
+            &kernel,
+            &position,
+            GuidedApprovalDecisionInput {
+                decision: GuidedApprovalDecision::Deny,
+                ..base.clone()
+            },
+            now + Duration::from_secs(2),
+        );
+        let changed_reason = sealed_guided_approval_command(
+            &kernel,
+            &position,
+            GuidedApprovalDecisionInput {
+                reason_code: "founder-reconsidered".to_owned(),
+                ..base
+            },
+            now + Duration::from_secs(3),
+        );
+
+        fn metadata(command: &IssueHarnessApprovalDecisionCommand) -> &CommandMetadata {
+            command.metadata.as_ref().expect("command metadata")
+        }
+        assert_eq!(
+            metadata(&first).idempotency_key,
+            guided_approval_idempotency_key("approval:guided:1")
+        );
+        assert_eq!(
+            metadata(&first).idempotency_key,
+            metadata(&replay).idempotency_key
+        );
+        assert_eq!(
+            metadata(&first).request_digest_sha256,
+            metadata(&replay).request_digest_sha256
+        );
+        assert_ne!(metadata(&first).command_id, metadata(&replay).command_id);
+        for changed in [&changed_decision, &changed_reason] {
+            assert_eq!(
+                metadata(&first).idempotency_key,
+                metadata(changed).idempotency_key
+            );
+            assert_ne!(
+                metadata(&first).request_digest_sha256,
+                metadata(changed).request_digest_sha256
+            );
+        }
+    }
+
+    #[test]
+    fn guided_approval_preflights_both_permissions_and_input_before_rpc() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(14_000);
+        for permissions in [&["local.approval.read"][..], &["local.approval.decide"][..]] {
+            let kernel = authenticated_kernel_with_permissions(
+                "founder:guided-denied",
+                "session:guided-denied",
+                permissions,
+                ClientSurface::Cli,
+                now,
+            );
+            let gets = Cell::new(0_u64);
+            let decisions = Cell::new(0_u64);
+            let result = block_on_ready(decide_guided_approval_via(
+                &kernel,
+                guided_approval_input(GuidedApprovalDecision::Deny),
+                now,
+                |_request| {
+                    gets.set(gets.get() + 1);
+                    std::future::ready(Err("must-not-get".to_owned()))
+                },
+                |_request| {
+                    decisions.set(decisions.get() + 1);
+                    std::future::ready(Err("must-not-decide".to_owned()))
+                },
+            ));
+            assert!(matches!(
+                result,
+                Err(ClientGuidedApprovalDecisionError::Kernel(
+                    KernelError::PermissionDenied(_)
+                ))
+            ));
+            assert_eq!(gets.get(), 0);
+            assert_eq!(decisions.get(), 0);
+        }
+
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-invalid",
+            "session:guided-invalid",
+            &["local.approval.read", "local.approval.decide"],
+            ClientSurface::Cli,
+            now,
+        );
+        for input in [
+            GuidedApprovalDecisionInput {
+                approval_request_id: " \t ".to_owned(),
+                ..guided_approval_input(GuidedApprovalDecision::AllowOnce)
+            },
+            GuidedApprovalDecisionInput {
+                reason_code: " \t ".to_owned(),
+                ..guided_approval_input(GuidedApprovalDecision::AllowOnce)
+            },
+            GuidedApprovalDecisionInput {
+                confirmation_proof_ref: Some("  ".to_owned()),
+                ..guided_approval_input(GuidedApprovalDecision::AllowOnce)
+            },
+        ] {
+            let gets = Cell::new(0_u64);
+            let decisions = Cell::new(0_u64);
+            assert!(matches!(
+                block_on_ready(decide_guided_approval_via(
+                    &kernel,
+                    input,
+                    now,
+                    |_request| {
+                        gets.set(gets.get() + 1);
+                        std::future::ready(Err("must-not-get".to_owned()))
+                    },
+                    |_request| {
+                        decisions.set(decisions.get() + 1);
+                        std::future::ready(Err("must-not-decide".to_owned()))
+                    },
+                )),
+                Err(ClientGuidedApprovalDecisionError::InvalidInput(_))
+            ));
+            assert_eq!(gets.get(), 0);
+            assert_eq!(decisions.get(), 0);
+        }
+    }
+
+    #[test]
+    fn guided_approval_rejects_missing_non_actionable_and_mismatched_latest_views() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(15_000);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-view",
+            "session:guided-view",
+            &["local.approval.read", "local.approval.decide"],
+            ClientSurface::Cli,
+            now,
+        );
+        let position = approval_position(15);
+        let decisions = Cell::new(0_u64);
+        let not_found = block_on_ready(decide_guided_approval_via(
+            &kernel,
+            guided_approval_input(GuidedApprovalDecision::Deny),
+            now,
+            |_request| {
+                std::future::ready(Ok(GetHarnessApprovalViewResponse {
+                    outcome: Some(get_harness_approval_view_response::Outcome::Error(
+                        local_api_error(LocalApiErrorCode::NotFound),
+                    )),
+                }))
+            },
+            |_request| {
+                decisions.set(decisions.get() + 1);
+                std::future::ready(Err("must-not-decide".to_owned()))
+            },
+        ));
+        assert!(matches!(
+            not_found,
+            Err(ClientGuidedApprovalDecisionError::NotFound)
+        ));
+
+        let non_actionable = block_on_ready(decide_guided_approval_via(
+            &kernel,
+            guided_approval_input(GuidedApprovalDecision::Deny),
+            now,
+            |_request| {
+                std::future::ready(Ok(GetHarnessApprovalViewResponse {
+                    outcome: Some(get_harness_approval_view_response::Outcome::View(
+                        approval_view("approval:guided:1", &position, None),
+                    )),
+                }))
+            },
+            |_request| {
+                decisions.set(decisions.get() + 1);
+                std::future::ready(Err("must-not-decide".to_owned()))
+            },
+        ));
+        assert!(matches!(
+            non_actionable,
+            Err(ClientGuidedApprovalDecisionError::NonActionable)
+        ));
+
+        let mismatch = block_on_ready(decide_guided_approval_via(
+            &kernel,
+            guided_approval_input(GuidedApprovalDecision::Deny),
+            now,
+            |_request| {
+                std::future::ready(Ok(GetHarnessApprovalViewResponse {
+                    outcome: Some(get_harness_approval_view_response::Outcome::View(
+                        approval_view(
+                            "approval:different",
+                            &position,
+                            Some(AvailableActionKind::DecideHarnessApproval as i32),
+                        ),
+                    )),
+                }))
+            },
+            |_request| {
+                decisions.set(decisions.get() + 1);
+                std::future::ready(Err("must-not-decide".to_owned()))
+            },
+        ));
+        assert!(matches!(
+            mismatch,
+            Err(ClientGuidedApprovalDecisionError::Protocol(
+                "approval view binding invalid"
+            ))
+        ));
+        assert_eq!(decisions.get(), 0);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn guided_approval_preserves_api_authority_transport_and_protocol_failures() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(16_000);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-failures",
+            "session:guided-failures",
+            &["local.approval.read", "local.approval.decide"],
+            ClientSurface::Cli,
+            now,
+        );
+        let position = approval_position(16);
+        let latest = || GetHarnessApprovalViewResponse {
+            outcome: Some(get_harness_approval_view_response::Outcome::View(
+                approval_view(
+                    "approval:guided:1",
+                    &position,
+                    Some(AvailableActionKind::DecideHarnessApproval as i32),
+                ),
+            )),
+        };
+
+        let api = block_on_ready(decide_guided_approval_via(
+            &kernel,
+            guided_approval_input(GuidedApprovalDecision::AllowOnce),
+            now,
+            |_request| {
+                std::future::ready(Ok(GetHarnessApprovalViewResponse {
+                    outcome: Some(get_harness_approval_view_response::Outcome::Error(
+                        local_api_error(LocalApiErrorCode::ProjectionBehind),
+                    )),
+                }))
+            },
+            |_request| std::future::ready(Err("must-not-decide".to_owned())),
+        ));
+        assert!(matches!(
+            api,
+            Err(ClientGuidedApprovalDecisionError::Api(_))
+        ));
+
+        let get_transport = block_on_ready(decide_guided_approval_via(
+            &kernel,
+            guided_approval_input(GuidedApprovalDecision::AllowOnce),
+            now,
+            |_request| std::future::ready(Err("get-status".to_owned())),
+            |_request| std::future::ready(Err("must-not-decide".to_owned())),
+        ));
+        assert!(matches!(
+            get_transport,
+            Err(ClientGuidedApprovalDecisionError::Transport(detail)) if detail == "get-status"
+        ));
+
+        let decide_transport = block_on_ready(decide_guided_approval_via(
+            &kernel,
+            guided_approval_input(GuidedApprovalDecision::AllowOnce),
+            now,
+            |_request| std::future::ready(Ok(latest())),
+            |_request| std::future::ready(Err("decide-status".to_owned())),
+        ));
+        assert!(matches!(
+            decide_transport,
+            Err(ClientGuidedApprovalDecisionError::Transport(detail)) if detail == "decide-status"
+        ));
+
+        let mut authority_failure =
+            guided_approval_response(GuidedApprovalDecision::AllowOnce, false, None);
+        let authority = authority_failure
+            .sanitized_authority_result
+            .as_mut()
+            .expect("sanitized result");
+        authority.committed = false;
+        authority.error_code = PolicyDecisionErrorCode::RevisionConflict as i32;
+        authority.safe_error_fingerprint = Some("approval/revision-conflict/v1".to_owned());
+        let authority = block_on_ready(decide_guided_approval_via(
+            &kernel,
+            guided_approval_input(GuidedApprovalDecision::AllowOnce),
+            now,
+            |_request| std::future::ready(Ok(latest())),
+            |_request| std::future::ready(Ok(authority_failure)),
+        ));
+        assert!(matches!(
+            authority,
+            Err(ClientGuidedApprovalDecisionError::Authority {
+                error_code,
+                ..
+            }) if error_code == PolicyDecisionErrorCode::RevisionConflict as i32
+        ));
+
+        let protocol = block_on_ready(decide_guided_approval_via(
+            &kernel,
+            guided_approval_input(GuidedApprovalDecision::AllowOnce),
+            now,
+            |_request| std::future::ready(Ok(latest())),
+            |_request| {
+                std::future::ready(Ok(DecideHarnessApprovalResponse {
+                    await_token: None,
+                    gateway_error: None,
+                    policy_authority_result: None,
+                    sanitized_authority_result: None,
+                }))
+            },
+        ));
+        assert!(matches!(
+            protocol,
+            Err(ClientGuidedApprovalDecisionError::Protocol(
+                "sanitized approval result missing"
+            ))
+        ));
+
+        let mut wrong_state =
+            guided_approval_response(GuidedApprovalDecision::AllowOnce, false, None);
+        wrong_state
+            .sanitized_authority_result
+            .as_mut()
+            .expect("sanitized result")
+            .state = HarnessApprovalDecisionStateKind::Revoked as i32;
+        let wrong_state = block_on_ready(decide_guided_approval_via(
+            &kernel,
+            guided_approval_input(GuidedApprovalDecision::AllowOnce),
+            now,
+            |_request| std::future::ready(Ok(latest())),
+            |_request| std::future::ready(Ok(wrong_state)),
+        ));
+        assert!(matches!(
+            wrong_state,
+            Err(ClientGuidedApprovalDecisionError::Protocol(
+                "sanitized approval result invalid"
+            ))
         ));
     }
 
