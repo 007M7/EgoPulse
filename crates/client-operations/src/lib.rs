@@ -17,6 +17,10 @@ pub use governed_state::{
     GovernedStateComposite, GovernedStateDomain, GovernedStateDomainPhase, GovernedStateReason,
     GovernedTaskDomainPosition, GovernedTaskDomainState,
 };
+pub use governed_state_driver::{
+    GovernedStateSession, GovernedStateSessionStartError, GovernedStateShutdown,
+    GovernedStateUpdate,
+};
 
 use std::{
     collections::{BTreeMap, BTreeSet},

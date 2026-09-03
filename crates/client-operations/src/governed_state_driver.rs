@@ -389,6 +389,200 @@ impl GovernedStateUpdate {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GovernedStateSessionStartError {
+    RuntimeUnavailable,
+}
+
+impl std::fmt::Display for GovernedStateSessionStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RuntimeUnavailable => formatter.write_str("governed state runtime unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for GovernedStateSessionStartError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GovernedStateShutdown {
+    _private: (),
+}
+
+pub struct GovernedStateSession {
+    core: GovernedStateSessionCore,
+    cancellation: watch::Sender<bool>,
+    task_worker: Option<tokio::task::JoinHandle<WorkerExit>>,
+    approval_worker: Option<tokio::task::JoinHandle<WorkerExit>>,
+}
+
+impl GovernedStateSession {
+    #[must_use]
+    pub fn state(&self) -> &GovernedStateComposite {
+        self.core.state()
+    }
+
+    pub async fn next_update(&mut self) -> Option<GovernedStateUpdate> {
+        loop {
+            if self
+                .task_worker
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                if let Some(worker) = self.task_worker.take()
+                    && let Some(update) =
+                        self.settle_worker(GovernedStateDomain::Task, worker.await)
+                {
+                    return Some(update);
+                }
+                continue;
+            }
+            if self
+                .approval_worker
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                if let Some(worker) = self.approval_worker.take()
+                    && let Some(update) =
+                        self.settle_worker(GovernedStateDomain::Approval, worker.await)
+                {
+                    return Some(update);
+                }
+                continue;
+            }
+
+            let event = if self.core.is_exhausted() {
+                match (self.task_worker.as_mut(), self.approval_worker.as_mut()) {
+                    (Some(task_worker), Some(approval_worker)) => {
+                        tokio::select! {
+                            biased;
+                            result = task_worker => SessionEvent::Task(result),
+                            result = approval_worker => SessionEvent::Approval(result),
+                        }
+                    }
+                    (Some(task_worker), None) => SessionEvent::Task(task_worker.await),
+                    (None, Some(approval_worker)) => SessionEvent::Approval(approval_worker.await),
+                    (None, None) => return None,
+                }
+            } else {
+                match (self.task_worker.as_mut(), self.approval_worker.as_mut()) {
+                    (Some(task_worker), Some(approval_worker)) => {
+                        tokio::select! {
+                            biased;
+                            update = self.core.next_update() => SessionEvent::Core(update),
+                            result = task_worker => SessionEvent::Task(result),
+                            result = approval_worker => SessionEvent::Approval(result),
+                        }
+                    }
+                    (Some(task_worker), None) => {
+                        tokio::select! {
+                            biased;
+                            update = self.core.next_update() => SessionEvent::Core(update),
+                            result = task_worker => SessionEvent::Task(result),
+                        }
+                    }
+                    (None, Some(approval_worker)) => {
+                        tokio::select! {
+                            biased;
+                            update = self.core.next_update() => SessionEvent::Core(update),
+                            result = approval_worker => SessionEvent::Approval(result),
+                        }
+                    }
+                    (None, None) => SessionEvent::Core(self.core.next_update().await),
+                }
+            };
+
+            match event {
+                SessionEvent::Core(Some(update)) => return Some(update),
+                SessionEvent::Core(None) => {
+                    if self.task_worker.is_none() && self.approval_worker.is_none() {
+                        return None;
+                    }
+                }
+                SessionEvent::Task(result) => {
+                    self.task_worker = None;
+                    if let Some(update) = self.settle_worker(GovernedStateDomain::Task, result) {
+                        return Some(update);
+                    }
+                }
+                SessionEvent::Approval(result) => {
+                    self.approval_worker = None;
+                    if let Some(update) = self.settle_worker(GovernedStateDomain::Approval, result)
+                    {
+                        return Some(update);
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn shutdown(mut self) -> GovernedStateShutdown {
+        let _ = self.cancellation.send(true);
+        let joined = tokio::time::timeout(Duration::from_secs(2), async {
+            match (&mut self.task_worker, &mut self.approval_worker) {
+                (Some(task_worker), Some(approval_worker)) => {
+                    let _ = tokio::join!(task_worker, approval_worker);
+                }
+                (Some(task_worker), None) => {
+                    let _ = task_worker.await;
+                }
+                (None, Some(approval_worker)) => {
+                    let _ = approval_worker.await;
+                }
+                (None, None) => {}
+            }
+        })
+        .await
+        .is_ok();
+
+        if !joined {
+            if let Some(worker) = self.task_worker.as_ref() {
+                worker.abort();
+            }
+            if let Some(worker) = self.approval_worker.as_ref() {
+                worker.abort();
+            }
+        }
+        self.task_worker = None;
+        self.approval_worker = None;
+        GovernedStateShutdown { _private: () }
+    }
+
+    fn settle_worker(
+        &mut self,
+        domain: GovernedStateDomain,
+        result: Result<WorkerExit, tokio::task::JoinError>,
+    ) -> Option<GovernedStateUpdate> {
+        match result {
+            Ok(WorkerExit::DomainFatal) => None,
+            Ok(
+                WorkerExit::Cancelled
+                | WorkerExit::RequestChannelClosed
+                | WorkerExit::AcknowledgementLost,
+            )
+            | Err(_) => Some(self.core.apply_supervisor_integrity_failure(domain)),
+        }
+    }
+}
+
+impl Drop for GovernedStateSession {
+    fn drop(&mut self) {
+        let _ = self.cancellation.send(true);
+        if let Some(worker) = self.task_worker.as_ref() {
+            worker.abort();
+        }
+        if let Some(worker) = self.approval_worker.as_ref() {
+            worker.abort();
+        }
+    }
+}
+
+enum SessionEvent {
+    Core(Option<GovernedStateUpdate>),
+    Task(Result<WorkerExit, tokio::task::JoinError>),
+    Approval(Result<WorkerExit, tokio::task::JoinError>),
+}
+
 enum ReadyRequest {
     Task(TaskRequest),
     Approval(ApprovalRequest),
@@ -439,6 +633,10 @@ impl GovernedStateSessionCore {
 
     fn state(&self) -> &GovernedStateComposite {
         &self.state
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.task_closed && self.approval_closed
     }
 
     async fn next_update(&mut self) -> Option<GovernedStateUpdate> {
@@ -557,6 +755,30 @@ impl GovernedStateSessionCore {
             }
         }
     }
+
+    fn apply_supervisor_integrity_failure(
+        &mut self,
+        domain: GovernedStateDomain,
+    ) -> GovernedStateUpdate {
+        match domain {
+            GovernedStateDomain::Task => {
+                let generation = self.state.task().generation();
+                self.state.apply_task(GovernedTaskReducerInput::Fatal {
+                    generation,
+                    cause: GovernedFatalCause::ProjectionIntegrityFailure,
+                });
+            }
+            GovernedStateDomain::Approval => {
+                let generation = self.state.approval().generation();
+                self.state
+                    .apply_approval(GovernedApprovalReducerInput::Fatal {
+                        generation,
+                        cause: GovernedFatalCause::ProjectionIntegrityFailure,
+                    });
+            }
+        }
+        GovernedStateUpdate { domain }
+    }
 }
 
 struct GovernedStateSources {
@@ -573,6 +795,34 @@ impl GovernedStateSources {
                 attachment: approval,
             },
         }
+    }
+}
+
+impl ClientAttachment {
+    pub fn start_governed_state_session(
+        self: &Arc<Self>,
+    ) -> Result<GovernedStateSession, GovernedStateSessionStartError> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| GovernedStateSessionStartError::RuntimeUnavailable)?;
+        let (core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+        let (cancellation, cancellation_receiver) = watch::channel(false);
+        let GovernedStateSources {
+            mut task,
+            mut approval,
+        } = GovernedStateSources::new(Arc::clone(self));
+        let task_cancellation = cancellation_receiver.clone();
+        let task_worker = runtime
+            .spawn(async move { run_task_worker(&mut task, task_sender, task_cancellation).await });
+        let approval_worker = runtime.spawn(async move {
+            run_approval_worker(&mut approval, approval_sender, cancellation_receiver).await
+        });
+
+        Ok(GovernedStateSession {
+            core,
+            cancellation,
+            task_worker: Some(task_worker),
+            approval_worker: Some(approval_worker),
+        })
     }
 }
 
