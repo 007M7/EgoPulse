@@ -4350,6 +4350,23 @@ async fn run_bounded_fixture_command(
     arguments: &[&str],
     label: &str,
 ) -> std::process::Output {
+    run_bounded_fixture_command_with_timeout(
+        executable,
+        instance,
+        arguments,
+        label,
+        R9A3D_IO_TIMEOUT,
+    )
+    .await
+}
+
+async fn run_bounded_fixture_command_with_timeout(
+    executable: PathBuf,
+    instance: &str,
+    arguments: &[&str],
+    label: &str,
+    wait: Duration,
+) -> std::process::Output {
     let mut command = Command::new(executable);
     command
         .env("EGOPULSE_IPC_INSTANCE", instance)
@@ -4377,7 +4394,7 @@ async fn run_bounded_fixture_command(
         let mut bytes = Vec::new();
         stderr.read_to_end(&mut bytes).await.map(|_| bytes)
     });
-    let status = match timeout(R9A3D_IO_TIMEOUT, child.wait()).await {
+    let status = match timeout(wait, child.wait()).await {
         Ok(result) => result.unwrap_or_else(|error| panic!("wait for {label}: {error}")),
         Err(_) => {
             child
@@ -9563,12 +9580,36 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
         String::from_utf8_lossy(&task_watch.stdout),
         String::from_utf8_lossy(&task_watch.stderr)
     );
-    let task_watch_json: serde_json::Value =
-        serde_json::from_slice(&task_watch.stdout).expect("Task watch JSON envelope");
-    assert_eq!(task_watch_json["operation"], "task.watch");
+    let task_watch_stdout = String::from_utf8(task_watch.stdout).expect("Task watch UTF-8");
+    let task_watch_envelopes: Vec<serde_json::Value> = task_watch_stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("Task watch NDJSON envelope"))
+        .collect();
     assert_eq!(
-        task_watch_json["data"]["kind"],
-        "STREAM_FRAME_KIND_HEARTBEAT"
+        task_watch_envelopes.len(),
+        2,
+        "Task watch must emit exactly one baseline and one live envelope: {task_watch_stdout}"
+    );
+    assert_eq!(task_watch_envelopes[0]["operation"], "task.watch");
+    assert_eq!(
+        task_watch_envelopes[0]["streamSchema"],
+        "egopulse.cli.task-watch/v1"
+    );
+    assert_eq!(task_watch_envelopes[0]["data"]["kind"], "baseline");
+    assert_eq!(task_watch_envelopes[1]["operation"], "task.watch");
+    assert_eq!(
+        task_watch_envelopes[1]["streamSchema"],
+        "egopulse.cli.task-watch/v1"
+    );
+    assert_eq!(task_watch_envelopes[1]["data"]["kind"], "update");
+    assert_eq!(
+        task_watch_envelopes[1]["data"]["classification"],
+        "heartbeat"
+    );
+    assert!(
+        task_watch_envelopes[1]["data"]["task"].is_null(),
+        "heartbeat update must not carry Task facts"
     );
 
     let approval_watch =
