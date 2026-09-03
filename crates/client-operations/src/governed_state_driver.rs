@@ -1,7 +1,10 @@
 use egopulse_client_kernel::KernelError;
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::LocalApiErrorCode;
 
-use crate::governed_state::{GovernedFatalCause, GovernedRecoverableCause};
+use crate::governed_state::{
+    GovernedApprovalReducerInput, GovernedFatalCause, GovernedRecoverableCause,
+    GovernedTaskReducerInput,
+};
 use crate::{ClientApprovalWatchError, ClientGovernedTaskError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,6 +19,76 @@ pub(crate) enum DriverFailure {
     Recoverable(GovernedRecoverableCause),
     Fatal(GovernedFatalCause),
     Reset,
+}
+
+pub(crate) fn task_failure_input(
+    stage: DriverStage,
+    generation: u64,
+    failure: DriverFailure,
+) -> GovernedTaskReducerInput {
+    match (stage, failure) {
+        (DriverStage::Recovery, DriverFailure::Recoverable(cause)) => {
+            GovernedTaskReducerInput::RebaselineRecoverableFailure { generation, cause }
+        }
+        (DriverStage::Initial | DriverStage::Live, DriverFailure::Recoverable(cause)) => {
+            GovernedTaskReducerInput::RecoverableFailure { generation, cause }
+        }
+        (DriverStage::Recovery, DriverFailure::Fatal(cause)) => {
+            GovernedTaskReducerInput::RebaselineFailed { generation, cause }
+        }
+        (DriverStage::Initial | DriverStage::Live, DriverFailure::Fatal(cause)) => {
+            GovernedTaskReducerInput::Fatal { generation, cause }
+        }
+        (DriverStage::Live, DriverFailure::Reset) => GovernedTaskReducerInput::Reset { generation },
+        (DriverStage::Initial, DriverFailure::Reset) => {
+            GovernedTaskReducerInput::RecoverableFailure {
+                generation,
+                cause: GovernedRecoverableCause::ProjectionResetRequired,
+            }
+        }
+        (DriverStage::Recovery, DriverFailure::Reset) => {
+            GovernedTaskReducerInput::RebaselineRecoverableFailure {
+                generation,
+                cause: GovernedRecoverableCause::ProjectionResetRequired,
+            }
+        }
+    }
+}
+
+pub(crate) fn approval_failure_input(
+    stage: DriverStage,
+    generation: u64,
+    failure: DriverFailure,
+) -> GovernedApprovalReducerInput {
+    match (stage, failure) {
+        (DriverStage::Recovery, DriverFailure::Recoverable(cause)) => {
+            GovernedApprovalReducerInput::RebaselineRecoverableFailure { generation, cause }
+        }
+        (DriverStage::Initial | DriverStage::Live, DriverFailure::Recoverable(cause)) => {
+            GovernedApprovalReducerInput::RecoverableFailure { generation, cause }
+        }
+        (DriverStage::Recovery, DriverFailure::Fatal(cause)) => {
+            GovernedApprovalReducerInput::RebaselineFailed { generation, cause }
+        }
+        (DriverStage::Initial | DriverStage::Live, DriverFailure::Fatal(cause)) => {
+            GovernedApprovalReducerInput::Fatal { generation, cause }
+        }
+        (DriverStage::Live, DriverFailure::Reset) => {
+            GovernedApprovalReducerInput::Reset { generation }
+        }
+        (DriverStage::Initial, DriverFailure::Reset) => {
+            GovernedApprovalReducerInput::RecoverableFailure {
+                generation,
+                cause: GovernedRecoverableCause::ProjectionResetRequired,
+            }
+        }
+        (DriverStage::Recovery, DriverFailure::Reset) => {
+            GovernedApprovalReducerInput::RebaselineRecoverableFailure {
+                generation,
+                cause: GovernedRecoverableCause::ProjectionResetRequired,
+            }
+        }
+    }
 }
 
 pub(crate) fn classify_task_error(
@@ -115,13 +188,22 @@ fn classify_api_error(code: i32, retryable: bool) -> DriverFailure {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use egopulse_client_kernel::{KernelError, KernelServerError};
     use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
         LocalApiError, LocalApiErrorCode,
     };
 
-    use super::{DriverFailure, DriverStage, classify_approval_error, classify_task_error};
-    use crate::governed_state::{GovernedFatalCause, GovernedRecoverableCause};
+    use super::{
+        DriverFailure, DriverStage, approval_failure_input, classify_approval_error,
+        classify_task_error, task_failure_input,
+    };
+    use crate::governed_state::{
+        GovernedApprovalDomainState, GovernedApprovalReducerInput, GovernedFatalCause,
+        GovernedRecoverableCause, GovernedStateComposite, GovernedStateDomainPhase,
+        GovernedStateReason, GovernedTaskDomainState, GovernedTaskReducerInput,
+    };
     use crate::{ClientApprovalWatchError, ClientGovernedTaskError};
 
     const STAGES: [DriverStage; 3] = [
@@ -479,5 +561,225 @@ mod tests {
             false,
             DriverFailure::Fatal(GovernedFatalCause::ApiRejected),
         );
+    }
+
+    #[test]
+    fn r9b2a_task_failure_input_respects_driver_stage_and_reset_recovery() {
+        let recoverable = DriverFailure::Recoverable(GovernedRecoverableCause::UnexpectedEof);
+        let fatal = DriverFailure::Fatal(GovernedFatalCause::PermissionDenied);
+
+        assert!(matches!(
+            task_failure_input(DriverStage::Initial, 7, recoverable),
+            GovernedTaskReducerInput::RecoverableFailure {
+                generation: 7,
+                cause: GovernedRecoverableCause::UnexpectedEof
+            }
+        ));
+        assert!(matches!(
+            task_failure_input(DriverStage::Recovery, 7, recoverable),
+            GovernedTaskReducerInput::RebaselineRecoverableFailure {
+                generation: 7,
+                cause: GovernedRecoverableCause::UnexpectedEof
+            }
+        ));
+        assert!(matches!(
+            task_failure_input(DriverStage::Live, 7, recoverable),
+            GovernedTaskReducerInput::RecoverableFailure {
+                generation: 7,
+                cause: GovernedRecoverableCause::UnexpectedEof
+            }
+        ));
+        assert!(matches!(
+            task_failure_input(DriverStage::Recovery, 7, fatal),
+            GovernedTaskReducerInput::RebaselineFailed {
+                generation: 7,
+                cause: GovernedFatalCause::PermissionDenied
+            }
+        ));
+        for stage in [DriverStage::Initial, DriverStage::Live] {
+            assert!(matches!(
+                task_failure_input(stage, 7, fatal),
+                GovernedTaskReducerInput::Fatal {
+                    generation: 7,
+                    cause: GovernedFatalCause::PermissionDenied
+                }
+            ));
+        }
+        assert!(matches!(
+            task_failure_input(DriverStage::Initial, 7, DriverFailure::Reset),
+            GovernedTaskReducerInput::RecoverableFailure {
+                generation: 7,
+                cause: GovernedRecoverableCause::ProjectionResetRequired
+            }
+        ));
+        assert!(matches!(
+            task_failure_input(DriverStage::Recovery, 7, DriverFailure::Reset),
+            GovernedTaskReducerInput::RebaselineRecoverableFailure {
+                generation: 7,
+                cause: GovernedRecoverableCause::ProjectionResetRequired
+            }
+        ));
+        assert!(matches!(
+            task_failure_input(DriverStage::Live, 7, DriverFailure::Reset),
+            GovernedTaskReducerInput::Reset { generation: 7 }
+        ));
+    }
+
+    #[test]
+    fn r9b2a_approval_failure_input_respects_driver_stage_and_reset_recovery() {
+        let recoverable = DriverFailure::Recoverable(GovernedRecoverableCause::UnexpectedEof);
+        let fatal = DriverFailure::Fatal(GovernedFatalCause::PermissionDenied);
+
+        assert!(matches!(
+            approval_failure_input(DriverStage::Initial, 9, recoverable),
+            GovernedApprovalReducerInput::RecoverableFailure {
+                generation: 9,
+                cause: GovernedRecoverableCause::UnexpectedEof
+            }
+        ));
+        assert!(matches!(
+            approval_failure_input(DriverStage::Recovery, 9, recoverable),
+            GovernedApprovalReducerInput::RebaselineRecoverableFailure {
+                generation: 9,
+                cause: GovernedRecoverableCause::UnexpectedEof
+            }
+        ));
+        assert!(matches!(
+            approval_failure_input(DriverStage::Live, 9, recoverable),
+            GovernedApprovalReducerInput::RecoverableFailure {
+                generation: 9,
+                cause: GovernedRecoverableCause::UnexpectedEof
+            }
+        ));
+        assert!(matches!(
+            approval_failure_input(DriverStage::Recovery, 9, fatal),
+            GovernedApprovalReducerInput::RebaselineFailed {
+                generation: 9,
+                cause: GovernedFatalCause::PermissionDenied
+            }
+        ));
+        for stage in [DriverStage::Initial, DriverStage::Live] {
+            assert!(matches!(
+                approval_failure_input(stage, 9, fatal),
+                GovernedApprovalReducerInput::Fatal {
+                    generation: 9,
+                    cause: GovernedFatalCause::PermissionDenied
+                }
+            ));
+        }
+        assert!(matches!(
+            approval_failure_input(DriverStage::Initial, 9, DriverFailure::Reset),
+            GovernedApprovalReducerInput::RecoverableFailure {
+                generation: 9,
+                cause: GovernedRecoverableCause::ProjectionResetRequired
+            }
+        ));
+        assert!(matches!(
+            approval_failure_input(DriverStage::Recovery, 9, DriverFailure::Reset),
+            GovernedApprovalReducerInput::RebaselineRecoverableFailure {
+                generation: 9,
+                cause: GovernedRecoverableCause::ProjectionResetRequired
+            }
+        ));
+        assert!(matches!(
+            approval_failure_input(DriverStage::Live, 9, DriverFailure::Reset),
+            GovernedApprovalReducerInput::Reset { generation: 9 }
+        ));
+    }
+
+    #[test]
+    fn r9b2a_reset_recovery_is_bounded_and_generation_fenced_symmetrically() {
+        let recovery_limit = NonZeroU32::new(2).expect("non-zero recovery limit");
+        let mut task_path = GovernedStateComposite::new(
+            GovernedTaskDomainState::connecting(recovery_limit),
+            GovernedApprovalDomainState::connecting(recovery_limit),
+        );
+        let approval_before = task_path.approval().clone();
+
+        task_path.apply_task(task_failure_input(
+            DriverStage::Initial,
+            1,
+            DriverFailure::Reset,
+        ));
+        assert_eq!(task_path.task().phase(), GovernedStateDomainPhase::Stale);
+        assert_eq!(task_path.task().generation(), 2);
+        assert_eq!(task_path.task().recovery_remaining(), 1);
+        assert_eq!(
+            task_path.task().reason(),
+            Some(GovernedStateReason::ProjectionResetRequired)
+        );
+        assert_eq!(task_path.approval(), &approval_before);
+
+        let task_before_stale_replay = task_path.task().clone();
+        task_path.apply_task(task_failure_input(
+            DriverStage::Recovery,
+            1,
+            DriverFailure::Reset,
+        ));
+        assert_eq!(task_path.task(), &task_before_stale_replay);
+        assert_eq!(task_path.approval(), &approval_before);
+
+        task_path.apply_task(task_failure_input(
+            DriverStage::Recovery,
+            2,
+            DriverFailure::Reset,
+        ));
+        assert_eq!(task_path.task().phase(), GovernedStateDomainPhase::Fatal);
+        assert_eq!(task_path.task().generation(), 3);
+        assert_eq!(task_path.task().recovery_remaining(), 0);
+        assert_eq!(
+            task_path.task().reason(),
+            Some(GovernedStateReason::RecoveryExhausted)
+        );
+        assert_eq!(task_path.approval(), &approval_before);
+
+        let mut approval_path = GovernedStateComposite::new(
+            GovernedTaskDomainState::connecting(recovery_limit),
+            GovernedApprovalDomainState::connecting(recovery_limit),
+        );
+        let task_before = approval_path.task().clone();
+
+        approval_path.apply_approval(approval_failure_input(
+            DriverStage::Initial,
+            1,
+            DriverFailure::Reset,
+        ));
+        assert_eq!(
+            approval_path.approval().phase(),
+            GovernedStateDomainPhase::Stale
+        );
+        assert_eq!(approval_path.approval().generation(), 2);
+        assert_eq!(approval_path.approval().recovery_remaining(), 1);
+        assert_eq!(
+            approval_path.approval().reason(),
+            Some(GovernedStateReason::ProjectionResetRequired)
+        );
+        assert_eq!(approval_path.task(), &task_before);
+
+        let approval_before_stale_replay = approval_path.approval().clone();
+        approval_path.apply_approval(approval_failure_input(
+            DriverStage::Recovery,
+            1,
+            DriverFailure::Reset,
+        ));
+        assert_eq!(approval_path.approval(), &approval_before_stale_replay);
+        assert_eq!(approval_path.task(), &task_before);
+
+        approval_path.apply_approval(approval_failure_input(
+            DriverStage::Recovery,
+            2,
+            DriverFailure::Reset,
+        ));
+        assert_eq!(
+            approval_path.approval().phase(),
+            GovernedStateDomainPhase::Fatal
+        );
+        assert_eq!(approval_path.approval().generation(), 3);
+        assert_eq!(approval_path.approval().recovery_remaining(), 0);
+        assert_eq!(
+            approval_path.approval().reason(),
+            Some(GovernedStateReason::RecoveryExhausted)
+        );
+        assert_eq!(approval_path.task(), &task_before);
     }
 }

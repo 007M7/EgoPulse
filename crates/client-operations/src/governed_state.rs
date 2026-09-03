@@ -30,6 +30,7 @@ pub enum GovernedStateReason {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GovernedRecoverableCause {
+    ProjectionResetRequired,
     RetryableApiRejected,
     TransportUnavailable,
     UnexpectedEof,
@@ -38,6 +39,7 @@ pub(crate) enum GovernedRecoverableCause {
 impl GovernedRecoverableCause {
     const fn reason(self) -> GovernedStateReason {
         match self {
+            Self::ProjectionResetRequired => GovernedStateReason::ProjectionResetRequired,
             Self::RetryableApiRejected => GovernedStateReason::ApiRejected,
             Self::TransportUnavailable => GovernedStateReason::TransportUnavailable,
             Self::UnexpectedEof => GovernedStateReason::UnexpectedEof,
