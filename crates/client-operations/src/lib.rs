@@ -790,6 +790,11 @@ impl ApprovalWatch {
 
 impl ApprovalQueueSession {
     #[must_use]
+    pub(crate) fn position(&self) -> &ProjectionPosition {
+        &self.last_position
+    }
+
+    #[must_use]
     pub fn actionable_approvals(&self) -> Vec<&ActionableApproval> {
         self.actionable.values().collect()
     }

@@ -1,11 +1,18 @@
+use std::collections::BTreeMap;
+
 use egopulse_client_kernel::KernelError;
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::LocalApiErrorCode;
+use egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition;
 
 use crate::governed_state::{
-    GovernedApprovalReducerInput, GovernedFatalCause, GovernedRecoverableCause,
+    GovernedApprovalDomainPosition, GovernedApprovalReducerInput, GovernedApprovalState,
+    GovernedFatalCause, GovernedRecoverableCause, GovernedTaskDomainPosition,
     GovernedTaskReducerInput,
 };
-use crate::{ClientApprovalWatchError, ClientGovernedTaskError};
+use crate::{
+    ApprovalQueueSession, ClientApprovalWatchError, ClientGovernedTaskError,
+    GovernedProjectionPosition, GovernedTaskSession, GovernedTaskState,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DriverStage {
@@ -88,6 +95,64 @@ pub(crate) fn approval_failure_input(
                 cause: GovernedRecoverableCause::ProjectionResetRequired,
             }
         }
+    }
+}
+
+pub(crate) fn task_complete_input_from_session(
+    generation: u64,
+    session: &GovernedTaskSession,
+) -> GovernedTaskReducerInput {
+    task_complete_input_from_parts(generation, session.position(), session.tasks())
+}
+
+fn task_complete_input_from_parts<'a>(
+    generation: u64,
+    position: &GovernedProjectionPosition,
+    tasks: impl IntoIterator<Item = &'a GovernedTaskState>,
+) -> GovernedTaskReducerInput {
+    let tasks = tasks
+        .into_iter()
+        .map(|task| (task.task_id.clone(), task.clone()))
+        .collect::<BTreeMap<_, _>>();
+    GovernedTaskReducerInput::CompleteRebaseline {
+        generation,
+        position: GovernedTaskDomainPosition::new(position.epoch.clone(), position.sequence),
+        tasks,
+    }
+}
+
+pub(crate) fn approval_complete_input_from_session(
+    generation: u64,
+    session: &ApprovalQueueSession,
+) -> GovernedApprovalReducerInput {
+    approval_complete_input_from_parts(
+        generation,
+        session.position(),
+        session.actionable_approvals().into_iter().map(|approval| {
+            let view = approval.view();
+            (view.approval_request_id.as_str(), view.task_id.as_str())
+        }),
+    )
+}
+
+fn approval_complete_input_from_parts<'a>(
+    generation: u64,
+    position: &ProjectionPosition,
+    approvals: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> GovernedApprovalReducerInput {
+    let approvals = approvals
+        .into_iter()
+        .map(|(approval_request_id, task_id)| {
+            (
+                approval_request_id.to_owned(),
+                GovernedApprovalState::new(approval_request_id, task_id),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    GovernedApprovalReducerInput::CompleteRebaseline {
+        generation,
+        position: GovernedApprovalDomainPosition::new(position.epoch.clone(), position.sequence),
+        approvals,
     }
 }
 
@@ -191,20 +256,25 @@ mod tests {
     use std::num::NonZeroU32;
 
     use egopulse_client_kernel::{KernelError, KernelServerError};
-    use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
-        LocalApiError, LocalApiErrorCode,
+    use egopulse_domain_contracts::v01::egopulse::{
+        localapi::v1::{LocalApiError, LocalApiErrorCode, ProjectionHealth, ProjectionPosition},
+        task::v1::TaskStatus,
     };
 
     use super::{
-        DriverFailure, DriverStage, approval_failure_input, classify_approval_error,
-        classify_task_error, task_failure_input,
+        DriverFailure, DriverStage, approval_complete_input_from_parts, approval_failure_input,
+        classify_approval_error, classify_task_error, task_complete_input_from_parts,
+        task_failure_input,
     };
     use crate::governed_state::{
         GovernedApprovalDomainState, GovernedApprovalReducerInput, GovernedFatalCause,
         GovernedRecoverableCause, GovernedStateComposite, GovernedStateDomainPhase,
         GovernedStateReason, GovernedTaskDomainState, GovernedTaskReducerInput,
     };
-    use crate::{ClientApprovalWatchError, ClientGovernedTaskError};
+    use crate::{
+        ClientApprovalWatchError, ClientGovernedTaskError, GovernedProjectionPosition,
+        GovernedProjectionState, GovernedTaskState,
+    };
 
     const STAGES: [DriverStage; 3] = [
         DriverStage::Initial,
@@ -232,6 +302,23 @@ mod tests {
             current_position: None,
             correlation_id: "correlation:governed-state-driver".to_owned(),
         }))
+    }
+
+    fn governed_task(task_id: &str, position: &GovernedProjectionPosition) -> GovernedTaskState {
+        GovernedTaskState {
+            task_id: task_id.to_owned(),
+            revision: 3,
+            status: TaskStatus::Ready,
+            resume_status: None,
+            hold_reason: None,
+            projection: GovernedProjectionState {
+                position: position.clone(),
+                health: ProjectionHealth::Ready,
+                stale: false,
+                reason: None,
+            },
+            run: None,
+        }
     }
 
     fn assert_local_api_classification(code: i32, retryable: bool, expected: DriverFailure) {
@@ -781,5 +868,61 @@ mod tests {
             Some(GovernedStateReason::RecoveryExhausted)
         );
         assert_eq!(approval_path.task(), &task_before);
+    }
+
+    #[test]
+    fn r9b2a_task_complete_input_clones_only_safe_session_facts_and_position() {
+        let position = GovernedProjectionPosition {
+            epoch: "task-epoch:7".to_owned(),
+            sequence: 41,
+        };
+        let first = governed_task("task:1", &position);
+        let second = governed_task("task:2", &position);
+
+        let input = task_complete_input_from_parts(8, &position, [&first, &second]);
+        let GovernedTaskReducerInput::CompleteRebaseline {
+            generation,
+            position,
+            tasks,
+        } = input
+        else {
+            panic!("expected complete Task rebaseline input");
+        };
+        assert_eq!(generation, 8);
+        assert_eq!(position.epoch(), "task-epoch:7");
+        assert_eq!(position.sequence(), 41);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks["task:1"], first);
+        assert_eq!(tasks["task:2"], second);
+    }
+
+    #[test]
+    fn r9b2a_approval_complete_input_contains_only_safe_ids_and_position() {
+        let position = ProjectionPosition {
+            epoch: "approval-epoch:9".to_owned(),
+            sequence: 53,
+            projected_at: None,
+        };
+        let input = approval_complete_input_from_parts(
+            10,
+            &position,
+            [("approval:1", "task:1"), ("approval:2", "task:2")],
+        );
+        let GovernedApprovalReducerInput::CompleteRebaseline {
+            generation,
+            position,
+            approvals,
+        } = input
+        else {
+            panic!("expected complete Approval rebaseline input");
+        };
+        assert_eq!(generation, 10);
+        assert_eq!(position.epoch(), "approval-epoch:9");
+        assert_eq!(position.sequence(), 53);
+        assert_eq!(approvals.len(), 2);
+        assert_eq!(approvals["approval:1"].approval_request_id(), "approval:1");
+        assert_eq!(approvals["approval:1"].task_id(), "task:1");
+        assert_eq!(approvals["approval:2"].approval_request_id(), "approval:2");
+        assert_eq!(approvals["approval:2"].task_id(), "task:2");
     }
 }
