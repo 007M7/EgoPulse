@@ -604,10 +604,10 @@ mod tests {
     };
 
     use super::{
-        ApprovalRequest, DriverFailure, DriverStage, GovernedStateSessionCore, Opened, TaskRequest,
-        approval_complete_input_from_parts, approval_failure_input, classify_approval_error,
-        classify_task_error, clone_shared_pair, open_source_via, task_complete_input_from_parts,
-        task_failure_input,
+        ApprovalRequest, DomainAck, DriverFailure, DriverStage, GovernedStateSessionCore, Opened,
+        TaskRequest, approval_complete_input_from_parts, approval_failure_input,
+        classify_approval_error, classify_task_error, clone_shared_pair, open_source_via,
+        task_complete_input_from_parts, task_failure_input,
     };
     use crate::governed_state::{
         GovernedApprovalDomainState, GovernedApprovalReducerInput, GovernedFatalCause,
@@ -1657,5 +1657,140 @@ mod tests {
         assert_eq!(approvals["approval:1"].task_id(), "task:1");
         assert_eq!(approvals["approval:2"].approval_request_id(), "approval:2");
         assert_eq!(approvals["approval:2"].task_id(), "task:2");
+    }
+
+    #[test]
+    fn r9b2b_next_update_parks_on_empty_queues_and_wakes_on_approval_send() {
+        let (mut core, _task_sender, approval_sender) =
+            GovernedStateSessionCore::with_recovery_limit(
+                NonZeroU32::new(3).expect("test recovery limit is non-zero"),
+            );
+        let mut next_update = pin!(core.next_update());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(
+            next_update.as_mut().poll(&mut context).is_pending(),
+            "next_update must park while both capacity-one queues are empty"
+        );
+
+        let (ack, _ack_receiver) = tokio::sync::oneshot::channel();
+        approval_sender
+            .try_send(ApprovalRequest {
+                input: GovernedApprovalReducerInput::Heartbeat { generation: 1 },
+                ack,
+            })
+            .expect("capacity-one approval queue must accept one request");
+        let update = match next_update.as_mut().poll(&mut context) {
+            Poll::Ready(update) => update.expect("parked coordinator must not be finished"),
+            Poll::Pending => panic!("queued approval request must make next_update ready"),
+        };
+        assert_eq!(update.domain(), GovernedStateDomain::Approval);
+    }
+
+    #[test]
+    fn r9b2b_approval_ack_is_own_domain_only_and_leaves_task_state_untouched() {
+        let (mut core, task_sender, approval_sender) =
+            GovernedStateSessionCore::with_recovery_limit(
+                NonZeroU32::new(3).expect("test recovery limit is non-zero"),
+            );
+        let task_before = core.state().task().clone();
+
+        // A task recoverable failure first moves only the task domain.
+        let (task_ack, mut task_ack_receiver) = tokio::sync::oneshot::channel();
+        task_sender
+            .try_send(TaskRequest {
+                input: GovernedTaskReducerInput::RecoverableFailure {
+                    generation: 1,
+                    cause: GovernedRecoverableCause::TransportUnavailable,
+                },
+                ack: task_ack,
+            })
+            .expect("capacity-one task queue must accept one request");
+        let task_update =
+            poll_ready_once(core.next_update()).expect("task request must produce a task update");
+        assert_eq!(task_update.domain(), GovernedStateDomain::Task);
+        assert_eq!(
+            task_ack_receiver
+                .try_recv()
+                .expect("ack must be ready after the coordinated apply"),
+            DomainAck {
+                phase: GovernedStateDomainPhase::Stale,
+                generation: 2,
+                recovery_remaining: 2,
+            }
+        );
+        let task_after_failure = core.state().task().clone();
+        assert_ne!(task_after_failure, task_before);
+
+        // An approval heartbeat then acks exactly the approval domain facts.
+        let (approval_ack, mut approval_ack_receiver) = tokio::sync::oneshot::channel();
+        approval_sender
+            .try_send(ApprovalRequest {
+                input: GovernedApprovalReducerInput::Heartbeat { generation: 1 },
+                ack: approval_ack,
+            })
+            .expect("capacity-one approval queue must accept one request");
+        let approval_update = poll_ready_once(core.next_update())
+            .expect("approval request must produce an approval update");
+        assert_eq!(approval_update.domain(), GovernedStateDomain::Approval);
+        let approval = core.state().approval();
+        assert_eq!(
+            approval_ack_receiver
+                .try_recv()
+                .expect("ack must be ready after the coordinated apply"),
+            DomainAck {
+                phase: approval.phase(),
+                generation: approval.generation(),
+                recovery_remaining: approval.recovery_remaining(),
+            }
+        );
+
+        // The approval apply must not have touched the changed task state.
+        assert_eq!(core.state().task(), &task_after_failure);
+        assert_ne!(core.state().task(), &task_before);
+    }
+
+    #[test]
+    fn r9b2b_dropped_ack_receiver_does_not_block_coordinator_or_other_domain() {
+        let (mut core, task_sender, approval_sender) =
+            GovernedStateSessionCore::with_recovery_limit(
+                NonZeroU32::new(3).expect("test recovery limit is non-zero"),
+            );
+
+        // The ack consumer disappears before the coordinator applies the request.
+        let (task_ack, task_ack_receiver) = tokio::sync::oneshot::channel();
+        drop(task_ack_receiver);
+        task_sender
+            .try_send(TaskRequest {
+                input: GovernedTaskReducerInput::Heartbeat { generation: 1 },
+                ack: task_ack,
+            })
+            .expect("capacity-one task queue must accept one request");
+        let task_update = poll_ready_once(core.next_update())
+            .expect("coordinator must apply a request whose ack consumer vanished");
+        assert_eq!(task_update.domain(), GovernedStateDomain::Task);
+        assert_eq!(core.state().task().generation(), 1);
+
+        // The coordinator keeps serving the other domain afterwards.
+        let (approval_ack, mut approval_ack_receiver) = tokio::sync::oneshot::channel();
+        approval_sender
+            .try_send(ApprovalRequest {
+                input: GovernedApprovalReducerInput::Heartbeat { generation: 1 },
+                ack: approval_ack,
+            })
+            .expect("capacity-one approval queue must accept one request");
+        let approval_update = poll_ready_once(core.next_update())
+            .expect("other domain must continue after a dropped ack receiver");
+        assert_eq!(approval_update.domain(), GovernedStateDomain::Approval);
+        let approval = core.state().approval();
+        assert_eq!(
+            approval_ack_receiver
+                .try_recv()
+                .expect("ack must be ready after the coordinated apply"),
+            DomainAck {
+                phase: approval.phase(),
+                generation: approval.generation(),
+                recovery_remaining: approval.recovery_remaining(),
+            }
+        );
     }
 }
