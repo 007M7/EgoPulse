@@ -1,5 +1,17 @@
 #![forbid(unsafe_code)]
 
+#[allow(
+    dead_code,
+    reason = "R9B.1 domain drivers consume this runtime-agnostic reducer in the follow-up slice"
+)]
+mod governed_state;
+
+pub use governed_state::{
+    GovernedApprovalDomainPosition, GovernedApprovalDomainState, GovernedApprovalState,
+    GovernedStateComposite, GovernedStateDomain, GovernedStateDomainPhase, GovernedStateReason,
+    GovernedTaskDomainPosition, GovernedTaskDomainState,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
