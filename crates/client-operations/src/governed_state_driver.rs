@@ -1,18 +1,242 @@
-use std::{collections::BTreeMap, future::Future, sync::Arc};
+use std::{collections::BTreeMap, future::Future, num::NonZeroU32, sync::Arc};
 
 use egopulse_client_kernel::KernelError;
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::LocalApiErrorCode;
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition;
+use tokio::sync::{mpsc, mpsc::error::TryRecvError, oneshot};
 
 use crate::governed_state::{
-    GovernedApprovalDomainPosition, GovernedApprovalReducerInput, GovernedApprovalState,
-    GovernedFatalCause, GovernedRecoverableCause, GovernedTaskDomainPosition,
-    GovernedTaskReducerInput,
+    GovernedApprovalDomainPosition, GovernedApprovalDomainState, GovernedApprovalReducerInput,
+    GovernedApprovalState, GovernedFatalCause, GovernedRecoverableCause, GovernedStateComposite,
+    GovernedStateDomain, GovernedStateDomainPhase, GovernedTaskDomainPosition,
+    GovernedTaskDomainState, GovernedTaskReducerInput,
 };
 use crate::{
     ApprovalQueueSession, ClientApprovalWatchError, ClientAttachment, ClientGovernedTaskError,
     GovernedProjectionPosition, GovernedTaskSession, GovernedTaskState,
 };
+
+const GOVERNED_STATE_REQUEST_CAPACITY: usize = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DomainAck {
+    phase: GovernedStateDomainPhase,
+    generation: u64,
+    recovery_remaining: u32,
+}
+
+struct TaskRequest {
+    input: GovernedTaskReducerInput,
+    ack: oneshot::Sender<DomainAck>,
+}
+
+struct ApprovalRequest {
+    input: GovernedApprovalReducerInput,
+    ack: oneshot::Sender<DomainAck>,
+}
+
+type TaskRequestSender = mpsc::Sender<TaskRequest>;
+type TaskRequestReceiver = mpsc::Receiver<TaskRequest>;
+type ApprovalRequestSender = mpsc::Sender<ApprovalRequest>;
+type ApprovalRequestReceiver = mpsc::Receiver<ApprovalRequest>;
+
+fn governed_state_request_channels() -> (
+    TaskRequestSender,
+    TaskRequestReceiver,
+    ApprovalRequestSender,
+    ApprovalRequestReceiver,
+) {
+    let (task_sender, task_receiver) = mpsc::channel(GOVERNED_STATE_REQUEST_CAPACITY);
+    let (approval_sender, approval_receiver) = mpsc::channel(GOVERNED_STATE_REQUEST_CAPACITY);
+    (
+        task_sender,
+        task_receiver,
+        approval_sender,
+        approval_receiver,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GovernedStateUpdate {
+    domain: GovernedStateDomain,
+}
+
+impl GovernedStateUpdate {
+    #[must_use]
+    pub const fn domain(&self) -> GovernedStateDomain {
+        self.domain
+    }
+}
+
+enum ReadyRequest {
+    Task(TaskRequest),
+    Approval(ApprovalRequest),
+}
+
+enum ReceivedRequest {
+    Task(Option<TaskRequest>),
+    Approval(Option<ApprovalRequest>),
+}
+
+struct GovernedStateSessionCore {
+    state: GovernedStateComposite,
+    task_receiver: TaskRequestReceiver,
+    approval_receiver: ApprovalRequestReceiver,
+    task_closed: bool,
+    approval_closed: bool,
+    preferred: GovernedStateDomain,
+}
+
+impl GovernedStateSessionCore {
+    fn new() -> (Self, TaskRequestSender, ApprovalRequestSender) {
+        Self::with_recovery_limit(
+            NonZeroU32::new(3).expect("production recovery limit is non-zero"),
+        )
+    }
+
+    fn with_recovery_limit(
+        recovery_limit: NonZeroU32,
+    ) -> (Self, TaskRequestSender, ApprovalRequestSender) {
+        let (task_sender, task_receiver, approval_sender, approval_receiver) =
+            governed_state_request_channels();
+        (
+            Self {
+                state: GovernedStateComposite::new(
+                    GovernedTaskDomainState::connecting(recovery_limit),
+                    GovernedApprovalDomainState::connecting(recovery_limit),
+                ),
+                task_receiver,
+                approval_receiver,
+                task_closed: false,
+                approval_closed: false,
+                preferred: GovernedStateDomain::Task,
+            },
+            task_sender,
+            approval_sender,
+        )
+    }
+
+    fn state(&self) -> &GovernedStateComposite {
+        &self.state
+    }
+
+    async fn next_update(&mut self) -> Option<GovernedStateUpdate> {
+        loop {
+            if let Some(request) = self.try_ready_request() {
+                return Some(self.apply_request(request));
+            }
+
+            if self.task_closed && self.approval_closed {
+                return None;
+            }
+
+            let received = match self.preferred {
+                GovernedStateDomain::Task => {
+                    tokio::select! {
+                        biased;
+                        request = self.task_receiver.recv(), if !self.task_closed => {
+                            ReceivedRequest::Task(request)
+                        }
+                        request = self.approval_receiver.recv(), if !self.approval_closed => {
+                            ReceivedRequest::Approval(request)
+                        }
+                    }
+                }
+                GovernedStateDomain::Approval => {
+                    tokio::select! {
+                        biased;
+                        request = self.approval_receiver.recv(), if !self.approval_closed => {
+                            ReceivedRequest::Approval(request)
+                        }
+                        request = self.task_receiver.recv(), if !self.task_closed => {
+                            ReceivedRequest::Task(request)
+                        }
+                    }
+                }
+            };
+            match received {
+                ReceivedRequest::Task(Some(request)) => {
+                    return Some(self.apply_request(ReadyRequest::Task(request)));
+                }
+                ReceivedRequest::Approval(Some(request)) => {
+                    return Some(self.apply_request(ReadyRequest::Approval(request)));
+                }
+                ReceivedRequest::Task(None) => self.task_closed = true,
+                ReceivedRequest::Approval(None) => self.approval_closed = true,
+            }
+        }
+    }
+
+    fn try_ready_request(&mut self) -> Option<ReadyRequest> {
+        match self.preferred {
+            GovernedStateDomain::Task => self
+                .try_task_request()
+                .or_else(|| self.try_approval_request()),
+            GovernedStateDomain::Approval => self
+                .try_approval_request()
+                .or_else(|| self.try_task_request()),
+        }
+    }
+
+    fn try_task_request(&mut self) -> Option<ReadyRequest> {
+        if self.task_closed {
+            return None;
+        }
+        match self.task_receiver.try_recv() {
+            Ok(request) => Some(ReadyRequest::Task(request)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.task_closed = true;
+                None
+            }
+        }
+    }
+
+    fn try_approval_request(&mut self) -> Option<ReadyRequest> {
+        if self.approval_closed {
+            return None;
+        }
+        match self.approval_receiver.try_recv() {
+            Ok(request) => Some(ReadyRequest::Approval(request)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.approval_closed = true;
+                None
+            }
+        }
+    }
+
+    fn apply_request(&mut self, request: ReadyRequest) -> GovernedStateUpdate {
+        match request {
+            ReadyRequest::Task(request) => {
+                self.state.apply_task(request.input);
+                let task = self.state.task();
+                let _ = request.ack.send(DomainAck {
+                    phase: task.phase(),
+                    generation: task.generation(),
+                    recovery_remaining: task.recovery_remaining(),
+                });
+                self.preferred = GovernedStateDomain::Approval;
+                GovernedStateUpdate {
+                    domain: GovernedStateDomain::Task,
+                }
+            }
+            ReadyRequest::Approval(request) => {
+                self.state.apply_approval(request.input);
+                let approval = self.state.approval();
+                let _ = request.ack.send(DomainAck {
+                    phase: approval.phase(),
+                    generation: approval.generation(),
+                    recovery_remaining: approval.recovery_remaining(),
+                });
+                self.preferred = GovernedStateDomain::Task;
+                GovernedStateUpdate {
+                    domain: GovernedStateDomain::Approval,
+                }
+            }
+        }
+    }
+}
 
 struct GovernedStateSources {
     task: TaskSource,
@@ -380,14 +604,16 @@ mod tests {
     };
 
     use super::{
-        DriverFailure, DriverStage, Opened, approval_complete_input_from_parts,
-        approval_failure_input, classify_approval_error, classify_task_error, clone_shared_pair,
-        open_source_via, task_complete_input_from_parts, task_failure_input,
+        ApprovalRequest, DriverFailure, DriverStage, GovernedStateSessionCore, Opened, TaskRequest,
+        approval_complete_input_from_parts, approval_failure_input, classify_approval_error,
+        classify_task_error, clone_shared_pair, open_source_via, task_complete_input_from_parts,
+        task_failure_input,
     };
     use crate::governed_state::{
         GovernedApprovalDomainState, GovernedApprovalReducerInput, GovernedFatalCause,
-        GovernedRecoverableCause, GovernedStateComposite, GovernedStateDomainPhase,
-        GovernedStateReason, GovernedTaskDomainState, GovernedTaskReducerInput,
+        GovernedRecoverableCause, GovernedStateComposite, GovernedStateDomain,
+        GovernedStateDomainPhase, GovernedStateReason, GovernedTaskDomainState,
+        GovernedTaskReducerInput,
     };
     use crate::{
         ClientApprovalWatchError, ClientGovernedTaskError, GovernedProjectionPosition,
@@ -551,6 +777,281 @@ mod tests {
         assert_eq!(approval.session, "approval-session");
         assert_eq!(approval.complete_input, "approval-input");
         assert_eq!(*approval_calls.borrow(), ["read", "open", "complete"]);
+    }
+
+    #[test]
+    fn r9b2b_session_core_starts_both_domains_connecting() {
+        let (core, _task_sender, _approval_sender) = GovernedStateSessionCore::new();
+
+        assert_eq!(
+            core.state().task().phase(),
+            GovernedStateDomainPhase::Connecting
+        );
+        assert_eq!(core.state().task().generation(), 1);
+        assert_eq!(core.state().task().recovery_remaining(), 3);
+        assert_eq!(
+            core.state().approval().phase(),
+            GovernedStateDomainPhase::Connecting
+        );
+        assert_eq!(core.state().approval().generation(), 1);
+        assert_eq!(core.state().approval().recovery_remaining(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_single_domain_apply_and_ack_leave_other_domain_unchanged() {
+        let recovery_limit = NonZeroU32::new(2).expect("non-zero recovery limit");
+        let (mut core, task_sender, _approval_sender) =
+            GovernedStateSessionCore::with_recovery_limit(recovery_limit);
+        let approval_before = core.state().approval().clone();
+        let (ack_sender, ack_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            task_sender
+                .try_send(TaskRequest {
+                    input: GovernedTaskReducerInput::Fatal {
+                        generation: 1,
+                        cause: GovernedFatalCause::PermissionDenied,
+                    },
+                    ack: ack_sender,
+                })
+                .is_ok()
+        );
+
+        let update = core.next_update().await.expect("Task update");
+        let ack = ack_receiver.await.expect("Task acknowledgement");
+        assert_eq!(update.domain(), GovernedStateDomain::Task);
+        assert_eq!(ack.phase, GovernedStateDomainPhase::Fatal);
+        assert_eq!(ack.generation, 1);
+        assert_eq!(ack.recovery_remaining, 2);
+        assert_eq!(core.state().approval(), &approval_before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_simultaneously_ready_domains_are_strictly_alternated() {
+        let (mut core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+        let (task_ack_sender, task_ack_receiver) = tokio::sync::oneshot::channel();
+        let (approval_ack_sender, approval_ack_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            task_sender
+                .try_send(TaskRequest {
+                    input: GovernedTaskReducerInput::Fatal {
+                        generation: 1,
+                        cause: GovernedFatalCause::PermissionDenied,
+                    },
+                    ack: task_ack_sender,
+                })
+                .is_ok()
+        );
+        assert!(
+            approval_sender
+                .try_send(ApprovalRequest {
+                    input: GovernedApprovalReducerInput::Fatal {
+                        generation: 1,
+                        cause: GovernedFatalCause::ApiRejected,
+                    },
+                    ack: approval_ack_sender,
+                })
+                .is_ok()
+        );
+
+        assert_eq!(
+            core.next_update().await.expect("first update").domain(),
+            GovernedStateDomain::Task
+        );
+        assert_eq!(
+            core.next_update().await.expect("second update").domain(),
+            GovernedStateDomain::Approval
+        );
+        assert_eq!(
+            task_ack_receiver.await.expect("Task acknowledgement").phase,
+            GovernedStateDomainPhase::Fatal
+        );
+        assert_eq!(
+            approval_ack_receiver
+                .await
+                .expect("Approval acknowledgement")
+                .phase,
+            GovernedStateDomainPhase::Fatal
+        );
+
+        let (second_task_ack_sender, second_task_ack_receiver) = tokio::sync::oneshot::channel();
+        let (second_approval_ack_sender, second_approval_ack_receiver) =
+            tokio::sync::oneshot::channel();
+        assert!(
+            task_sender
+                .try_send(TaskRequest {
+                    input: GovernedTaskReducerInput::Replay { generation: 1 },
+                    ack: second_task_ack_sender,
+                })
+                .is_ok()
+        );
+        assert!(
+            approval_sender
+                .try_send(ApprovalRequest {
+                    input: GovernedApprovalReducerInput::Replay { generation: 1 },
+                    ack: second_approval_ack_sender,
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            core.next_update().await.expect("third update").domain(),
+            GovernedStateDomain::Task
+        );
+        assert_eq!(
+            core.next_update().await.expect("fourth update").domain(),
+            GovernedStateDomain::Approval
+        );
+        assert!(second_task_ack_receiver.await.is_ok());
+        assert!(second_approval_ack_receiver.await.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_pending_or_closed_domain_does_not_block_other_domain() {
+        let (mut core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+        let (first_ack_sender, first_ack_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            approval_sender
+                .try_send(ApprovalRequest {
+                    input: GovernedApprovalReducerInput::Replay { generation: 1 },
+                    ack: first_ack_sender,
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            core.next_update()
+                .await
+                .expect("Approval bypasses pending Task domain")
+                .domain(),
+            GovernedStateDomain::Approval
+        );
+        assert_eq!(
+            first_ack_receiver
+                .await
+                .expect("first Approval acknowledgement")
+                .phase,
+            GovernedStateDomainPhase::Connecting
+        );
+
+        drop(task_sender);
+        let (second_ack_sender, second_ack_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            approval_sender
+                .try_send(ApprovalRequest {
+                    input: GovernedApprovalReducerInput::Heartbeat { generation: 1 },
+                    ack: second_ack_sender,
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            core.next_update()
+                .await
+                .expect("Approval bypasses closed Task domain")
+                .domain(),
+            GovernedStateDomain::Approval
+        );
+        assert_eq!(
+            second_ack_receiver
+                .await
+                .expect("second Approval acknowledgement")
+                .generation,
+            1
+        );
+
+        drop(approval_sender);
+        assert_eq!(core.next_update().await, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_buffered_requests_survive_immediate_sender_drop_symmetrically() {
+        let (mut core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+        let (task_ack_sender, task_ack_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            task_sender
+                .try_send(TaskRequest {
+                    input: GovernedTaskReducerInput::Replay { generation: 1 },
+                    ack: task_ack_sender,
+                })
+                .is_ok()
+        );
+        drop(task_sender);
+        assert_eq!(
+            core.next_update()
+                .await
+                .expect("buffered Task request")
+                .domain(),
+            GovernedStateDomain::Task
+        );
+        assert!(task_ack_receiver.await.is_ok());
+
+        let (approval_ack_sender, approval_ack_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            approval_sender
+                .try_send(ApprovalRequest {
+                    input: GovernedApprovalReducerInput::Replay { generation: 1 },
+                    ack: approval_ack_sender,
+                })
+                .is_ok()
+        );
+        drop(approval_sender);
+        assert_eq!(
+            core.next_update()
+                .await
+                .expect("buffered Approval request")
+                .domain(),
+            GovernedStateDomain::Approval
+        );
+        assert!(approval_ack_receiver.await.is_ok());
+        assert_eq!(core.next_update().await, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_each_domain_channel_has_exact_capacity_one() {
+        let (mut core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+        let (first_task_ack, first_task_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            task_sender
+                .try_send(TaskRequest {
+                    input: GovernedTaskReducerInput::Replay { generation: 1 },
+                    ack: first_task_ack,
+                })
+                .is_ok()
+        );
+        let (second_task_ack, _second_task_receiver) = tokio::sync::oneshot::channel();
+        assert!(matches!(
+            task_sender.try_send(TaskRequest {
+                input: GovernedTaskReducerInput::Replay { generation: 1 },
+                ack: second_task_ack,
+            }),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
+
+        let (first_approval_ack, first_approval_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            approval_sender
+                .try_send(ApprovalRequest {
+                    input: GovernedApprovalReducerInput::Replay { generation: 1 },
+                    ack: first_approval_ack,
+                })
+                .is_ok()
+        );
+        let (second_approval_ack, _second_approval_receiver) = tokio::sync::oneshot::channel();
+        assert!(matches!(
+            approval_sender.try_send(ApprovalRequest {
+                input: GovernedApprovalReducerInput::Replay { generation: 1 },
+                ack: second_approval_ack,
+            }),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
+
+        assert_eq!(
+            core.next_update().await.expect("Task request").domain(),
+            GovernedStateDomain::Task
+        );
+        assert_eq!(
+            core.next_update().await.expect("Approval request").domain(),
+            GovernedStateDomain::Approval
+        );
+        assert!(first_task_receiver.await.is_ok());
+        assert!(first_approval_receiver.await.is_ok());
     }
 
     fn assert_local_api_classification(code: i32, retryable: bool, expected: DriverFailure) {
