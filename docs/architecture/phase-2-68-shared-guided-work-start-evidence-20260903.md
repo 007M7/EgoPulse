@@ -115,9 +115,10 @@ U-04a proves the shared production operation and CLI component foundation,
 including local input handling, safe preview projection, sealed confirmation
 and exact replay semantics. It is not the complete U-04 product loop.
 
-U-04c remains pending and must supply evidence from a real daemon process,
-Windows IPC, the production command seam and a real ConPTY/terminal session.
-This slice does not prove cross-process outcome-unknown recovery, real
-interactive terminal cleanup, packaged-binary behavior or end-to-end
-Authority persistence, and none of those claims should be inferred from the
-40/40 and 23/23 component suites.
+U-04c is now locally verified by
+`phase-2-70-guided-work-start-real-daemon-evidence-20260904.md`. That evidence
+adds a real daemon process, Windows IPC, production CLI/TUI seams, durable
+Context/Task inspection and a normal ConPTY session without changing this
+shared operation. Exact outcome-unknown replay is proven only inside the same
+active client and attachment; packaged-binary behavior and recovery-capsule
+persistence across a client-process restart remain outside the claim.

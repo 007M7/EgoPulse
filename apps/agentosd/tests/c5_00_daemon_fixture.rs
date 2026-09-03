@@ -82,8 +82,9 @@ use egopulse_domain_contracts::v01::egopulse::{
         ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
     },
     localapi::v1::{
-        ClientSurface, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest, LocalApiErrorCode,
-        MemoryMutationCommand, OpenSessionRequest, RetrieveMemoryRequest,
+        ClientSurface, ConfirmWorkRequest, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
+        LocalApiErrorCode, MemoryMutationCommand, OpenSessionRequest, PrepareWorkRequest,
+        RetrieveMemoryRequest, WorkPreparationPreview,
         local_session_service_client::LocalSessionServiceClient, memory_mutation_command,
         retrieve_memory_response,
     },
@@ -94,7 +95,7 @@ use egopulse_domain_contracts::v01::egopulse::{
     task::v1::{
         ActivateTaskCommand, ApplyFounderVerdictCommand, CreateTaskCommand,
         RecordTaskVerificationCommand, RequestTaskCancellationCommand, SubmitTaskEvidenceCommand,
-        TaskCommand, TaskEvent, TaskSnapshot, TaskStatus, task_command,
+        TaskCommand, TaskCommandResult, TaskEvent, TaskSnapshot, TaskStatus, task_command,
     },
     verdict::v1::{
         ConfirmationClass, ConsumeFounderVerdictCommand, FounderVerdictDecision,
@@ -126,7 +127,9 @@ use egopulse_local_api::session::{
 };
 use egopulse_local_api::{
     LocalApiClient,
-    command_gateway::{CommandPortFailure, CommandPrincipal},
+    command_gateway::{
+        CommandPortFailure, CommandPortResult, CommandPrincipal, WorkPreparationPort,
+    },
 };
 use egopulse_local_ide_control::collaboration_control::{
     AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
@@ -144,8 +147,10 @@ use egopulse_policy_decision_authority::{
     ResolvedApprovalAuthorization,
 };
 use egopulse_tui::{
-    approval_queue::ApprovalQueueController, result_review::ResultReviewController,
+    approval_queue::ApprovalQueueController,
+    result_review::ResultReviewController,
     task_watch::TaskWatchController,
+    work_start::{WorkStartController, WorkStartStage},
 };
 use egopulse_v01_fault_conformance::memory_restart_oracle::MemoryRestartOracle;
 use egopulse_v01_fault_conformance::r8b2c::{
@@ -168,12 +173,17 @@ use egopulse_v01_fault_conformance::u03c_result_review::{
     ExpectedStoreProfile, GovernedResultDurabilitySnapshot, GovernedResultOracleRequest,
     read_governed_result_durability,
 };
+use egopulse_v01_fault_conformance::u04c_work_start::{
+    U04cContextRecord, U04cTaskRecord, U04cWorkStartDurabilitySnapshot, U04cWorkStartOracleRequest,
+    read_u04c_work_start_durability,
+};
 use egopulse_verification_authority::{
     ArtifactBackedReferenceResolver, AuthenticatedVerificationPrincipal, CriterionPolicySnapshot,
     VerificationAuthority, VerificationAuthorityConfig, VerificationPrincipalKind,
     VerificationSqlCipherKey, canonical_checker_profile_digest,
     canonical_request_digest as canonical_verification_request_digest,
 };
+use portable_pty::{CommandBuilder as PtyCommandBuilder, PtySize, native_pty_system};
 use prost::Message;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -218,6 +228,11 @@ const U03C_SENSITIVE_WORKSPACE: &str = "workspace-u03c-never-render";
 const U03C_SENSITIVE_RAW: &str = "raw-u03c-provider-harness-never-render";
 const U03C_TASK_SCHEMA_SHA256: &str =
     "468a3d02b5c0703eb1e7626fb70f1067905a603a98f959aabdf6c4b5961b0e32";
+const U04C_CONTEXT_SCHEMA_SHA256: &str =
+    "3aa12bbc894776e03fc1e732619b8cd5b318651316536f098e698a5695607d54";
+const U04C_PREPARE_POST_COMMIT_MODE: &str = "u04c-prepare-post-commit-unavailable";
+const U04C_CONFIRM_POST_COMMIT_MODE: &str = "u04c-confirm-post-commit-unavailable";
+const U04C_REPLAY_WITNESS_FILE: &str = "u04c-exact-replay.json";
 const U03C_COLLABORATION_SCHEMA_SHA256: &str =
     "c57c09247f94762b3a931d43c1e4db8b321abfea308e0493d729ecee771d1873";
 const U03C_ARTIFACT_SCHEMA_SHA256: &str =
@@ -2208,6 +2223,211 @@ fn fixture_mode() -> String {
     std::env::var(FIXTURE_MODE_ENV).unwrap_or_else(|_| "deny".to_owned())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum U04cInjectedOperation {
+    Prepare,
+    Confirm,
+}
+
+#[derive(Clone)]
+enum U04cFirstResponse {
+    Prepare(Box<WorkPreparationPreview>),
+    Confirm(Box<CommandPortResult<TaskCommandResult>>),
+}
+
+#[derive(Default)]
+struct U04cWorkPortState {
+    calls: u8,
+    request: Vec<u8>,
+    principal: Option<CommandPrincipal>,
+    response: Option<U04cFirstResponse>,
+    durability: Option<U04cWorkStartDurabilitySnapshot>,
+}
+
+#[derive(serde::Serialize)]
+struct U04cReplayWitness<'a> {
+    operation: &'a str,
+    process_id: u32,
+    request_sha256: String,
+    principal_id: &'a str,
+    calls: u8,
+    authority_tables_unchanged: bool,
+}
+
+struct U04cPostCommitUnavailableWorkPort {
+    inner: Arc<dyn WorkPreparationPort>,
+    root: PathBuf,
+    operation: U04cInjectedOperation,
+    state: Mutex<U04cWorkPortState>,
+}
+
+impl U04cPostCommitUnavailableWorkPort {
+    fn new(
+        inner: Arc<dyn WorkPreparationPort>,
+        root: PathBuf,
+        operation: U04cInjectedOperation,
+    ) -> Self {
+        Self {
+            inner,
+            root,
+            operation,
+            state: Mutex::new(U04cWorkPortState::default()),
+        }
+    }
+
+    fn durability(
+        &self,
+        snapshot_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> U04cWorkStartDurabilitySnapshot {
+        read_u04c_work_start_durability(&U04cWorkStartOracleRequest {
+            root: &self.root,
+            context_key: &[0x15; 32],
+            context_store_epoch: "c5-context-epoch",
+            context_schema_sha256: U04C_CONTEXT_SCHEMA_SHA256,
+            task_key: &[0x11; 32],
+            task_store_epoch: "c5-00-task-epoch",
+            task_schema_sha256: U03C_TASK_SCHEMA_SHA256,
+            snapshot_id,
+            task_id,
+        })
+        .expect("read U-04c Authority durability through the strict read-only oracle")
+    }
+
+    fn verify_replay(
+        &self,
+        state: &mut U04cWorkPortState,
+        request: &[u8],
+        principal: &CommandPrincipal,
+        response: U04cFirstResponse,
+        durability: U04cWorkStartDurabilitySnapshot,
+    ) -> Result<(), CommandPortFailure> {
+        let response_matches =
+            state
+                .response
+                .as_ref()
+                .is_some_and(|first| match (first, &response) {
+                    (U04cFirstResponse::Prepare(first), U04cFirstResponse::Prepare(second)) => {
+                        first == second
+                    }
+                    (U04cFirstResponse::Confirm(first), U04cFirstResponse::Confirm(second)) => {
+                        let mut normalized = second.clone();
+                        let replayed = normalized.result.replayed;
+                        normalized.result.replayed = first.result.replayed;
+                        replayed && first.result == normalized.result
+                    }
+                    _ => false,
+                });
+        if state.calls != 1
+            || state.request != request
+            || state.principal.as_ref() != Some(principal)
+            || !response_matches
+            || state.durability.as_ref() != Some(&durability)
+        {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        state.calls = 2;
+        let operation = match self.operation {
+            U04cInjectedOperation::Prepare => "prepare",
+            U04cInjectedOperation::Confirm => "confirm",
+        };
+        publish_r9a3_json_atomically(
+            &self.root.join(U04C_REPLAY_WITNESS_FILE),
+            &U04cReplayWitness {
+                operation,
+                process_id: std::process::id(),
+                request_sha256: format!("{:x}", Sha256::digest(request)),
+                principal_id: principal.principal_id.as_str(),
+                calls: state.calls,
+                authority_tables_unchanged: true,
+            },
+            "U-04c exact replay witness",
+        );
+        Ok(())
+    }
+}
+
+impl WorkPreparationPort for U04cPostCommitUnavailableWorkPort {
+    fn prepare(
+        &self,
+        request: &PrepareWorkRequest,
+        principal: &CommandPrincipal,
+    ) -> Result<WorkPreparationPreview, CommandPortFailure> {
+        if self.operation != U04cInjectedOperation::Prepare {
+            return self.inner.prepare(request, principal);
+        }
+        let encoded = request.encode_to_vec();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+        if state.calls >= 2 {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        let response = self.inner.prepare(request, principal)?;
+        let durability = self.durability(Some(response.snapshot_id.as_str()), None);
+        if state.calls == 0 {
+            state.calls = 1;
+            state.request = encoded;
+            state.principal = Some(principal.clone());
+            state.response = Some(U04cFirstResponse::Prepare(Box::new(response)));
+            state.durability = Some(durability);
+            return Err(CommandPortFailure::Unavailable);
+        }
+        self.verify_replay(
+            &mut state,
+            &encoded,
+            principal,
+            U04cFirstResponse::Prepare(Box::new(response.clone())),
+            durability,
+        )?;
+        Ok(response)
+    }
+
+    fn confirm(
+        &self,
+        request: &ConfirmWorkRequest,
+        principal: &CommandPrincipal,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        if self.operation != U04cInjectedOperation::Confirm {
+            return self.inner.confirm(request, principal);
+        }
+        let encoded = request.encode_to_vec();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+        if state.calls >= 2 {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        let response = self.inner.confirm(request, principal)?;
+        let task_id = match response.result.outcome.as_ref() {
+            Some(egopulse_domain_contracts::v01::egopulse::task::v1::task_command_result::Outcome::Task(task)) => task.task_id.as_str(),
+            _ => return Err(CommandPortFailure::IntegrityFailure),
+        };
+        let durability = self.durability(Some(request.snapshot_id.as_str()), Some(task_id));
+        if state.calls == 0 {
+            if response.result.replayed {
+                return Err(CommandPortFailure::IntegrityFailure);
+            }
+            state.calls = 1;
+            state.request = encoded;
+            state.principal = Some(principal.clone());
+            state.response = Some(U04cFirstResponse::Confirm(Box::new(response)));
+            state.durability = Some(durability);
+            return Err(CommandPortFailure::Unavailable);
+        }
+        self.verify_replay(
+            &mut state,
+            &encoded,
+            principal,
+            U04cFirstResponse::Confirm(Box::new(response.clone())),
+            durability,
+        )?;
+        Ok(response)
+    }
+}
+
 fn dynamic_fixture_mode() -> bool {
     matches!(
         fixture_mode().as_str(),
@@ -2241,6 +2461,8 @@ fn r9a3d_fixture_mode() -> bool {
             | R9A3D_EXTERNAL_RECOVERY_MODE
             | R9A3E_PREAUTH_UNAVAILABLE_MODE
             | R9A3E_REVOKED_READY_MODE
+            | U04C_PREPARE_POST_COMMIT_MODE
+            | U04C_CONFIRM_POST_COMMIT_MODE
     )
 }
 
@@ -3688,6 +3910,8 @@ fn open_fixture_providers(root: &Path) -> DaemonProviders {
             | R9A3D_EXTERNAL_RECOVERY_MODE
             | R9A3E_PREAUTH_UNAVAILABLE_MODE
             | R9A3E_REVOKED_READY_MODE
+            | U04C_PREPARE_POST_COMMIT_MODE
+            | U04C_CONFIRM_POST_COMMIT_MODE
     ) {
         open_fixture_providers_with_guards(
             root,
@@ -3849,8 +4073,21 @@ where
             .and_then(|port| port.with_activation_run_id(R8A_ACTIVATION_RUN_ID.to_owned()))
             .expect("R-8A Work Preparation dispatch binding");
     }
+    let work_port: Arc<dyn WorkPreparationPort> = match fixture_mode().as_str() {
+        U04C_PREPARE_POST_COMMIT_MODE => Arc::new(U04cPostCommitUnavailableWorkPort::new(
+            Arc::new(work_port),
+            root.to_owned(),
+            U04cInjectedOperation::Prepare,
+        )),
+        U04C_CONFIRM_POST_COMMIT_MODE => Arc::new(U04cPostCommitUnavailableWorkPort::new(
+            Arc::new(work_port),
+            root.to_owned(),
+            U04cInjectedOperation::Confirm,
+        )),
+        _ => Arc::new(work_port),
+    };
     let providers = providers
-        .with_work_preparation_port(Arc::new(work_port))
+        .with_work_preparation_port(work_port)
         .with_context_authority(Arc::clone(&context))
         .with_context_mutation(Arc::new(ContextMutationPortAdapter::new(
             Arc::clone(&context),
@@ -4015,6 +4252,8 @@ async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Chi
                     | U03C_RESULT_REVIEW_MODE
                     | U03C_RESULT_REVIEW_DENY_MODE
                     | U03C_RESULT_REVIEW_STALE_MODE
+                    | U04C_PREPARE_POST_COMMIT_MODE
+                    | U04C_CONFIRM_POST_COMMIT_MODE
             ) {
                 Stdio::inherit()
             } else {
@@ -9675,4 +9914,883 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
     let status = child.wait().await.expect("fixture child exit");
     assert!(status.success(), "fixture child failed: {status}");
     fs::remove_dir_all(&root).expect("remove successful C5 CLI fixture root");
+}
+
+fn u04c_durability(
+    root: &Path,
+    snapshot_id: Option<&str>,
+    task_id: Option<&str>,
+) -> U04cWorkStartDurabilitySnapshot {
+    read_u04c_work_start_durability(&U04cWorkStartOracleRequest {
+        root,
+        context_key: &[0x15; 32],
+        context_store_epoch: "c5-context-epoch",
+        context_schema_sha256: U04C_CONTEXT_SCHEMA_SHA256,
+        task_key: &[0x11; 32],
+        task_store_epoch: "c5-00-task-epoch",
+        task_schema_sha256: U03C_TASK_SCHEMA_SHA256,
+        snapshot_id,
+        task_id,
+    })
+    .expect("read U-04c durability snapshot")
+}
+
+fn u04c_assert_task_context_binding(
+    root: &Path,
+    task_record: &U04cTaskRecord,
+) -> U04cContextRecord {
+    let task_snapshot =
+        TaskSnapshot::decode(task_record.snapshot.as_slice()).expect("decode durable U-04c Task");
+    assert_eq!(task_snapshot.task_id, task_record.task_id);
+    assert_eq!(task_snapshot.revision, task_record.revision);
+    assert_eq!(task_snapshot.status, task_record.status);
+    assert!(
+        !task_snapshot.input_snapshot_id.is_empty(),
+        "durable U-04c Task must bind an input snapshot"
+    );
+    let bound = u04c_durability(
+        root,
+        Some(task_snapshot.input_snapshot_id.as_str()),
+        Some(task_record.task_id.as_str()),
+    );
+    assert_eq!(bound.task_record.as_ref(), Some(task_record));
+    let context = bound
+        .context_record
+        .expect("Task-bound U-04c Context snapshot must exist uniquely");
+    assert_eq!(context.snapshot_id, task_snapshot.input_snapshot_id);
+    assert_eq!(context.state, "issued");
+    context
+}
+
+async fn run_u04c_cli(instance: &str, arguments: &[&str]) -> std::process::Output {
+    run_bounded_fixture_command(
+        cli_executable(),
+        instance,
+        arguments,
+        "U-04c CLI subprocess",
+    )
+    .await
+}
+
+const U04C_CONPTY_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const U04C_CONPTY_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(12);
+
+struct U04cConptyOutput {
+    bytes: Vec<u8>,
+    screen: vt100::Parser,
+    overflowed: bool,
+    reader_error: Option<String>,
+}
+
+impl Default for U04cConptyOutput {
+    fn default() -> Self {
+        Self {
+            bytes: Vec::new(),
+            screen: vt100::Parser::new(32, 140, 0),
+            overflowed: false,
+            reader_error: None,
+        }
+    }
+}
+
+struct U04cConptySession {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Option<Box<dyn Write + Send>>,
+    output: Arc<Mutex<U04cConptyOutput>>,
+    reader: Option<thread::JoinHandle<()>>,
+    cursor_queries_answered: usize,
+}
+
+impl U04cConptySession {
+    fn spawn(instance: &str) -> Self {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 32,
+                cols: 140,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open U-04c Windows ConPTY");
+        let command = u04c_conpty_command(
+            tui_executable(),
+            &["--instance".to_owned(), instance.to_owned()],
+            instance,
+        );
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn normal egopulse-tui in U-04c ConPTY");
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("clone U-04c ConPTY reader");
+        let writer = pair.master.take_writer().expect("take U-04c ConPTY writer");
+        drop(pair.slave);
+
+        let output = Arc::new(Mutex::new(U04cConptyOutput::default()));
+        let reader_output = Arc::clone(&output);
+        let reader = thread::spawn(move || {
+            let mut chunk = [0_u8; 8192];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        let mut output = reader_output.lock().expect("lock U-04c ConPTY output");
+                        let remaining = U04C_CONPTY_OUTPUT_LIMIT.saturating_sub(output.bytes.len());
+                        let retained = read.min(remaining);
+                        output.bytes.extend_from_slice(&chunk[..retained]);
+                        output.screen.process(&chunk[..retained]);
+                        if retained != read {
+                            output.overflowed = true;
+                        }
+                    }
+                    Err(error) => {
+                        reader_output
+                            .lock()
+                            .expect("lock U-04c ConPTY reader error")
+                            .reader_error = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            child,
+            _master: pair.master,
+            writer: Some(writer),
+            output,
+            reader: Some(reader),
+            cursor_queries_answered: 0,
+        }
+    }
+
+    fn process_id(&self) -> u32 {
+        self.child
+            .process_id()
+            .expect("U-04c ConPTY child must expose its PID")
+    }
+
+    fn send_keys(&mut self, keys: &[u8]) {
+        let writer = self.writer.as_mut().expect("U-04c ConPTY writer");
+        writer.write_all(keys).expect("write U-04c ConPTY keys");
+        writer.flush().expect("flush U-04c ConPTY keys");
+    }
+
+    fn output_text(&self) -> String {
+        let output = self.output.lock().expect("lock U-04c ConPTY output");
+        assert!(!output.overflowed, "U-04c ConPTY output exceeded its cap");
+        assert!(
+            output.reader_error.is_none(),
+            "U-04c ConPTY reader failed: {:?}",
+            output.reader_error
+        );
+        String::from_utf8_lossy(&output.bytes).into_owned()
+    }
+
+    fn screen_text(&self) -> String {
+        let output = self.output.lock().expect("lock U-04c ConPTY screen");
+        assert!(!output.overflowed, "U-04c ConPTY output exceeded its cap");
+        assert!(
+            output.reader_error.is_none(),
+            "U-04c ConPTY reader failed: {:?}",
+            output.reader_error
+        );
+        output.screen.screen().contents()
+    }
+
+    async fn wait_for_checkpoint(&mut self, checkpoint: &str) {
+        let deadline = Instant::now() + U04C_CONPTY_CHECKPOINT_TIMEOUT;
+        loop {
+            let raw_output = self.output_text();
+            let cursor_queries = raw_output.matches("\u{1b}[6n").count();
+            while self.cursor_queries_answered < cursor_queries {
+                self.send_keys(b"\x1b[1;1R");
+                self.cursor_queries_answered += 1;
+            }
+            let screen = self.screen_text();
+            if screen.contains(checkpoint) {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().expect("inspect U-04c ConPTY child") {
+                panic!(
+                    "U-04c ConPTY exited before checkpoint {checkpoint:?}: {status:?}; screen={screen}; raw_output={raw_output}"
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "U-04c ConPTY missed checkpoint {checkpoint:?}; DSR={}/{}; screen={}; raw_tail={}",
+                cursor_queries,
+                self.cursor_queries_answered,
+                screen,
+                raw_output
+                    .chars()
+                    .rev()
+                    .take(4_000)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>(),
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn finish_successfully(&mut self) {
+        self.send_keys(b"q");
+        let deadline = Instant::now() + U04C_CONPTY_CHECKPOINT_TIMEOUT;
+        let status = loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .expect("inspect completed U-04c ConPTY child")
+            {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                self.child
+                    .kill()
+                    .expect("kill timed-out U-04c ConPTY child");
+                let reap_deadline = Instant::now() + R9A3_WITNESS_REAP_TIMEOUT;
+                while self
+                    .child
+                    .try_wait()
+                    .expect("reap killed U-04c ConPTY child")
+                    .is_none()
+                {
+                    assert!(
+                        Instant::now() < reap_deadline,
+                        "U-04c ConPTY child did not reap after timeout"
+                    );
+                    sleep(Duration::from_millis(25)).await;
+                }
+                panic!("U-04c ConPTY did not exit after q before its deadline");
+            }
+            sleep(Duration::from_millis(25)).await;
+        };
+        assert!(status.success(), "U-04c ConPTY failed: {status:?}");
+        self.writer.take();
+        let reader_deadline = Instant::now() + R9A3_WITNESS_REAP_TIMEOUT;
+        while self
+            .reader
+            .as_ref()
+            .is_some_and(|reader| !reader.is_finished())
+        {
+            assert!(
+                Instant::now() < reader_deadline,
+                "U-04c ConPTY reader did not finish"
+            );
+            sleep(Duration::from_millis(25)).await;
+        }
+        if let Some(reader) = self.reader.take() {
+            reader.join().expect("join U-04c ConPTY reader");
+        }
+    }
+}
+
+fn u04c_conpty_command(
+    program: impl AsRef<std::ffi::OsStr>,
+    arguments: &[String],
+    instance: &str,
+) -> PtyCommandBuilder {
+    const INHERITED_ENVIRONMENT: [&str; 9] = [
+        "SystemRoot",
+        "WINDIR",
+        "PATH",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+    ];
+    let mut command = PtyCommandBuilder::new(program);
+    command.env_clear();
+    for name in INHERITED_ENVIRONMENT {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.env("EGOPULSE_IPC_INSTANCE", instance);
+    command.args(arguments);
+    command
+}
+
+async fn assert_u04c_conpty_host_available(instance: &str) {
+    let system_root = std::env::var_os("SystemRoot").expect("SystemRoot for ConPTY canary");
+    let cmd = PathBuf::from(system_root).join("System32").join("cmd.exe");
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 8,
+            cols: 40,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open U-04c ConPTY canary");
+    let command = u04c_conpty_command(
+        cmd,
+        &[
+            "/d".to_owned(),
+            "/c".to_owned(),
+            "exit".to_owned(),
+            "/b".to_owned(),
+            "0".to_owned(),
+        ],
+        instance,
+    );
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("clone U-04c ConPTY canary reader");
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("take U-04c ConPTY canary writer");
+    let canary_output = Arc::new(Mutex::new(Vec::new()));
+    let reader_output = Arc::clone(&canary_output);
+    let reader = thread::spawn(move || {
+        let mut chunk = [0_u8; 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(read) => reader_output
+                    .lock()
+                    .expect("lock U-04c ConPTY canary output")
+                    .extend_from_slice(&chunk[..read]),
+                Err(error) => return Err(error),
+            }
+        }
+    });
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .expect("spawn U-04c ConPTY cmd canary");
+    drop(pair.slave);
+    let master = pair.master;
+    let deadline = Instant::now() + R9A3_WITNESS_REAP_TIMEOUT;
+    let mut answered_cursor_query = false;
+    let status = loop {
+        if !answered_cursor_query
+            && String::from_utf8_lossy(
+                &canary_output
+                    .lock()
+                    .expect("read U-04c ConPTY canary checkpoint"),
+            )
+            .contains("\u{1b}[6n")
+        {
+            writer
+                .write_all(b"\x1b[1;1R")
+                .expect("answer U-04c ConPTY canary cursor query");
+            writer
+                .flush()
+                .expect("flush U-04c ConPTY canary cursor answer");
+            answered_cursor_query = true;
+        }
+        if let Some(status) = child.try_wait().expect("inspect U-04c ConPTY cmd canary") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill U-04c ConPTY cmd canary");
+            let reap_deadline = Instant::now() + R9A3_WITNESS_REAP_TIMEOUT;
+            while child
+                .try_wait()
+                .expect("reap U-04c ConPTY cmd canary")
+                .is_none()
+            {
+                assert!(
+                    Instant::now() < reap_deadline,
+                    "U-04c ConPTY cmd canary did not reap"
+                );
+                sleep(Duration::from_millis(25)).await;
+            }
+            drop(writer);
+            drop(master);
+            let _ = reader.join();
+            let output = canary_output
+                .lock()
+                .expect("read timed-out U-04c ConPTY canary output")
+                .clone();
+            panic!(
+                "U-04c ConPTY cmd canary exceeded its deadline; output={}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        sleep(Duration::from_millis(25)).await;
+    };
+    drop(writer);
+    drop(master);
+    let read_result = reader.join().expect("join U-04c ConPTY canary reader");
+    read_result.expect("read U-04c ConPTY canary output");
+    let output = canary_output
+        .lock()
+        .expect("read U-04c ConPTY canary output")
+        .clone();
+    assert!(
+        status.success(),
+        "U-04c ConPTY cmd canary failed: {status:?}; output={}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+impl Drop for U04cConptySession {
+    fn drop(&mut self) {
+        self.writer.take();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let deadline = Instant::now() + R9A3_WITNESS_REAP_TIMEOUT;
+            while Instant::now() < deadline {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if self
+            .reader
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished)
+            && let Some(reader) = self.reader.take()
+        {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn selected_u04c_task_id(screen: &str) -> Option<String> {
+    screen.lines().find_map(|line| {
+        let selected = line.split_once('>')?.1.trim_start();
+        let task_id = selected.split_ascii_whitespace().next()?;
+        (task_id.starts_with("task")
+            && task_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, ':' | '-' | '_' | '.')
+            }))
+        .then(|| task_id.to_owned())
+    })
+}
+
+fn u04c_projection_task_count(screen: &str) -> Option<u64> {
+    let marker = "Connected · ";
+    let start = screen.find(marker)? + marker.len();
+    let count = screen[start..].split_ascii_whitespace().next()?;
+    count.parse().ok()
+}
+
+async fn stop_u04c_fixture(child: &mut Child, label: &str) {
+    let status = shutdown_fixture_child(child, label).await;
+    assert!(status.success(), "{label} failed: {status}");
+    assert!(
+        child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("inspect reaped {label}: {error}"))
+            .is_some(),
+        "{label} must be reaped"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u04c_real_cli_cancel_blocked_and_happy_have_exact_task_durability() {
+    for (case, source_exists, action, expect_success) in [
+        ("cancel", true, "--cancel", true),
+        ("blocked", false, "--confirm", false),
+        ("happy", true, "--confirm", true),
+    ] {
+        let root = std::env::temp_dir().join(format!("egopulse-u04c-{case}-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create U-04c CLI fixture root");
+        if source_exists {
+            fs::write(root.join("context.md"), "U-04c safe governed input")
+                .expect("write U-04c Context source");
+        }
+        let instance = format!("u04c-{case}-{}", Uuid::now_v7());
+        let mut child = spawn_fixture_with_mode(&root, &instance, "allow").await;
+        wait_for_cli_status_with_child(&instance, &mut child).await;
+        let before = u04c_durability(&root, None, None);
+        let output = run_u04c_cli(
+            &instance,
+            &[
+                "work",
+                "start",
+                "--intent",
+                "start one governed U-04c task",
+                "--scope",
+                "scope:u04c",
+                "--work-type",
+                "governed_repository_change",
+                "--context-ref",
+                "context.md",
+                action,
+                "--json",
+            ],
+        )
+        .await;
+        assert_eq!(
+            output.status.success(),
+            expect_success,
+            "{case}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("U-04c CLI JSON envelope");
+        let task_id = envelope["data"]["createdTaskId"].as_str();
+        let after = u04c_durability(&root, None, task_id);
+        if case == "happy" {
+            let task = after.task_record.as_ref().expect("happy path durable Task");
+            assert_eq!(task.task_id, task_id.expect("happy Task id"));
+            assert_ne!(task.status, TaskStatus::Completed as i32);
+            let context = u04c_assert_task_context_binding(&root, task);
+            assert_eq!(
+                context.snapshot_id,
+                TaskSnapshot::decode(task.snapshot.as_slice())
+                    .expect("decode happy Task")
+                    .input_snapshot_id
+            );
+            assert_eq!(
+                after
+                    .task
+                    .table_digests
+                    .iter()
+                    .find(|table| table.table_name == "tasks")
+                    .expect("Task table digest")
+                    .row_count,
+                1
+            );
+        } else {
+            assert_eq!(after.task, before.task, "{case} must write no Task tables");
+            assert!(after.task_record.is_none());
+            if case == "cancel" {
+                assert_eq!(
+                    after.context, before.context,
+                    "editing cancellation must not write Context tables"
+                );
+                assert!(after.context_record.is_none());
+            }
+        }
+        stop_u04c_fixture(&mut child, case).await;
+        fs::remove_dir_all(&root).expect("remove U-04c CLI fixture root");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u04c_post_commit_unavailable_exact_replays_without_authority_growth() {
+    for (case, mode) in [
+        ("prepare", U04C_PREPARE_POST_COMMIT_MODE),
+        ("confirm", U04C_CONFIRM_POST_COMMIT_MODE),
+    ] {
+        let root = std::env::temp_dir().join(format!("egopulse-u04c-{case}-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create U-04c replay fixture root");
+        fs::write(root.join("context.md"), "U-04c exact replay source")
+            .expect("write U-04c replay Context source");
+        let instance = format!("u04c-replay-{case}-{}", Uuid::now_v7());
+        let mut child = spawn_fixture_with_mode(&root, &instance, mode).await;
+        wait_for_cli_status_with_child(&instance, &mut child).await;
+        let task_id = if case == "prepare" {
+            let attachment = Arc::new(
+                attach_client_operation(
+                    &instance,
+                    ClientSurface::Tui,
+                    format!("u04c-prepare-replay-{}", Uuid::now_v7()),
+                )
+                .await
+                .expect("attach U-04c prepare recovery client"),
+            );
+            let mut controller = WorkStartController::new(attachment);
+            {
+                let draft = controller.model_mut().draft_mut();
+                draft.intent = "recover the exact U-04c request".to_owned();
+                draft.work_type = "governed_repository_change".to_owned();
+                draft.target_scope_ref = "scope:u04c-replay".to_owned();
+                draft.context_references = "context.md".to_owned();
+            }
+            controller.prepare().await.expect("start U-04c prepare");
+            timeout(Duration::from_secs(8), async {
+                while controller.model().stage() == WorkStartStage::Preparing {
+                    controller.pump().await.expect("pump unknown preparation");
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("unknown preparation deadline");
+            assert_eq!(
+                controller.model().stage(),
+                WorkStartStage::PreparationOutcomeUnknown
+            );
+            controller
+                .replay_preparation()
+                .await
+                .expect("start exact preparation replay");
+            timeout(Duration::from_secs(8), async {
+                while controller.model().stage() == WorkStartStage::Preparing {
+                    controller.pump().await.expect("pump preparation replay");
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("preparation replay deadline");
+            assert_eq!(controller.model().stage(), WorkStartStage::PreviewReady);
+            controller
+                .cancel_preview()
+                .await
+                .expect("discard prepared preview");
+            None
+        } else {
+            let output = run_u04c_cli(
+                &instance,
+                &[
+                    "work",
+                    "start",
+                    "--intent",
+                    "recover the exact U-04c request",
+                    "--scope",
+                    "scope:u04c-replay",
+                    "--work-type",
+                    "governed_repository_change",
+                    "--context-ref",
+                    "context.md",
+                    "--confirm",
+                    "--json",
+                ],
+            )
+            .await;
+            assert!(
+                output.status.success(),
+                "{case}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("U-04c replay CLI JSON");
+            Some(
+                envelope["data"]["createdTaskId"]
+                    .as_str()
+                    .expect("U-04c replay Task id")
+                    .to_owned(),
+            )
+        };
+        let witness: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join(U04C_REPLAY_WITNESS_FILE)).expect("read U-04c replay witness"),
+        )
+        .expect("decode U-04c replay witness");
+        assert_eq!(witness["operation"], case);
+        assert_eq!(witness["calls"], 2);
+        assert_eq!(witness["authority_tables_unchanged"], true);
+        assert_eq!(
+            witness["process_id"],
+            u64::from(child.id().expect("daemon pid"))
+        );
+        assert_eq!(witness["principal_id"], "os-user:c5-fixture");
+        assert_eq!(witness["request_sha256"].as_str().map(str::len), Some(64));
+        if let Some(task_id) = task_id.as_deref() {
+            assert!(
+                u04c_durability(&root, None, Some(task_id))
+                    .task_record
+                    .is_some()
+            );
+        } else {
+            assert_eq!(
+                u04c_durability(&root, None, None)
+                    .task
+                    .table_digests
+                    .iter()
+                    .find(|table| table.table_name == "tasks")
+                    .expect("Task table digest")
+                    .row_count,
+                0
+            );
+        }
+        stop_u04c_fixture(&mut child, case).await;
+        fs::remove_dir_all(&root).expect("remove U-04c replay fixture root");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u04c_production_tui_controllers_share_attachment_and_select_exact_confirmed_task() {
+    let root = std::env::temp_dir().join(format!("egopulse-u04c-controller-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create U-04c controller fixture root");
+    fs::write(root.join("context.md"), "U-04c controller Context")
+        .expect("write U-04c controller Context source");
+    let instance = format!("u04c-controller-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, "allow").await;
+    wait_for_cli_status_with_child(&instance, &mut child).await;
+
+    let attachment = Arc::new(
+        attach_client_operation(
+            &instance,
+            ClientSurface::Tui,
+            format!("u04c-controller-{}", Uuid::now_v7()),
+        )
+        .await
+        .expect("attach U-04c production TUI client"),
+    );
+    let work_attachment = Arc::clone(&attachment);
+    let watch_attachment = Arc::clone(&attachment);
+    assert!(Arc::ptr_eq(&work_attachment, &watch_attachment));
+    let mut work = WorkStartController::new(work_attachment);
+    let mut watch = TaskWatchController::new(watch_attachment);
+    watch
+        .start()
+        .await
+        .expect("open pre-confirm Task Watch baseline");
+    {
+        let draft = work.model_mut().draft_mut();
+        draft.intent = "start from the U-04c TUI controller".to_owned();
+        draft.work_type = "governed_repository_change".to_owned();
+        draft.target_scope_ref = "scope:u04c-controller".to_owned();
+        draft.context_references = "context.md".to_owned();
+    }
+    work.prepare().await.expect("start U-04c preparation");
+    timeout(Duration::from_secs(8), async {
+        while work.model().stage() == WorkStartStage::Preparing {
+            work.pump().await.expect("pump U-04c preparation");
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("U-04c preparation deadline");
+    assert_eq!(work.model().stage(), WorkStartStage::PreviewReady);
+    work.confirm().await.expect("start U-04c confirmation");
+    let task_id = timeout(Duration::from_secs(8), async {
+        loop {
+            work.pump().await.expect("pump U-04c confirmation");
+            if let Some(task_id) = work.take_confirmed_task_id() {
+                break task_id;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("U-04c confirmation deadline");
+
+    assert!(!watch.select_task(&task_id));
+    watch.clear_selection();
+    assert_eq!(
+        watch
+            .model()
+            .and_then(|model| model.selected_task_id.as_deref()),
+        None,
+        "projection lag must not select an unrelated Task"
+    );
+    timeout(Duration::from_secs(8), async {
+        loop {
+            watch
+                .pump()
+                .await
+                .expect("pump exact U-04c Task projection");
+            if watch.select_task(&task_id) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("exact U-04c Task projection deadline");
+    let selected = watch
+        .model()
+        .and_then(|model| model.selected_task_id.as_deref())
+        .expect("exact U-04c selected Task");
+    assert_eq!(selected, task_id);
+    let projected = watch
+        .model()
+        .expect("U-04c Task Watch model")
+        .tasks
+        .iter()
+        .filter_map(|view| view.task.as_ref())
+        .find(|task| task.task_id == task_id)
+        .expect("U-04c confirmed Task projection");
+    assert_ne!(projected.status, TaskStatus::Completed as i32);
+    let durable = u04c_durability(&root, None, Some(&task_id));
+    let task_record = durable.task_record.expect("U-04c durable Task");
+    assert_eq!(task_record.task_id, task_id);
+    assert_eq!(task_record.status, projected.status);
+
+    watch.stop().await;
+    stop_u04c_fixture(&mut child, "U-04c controller daemon").await;
+    drop(work);
+    drop(watch);
+    drop(attachment);
+    fs::remove_dir_all(&root).expect("remove U-04c controller fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u04c_real_windows_conpty_drives_normal_tui_from_dashboard_to_exact_task_watch() {
+    const DAEMON_ONLY_CANARY: &str = "U04C_DAEMON_ONLY_CONTEXT_CANARY_NEVER_RENDER";
+    let root = std::env::temp_dir().join(format!("egopulse-u04c-conpty-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create U-04c ConPTY fixture root");
+    fs::write(root.join("context.md"), DAEMON_ONLY_CANARY)
+        .expect("write U-04c ConPTY Context source");
+    let instance = format!("u04c-conpty-{}", Uuid::now_v7());
+    let mut daemon = spawn_fixture_with_mode(&root, &instance, "allow").await;
+    let daemon_pid = daemon.id().expect("U-04c ConPTY daemon PID");
+    wait_for_cli_status_with_child(&instance, &mut daemon).await;
+    let before = u04c_durability(&root, None, None);
+
+    assert_u04c_conpty_host_available(&instance).await;
+    let mut terminal = U04cConptySession::spawn(&instance);
+    assert_ne!(terminal.process_id(), std::process::id());
+    assert_ne!(terminal.process_id(), daemon_pid);
+    terminal.wait_for_checkpoint("n new work").await;
+    let projection_task_count_before = u04c_projection_task_count(&terminal.screen_text())
+        .expect("Dashboard must expose its current projected Task count");
+    terminal.send_keys(b"n");
+    terminal.wait_for_checkpoint("Stage: Editing").await;
+    terminal.send_keys(
+        b"start one governed U-04c ConPTY task\tgoverned_repository_change\tscope:u04c-conpty\tcontext.md\r",
+    );
+    terminal
+        .wait_for_checkpoint("Review the governed preview; Enter")
+        .await;
+    terminal.send_keys(b"\r");
+    terminal.wait_for_checkpoint("Task Watch").await;
+    terminal
+        .wait_for_checkpoint(format!("{} tasks", projection_task_count_before + 1).as_str())
+        .await;
+    let rendered = terminal.output_text();
+    let task_watch_screen = terminal.screen_text();
+    assert!(
+        task_watch_screen.contains("Task Watch"),
+        "the current ConPTY screen must be the post-confirmation Task Watch"
+    );
+    let task_id = selected_u04c_task_id(&task_watch_screen)
+        .expect("Task Watch must select the exact governed Task after confirmation");
+    assert!(
+        !rendered.contains(DAEMON_ONLY_CANARY),
+        "the TUI must not render daemon-only Context contents"
+    );
+    assert!(!rendered.contains("TASK_STATUS_COMPLETED"));
+    terminal.finish_successfully().await;
+
+    let after = u04c_durability(&root, None, Some(&task_id));
+    let task = after
+        .task_record
+        .as_ref()
+        .expect("U-04c ConPTY durable Task");
+    assert_eq!(task.task_id, task_id);
+    assert_ne!(task.status, TaskStatus::Completed as i32);
+    let context = u04c_assert_task_context_binding(&root, task);
+    assert_eq!(
+        context.snapshot_id,
+        TaskSnapshot::decode(task.snapshot.as_slice())
+            .expect("decode ConPTY Task")
+            .input_snapshot_id
+    );
+    assert_eq!(
+        after
+            .task
+            .table_digests
+            .iter()
+            .find(|table| table.table_name == "tasks")
+            .expect("U-04c ConPTY tasks table")
+            .row_count,
+        before
+            .task
+            .table_digests
+            .iter()
+            .find(|table| table.table_name == "tasks")
+            .expect("U-04c pre-ConPTY tasks table")
+            .row_count
+            + 1
+    );
+
+    drop(terminal);
+    stop_u04c_fixture(&mut daemon, "U-04c ConPTY daemon").await;
+    fs::remove_dir_all(&root).expect("remove U-04c ConPTY fixture root");
 }

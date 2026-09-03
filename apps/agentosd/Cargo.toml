@@ -39,6 +39,8 @@ egopulse-client-operations.workspace = true
 egopulse-dsh-adapter.workspace = true
 egopulse-tui = { path = "../tui" }
 egopulse-v01-fault-conformance = { path = "../../contracts/toolchain/fault-conformance" }
+portable-pty = "=0.9.0"
+vt100 = "=0.16.2"
 
 [[bin]]
 name = "agentosd"

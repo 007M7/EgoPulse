@@ -113,8 +113,10 @@ the warnings do not change the verified behavior in this slice.
 U-04b proves the TUI component and application lifecycle integration over the
 shared guided Work Start operation. It does not complete U-04.
 
-U-04c remains pending and must provide evidence from a real daemon process,
-Windows IPC, the production command seam, durable Authority stores and a real
-ConPTY/terminal interaction. This slice does not prove cross-process recovery,
-packaged-binary behavior, real terminal cleanup or persistent database effects,
-and none of those claims should be inferred from the 49 component tests.
+U-04c is now locally verified by
+`phase-2-70-guided-work-start-real-daemon-evidence-20260904.md`. It exercises
+this production controller against a real daemon and Windows IPC, binds the
+confirmed Task to the durable stores, and drives the normal TUI through a real
+ConPTY session. The evidence remains local debug-binary evidence: it does not
+prove packaged installation or recovery-capsule persistence across a client
+process restart.
