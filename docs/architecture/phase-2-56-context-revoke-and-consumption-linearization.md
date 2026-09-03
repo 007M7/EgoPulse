@@ -603,6 +603,10 @@ non-owner revoke, making revoke retroactive, adding an authorization TTL,
 exposing raw audit references, moving retention to an external system, or
 expanding into R-9B/R-9C or capability revocation.
 
+The R-9B-only expansion decision was subsequently granted and is recorded in
+`phase-2-75-r9b-governed-state-dual-stream-contract-20260904.md`. That decision
+does not authorize R-9C, capability revocation or any change to R-9A defaults.
+
 ## Exit condition
 
 R-9A is complete only when all three sub-slices and all applicable Gates have
