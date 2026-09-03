@@ -375,4 +375,109 @@ mod tests {
             DriverFailure::Fatal(GovernedFatalCause::ProjectionIntegrityFailure),
         );
     }
+
+    #[test]
+    fn r9b2a_top_level_failure_matrix_is_symmetric_and_stage_invariant() {
+        for stage in STAGES {
+            assert_eq!(
+                classify_task_error(
+                    stage,
+                    &ClientGovernedTaskError::Transport("transport down".to_owned())
+                ),
+                DriverFailure::Recoverable(GovernedRecoverableCause::TransportUnavailable)
+            );
+            assert_eq!(
+                classify_approval_error(
+                    stage,
+                    &ClientApprovalWatchError::Transport("transport down".to_owned())
+                ),
+                DriverFailure::Recoverable(GovernedRecoverableCause::TransportUnavailable)
+            );
+            assert_eq!(
+                classify_task_error(stage, &ClientGovernedTaskError::UnexpectedEof),
+                DriverFailure::Recoverable(GovernedRecoverableCause::UnexpectedEof)
+            );
+            assert_eq!(
+                classify_approval_error(stage, &ClientApprovalWatchError::UnexpectedEof),
+                DriverFailure::Recoverable(GovernedRecoverableCause::UnexpectedEof)
+            );
+            assert_eq!(
+                classify_task_error(stage, &ClientGovernedTaskError::ResetBarrier),
+                DriverFailure::Reset
+            );
+            assert_eq!(
+                classify_approval_error(stage, &ClientApprovalWatchError::ResetBarrier),
+                DriverFailure::Reset
+            );
+            assert_eq!(
+                classify_task_error(stage, &ClientGovernedTaskError::Protocol("integrity")),
+                DriverFailure::Fatal(GovernedFatalCause::ProjectionIntegrityFailure)
+            );
+            assert_eq!(
+                classify_approval_error(stage, &ClientApprovalWatchError::Protocol("integrity")),
+                DriverFailure::Fatal(GovernedFatalCause::ProjectionIntegrityFailure)
+            );
+            assert_eq!(
+                classify_task_error(stage, &ClientGovernedTaskError::BaselineLimitExceeded),
+                DriverFailure::Fatal(GovernedFatalCause::BaselineLimitExceeded)
+            );
+            assert_eq!(
+                classify_approval_error(stage, &ClientApprovalWatchError::BaselineLimitExceeded),
+                DriverFailure::Fatal(GovernedFatalCause::BaselineLimitExceeded)
+            );
+        }
+    }
+
+    #[test]
+    fn r9b2a_kernel_unknown_fallback_and_worker_unavailable_maps_by_retryable() {
+        assert_kernel_classification(
+            || KernelError::UnknownServerError,
+            DriverFailure::Fatal(GovernedFatalCause::ProjectionIntegrityFailure),
+        );
+        assert_kernel_classification(
+            || KernelError::InvalidSurface,
+            DriverFailure::Fatal(GovernedFatalCause::ProjectionIntegrityFailure),
+        );
+        assert_kernel_classification(
+            || KernelError::InvalidIdentifier,
+            DriverFailure::Fatal(GovernedFatalCause::ProjectionIntegrityFailure),
+        );
+        assert_kernel_classification(
+            || KernelError::UnknownPermission("perm".to_owned()),
+            DriverFailure::Fatal(GovernedFatalCause::ProjectionIntegrityFailure),
+        );
+        assert_kernel_classification(
+            || KernelError::UnknownRpc("rpc".to_owned()),
+            DriverFailure::Fatal(GovernedFatalCause::ProjectionIntegrityFailure),
+        );
+        assert_kernel_classification(
+            || KernelError::UnknownStreamFrame,
+            DriverFailure::Fatal(GovernedFatalCause::ProjectionIntegrityFailure),
+        );
+        assert_kernel_classification(
+            || KernelError::StreamPositionInvalid,
+            DriverFailure::Fatal(GovernedFatalCause::ProjectionIntegrityFailure),
+        );
+
+        assert_local_api_classification(
+            LocalApiErrorCode::CognitionWorkerUnavailable as i32,
+            true,
+            DriverFailure::Recoverable(GovernedRecoverableCause::RetryableApiRejected),
+        );
+        assert_local_api_classification(
+            LocalApiErrorCode::CognitionWorkerUnavailable as i32,
+            false,
+            DriverFailure::Fatal(GovernedFatalCause::ApiRejected),
+        );
+        assert_kernel_server_classification(
+            LocalApiErrorCode::CognitionWorkerUnavailable,
+            true,
+            DriverFailure::Recoverable(GovernedRecoverableCause::RetryableApiRejected),
+        );
+        assert_kernel_server_classification(
+            LocalApiErrorCode::CognitionWorkerUnavailable,
+            false,
+            DriverFailure::Fatal(GovernedFatalCause::ApiRejected),
+        );
+    }
 }
