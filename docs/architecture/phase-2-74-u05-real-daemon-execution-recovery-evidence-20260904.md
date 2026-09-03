@@ -83,7 +83,15 @@ Changed files for the complete slice are limited to:
 
 - `apps/agentosd/tests/c5_00_daemon_fixture.rs`
 - `contracts/toolchain/fault-conformance/src/u03c_result_review.rs`
+- `contracts/manifest.json`
+- `generated/contract-bindings-manifest.json`
+- `scripts/contract-codegen.ps1`
+- `scripts/verify-v01-contract-import.mjs`
 - `docs/architecture/phase-2-74-u05-real-daemon-execution-recovery-evidence-20260904.md`
+
+The manifest and code-generation pin updates only acknowledge the changed
+read-only conformance-oracle digest. They do not add a contract artifact,
+change the draft version, regenerate bindings or alter product semantics.
 
 ## Verification
 
@@ -113,6 +121,9 @@ cargo fmt --all -- --check
 
 git diff --check
   passed
+
+pnpm run check
+  passed (contract import, codegen, package integrity and TypeScript checks)
 ```
 
 Windows linking may emit the existing missing `ossl_static.pdb` LNK4099
