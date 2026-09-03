@@ -366,6 +366,13 @@ impl<C: TaskWatchClient + ?Sized + 'static> TaskWatchController<C> {
         }
     }
 
+    /// Clears only the local page selection; projected Task facts remain unchanged.
+    pub fn clear_selection(&mut self) {
+        if let Some(model) = &mut self.model {
+            model.selected_task_id = None;
+        }
+    }
+
     fn select_relative(&mut self, forward: bool) {
         let Some(model) = &mut self.model else {
             return;

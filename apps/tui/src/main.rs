@@ -60,6 +60,7 @@ use egopulse_tui::result_review::{
 use egopulse_tui::task_watch::{
     TaskWatchClient, TaskWatchController, TaskWatchOpenFuture, TaskWatchPageModel,
 };
+use egopulse_tui::work_start::{WorkStartController, WorkStartStage, render_work_start_page};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -841,6 +842,7 @@ impl CommandForm {
 
 enum InteractiveMode {
     Dashboard,
+    WorkStart,
     TaskWatch,
     ResultReview,
     ApprovalQueue,
@@ -854,6 +856,14 @@ enum InteractiveAction {
     Command(Box<TuiCommand>),
     StageContextRevoke(ContextRevokeInput),
     ConfirmContextRevoke,
+    OpenWorkStart,
+    CloseWorkStart,
+    PrepareWorkStart,
+    ReplayWorkPreparation,
+    CancelWorkPreview,
+    ConfirmWorkStart,
+    ReplayWorkConfirmation,
+    OpenTaskWatchForWorkReconciliation,
     OpenTaskWatch,
     RefetchTaskWatch,
     CloseTaskWatch,
@@ -865,6 +875,146 @@ enum InteractiveAction {
     CloseApprovalQueue,
     SubmitApprovalDecision,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkStartKeyIntent {
+    Ignore,
+    Quit,
+    Close,
+    NextField,
+    PreviousField,
+    Backspace,
+    Push(char),
+    Prepare,
+    WaitForPreparation,
+    Confirm,
+    CancelPreview,
+    ReplayPreparation,
+    KeepPreparationRecovery,
+    ConfirmationCannotCancel,
+    ReplayConfirmation,
+    ReconcileInTaskWatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkStartExitPolicy {
+    DropSettled,
+    CancelPreview,
+    AwaitSettlement,
+    PreserveRecovery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkStartMutationAction {
+    Prepare,
+    ReplayPreparation,
+    CancelPreview,
+    Confirm,
+    ReplayConfirmation,
+}
+
+type WorkStartMutationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+trait WorkStartMutationTarget {
+    fn prepare_mutation(&mut self) -> WorkStartMutationFuture<'_>;
+    fn replay_preparation_mutation(&mut self) -> WorkStartMutationFuture<'_>;
+    fn cancel_preview_mutation(&mut self) -> WorkStartMutationFuture<'_>;
+    fn confirm_mutation(&mut self) -> WorkStartMutationFuture<'_>;
+    fn replay_confirmation_mutation(&mut self) -> WorkStartMutationFuture<'_>;
+}
+
+impl WorkStartMutationTarget for WorkStartController {
+    fn prepare_mutation(&mut self) -> WorkStartMutationFuture<'_> {
+        Box::pin(self.prepare())
+    }
+
+    fn replay_preparation_mutation(&mut self) -> WorkStartMutationFuture<'_> {
+        Box::pin(self.replay_preparation())
+    }
+
+    fn cancel_preview_mutation(&mut self) -> WorkStartMutationFuture<'_> {
+        Box::pin(self.cancel_preview())
+    }
+
+    fn confirm_mutation(&mut self) -> WorkStartMutationFuture<'_> {
+        Box::pin(self.confirm())
+    }
+
+    fn replay_confirmation_mutation(&mut self) -> WorkStartMutationFuture<'_> {
+        Box::pin(self.replay_confirmation())
+    }
+}
+
+async fn execute_work_start_mutation<T: WorkStartMutationTarget + ?Sized>(
+    target: &mut T,
+    action: WorkStartMutationAction,
+) -> Result<(), String> {
+    match action {
+        WorkStartMutationAction::Prepare => target.prepare_mutation().await,
+        WorkStartMutationAction::ReplayPreparation => target.replay_preparation_mutation().await,
+        WorkStartMutationAction::CancelPreview => target.cancel_preview_mutation().await,
+        WorkStartMutationAction::Confirm => target.confirm_mutation().await,
+        WorkStartMutationAction::ReplayConfirmation => target.replay_confirmation_mutation().await,
+    }
+}
+
+fn work_start_exit_policy(stage: WorkStartStage, running: bool) -> WorkStartExitPolicy {
+    if running {
+        WorkStartExitPolicy::AwaitSettlement
+    } else {
+        match stage {
+            WorkStartStage::PreviewReady => WorkStartExitPolicy::CancelPreview,
+            WorkStartStage::PreparationOutcomeUnknown
+            | WorkStartStage::ConfirmationOutcomeUnknown => WorkStartExitPolicy::PreserveRecovery,
+            WorkStartStage::Editing
+            | WorkStartStage::Preparing
+            | WorkStartStage::Confirming
+            | WorkStartStage::Failed => WorkStartExitPolicy::DropSettled,
+        }
+    }
+}
+
+fn work_start_key_intent(
+    stage: WorkStartStage,
+    key: crossterm::event::KeyEvent,
+) -> WorkStartKeyIntent {
+    match (stage, key.code) {
+        (_, KeyCode::Char('q')) => WorkStartKeyIntent::Quit,
+        (WorkStartStage::Editing, KeyCode::Esc) | (WorkStartStage::Failed, KeyCode::Esc) => {
+            WorkStartKeyIntent::Close
+        }
+        (WorkStartStage::Editing, KeyCode::Tab) => WorkStartKeyIntent::NextField,
+        (WorkStartStage::Editing, KeyCode::BackTab) => WorkStartKeyIntent::PreviousField,
+        (WorkStartStage::Editing, KeyCode::Backspace) => WorkStartKeyIntent::Backspace,
+        (WorkStartStage::Editing, KeyCode::Char(character))
+            if !key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            WorkStartKeyIntent::Push(character)
+        }
+        (WorkStartStage::Editing | WorkStartStage::Failed, KeyCode::Enter) => {
+            WorkStartKeyIntent::Prepare
+        }
+        (WorkStartStage::Preparing, KeyCode::Esc) => WorkStartKeyIntent::WaitForPreparation,
+        (WorkStartStage::PreviewReady, KeyCode::Enter) => WorkStartKeyIntent::Confirm,
+        (WorkStartStage::PreviewReady, KeyCode::Esc) => WorkStartKeyIntent::CancelPreview,
+        (WorkStartStage::PreparationOutcomeUnknown, KeyCode::Enter) => {
+            WorkStartKeyIntent::ReplayPreparation
+        }
+        (WorkStartStage::PreparationOutcomeUnknown, KeyCode::Esc) => {
+            WorkStartKeyIntent::KeepPreparationRecovery
+        }
+        (WorkStartStage::Confirming, KeyCode::Esc) => WorkStartKeyIntent::ConfirmationCannotCancel,
+        (WorkStartStage::ConfirmationOutcomeUnknown, KeyCode::Enter) => {
+            WorkStartKeyIntent::ReplayConfirmation
+        }
+        (WorkStartStage::ConfirmationOutcomeUnknown, KeyCode::Char('w')) => {
+            WorkStartKeyIntent::ReconcileInTaskWatch
+        }
+        _ => WorkStartKeyIntent::Ignore,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1001,6 +1151,9 @@ trait InteractiveClient: TaskWatchClient + ApprovalQueueClient + TaskResultRevie
         &self,
         input: ContextRevokeInput,
     ) -> Result<PendingContextRevoke, String>;
+    fn work_start_controller(&self) -> Result<WorkStartController, String> {
+        Err("Work Start is unavailable for this client".to_owned())
+    }
 }
 
 struct AttachedClient(Arc<ClientAttachment>);
@@ -1090,6 +1243,10 @@ impl InteractiveClient for AttachedClient {
             Arc::clone(&self.0),
             prepared,
         ))
+    }
+
+    fn work_start_controller(&self) -> Result<WorkStartController, String> {
+        Ok(WorkStartController::new(Arc::clone(&self.0)))
     }
 }
 
@@ -2456,6 +2613,8 @@ struct App {
     task_watch: Option<TaskWatchController<dyn InteractiveClient>>,
     approval_queue: Option<ApprovalQueueController<dyn InteractiveClient>>,
     result_review: Option<ResultReviewController<dyn InteractiveClient>>,
+    work_start: Option<WorkStartController>,
+    pending_task_watch_selection: Option<String>,
 }
 
 impl App {
@@ -2471,6 +2630,8 @@ impl App {
             task_watch: None,
             approval_queue: None,
             result_review: None,
+            work_start: None,
+            pending_task_watch_selection: None,
         }
     }
 
@@ -2507,8 +2668,87 @@ impl App {
                 KeyCode::Char('r') => Ok(None),
                 KeyCode::Char('w') => Ok(Some(InteractiveAction::OpenTaskWatch)),
                 KeyCode::Char('a') => Ok(Some(InteractiveAction::OpenApprovalQueue)),
+                KeyCode::Char('n') => Ok(Some(InteractiveAction::OpenWorkStart)),
+                KeyCode::Char('q') | KeyCode::Esc => Ok(Some(InteractiveAction::Quit)),
                 _ => Ok(None),
             },
+            InteractiveMode::WorkStart => {
+                let stage = self
+                    .work_start
+                    .as_ref()
+                    .map(|controller| controller.model().stage())
+                    .ok_or_else(|| "Work Start controller is unavailable".to_owned())?;
+                match work_start_key_intent(stage, key) {
+                    WorkStartKeyIntent::Quit => Ok(Some(InteractiveAction::Quit)),
+                    WorkStartKeyIntent::Close => Ok(Some(InteractiveAction::CloseWorkStart)),
+                    WorkStartKeyIntent::NextField => {
+                        self.work_start
+                            .as_mut()
+                            .expect("Work Start controller exists")
+                            .model_mut()
+                            .next_field();
+                        Ok(None)
+                    }
+                    WorkStartKeyIntent::PreviousField => {
+                        self.work_start
+                            .as_mut()
+                            .expect("Work Start controller exists")
+                            .model_mut()
+                            .previous_field();
+                        Ok(None)
+                    }
+                    WorkStartKeyIntent::Backspace => {
+                        self.work_start
+                            .as_mut()
+                            .expect("Work Start controller exists")
+                            .model_mut()
+                            .backspace();
+                        Ok(None)
+                    }
+                    WorkStartKeyIntent::Push(character) => {
+                        self.work_start
+                            .as_mut()
+                            .expect("Work Start controller exists")
+                            .model_mut()
+                            .push(character);
+                        Ok(None)
+                    }
+                    WorkStartKeyIntent::Prepare => Ok(Some(InteractiveAction::PrepareWorkStart)),
+                    WorkStartKeyIntent::WaitForPreparation => {
+                        self.work_start
+                            .as_mut()
+                            .expect("Work Start controller exists")
+                            .request_return_after_preparation();
+                        Ok(None)
+                    }
+                    WorkStartKeyIntent::Confirm => Ok(Some(InteractiveAction::ConfirmWorkStart)),
+                    WorkStartKeyIntent::CancelPreview => {
+                        Ok(Some(InteractiveAction::CancelWorkPreview))
+                    }
+                    WorkStartKeyIntent::ReplayPreparation => {
+                        Ok(Some(InteractiveAction::ReplayWorkPreparation))
+                    }
+                    WorkStartKeyIntent::KeepPreparationRecovery => {
+                        self.message = "Preparation outcome remains unknown; Enter exact-replays the sealed request"
+                            .to_owned();
+                        Ok(None)
+                    }
+                    WorkStartKeyIntent::ConfirmationCannotCancel => {
+                        self.work_start
+                            .as_mut()
+                            .expect("Work Start controller exists")
+                            .note_confirmation_cannot_cancel();
+                        Ok(None)
+                    }
+                    WorkStartKeyIntent::ReplayConfirmation => {
+                        Ok(Some(InteractiveAction::ReplayWorkConfirmation))
+                    }
+                    WorkStartKeyIntent::ReconcileInTaskWatch => {
+                        Ok(Some(InteractiveAction::OpenTaskWatchForWorkReconciliation))
+                    }
+                    WorkStartKeyIntent::Ignore => Ok(None),
+                }
+            }
             InteractiveMode::TaskWatch => match key.code {
                 KeyCode::Esc => Ok(Some(InteractiveAction::CloseTaskWatch)),
                 KeyCode::Char('r') => Ok(Some(InteractiveAction::RefetchTaskWatch)),
@@ -2526,14 +2766,20 @@ impl App {
                     Ok(None)
                 }
                 KeyCode::Enter
-                    if self
-                        .task_watch
-                        .as_ref()
-                        .and_then(|controller| controller.model())
-                        .and_then(|model| model.selected_task_id.as_ref())
-                        .is_some() =>
+                    if self.pending_task_watch_selection.is_none()
+                        && self
+                            .task_watch
+                            .as_ref()
+                            .and_then(|controller| controller.model())
+                            .and_then(|model| model.selected_task_id.as_ref())
+                            .is_some() =>
                 {
                     Ok(Some(InteractiveAction::OpenResultReview))
+                }
+                KeyCode::Enter if self.pending_task_watch_selection.is_some() => {
+                    self.message = "Authority confirmed the Task, but its exact projection has not arrived; result review remains blocked"
+                        .to_owned();
+                    Ok(None)
                 }
                 _ => Ok(None),
             },
@@ -2858,7 +3104,152 @@ impl App {
         Ok(())
     }
 
+    async fn start_work_start(&mut self) -> Result<(), String> {
+        if self.work_start.is_some() {
+            self.stop_task_watch().await;
+            self.stop_approval_queue().await;
+            self.stop_result_review().await;
+            let controller = self
+                .work_start
+                .as_ref()
+                .expect("retained Work Start controller exists");
+            self.message = controller.model().message().to_owned();
+            self.mode = InteractiveMode::WorkStart;
+            return Ok(());
+        }
+        self.stop_task_watch().await;
+        self.stop_approval_queue().await;
+        self.stop_result_review().await;
+        self.ensure_task_watch_client().await?;
+        let controller = self
+            .client
+            .as_ref()
+            .expect("Work Start client is attached")
+            .work_start_controller()?;
+        self.message = controller.model().message().to_owned();
+        self.work_start = Some(controller);
+        self.mode = InteractiveMode::WorkStart;
+        Ok(())
+    }
+
+    async fn close_work_start_if_settled(&mut self) -> bool {
+        let Some(controller) = self.work_start.as_mut() else {
+            return true;
+        };
+        if work_start_exit_policy(controller.model().stage(), controller.is_running())
+            == WorkStartExitPolicy::AwaitSettlement
+            && let Err(error) = controller.wait_for_settlement(Duration::from_secs(1)).await
+        {
+            self.message = format!("Cannot close Work Start: {error}");
+            return false;
+        }
+        let policy = work_start_exit_policy(controller.model().stage(), controller.is_running());
+        if policy == WorkStartExitPolicy::PreserveRecovery {
+            self.message = "Work Start has an outcome-unknown recovery capsule; exact replay or Task Watch reconciliation is required before exit"
+                .to_owned();
+            return false;
+        }
+        if policy == WorkStartExitPolicy::CancelPreview
+            && let Err(error) = controller.cancel_preview().await
+        {
+            self.message = format!("Work Start preview cannot close: {error}");
+            return false;
+        }
+        self.work_start.take();
+        true
+    }
+
+    async fn settle_work_start_for_quit(&mut self) -> bool {
+        if self
+            .work_start
+            .as_ref()
+            .is_some_and(|controller| controller.model().stage() == WorkStartStage::Preparing)
+            && let Some(controller) = self.work_start.as_mut()
+        {
+            controller.request_return_after_preparation();
+        }
+        self.close_work_start_if_settled().await
+    }
+
+    async fn apply_work_start_events(&mut self) -> Result<(), String> {
+        let (navigate_dashboard, confirmed_task_id) = {
+            let controller = self
+                .work_start
+                .as_mut()
+                .ok_or_else(|| "Work Start controller is unavailable".to_owned())?;
+            controller.pump().await?;
+            self.message = controller.model().message().to_owned();
+            (
+                controller.take_dashboard_navigation(),
+                controller.take_confirmed_task_id(),
+            )
+        };
+        if let Some(task_id) = confirmed_task_id {
+            debug_assert!(
+                !self
+                    .work_start
+                    .as_ref()
+                    .is_some_and(WorkStartController::is_running),
+                "a confirmed Work Start runtime must be settled"
+            );
+            self.work_start.take();
+            self.pending_task_watch_selection = Some(task_id);
+            if let Err(error) = self.start_task_watch().await {
+                self.mode = InteractiveMode::Dashboard;
+                self.message = format!(
+                    "Task was confirmed, but Task Watch is temporarily unavailable: {error}; the exact Task selection is retained"
+                );
+            }
+        } else if navigate_dashboard {
+            debug_assert!(
+                !self
+                    .work_start
+                    .as_ref()
+                    .is_some_and(WorkStartController::is_running),
+                "dashboard navigation requires a settled Work Start runtime"
+            );
+            self.work_start.take();
+            self.mode = InteractiveMode::Dashboard;
+        }
+        Ok(())
+    }
+
     async fn start_task_watch(&mut self) -> Result<(), String> {
+        self.start_task_watch_inner(false).await
+    }
+
+    async fn start_task_watch_for_work_reconciliation(&mut self) -> Result<(), String> {
+        self.start_task_watch_inner(true).await
+    }
+
+    async fn start_task_watch_inner(&mut self, preserve_unknown_work: bool) -> Result<(), String> {
+        if self
+            .work_start
+            .as_ref()
+            .is_some_and(WorkStartController::is_running)
+        {
+            return Err(
+                "Work Start mutation is unresolved; Task Watch cannot replace it".to_owned(),
+            );
+        }
+        if let Some(controller) = self.work_start.as_ref() {
+            let unknown = matches!(
+                controller.model().stage(),
+                WorkStartStage::PreparationOutcomeUnknown
+                    | WorkStartStage::ConfirmationOutcomeUnknown
+            );
+            if unknown && !preserve_unknown_work {
+                return Err(
+                    "Work Start recovery capsule must be reconciled before changing pages"
+                        .to_owned(),
+                );
+            }
+            if !unknown {
+                return Err(
+                    "Settle or explicitly cancel the current Work Start page first".to_owned(),
+                );
+            }
+        }
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
         self.stop_result_review().await;
@@ -2873,6 +3264,7 @@ impl App {
         self.message = model.message.clone();
         self.task_watch = Some(controller);
         self.mode = InteractiveMode::TaskWatch;
+        self.apply_pending_task_watch_selection();
         Ok(())
     }
 
@@ -2893,10 +3285,37 @@ impl App {
             .ok_or_else(|| "Task Watch controller omitted its page model".to_owned())?;
         self.snapshot = Some(snapshot_from_task_watch_model(model));
         self.message = model.message.clone();
+        self.apply_pending_task_watch_selection();
         Ok(())
     }
 
+    fn apply_pending_task_watch_selection(&mut self) {
+        let Some(task_id) = self.pending_task_watch_selection.clone() else {
+            return;
+        };
+        let selected = self
+            .task_watch
+            .as_mut()
+            .is_some_and(|controller| controller.select_task(&task_id));
+        if selected {
+            self.pending_task_watch_selection = None;
+            self.message = format!("Task {task_id} selected from its governed projection");
+        } else {
+            if let Some(controller) = self.task_watch.as_mut() {
+                controller.clear_selection();
+            }
+            self.message = format!(
+                "Task {task_id} is confirmed but not projected yet; Task Watch will retain and refetch this selection"
+            );
+        }
+    }
+
     async fn start_approval_queue(&mut self) -> Result<(), String> {
+        if self.work_start.is_some() {
+            return Err(
+                "Work Start must be resumed and settled before opening Approval Queue".to_owned(),
+            );
+        }
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
         self.stop_result_review().await;
@@ -2939,6 +3358,11 @@ impl App {
     }
 
     async fn start_result_review(&mut self) -> Result<(), String> {
+        if self.work_start.is_some() {
+            return Err(
+                "Work Start recovery must be settled before opening result review".to_owned(),
+            );
+        }
         let selected_task_id = self
             .task_watch
             .as_ref()
@@ -3119,6 +3543,14 @@ impl App {
                     );
                 }
             }
+            InteractiveMode::WorkStart => match self.work_start.as_ref() {
+                Some(controller) => render_work_start_page(frame, body[1], controller.model()),
+                None => frame.render_widget(
+                    Paragraph::new("Work Start controller is unavailable.")
+                        .block(Block::default().borders(Borders::ALL).title("Work Start")),
+                    body[1],
+                ),
+            },
             InteractiveMode::ResultReview => match self
                 .result_review
                 .as_ref()
@@ -3172,7 +3604,7 @@ impl App {
     fn footer_text(&self) -> String {
         if matches!(self.mode, InteractiveMode::Dashboard) {
             return format!(
-                "{} - w task watch - a approval queue - c command palette - r refresh - Tab panel - q quit",
+                "{} - n new work - w task watch - a approval queue - c command palette - r refresh - Tab panel - q quit",
                 self.message
             );
         }
@@ -3183,6 +3615,10 @@ impl App {
                     self.message
                 )
             }
+            InteractiveMode::WorkStart => format!(
+                "{} - Tab/BackTab field - Enter advance - Esc governed back - q bounded close",
+                self.message
+            ),
             InteractiveMode::ResultReview => format!(
                 "{} - Tab/BackTab section - Up/Down/PgUp/PgDn scroll - r refresh - Esc Task Watch - q quit",
                 self.message
@@ -3674,8 +4110,14 @@ async fn run_interactive(args: Args) -> Result<(), String> {
     let mut app = App::new(args.instance);
     app.refresh().await;
     let mut terminal = init_terminal().map_err(|error| error.to_string())?;
-    let result = run_loop(&mut terminal, &mut app).await;
-    let result = finish_interactive_session(&mut app, result).await;
+    let result = loop {
+        let loop_result = run_loop(&mut terminal, &mut app).await;
+        let finished = finish_interactive_session(&mut app, loop_result).await;
+        if finished.is_err() && app.work_start.is_some() {
+            continue;
+        }
+        break finished;
+    };
     restore_terminal(&mut terminal).map_err(|error| error.to_string())?;
     result
 }
@@ -3684,6 +4126,9 @@ async fn finish_interactive_session<T>(
     app: &mut App,
     result: Result<T, String>,
 ) -> Result<T, String> {
+    if !app.settle_work_start_for_quit().await {
+        return Err(app.message.clone());
+    }
     app.stop_task_watch().await;
     app.stop_approval_queue().await;
     app.stop_result_review().await;
@@ -3696,8 +4141,101 @@ async fn execute_interactive_action(
     next_refresh: &mut tokio::time::Instant,
 ) -> Result<InteractiveLoopControl, String> {
     match action {
+        InteractiveAction::OpenWorkStart => {
+            if let Err(error) = app.start_work_start().await {
+                app.mode = InteractiveMode::Dashboard;
+                app.message = format!("Work Start unavailable: {error}");
+            }
+        }
+        InteractiveAction::CloseWorkStart => {
+            if app.close_work_start_if_settled().await {
+                app.mode = InteractiveMode::Dashboard;
+                app.message = "Work Start cancelled before preparation; no RPC was sent".to_owned();
+            }
+        }
+        InteractiveAction::PrepareWorkStart => {
+            let result = match app.work_start.as_mut() {
+                Some(controller) => {
+                    execute_work_start_mutation(controller, WorkStartMutationAction::Prepare).await
+                }
+                None => Err("Work Start controller is unavailable".to_owned()),
+            };
+            if let Err(error) = result {
+                app.message = format!("Work Start preparation rejected: {error}");
+            }
+        }
+        InteractiveAction::ReplayWorkPreparation => {
+            let result = match app.work_start.as_mut() {
+                Some(controller) => {
+                    execute_work_start_mutation(
+                        controller,
+                        WorkStartMutationAction::ReplayPreparation,
+                    )
+                    .await
+                }
+                None => Err("Work Start controller is unavailable".to_owned()),
+            };
+            if let Err(error) = result {
+                app.message = format!("Exact preparation replay rejected: {error}");
+            }
+        }
+        InteractiveAction::CancelWorkPreview => {
+            let result = match app.work_start.as_mut() {
+                Some(controller) => {
+                    execute_work_start_mutation(controller, WorkStartMutationAction::CancelPreview)
+                        .await
+                }
+                None => Err("Work Start controller is unavailable".to_owned()),
+            };
+            match result {
+                Ok(()) => {
+                    app.apply_work_start_events().await?;
+                }
+                Err(error) => app.message = format!("Work Start preview cannot close: {error}"),
+            }
+        }
+        InteractiveAction::ConfirmWorkStart => {
+            let result = match app.work_start.as_mut() {
+                Some(controller) => {
+                    execute_work_start_mutation(controller, WorkStartMutationAction::Confirm).await
+                }
+                None => Err("Work Start controller is unavailable".to_owned()),
+            };
+            if let Err(error) = result {
+                app.message = format!("Task confirmation was not sent: {error}");
+            }
+        }
+        InteractiveAction::ReplayWorkConfirmation => {
+            let result = match app.work_start.as_mut() {
+                Some(controller) => {
+                    execute_work_start_mutation(
+                        controller,
+                        WorkStartMutationAction::ReplayConfirmation,
+                    )
+                    .await
+                }
+                None => Err("Work Start controller is unavailable".to_owned()),
+            };
+            if let Err(error) = result {
+                app.message = format!("Exact Task confirmation replay rejected: {error}");
+            }
+        }
+        InteractiveAction::OpenTaskWatchForWorkReconciliation => {
+            if let Err(error) = app.start_task_watch_for_work_reconciliation().await {
+                app.mode = InteractiveMode::WorkStart;
+                app.message = format!("Task Watch unavailable for reconciliation: {error}");
+            } else {
+                app.message = "Task confirmation remains uncertain; Task Watch is observation-only and does not imply cancellation or completion"
+                    .to_owned();
+            }
+        }
         InteractiveAction::OpenTaskWatch | InteractiveAction::RefetchTaskWatch => {
-            if let Err(error) = app.start_task_watch().await {
+            let result = if app.work_start.is_some() {
+                app.start_task_watch_for_work_reconciliation().await
+            } else {
+                app.start_task_watch().await
+            };
+            if let Err(error) = result {
                 app.mode = InteractiveMode::Dashboard;
                 app.message = format!("Task Watch unavailable: {error}");
             }
@@ -3752,6 +4290,9 @@ async fn execute_interactive_action(
             };
         }
         InteractiveAction::Quit => {
+            if !app.settle_work_start_for_quit().await {
+                return Ok(InteractiveLoopControl::Continue);
+            }
             app.stop_task_watch().await;
             app.stop_approval_queue().await;
             app.stop_result_review().await;
@@ -3796,6 +4337,11 @@ async fn execute_interactive_action(
 async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), String> {
     let mut next_refresh = tokio::time::Instant::now();
     loop {
+        if matches!(app.mode, InteractiveMode::WorkStart)
+            && let Err(error) = app.apply_work_start_events().await
+        {
+            app.message = format!("Work Start stopped fail-closed: {error}");
+        }
         if matches!(app.mode, InteractiveMode::TaskWatch)
             && let Err(error) = app.apply_task_watch_events().await
         {
@@ -3833,9 +4379,6 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
             && key.kind == KeyEventKind::Press
         {
             let dashboard = matches!(app.mode, InteractiveMode::Dashboard);
-            if dashboard && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                return Ok(());
-            }
             if dashboard && key.code == KeyCode::Char('r') {
                 app.message = "Refreshing…".to_owned();
                 app.refresh().await;
@@ -3923,6 +4466,67 @@ mod tests {
     struct ScriptedTaskWatch {
         steps: Arc<Mutex<VecDeque<ScriptedWatchStep>>>,
         next_calls: Arc<AtomicUsize>,
+    }
+
+    struct CountingWorkStartMutationTarget {
+        stage: WorkStartStage,
+        ready: bool,
+        prepare_calls: usize,
+        replay_preparation_calls: usize,
+        cancel_preview_calls: usize,
+        confirm_calls: usize,
+        replay_confirmation_calls: usize,
+    }
+
+    impl CountingWorkStartMutationTarget {
+        fn new(stage: WorkStartStage, ready: bool) -> Self {
+            Self {
+                stage,
+                ready,
+                prepare_calls: 0,
+                replay_preparation_calls: 0,
+                cancel_preview_calls: 0,
+                confirm_calls: 0,
+                replay_confirmation_calls: 0,
+            }
+        }
+    }
+
+    impl WorkStartMutationTarget for CountingWorkStartMutationTarget {
+        fn prepare_mutation(&mut self) -> WorkStartMutationFuture<'_> {
+            self.prepare_calls += 1;
+            self.stage = WorkStartStage::Preparing;
+            Box::pin(async { Ok(()) })
+        }
+
+        fn replay_preparation_mutation(&mut self) -> WorkStartMutationFuture<'_> {
+            self.replay_preparation_calls += 1;
+            self.stage = WorkStartStage::Preparing;
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cancel_preview_mutation(&mut self) -> WorkStartMutationFuture<'_> {
+            self.cancel_preview_calls += 1;
+            self.stage = WorkStartStage::Editing;
+            Box::pin(async { Ok(()) })
+        }
+
+        fn confirm_mutation(&mut self) -> WorkStartMutationFuture<'_> {
+            if !self.ready {
+                return Box::pin(async {
+                    Err("blocked preview cannot dispatch confirmation".to_owned())
+                });
+            }
+            self.confirm_calls += 1;
+            self.stage = WorkStartStage::Confirming;
+            Box::pin(async { Ok(()) })
+        }
+
+        fn replay_confirmation_mutation(&mut self) -> WorkStartMutationFuture<'_> {
+            self.replay_confirmation_calls += 1;
+            self.stage = WorkStartStage::Confirming;
+            Box::pin(async { Ok(()) })
+        }
     }
 
     impl TaskWatchStream for ScriptedTaskWatch {
@@ -5405,6 +6009,7 @@ mod tests {
         let footer = app.footer_text();
         assert!(footer.contains("w task watch"));
         assert!(footer.contains("a approval queue"));
+        assert!(footer.contains("n new work"));
 
         assert_eq!(
             approval_decision_feedback(7, false, false),
@@ -5415,6 +6020,249 @@ mod tests {
         assert!(warning.contains("projection synchronization reported a warning"));
         assert!(warning.contains("Do not retry the decision"));
         assert!(warning.contains("refresh the queue instead"));
+    }
+
+    #[test]
+    fn work_start_keyboard_intents_preserve_linear_and_unknown_boundaries() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = App::new("work-start-keys".to_owned());
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('n'))).unwrap(),
+            Some(InteractiveAction::OpenWorkStart)
+        ));
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::Editing, key(KeyCode::Tab)),
+            WorkStartKeyIntent::NextField
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::Editing, key(KeyCode::BackTab)),
+            WorkStartKeyIntent::PreviousField
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::Editing, key(KeyCode::Char('x'))),
+            WorkStartKeyIntent::Push('x')
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::Editing, key(KeyCode::Backspace)),
+            WorkStartKeyIntent::Backspace
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::Editing, key(KeyCode::Esc)),
+            WorkStartKeyIntent::Close
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::Editing, key(KeyCode::Enter)),
+            WorkStartKeyIntent::Prepare
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::Preparing, key(KeyCode::Esc)),
+            WorkStartKeyIntent::WaitForPreparation
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::PreviewReady, key(KeyCode::Enter)),
+            WorkStartKeyIntent::Confirm
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::PreviewReady, key(KeyCode::Esc)),
+            WorkStartKeyIntent::CancelPreview
+        );
+        assert_eq!(
+            work_start_key_intent(
+                WorkStartStage::PreparationOutcomeUnknown,
+                key(KeyCode::Enter)
+            ),
+            WorkStartKeyIntent::ReplayPreparation
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::PreparationOutcomeUnknown, key(KeyCode::Esc)),
+            WorkStartKeyIntent::KeepPreparationRecovery
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::Confirming, key(KeyCode::Enter)),
+            WorkStartKeyIntent::Ignore
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::Confirming, key(KeyCode::Esc)),
+            WorkStartKeyIntent::ConfirmationCannotCancel
+        );
+        assert_eq!(
+            work_start_key_intent(
+                WorkStartStage::ConfirmationOutcomeUnknown,
+                key(KeyCode::Enter)
+            ),
+            WorkStartKeyIntent::ReplayConfirmation
+        );
+        assert_eq!(
+            work_start_key_intent(
+                WorkStartStage::ConfirmationOutcomeUnknown,
+                key(KeyCode::Char('w'))
+            ),
+            WorkStartKeyIntent::ReconcileInTaskWatch
+        );
+        for stage in [
+            WorkStartStage::Preparing,
+            WorkStartStage::PreviewReady,
+            WorkStartStage::PreparationOutcomeUnknown,
+            WorkStartStage::Confirming,
+            WorkStartStage::ConfirmationOutcomeUnknown,
+        ] {
+            assert_eq!(
+                work_start_key_intent(stage, key(KeyCode::Char('q'))),
+                WorkStartKeyIntent::Quit
+            );
+        }
+        assert_eq!(
+            work_start_exit_policy(WorkStartStage::Preparing, true),
+            WorkStartExitPolicy::AwaitSettlement
+        );
+        assert_eq!(
+            work_start_exit_policy(WorkStartStage::Confirming, true),
+            WorkStartExitPolicy::AwaitSettlement
+        );
+        assert_eq!(
+            work_start_exit_policy(WorkStartStage::PreviewReady, false),
+            WorkStartExitPolicy::CancelPreview
+        );
+        assert_eq!(
+            work_start_exit_policy(WorkStartStage::PreparationOutcomeUnknown, false),
+            WorkStartExitPolicy::PreserveRecovery
+        );
+        assert_eq!(
+            work_start_exit_policy(WorkStartStage::ConfirmationOutcomeUnknown, false),
+            WorkStartExitPolicy::PreserveRecovery
+        );
+    }
+
+    #[tokio::test]
+    async fn work_start_key_and_execute_seam_never_duplicates_mutations() {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        let mut blocked = CountingWorkStartMutationTarget::new(WorkStartStage::PreviewReady, false);
+        assert_eq!(
+            work_start_key_intent(blocked.stage, enter),
+            WorkStartKeyIntent::Confirm
+        );
+        assert!(
+            execute_work_start_mutation(&mut blocked, WorkStartMutationAction::Confirm)
+                .await
+                .is_err()
+        );
+        assert_eq!(blocked.confirm_calls, 0);
+
+        let mut confirmation =
+            CountingWorkStartMutationTarget::new(WorkStartStage::PreviewReady, true);
+        execute_work_start_mutation(&mut confirmation, WorkStartMutationAction::Confirm)
+            .await
+            .unwrap();
+        assert_eq!(confirmation.confirm_calls, 1);
+        assert_eq!(
+            work_start_key_intent(confirmation.stage, enter),
+            WorkStartKeyIntent::Ignore
+        );
+        assert_eq!(confirmation.confirm_calls, 1);
+
+        let pending = CountingWorkStartMutationTarget::new(WorkStartStage::Preparing, true);
+        assert_eq!(
+            work_start_key_intent(pending.stage, escape),
+            WorkStartKeyIntent::WaitForPreparation
+        );
+        assert_eq!(pending.prepare_calls, 0);
+        assert_eq!(pending.replay_preparation_calls, 0);
+
+        let mut preparation_unknown =
+            CountingWorkStartMutationTarget::new(WorkStartStage::PreparationOutcomeUnknown, true);
+        assert_eq!(
+            work_start_key_intent(preparation_unknown.stage, enter),
+            WorkStartKeyIntent::ReplayPreparation
+        );
+        execute_work_start_mutation(
+            &mut preparation_unknown,
+            WorkStartMutationAction::ReplayPreparation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(preparation_unknown.replay_preparation_calls, 1);
+        assert_eq!(
+            work_start_key_intent(preparation_unknown.stage, enter),
+            WorkStartKeyIntent::Ignore
+        );
+        assert_eq!(preparation_unknown.replay_preparation_calls, 1);
+
+        let mut confirmation_unknown =
+            CountingWorkStartMutationTarget::new(WorkStartStage::ConfirmationOutcomeUnknown, true);
+        execute_work_start_mutation(
+            &mut confirmation_unknown,
+            WorkStartMutationAction::ReplayConfirmation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(confirmation_unknown.replay_confirmation_calls, 1);
+        assert_eq!(
+            work_start_key_intent(confirmation_unknown.stage, enter),
+            WorkStartKeyIntent::Ignore
+        );
+        assert_eq!(confirmation_unknown.replay_confirmation_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn confirmed_task_projection_lag_blocks_wrong_review_and_keeps_exact_selection() {
+        let mut first = watch_snapshot("task:other", 1, 90);
+        first.tasks[0].task.as_mut().unwrap().status = TaskStatus::Active as i32;
+        let mut second = watch_snapshot("task:confirmed", 1, 91);
+        second.tasks[0].task.as_mut().unwrap().status = TaskStatus::Active as i32;
+        let client = Arc::new(WatchInteractiveClient {
+            snapshots: Arc::new(Mutex::new(VecDeque::from([first, second]))),
+            sessions: Arc::new(Mutex::new(VecDeque::from([
+                VecDeque::from([ScriptedWatchStep::Pending]),
+                VecDeque::from([ScriptedWatchStep::Pending]),
+            ]))),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            snapshot_calls: Arc::new(AtomicUsize::new(0)),
+            open_calls: Arc::new(AtomicUsize::new(0)),
+            next_calls: Arc::new(AtomicUsize::new(0)),
+        }) as Arc<dyn InteractiveClient>;
+        let mut app = App::new("work-projection-lag".to_owned());
+        app.client = Some(client);
+        app.pending_task_watch_selection = Some("task:confirmed".to_owned());
+        app.start_task_watch().await.unwrap();
+
+        assert_eq!(
+            app.task_watch
+                .as_ref()
+                .and_then(TaskWatchController::model)
+                .and_then(|model| model.selected_task_id.as_deref()),
+            None
+        );
+        assert_eq!(
+            app.pending_task_watch_selection.as_deref(),
+            Some("task:confirmed")
+        );
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap()
+                .is_none()
+        );
+        assert!(app.message.contains("exact projection has not arrived"));
+        assert_ne!(
+            app.snapshot.as_ref().unwrap().tasks[0]
+                .task
+                .as_ref()
+                .unwrap()
+                .status,
+            TaskStatus::Completed as i32
+        );
+
+        app.start_task_watch().await.unwrap();
+        assert!(app.pending_task_watch_selection.is_none());
+        assert_eq!(
+            app.task_watch
+                .as_ref()
+                .and_then(TaskWatchController::model)
+                .and_then(|model| model.selected_task_id.as_deref()),
+            Some("task:confirmed")
+        );
+        app.stop_task_watch().await;
     }
 
     #[test]
