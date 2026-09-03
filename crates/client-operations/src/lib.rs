@@ -10,29 +10,36 @@ use egopulse_client_kernel::{ClientKernel, KernelError, SnapshotStreamTracker, S
 use egopulse_domain_contracts::{
     context_revoke::ContextRevokeSemanticRequest,
     v01::egopulse::{
+        artifact::v1::ArtifactSetStatus,
         common::v1::CommandMetadata,
         harness::v1::ApprovalDecision,
         localapi::v1::{
             AvailableActionKind, ClientRequestMetadata, ClientSurface, ConfirmWorkRequest,
             ConfirmWorkResponse, ContextGovernanceState, ContextMutationCommand,
             ContextRevokeReceipt, DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
-            ExecuteContextMutationRequest, ExecuteContextMutationResponse,
-            GetHarnessApprovalViewRequest, GetHarnessApprovalViewResponse,
-            GetProjectionStatusRequest, HarnessApprovalAuthorityResult, HarnessApprovalView,
+            EvidenceGraphView, ExecuteContextMutationRequest, ExecuteContextMutationResponse,
+            GetEvidenceGraphRequest, GetEvidenceGraphResponse, GetHarnessApprovalViewRequest,
+            GetHarnessApprovalViewResponse, GetProjectionStatusRequest, GetTaskViewRequest,
+            GetTaskViewResponse, HarnessApprovalAuthorityResult, HarnessApprovalView,
             HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest,
             ListHarnessApprovalViewsResponse, ListTaskViewsRequest, LocalApiError,
-            PrepareWorkRequest, ProjectionAwaitToken, ProjectionMetadata, ProjectionPosition,
-            RevokeContextSnapshotCommand, StreamFrameKind, TaskView, TaskViewStreamFrame,
-            WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, WorkPreparationPreview,
-            WorkSourceRequest, context_mutation_command, execute_context_mutation_response,
-            get_harness_approval_view_response,
+            PrepareWorkRequest, ProjectionAwaitToken, ProjectionHealth, ProjectionMetadata,
+            ProjectionPosition, RevokeContextSnapshotCommand, SourceDomain, SourceRevision,
+            StreamFrameKind, TaskView, TaskViewStreamFrame, WatchHarnessApprovalViewsRequest,
+            WatchTaskViewsRequest, WorkPreparationPreview, WorkSourceRequest,
+            context_mutation_command, execute_context_mutation_response,
+            get_evidence_graph_response, get_harness_approval_view_response,
+            get_task_view_response,
         },
         policy::v1::{
             HarnessApprovalDecisionStateKind, IssueHarnessApprovalDecisionCommand,
             PolicyDecisionCommand, PolicyDecisionErrorCode, policy_decision_command,
         },
-        task::v1::{TaskCommand, task_command},
-        verdict::v1::{VerdictCommand, verdict_command},
+        task::v1::{TaskCommand, TaskStatus as DomainTaskStatus, task_command},
+        verdict::v1::{
+            FounderVerdictDecision, FounderVerdictStateKind, VerdictCommand, verdict_command,
+        },
+        verification::v1::VerificationConclusion,
     },
 };
 use egopulse_local_api::{LocalApiClient, LocalApiConnection, LocalIpcAddress};
@@ -53,6 +60,8 @@ const DECIDE_HARNESS_APPROVAL_RPC: &str = "LocalCommandGatewayService/DecideHarn
 const ISSUE_HARNESS_APPROVAL_DECISION_COMMAND: &str = "issue_harness_approval_decision";
 const APPROVAL_DECISION_IDEMPOTENCY_SCOPE: &str = "approval-decision";
 const GUIDED_APPROVAL_IDEMPOTENCY_DOMAIN: &[u8] = b"egopulse/guided-approval/v1\0";
+const GET_TASK_VIEW_RPC: &str = "LocalReadModelService/GetTaskView";
+const GET_EVIDENCE_GRAPH_RPC: &str = "LocalReadModelService/GetEvidenceGraph";
 const APPROVAL_WATCH_BASELINE_PAGE_SIZE: u32 = 100;
 const APPROVAL_WATCH_BASELINE_MAX_PAGES: usize = 100;
 const APPROVAL_WATCH_BASELINE_MAX_VIEWS: usize = 1_000;
@@ -197,6 +206,55 @@ pub enum ClientReadError {
     Api(Box<LocalApiError>),
     #[error("local API returned an incomplete response: {0}")]
     Protocol(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskResultReviewStage {
+    Task,
+    Evidence,
+}
+
+impl TaskResultReviewStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Evidence => "evidence",
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ClientTaskResultReviewError {
+    #[error("invalid projected result review input: {0}")]
+    InvalidInput(&'static str),
+    #[error("client kernel rejected the {stage:?} review stage: {source}")]
+    Kernel {
+        stage: TaskResultReviewStage,
+        #[source]
+        source: KernelError,
+    },
+    #[error("local API transport failed during the {stage:?} review stage: {detail}")]
+    Transport {
+        stage: TaskResultReviewStage,
+        detail: String,
+    },
+    #[error("local API rejected the {stage:?} review stage: {error:?}")]
+    Api {
+        stage: TaskResultReviewStage,
+        error: Box<LocalApiError>,
+    },
+    #[error("projected result review integrity failed during the {stage:?} stage: {detail}")]
+    Integrity {
+        stage: TaskResultReviewStage,
+        detail: &'static str,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskResultReview {
+    pub task_view: TaskView,
+    pub evidence_graph: Option<EvidenceGraphView>,
 }
 
 #[derive(Debug, Error)]
@@ -1066,6 +1124,42 @@ impl ClientAttachment {
         })
     }
 
+    /// Reads projected result metadata and its governance evidence without
+    /// accepting an ArtifactSet identity from the caller.
+    pub async fn read_task_result_review(
+        &self,
+        task_id: &str,
+    ) -> Result<TaskResultReview, ClientTaskResultReviewError> {
+        let read_client = self.connection.read_model_service();
+        let evidence_client = read_client.clone();
+        read_task_result_review_via(
+            &self.kernel,
+            task_id,
+            SystemTime::now(),
+            move |request| {
+                let mut client = read_client;
+                async move {
+                    client
+                        .get_task_view(request)
+                        .await
+                        .map(|response| response.into_inner())
+                        .map_err(|error| error.to_string())
+                }
+            },
+            move |request| {
+                let mut client = evidence_client;
+                async move {
+                    client
+                        .get_evidence_graph(request)
+                        .await
+                        .map(|response| response.into_inner())
+                        .map_err(|error| error.to_string())
+                }
+            },
+        )
+        .await
+    }
+
     /// The shared client operation for both CLI and TUI. The request contains
     /// only user intent, scope and explicit source references; all governance
     /// facts are returned by the daemon-owned preparation compiler.
@@ -1151,6 +1245,539 @@ where
     dispatch(approval_watch_wire_request(metadata, resume_after))
         .await
         .map_err(ClientApprovalWatchError::Transport)
+}
+
+async fn read_task_result_review_via<T, TFut, E, EFut>(
+    kernel: &ClientKernel,
+    task_id: &str,
+    now: SystemTime,
+    get_task: T,
+    get_evidence: E,
+) -> Result<TaskResultReview, ClientTaskResultReviewError>
+where
+    T: FnOnce(GetTaskViewRequest) -> TFut,
+    TFut: Future<Output = Result<GetTaskViewResponse, String>>,
+    E: FnOnce(GetEvidenceGraphRequest) -> EFut,
+    EFut: Future<Output = Result<GetEvidenceGraphResponse, String>>,
+{
+    if task_id.trim().is_empty() {
+        return Err(ClientTaskResultReviewError::InvalidInput(
+            "task_id must not be empty",
+        ));
+    }
+    authorize_review_rpc(kernel, GET_TASK_VIEW_RPC, TaskResultReviewStage::Task)?;
+    let task_response = get_task(GetTaskViewRequest {
+        client: Some(review_metadata(kernel, now, TaskResultReviewStage::Task)?),
+        task_id: task_id.to_owned(),
+        minimum_position: None,
+    })
+    .await
+    .map_err(|detail| ClientTaskResultReviewError::Transport {
+        stage: TaskResultReviewStage::Task,
+        detail,
+    })?;
+    let task_view = match task_response.outcome {
+        Some(get_task_view_response::Outcome::View(view)) => view,
+        Some(get_task_view_response::Outcome::Error(error)) => {
+            return Err(ClientTaskResultReviewError::Api {
+                stage: TaskResultReviewStage::Task,
+                error: Box::new(error),
+            });
+        }
+        None => {
+            return Err(review_integrity(
+                TaskResultReviewStage::Task,
+                "task view outcome missing",
+            ));
+        }
+    };
+    let (task_position, artifact_set_id) = validate_task_result_view(&task_view, task_id)?;
+    let Some(artifact_set_id) = artifact_set_id else {
+        return Ok(TaskResultReview {
+            task_view,
+            evidence_graph: None,
+        });
+    };
+
+    authorize_review_rpc(
+        kernel,
+        GET_EVIDENCE_GRAPH_RPC,
+        TaskResultReviewStage::Evidence,
+    )?;
+    let evidence_response = get_evidence(GetEvidenceGraphRequest {
+        client: Some(review_metadata(
+            kernel,
+            now,
+            TaskResultReviewStage::Evidence,
+        )?),
+        task_id: task_id.to_owned(),
+        artifact_set_id: artifact_set_id.clone(),
+        minimum_position: Some(task_position),
+    })
+    .await
+    .map_err(|detail| ClientTaskResultReviewError::Transport {
+        stage: TaskResultReviewStage::Evidence,
+        detail,
+    })?;
+    let graph = match evidence_response.outcome {
+        Some(get_evidence_graph_response::Outcome::Graph(graph)) => graph,
+        Some(get_evidence_graph_response::Outcome::Error(error)) => {
+            return Err(ClientTaskResultReviewError::Api {
+                stage: TaskResultReviewStage::Evidence,
+                error: Box::new(error),
+            });
+        }
+        None => {
+            return Err(review_integrity(
+                TaskResultReviewStage::Evidence,
+                "evidence graph outcome missing",
+            ));
+        }
+    };
+    validate_evidence_graph(&task_view, &graph, task_id, &artifact_set_id)?;
+    Ok(TaskResultReview {
+        task_view,
+        evidence_graph: Some(graph),
+    })
+}
+
+fn authorize_review_rpc(
+    kernel: &ClientKernel,
+    rpc: &str,
+    stage: TaskResultReviewStage,
+) -> Result<(), ClientTaskResultReviewError> {
+    let session = kernel
+        .session()
+        .ok_or(KernelError::SessionUnavailable)
+        .map_err(|source| ClientTaskResultReviewError::Kernel { stage, source })?;
+    kernel
+        .profiles()
+        .authorize_rpc(rpc, &session.granted_permission_codes)
+        .map(|_| ())
+        .map_err(|source| ClientTaskResultReviewError::Kernel { stage, source })
+}
+
+fn review_metadata(
+    kernel: &ClientKernel,
+    now: SystemTime,
+    stage: TaskResultReviewStage,
+) -> Result<ClientRequestMetadata, ClientTaskResultReviewError> {
+    kernel
+        .request_metadata(Uuid::now_v7().to_string(), None, now)
+        .map_err(|source| ClientTaskResultReviewError::Kernel { stage, source })
+}
+
+fn review_integrity(
+    stage: TaskResultReviewStage,
+    detail: &'static str,
+) -> ClientTaskResultReviewError {
+    ClientTaskResultReviewError::Integrity { stage, detail }
+}
+
+fn validate_projection_metadata(
+    metadata: Option<&ProjectionMetadata>,
+    stage: TaskResultReviewStage,
+) -> Result<ProjectionPosition, ClientTaskResultReviewError> {
+    let metadata =
+        metadata.ok_or_else(|| review_integrity(stage, "projection metadata missing"))?;
+    if metadata.stale || metadata.health != ProjectionHealth::Ready as i32 {
+        return Err(review_integrity(
+            stage,
+            "projection is not ready and current",
+        ));
+    }
+    let position = metadata
+        .position
+        .as_ref()
+        .ok_or_else(|| review_integrity(stage, "projection position missing"))?;
+    if position.epoch.is_empty() || position.sequence == 0 {
+        return Err(review_integrity(stage, "projection position invalid"));
+    }
+    let mut sources = BTreeSet::new();
+    for source in &metadata.source_revisions {
+        if SourceDomain::try_from(source.domain).is_err()
+            || source.domain == SourceDomain::Unspecified as i32
+            || source.aggregate_id.is_empty()
+            || source.revision == 0
+            || source.last_event_id.is_empty()
+            || !sources.insert((source.domain, source.aggregate_id.as_str()))
+        {
+            return Err(review_integrity(
+                stage,
+                "projection source revision invalid",
+            ));
+        }
+    }
+    Ok(position.clone())
+}
+
+fn exact_source<'a>(
+    metadata: &'a ProjectionMetadata,
+    domain: SourceDomain,
+    aggregate_id: &str,
+    stage: TaskResultReviewStage,
+) -> Result<&'a SourceRevision, ClientTaskResultReviewError> {
+    let mut matches = metadata
+        .source_revisions
+        .iter()
+        .filter(|source| source.domain == domain as i32 && source.aggregate_id == aggregate_id);
+    let source = matches
+        .next()
+        .ok_or_else(|| review_integrity(stage, "required projection source missing"))?;
+    if matches.next().is_some() {
+        return Err(review_integrity(stage, "projection source duplicated"));
+    }
+    Ok(source)
+}
+
+fn validate_task_result_view(
+    view: &TaskView,
+    expected_task_id: &str,
+) -> Result<(ProjectionPosition, Option<String>), ClientTaskResultReviewError> {
+    let stage = TaskResultReviewStage::Task;
+    let position = validate_projection_metadata(view.metadata.as_ref(), stage)?;
+    let metadata = view.metadata.as_ref().expect("metadata validated");
+    let task = view
+        .task
+        .as_ref()
+        .ok_or_else(|| review_integrity(stage, "task snapshot missing"))?;
+    if task.task_id != expected_task_id
+        || task.task_id.is_empty()
+        || task.revision == 0
+        || DomainTaskStatus::try_from(task.status).is_err()
+        || task.status == DomainTaskStatus::Unspecified as i32
+    {
+        return Err(review_integrity(stage, "task identity mismatch"));
+    }
+    let task_source = exact_source(metadata, SourceDomain::Task, expected_task_id, stage)?;
+    if task_source.revision != task.revision {
+        return Err(review_integrity(stage, "task source revision mismatch"));
+    }
+
+    let artifact_set_id = match (&task.artifact_set_id, &view.artifact_set) {
+        (None, None) => None,
+        (Some(id), Some(set)) if !id.is_empty() && set.artifact_set_id == *id => {
+            let lineage = set
+                .lineage
+                .as_ref()
+                .ok_or_else(|| review_integrity(stage, "ArtifactSet lineage missing"))?;
+            if set.revision == 0
+                || ArtifactSetStatus::try_from(set.status).is_err()
+                || set.status == ArtifactSetStatus::Unspecified as i32
+                || !result_lineage_is_complete(lineage)
+                || lineage.task_id != task.task_id
+                || lineage.work_revision != task.work_revision
+            {
+                return Err(review_integrity(stage, "ArtifactSet binding mismatch"));
+            }
+            let set_source = exact_source(metadata, SourceDomain::Artifact, id, stage)?;
+            if set_source.revision != set.revision {
+                return Err(review_integrity(
+                    stage,
+                    "ArtifactSet source revision mismatch",
+                ));
+            }
+            Some(id.clone())
+        }
+        _ => {
+            return Err(review_integrity(
+                stage,
+                "ArtifactSet presence or identity mismatch",
+            ));
+        }
+    };
+
+    match (&task.verification_artifact_id, &view.verification) {
+        (None, None) => {}
+        (Some(id), Some(verification))
+            if !id.is_empty() && verification.verification_artifact_id == *id =>
+        {
+            let binding = verification
+                .binding
+                .as_ref()
+                .ok_or_else(|| review_integrity(stage, "Verification binding missing"))?;
+            let lineage = binding
+                .lineage
+                .as_ref()
+                .ok_or_else(|| review_integrity(stage, "Verification lineage missing"))?;
+            let set = view
+                .artifact_set
+                .as_ref()
+                .ok_or_else(|| review_integrity(stage, "Verification ArtifactSet missing"))?;
+            let set_lineage = set
+                .lineage
+                .as_ref()
+                .ok_or_else(|| review_integrity(stage, "ArtifactSet lineage missing"))?;
+            if verification.version == 0
+                || VerificationConclusion::try_from(verification.conclusion).is_err()
+                || verification.conclusion == VerificationConclusion::Unspecified as i32
+                || lineage != set_lineage
+                || binding.artifact_set_id != set.artifact_set_id
+                || binding.artifact_set_manifest != set.canonical_manifest
+                || binding.acceptance_contract_ref != task.acceptance_contract_ref
+                || (!binding.claim_id.is_empty() && !set.claim_ids.contains(&binding.claim_id))
+            {
+                return Err(review_integrity(stage, "Verification binding mismatch"));
+            }
+            let source = exact_source(metadata, SourceDomain::Verification, id, stage)?;
+            if source.revision != verification.version {
+                return Err(review_integrity(
+                    stage,
+                    "Verification source revision mismatch",
+                ));
+            }
+        }
+        _ => {
+            return Err(review_integrity(
+                stage,
+                "Verification presence or identity mismatch",
+            ));
+        }
+    }
+
+    match (
+        &task.founder_verdict_id,
+        &view.founder_verdict,
+        &view.founder_verdict_state,
+    ) {
+        (None, None, None) => {}
+        (Some(id), Some(verdict), Some(state))
+            if !id.is_empty()
+                && verdict.founder_verdict_id == *id
+                && state.founder_verdict_id == *id =>
+        {
+            let scope = verdict
+                .scope
+                .as_ref()
+                .ok_or_else(|| review_integrity(stage, "Founder Verdict scope missing"))?;
+            let verification = view
+                .verification
+                .as_ref()
+                .ok_or_else(|| review_integrity(stage, "Founder Verdict verification missing"))?;
+            let set = view
+                .artifact_set
+                .as_ref()
+                .ok_or_else(|| review_integrity(stage, "Founder Verdict ArtifactSet missing"))?;
+            if verdict.version == 0
+                || state.revision == 0
+                || FounderVerdictDecision::try_from(verdict.decision).is_err()
+                || verdict.decision == FounderVerdictDecision::Unspecified as i32
+                || FounderVerdictStateKind::try_from(state.state).is_err()
+                || state.state == FounderVerdictStateKind::Unspecified as i32
+                || scope.task_id != task.task_id
+                || scope.work_revision != task.work_revision
+                || scope.artifact_set_id != set.artifact_set_id
+                || scope.artifact_set_manifest != set.canonical_manifest
+                || scope.verification_artifact_id != verification.verification_artifact_id
+                || scope.verification_payload != verification.canonical_payload
+                || scope.acceptance_contract_ref != task.acceptance_contract_ref
+                || verdict.observed_verification_conclusion != verification.conclusion
+            {
+                return Err(review_integrity(stage, "Founder Verdict binding mismatch"));
+            }
+            let source = exact_source(metadata, SourceDomain::FounderVerdict, id, stage)?;
+            if source.revision != state.revision || source.revision != verdict.version {
+                return Err(review_integrity(
+                    stage,
+                    "Founder Verdict source revision mismatch",
+                ));
+            }
+        }
+        _ => {
+            return Err(review_integrity(
+                stage,
+                "Founder Verdict presence or identity mismatch",
+            ));
+        }
+    }
+    Ok((position, artifact_set_id))
+}
+
+fn result_lineage_is_complete(
+    lineage: &egopulse_domain_contracts::v01::egopulse::artifact::v1::LineageBinding,
+) -> bool {
+    !lineage.task_id.is_empty()
+        && lineage.task_revision > 0
+        && lineage.work_revision > 0
+        && !lineage.run_id.is_empty()
+        && lineage.run_revision > 0
+        && !lineage.step_id.is_empty()
+        && lineage.step_revision > 0
+        && !lineage.attempt_id.is_empty()
+        && lineage.attempt_revision > 0
+        && !lineage.dispatch_id.is_empty()
+        && lineage.fencing_token > 0
+}
+
+fn unique_ids<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    stage: TaskResultReviewStage,
+) -> Result<BTreeSet<&'a str>, ClientTaskResultReviewError> {
+    let mut ids = BTreeSet::new();
+    for value in values {
+        if value.is_empty() || !ids.insert(value) {
+            return Err(review_integrity(stage, "evidence graph membership invalid"));
+        }
+    }
+    Ok(ids)
+}
+
+fn validate_evidence_graph(
+    task_view: &TaskView,
+    graph: &EvidenceGraphView,
+    expected_task_id: &str,
+    expected_artifact_set_id: &str,
+) -> Result<(), ClientTaskResultReviewError> {
+    let stage = TaskResultReviewStage::Evidence;
+    let task_position = task_view
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.position.as_ref())
+        .expect("Task projection validated");
+    let graph_position = validate_projection_metadata(graph.metadata.as_ref(), stage)?;
+    if graph.task_id != expected_task_id
+        || graph.artifact_set_id != expected_artifact_set_id
+        || graph_position.epoch != task_position.epoch
+    {
+        return Err(review_integrity(stage, "evidence graph binding mismatch"));
+    }
+    let task_metadata = task_view
+        .metadata
+        .as_ref()
+        .expect("Task metadata validated");
+    let graph_metadata = graph.metadata.as_ref().expect("graph metadata validated");
+    let task_set_source = exact_source(
+        task_metadata,
+        SourceDomain::Artifact,
+        expected_artifact_set_id,
+        stage,
+    )?;
+    let graph_set_source = exact_source(
+        graph_metadata,
+        SourceDomain::Artifact,
+        expected_artifact_set_id,
+        stage,
+    )?;
+    if task_set_source != graph_set_source {
+        return Err(review_integrity(stage, "ArtifactSet source tuple mismatch"));
+    }
+
+    let set = task_view
+        .artifact_set
+        .as_ref()
+        .expect("ArtifactSet validated");
+    let set_lineage = set.lineage.as_ref().expect("ArtifactSet lineage validated");
+    let expected_artifacts = unique_ids(set.artifact_ids.iter().map(String::as_str), stage)?;
+    let expected_claims = unique_ids(set.claim_ids.iter().map(String::as_str), stage)?;
+    let expected_evidence = unique_ids(set.evidence_ids.iter().map(String::as_str), stage)?;
+    let actual_artifacts = unique_ids(
+        graph
+            .artifacts
+            .iter()
+            .map(|value| value.artifact_id.as_str()),
+        stage,
+    )?;
+    let actual_claims = unique_ids(
+        graph.claims.iter().map(|value| value.claim_id.as_str()),
+        stage,
+    )?;
+    let actual_evidence = unique_ids(
+        graph
+            .evidence
+            .iter()
+            .map(|value| value.evidence_id.as_str()),
+        stage,
+    )?;
+    if expected_artifacts != actual_artifacts
+        || expected_claims != actual_claims
+        || expected_evidence != actual_evidence
+    {
+        return Err(review_integrity(
+            stage,
+            "evidence graph membership mismatch",
+        ));
+    }
+    let mut expected_sources = BTreeSet::from([expected_artifact_set_id]);
+    expected_sources.extend(expected_artifacts.iter().copied());
+    expected_sources.extend(expected_claims.iter().copied());
+    expected_sources.extend(expected_evidence.iter().copied());
+    if graph_metadata.source_revisions.len() != expected_sources.len()
+        || graph_metadata.source_revisions.iter().any(|source| {
+            source.domain != SourceDomain::Artifact as i32
+                || !expected_sources.contains(source.aggregate_id.as_str())
+        })
+    {
+        return Err(review_integrity(
+            stage,
+            "evidence graph source membership mismatch",
+        ));
+    }
+
+    for artifact in &graph.artifacts {
+        let source = exact_source(
+            graph_metadata,
+            SourceDomain::Artifact,
+            &artifact.artifact_id,
+            stage,
+        )?;
+        let lineage = artifact
+            .provenance
+            .as_ref()
+            .and_then(|value| value.lineage.as_ref())
+            .ok_or_else(|| review_integrity(stage, "artifact lineage missing"))?;
+        if artifact.revision == 0 || source.revision != artifact.revision || lineage != set_lineage
+        {
+            return Err(review_integrity(stage, "artifact lineage mismatch"));
+        }
+    }
+    for claim in &graph.claims {
+        let source = exact_source(
+            graph_metadata,
+            SourceDomain::Artifact,
+            &claim.claim_id,
+            stage,
+        )?;
+        let lineage = claim
+            .lineage
+            .as_ref()
+            .ok_or_else(|| review_integrity(stage, "claim lineage missing"))?;
+        let claim_artifact_ids =
+            unique_ids(claim.subject_artifact_ids.iter().map(String::as_str), stage)?;
+        if claim.revision == 0
+            || source.revision != claim.revision
+            || lineage != set_lineage
+            || claim_artifact_ids
+                .iter()
+                .any(|id| !actual_artifacts.contains(id))
+        {
+            return Err(review_integrity(stage, "claim reference mismatch"));
+        }
+    }
+    for evidence in &graph.evidence {
+        let source = exact_source(
+            graph_metadata,
+            SourceDomain::Artifact,
+            &evidence.evidence_id,
+            stage,
+        )?;
+        let lineage = evidence
+            .lineage
+            .as_ref()
+            .ok_or_else(|| review_integrity(stage, "evidence lineage missing"))?;
+        let evidence_artifact_ids =
+            unique_ids(evidence.artifact_ids.iter().map(String::as_str), stage)?;
+        if evidence.revision == 0
+            || source.revision != evidence.revision
+            || lineage != set_lineage
+            || !actual_claims.contains(evidence.claim_id.as_str())
+            || evidence_artifact_ids
+                .iter()
+                .any(|id| !actual_artifacts.contains(id))
+        {
+            return Err(review_integrity(stage, "evidence reference mismatch"));
+        }
+    }
+    Ok(())
 }
 
 async fn read_actionable_approval_queue_via<F, Fut>(
@@ -1948,7 +2575,7 @@ fn task_metadata_mut(command: &mut TaskCommand) -> Option<&mut CommandMetadata> 
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::Cell,
+        cell::{Cell, RefCell},
         collections::VecDeque,
         pin::pin,
         task::{Context, Poll, Waker},
@@ -1963,7 +2590,15 @@ mod tests {
         ProjectionPosition, SourceDomain, SourceRevision, StreamFrameKind,
     };
     use egopulse_domain_contracts::v01::egopulse::{
-        common::v1::ContractReference, localapi::v1::ProjectionMetadata, task::v1::TaskSnapshot,
+        artifact::v1::{
+            ArtifactDescriptor, ArtifactSet, Claim, ContentAddress, Evidence, LineageBinding,
+            Provenance,
+        },
+        common::v1::ContractReference,
+        localapi::v1::{ProjectionMetadata, RedactedField},
+        task::v1::{TaskSnapshot, TaskStatus},
+        verdict::v1::{FounderVerdict, FounderVerdictState, VerdictScope},
+        verification::v1::{VerificationArtifact, VerificationBinding, VerificationConclusion},
     };
 
     use super::*;
@@ -2110,6 +2745,197 @@ mod tests {
             replayed: false,
             acknowledged_after_durability_barrier: true,
         }
+    }
+
+    fn review_position(sequence: u64) -> ProjectionPosition {
+        ProjectionPosition {
+            epoch: "epoch:review".to_owned(),
+            sequence,
+            projected_at: Some(Timestamp {
+                seconds: sequence as i64,
+                nanos: 0,
+            }),
+        }
+    }
+
+    fn review_source(domain: SourceDomain, id: &str, revision: u64) -> SourceRevision {
+        SourceRevision {
+            domain: domain as i32,
+            aggregate_id: id.to_owned(),
+            revision,
+            last_event_id: format!("event:{id}:{revision}"),
+        }
+    }
+
+    fn review_metadata(sequence: u64, sources: Vec<SourceRevision>) -> ProjectionMetadata {
+        ProjectionMetadata {
+            schema_ref: Some(ContractReference {
+                contract_id: "egopulse.localapi.v1/review".to_owned(),
+                version: "0.1.0".to_owned(),
+                sha256: "a".repeat(64),
+            }),
+            position: Some(review_position(sequence)),
+            source_revisions: sources,
+            health: ProjectionHealth::Ready as i32,
+            stale: false,
+            safe_health_reason_code: None,
+        }
+    }
+
+    fn review_lineage() -> LineageBinding {
+        LineageBinding {
+            task_id: "task:review".to_owned(),
+            task_revision: 4,
+            work_revision: 2,
+            run_id: "run:review".to_owned(),
+            run_revision: 2,
+            step_id: "step:review".to_owned(),
+            step_revision: 2,
+            attempt_id: "attempt:review".to_owned(),
+            attempt_revision: 2,
+            dispatch_id: "dispatch:review".to_owned(),
+            fencing_token: 1,
+        }
+    }
+
+    fn review_address(seed: char) -> ContentAddress {
+        ContentAddress {
+            algorithm: 1,
+            digest: seed.to_string().repeat(64),
+            byte_length: 12,
+        }
+    }
+
+    fn task_result_fixture() -> (TaskView, EvidenceGraphView) {
+        let lineage = review_lineage();
+        let manifest = review_address('b');
+        let verification_payload = review_address('c');
+        let acceptance = ContractReference {
+            contract_id: "acceptance:review".to_owned(),
+            version: "1".to_owned(),
+            sha256: "d".repeat(64),
+        };
+        let artifact_set = ArtifactSet {
+            artifact_set_id: "artifact-set:review".to_owned(),
+            revision: 3,
+            status: ArtifactSetStatus::Sealed as i32,
+            lineage: Some(lineage.clone()),
+            artifact_ids: vec!["artifact:review".to_owned()],
+            claim_ids: vec!["claim:review".to_owned()],
+            evidence_ids: vec!["evidence:review".to_owned()],
+            canonical_manifest: Some(manifest.clone()),
+            ..Default::default()
+        };
+        let verification = VerificationArtifact {
+            verification_artifact_id: "verification:review".to_owned(),
+            version: 2,
+            binding: Some(VerificationBinding {
+                lineage: Some(lineage.clone()),
+                artifact_set_id: artifact_set.artifact_set_id.clone(),
+                artifact_set_manifest: Some(manifest.clone()),
+                claim_id: "claim:review".to_owned(),
+                acceptance_contract_ref: Some(acceptance.clone()),
+                ..Default::default()
+            }),
+            conclusion: VerificationConclusion::Passed as i32,
+            canonical_payload: Some(verification_payload.clone()),
+            ..Default::default()
+        };
+        let verdict = FounderVerdict {
+            founder_verdict_id: "verdict:review".to_owned(),
+            version: 1,
+            decision: FounderVerdictDecision::Accept as i32,
+            scope: Some(VerdictScope {
+                task_id: "task:review".to_owned(),
+                task_revision: 6,
+                work_revision: 2,
+                artifact_set_id: artifact_set.artifact_set_id.clone(),
+                artifact_set_manifest: Some(manifest),
+                verification_artifact_id: verification.verification_artifact_id.clone(),
+                verification_payload: Some(verification_payload),
+                acceptance_contract_ref: Some(acceptance.clone()),
+            }),
+            observed_verification_conclusion: VerificationConclusion::Passed as i32,
+            ..Default::default()
+        };
+        let task_view = TaskView {
+            metadata: Some(review_metadata(
+                20,
+                vec![
+                    review_source(SourceDomain::Task, "task:review", 7),
+                    review_source(SourceDomain::Artifact, "artifact-set:review", 3),
+                    review_source(SourceDomain::Verification, "verification:review", 2),
+                    review_source(SourceDomain::FounderVerdict, "verdict:review", 1),
+                ],
+            )),
+            task: Some(TaskSnapshot {
+                task_id: "task:review".to_owned(),
+                revision: 7,
+                work_revision: 2,
+                status: TaskStatus::Active as i32,
+                artifact_set_id: Some(artifact_set.artifact_set_id.clone()),
+                verification_artifact_id: Some(verification.verification_artifact_id.clone()),
+                founder_verdict_id: Some(verdict.founder_verdict_id.clone()),
+                acceptance_contract_ref: Some(acceptance),
+                ..Default::default()
+            }),
+            artifact_set: Some(artifact_set),
+            verification: Some(verification),
+            founder_verdict: Some(verdict),
+            founder_verdict_state: Some(FounderVerdictState {
+                founder_verdict_id: "verdict:review".to_owned(),
+                revision: 1,
+                state: 1,
+                ..Default::default()
+            }),
+            redactions: vec![RedactedField {
+                field_path: "founder_verdict.authority_proof".to_owned(),
+                reason_code: "PRIVATE_AUTHORITY_PROOF".to_owned(),
+            }],
+            ..Default::default()
+        };
+        let graph = EvidenceGraphView {
+            metadata: Some(review_metadata(
+                10,
+                vec![
+                    review_source(SourceDomain::Artifact, "artifact-set:review", 3),
+                    review_source(SourceDomain::Artifact, "artifact:review", 1),
+                    review_source(SourceDomain::Artifact, "claim:review", 1),
+                    review_source(SourceDomain::Artifact, "evidence:review", 1),
+                ],
+            )),
+            task_id: "task:review".to_owned(),
+            artifact_set_id: "artifact-set:review".to_owned(),
+            artifacts: vec![ArtifactDescriptor {
+                artifact_id: "artifact:review".to_owned(),
+                revision: 1,
+                provenance: Some(Provenance {
+                    lineage: Some(lineage.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            claims: vec![Claim {
+                claim_id: "claim:review".to_owned(),
+                revision: 1,
+                lineage: Some(lineage.clone()),
+                subject_artifact_ids: vec!["artifact:review".to_owned()],
+                ..Default::default()
+            }],
+            evidence: vec![Evidence {
+                evidence_id: "evidence:review".to_owned(),
+                revision: 1,
+                claim_id: "claim:review".to_owned(),
+                artifact_ids: vec!["artifact:review".to_owned()],
+                lineage: Some(lineage),
+                ..Default::default()
+            }],
+            redactions: vec![RedactedField {
+                field_path: "artifacts.provenance.raw_source_ref".to_owned(),
+                reason_code: "RAW_SOURCE_REDACTED".to_owned(),
+            }],
+        };
+        (task_view, graph)
     }
 
     fn approval_position(sequence: u64) -> ProjectionPosition {
@@ -4324,6 +5150,469 @@ mod tests {
                     reset_reason_code: None,
                 }),
                 Err(ClientApprovalWatchError::ResetBarrier)
+            ));
+        }
+    }
+
+    #[test]
+    fn task_result_review_reads_derived_evidence_with_older_graph_position() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:review",
+            "session:review",
+            &["local.task.read", "local.evidence.read"],
+            ClientSurface::Cli,
+            now,
+        );
+        let (task_view, graph) = task_result_fixture();
+        let captured_task = RefCell::new(None);
+        let captured_evidence = RefCell::new(None);
+        let result = block_on_ready(read_task_result_review_via(
+            &kernel,
+            "task:review",
+            now,
+            |request| {
+                *captured_task.borrow_mut() = Some(request);
+                std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view.clone())),
+                }))
+            },
+            |request| {
+                *captured_evidence.borrow_mut() = Some(request);
+                std::future::ready(Ok(GetEvidenceGraphResponse {
+                    outcome: Some(get_evidence_graph_response::Outcome::Graph(graph.clone())),
+                }))
+            },
+        ))
+        .expect("valid projected review");
+        assert_eq!(result.task_view, task_view);
+        assert_eq!(result.evidence_graph.as_ref(), Some(&graph));
+        assert_eq!(
+            result.task_view.task.as_ref().unwrap().status,
+            TaskStatus::Active as i32,
+            "read-only review must not derive completion"
+        );
+        assert_eq!(result.task_view.redactions.len(), 1);
+        assert_eq!(result.evidence_graph.unwrap().redactions.len(), 1);
+        let task_request = captured_task.borrow();
+        assert_eq!(task_request.as_ref().unwrap().task_id, "task:review");
+        let evidence_request = captured_evidence.borrow();
+        let evidence_request = evidence_request.as_ref().unwrap();
+        assert_eq!(evidence_request.task_id, "task:review");
+        assert_eq!(evidence_request.artifact_set_id, "artifact-set:review");
+        assert_eq!(
+            evidence_request.minimum_position.as_ref().unwrap(),
+            task_view
+                .metadata
+                .as_ref()
+                .unwrap()
+                .position
+                .as_ref()
+                .unwrap()
+        );
+        assert!(
+            graph
+                .metadata
+                .as_ref()
+                .unwrap()
+                .position
+                .as_ref()
+                .unwrap()
+                .sequence
+                < task_view
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .position
+                    .as_ref()
+                    .unwrap()
+                    .sequence
+        );
+    }
+
+    #[test]
+    fn task_result_review_without_artifacts_stops_after_one_rpc() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let kernel =
+            authenticated_kernel("founder:review", "session:review", "local.task.read", now);
+        let (mut task_view, _) = task_result_fixture();
+        let task = task_view.task.as_mut().unwrap();
+        task.artifact_set_id = None;
+        task.verification_artifact_id = None;
+        task.founder_verdict_id = None;
+        task_view.artifact_set = None;
+        task_view.verification = None;
+        task_view.founder_verdict = None;
+        task_view.founder_verdict_state = None;
+        task_view
+            .metadata
+            .as_mut()
+            .unwrap()
+            .source_revisions
+            .retain(|source| source.domain == SourceDomain::Task as i32);
+        let evidence_calls = Cell::new(0);
+        let result = block_on_ready(read_task_result_review_via(
+            &kernel,
+            "task:review",
+            now,
+            |_| {
+                std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                }))
+            },
+            |_| {
+                evidence_calls.set(evidence_calls.get() + 1);
+                std::future::ready(Err("must not dispatch".to_owned()))
+            },
+        ))
+        .expect("Task without ArtifactSet");
+        assert!(result.evidence_graph.is_none());
+        assert_eq!(evidence_calls.get(), 0);
+    }
+
+    #[test]
+    fn task_result_review_permissions_and_remote_failures_keep_stage_and_zero_dispatch() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let denied = authenticated_kernel(
+            "founder:review",
+            "session:review",
+            "local.evidence.read",
+            now,
+        );
+        let task_calls = Cell::new(0);
+        let evidence_calls = Cell::new(0);
+        assert!(matches!(
+            block_on_ready(read_task_result_review_via(
+                &denied,
+                "task:review",
+                now,
+                |_| {
+                    task_calls.set(task_calls.get() + 1);
+                    std::future::ready(Err("not called".to_owned()))
+                },
+                |_| {
+                    evidence_calls.set(evidence_calls.get() + 1);
+                    std::future::ready(Err("not called".to_owned()))
+                },
+            )),
+            Err(ClientTaskResultReviewError::Kernel {
+                stage: TaskResultReviewStage::Task,
+                ..
+            })
+        ));
+        assert_eq!((task_calls.get(), evidence_calls.get()), (0, 0));
+        assert!(matches!(
+            block_on_ready(read_task_result_review_via(
+                &denied,
+                "  ",
+                now,
+                |_| std::future::ready(Err("not called".to_owned())),
+                |_| std::future::ready(Err("not called".to_owned())),
+            )),
+            Err(ClientTaskResultReviewError::InvalidInput(_))
+        ));
+
+        let task_only =
+            authenticated_kernel("founder:review", "session:review", "local.task.read", now);
+        let (task_view, _) = task_result_fixture();
+        let evidence_calls = Cell::new(0);
+        assert!(matches!(
+            block_on_ready(read_task_result_review_via(
+                &task_only,
+                "task:review",
+                now,
+                |_| std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                })),
+                |_| {
+                    evidence_calls.set(evidence_calls.get() + 1);
+                    std::future::ready(Err("not called".to_owned()))
+                },
+            )),
+            Err(ClientTaskResultReviewError::Kernel {
+                stage: TaskResultReviewStage::Evidence,
+                ..
+            })
+        ));
+        assert_eq!(evidence_calls.get(), 0);
+
+        let both = authenticated_kernel_with_permissions(
+            "founder:review",
+            "session:review",
+            &["local.task.read", "local.evidence.read"],
+            ClientSurface::Cli,
+            now,
+        );
+        assert!(matches!(
+            block_on_ready(read_task_result_review_via(
+                &both,
+                "task:review",
+                now,
+                |_| std::future::ready(Err("offline".to_owned())),
+                |_| std::future::ready(Err("not called".to_owned())),
+            )),
+            Err(ClientTaskResultReviewError::Transport {
+                stage: TaskResultReviewStage::Task,
+                ..
+            })
+        ));
+        let (task_view, _) = task_result_fixture();
+        assert!(matches!(
+            block_on_ready(read_task_result_review_via(
+                &both,
+                "task:review",
+                now,
+                |_| std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                })),
+                |_| std::future::ready(Ok(GetEvidenceGraphResponse {
+                    outcome: Some(get_evidence_graph_response::Outcome::Error(LocalApiError {
+                        code: LocalApiErrorCode::NotFound as i32,
+                        ..Default::default()
+                    })),
+                })),
+            )),
+            Err(ClientTaskResultReviewError::Api {
+                stage: TaskResultReviewStage::Evidence,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            block_on_ready(read_task_result_review_via(
+                &both,
+                "task:review",
+                now,
+                |_| std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::Error(LocalApiError {
+                        code: LocalApiErrorCode::NotFound as i32,
+                        ..Default::default()
+                    })),
+                })),
+                |_| std::future::ready(Err("not called".to_owned())),
+            )),
+            Err(ClientTaskResultReviewError::Api {
+                stage: TaskResultReviewStage::Task,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            block_on_ready(read_task_result_review_via(
+                &both,
+                "task:review",
+                now,
+                |_| std::future::ready(Ok(GetTaskViewResponse { outcome: None })),
+                |_| std::future::ready(Err("not called".to_owned())),
+            )),
+            Err(ClientTaskResultReviewError::Integrity {
+                stage: TaskResultReviewStage::Task,
+                ..
+            })
+        ));
+
+        let (task_view, _) = task_result_fixture();
+        assert!(matches!(
+            block_on_ready(read_task_result_review_via(
+                &both,
+                "task:review",
+                now,
+                |_| std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                })),
+                |_| std::future::ready(Err("offline".to_owned())),
+            )),
+            Err(ClientTaskResultReviewError::Transport {
+                stage: TaskResultReviewStage::Evidence,
+                ..
+            })
+        ));
+
+        let (task_view, _) = task_result_fixture();
+        assert!(matches!(
+            block_on_ready(read_task_result_review_via(
+                &both,
+                "task:review",
+                now,
+                |_| std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                })),
+                |_| std::future::ready(Ok(GetEvidenceGraphResponse { outcome: None })),
+            )),
+            Err(ClientTaskResultReviewError::Integrity {
+                stage: TaskResultReviewStage::Evidence,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn task_result_review_rejects_task_and_governance_binding_drift() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:review",
+            "session:review",
+            &["local.task.read", "local.evidence.read"],
+            ClientSurface::Cli,
+            now,
+        );
+        let (baseline, graph) = task_result_fixture();
+        let mut cases = Vec::new();
+        let mut missing_metadata = baseline.clone();
+        missing_metadata.metadata = None;
+        cases.push(missing_metadata);
+        let mut missing_task = baseline.clone();
+        missing_task.task = None;
+        cases.push(missing_task);
+        let mut not_ready = baseline.clone();
+        not_ready.metadata.as_mut().unwrap().health = ProjectionHealth::Rebuilding as i32;
+        cases.push(not_ready);
+        let mut stale = baseline.clone();
+        stale.metadata.as_mut().unwrap().stale = true;
+        cases.push(stale);
+        let mut wrong_id = baseline.clone();
+        wrong_id.task.as_mut().unwrap().task_id = "task:other".to_owned();
+        cases.push(wrong_id);
+        let mut artifact_set = baseline.clone();
+        artifact_set.artifact_set.as_mut().unwrap().artifact_set_id =
+            "artifact-set:other".to_owned();
+        cases.push(artifact_set);
+        let mut verification = baseline.clone();
+        verification
+            .verification
+            .as_mut()
+            .unwrap()
+            .binding
+            .as_mut()
+            .unwrap()
+            .lineage
+            .as_mut()
+            .unwrap()
+            .task_id = "task:other".to_owned();
+        cases.push(verification);
+        let mut verdict = baseline.clone();
+        verdict
+            .founder_verdict
+            .as_mut()
+            .unwrap()
+            .scope
+            .as_mut()
+            .unwrap()
+            .artifact_set_id = "artifact-set:other".to_owned();
+        cases.push(verdict);
+        let mut state = baseline.clone();
+        state
+            .founder_verdict_state
+            .as_mut()
+            .unwrap()
+            .founder_verdict_id = "verdict:other".to_owned();
+        cases.push(state);
+        let mut malformed_verdict = baseline.clone();
+        malformed_verdict.founder_verdict.as_mut().unwrap().decision = i32::MAX;
+        cases.push(malformed_verdict);
+
+        for task_view in cases {
+            let evidence_calls = Cell::new(0);
+            assert!(matches!(
+                block_on_ready(read_task_result_review_via(
+                    &kernel,
+                    "task:review",
+                    now,
+                    |_| std::future::ready(Ok(GetTaskViewResponse {
+                        outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                    })),
+                    |_| {
+                        evidence_calls.set(evidence_calls.get() + 1);
+                        std::future::ready(Ok(GetEvidenceGraphResponse {
+                            outcome: Some(get_evidence_graph_response::Outcome::Graph(
+                                graph.clone(),
+                            )),
+                        }))
+                    },
+                )),
+                Err(ClientTaskResultReviewError::Integrity {
+                    stage: TaskResultReviewStage::Task,
+                    ..
+                })
+            ));
+            assert_eq!(evidence_calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn task_result_review_rejects_graph_source_membership_duplicate_and_dangling_drift() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:review",
+            "session:review",
+            &["local.task.read", "local.evidence.read"],
+            ClientSurface::Cli,
+            now,
+        );
+        let (task_view, baseline) = task_result_fixture();
+        let mut cases = Vec::new();
+        let mut wrong_task = baseline.clone();
+        wrong_task.task_id = "task:other".to_owned();
+        cases.push(wrong_task);
+        let mut wrong_set = baseline.clone();
+        wrong_set.artifact_set_id = "artifact-set:other".to_owned();
+        cases.push(wrong_set);
+        let mut wrong_epoch = baseline.clone();
+        wrong_epoch
+            .metadata
+            .as_mut()
+            .unwrap()
+            .position
+            .as_mut()
+            .unwrap()
+            .epoch = "epoch:other".to_owned();
+        cases.push(wrong_epoch);
+        let mut source = baseline.clone();
+        source.metadata.as_mut().unwrap().source_revisions[0].revision += 1;
+        cases.push(source);
+        let mut duplicate = baseline.clone();
+        duplicate.artifacts.push(duplicate.artifacts[0].clone());
+        cases.push(duplicate);
+        let mut duplicate_reference = baseline.clone();
+        duplicate_reference.claims[0]
+            .subject_artifact_ids
+            .push("artifact:review".to_owned());
+        cases.push(duplicate_reference);
+        let mut extra_source = baseline.clone();
+        extra_source
+            .metadata
+            .as_mut()
+            .unwrap()
+            .source_revisions
+            .push(review_source(SourceDomain::Artifact, "artifact:extra", 1));
+        cases.push(extra_source);
+        let mut missing = baseline.clone();
+        missing.evidence.clear();
+        cases.push(missing);
+        let mut dangling_claim = baseline.clone();
+        dangling_claim.claims[0].subject_artifact_ids = vec!["artifact:missing".to_owned()];
+        cases.push(dangling_claim);
+        let mut dangling_evidence = baseline;
+        dangling_evidence.evidence[0].claim_id = "claim:missing".to_owned();
+        cases.push(dangling_evidence);
+
+        for graph in cases {
+            assert!(matches!(
+                block_on_ready(read_task_result_review_via(
+                    &kernel,
+                    "task:review",
+                    now,
+                    |_| std::future::ready(Ok(GetTaskViewResponse {
+                        outcome: Some(get_task_view_response::Outcome::View(task_view.clone())),
+                    })),
+                    |_| std::future::ready(Ok(GetEvidenceGraphResponse {
+                        outcome: Some(get_evidence_graph_response::Outcome::Graph(graph)),
+                    })),
+                )),
+                Err(ClientTaskResultReviewError::Integrity {
+                    stage: TaskResultReviewStage::Evidence,
+                    ..
+                })
             ));
         }
     }

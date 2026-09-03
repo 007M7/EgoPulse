@@ -17,16 +17,21 @@ use egopulse_client_kernel::KernelError;
 use egopulse_client_operations::{
     ApprovalWatch, ApprovalWatchClassification, ApprovalWatchCursor, ApprovalWatchUpdate,
     AttachError, ClientApprovalWatchError, ClientAttachment, ClientContextRevokeError,
-    ClientGuidedApprovalDecisionError, ClientTaskWatchError, ClientWorkError, ContextRevokeInput,
-    GuidedApprovalDecision, GuidedApprovalDecisionInput, TaskWatch, TaskWatchClassification,
-    TaskWatchRequest, TaskWatchUpdate, attach as attach_client, command_metadata, set_task_digest,
+    ClientGuidedApprovalDecisionError, ClientTaskResultReviewError, ClientTaskWatchError,
+    ClientWorkError, ContextRevokeInput, GuidedApprovalDecision, GuidedApprovalDecisionInput,
+    TaskResultReview, TaskResultReviewStage, TaskWatch, TaskWatchClassification, TaskWatchRequest,
+    TaskWatchUpdate, attach as attach_client, command_metadata, set_task_digest,
     set_verdict_digest, timestamp_after,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
 };
 use egopulse_domain_contracts::v01::egopulse::{
-    artifact::v1::{ContentAddress, HashAlgorithm},
+    artifact::v1::{
+        ArtifactSemanticClass, ArtifactSetStatus, ArtifactStatus, ClaimSourceType, ClaimStatus,
+        ContentAddress, EvidenceProducerClass, EvidenceRelation, EvidenceStatus, HashAlgorithm,
+        IntegrityStatus,
+    },
     collaboration::v1::{RunStatus, StepStatus},
     common::v1::ContractReference,
     localapi::v1::{
@@ -35,9 +40,10 @@ use egopulse_domain_contracts::v01::egopulse::{
         GetEvidenceGraphRequest, GetHarnessApprovalViewRequest, GetProjectionStatusRequest,
         GetTaskViewRequest, ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError,
         LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken,
-        ProjectionHealth, ProjectionMetadata, RetrieveMemoryRequest, SourceRevision, TaskView,
-        await_projection_response, get_evidence_graph_response, get_harness_approval_view_response,
-        get_task_view_response, memory_mutation_command, retrieve_memory_response,
+        ProjectionHealth, ProjectionMetadata, RetrieveMemoryRequest, SourceDomain, SourceRevision,
+        TaskView, await_projection_response, get_evidence_graph_response,
+        get_harness_approval_view_response, get_task_view_response, memory_mutation_command,
+        retrieve_memory_response,
     },
     policy::v1::PolicyDecisionErrorCode,
     task::v1::{
@@ -45,10 +51,14 @@ use egopulse_domain_contracts::v01::egopulse::{
         TaskErrorCode, TaskStatus, task_command, task_command_result,
     },
     verdict::v1::{
-        FounderVerdictDecision, IssueFounderVerdictCommand, RevokeFounderVerdictCommand,
-        VerdictCommand, VerdictErrorCode, VerdictScope, verdict_command,
+        FounderVerdictDecision, FounderVerdictStateKind, IssueFounderVerdictCommand,
+        RevokeFounderVerdictCommand, RiskCategory, VerdictCommand, VerdictErrorCode, VerdictScope,
+        verdict_command,
     },
-    verification::v1::VerificationConclusion,
+    verification::v1::{
+        CheckerAssuranceClass, CriterionOutcome, CriterionRequirement, DiscrepancySeverity,
+        EvidenceCoverage, UnverifiedReason, VerificationConclusion,
+    },
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -250,6 +260,12 @@ enum MemoryCommand {
 enum TaskCommandCli {
     /// Read one projected Task.
     Get {
+        task_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Review projected result metadata and governance evidence.
+    Review {
         task_id: String,
         #[arg(long)]
         json: bool,
@@ -788,6 +804,7 @@ fn command_json(command: &Command) -> bool {
         | Command::Task {
             command:
                 TaskCommandCli::Get { json, .. }
+                | TaskCommandCli::Review { json, .. }
                 | TaskCommandCli::List { json, .. }
                 | TaskCommandCli::Watch { json, .. }
                 | TaskCommandCli::Create { json, .. }
@@ -1706,6 +1723,7 @@ async fn await_projection(
 async fn task(command: TaskCommandCli) -> Result<(), CliFailure> {
     match command {
         TaskCommandCli::Get { task_id, json } => task_get(task_id, json).await,
+        TaskCommandCli::Review { task_id, json } => task_review(task_id, json).await,
         TaskCommandCli::List {
             page_size,
             cursor,
@@ -1801,6 +1819,47 @@ async fn task_get(task_id: String, json: bool) -> Result<(), CliFailure> {
     };
     render_task_view("task.get", &view, json);
     Ok(())
+}
+
+async fn task_review(task_id: String, json: bool) -> Result<(), CliFailure> {
+    let attached = attach("task.review").await?;
+    let review = attached
+        .0
+        .read_task_result_review(&task_id)
+        .await
+        .map_err(task_result_review_failure)?;
+    render_task_result_review(&review, json);
+    Ok(())
+}
+
+fn task_result_review_failure(error: ClientTaskResultReviewError) -> CliFailure {
+    let (stage, failure) = match error {
+        ClientTaskResultReviewError::InvalidInput(detail) => {
+            return CliFailure::protocol(detail).for_operation("task.review");
+        }
+        ClientTaskResultReviewError::Kernel { stage, source } => {
+            let failure = match source {
+                KernelError::PermissionDenied(_) => {
+                    CliFailure::permission("task.review", "request access from an administrator")
+                }
+                other => CliFailure::protocol(other.to_string()),
+            };
+            (stage, failure)
+        }
+        ClientTaskResultReviewError::Transport { stage, detail } => {
+            (stage, CliFailure::daemon_unavailable(detail))
+        }
+        ClientTaskResultReviewError::Api { stage, error } => {
+            (stage, CliFailure::from_local_api_error(*error))
+        }
+        ClientTaskResultReviewError::Integrity { stage, detail } => {
+            (stage, CliFailure::protocol(detail))
+        }
+    };
+    failure.for_operation(match stage {
+        TaskResultReviewStage::Task => "task.review.task",
+        TaskResultReviewStage::Evidence => "task.review.evidence",
+    })
 }
 
 async fn task_list(page_size: u32, cursor: Option<String>, json: bool) -> Result<(), CliFailure> {
@@ -3157,6 +3216,476 @@ fn render_task_view(operation: &'static str, view: &TaskView, json_output: bool)
     }
 }
 
+fn redactions_json(
+    redactions: &[egopulse_domain_contracts::v01::egopulse::localapi::v1::RedactedField],
+) -> serde_json::Value {
+    json!(
+        redactions
+            .iter()
+            .map(|item| json!({
+                "fieldPath": item.field_path,
+                "reasonCode": item.reason_code,
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+fn review_projection_json(metadata: Option<&ProjectionMetadata>) -> serde_json::Value {
+    metadata.map_or(serde_json::Value::Null, |metadata| {
+        json!({
+            "schemaRef": contract_reference_json(metadata.schema_ref.as_ref()),
+            "health": ProjectionHealth::try_from(metadata.health).ok().map(|value| value.as_str_name()),
+            "stale": metadata.stale,
+            "safeHealthReasonCode": metadata.safe_health_reason_code,
+            "position": metadata.position.as_ref().map(|position| json!({
+                "epoch": position.epoch,
+                "sequence": position.sequence,
+                "projectedAt": optional_timestamp_json(position.projected_at.as_ref()),
+            })),
+            "sourceRevisions": metadata.source_revisions.iter().map(|source| json!({
+                "domain": SourceDomain::try_from(source.domain).ok().map(|value| value.as_str_name()),
+                "aggregateId": source.aggregate_id,
+                "revision": source.revision,
+                "lastEventId": source.last_event_id,
+            })).collect::<Vec<_>>(),
+        })
+    })
+}
+
+fn optional_timestamp_json(value: Option<&prost_types::Timestamp>) -> serde_json::Value {
+    value.map_or(
+        serde_json::Value::Null,
+        |value| json!({ "seconds": value.seconds, "nanos": value.nanos }),
+    )
+}
+
+fn contract_reference_json(value: Option<&ContractReference>) -> serde_json::Value {
+    value.map_or(serde_json::Value::Null, |value| {
+        json!({
+            "contractId": value.contract_id,
+            "version": value.version,
+            "sha256": value.sha256,
+        })
+    })
+}
+
+fn content_address_json(value: Option<&ContentAddress>) -> serde_json::Value {
+    value.map_or(serde_json::Value::Null, |value| {
+        json!({
+            "algorithm": HashAlgorithm::try_from(value.algorithm)
+                .ok()
+                .map(|algorithm| algorithm.as_str_name()),
+            "digest": value.digest,
+            "byteLength": value.byte_length,
+        })
+    })
+}
+
+fn lineage_json(
+    value: Option<&egopulse_domain_contracts::v01::egopulse::artifact::v1::LineageBinding>,
+) -> serde_json::Value {
+    value.map_or(serde_json::Value::Null, |value| {
+        json!({
+            "taskId": value.task_id,
+            "taskRevision": value.task_revision,
+            "workRevision": value.work_revision,
+            "runId": value.run_id,
+            "runRevision": value.run_revision,
+            "stepId": value.step_id,
+            "stepRevision": value.step_revision,
+            "attemptId": value.attempt_id,
+            "attemptRevision": value.attempt_revision,
+            "dispatchId": value.dispatch_id,
+            "fencingToken": value.fencing_token,
+        })
+    })
+}
+
+fn safe_producer_json(
+    value: Option<&egopulse_domain_contracts::v01::egopulse::artifact::v1::ProducerIdentity>,
+) -> serde_json::Value {
+    value.map_or(serde_json::Value::Null, |value| {
+        json!({
+            "principalKind": value.principal_kind,
+            "componentName": value.component_name,
+            "componentVersion": value.component_version,
+            "capabilityProfileId": value.capability_profile_id,
+        })
+    })
+}
+
+fn artifact_set_json(
+    set: &egopulse_domain_contracts::v01::egopulse::artifact::v1::ArtifactSet,
+) -> serde_json::Value {
+    json!({
+        "artifactSetId": set.artifact_set_id,
+        "revision": set.revision,
+        "status": ArtifactSetStatus::try_from(set.status).ok().map(|value| value.as_str_name()),
+        "lineage": lineage_json(set.lineage.as_ref()),
+        "artifactIds": set.artifact_ids,
+        "claimIds": set.claim_ids,
+        "evidenceIds": set.evidence_ids,
+        "canonicalManifest": content_address_json(set.canonical_manifest.as_ref()),
+        "createdAt": optional_timestamp_json(set.created_at.as_ref()),
+        "sealedAt": optional_timestamp_json(set.sealed_at.as_ref()),
+        "supersedesArtifactSetId": set.supersedes_artifact_set_id,
+    })
+}
+
+fn artifact_json(
+    artifact: &egopulse_domain_contracts::v01::egopulse::artifact::v1::ArtifactDescriptor,
+) -> serde_json::Value {
+    let provenance = artifact.provenance.as_ref().map(|value| {
+        json!({
+            "lineage": lineage_json(value.lineage.as_ref()),
+            "producer": safe_producer_json(value.producer.as_ref()),
+            "inputArtifactIds": value.input_artifact_ids,
+            "transformationContractRef": contract_reference_json(value.transformation_contract_ref.as_ref()),
+            "observedAt": optional_timestamp_json(value.observed_at.as_ref()),
+            "capturedAt": optional_timestamp_json(value.captured_at.as_ref()),
+        })
+    });
+    json!({
+        "artifactId": artifact.artifact_id,
+        "revision": artifact.revision,
+        "status": ArtifactStatus::try_from(artifact.status).ok().map(|value| value.as_str_name()),
+        "semanticClass": ArtifactSemanticClass::try_from(artifact.semantic_class).ok().map(|value| value.as_str_name()),
+        "typeContractRef": contract_reference_json(artifact.type_contract_ref.as_ref()),
+        "mediaType": artifact.media_type,
+        "content": content_address_json(artifact.content.as_ref()),
+        "integrityStatus": IntegrityStatus::try_from(artifact.integrity_status).ok().map(|value| value.as_str_name()),
+        "provenance": provenance,
+        "sensitivityClass": artifact.sensitivity_class,
+        "retentionProfileRef": contract_reference_json(artifact.retention_profile_ref.as_ref()),
+        "createdAt": optional_timestamp_json(artifact.created_at.as_ref()),
+        "sealedAt": optional_timestamp_json(artifact.sealed_at.as_ref()),
+        "supersedesArtifactId": artifact.supersedes_artifact_id,
+        "quarantineReasonCode": artifact.quarantine_reason_code,
+    })
+}
+
+fn claim_json(
+    claim: &egopulse_domain_contracts::v01::egopulse::artifact::v1::Claim,
+) -> serde_json::Value {
+    json!({
+        "claimId": claim.claim_id,
+        "revision": claim.revision,
+        "status": ClaimStatus::try_from(claim.status).ok().map(|value| value.as_str_name()),
+        "sourceType": ClaimSourceType::try_from(claim.source_type).ok().map(|value| value.as_str_name()),
+        "semanticProfileRef": contract_reference_json(claim.semantic_profile_ref.as_ref()),
+        "lineage": lineage_json(claim.lineage.as_ref()),
+        "subjectArtifactIds": claim.subject_artifact_ids,
+        "acceptanceContractRef": contract_reference_json(claim.acceptance_contract_ref.as_ref()),
+        "statement": content_address_json(claim.statement.as_ref()),
+        "proposedAt": optional_timestamp_json(claim.proposed_at.as_ref()),
+        "supersedesClaimId": claim.supersedes_claim_id,
+    })
+}
+
+fn evidence_json(
+    evidence: &egopulse_domain_contracts::v01::egopulse::artifact::v1::Evidence,
+) -> serde_json::Value {
+    json!({
+        "evidenceId": evidence.evidence_id,
+        "revision": evidence.revision,
+        "status": EvidenceStatus::try_from(evidence.status).ok().map(|value| value.as_str_name()),
+        "relation": EvidenceRelation::try_from(evidence.relation).ok().map(|value| value.as_str_name()),
+        "claimId": evidence.claim_id,
+        "artifactIds": evidence.artifact_ids,
+        "evidenceProfileRef": contract_reference_json(evidence.evidence_profile_ref.as_ref()),
+        "lineage": lineage_json(evidence.lineage.as_ref()),
+        "producerClass": EvidenceProducerClass::try_from(evidence.producer_class).ok().map(|value| value.as_str_name()),
+        "independentOfClaimProposer": evidence.independent_of_claim_proposer,
+        "integrityStatus": IntegrityStatus::try_from(evidence.integrity_status).ok().map(|value| value.as_str_name()),
+        "coverageDescriptor": content_address_json(evidence.coverage_descriptor.as_ref()),
+        "limitationCodes": evidence.limitation_codes,
+        "recordedAt": optional_timestamp_json(evidence.recorded_at.as_ref()),
+        "supersedesEvidenceId": evidence.supersedes_evidence_id,
+    })
+}
+
+fn verification_json(
+    verification: &egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationArtifact,
+) -> serde_json::Value {
+    let binding = verification.binding.as_ref().map(|value| {
+        json!({
+            "lineage": lineage_json(value.lineage.as_ref()),
+            "artifactSetId": value.artifact_set_id,
+            "artifactSetManifest": content_address_json(value.artifact_set_manifest.as_ref()),
+            "claimId": value.claim_id,
+            "claimSemanticProfileRef": contract_reference_json(value.claim_semantic_profile_ref.as_ref()),
+            "acceptanceContractRef": contract_reference_json(value.acceptance_contract_ref.as_ref()),
+        })
+    });
+    let provenance = verification.provenance.as_ref().map(|value| {
+        json!({
+            "checkerProfileRefs": value.checker_profile_refs.iter().map(|item| contract_reference_json(Some(item))).collect::<Vec<_>>(),
+            "toolReceiptArtifactIds": value.tool_receipt_artifact_ids,
+            "modelCallReceiptArtifactIds": value.model_call_receipt_artifact_ids,
+            "rawOutputArtifactIds": value.raw_output_artifact_ids,
+            "durationMs": value.duration_ms,
+            "costReceiptArtifactId": value.cost_receipt_artifact_id,
+        })
+    });
+    json!({
+        "verificationArtifactId": verification.verification_artifact_id,
+        "version": verification.version,
+        "verificationRequestId": verification.verification_request_id,
+        "verificationRunId": verification.verification_run_id,
+        "verificationType": verification.verification_type,
+        "binding": binding,
+        "conclusion": VerificationConclusion::try_from(verification.conclusion).ok().map(|value| value.as_str_name()),
+        "overallEvidenceCoverage": EvidenceCoverage::try_from(verification.overall_evidence_coverage).ok().map(|value| value.as_str_name()),
+        "criterionResults": verification.criterion_results.iter().map(|value| json!({
+            "criterionResultId": value.criterion_result_id,
+            "criterionId": value.criterion_id,
+            "requirement": CriterionRequirement::try_from(value.requirement).ok().map(|item| item.as_str_name()),
+            "outcome": CriterionOutcome::try_from(value.outcome).ok().map(|item| item.as_str_name()),
+            "assuranceClass": CheckerAssuranceClass::try_from(value.assurance_class).ok().map(|item| item.as_str_name()),
+            "checkerProfileRef": contract_reference_json(value.checker_profile_ref.as_ref()),
+            "evidenceCoverage": EvidenceCoverage::try_from(value.evidence_coverage).ok().map(|item| item.as_str_name()),
+            "evidenceIds": value.evidence_ids,
+            "discrepancyIds": value.discrepancy_ids,
+            "unverifiedItemIds": value.unverified_item_ids,
+            "durationMs": value.duration_ms,
+            "safeDetailArtifactId": value.safe_detail_artifact_id,
+        })).collect::<Vec<_>>(),
+        "discrepancies": verification.discrepancies.iter().map(|value| json!({
+            "discrepancyId": value.discrepancy_id,
+            "criterionId": value.criterion_id,
+            "severity": DiscrepancySeverity::try_from(value.severity).ok().map(|item| item.as_str_name()),
+            "evidenceIds": value.evidence_ids,
+            "descriptionArtifactId": value.description_artifact_id,
+            "suggestedFixArtifactId": value.suggested_fix_artifact_id,
+        })).collect::<Vec<_>>(),
+        "unverifiedItems": verification.unverified_items.iter().map(|value| json!({
+            "unverifiedItemId": value.unverified_item_id,
+            "criterionId": value.criterion_id,
+            "reason": UnverifiedReason::try_from(value.reason).ok().map(|item| item.as_str_name()),
+            "evidenceIds": value.evidence_ids,
+            "contextArtifactId": value.context_artifact_id,
+        })).collect::<Vec<_>>(),
+        "provenance": provenance,
+        "canonicalPayload": content_address_json(verification.canonical_payload.as_ref()),
+        "completedAt": optional_timestamp_json(verification.completed_at.as_ref()),
+        "supersedesVerificationArtifactId": verification.supersedes_verification_artifact_id,
+    })
+}
+
+fn verdict_json(
+    verdict: &egopulse_domain_contracts::v01::egopulse::verdict::v1::FounderVerdict,
+) -> serde_json::Value {
+    let scope = verdict.scope.as_ref().map(|value| {
+        json!({
+            "taskId": value.task_id,
+            "taskRevision": value.task_revision,
+            "workRevision": value.work_revision,
+            "artifactSetId": value.artifact_set_id,
+            "artifactSetManifest": content_address_json(value.artifact_set_manifest.as_ref()),
+            "verificationArtifactId": value.verification_artifact_id,
+            "verificationPayload": content_address_json(value.verification_payload.as_ref()),
+            "acceptanceContractRef": contract_reference_json(value.acceptance_contract_ref.as_ref()),
+        })
+    });
+    json!({
+        "founderVerdictId": verdict.founder_verdict_id,
+        "version": verdict.version,
+        "decision": FounderVerdictDecision::try_from(verdict.decision).ok().map(|value| value.as_str_name()),
+        "scope": scope,
+        "observedVerificationConclusion": VerificationConclusion::try_from(verdict.observed_verification_conclusion).ok().map(|value| value.as_str_name()),
+        "riskAcceptances": verdict.risk_acceptances.iter().map(|value| json!({
+            "riskAcceptanceId": value.risk_acceptance_id,
+            "category": RiskCategory::try_from(value.category).ok().map(|item| item.as_str_name()),
+            "discrepancyIds": value.discrepancy_ids,
+            "unverifiedItemIds": value.unverified_item_ids,
+            "rationaleArtifactId": value.rationale_artifact_id,
+            "compensatingControlArtifactIds": value.compensating_control_artifact_ids,
+            "reviewTriggerCode": value.review_trigger_code,
+        })).collect::<Vec<_>>(),
+        "reworkDirective": verdict.rework_directive.as_ref().map(|value| json!({
+            "directiveId": value.directive_id,
+            "reasonCode": value.reason_code,
+            "requiredChangesArtifactId": value.required_changes_artifact_id,
+            "targetDiscrepancyIds": value.target_discrepancy_ids,
+            "targetUnverifiedItemIds": value.target_unverified_item_ids,
+        })),
+        "reasonCode": verdict.reason_code,
+        "rationaleArtifactId": verdict.rationale_artifact_id,
+        "validFrom": optional_timestamp_json(verdict.valid_from.as_ref()),
+        "expiresAt": optional_timestamp_json(verdict.expires_at.as_ref()),
+        "issuedAt": optional_timestamp_json(verdict.issued_at.as_ref()),
+        "canonicalPayload": content_address_json(verdict.canonical_payload.as_ref()),
+        "supersedesFounderVerdictId": verdict.supersedes_founder_verdict_id,
+    })
+}
+
+fn verdict_state_json(
+    state: &egopulse_domain_contracts::v01::egopulse::verdict::v1::FounderVerdictState,
+) -> serde_json::Value {
+    json!({
+        "founderVerdictId": state.founder_verdict_id,
+        "revision": state.revision,
+        "state": FounderVerdictStateKind::try_from(state.state).ok().map(|value| value.as_str_name()),
+        "consumptionReceiptId": state.consumption_receipt_id,
+        "supersededByVerdictId": state.superseded_by_verdict_id,
+        "terminalReasonCode": state.terminal_reason_code,
+        "updatedAt": optional_timestamp_json(state.updated_at.as_ref()),
+    })
+}
+
+fn task_result_review_json(review: &TaskResultReview) -> serde_json::Value {
+    let task = review.task_view.task.as_ref();
+    let artifact_set = review
+        .task_view
+        .artifact_set
+        .as_ref()
+        .map(artifact_set_json);
+    let verification = review
+        .task_view
+        .verification
+        .as_ref()
+        .map(verification_json);
+    let verdict = review.task_view.founder_verdict.as_ref().map(verdict_json);
+    let verdict_state = review
+        .task_view
+        .founder_verdict_state
+        .as_ref()
+        .map(verdict_state_json);
+    let graph = review.evidence_graph.as_ref().map(|graph| {
+        json!({
+            "taskId": graph.task_id,
+            "artifactSetId": graph.artifact_set_id,
+            "artifacts": graph.artifacts.iter().map(artifact_json).collect::<Vec<_>>(),
+            "claims": graph.claims.iter().map(claim_json).collect::<Vec<_>>(),
+            "evidence": graph.evidence.iter().map(evidence_json).collect::<Vec<_>>(),
+            "projection": review_projection_json(graph.metadata.as_ref()),
+            "redactions": redactions_json(&graph.redactions),
+        })
+    });
+    json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": "task.review",
+        "data": {
+            "kind": "projected result metadata/governance evidence",
+            "taskId": task.map(|task| task.task_id.clone()),
+            "taskRevision": task.map(|task| task.revision),
+            "taskStatus": task.and_then(|task| TaskStatus::try_from(task.status).ok()).map(|status| status.as_str_name()),
+            "artifactSet": artifact_set,
+            "evidenceGraph": graph,
+            "verification": verification,
+            "founderVerdict": verdict,
+            "founderVerdictState": verdict_state,
+            "taskProjection": review_projection_json(review.task_view.metadata.as_ref()),
+            "redactions": redactions_json(&review.task_view.redactions),
+        },
+        "correlationId": Uuid::now_v7().to_string(),
+    })
+}
+
+fn task_result_review_text(review: &TaskResultReview) -> String {
+    let payload = task_result_review_json(review);
+    let data = &payload["data"];
+    let artifact_set = data["artifactSet"]["artifactSetId"]
+        .as_str()
+        .unwrap_or("none");
+    let artifacts = review
+        .evidence_graph
+        .as_ref()
+        .map_or(0, |graph| graph.artifacts.len());
+    let quarantined = review.evidence_graph.as_ref().map_or(0, |graph| {
+        graph
+            .artifacts
+            .iter()
+            .filter(|item| item.status == ArtifactStatus::Quarantined as i32)
+            .count()
+    });
+    let claims = review
+        .evidence_graph
+        .as_ref()
+        .map_or(0, |graph| graph.claims.len());
+    let evidence = review
+        .evidence_graph
+        .as_ref()
+        .map_or(0, |graph| graph.evidence.len());
+    let relations = review.evidence_graph.as_ref().map_or_else(
+        || "none".to_owned(),
+        |graph| {
+            let values = graph
+                .evidence
+                .iter()
+                .filter_map(|item| EvidenceRelation::try_from(item.relation).ok())
+                .map(|value| value.as_str_name())
+                .collect::<Vec<_>>()
+                .join(",");
+            if values.is_empty() {
+                "none".to_owned()
+            } else {
+                values
+            }
+        },
+    );
+    let verification_conclusion = data["verification"]["conclusion"]
+        .as_str()
+        .unwrap_or("none");
+    let verification_coverage = data["verification"]["overallEvidenceCoverage"]
+        .as_str()
+        .unwrap_or("none");
+    let discrepancies = data["verification"]["discrepancies"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let unverified = data["verification"]["unverifiedItems"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let verdict_decision = data["founderVerdict"]["decision"]
+        .as_str()
+        .unwrap_or("none");
+    let verdict_observed = data["founderVerdict"]["observedVerificationConclusion"]
+        .as_str()
+        .unwrap_or("none");
+    let verdict_state = data["founderVerdictState"]["state"]
+        .as_str()
+        .unwrap_or("none");
+    let terminal_reason = data["founderVerdictState"]["terminalReasonCode"]
+        .as_str()
+        .unwrap_or("none");
+    format!(
+        "Projected result metadata/governance evidence: task={} revision={} status={}\nArtifactSet: {} artifacts={} quarantined={}\nClaims/Evidence: claims={} evidence={} relations={}\nVerification: conclusion={} coverage={} discrepancies={} unverified={}\nFounder Verdict: observed={} decision={} state={} terminal_reason={}\nRedactions: task={} evidence={}",
+        data["taskId"].as_str().unwrap_or(""),
+        data["taskRevision"].as_u64().unwrap_or_default(),
+        data["taskStatus"].as_str().unwrap_or(""),
+        artifact_set,
+        artifacts,
+        quarantined,
+        claims,
+        evidence,
+        relations,
+        verification_conclusion,
+        verification_coverage,
+        discrepancies,
+        unverified,
+        verdict_observed,
+        verdict_decision,
+        verdict_state,
+        terminal_reason,
+        data["redactions"].as_array().map_or(0, Vec::len),
+        data["evidenceGraph"]["redactions"]
+            .as_array()
+            .map_or(0, Vec::len),
+    )
+}
+
+fn render_task_result_review(review: &TaskResultReview, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&task_result_review_json(review)).unwrap()
+        );
+    } else {
+        println!("{}", task_result_review_text(review));
+    }
+}
+
 fn approval_json(
     view: &egopulse_domain_contracts::v01::egopulse::localapi::v1::HarnessApprovalView,
     operation: &'static str,
@@ -3857,5 +4386,527 @@ mod tests {
         );
         assert_eq!(summary["collaboration"]["returnPendingSteps"], 1);
         assert_eq!(summary["collaboration"]["returnedSteps"], 1);
+    }
+
+    #[test]
+    fn task_review_cli_is_positional_and_existing_task_get_stays_compatible() {
+        let review = Cli::try_parse_from(["egopulse", "task", "review", "task:review", "--json"])
+            .expect("task review command");
+        assert!(matches!(
+            review.command,
+            Command::Task {
+                command: TaskCommandCli::Review {
+                    task_id,
+                    json: true
+                }
+            } if task_id == "task:review"
+        ));
+
+        let get = Cli::try_parse_from(["egopulse", "task", "get", "task:existing", "--json"])
+            .expect("existing task get command");
+        assert!(matches!(
+            get.command,
+            Command::Task {
+                command: TaskCommandCli::Get {
+                    task_id,
+                    json: true
+                }
+            } if task_id == "task:existing"
+        ));
+    }
+
+    #[test]
+    fn task_review_json_is_projected_redacted_and_never_derives_completion() {
+        use egopulse_domain_contracts::v01::egopulse::{
+            artifact::v1::{
+                ArtifactDescriptor, ArtifactSet, Claim, Evidence, LineageBinding, ProducerIdentity,
+                Provenance,
+            },
+            localapi::v1::{EvidenceGraphView, ProjectionPosition, RedactedField},
+            task::v1::TaskSnapshot,
+            verdict::v1::{
+                FounderAuthorityProof, FounderVerdict, FounderVerdictState, ReworkDirective,
+                RiskAcceptance,
+            },
+            verification::v1::{
+                CriterionResult, Discrepancy, UnverifiedItem, VerificationArtifact,
+                VerificationBinding, VerificationProvenance,
+            },
+        };
+
+        let timestamp = || prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 42,
+        };
+        let contract = |id: &str| ContractReference {
+            contract_id: id.to_owned(),
+            version: "v1".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let address = |digest: char, byte_length| ContentAddress {
+            algorithm: HashAlgorithm::Sha256 as i32,
+            digest: digest.to_string().repeat(64),
+            byte_length,
+        };
+        let lineage = LineageBinding {
+            task_id: "task:review".to_owned(),
+            task_revision: 6,
+            work_revision: 2,
+            run_id: "run:review".to_owned(),
+            run_revision: 4,
+            step_id: "step:review".to_owned(),
+            step_revision: 3,
+            attempt_id: "attempt:review".to_owned(),
+            attempt_revision: 2,
+            dispatch_id: "dispatch:review".to_owned(),
+            fencing_token: 9,
+        };
+        let sensitive_producer = ProducerIdentity {
+            principal_kind: "HarnessAdapter".to_owned(),
+            principal_id: "SECRET-PRODUCER-PRINCIPAL".to_owned(),
+            component_name: "safe-checker".to_owned(),
+            component_version: "1.2.3".to_owned(),
+            capability_profile_id: Some("capability:safe".to_owned()),
+            native_execution_ref: Some("SECRET-NATIVE-REF".to_owned()),
+        };
+        let artifact_set = ArtifactSet {
+            artifact_set_id: "artifact-set:review".to_owned(),
+            revision: 3,
+            status: ArtifactSetStatus::Sealed as i32,
+            lineage: Some(lineage.clone()),
+            artifact_ids: vec!["artifact:review".to_owned()],
+            claim_ids: vec!["claim:review".to_owned()],
+            evidence_ids: vec!["evidence:review".to_owned()],
+            canonical_manifest: Some(address('b', 100)),
+            created_at: Some(timestamp()),
+            sealed_at: Some(timestamp()),
+            supersedes_artifact_set_id: Some("artifact-set:previous".to_owned()),
+        };
+        let verification = VerificationArtifact {
+            verification_artifact_id: "verification:review".to_owned(),
+            version: 2,
+            verification_request_id: "verification-request:review".to_owned(),
+            verification_run_id: "verification-run:review".to_owned(),
+            verification_type: "acceptance".to_owned(),
+            binding: Some(VerificationBinding {
+                lineage: Some(lineage.clone()),
+                artifact_set_id: artifact_set.artifact_set_id.clone(),
+                artifact_set_manifest: artifact_set.canonical_manifest.clone(),
+                claim_id: "claim:review".to_owned(),
+                claim_semantic_profile_ref: Some(contract("claim-profile:safe")),
+                acceptance_contract_ref: Some(contract("acceptance:safe")),
+            }),
+            conclusion: VerificationConclusion::Partial as i32,
+            overall_evidence_coverage: EvidenceCoverage::Partial as i32,
+            criterion_results: vec![CriterionResult {
+                criterion_result_id: "criterion-result:1".to_owned(),
+                criterion_id: "criterion:1".to_owned(),
+                requirement: CriterionRequirement::MustPass as i32,
+                outcome: CriterionOutcome::Failed as i32,
+                assurance_class: CheckerAssuranceClass::Deterministic as i32,
+                checker_profile_ref: Some(contract("checker:safe")),
+                evidence_coverage: EvidenceCoverage::Partial as i32,
+                evidence_ids: vec!["evidence:review".to_owned()],
+                discrepancy_ids: vec!["discrepancy:1".to_owned()],
+                unverified_item_ids: vec!["unverified:1".to_owned()],
+                duration_ms: 25,
+                safe_detail_artifact_id: Some("artifact:detail".to_owned()),
+            }],
+            discrepancies: vec![Discrepancy {
+                discrepancy_id: "discrepancy:1".to_owned(),
+                criterion_id: "criterion:1".to_owned(),
+                severity: DiscrepancySeverity::Major as i32,
+                evidence_ids: vec!["evidence:review".to_owned()],
+                description_artifact_id: "artifact:description".to_owned(),
+                suggested_fix_artifact_id: Some("artifact:fix".to_owned()),
+            }],
+            unverified_items: vec![UnverifiedItem {
+                unverified_item_id: "unverified:1".to_owned(),
+                criterion_id: "criterion:1".to_owned(),
+                reason: UnverifiedReason::InsufficientEvidence as i32,
+                evidence_ids: vec!["evidence:review".to_owned()],
+                context_artifact_id: Some("artifact:context".to_owned()),
+            }],
+            provenance: Some(VerificationProvenance {
+                verifier_principal_id: "SECRET-VERIFIER-PRINCIPAL".to_owned(),
+                checker_profile_refs: vec![contract("checker:safe")],
+                tool_receipt_artifact_ids: vec!["artifact:tool-receipt".to_owned()],
+                model_call_receipt_artifact_ids: vec!["artifact:model-receipt".to_owned()],
+                raw_output_artifact_ids: vec!["artifact:raw-output".to_owned()],
+                duration_ms: 30,
+                cost_receipt_artifact_id: Some("artifact:cost".to_owned()),
+            }),
+            canonical_payload: Some(address('c', 200)),
+            completed_at: Some(timestamp()),
+            supersedes_verification_artifact_id: Some("verification:previous".to_owned()),
+        };
+        let review = TaskResultReview {
+            task_view: TaskView {
+                metadata: Some(ProjectionMetadata {
+                    health: ProjectionHealth::Ready as i32,
+                    position: Some(ProjectionPosition {
+                        epoch: "epoch:review".to_owned(),
+                        sequence: 20,
+                        projected_at: Some(timestamp()),
+                    }),
+                    ..Default::default()
+                }),
+                task: Some(TaskSnapshot {
+                    task_id: "task:review".to_owned(),
+                    revision: 7,
+                    status: TaskStatus::Active as i32,
+                    ..Default::default()
+                }),
+                artifact_set: Some(artifact_set),
+                verification: Some(verification),
+                founder_verdict: Some(FounderVerdict {
+                    founder_verdict_id: "verdict:review".to_owned(),
+                    version: 1,
+                    decision: FounderVerdictDecision::Rework as i32,
+                    scope: Some(VerdictScope {
+                        task_id: "task:review".to_owned(),
+                        task_revision: 6,
+                        work_revision: 2,
+                        artifact_set_id: "artifact-set:review".to_owned(),
+                        artifact_set_manifest: Some(address('b', 100)),
+                        verification_artifact_id: "verification:review".to_owned(),
+                        verification_payload: Some(address('c', 200)),
+                        acceptance_contract_ref: Some(contract("acceptance:safe")),
+                    }),
+                    observed_verification_conclusion: VerificationConclusion::Partial as i32,
+                    authority_proof: Some(FounderAuthorityProof {
+                        authenticated_founder_principal_id: "SECRET-PRINCIPAL".to_owned(),
+                        confirmation_proof_ref: "SECRET-PROOF".to_owned(),
+                        ..Default::default()
+                    }),
+                    risk_acceptances: vec![RiskAcceptance {
+                        risk_acceptance_id: "risk:1".to_owned(),
+                        category: RiskCategory::QualityResidual as i32,
+                        discrepancy_ids: vec!["discrepancy:1".to_owned()],
+                        unverified_item_ids: vec!["unverified:1".to_owned()],
+                        rationale_artifact_id: "artifact:risk-rationale".to_owned(),
+                        compensating_control_artifact_ids: vec!["artifact:control".to_owned()],
+                        review_trigger_code: Some("review:later".to_owned()),
+                    }],
+                    rework_directive: Some(ReworkDirective {
+                        directive_id: "rework:1".to_owned(),
+                        reason_code: "fix-major-discrepancy".to_owned(),
+                        required_changes_artifact_id: "artifact:required-changes".to_owned(),
+                        target_discrepancy_ids: vec!["discrepancy:1".to_owned()],
+                        target_unverified_item_ids: vec!["unverified:1".to_owned()],
+                    }),
+                    reason_code: "founder-requires-rework".to_owned(),
+                    rationale_artifact_id: Some("artifact:verdict-rationale".to_owned()),
+                    valid_from: Some(timestamp()),
+                    expires_at: Some(timestamp()),
+                    issued_at: Some(timestamp()),
+                    canonical_payload: Some(address('d', 300)),
+                    supersedes_founder_verdict_id: Some("verdict:previous".to_owned()),
+                }),
+                founder_verdict_state: Some(FounderVerdictState {
+                    founder_verdict_id: "verdict:review".to_owned(),
+                    revision: 1,
+                    state: FounderVerdictStateKind::Issued as i32,
+                    consumption_receipt_id: Some("receipt:consumption".to_owned()),
+                    superseded_by_verdict_id: Some("verdict:next".to_owned()),
+                    terminal_reason_code: Some("terminal:safe".to_owned()),
+                    updated_at: Some(timestamp()),
+                }),
+                redactions: vec![RedactedField {
+                    field_path: "founder_verdict.authority_proof".to_owned(),
+                    reason_code: "PRIVATE_AUTHORITY_PROOF".to_owned(),
+                }],
+                ..Default::default()
+            },
+            evidence_graph: Some(EvidenceGraphView {
+                metadata: Some(ProjectionMetadata {
+                    health: ProjectionHealth::Ready as i32,
+                    position: Some(ProjectionPosition {
+                        epoch: "epoch:review".to_owned(),
+                        sequence: 10,
+                        projected_at: Some(timestamp()),
+                    }),
+                    ..Default::default()
+                }),
+                task_id: "task:review".to_owned(),
+                artifact_set_id: "artifact-set:review".to_owned(),
+                artifacts: vec![ArtifactDescriptor {
+                    artifact_id: "artifact:review".to_owned(),
+                    revision: 2,
+                    status: ArtifactStatus::Quarantined as i32,
+                    semantic_class: ArtifactSemanticClass::HarnessOutput as i32,
+                    type_contract_ref: Some(contract("artifact-type:safe")),
+                    media_type: "application/json".to_owned(),
+                    content: Some(address('e', 400)),
+                    integrity_status: IntegrityStatus::DigestVerified as i32,
+                    provenance: Some(Provenance {
+                        lineage: Some(lineage.clone()),
+                        producer: Some(sensitive_producer.clone()),
+                        input_artifact_ids: vec!["artifact:input".to_owned()],
+                        transformation_contract_ref: Some(contract("transform:safe")),
+                        workspace_ref: "SECRET-WORKSPACE-REF".to_owned(),
+                        observed_at: Some(timestamp()),
+                        captured_at: Some(timestamp()),
+                        raw_source_ref: Some("SECRET-RAW-REF".to_owned()),
+                    }),
+                    sensitivity_class: "internal".to_owned(),
+                    retention_profile_ref: Some(contract("retention:safe")),
+                    created_at: Some(timestamp()),
+                    sealed_at: Some(timestamp()),
+                    supersedes_artifact_id: Some("artifact:previous".to_owned()),
+                    quarantine_reason_code: Some("quarantine:safe".to_owned()),
+                }],
+                claims: vec![Claim {
+                    claim_id: "claim:review".to_owned(),
+                    revision: 2,
+                    status: ClaimStatus::Proposed as i32,
+                    source_type: ClaimSourceType::HarnessReport as i32,
+                    semantic_profile_ref: Some(contract("claim-profile:safe")),
+                    lineage: Some(lineage.clone()),
+                    subject_artifact_ids: vec!["artifact:review".to_owned()],
+                    acceptance_contract_ref: Some(contract("acceptance:safe")),
+                    statement: Some(address('f', 500)),
+                    proposer: Some(sensitive_producer.clone()),
+                    proposed_at: Some(timestamp()),
+                    supersedes_claim_id: Some("claim:previous".to_owned()),
+                }],
+                evidence: vec![Evidence {
+                    evidence_id: "evidence:review".to_owned(),
+                    revision: 2,
+                    status: EvidenceStatus::Recorded as i32,
+                    relation: EvidenceRelation::Qualifies as i32,
+                    claim_id: "claim:review".to_owned(),
+                    artifact_ids: vec!["artifact:review".to_owned()],
+                    evidence_profile_ref: Some(contract("evidence-profile:safe")),
+                    lineage: Some(lineage),
+                    producer: Some(sensitive_producer),
+                    producer_class: EvidenceProducerClass::DeterministicChecker as i32,
+                    independent_of_claim_proposer: true,
+                    integrity_status: IntegrityStatus::DigestVerified as i32,
+                    coverage_descriptor: Some(address('9', 600)),
+                    limitation_codes: vec!["limitation:safe".to_owned()],
+                    recorded_at: Some(timestamp()),
+                    supersedes_evidence_id: Some("evidence:previous".to_owned()),
+                }],
+                redactions: vec![RedactedField {
+                    field_path: "artifacts.provenance.raw_source_ref".to_owned(),
+                    reason_code: "RAW_SOURCE_REDACTED".to_owned(),
+                }],
+            }),
+        };
+
+        let payload = task_result_review_json(&review);
+        assert_eq!(payload["schemaVersion"], "egopulse.cli-result/v0.1");
+        assert_eq!(payload["operation"], "task.review");
+        assert_eq!(
+            payload["data"]["kind"],
+            "projected result metadata/governance evidence"
+        );
+        assert_eq!(payload["data"]["taskStatus"], "TASK_STATUS_ACTIVE");
+        assert_eq!(
+            payload["data"]["artifactSet"]["artifactSetId"],
+            "artifact-set:review"
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["artifacts"][0]["artifactId"],
+            "artifact:review"
+        );
+        assert_eq!(
+            payload["data"]["artifactSet"]["lineage"]["dispatchId"],
+            "dispatch:review"
+        );
+        assert_eq!(
+            payload["data"]["artifactSet"]["supersedesArtifactSetId"],
+            "artifact-set:previous"
+        );
+        assert_eq!(
+            payload["data"]["artifactSet"]["createdAt"]["seconds"],
+            1_700_000_000
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["artifacts"][0]["semanticClass"],
+            "ARTIFACT_SEMANTIC_CLASS_HARNESS_OUTPUT"
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["artifacts"][0]["content"]["byteLength"],
+            400
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["artifacts"][0]["retentionProfileRef"]["contractId"],
+            "retention:safe"
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["artifacts"][0]["quarantineReasonCode"],
+            "quarantine:safe"
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["artifacts"][0]["provenance"]["inputArtifactIds"][0],
+            "artifact:input"
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["claims"][0]["sourceType"],
+            "CLAIM_SOURCE_TYPE_HARNESS_REPORT"
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["claims"][0]["statement"]["digest"],
+            "f".repeat(64)
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["claims"][0]["proposedAt"]["nanos"],
+            42
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["evidence"][0]["relation"],
+            "EVIDENCE_RELATION_QUALIFIES"
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["evidence"][0]["limitationCodes"][0],
+            "limitation:safe"
+        );
+        assert_eq!(
+            payload["data"]["evidenceGraph"]["evidence"][0]["independentOfClaimProposer"],
+            true
+        );
+        assert_eq!(
+            payload["data"]["verification"]["verificationArtifactId"],
+            "verification:review"
+        );
+        assert_eq!(
+            payload["data"]["verification"]["verificationRequestId"],
+            "verification-request:review"
+        );
+        assert_eq!(
+            payload["data"]["verification"]["binding"]["lineage"]["attemptId"],
+            "attempt:review"
+        );
+        assert_eq!(
+            payload["data"]["verification"]["overallEvidenceCoverage"],
+            "EVIDENCE_COVERAGE_PARTIAL"
+        );
+        assert_eq!(
+            payload["data"]["verification"]["criterionResults"][0]["outcome"],
+            "CRITERION_OUTCOME_FAILED"
+        );
+        assert_eq!(
+            payload["data"]["verification"]["discrepancies"][0]["severity"],
+            "DISCREPANCY_SEVERITY_MAJOR"
+        );
+        assert_eq!(
+            payload["data"]["verification"]["unverifiedItems"][0]["reason"],
+            "UNVERIFIED_REASON_INSUFFICIENT_EVIDENCE"
+        );
+        assert_eq!(
+            payload["data"]["verification"]["provenance"]["durationMs"],
+            30
+        );
+        assert_eq!(
+            payload["data"]["verification"]["canonicalPayload"]["byteLength"],
+            200
+        );
+        assert_eq!(
+            payload["data"]["founderVerdict"]["founderVerdictId"],
+            "verdict:review"
+        );
+        assert_eq!(
+            payload["data"]["founderVerdict"]["scope"]["verificationPayload"]["byteLength"],
+            200
+        );
+        assert_eq!(
+            payload["data"]["founderVerdict"]["observedVerificationConclusion"],
+            "VERIFICATION_CONCLUSION_PARTIAL"
+        );
+        assert_eq!(
+            payload["data"]["founderVerdict"]["riskAcceptances"][0]["category"],
+            "RISK_CATEGORY_QUALITY_RESIDUAL"
+        );
+        assert_eq!(
+            payload["data"]["founderVerdict"]["reworkDirective"]["directiveId"],
+            "rework:1"
+        );
+        assert_eq!(
+            payload["data"]["founderVerdict"]["issuedAt"]["seconds"],
+            1_700_000_000
+        );
+        assert_eq!(
+            payload["data"]["founderVerdictState"]["terminalReasonCode"],
+            "terminal:safe"
+        );
+        assert_eq!(
+            payload["data"]["founderVerdictState"]["consumptionReceiptId"],
+            "receipt:consumption"
+        );
+        assert_eq!(
+            payload["data"]["taskProjection"]["position"]["sequence"],
+            20
+        );
+        assert_eq!(payload["data"]["redactions"].as_array().unwrap().len(), 1);
+        let encoded = serde_json::to_string(&payload).unwrap();
+        for forbidden in [
+            "SECRET-PRINCIPAL",
+            "SECRET-PRODUCER-PRINCIPAL",
+            "SECRET-VERIFIER-PRINCIPAL",
+            "SECRET-PROOF",
+            "SECRET-RAW-REF",
+            "SECRET-NATIVE-REF",
+            "SECRET-WORKSPACE-REF",
+            "authorityProof",
+            "principalId",
+            "verifierPrincipalId",
+            "rawSourceRef",
+            "workspaceRef",
+            "nativeExecutionRef",
+            "artifactBytes",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+        let text = task_result_review_text(&review);
+        assert!(text.starts_with("Projected result metadata/governance evidence:"));
+        assert!(text.contains("status=TASK_STATUS_ACTIVE"));
+        assert!(text.contains("artifacts=1 quarantined=1"));
+        assert!(text.contains("claims=1 evidence=1 relations=EVIDENCE_RELATION_QUALIFIES"));
+        assert!(text.contains("coverage=EVIDENCE_COVERAGE_PARTIAL discrepancies=1 unverified=1"));
+        assert!(text.contains("observed=VERIFICATION_CONCLUSION_PARTIAL"));
+        assert!(text.contains("decision=FOUNDER_VERDICT_DECISION_REWORK"));
+        assert!(text.contains("state=FOUNDER_VERDICT_STATE_KIND_ISSUED"));
+        assert!(text.contains("terminal_reason=terminal:safe"));
+        for forbidden in [
+            "SECRET-PRINCIPAL",
+            "SECRET-PRODUCER-PRINCIPAL",
+            "SECRET-VERIFIER-PRINCIPAL",
+            "SECRET-PROOF",
+            "SECRET-RAW-REF",
+            "SECRET-NATIVE-REF",
+            "SECRET-WORKSPACE-REF",
+        ] {
+            assert!(!text.contains(forbidden), "text leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn task_review_missing_result_components_render_as_null() {
+        let review = TaskResultReview {
+            task_view: TaskView {
+                task: Some(
+                    egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
+                        task_id: "task:active".to_owned(),
+                        status: TaskStatus::Active as i32,
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            },
+            evidence_graph: None,
+        };
+        let payload = task_result_review_json(&review);
+        for field in [
+            "artifactSet",
+            "evidenceGraph",
+            "verification",
+            "founderVerdict",
+            "founderVerdictState",
+        ] {
+            assert!(payload["data"][field].is_null(), "{field}");
+        }
+        assert_eq!(payload["data"]["taskStatus"], "TASK_STATUS_ACTIVE");
     }
 }
