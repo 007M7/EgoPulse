@@ -149,7 +149,7 @@ use egopulse_policy_decision_authority::{
 use egopulse_tui::{
     approval_queue::ApprovalQueueController,
     result_review::ResultReviewController,
-    task_watch::TaskWatchController,
+    task_watch::{TaskWatchController, TaskWatchPhase},
     work_start::{WorkStartController, WorkStartStage},
 };
 use egopulse_v01_fault_conformance::memory_restart_oracle::MemoryRestartOracle;
@@ -171,7 +171,7 @@ use egopulse_v01_fault_conformance::r9a3_context::{
 };
 use egopulse_v01_fault_conformance::u03c_result_review::{
     ExpectedStoreProfile, GovernedResultDurabilitySnapshot, GovernedResultOracleRequest,
-    read_governed_result_durability,
+    discover_single_task_id, read_governed_result_durability,
 };
 use egopulse_v01_fault_conformance::u04c_work_start::{
     U04cContextRecord, U04cTaskRecord, U04cWorkStartDurabilitySnapshot, U04cWorkStartOracleRequest,
@@ -1994,6 +1994,7 @@ impl StaticApprovalProjectionSource {
                 task_id: "task-c5-03".to_owned(),
                 work_revision: 1,
                 status: RunStatus::ReturnPending as i32,
+                step_ids: vec!["c5-step".to_owned()],
                 ..Default::default()
             }),
             steps: vec![StepSnapshot {
@@ -2001,6 +2002,8 @@ impl StaticApprovalProjectionSource {
                 run_id: "c5-run".to_owned(),
                 revision: 1,
                 status: StepStatus::ReturnPending as i32,
+                attempt_ids: vec!["c5-attempt".to_owned()],
+                current_attempt_id: Some("c5-attempt".to_owned()),
                 ..Default::default()
             }],
             attempts: vec![AttemptSnapshot {
@@ -2008,6 +2011,9 @@ impl StaticApprovalProjectionSource {
                 run_id: "c5-run".to_owned(),
                 step_id: "c5-step".to_owned(),
                 revision: 1,
+                attempt_number: 1,
+                status: AttemptStatus::Returned as i32,
+                recovery_class: RecoveryClass::ResumeSafe as i32,
                 dispatch_id: Some("c5-dispatch".to_owned()),
                 lease: Some(Lease {
                     fencing_token: 7,
@@ -5237,6 +5243,17 @@ fn u03c_durability_oracle(root: &Path, task_id: &str) -> GovernedResultDurabilit
     snapshot
 }
 
+fn u03c_discover_single_task_id(root: &Path) -> String {
+    discover_single_task_id(
+        root,
+        &ExpectedStoreProfile {
+            schema_profile_id: "egopulse/task-authority-store/v1",
+            schema_profile_sha256: U03C_TASK_SCHEMA_SHA256,
+        },
+    )
+    .expect("discover the sole U-03c Task through the strict read-only conformance oracle")
+}
+
 async fn wait_for_u03c_ready(instance: &str, child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
@@ -5292,12 +5309,12 @@ async fn u03c_selected_task(
         loop {
             controller
                 .pump()
-                .await
                 .map_err(|error| format!("pump U-03c Task Watch: {error}"))?;
-            if let Some(task_id) = controller
+            let task_id = controller
                 .model()
-                .and_then(|model| model.selected_task_id.clone())
-            {
+                .filter(|model| model.phase == TaskWatchPhase::Live)
+                .and_then(|model| model.selected_task_id.clone());
+            if let Some(task_id) = task_id {
                 assert!(controller.select_task(&task_id));
                 break Ok((attachment, controller, task_id));
             }
@@ -5688,6 +5705,283 @@ async fn u03c_real_daemon_cli_and_tui_review_complete_governed_result_without_au
     let status = shutdown_fixture_child(&mut child, "U-03c result review daemon").await;
     assert!(status.success(), "U-03c daemon shutdown failed: {status}");
     fs::remove_dir_all(&root).expect("remove U-03c fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u05d_real_daemon_tui_baseline_is_read_only() {
+    let root = std::env::temp_dir().join(format!("egopulse-u05d-tui-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create U-05d fixture root");
+    let instance = format!("u05d-tui-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, U03C_RESULT_REVIEW_MODE).await;
+    assert_ne!(child.id(), Some(std::process::id()));
+    wait_for_u03c_ready(&instance, &mut child).await;
+
+    let task_id = u03c_discover_single_task_id(&root);
+    let before = u03c_durability_oracle(&root, &task_id);
+
+    let (attachment, mut controller, selected_task_id) =
+        u03c_selected_task_or_reap(&instance, &mut child).await;
+    assert_eq!(selected_task_id, task_id);
+    wait_for_u03c_projection(&attachment, &task_id, true).await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            controller
+                .pump()
+                .expect("pump the production U-05d Task Watch controller");
+            let settled = controller.model().is_some_and(|model| {
+                model.phase == TaskWatchPhase::Live
+                    && model.tasks.iter().any(|task| {
+                        task.task_id == task_id
+                            && task.status == TaskStatus::Rework
+                            && task.run.as_ref().is_some_and(|run| {
+                                run.run_id == U03C_RUN_ID
+                                    && run.status == RunStatus::Returned
+                                    && run.steps.iter().any(|step| {
+                                        step.step_id == U03C_STEP_ID
+                                            && step.status == StepStatus::Returned
+                                            && step.attempts.iter().any(|attempt| {
+                                                attempt.attempt_id == U03C_ATTEMPT_ID
+                                                    && attempt.status == AttemptStatus::Returned
+                                            })
+                                    })
+                            })
+                    })
+            });
+            if settled {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("U-05d governed Task tree becomes live");
+
+    let model = controller
+        .model()
+        .expect("production U-05d Task Watch model");
+    assert_eq!(model.phase, TaskWatchPhase::Live);
+    let task = model
+        .tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .expect("U-05d governed Task");
+    assert_eq!(task.status, TaskStatus::Rework);
+    assert_ne!(task.status, TaskStatus::Completed);
+    let run = task.run.as_ref().expect("U-05d governed Run");
+    assert_eq!(run.run_id, U03C_RUN_ID);
+    assert_eq!(run.status, RunStatus::Returned);
+    let step = run
+        .steps
+        .iter()
+        .find(|step| step.step_id == U03C_STEP_ID)
+        .expect("U-05d governed Step");
+    assert_eq!(step.status, StepStatus::Returned);
+    let attempt = step
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_id == U03C_ATTEMPT_ID)
+        .expect("U-05d governed Attempt");
+    assert_eq!(attempt.status, AttemptStatus::Returned);
+    let d1_task = task.clone();
+
+    let cli = run_bounded_fixture_command_with_timeout(
+        cli_executable(),
+        &instance,
+        &["task", "watch", "--frames", "1", "--json"],
+        "U-05d CLI Task Watch",
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(
+        cli.status.success(),
+        "U-05d CLI Task Watch failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&cli.stdout),
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_stdout = String::from_utf8(cli.stdout).expect("U-05d CLI Task Watch UTF-8");
+    let envelopes: Vec<serde_json::Value> = cli_stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("U-05d CLI Task Watch NDJSON envelope"))
+        .collect();
+    assert_eq!(
+        envelopes.len(),
+        2,
+        "U-05d CLI must emit exactly one baseline and one live update: {cli_stdout}"
+    );
+    assert_eq!(envelopes[0]["operation"], "task.watch");
+    assert_eq!(envelopes[0]["streamSchema"], "egopulse.cli.task-watch/v1");
+    assert_eq!(envelopes[0]["data"]["kind"], "baseline");
+    let cli_task = envelopes[0]["data"]["tasks"]
+        .as_array()
+        .expect("U-05d CLI baseline tasks")
+        .iter()
+        .find(|task| task["taskId"].as_str() == Some(task_id.as_str()))
+        .expect("U-05d CLI baseline contains the governed Task");
+    assert_eq!(cli_task["status"], "TASK_STATUS_REWORK");
+    assert_eq!(cli_task["run"]["runId"], U03C_RUN_ID);
+    assert_eq!(cli_task["run"]["status"], "RUN_STATUS_RETURNED");
+    let cli_step = cli_task["run"]["steps"]
+        .as_array()
+        .expect("U-05d CLI governed Steps")
+        .iter()
+        .find(|step| step["stepId"] == U03C_STEP_ID)
+        .expect("U-05d CLI governed Step");
+    assert_eq!(cli_step["status"], "STEP_STATUS_RETURNED");
+    let cli_attempt = cli_step["attempts"]
+        .as_array()
+        .expect("U-05d CLI governed Attempts")
+        .iter()
+        .find(|attempt| attempt["attemptId"] == U03C_ATTEMPT_ID)
+        .expect("U-05d CLI governed Attempt");
+    assert_eq!(cli_attempt["status"], "ATTEMPT_STATUS_RETURNED");
+    assert_eq!(envelopes[1]["operation"], "task.watch");
+    assert_eq!(envelopes[1]["streamSchema"], "egopulse.cli.task-watch/v1");
+    assert_eq!(envelopes[1]["data"]["kind"], "update");
+    assert_eq!(envelopes[1]["data"]["classification"], "heartbeat");
+    assert!(envelopes[1]["data"]["task"].is_null());
+    for sentinel in [
+        U03C_SENSITIVE_PRINCIPAL,
+        U03C_SENSITIVE_PROOF,
+        U03C_SENSITIVE_WORKSPACE,
+        U03C_SENSITIVE_RAW,
+        "native-u03c-never-render",
+        "session-u03c-never-render",
+    ] {
+        assert!(!cli_stdout.contains(sentinel), "CLI leaked {sentinel}");
+    }
+    assert_eq!(u03c_durability_oracle(&root, &task_id), before);
+
+    let d1_pid = child.id().expect("U-05d D1 PID");
+    let status = shutdown_fixture_child(&mut child, "U-05d D1 daemon").await;
+    assert!(status.success(), "U-05d D1 shutdown failed: {status}");
+    timeout(Duration::from_secs(8), async {
+        loop {
+            controller
+                .pump()
+                .expect("pump U-05d Task Watch after D1 shutdown");
+            if controller
+                .model()
+                .is_some_and(|model| model.phase == TaskWatchPhase::FatalStopped)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("U-05d Task Watch exhausts its bounded reconnect budget");
+    let stopped_model = controller.model().expect("U-05d stopped Task Watch model");
+    assert_eq!(
+        stopped_model.message,
+        "Task Watch stopped after bounded reconnect attempts"
+    );
+    assert_eq!(
+        stopped_model
+            .tasks
+            .iter()
+            .find(|task| task.task_id == task_id),
+        Some(&d1_task),
+        "D1 disconnect must not rewrite the last safe Task facts"
+    );
+    for sentinel in [
+        root.to_string_lossy().as_ref(),
+        U03C_SENSITIVE_PRINCIPAL,
+        U03C_SENSITIVE_PROOF,
+        U03C_SENSITIVE_WORKSPACE,
+        U03C_SENSITIVE_RAW,
+        "native-u03c-never-render",
+        "session-u03c-never-render",
+    ] {
+        assert!(
+            !stopped_model.message.contains(sentinel),
+            "Task Watch stop message leaked {sentinel}"
+        );
+    }
+    timeout(Duration::from_secs(5), controller.stop())
+        .await
+        .expect("stop U-05d Task Watch controller within the bound");
+    assert!(!controller.is_running());
+    drop(controller);
+    drop(attachment);
+    assert_eq!(u03c_durability_oracle(&root, &task_id), before);
+
+    let mut second = spawn_fixture_with_mode(&root, &instance, U03C_RESULT_REVIEW_MODE).await;
+    let d2_pid = second.id().expect("U-05d D2 PID");
+    assert_ne!(d2_pid, std::process::id());
+    assert_ne!(d2_pid, d1_pid, "U-05d restart must use a new process");
+    wait_for_u03c_ready(&instance, &mut second).await;
+    assert_eq!(u03c_discover_single_task_id(&root), task_id);
+    assert_eq!(
+        u03c_durability_oracle(&root, &task_id),
+        before,
+        "D2 production replay must leave the full Authority baseline unchanged before any client read"
+    );
+    let (second_attachment, mut second_controller, second_task_id) =
+        u03c_selected_task_or_reap(&instance, &mut second).await;
+    assert_eq!(second_task_id, task_id);
+    assert_eq!(
+        second_controller
+            .model()
+            .expect("U-05d D2 Task Watch model")
+            .phase,
+        TaskWatchPhase::Live
+    );
+    let d2_task = second_controller
+        .model()
+        .expect("U-05d D2 Task Watch model")
+        .tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .expect("U-05d D2 governed Task");
+    assert_eq!(d2_task.task_id, d1_task.task_id);
+    assert_eq!(d2_task.revision, d1_task.revision);
+    assert_eq!(d2_task.status, d1_task.status);
+    let d1_run = d1_task.run.as_ref().expect("U-05d D1 governed Run");
+    let d2_run = d2_task.run.as_ref().expect("U-05d D2 governed Run");
+    assert_eq!(d2_run.run_id, d1_run.run_id);
+    assert_eq!(d2_run.revision, d1_run.revision);
+    assert_eq!(d2_run.status, d1_run.status);
+    let d1_step = d1_run
+        .steps
+        .iter()
+        .find(|step| step.step_id == U03C_STEP_ID)
+        .expect("U-05d D1 governed Step");
+    let d2_step = d2_run
+        .steps
+        .iter()
+        .find(|step| step.step_id == U03C_STEP_ID)
+        .expect("U-05d D2 governed Step");
+    assert_eq!(d2_step.step_id, d1_step.step_id);
+    assert_eq!(d2_step.revision, d1_step.revision);
+    assert_eq!(d2_step.status, d1_step.status);
+    let d1_attempt = d1_step
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_id == U03C_ATTEMPT_ID)
+        .expect("U-05d D1 governed Attempt");
+    let d2_attempt = d2_step
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_id == U03C_ATTEMPT_ID)
+        .expect("U-05d D2 governed Attempt");
+    assert_eq!(d2_attempt.attempt_id, d1_attempt.attempt_id);
+    assert_eq!(d2_attempt.revision, d1_attempt.revision);
+    assert_eq!(d2_attempt.status, d1_attempt.status);
+    assert_eq!(u03c_durability_oracle(&root, &task_id), before);
+
+    timeout(Duration::from_secs(5), second_controller.stop())
+        .await
+        .expect("stop U-05d D2 Task Watch controller within the bound");
+    drop(second_controller);
+    drop(second_attachment);
+    let second_status = shutdown_fixture_child(&mut second, "U-05d D2 daemon").await;
+    assert!(
+        second_status.success(),
+        "U-05d D2 shutdown failed: {second_status}"
+    );
+    assert_eq!(u03c_durability_oracle(&root, &task_id), before);
+    fs::remove_dir_all(&root).expect("remove U-05d fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9351,14 +9645,12 @@ async fn u01b_real_daemon_production_controller_observes_without_task_mutation()
         loop {
             controller
                 .pump()
-                .await
                 .expect("production controller validates the daemon update");
             if controller.model().is_some_and(|model| {
-                model.tasks.iter().any(|view| {
-                    view.task
-                        .as_ref()
-                        .is_some_and(|task| task.task_id == created_task_id)
-                })
+                model
+                    .tasks
+                    .iter()
+                    .any(|task| task.task_id == created_task_id)
             }) {
                 break;
             }
@@ -9373,17 +9665,24 @@ async fn u01b_real_daemon_production_controller_observes_without_task_mutation()
     let controller_target = controller_model
         .tasks
         .iter()
-        .filter_map(|view| view.task.as_ref())
         .find(|task| task.task_id == created_task_id)
         .expect("controller page contains the governed Task");
     assert_ne!(
         controller_target.status,
-        TaskStatus::Completed as i32,
+        TaskStatus::Completed,
         "observation-only production controller must not false-complete the target Task"
     );
     assert_eq!(
-        controller_target, &durable_before_controller_pump.snapshot,
-        "controller page must render the exact durable Task Authority snapshot"
+        controller_target.task_id, durable_before_controller_pump.snapshot.task_id,
+        "controller page must preserve the durable Task identity"
+    );
+    assert_eq!(
+        controller_target.revision, durable_before_controller_pump.snapshot.revision,
+        "controller page must preserve the durable Task revision"
+    );
+    assert_eq!(
+        controller_target.status as i32, durable_before_controller_pump.snapshot.status,
+        "controller page must preserve the durable Task status"
     );
     let after = attachment
         .read_projection_snapshot()
@@ -9393,10 +9692,17 @@ async fn u01b_real_daemon_production_controller_observes_without_task_mutation()
         after.tasks, after_external_write.tasks,
         "consuming Task Watch must not mutate Tasks beyond the separately committed governed command"
     );
-    assert_eq!(
-        controller_model.tasks, after.tasks,
-        "production controller page facts must equal the Authority-backed projection"
-    );
+    assert_eq!(controller_model.tasks.len(), after.tasks.len());
+    for governed in &controller_model.tasks {
+        let projected = after
+            .tasks
+            .iter()
+            .filter_map(|view| view.task.as_ref())
+            .find(|task| task.task_id == governed.task_id)
+            .expect("safe controller Task must exist in the Authority-backed projection");
+        assert_eq!(governed.revision, projected.revision);
+        assert_eq!(governed.status as i32, projected.status);
+    }
     let target = after
         .tasks
         .iter()
@@ -10712,10 +11018,7 @@ async fn u04c_production_tui_controllers_share_attachment_and_select_exact_confi
     );
     timeout(Duration::from_secs(8), async {
         loop {
-            watch
-                .pump()
-                .await
-                .expect("pump exact U-04c Task projection");
+            watch.pump().expect("pump exact U-04c Task projection");
             if watch.select_task(&task_id) {
                 break;
             }
@@ -10734,14 +11037,13 @@ async fn u04c_production_tui_controllers_share_attachment_and_select_exact_confi
         .expect("U-04c Task Watch model")
         .tasks
         .iter()
-        .filter_map(|view| view.task.as_ref())
         .find(|task| task.task_id == task_id)
         .expect("U-04c confirmed Task projection");
-    assert_ne!(projected.status, TaskStatus::Completed as i32);
+    assert_ne!(projected.status, TaskStatus::Completed);
     let durable = u04c_durability(&root, None, Some(&task_id));
     let task_record = durable.task_record.expect("U-04c durable Task");
     assert_eq!(task_record.task_id, task_id);
-    assert_eq!(task_record.status, projected.status);
+    assert_eq!(task_record.status, projected.status as i32);
 
     watch.stop().await;
     stop_u04c_fixture(&mut child, "U-04c controller daemon").await;

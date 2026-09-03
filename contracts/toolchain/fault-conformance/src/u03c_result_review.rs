@@ -200,6 +200,40 @@ pub fn read_governed_result_durability(
     })
 }
 
+/// Discovers the sole durable Task identity without opening a product writer.
+///
+/// The read is bound to the U-03c fixture store identity and validates the
+/// complete fixed Task table set before publishing the identity.
+pub fn discover_single_task_id(
+    root: &Path,
+    expected_profile: &ExpectedStoreProfile<'_>,
+) -> FaultConformanceResult<String> {
+    let mut connection = open_read_only(root.join("task-authority.db"), [0x11; 32])?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let mut owner = metadata(
+        &tx,
+        "task_store_metadata",
+        "c5-00-task-epoch",
+        expected_profile,
+        true,
+    )?;
+    require_sequence(&owner, &tx, "task_events")?;
+    owner.table_digests = table_digests(&tx, TASK_TABLES)?;
+    if count(&tx, "tasks")? != 1 {
+        return Err(FaultConformanceError::invariant(
+            "U-03c Task identity is not unique",
+        ));
+    }
+    let task_id: String = tx.query_row("SELECT task_id FROM tasks", [], |row| row.get(0))?;
+    if task_id.is_empty() || task_id.chars().any(char::is_control) {
+        return Err(FaultConformanceError::invariant(
+            "U-03c Task identity is invalid",
+        ));
+    }
+    tx.commit()?;
+    Ok(task_id)
+}
+
 fn open_read_only(path: PathBuf, key: [u8; 32]) -> FaultConformanceResult<Connection> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.pragma_update(None, "key", format!("x'{}'", hex::encode(key)))?;
