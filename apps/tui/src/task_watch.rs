@@ -74,6 +74,7 @@ pub struct TaskWatchPageModel {
     pub resume_sequence: Option<u64>,
     pub tasks: Vec<TaskView>,
     pub approvals: Vec<HarnessApprovalView>,
+    pub selected_task_id: Option<String>,
     pub message: String,
 }
 
@@ -89,6 +90,14 @@ impl TaskWatchPageModel {
         if resume_epoch.is_none() || resume_sequence.is_none() {
             return Err("Task watch baseline has no resumable projection position".to_owned());
         }
+        let mut tasks = projection.tasks;
+        tasks.sort_by(|left, right| {
+            task_id_of(left)
+                .unwrap_or_default()
+                .cmp(task_id_of(right).unwrap_or_default())
+        });
+        validate_task_identities(&tasks)?;
+        let selected_task_id = tasks.first().and_then(task_id_of).map(str::to_owned);
         Ok(Self {
             health: ProjectionHealth::try_from(projection.metadata.health)
                 .map(|value| value.as_str_name().to_owned())
@@ -100,8 +109,9 @@ impl TaskWatchPageModel {
                 .unwrap_or_else(|| "unknown".to_owned()),
             resume_epoch,
             resume_sequence,
-            tasks: projection.tasks,
+            tasks,
             approvals: projection.approvals,
+            selected_task_id,
             message: "Task Watch live; Esc returns, r refetches, q quits".to_owned(),
         })
     }
@@ -223,8 +233,37 @@ impl<C: TaskWatchClient + ?Sized + 'static> TaskWatchController<C> {
     }
 
     pub async fn start(&mut self) -> Result<(), String> {
+        let previous_selection = self
+            .model
+            .as_ref()
+            .and_then(|model| model.selected_task_id.clone());
+        let previous_index = self.model.as_ref().and_then(selected_task_index);
         self.stop().await;
-        let baseline = self.client.task_watch_baseline().await?;
+        let mut baseline = self.client.task_watch_baseline().await?;
+        normalize_task_order(&mut baseline.tasks);
+        validate_task_identities(&baseline.tasks)?;
+        let desired_selection = previous_selection
+            .clone()
+            .or_else(|| baseline.selected_task_id.clone());
+        let desired_index = previous_index.or_else(|| {
+            desired_selection.as_deref().and_then(|selected| {
+                baseline
+                    .tasks
+                    .iter()
+                    .position(|view| task_id_of(view) == Some(selected))
+            })
+        });
+        let selection_disappeared = previous_selection.as_ref().is_some_and(|selected| {
+            !baseline
+                .tasks
+                .iter()
+                .any(|view| task_id_of(view) == Some(selected.as_str()))
+        });
+        reconcile_task_selection(&mut baseline, desired_selection.as_deref(), desired_index);
+        if selection_disappeared {
+            baseline.message =
+                "Selected Task left the projection; selection moved safely".to_owned();
+        }
         let resume_epoch = baseline.resume_epoch.clone();
         let resume_sequence = baseline.resume_sequence;
         if resume_epoch.is_none() || resume_sequence.is_none() {
@@ -303,6 +342,47 @@ impl<C: TaskWatchClient + ?Sized + 'static> TaskWatchController<C> {
         Ok(())
     }
 
+    pub fn select_previous(&mut self) {
+        self.select_relative(false);
+    }
+
+    pub fn select_next(&mut self) {
+        self.select_relative(true);
+    }
+
+    pub fn select_task(&mut self, task_id: &str) -> bool {
+        let Some(model) = &mut self.model else {
+            return false;
+        };
+        if model
+            .tasks
+            .iter()
+            .any(|view| task_id_of(view) == Some(task_id))
+        {
+            model.selected_task_id = Some(task_id.to_owned());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_relative(&mut self, forward: bool) {
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        if model.tasks.is_empty() {
+            model.selected_task_id = None;
+            return;
+        }
+        let current = selected_task_index(model).unwrap_or(0);
+        let next = if forward {
+            (current + 1).min(model.tasks.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        model.selected_task_id = task_id_of(&model.tasks[next]).map(str::to_owned);
+    }
+
     fn take_events(&mut self) -> Vec<TaskWatchWorkerEvent> {
         let Some(runtime) = &mut self.runtime else {
             return Vec::new();
@@ -319,7 +399,10 @@ impl<C: TaskWatchClient + ?Sized + 'static> TaskWatchController<C> {
             .model
             .as_mut()
             .ok_or_else(|| "Task Watch has no baseline snapshot".to_owned())?;
+        let mut selection_disappeared = false;
         if update.classification == TaskWatchClassification::Applied {
+            let previous_selection = model.selected_task_id.clone();
+            let previous_index = selected_task_index(model);
             let view = update
                 .view
                 .ok_or_else(|| "applied Task watch update omitted its view".to_owned())?;
@@ -349,17 +432,24 @@ impl<C: TaskWatchClient + ?Sized + 'static> TaskWatchController<C> {
                     return Err("Task Watch baseline contains duplicate Task identities".to_owned());
                 }
             }
-            model.tasks.sort_by(|left, right| {
-                task_id_of(left)
-                    .unwrap_or_default()
-                    .cmp(task_id_of(right).unwrap_or_default())
+            normalize_task_order(&mut model.tasks);
+            selection_disappeared = previous_selection.as_ref().is_some_and(|selected| {
+                !model
+                    .tasks
+                    .iter()
+                    .any(|view| task_id_of(view) == Some(selected.as_str()))
             });
+            reconcile_task_selection(model, previous_selection.as_deref(), previous_index);
+            if selection_disappeared {
+                model.message =
+                    "Selected Task left the projection; selection moved safely".to_owned();
+            }
         }
         model.position = format!("{}:{}", update.position.epoch, update.position.sequence);
         model.resume_epoch = Some(update.position.epoch);
         model.resume_sequence = Some(update.position.sequence);
         model.stale = false;
-        model.message = match update.classification {
+        let normal_message = match update.classification {
             TaskWatchClassification::Applied => {
                 "Task Watch applied a durable projection".to_owned()
             }
@@ -373,6 +463,9 @@ impl<C: TaskWatchClient + ?Sized + 'static> TaskWatchController<C> {
                 return Err("reset update crossed the Task Watch refetch barrier".to_owned());
             }
         };
+        if !selection_disappeared {
+            model.message = normal_message;
+        }
         Ok(())
     }
 }
@@ -385,6 +478,58 @@ impl<C: TaskWatchClient + ?Sized + 'static> Drop for TaskWatchController<C> {
 
 fn task_id_of(view: &TaskView) -> Option<&str> {
     view.task.as_ref().map(|task| task.task_id.as_str())
+}
+
+fn normalize_task_order(tasks: &mut [TaskView]) {
+    tasks.sort_by(|left, right| {
+        task_id_of(left)
+            .unwrap_or_default()
+            .cmp(task_id_of(right).unwrap_or_default())
+    });
+}
+
+fn validate_task_identities(tasks: &[TaskView]) -> Result<(), String> {
+    let mut previous = None;
+    for view in tasks {
+        let task_id = task_id_of(view)
+            .filter(|task_id| !task_id.is_empty())
+            .ok_or_else(|| "Task Watch baseline contains an empty Task identity".to_owned())?;
+        if previous == Some(task_id) {
+            return Err("Task Watch baseline contains duplicate Task identities".to_owned());
+        }
+        previous = Some(task_id);
+    }
+    Ok(())
+}
+
+fn selected_task_index(model: &TaskWatchPageModel) -> Option<usize> {
+    let selected = model.selected_task_id.as_deref()?;
+    model
+        .tasks
+        .iter()
+        .position(|view| task_id_of(view) == Some(selected))
+}
+
+fn reconcile_task_selection(
+    model: &mut TaskWatchPageModel,
+    previous_selection: Option<&str>,
+    previous_index: Option<usize>,
+) {
+    if let Some(previous) = previous_selection
+        && model
+            .tasks
+            .iter()
+            .any(|view| task_id_of(view) == Some(previous))
+    {
+        model.selected_task_id = Some(previous.to_owned());
+        return;
+    }
+    model.selected_task_id = if model.tasks.is_empty() {
+        None
+    } else {
+        let index = previous_index.unwrap_or(0).min(model.tasks.len() - 1);
+        task_id_of(&model.tasks[index]).map(str::to_owned)
+    };
 }
 
 async fn send_task_watch_event(
@@ -746,6 +891,7 @@ mod tests {
             resume_sequence: Some(sequence),
             tasks: vec![task("task:active", 1, TaskStatus::Active)],
             approvals: Vec::new(),
+            selected_task_id: Some("task:active".to_owned()),
             message: "baseline".to_owned(),
         }
     }
@@ -1077,5 +1223,63 @@ mod tests {
             TASK_WATCH_RECONNECT_DELAYS
         );
         assert!(!budget.is_running());
+    }
+
+    #[tokio::test]
+    async fn selection_is_stable_by_task_identity_and_refetch_falls_back_adjacent() {
+        let mut first = baseline(80);
+        first.tasks = vec![
+            task("task:c", 1, TaskStatus::Active),
+            task("task:a", 1, TaskStatus::Active),
+            task("task:b", 1, TaskStatus::Active),
+        ];
+        first.selected_task_id = Some("task:c".to_owned());
+        let mut second = baseline(90);
+        second.tasks = vec![
+            task("task:d", 1, TaskStatus::Active),
+            task("task:a", 1, TaskStatus::Active),
+        ];
+        let client = client(
+            VecDeque::from([first, second]),
+            VecDeque::from([
+                VecDeque::from([Step::Pending]),
+                VecDeque::from([Step::Pending]),
+            ]),
+        );
+        let mut controller = TaskWatchController::new(client);
+        controller.start().await.unwrap();
+        assert_eq!(
+            controller.model().unwrap().selected_task_id.as_deref(),
+            Some("task:c")
+        );
+        controller.select_previous();
+        assert_eq!(
+            controller.model().unwrap().selected_task_id.as_deref(),
+            Some("task:b")
+        );
+        controller
+            .apply_update(update(
+                TaskWatchClassification::Applied,
+                81,
+                Some(task("task:aa", 1, TaskStatus::Active)),
+            ))
+            .unwrap();
+        assert_eq!(
+            controller.model().unwrap().selected_task_id.as_deref(),
+            Some("task:b")
+        );
+        controller.start().await.unwrap();
+        assert_eq!(
+            controller.model().unwrap().selected_task_id.as_deref(),
+            Some("task:d")
+        );
+        assert!(
+            controller
+                .model()
+                .unwrap()
+                .message
+                .contains("left the projection")
+        );
+        controller.stop().await;
     }
 }

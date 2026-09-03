@@ -53,6 +53,10 @@ use egopulse_tui::approval_queue::{
     ApprovalDecisionReceipt, ApprovalQueueClient, ApprovalQueueController, ApprovalQueueOpenFuture,
     GuidedApprovalFuture,
 };
+use egopulse_tui::result_review::{
+    RESULT_REVIEW_NOTICE, ResultReviewController, ResultReviewPageModel, TaskResultReviewClient,
+    TaskResultReviewFuture,
+};
 use egopulse_tui::task_watch::{
     TaskWatchClient, TaskWatchController, TaskWatchOpenFuture, TaskWatchPageModel,
 };
@@ -838,6 +842,7 @@ impl CommandForm {
 enum InteractiveMode {
     Dashboard,
     TaskWatch,
+    ResultReview,
     ApprovalQueue,
     ApprovalDecisionModal(ApprovalDecisionModal),
     Palette { selected: usize },
@@ -852,6 +857,9 @@ enum InteractiveAction {
     OpenTaskWatch,
     RefetchTaskWatch,
     CloseTaskWatch,
+    OpenResultReview,
+    RefreshResultReview,
+    CloseResultReview,
     OpenApprovalQueue,
     RefetchApprovalQueue,
     CloseApprovalQueue,
@@ -987,7 +995,7 @@ impl PendingContextRevoke {
     }
 }
 
-trait InteractiveClient: TaskWatchClient + ApprovalQueueClient {
+trait InteractiveClient: TaskWatchClient + ApprovalQueueClient + TaskResultReviewClient {
     fn snapshot(&self) -> SnapshotFuture<'_>;
     fn prepare_context_revoke(
         &self,
@@ -1114,6 +1122,12 @@ impl ApprovalQueueClient for AttachedClient {
         input: GuidedApprovalDecisionInput,
     ) -> GuidedApprovalFuture<'_> {
         ApprovalQueueClient::decide_guided_approval(self.0.as_ref(), input)
+    }
+}
+
+impl TaskResultReviewClient for AttachedClient {
+    fn read_task_result_review<'a>(&'a self, task_id: &'a str) -> TaskResultReviewFuture<'a> {
+        TaskResultReviewClient::read_task_result_review(self.0.as_ref(), task_id)
     }
 }
 
@@ -2414,6 +2428,7 @@ fn snapshot_into_task_watch_model(snapshot: Snapshot) -> TaskWatchPageModel {
         resume_sequence: snapshot.resume_sequence,
         tasks: snapshot.tasks,
         approvals: snapshot.approvals,
+        selected_task_id: None,
         message: "Task Watch live; Esc returns, r refetches, q quits".to_owned(),
     }
 }
@@ -2440,6 +2455,7 @@ struct App {
     mode: InteractiveMode,
     task_watch: Option<TaskWatchController<dyn InteractiveClient>>,
     approval_queue: Option<ApprovalQueueController<dyn InteractiveClient>>,
+    result_review: Option<ResultReviewController<dyn InteractiveClient>>,
 }
 
 impl App {
@@ -2454,6 +2470,7 @@ impl App {
             mode: InteractiveMode::Dashboard,
             task_watch: None,
             approval_queue: None,
+            result_review: None,
         }
     }
 
@@ -2496,6 +2513,94 @@ impl App {
                 KeyCode::Esc => Ok(Some(InteractiveAction::CloseTaskWatch)),
                 KeyCode::Char('r') => Ok(Some(InteractiveAction::RefetchTaskWatch)),
                 KeyCode::Char('q') => Ok(Some(InteractiveAction::Quit)),
+                KeyCode::Up => {
+                    if let Some(controller) = &mut self.task_watch {
+                        controller.select_previous();
+                    }
+                    Ok(None)
+                }
+                KeyCode::Down => {
+                    if let Some(controller) = &mut self.task_watch {
+                        controller.select_next();
+                    }
+                    Ok(None)
+                }
+                KeyCode::Enter
+                    if self
+                        .task_watch
+                        .as_ref()
+                        .and_then(|controller| controller.model())
+                        .and_then(|model| model.selected_task_id.as_ref())
+                        .is_some() =>
+                {
+                    Ok(Some(InteractiveAction::OpenResultReview))
+                }
+                _ => Ok(None),
+            },
+            InteractiveMode::ResultReview => match key.code {
+                KeyCode::Esc => Ok(Some(InteractiveAction::CloseResultReview)),
+                KeyCode::Char('r') => Ok(Some(InteractiveAction::RefreshResultReview)),
+                KeyCode::Char('q') => Ok(Some(InteractiveAction::Quit)),
+                KeyCode::Tab => {
+                    if let Some(model) = self
+                        .result_review
+                        .as_mut()
+                        .and_then(ResultReviewController::model_mut)
+                    {
+                        model.next_section();
+                    }
+                    Ok(None)
+                }
+                KeyCode::BackTab => {
+                    if let Some(model) = self
+                        .result_review
+                        .as_mut()
+                        .and_then(ResultReviewController::model_mut)
+                    {
+                        model.previous_section();
+                    }
+                    Ok(None)
+                }
+                KeyCode::Up => {
+                    if let Some(model) = self
+                        .result_review
+                        .as_mut()
+                        .and_then(ResultReviewController::model_mut)
+                    {
+                        model.scroll_up(1);
+                    }
+                    Ok(None)
+                }
+                KeyCode::Down => {
+                    if let Some(model) = self
+                        .result_review
+                        .as_mut()
+                        .and_then(ResultReviewController::model_mut)
+                    {
+                        model.scroll_down(1);
+                    }
+                    Ok(None)
+                }
+                KeyCode::PageUp => {
+                    if let Some(model) = self
+                        .result_review
+                        .as_mut()
+                        .and_then(ResultReviewController::model_mut)
+                    {
+                        model.scroll_up(10);
+                    }
+                    Ok(None)
+                }
+                KeyCode::PageDown => {
+                    if let Some(model) = self
+                        .result_review
+                        .as_mut()
+                        .and_then(ResultReviewController::model_mut)
+                    {
+                        model.scroll_down(10);
+                    }
+                    Ok(None)
+                }
                 _ => Ok(None),
             },
             InteractiveMode::ApprovalQueue => match key.code {
@@ -2756,6 +2861,7 @@ impl App {
     async fn start_task_watch(&mut self) -> Result<(), String> {
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
+        self.stop_result_review().await;
         self.ensure_task_watch_client().await?;
         let client = Arc::clone(self.client.as_ref().expect("Task watch client is attached"));
         let mut controller = TaskWatchController::new(client);
@@ -2793,6 +2899,7 @@ impl App {
     async fn start_approval_queue(&mut self) -> Result<(), String> {
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
+        self.stop_result_review().await;
         self.ensure_task_watch_client().await?;
         let client = Arc::clone(
             self.client
@@ -2828,6 +2935,69 @@ impl App {
             .ok_or_else(|| "Approval Queue controller omitted its page model".to_owned())?
             .message
             .clone();
+        Ok(())
+    }
+
+    async fn start_result_review(&mut self) -> Result<(), String> {
+        let selected_task_id = self
+            .task_watch
+            .as_ref()
+            .and_then(|controller| controller.model())
+            .and_then(|model| model.selected_task_id.clone())
+            .ok_or_else(|| "Select a Task before opening result review".to_owned())?;
+        self.stop_task_watch().await;
+        self.stop_approval_queue().await;
+        self.stop_result_review().await;
+        self.ensure_task_watch_client().await?;
+        let client = Arc::clone(
+            self.client
+                .as_ref()
+                .expect("Result review client is attached"),
+        );
+        let mut controller = ResultReviewController::new(client, selected_task_id);
+        controller.start().await?;
+        self.message = "Loading projected result metadata and governance evidence".to_owned();
+        self.result_review = Some(controller);
+        self.mode = InteractiveMode::ResultReview;
+        Ok(())
+    }
+
+    async fn stop_result_review(&mut self) {
+        if let Some(mut controller) = self.result_review.take() {
+            controller.stop().await;
+        }
+    }
+
+    async fn apply_result_review_events(&mut self) -> Result<(), String> {
+        let controller = self
+            .result_review
+            .as_mut()
+            .ok_or_else(|| "Result review controller is unavailable".to_owned())?;
+        controller.pump().await?;
+        if let Some(model) = controller.model() {
+            self.message = model.message.clone();
+        }
+        Ok(())
+    }
+
+    async fn pump_result_review_fail_closed(&mut self) {
+        if let Err(error) = self.apply_result_review_events().await {
+            self.message = format!("Result review stopped fail-closed: {error}");
+        }
+    }
+
+    async fn close_result_review_to_task_watch(&mut self) -> Result<(), String> {
+        let task_id = self
+            .result_review
+            .as_ref()
+            .map(|controller| controller.task_id().to_owned());
+        self.stop_result_review().await;
+        self.start_task_watch().await?;
+        if let (Some(task_id), Some(controller)) = (task_id, self.task_watch.as_mut())
+            && !controller.select_task(&task_id)
+        {
+            self.message = "Reviewed Task left the projection; selection moved safely".to_owned();
+        }
         Ok(())
     }
 
@@ -2930,11 +3100,38 @@ impl App {
                     body[1],
                 ),
             },
-            InteractiveMode::TaskWatch => match snapshot {
-                Some(snapshot) => render_task_watch(frame, body[1], snapshot),
+            InteractiveMode::TaskWatch => {
+                if let Some(model) = self
+                    .task_watch
+                    .as_ref()
+                    .and_then(TaskWatchController::model)
+                {
+                    render_task_watch(frame, body[1], model);
+                } else if let Some(snapshot) = snapshot {
+                    let model = snapshot_into_task_watch_model(snapshot.clone());
+                    render_task_watch(frame, body[1], &model);
+                } else {
+                    frame.render_widget(
+                        Paragraph::new("Task Watch has no baseline snapshot.")
+                            .block(Block::default().borders(Borders::ALL))
+                            .wrap(Wrap { trim: true }),
+                        body[1],
+                    );
+                }
+            }
+            InteractiveMode::ResultReview => match self
+                .result_review
+                .as_ref()
+                .and_then(ResultReviewController::model)
+            {
+                Some(model) => render_result_review(frame, body[1], model),
                 None => frame.render_widget(
-                    Paragraph::new("Task Watch has no baseline snapshot.")
-                        .block(Block::default().borders(Borders::ALL))
+                    Paragraph::new("Loading projected result metadata and governance evidence...")
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title("Result Review"),
+                        )
                         .wrap(Wrap { trim: true }),
                     body[1],
                 ),
@@ -2981,8 +3178,15 @@ impl App {
         }
         match &self.mode {
             InteractiveMode::TaskWatch => {
-                format!("{} - Esc dashboard - r refetch - q quit", self.message)
+                format!(
+                    "{} - Up/Down select - Enter review - Esc dashboard - r refetch - q quit",
+                    self.message
+                )
             }
+            InteractiveMode::ResultReview => format!(
+                "{} - Tab/BackTab section - Up/Down/PgUp/PgDn scroll - r refresh - Esc Task Watch - q quit",
+                self.message
+            ),
             InteractiveMode::ApprovalQueue => format!(
                 "{} - Up/Down select - Enter decide - Esc dashboard - r refetch - q quit",
                 self.message
@@ -3198,7 +3402,7 @@ fn context_revoke_confirmation_text(pending: &PendingContextRevoke) -> Vec<Strin
     ]
 }
 
-fn render_task_watch(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+fn render_task_watch(frame: &mut Frame<'_>, area: Rect, model: &TaskWatchPageModel) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(1)])
@@ -3206,14 +3410,115 @@ fn render_task_watch(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
     frame.render_widget(
         Paragraph::new(format!(
             "position {} - {} - {} tasks",
-            snapshot.position,
-            if snapshot.stale { "stale" } else { "live" },
-            snapshot.tasks.len()
+            model.position,
+            if model.stale { "stale" } else { "live" },
+            model.tasks.len()
         ))
         .block(Block::default().borders(Borders::ALL).title("Task Watch")),
         sections[0],
     );
-    render_tasks(frame, sections[1], &snapshot.tasks);
+    render_task_watch_tasks(frame, sections[1], model);
+}
+
+fn render_task_watch_tasks(frame: &mut Frame<'_>, area: Rect, model: &TaskWatchPageModel) {
+    let rows = model.tasks.iter().map(|view| {
+        let task = view.task.as_ref();
+        let task_id = task.map_or("-", |value| value.task_id.as_str());
+        let selected = model.selected_task_id.as_deref() == Some(task_id);
+        Row::new([
+            Cell::from(if selected { ">" } else { " " }),
+            Cell::from(task_id.to_owned()),
+            Cell::from(
+                task.and_then(|value| TaskStatus::try_from(value.status).ok())
+                    .map(|value| value.as_str_name())
+                    .unwrap_or("TASK_STATUS_UNSPECIFIED"),
+            ),
+            Cell::from(task.map_or("-".to_owned(), |value| value.revision.to_string())),
+        ])
+        .style(if selected {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        })
+    });
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(2),
+                Constraint::Percentage(55),
+                Constraint::Percentage(30),
+                Constraint::Length(12),
+            ],
+        )
+        .header(
+            Row::new(["", "Task", "Status", "Revision"]).style(Style::default().fg(Color::Yellow)),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Projected Tasks"),
+        ),
+        area,
+    );
+}
+
+fn render_result_review(frame: &mut Frame<'_>, area: Rect, model: &ResultReviewPageModel) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "task={} status={} - {RESULT_REVIEW_NOTICE}",
+            model.task_id, model.task_status
+        ))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Projected Result Review"),
+        )
+        .style(Style::default().fg(Color::Cyan)),
+        layout[0],
+    );
+    let tabs = Tabs::new(
+        egopulse_tui::result_review::ResultReviewSection::ALL
+            .iter()
+            .map(|section| Line::from(section.title()))
+            .collect::<Vec<_>>(),
+    )
+    .select(
+        egopulse_tui::result_review::ResultReviewSection::ALL
+            .iter()
+            .position(|section| *section == model.section)
+            .unwrap_or_default(),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Evidence sections"),
+    )
+    .highlight_style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_widget(tabs, layout[1]);
+    frame.render_widget(
+        Paragraph::new(model.lines().join("\n"))
+            .scroll((model.scroll, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(model.section.title()),
+            )
+            .wrap(Wrap { trim: false }),
+        layout[2],
+    );
 }
 
 fn render_tasks(frame: &mut Frame<'_>, area: Rect, tasks: &[TaskView]) {
@@ -3381,6 +3686,7 @@ async fn finish_interactive_session<T>(
 ) -> Result<T, String> {
     app.stop_task_watch().await;
     app.stop_approval_queue().await;
+    app.stop_result_review().await;
     result
 }
 
@@ -3401,6 +3707,26 @@ async fn execute_interactive_action(
             app.mode = InteractiveMode::Dashboard;
             app.refresh().await;
             *next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+        }
+        InteractiveAction::OpenResultReview => {
+            if let Err(error) = app.start_result_review().await {
+                app.message = format!("Result review unavailable: {error}");
+            }
+        }
+        InteractiveAction::RefreshResultReview => {
+            let result = match app.result_review.as_mut() {
+                Some(controller) => controller.refresh().await,
+                None => Err("Result review controller is unavailable".to_owned()),
+            };
+            if let Err(error) = result {
+                app.message = format!("Result review unavailable: {error}");
+            }
+        }
+        InteractiveAction::CloseResultReview => {
+            if let Err(error) = app.close_result_review_to_task_watch().await {
+                app.mode = InteractiveMode::Dashboard;
+                app.message = format!("Task Watch unavailable after review: {error}");
+            }
         }
         InteractiveAction::OpenApprovalQueue | InteractiveAction::RefetchApprovalQueue => {
             if let Err(error) = app.start_approval_queue().await {
@@ -3428,6 +3754,7 @@ async fn execute_interactive_action(
         InteractiveAction::Quit => {
             app.stop_task_watch().await;
             app.stop_approval_queue().await;
+            app.stop_result_review().await;
             return Ok(InteractiveLoopControl::Quit);
         }
         InteractiveAction::StageContextRevoke(input) => {
@@ -3477,6 +3804,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
                 snapshot.stale = true;
             }
             app.message = format!("Task Watch stopped fail-closed: {error}");
+        }
+        if matches!(app.mode, InteractiveMode::ResultReview) {
+            app.pump_result_review_fail_closed().await;
         }
         if matches!(
             app.mode,
@@ -3569,7 +3899,8 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
     use egopulse_client_operations::{
-        ApprovalWatchClassification, ClientTaskWatchError, TaskWatchRequest,
+        ApprovalWatchClassification, ClientTaskResultReviewError, ClientTaskWatchError,
+        TaskResultReview, TaskWatchRequest,
     };
     use egopulse_tui::approval_queue::{
         ApprovalQueueItem, ApprovalQueueNextFuture, ApprovalQueueOpened, ApprovalQueueStream,
@@ -3678,6 +4009,16 @@ mod tests {
         }
     }
 
+    impl TaskResultReviewClient for WatchInteractiveClient {
+        fn read_task_result_review<'a>(&'a self, _task_id: &'a str) -> TaskResultReviewFuture<'a> {
+            Box::pin(async {
+                Err(ClientTaskResultReviewError::InvalidInput(
+                    "result review unavailable in Task Watch fixture",
+                ))
+            })
+        }
+    }
+
     impl ApprovalQueueClient for WatchInteractiveClient {
         fn open_approval_queue(&self) -> ApprovalQueueOpenFuture<'_> {
             Box::pin(async {
@@ -3741,6 +4082,11 @@ mod tests {
         approval_decide_calls: AtomicUsize,
         task_open_calls: AtomicUsize,
         approval_open_calls: AtomicUsize,
+        review_calls: AtomicUsize,
+        review_task_ids: Mutex<Vec<String>>,
+        task_stream_dropped: Arc<std::sync::atomic::AtomicBool>,
+        review_started_after_task_stop: std::sync::atomic::AtomicBool,
+        review_steps: Mutex<VecDeque<MainReviewStep>>,
     }
 
     impl CombinedInteractiveClient {
@@ -3751,7 +4097,38 @@ mod tests {
                 approval_decide_calls: AtomicUsize::new(0),
                 task_open_calls: AtomicUsize::new(0),
                 approval_open_calls: AtomicUsize::new(0),
+                review_calls: AtomicUsize::new(0),
+                review_task_ids: Mutex::new(Vec::new()),
+                task_stream_dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                review_started_after_task_stop: std::sync::atomic::AtomicBool::new(false),
+                review_steps: Mutex::new(VecDeque::new()),
             }
+        }
+
+        fn with_review_steps(mut self, steps: VecDeque<MainReviewStep>) -> Self {
+            self.review_steps = Mutex::new(steps);
+            self
+        }
+    }
+
+    enum MainReviewStep {
+        Success,
+        Integrity,
+    }
+
+    struct CombinedTaskWatchStream {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for CombinedTaskWatchStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl TaskWatchStream for CombinedTaskWatchStream {
+        fn next_update(&mut self) -> TaskWatchNextFuture<'_> {
+            Box::pin(std::future::pending())
         }
     }
 
@@ -3766,11 +4143,10 @@ mod tests {
 
         fn open_task_watch(&self, _request: TaskWatchRequest) -> TaskWatchOpenFuture<'_> {
             self.task_open_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {
-                Ok(Box::new(ScriptedTaskWatch {
-                    steps: Arc::new(Mutex::new(VecDeque::from([ScriptedWatchStep::Pending]))),
-                    next_calls: Arc::new(AtomicUsize::new(0)),
-                }) as Box<dyn TaskWatchStream>)
+            self.task_stream_dropped.store(false, Ordering::SeqCst);
+            let dropped = Arc::clone(&self.task_stream_dropped);
+            Box::pin(async move {
+                Ok(Box::new(CombinedTaskWatchStream { dropped }) as Box<dyn TaskWatchStream>)
             })
         }
     }
@@ -3825,6 +4201,48 @@ mod tests {
             _input: ContextRevokeInput,
         ) -> Result<PendingContextRevoke, String> {
             Err("Context revoke not used by lifecycle tests".to_owned())
+        }
+    }
+
+    impl TaskResultReviewClient for CombinedInteractiveClient {
+        fn read_task_result_review<'a>(&'a self, task_id: &'a str) -> TaskResultReviewFuture<'a> {
+            self.review_calls.fetch_add(1, Ordering::SeqCst);
+            self.review_started_after_task_stop.store(
+                self.task_stream_dropped.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            self.review_task_ids
+                .lock()
+                .unwrap()
+                .push(task_id.to_owned());
+            let step = self
+                .review_steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(MainReviewStep::Success);
+            Box::pin(async move {
+                if matches!(step, MainReviewStep::Integrity) {
+                    return Err(ClientTaskResultReviewError::Integrity {
+                        stage: egopulse_client_operations::TaskResultReviewStage::Evidence,
+                        detail: "scripted integrity failure",
+                    });
+                }
+                Ok(TaskResultReview {
+                    task_view: TaskView {
+                        task: Some(
+                            egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
+                                task_id: task_id.to_owned(),
+                                revision: 1,
+                                status: TaskStatus::Active as i32,
+                                ..Default::default()
+                            },
+                        ),
+                        ..Default::default()
+                    },
+                    evidence_graph: None,
+                })
+            })
         }
     }
 
@@ -3914,6 +4332,16 @@ mod tests {
                         ..Default::default()
                     },
                 }),
+            })
+        }
+    }
+
+    impl TaskResultReviewClient for FakeInteractiveClient {
+        fn read_task_result_review<'a>(&'a self, _task_id: &'a str) -> TaskResultReviewFuture<'a> {
+            Box::pin(async {
+                Err(ClientTaskResultReviewError::InvalidInput(
+                    "result review unavailable in fake fixture",
+                ))
             })
         }
     }
@@ -4058,9 +4486,71 @@ mod tests {
         assert!(app.task_watch.is_some());
         assert!(app.approval_queue.is_none());
 
+        let action = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap()
+            .expect("selected Task opens review");
+        assert!(matches!(action, InteractiveAction::OpenResultReview));
+        let mut refresh = tokio::time::Instant::now();
+        execute_interactive_action(&mut app, action, &mut refresh)
+            .await
+            .unwrap();
+        assert!(app.task_watch.is_none());
+        assert!(app.approval_queue.is_none());
+        assert!(app.result_review.is_some());
+        wait_for_test_count(&client.review_calls, 1).await;
+        assert_eq!(
+            client.review_task_ids.lock().unwrap().as_slice(),
+            ["task:mutual"]
+        );
+        assert!(client.review_started_after_task_stop.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while app.result_review.as_ref().unwrap().model().is_none() {
+                app.apply_result_review_events().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Governance evidence does not complete"));
+        assert!(rendered.contains("Task status: Active"));
+        assert!(rendered.contains("ArtifactSet: Not projected"));
+        assert!(!rendered.contains("Task status: Completed"));
+
+        let close = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap()
+            .expect("review Esc action");
+        assert!(matches!(close, InteractiveAction::CloseResultReview));
+        execute_interactive_action(&mut app, close, &mut refresh)
+            .await
+            .unwrap();
+        assert!(app.result_review.is_none());
+        assert_eq!(
+            app.task_watch
+                .as_ref()
+                .unwrap()
+                .model()
+                .unwrap()
+                .selected_task_id
+                .as_deref(),
+            Some("task:mutual")
+        );
+
         app.start_approval_queue().await.unwrap();
         assert!(app.task_watch.is_none());
         assert!(app.approval_queue.is_some());
+        assert!(app.result_review.is_none());
 
         app.start_task_watch().await.unwrap();
         wait_for_test_count(&client.task_open_calls, 2).await;
@@ -4068,6 +4558,128 @@ mod tests {
         assert!(app.approval_queue.is_none());
         assert_eq!(client.task_open_calls.load(Ordering::SeqCst), 2);
         assert_eq!(client.approval_open_calls.load(Ordering::SeqCst), 1);
+        let action = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap()
+            .unwrap();
+        execute_interactive_action(&mut app, action, &mut refresh)
+            .await
+            .unwrap();
+        let quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            execute_interactive_action(&mut app, quit, &mut refresh)
+                .await
+                .unwrap(),
+            InteractiveLoopControl::Quit
+        );
+        assert!(app.task_watch.is_none());
+        assert!(app.approval_queue.is_none());
+        assert!(app.result_review.is_none());
+    }
+
+    #[tokio::test]
+    async fn result_review_failure_keeps_stopped_controller_for_one_explicit_refresh() {
+        let client = Arc::new(
+            CombinedInteractiveClient::new(VecDeque::new()).with_review_steps(VecDeque::from([
+                MainReviewStep::Integrity,
+                MainReviewStep::Success,
+            ])),
+        );
+        let mut app = App::new("review-recovery".to_owned());
+        app.client = Some(Arc::clone(&client) as Arc<dyn InteractiveClient>);
+        app.start_task_watch().await.unwrap();
+        wait_for_test_count(&client.task_open_calls, 1).await;
+        let open = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap()
+            .expect("selected Task opens result review");
+        let mut next_refresh = tokio::time::Instant::now();
+        execute_interactive_action(&mut app, open, &mut next_refresh)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                app.pump_result_review_fail_closed().await;
+                if app
+                    .result_review
+                    .as_ref()
+                    .is_some_and(|controller| !controller.is_running())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(app.mode, InteractiveMode::ResultReview));
+        assert!(app.result_review.is_some());
+        assert!(!app.result_review.as_ref().unwrap().is_running());
+        assert!(app.result_review.as_ref().unwrap().model().is_none());
+        assert!(app.message.contains("stopped fail-closed"));
+        assert_eq!(client.review_calls.load(Ordering::SeqCst), 1);
+
+        for _ in 0..3 {
+            app.pump_result_review_fail_closed().await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            client.review_calls.load(Ordering::SeqCst),
+            1,
+            "a failed result review must not retry automatically"
+        );
+
+        let retry = app
+            .handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap()
+            .expect("explicit result review refresh");
+        assert!(matches!(retry, InteractiveAction::RefreshResultReview));
+        execute_interactive_action(&mut app, retry, &mut next_refresh)
+            .await
+            .unwrap();
+        wait_for_test_count(&client.review_calls, 2).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                app.pump_result_review_fail_closed().await;
+                if app
+                    .result_review
+                    .as_ref()
+                    .and_then(ResultReviewController::model)
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(client.review_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            app.result_review.as_ref().unwrap().model().unwrap().task_id,
+            "task:mutual"
+        );
+
+        let close = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap()
+            .expect("review Esc returns to Task Watch");
+        execute_interactive_action(&mut app, close, &mut next_refresh)
+            .await
+            .unwrap();
+        assert!(matches!(app.mode, InteractiveMode::TaskWatch));
+        assert!(app.result_review.is_none());
+        assert_eq!(
+            app.task_watch
+                .as_ref()
+                .and_then(TaskWatchController::model)
+                .and_then(|model| model.selected_task_id.as_deref()),
+            Some("task:mutual")
+        );
         app.stop_task_watch().await;
     }
 
@@ -4638,6 +5250,12 @@ mod tests {
     fn task_watch_page_renders_explicit_live_and_stale_state() {
         let mut app = App::new("watch-render".to_owned());
         app.mode = InteractiveMode::TaskWatch;
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap()
+                .is_none(),
+            "Task review cannot start without a selected Task"
+        );
         app.snapshot = Some(watch_snapshot("task:render", 3, 14));
         app.message = "Task Watch live".to_owned();
         let backend = ratatui::backend::TestBackend::new(110, 24);
