@@ -21,13 +21,14 @@ use egopulse_client_kernel::KernelError;
 use egopulse_client_operations::{
     ApprovalWatch, ApprovalWatchClassification, ApprovalWatchCursor, ApprovalWatchUpdate,
     AttachError, ClientApprovalWatchError, ClientAttachment, ClientContextRevokeError,
-    ClientGuidedApprovalDecisionError, ClientGuidedWorkError, ClientTaskResultReviewError,
-    ClientTaskWatchError, ClientWorkError, ContextRevokeInput, GuidedApprovalDecision,
+    ClientGovernedTaskError, ClientGuidedApprovalDecisionError, ClientGuidedWorkError,
+    ClientTaskResultReviewError, ClientWorkError, ContextRevokeInput, GovernedHoldReason,
+    GovernedProjectionPosition, GovernedProjectionReason, GovernedTaskBaseline,
+    GovernedTaskSession, GovernedTaskState, GovernedTaskUpdate, GuidedApprovalDecision,
     GuidedApprovalDecisionInput, GuidedWorkConfirmationAttempt, GuidedWorkInput,
     GuidedWorkPreparationAttempt, GuidedWorkPreview, GuidedWorkSource, TaskResultReview,
-    TaskResultReviewStage, TaskWatch, TaskWatchClassification, TaskWatchRequest, TaskWatchUpdate,
-    attach as attach_client, command_metadata, set_task_digest, set_verdict_digest,
-    timestamp_after, validate_guided_work_input,
+    TaskResultReviewStage, TaskWatchClassification, attach as attach_client, command_metadata,
+    set_task_digest, set_verdict_digest, timestamp_after, validate_guided_work_input,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -553,6 +554,48 @@ impl CliFailure {
             required_action_code: Some("REFETCH_PROJECTION".to_owned()),
             safe_fingerprint: None,
             operation,
+        }
+    }
+
+    fn projection_not_caught_up() -> Self {
+        Self {
+            exit_code: 7,
+            reason_code: "PROJECTION_NOT_CAUGHT_UP",
+            message:
+                "the current complete Task baseline has not reached the requested minimum position"
+                    .to_owned(),
+            category: "projection",
+            retryable: true,
+            required_action_code: Some("WAIT_FOR_PROJECTION".to_owned()),
+            safe_fingerprint: None,
+            operation: "task.watch",
+        }
+    }
+
+    fn reset_required() -> Self {
+        Self {
+            exit_code: 7,
+            reason_code: "RESET_REQUIRED",
+            message: "Task watch exceeded the bounded projection reset recovery budget; rerun the command"
+                .to_owned(),
+            category: "projection",
+            retryable: true,
+            required_action_code: Some("REFETCH_PROJECTION".to_owned()),
+            safe_fingerprint: None,
+            operation: "task.watch",
+        }
+    }
+
+    fn task_watch_session_changed() -> Self {
+        Self {
+            exit_code: 5,
+            reason_code: "SESSION_CHANGED",
+            message: "the authenticated Task watch session expired; rerun the command".to_owned(),
+            category: "contract",
+            retryable: false,
+            required_action_code: Some("REATTACH_SESSION".to_owned()),
+            safe_fingerprint: None,
+            operation: "task.watch",
         }
     }
 
@@ -2385,62 +2428,169 @@ async fn task_watch(
     json: bool,
 ) -> Result<(), CliFailure> {
     validate_task_watch_request(frames, &resume_epoch, resume_sequence)?;
-    let attached = attach("task.watch").await?;
-    let watch = attached
-        .0
-        .open_task_watch(TaskWatchRequest {
-            resume_epoch,
-            resume_sequence,
-        })
-        .await
-        .map_err(task_watch_failure)?;
-    consume_task_watch(watch, frames, |update| {
-        render_task_watch_update(update, json);
-    })
+    let mut attached = attach("task.watch").await?;
+    consume_governed_task_watch(
+        &mut attached,
+        frames,
+        resume_epoch,
+        resume_sequence,
+        |record| render_governed_task_watch_record(record, json),
+    )
     .await
 }
 
-trait CliTaskWatchSource {
-    fn next_update(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<TaskWatchUpdate>, ClientTaskWatchError>> + '_>>;
+trait CliGovernedTaskBaseline {
+    fn position(&self) -> GovernedProjectionPosition;
+
+    fn tasks(&self) -> Vec<GovernedTaskState>;
 }
 
-impl CliTaskWatchSource for TaskWatch {
-    fn next_update(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<TaskWatchUpdate>, ClientTaskWatchError>> + '_>>
-    {
-        Box::pin(TaskWatch::next_update(self))
+impl CliGovernedTaskBaseline for GovernedTaskBaseline {
+    fn position(&self) -> GovernedProjectionPosition {
+        self.position().clone()
+    }
+
+    fn tasks(&self) -> Vec<GovernedTaskState> {
+        self.tasks().into_iter().cloned().collect()
     }
 }
 
-async fn consume_task_watch<S, R>(
-    mut watch: S,
+trait CliGovernedTaskSession {
+    fn next_update(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<GovernedTaskUpdate, ClientGovernedTaskError>> + '_>>;
+}
+
+impl CliGovernedTaskSession for GovernedTaskSession {
+    fn next_update(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<GovernedTaskUpdate, ClientGovernedTaskError>> + '_>>
+    {
+        Box::pin(GovernedTaskSession::next_update(self))
+    }
+}
+
+trait CliGovernedTaskClient {
+    type Baseline: CliGovernedTaskBaseline;
+    type Session: CliGovernedTaskSession;
+
+    fn read_baseline(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Baseline, ClientGovernedTaskError>> + '_>>;
+
+    fn open_session(
+        &mut self,
+        baseline: Self::Baseline,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Session, ClientGovernedTaskError>> + '_>>;
+}
+
+impl CliGovernedTaskClient for AttachedClient {
+    type Baseline = GovernedTaskBaseline;
+    type Session = GovernedTaskSession;
+
+    fn read_baseline(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Baseline, ClientGovernedTaskError>> + '_>> {
+        Box::pin(self.0.read_governed_task_baseline())
+    }
+
+    fn open_session(
+        &mut self,
+        baseline: Self::Baseline,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Session, ClientGovernedTaskError>> + '_>> {
+        Box::pin(self.0.open_governed_task_session(baseline))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CliGovernedTaskWatchRecord {
+    ResumeEpochMismatch {
+        requested: GovernedProjectionPosition,
+        current: GovernedProjectionPosition,
+    },
+    Baseline {
+        position: GovernedProjectionPosition,
+        tasks: Vec<GovernedTaskState>,
+    },
+    Update(GovernedTaskUpdate),
+}
+
+const MAX_TASK_WATCH_REBASES: u32 = 3;
+
+async fn consume_governed_task_watch<C, R>(
+    client: &mut C,
     frames: u32,
+    resume_epoch: Option<String>,
+    resume_sequence: Option<u64>,
     mut render: R,
 ) -> Result<(), CliFailure>
 where
-    S: CliTaskWatchSource,
-    R: FnMut(&TaskWatchUpdate),
+    C: CliGovernedTaskClient,
+    R: FnMut(&CliGovernedTaskWatchRecord),
 {
-    validate_task_watch_request(frames, &None, None)?;
-    let mut emitted = 0_u32;
-    while emitted < frames {
-        let Some(update) = watch.next_update().await.map_err(task_watch_failure)? else {
-            return ensure_task_watch_complete(frames, emitted);
-        };
-        if update.classification == TaskWatchClassification::ResetRequired {
-            return Err(CliFailure::stream_recovery(
-                "task.watch",
-                update
-                    .reset_reason_code
-                    .as_deref()
-                    .unwrap_or("stream reset required"),
-            ));
+    validate_task_watch_request(frames, &resume_epoch, resume_sequence)?;
+    let mut baseline = client
+        .read_baseline()
+        .await
+        .map_err(governed_task_watch_failure)?;
+    let baseline_position = baseline.position();
+    if let (Some(requested_epoch), Some(requested_sequence)) =
+        (resume_epoch.as_deref(), resume_sequence)
+    {
+        if requested_epoch == baseline_position.epoch {
+            if baseline_position.sequence < requested_sequence {
+                return Err(CliFailure::projection_not_caught_up());
+            }
+        } else {
+            render(&CliGovernedTaskWatchRecord::ResumeEpochMismatch {
+                requested: GovernedProjectionPosition {
+                    epoch: requested_epoch.to_owned(),
+                    sequence: requested_sequence,
+                },
+                current: baseline_position.clone(),
+            });
         }
-        render(&update);
+    }
+    render(&CliGovernedTaskWatchRecord::Baseline {
+        position: baseline_position,
+        tasks: baseline.tasks(),
+    });
+    let mut session = client
+        .open_session(baseline)
+        .await
+        .map_err(governed_task_watch_failure)?;
+    let mut emitted = 0_u32;
+    let mut rebases = 0_u32;
+    while emitted < frames {
+        let update = session
+            .next_update()
+            .await
+            .map_err(governed_task_watch_failure)?;
+        let reset_required = update.classification == TaskWatchClassification::ResetRequired;
+        render(&CliGovernedTaskWatchRecord::Update(update));
         emitted += 1;
+        if reset_required {
+            drop(session);
+            if emitted == frames {
+                return Ok(());
+            }
+            if rebases == MAX_TASK_WATCH_REBASES {
+                return Err(CliFailure::reset_required());
+            }
+            rebases += 1;
+            baseline = client
+                .read_baseline()
+                .await
+                .map_err(governed_task_watch_failure)?;
+            render(&CliGovernedTaskWatchRecord::Baseline {
+                position: baseline.position(),
+                tasks: baseline.tasks(),
+            });
+            session = client
+                .open_session(baseline)
+                .await
+                .map_err(governed_task_watch_failure)?;
+        }
     }
     Ok(())
 }
@@ -2467,75 +2617,295 @@ fn validate_task_watch_request(
     Ok(())
 }
 
-fn ensure_task_watch_complete(requested: u32, received: u32) -> Result<(), CliFailure> {
-    if received < requested {
-        return Err(task_watch_failure(ClientTaskWatchError::PrematureEof {
-            expected: requested,
-            received,
-        }));
-    }
-    Ok(())
-}
-
-fn task_watch_failure(error: ClientTaskWatchError) -> CliFailure {
+fn governed_task_watch_failure(error: ClientGovernedTaskError) -> CliFailure {
     match error {
-        ClientTaskWatchError::Transport(detail) => {
-            CliFailure::daemon_unavailable(detail).for_operation("task.watch")
+        ClientGovernedTaskError::Transport(_) => {
+            CliFailure::daemon_unavailable("Task watch transport ended; rerun the command")
+                .for_operation("task.watch")
         }
-        ClientTaskWatchError::Kernel(KernelError::PermissionDenied(permission)) => {
+        ClientGovernedTaskError::Kernel(KernelError::PermissionDenied(permission)) => {
             CliFailure::permission("task.watch", permission)
         }
-        invalid @ ClientTaskWatchError::InvalidResumePair => {
-            CliFailure::protocol(invalid.to_string()).for_operation("task.watch")
+        ClientGovernedTaskError::Kernel(KernelError::SessionUnavailable) => {
+            CliFailure::daemon_unavailable("Task watch session is unavailable; rerun the command")
+                .for_operation("task.watch")
         }
-        recovery @ (ClientTaskWatchError::Kernel(_)
-        | ClientTaskWatchError::ResetBarrier
-        | ClientTaskWatchError::PrematureEof { .. }) => {
-            CliFailure::stream_recovery("task.watch", recovery.to_string())
+        ClientGovernedTaskError::Kernel(KernelError::SessionExpired) => {
+            CliFailure::task_watch_session_changed()
+        }
+        ClientGovernedTaskError::Api(error) => {
+            CliFailure::from_local_api_error(*error).for_operation("task.watch")
+        }
+        ClientGovernedTaskError::UnexpectedEof => CliFailure::stream_recovery(
+            "task.watch",
+            "Task watch ended before the requested live frames; rerun the command",
+        ),
+        ClientGovernedTaskError::ResetBarrier => CliFailure::reset_required(),
+        ClientGovernedTaskError::BaselineLimitExceeded => {
+            CliFailure::protocol("governed Task baseline exceeded the safe 1000-item limit")
+                .for_operation("task.watch")
+        }
+        ClientGovernedTaskError::Protocol(_) | ClientGovernedTaskError::Kernel(_) => {
+            CliFailure::protocol("governed Task projection integrity validation failed")
+                .for_operation("task.watch")
         }
     }
 }
 
-fn task_watch_update_json(update: &TaskWatchUpdate) -> serde_json::Value {
-    let apply = match update.classification {
+fn governed_hold_reason_name(reason: GovernedHoldReason) -> &'static str {
+    match reason {
+        GovernedHoldReason::CancellationOutcomeUnknown => "cancellation_outcome_unknown",
+        GovernedHoldReason::CompensationRequired => "compensation_required",
+        GovernedHoldReason::ManualRecoveryRequired => "manual_recovery_required",
+        GovernedHoldReason::IrreversibleOutcomeUnknown => "irreversible_outcome_unknown",
+        GovernedHoldReason::Unclassified => "unclassified",
+    }
+}
+
+fn governed_projection_reason_name(reason: GovernedProjectionReason) -> &'static str {
+    match reason {
+        GovernedProjectionReason::DependencyProjectionPending => "dependency_projection_pending",
+        GovernedProjectionReason::ProjectionNotReady => "projection_not_ready",
+        GovernedProjectionReason::TaskProjectionInvalid => "task_projection_invalid",
+        GovernedProjectionReason::Unclassified => "unclassified",
+    }
+}
+
+fn governed_task_json(task: &GovernedTaskState) -> serde_json::Value {
+    let run = task.run.as_ref().map(|run| {
+        let steps = run
+            .steps
+            .iter()
+            .map(|step| {
+                let attempts = step
+                    .attempts
+                    .iter()
+                    .map(|attempt| {
+                        json!({
+                            "attemptId": attempt.attempt_id,
+                            "revision": attempt.revision,
+                            "attemptNumber": attempt.attempt_number,
+                            "status": attempt.status.as_str_name(),
+                            "recoveryClass": attempt.recovery_class.as_str_name(),
+                            "holdReason": attempt.hold_reason.map(governed_hold_reason_name),
+                            "lastHarnessSequence": attempt.last_harness_sequence,
+                            "checkpointReferenceRecorded": attempt.checkpoint_reference_recorded,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "stepId": step.step_id,
+                    "revision": step.revision,
+                    "status": step.status.as_str_name(),
+                    "holdReason": step.hold_reason.map(governed_hold_reason_name),
+                    "currentAttemptId": step.current_attempt_id,
+                    "attempts": attempts,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "runId": run.run_id,
+            "revision": run.revision,
+            "status": run.status.as_str_name(),
+            "workRevision": run.work_revision,
+            "holdReason": run.hold_reason.map(governed_hold_reason_name),
+            "steps": steps,
+        })
+    });
+    json!({
+        "taskId": task.task_id,
+        "revision": task.revision,
+        "status": task.status.as_str_name(),
+        "resumeStatus": task.resume_status.map(|status| status.as_str_name()),
+        "holdReason": task.hold_reason.map(governed_hold_reason_name),
+        "projection": {
+            "position": {
+                "epoch": task.projection.position.epoch,
+                "sequence": task.projection.position.sequence,
+            },
+            "health": task.projection.health.as_str_name(),
+            "stale": task.projection.stale,
+            "reason": task.projection.reason.map(governed_projection_reason_name),
+        },
+        "run": run,
+    })
+}
+
+fn task_watch_classification_name(classification: TaskWatchClassification) -> &'static str {
+    match classification {
         TaskWatchClassification::Applied => "applied",
         TaskWatchClassification::Replay => "replay",
         TaskWatchClassification::Heartbeat => "heartbeat",
         TaskWatchClassification::ResetRequired => "reset_required",
+    }
+}
+
+fn governed_task_watch_record_json(record: &CliGovernedTaskWatchRecord) -> serde_json::Value {
+    let (data, position) = match record {
+        CliGovernedTaskWatchRecord::ResumeEpochMismatch { requested, current } => (
+            json!({
+                "kind": "resume_epoch_mismatch",
+                "classification": "reset_required",
+                "task": null,
+                "tasks": null,
+                "requestedFloor": {
+                    "epoch": requested.epoch,
+                    "sequence": requested.sequence,
+                },
+                "message": "The requested epoch was reset; continuing from the current complete baseline",
+            }),
+            current,
+        ),
+        CliGovernedTaskWatchRecord::Baseline { position, tasks } => (
+            json!({
+                "kind": "baseline",
+                "classification": null,
+                "task": null,
+                "tasks": tasks.iter().map(governed_task_json).collect::<Vec<_>>(),
+            }),
+            position,
+        ),
+        CliGovernedTaskWatchRecord::Update(update) => (
+            json!({
+                "kind": "update",
+                "classification": task_watch_classification_name(update.classification),
+                "task": match update.classification {
+                    TaskWatchClassification::Heartbeat | TaskWatchClassification::ResetRequired => None,
+                    TaskWatchClassification::Applied | TaskWatchClassification::Replay => {
+                        update.task.as_ref().map(governed_task_json)
+                    }
+                },
+                "tasks": null,
+            }),
+            &update.position,
+        ),
     };
     json!({
         "schemaVersion": "egopulse.cli-result/v0.1",
+        "streamSchema": "egopulse.cli.task-watch/v1",
         "ok": true,
         "operation": "task.watch",
-        "data": {
-            "kind": update.kind.contract_name(),
-            "apply": apply,
-            "view": update.view.as_ref().map(task_summary),
-            "resetReasonCode": update.reset_reason_code,
+        "data": data,
+        "projection": {
+            "position": {
+                "epoch": position.epoch,
+                "sequence": position.sequence,
+            },
         },
-        "projection": projection_position_json(Some(&update.position)),
         "correlationId": Uuid::now_v7().to_string(),
     })
 }
 
-fn task_watch_update_text(update: &TaskWatchUpdate) -> String {
-    let payload = task_watch_update_json(update);
-    format!(
-        "Task watch: kind={} apply={} position={}",
-        payload["data"]["kind"].as_str().unwrap_or("unknown"),
-        payload["data"]["apply"].as_str().unwrap_or("unknown"),
-        payload["projection"]["position"]
-    )
+fn append_governed_task_text(output: &mut String, task: &GovernedTaskState, prefix: &str) {
+    output.push_str(&format!(
+        "{prefix}Task {} revision={} status={} resume={} hold={} projection={}:{} health={} stale={} reason={}\n",
+        task.task_id,
+        task.revision,
+        task.status.as_str_name(),
+        task.resume_status
+            .map(|status| status.as_str_name())
+            .unwrap_or("none"),
+        task.hold_reason
+            .map(governed_hold_reason_name)
+            .unwrap_or("none"),
+        task.projection.position.epoch,
+        task.projection.position.sequence,
+        task.projection.health.as_str_name(),
+        task.projection.stale,
+        task.projection
+            .reason
+            .map(governed_projection_reason_name)
+            .unwrap_or("none"),
+    ));
+    if let Some(run) = &task.run {
+        output.push_str(&format!(
+            "{prefix}  Run {} revision={} status={} work_revision={} hold={}\n",
+            run.run_id,
+            run.revision,
+            run.status.as_str_name(),
+            run.work_revision,
+            run.hold_reason
+                .map(governed_hold_reason_name)
+                .unwrap_or("none"),
+        ));
+        for step in &run.steps {
+            output.push_str(&format!(
+                "{prefix}    Step {} revision={} status={} hold={} current_attempt={}\n",
+                step.step_id,
+                step.revision,
+                step.status.as_str_name(),
+                step.hold_reason
+                    .map(governed_hold_reason_name)
+                    .unwrap_or("none"),
+                step.current_attempt_id.as_deref().unwrap_or("none"),
+            ));
+            for attempt in &step.attempts {
+                output.push_str(&format!(
+                    "{prefix}      Attempt {} revision={} number={} status={} recovery={} hold={} last_harness_sequence={} checkpoint_reference_recorded={}\n",
+                    attempt.attempt_id,
+                    attempt.revision,
+                    attempt.attempt_number,
+                    attempt.status.as_str_name(),
+                    attempt.recovery_class.as_str_name(),
+                    attempt
+                        .hold_reason
+                        .map(governed_hold_reason_name)
+                        .unwrap_or("none"),
+                    attempt.last_harness_sequence,
+                    attempt.checkpoint_reference_recorded,
+                ));
+            }
+        }
+    } else {
+        output.push_str(&format!("{prefix}  Run: not projected\n"));
+    }
 }
 
-fn render_task_watch_update(update: &TaskWatchUpdate, json: bool) {
+fn governed_task_watch_record_text(record: &CliGovernedTaskWatchRecord) -> String {
+    match record {
+        CliGovernedTaskWatchRecord::ResumeEpochMismatch { requested, current } => format!(
+            "Task watch reset compatibility: requested floor {}:{}; current baseline {}:{}; continuing from the current complete baseline",
+            requested.epoch, requested.sequence, current.epoch, current.sequence
+        ),
+        CliGovernedTaskWatchRecord::Baseline { position, tasks } => {
+            let mut output = format!(
+                "Task watch baseline: position={}:{} tasks={}\n",
+                position.epoch,
+                position.sequence,
+                tasks.len()
+            );
+            for task in tasks {
+                append_governed_task_text(&mut output, task, "  ");
+            }
+            output.trim_end().to_owned()
+        }
+        CliGovernedTaskWatchRecord::Update(update) => {
+            let mut output = format!(
+                "Task watch update: classification={} position={}:{}\n",
+                task_watch_classification_name(update.classification),
+                update.position.epoch,
+                update.position.sequence
+            );
+            if matches!(
+                update.classification,
+                TaskWatchClassification::Applied | TaskWatchClassification::Replay
+            ) && let Some(task) = &update.task
+            {
+                append_governed_task_text(&mut output, task, "  ");
+            }
+            output.trim_end().to_owned()
+        }
+    }
+}
+
+fn render_governed_task_watch_record(record: &CliGovernedTaskWatchRecord, json: bool) {
     if json {
         println!(
             "{}",
-            serde_json::to_string(&task_watch_update_json(update)).unwrap()
+            serde_json::to_string(&governed_task_watch_record_json(record)).unwrap()
         );
     } else {
-        println!("{}", task_watch_update_text(update));
+        println!("{}", governed_task_watch_record_text(record));
     }
 }
 
@@ -4248,30 +4618,92 @@ fn parse_await_token(input: &str) -> Result<ProjectionAwaitToken, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, collections::VecDeque, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        rc::Rc,
+    };
 
     use super::*;
+    use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
+        AttemptStatus, RecoveryClass,
+    };
 
-    struct ScriptedTaskWatchSource {
-        outcomes: VecDeque<Result<Option<TaskWatchUpdate>, ClientTaskWatchError>>,
+    struct ScriptedGovernedTaskBaseline {
+        position: GovernedProjectionPosition,
+        tasks: Vec<GovernedTaskState>,
+    }
+
+    impl CliGovernedTaskBaseline for ScriptedGovernedTaskBaseline {
+        fn position(&self) -> GovernedProjectionPosition {
+            self.position.clone()
+        }
+
+        fn tasks(&self) -> Vec<GovernedTaskState> {
+            self.tasks.clone()
+        }
+    }
+
+    struct ScriptedGovernedTaskSession {
+        outcomes: VecDeque<Result<GovernedTaskUpdate, ClientGovernedTaskError>>,
         polls: Rc<Cell<u64>>,
         drops: Rc<Cell<u64>>,
     }
 
-    impl CliTaskWatchSource for ScriptedTaskWatchSource {
+    impl CliGovernedTaskSession for ScriptedGovernedTaskSession {
         fn next_update(
             &mut self,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<TaskWatchUpdate>, ClientTaskWatchError>> + '_>>
+        ) -> Pin<Box<dyn Future<Output = Result<GovernedTaskUpdate, ClientGovernedTaskError>> + '_>>
         {
             self.polls.set(self.polls.get() + 1);
-            let outcome = self.outcomes.pop_front().unwrap_or(Ok(None));
+            let outcome = self
+                .outcomes
+                .pop_front()
+                .unwrap_or(Err(ClientGovernedTaskError::UnexpectedEof));
             Box::pin(std::future::ready(outcome))
         }
     }
 
-    impl Drop for ScriptedTaskWatchSource {
+    impl Drop for ScriptedGovernedTaskSession {
         fn drop(&mut self) {
             self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    struct ScriptedGovernedTaskClient {
+        baselines: VecDeque<Result<ScriptedGovernedTaskBaseline, ClientGovernedTaskError>>,
+        sessions: VecDeque<Result<ScriptedGovernedTaskSession, ClientGovernedTaskError>>,
+        baseline_reads: Rc<Cell<u64>>,
+        session_opens: Rc<Cell<u64>>,
+    }
+
+    impl CliGovernedTaskClient for ScriptedGovernedTaskClient {
+        type Baseline = ScriptedGovernedTaskBaseline;
+        type Session = ScriptedGovernedTaskSession;
+
+        fn read_baseline(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Result<Self::Baseline, ClientGovernedTaskError>> + '_>>
+        {
+            self.baseline_reads.set(self.baseline_reads.get() + 1);
+            Box::pin(std::future::ready(
+                self.baselines
+                    .pop_front()
+                    .unwrap_or(Err(ClientGovernedTaskError::UnexpectedEof)),
+            ))
+        }
+
+        fn open_session(
+            &mut self,
+            _baseline: Self::Baseline,
+        ) -> Pin<Box<dyn Future<Output = Result<Self::Session, ClientGovernedTaskError>> + '_>>
+        {
+            self.session_opens.set(self.session_opens.get() + 1);
+            Box::pin(std::future::ready(
+                self.sessions
+                    .pop_front()
+                    .unwrap_or(Err(ClientGovernedTaskError::UnexpectedEof)),
+            ))
         }
     }
 
@@ -4315,13 +4747,71 @@ mod tests {
         }
     }
 
-    fn scripted_watch(
-        outcomes: Vec<Result<Option<TaskWatchUpdate>, ClientTaskWatchError>>,
-    ) -> (ScriptedTaskWatchSource, Rc<Cell<u64>>, Rc<Cell<u64>>) {
+    fn governed_position(epoch: &str, sequence: u64) -> GovernedProjectionPosition {
+        GovernedProjectionPosition {
+            epoch: epoch.to_owned(),
+            sequence,
+        }
+    }
+
+    fn governed_task(task_id: &str, status: TaskStatus) -> GovernedTaskState {
+        GovernedTaskState {
+            task_id: task_id.to_owned(),
+            revision: 7,
+            status,
+            resume_status: Some(TaskStatus::Active),
+            hold_reason: Some(GovernedHoldReason::ManualRecoveryRequired),
+            projection: egopulse_client_operations::GovernedProjectionState {
+                position: governed_position("epoch:watch", 9),
+                health: ProjectionHealth::Ready,
+                stale: false,
+                reason: None,
+            },
+            run: Some(egopulse_client_operations::GovernedRunState {
+                run_id: "run:governed".to_owned(),
+                revision: 6,
+                status: RunStatus::Returned,
+                work_revision: 3,
+                hold_reason: Some(GovernedHoldReason::CompensationRequired),
+                steps: vec![egopulse_client_operations::GovernedStepState {
+                    step_id: "step:governed".to_owned(),
+                    revision: 5,
+                    status: StepStatus::Held,
+                    hold_reason: Some(GovernedHoldReason::IrreversibleOutcomeUnknown),
+                    current_attempt_id: Some("attempt:governed".to_owned()),
+                    attempts: vec![egopulse_client_operations::GovernedAttemptState {
+                        attempt_id: "attempt:governed".to_owned(),
+                        revision: 4,
+                        attempt_number: 2,
+                        status: AttemptStatus::Held,
+                        recovery_class: RecoveryClass::ManualOnly,
+                        hold_reason: Some(GovernedHoldReason::CancellationOutcomeUnknown),
+                        last_harness_sequence: 11,
+                        checkpoint_reference_recorded: true,
+                    }],
+                }],
+            }),
+        }
+    }
+
+    fn governed_baseline(
+        epoch: &str,
+        sequence: u64,
+        tasks: Vec<GovernedTaskState>,
+    ) -> ScriptedGovernedTaskBaseline {
+        ScriptedGovernedTaskBaseline {
+            position: governed_position(epoch, sequence),
+            tasks,
+        }
+    }
+
+    fn scripted_governed_session(
+        outcomes: Vec<Result<GovernedTaskUpdate, ClientGovernedTaskError>>,
+    ) -> (ScriptedGovernedTaskSession, Rc<Cell<u64>>, Rc<Cell<u64>>) {
         let polls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
         (
-            ScriptedTaskWatchSource {
+            ScriptedGovernedTaskSession {
                 outcomes: outcomes.into(),
                 polls: Rc::clone(&polls),
                 drops: Rc::clone(&drops),
@@ -4331,19 +4821,34 @@ mod tests {
         )
     }
 
-    fn task_watch_update(classification: TaskWatchClassification) -> TaskWatchUpdate {
-        TaskWatchUpdate {
+    fn governed_task_update(
+        classification: TaskWatchClassification,
+        sequence: u64,
+        task: Option<GovernedTaskState>,
+    ) -> GovernedTaskUpdate {
+        GovernedTaskUpdate {
             classification,
-            kind: egopulse_client_operations::TaskWatchFrameKind::Heartbeat,
-            position: egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition {
-                epoch: "epoch:watch".to_owned(),
-                sequence: 9,
-                projected_at: None,
-            },
-            view: None,
-            reset_reason_code: (classification == TaskWatchClassification::ResetRequired)
-                .then(|| "projection_reset".to_owned()),
+            position: governed_position("epoch:watch", sequence),
+            task,
         }
+    }
+
+    fn scripted_governed_client(
+        baselines: Vec<Result<ScriptedGovernedTaskBaseline, ClientGovernedTaskError>>,
+        sessions: Vec<Result<ScriptedGovernedTaskSession, ClientGovernedTaskError>>,
+    ) -> (ScriptedGovernedTaskClient, Rc<Cell<u64>>, Rc<Cell<u64>>) {
+        let baseline_reads = Rc::new(Cell::new(0));
+        let session_opens = Rc::new(Cell::new(0));
+        (
+            ScriptedGovernedTaskClient {
+                baselines: baselines.into(),
+                sessions: sessions.into(),
+                baseline_reads: Rc::clone(&baseline_reads),
+                session_opens: Rc::clone(&session_opens),
+            },
+            baseline_reads,
+            session_opens,
+        )
     }
 
     #[test]
@@ -4387,7 +4892,7 @@ mod tests {
     }
 
     #[test]
-    fn task_watch_cli_preserves_bounds_resume_pair_and_premature_eof_failures() {
+    fn task_watch_cli_preserves_bounds_and_requires_a_complete_resume_floor() {
         assert!(validate_task_watch_request(1, &None, None).is_ok());
         for frames in [0, 1001] {
             let failure = validate_task_watch_request(frames, &None, None).unwrap_err();
@@ -4399,125 +4904,415 @@ mod tests {
             let failure = validate_task_watch_request(1, &epoch, sequence).unwrap_err();
             assert_eq!(failure.reason_code, "LOCAL_API_PROTOCOL_ERROR");
         }
-        assert!(ensure_task_watch_complete(2, 2).is_ok());
-        let failure = ensure_task_watch_complete(2, 1).unwrap_err();
-        assert_eq!(failure.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
-        assert!(failure.message.contains("after 1 frames"));
-        assert!(failure.message.contains("requested 2"));
     }
 
     #[test]
-    fn task_watch_cli_keeps_json_schema_and_error_categories_stable() {
-        let update = TaskWatchUpdate {
-            classification: TaskWatchClassification::Replay,
-            kind: egopulse_client_operations::TaskWatchFrameKind::Snapshot,
-            position: egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition {
-                epoch: "epoch:watch".to_owned(),
-                sequence: 9,
-                projected_at: None,
-            },
-            view: Some(TaskView::default()),
-            reset_reason_code: None,
-        };
-        let payload = task_watch_update_json(&update);
+    fn governed_task_watch_json_and_text_expose_only_the_safe_fact_tree() {
+        let record = CliGovernedTaskWatchRecord::Update(governed_task_update(
+            TaskWatchClassification::Applied,
+            10,
+            Some(governed_task("task:safe", TaskStatus::Active)),
+        ));
+        let payload = governed_task_watch_record_json(&record);
         assert_eq!(payload["schemaVersion"], "egopulse.cli-result/v0.1");
+        assert_eq!(payload["streamSchema"], "egopulse.cli.task-watch/v1");
         assert_eq!(payload["operation"], "task.watch");
-        assert_eq!(payload["data"]["kind"], "STREAM_FRAME_KIND_SNAPSHOT");
-        assert_eq!(payload["data"]["apply"], "replay");
+        assert_eq!(payload["data"]["kind"], "update");
+        assert_eq!(payload["data"]["classification"], "applied");
+        assert_eq!(payload["data"]["task"]["status"], "TASK_STATUS_ACTIVE");
+        assert_eq!(
+            payload["data"]["task"]["run"]["status"],
+            "RUN_STATUS_RETURNED"
+        );
+        assert_eq!(
+            payload["data"]["task"]["run"]["steps"][0]["attempts"][0]["checkpointReferenceRecorded"],
+            true
+        );
+        assert_eq!(
+            payload["data"]["task"]["run"]["steps"][0]["attempts"][0]["lastHarnessSequence"],
+            11
+        );
         assert_eq!(payload["projection"]["position"]["epoch"], "epoch:watch");
-        assert_eq!(payload["projection"]["position"]["sequence"], 9);
+        assert_eq!(payload["projection"]["position"]["sequence"], 10);
+        let encoded = serde_json::to_string(&payload).unwrap();
+        for forbidden in [
+            "workspaceRef",
+            "harnessId",
+            "capabilityProfileRef",
+            "dispatchId",
+            "dispatchFingerprint",
+            "harnessSessionRef",
+            "lease",
+            "fencingToken",
+            "checkpointId",
+            "context",
+            "artifact",
+            "provider",
+            "model",
+            "content",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked field {forbidden}");
+        }
+        let text = governed_task_watch_record_text(&record);
+        assert!(text.contains("Task task:safe revision=7 status=TASK_STATUS_ACTIVE"));
+        assert!(text.contains("Run run:governed revision=6 status=RUN_STATUS_RETURNED"));
+        assert!(text.contains("checkpoint_reference_recorded=true"));
+        assert!(!text.contains("TASK_STATUS_COMPLETED"));
 
-        let transport = task_watch_failure(ClientTaskWatchError::Transport("closed".to_owned()));
+        let heartbeat = governed_task_watch_record_json(&CliGovernedTaskWatchRecord::Update(
+            governed_task_update(
+                TaskWatchClassification::Heartbeat,
+                11,
+                Some(governed_task("task:must-not-render", TaskStatus::Completed)),
+            ),
+        ));
+        assert!(heartbeat["data"]["task"].is_null());
+        let reset = governed_task_watch_record_json(&CliGovernedTaskWatchRecord::Update(
+            governed_task_update(
+                TaskWatchClassification::ResetRequired,
+                12,
+                Some(governed_task("task:must-not-render", TaskStatus::Completed)),
+            ),
+        ));
+        assert!(reset["data"]["task"].is_null());
+    }
+
+    #[test]
+    fn governed_task_watch_errors_have_stable_safe_categories() {
+        let transport = governed_task_watch_failure(ClientGovernedTaskError::Transport(
+            "private-pipe-canary".to_owned(),
+        ));
         assert_eq!(transport.reason_code, "DAEMON_UNAVAILABLE");
-        let protocol = task_watch_failure(ClientTaskWatchError::Kernel(
+        assert!(!transport.message.contains("private-pipe-canary"));
+        let protocol = governed_task_watch_failure(ClientGovernedTaskError::Kernel(
             KernelError::UnknownStreamFrame,
         ));
-        assert_eq!(protocol.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
-        let reset = task_watch_failure(ClientTaskWatchError::ResetBarrier);
-        assert_eq!(reset.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
-        assert_ne!(transport.message, protocol.message);
-        assert_ne!(protocol.message, reset.message);
+        assert_eq!(protocol.reason_code, "LOCAL_API_PROTOCOL_ERROR");
+        let reset = governed_task_watch_failure(ClientGovernedTaskError::ResetBarrier);
+        assert_eq!(reset.reason_code, "RESET_REQUIRED");
+        let eof = governed_task_watch_failure(ClientGovernedTaskError::UnexpectedEof);
+        assert_eq!(eof.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
+        let limit = governed_task_watch_failure(ClientGovernedTaskError::BaselineLimitExceeded);
+        assert_eq!(limit.reason_code, "LOCAL_API_PROTOCOL_ERROR");
 
-        let permission = task_watch_failure(ClientTaskWatchError::Kernel(
+        let permission = governed_task_watch_failure(ClientGovernedTaskError::Kernel(
             KernelError::PermissionDenied("local.task.read".to_owned()),
         ));
         assert_eq!(permission.reason_code, "PERMISSION_DENIED");
         assert_eq!(permission.operation, "task.watch");
+        let session = governed_task_watch_failure(ClientGovernedTaskError::Kernel(
+            KernelError::SessionExpired,
+        ));
+        assert_eq!(session.reason_code, "SESSION_CHANGED");
+        assert_eq!(session.category, "contract");
 
-        let text = task_watch_update_text(&task_watch_update(TaskWatchClassification::Heartbeat));
-        assert_eq!(
-            text,
-            "Task watch: kind=STREAM_FRAME_KIND_HEARTBEAT apply=heartbeat position={\"epoch\":\"epoch:watch\",\"sequence\":9}"
-        );
+        let api =
+            governed_task_watch_failure(ClientGovernedTaskError::Api(Box::new(LocalApiError {
+                code: LocalApiErrorCode::ProjectionBehind as i32,
+                retryable: true,
+                required_action_code: Some("WAIT_FOR_PROJECTION".to_owned()),
+                safe_fingerprint: "projection-behind".to_owned(),
+                ..Default::default()
+            })));
+        assert_eq!(api.reason_code, "LOCAL_API_ERROR");
+        assert_eq!(api.category, "projection");
+        assert_eq!(api.operation, "task.watch");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn task_watch_consume_loop_polls_exactly_n_and_drops_source() {
-        let (source, polls, drops) = scripted_watch(vec![
-            Ok(Some(task_watch_update(TaskWatchClassification::Applied))),
-            Ok(Some(task_watch_update(TaskWatchClassification::Replay))),
-            Err(ClientTaskWatchError::Transport(
+    async fn governed_task_watch_emits_atomic_baseline_then_exact_live_frames() {
+        let (session, polls, drops) = scripted_governed_session(vec![
+            Ok(governed_task_update(
+                TaskWatchClassification::Applied,
+                101,
+                Some(governed_task("task:new", TaskStatus::Active)),
+            )),
+            Ok(governed_task_update(
+                TaskWatchClassification::Replay,
+                101,
+                Some(governed_task("task:new", TaskStatus::Active)),
+            )),
+            Err(ClientGovernedTaskError::Transport(
                 "must-not-poll-third".to_owned(),
             )),
         ]);
-        let rendered = Rc::new(Cell::new(0_u64));
-        let rendered_witness = Rc::clone(&rendered);
-        consume_task_watch(source, 2, move |_update| {
-            rendered_witness.set(rendered_witness.get() + 1);
+        let (mut client, reads, opens) = scripted_governed_client(
+            vec![Ok(governed_baseline(
+                "epoch:watch",
+                100,
+                vec![governed_task("task:baseline", TaskStatus::Active)],
+            ))],
+            vec![Ok(session)],
+        );
+        let records = Rc::new(RefCell::new(Vec::new()));
+        let witness = Rc::clone(&records);
+        consume_governed_task_watch(&mut client, 2, None, None, move |record| {
+            witness.borrow_mut().push(record.clone());
         })
         .await
         .unwrap();
         assert_eq!(polls.get(), 2);
-        assert_eq!(rendered.get(), 2);
+        assert_eq!(reads.get(), 1);
+        assert_eq!(opens.get(), 1);
         assert_eq!(drops.get(), 1);
+        let records = records.borrow();
+        assert_eq!(records.len(), 3);
+        assert!(matches!(
+            records[0],
+            CliGovernedTaskWatchRecord::Baseline { .. }
+        ));
+        assert!(matches!(records[1], CliGovernedTaskWatchRecord::Update(_)));
+        assert!(matches!(records[2], CliGovernedTaskWatchRecord::Update(_)));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn task_watch_consume_loop_fails_closed_without_extra_polls() {
-        let (zero_source, zero_polls, zero_drops) = scripted_watch(vec![Ok(Some(
-            task_watch_update(TaskWatchClassification::Applied),
-        ))]);
-        assert!(consume_task_watch(zero_source, 0, |_| {}).await.is_err());
-        assert_eq!(zero_polls.get(), 0);
-        assert_eq!(zero_drops.get(), 1);
+    async fn governed_task_watch_resume_floor_is_checked_before_opening_live_watch() {
+        let (unused_session, polls, drops) = scripted_governed_session(Vec::new());
+        let (mut ahead, reads, opens) = scripted_governed_client(
+            vec![Ok(governed_baseline("epoch:watch", 99, Vec::new()))],
+            vec![Ok(unused_session)],
+        );
+        let ahead_failure = consume_governed_task_watch(
+            &mut ahead,
+            1,
+            Some("epoch:watch".to_owned()),
+            Some(100),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(ahead_failure.reason_code, "PROJECTION_NOT_CAUGHT_UP");
+        assert_eq!(reads.get(), 1);
+        assert_eq!(opens.get(), 0);
+        assert_eq!(polls.get(), 0);
+        drop(ahead);
+        assert_eq!(drops.get(), 1);
 
-        let (partial_source, partial_polls, partial_drops) = scripted_watch(vec![
-            Ok(Some(task_watch_update(TaskWatchClassification::Applied))),
-            Ok(None),
+        let (session, polls, _) = scripted_governed_session(vec![Ok(governed_task_update(
+            TaskWatchClassification::Heartbeat,
+            101,
+            None,
+        ))]);
+        let (mut old_floor, _, opens) = scripted_governed_client(
+            vec![Ok(governed_baseline("epoch:watch", 100, Vec::new()))],
+            vec![Ok(session)],
+        );
+        let records = Rc::new(RefCell::new(Vec::new()));
+        let witness = Rc::clone(&records);
+        consume_governed_task_watch(
+            &mut old_floor,
+            1,
+            Some("epoch:watch".to_owned()),
+            Some(80),
+            move |record| witness.borrow_mut().push(record.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opens.get(), 1);
+        assert_eq!(polls.get(), 1);
+        assert_eq!(records.borrow().len(), 2);
+        assert!(matches!(
+            records.borrow()[0],
+            CliGovernedTaskWatchRecord::Baseline { .. }
+        ));
+
+        let (session, _, _) = scripted_governed_session(vec![Ok(governed_task_update(
+            TaskWatchClassification::Heartbeat,
+            101,
+            None,
+        ))]);
+        let (mut epoch_reset, _, _) = scripted_governed_client(
+            vec![Ok(governed_baseline("epoch:new", 100, Vec::new()))],
+            vec![Ok(session)],
+        );
+        let records = Rc::new(RefCell::new(Vec::new()));
+        let witness = Rc::clone(&records);
+        consume_governed_task_watch(
+            &mut epoch_reset,
+            1,
+            Some("epoch:old".to_owned()),
+            Some(999),
+            move |record| witness.borrow_mut().push(record.clone()),
+        )
+        .await
+        .unwrap();
+        let records = records.borrow();
+        assert!(matches!(
+            records[0],
+            CliGovernedTaskWatchRecord::ResumeEpochMismatch { .. }
+        ));
+        assert!(matches!(
+            records[1],
+            CliGovernedTaskWatchRecord::Baseline { .. }
+        ));
+        assert!(matches!(records[2], CliGovernedTaskWatchRecord::Update(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn governed_task_watch_eof_and_transport_stop_without_reattach_or_extra_poll() {
+        let (partial_session, partial_polls, partial_drops) = scripted_governed_session(vec![
+            Ok(governed_task_update(
+                TaskWatchClassification::Heartbeat,
+                10,
+                None,
+            )),
+            Err(ClientGovernedTaskError::UnexpectedEof),
         ]);
-        let partial = consume_task_watch(partial_source, 2, |_| {})
+        let (mut partial_client, reads, opens) = scripted_governed_client(
+            vec![Ok(governed_baseline("epoch:watch", 9, Vec::new()))],
+            vec![Ok(partial_session)],
+        );
+        let partial = consume_governed_task_watch(&mut partial_client, 2, None, None, |_| {})
             .await
             .unwrap_err();
         assert_eq!(partial.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
-        assert!(partial.message.contains("after 1 frames"));
         assert_eq!(partial_polls.get(), 2);
         assert_eq!(partial_drops.get(), 1);
+        assert_eq!(reads.get(), 1);
+        assert_eq!(opens.get(), 1);
 
-        let (transport_source, transport_polls, transport_drops) = scripted_watch(vec![Err(
-            ClientTaskWatchError::Transport("tonic-status".to_owned()),
-        )]);
-        let transport = consume_task_watch(transport_source, 1, |_| {})
+        let (transport_session, transport_polls, transport_drops) =
+            scripted_governed_session(vec![Err(ClientGovernedTaskError::Transport(
+                "tonic-status-canary".to_owned(),
+            ))]);
+        let (mut transport_client, _, _) = scripted_governed_client(
+            vec![Ok(governed_baseline("epoch:watch", 9, Vec::new()))],
+            vec![Ok(transport_session)],
+        );
+        let transport = consume_governed_task_watch(&mut transport_client, 1, None, None, |_| {})
             .await
             .unwrap_err();
         assert_eq!(transport.reason_code, "DAEMON_UNAVAILABLE");
+        assert!(!transport.message.contains("tonic-status-canary"));
         assert_eq!(transport_polls.get(), 1);
         assert_eq!(transport_drops.get(), 1);
+    }
 
-        let (reset_source, reset_polls, reset_drops) = scripted_watch(vec![
-            Ok(Some(task_watch_update(
-                TaskWatchClassification::ResetRequired,
-            ))),
-            Err(ClientTaskWatchError::Transport(
-                "must-not-poll-after-reset".to_owned(),
-            )),
-        ]);
-        let reset = consume_task_watch(reset_source, 2, |_| {})
-            .await
-            .unwrap_err();
-        assert_eq!(reset.reason_code, "PROJECTION_STREAM_RECOVERY_REQUIRED");
-        assert!(reset.message.contains("projection_reset"));
-        assert_eq!(reset_polls.get(), 1);
-        assert_eq!(reset_drops.get(), 1);
+    #[tokio::test(flavor = "current_thread")]
+    async fn governed_task_watch_rebases_on_reset_and_enforces_three_rebase_budget() {
+        let polls = Rc::new(Cell::new(0_u64));
+        let drops = Rc::new(Cell::new(0_u64));
+        let sessions = (11..=14)
+            .map(|sequence| {
+                Ok(ScriptedGovernedTaskSession {
+                    outcomes: vec![Ok(governed_task_update(
+                        TaskWatchClassification::ResetRequired,
+                        sequence,
+                        None,
+                    ))]
+                    .into(),
+                    polls: Rc::clone(&polls),
+                    drops: Rc::clone(&drops),
+                })
+            })
+            .collect();
+        let baselines = (10..=13)
+            .map(|sequence| {
+                Ok(governed_baseline(
+                    "epoch:watch",
+                    sequence,
+                    vec![governed_task(
+                        &format!("task:baseline-{sequence}"),
+                        TaskStatus::Active,
+                    )],
+                ))
+            })
+            .collect();
+        let (mut client, reads, opens) = scripted_governed_client(baselines, sessions);
+        let records = Rc::new(RefCell::new(Vec::new()));
+        let witness = Rc::clone(&records);
+        let failure = consume_governed_task_watch(&mut client, 5, None, None, move |record| {
+            witness.borrow_mut().push(record.clone())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(failure.reason_code, "RESET_REQUIRED");
+        assert_eq!(reads.get(), 4);
+        assert_eq!(opens.get(), 4);
+        assert_eq!(polls.get(), 4);
+        assert_eq!(drops.get(), 4);
+        let records = records.borrow();
+        assert_eq!(records.len(), 8);
+        for index in [0_usize, 2, 4, 6] {
+            assert!(matches!(
+                records[index],
+                CliGovernedTaskWatchRecord::Baseline { .. }
+            ));
+        }
+        for index in [1_usize, 3, 5, 7] {
+            assert!(matches!(
+                records[index],
+                CliGovernedTaskWatchRecord::Update(GovernedTaskUpdate {
+                    classification: TaskWatchClassification::ResetRequired,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn governed_task_watch_final_reset_drops_session_without_extra_rebaseline() {
+        let (session, polls, drops) = scripted_governed_session(vec![Ok(governed_task_update(
+            TaskWatchClassification::ResetRequired,
+            11,
+            None,
+        ))]);
+        let (mut client, reads, opens) = scripted_governed_client(
+            vec![Ok(governed_baseline("epoch:watch", 10, Vec::new()))],
+            vec![Ok(session)],
+        );
+        let records = Rc::new(RefCell::new(Vec::new()));
+        let witness = Rc::clone(&records);
+        consume_governed_task_watch(&mut client, 1, None, None, move |record| {
+            witness.borrow_mut().push(record.clone())
+        })
+        .await
+        .unwrap();
+        assert_eq!(reads.get(), 1);
+        assert_eq!(opens.get(), 1);
+        assert_eq!(polls.get(), 1);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(records.borrow().len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn governed_task_watch_baseline_failures_never_open_or_poll_live_watch() {
+        let errors = vec![
+            (
+                ClientGovernedTaskError::Kernel(KernelError::PermissionDenied(
+                    "local.task.read".to_owned(),
+                )),
+                "PERMISSION_DENIED",
+            ),
+            (
+                ClientGovernedTaskError::Protocol("sensitive-integrity-canary"),
+                "LOCAL_API_PROTOCOL_ERROR",
+            ),
+            (
+                ClientGovernedTaskError::BaselineLimitExceeded,
+                "LOCAL_API_PROTOCOL_ERROR",
+            ),
+            (
+                ClientGovernedTaskError::Api(Box::new(LocalApiError {
+                    code: LocalApiErrorCode::ProjectionBehind as i32,
+                    retryable: true,
+                    required_action_code: Some("WAIT_FOR_PROJECTION".to_owned()),
+                    safe_fingerprint: "projection-behind".to_owned(),
+                    ..Default::default()
+                })),
+                "LOCAL_API_ERROR",
+            ),
+        ];
+        for (error, expected_reason) in errors {
+            let (mut client, reads, opens) = scripted_governed_client(vec![Err(error)], Vec::new());
+            let failure = consume_governed_task_watch(&mut client, 1, None, None, |_| {})
+                .await
+                .unwrap_err();
+            assert_eq!(failure.reason_code, expected_reason);
+            assert_eq!(reads.get(), 1);
+            assert_eq!(opens.get(), 0);
+            assert!(!failure.message.contains("sensitive-integrity-canary"));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
