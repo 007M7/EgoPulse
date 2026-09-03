@@ -1531,7 +1531,6 @@ fn compile_approval_baseline(
                 "approval baseline contained pages after completion",
             ));
         }
-        let mut tracker = SnapshotStreamTracker::default();
         for view in page.views {
             if view.approval_request_id.is_empty()
                 || !seen_ids.insert(view.approval_request_id.clone())
@@ -1540,12 +1539,28 @@ fn compile_approval_baseline(
                     "approval baseline identity missing or duplicated",
                 ));
             }
-            tracker.apply_harness_approval_frame(&HarnessApprovalViewStreamFrame {
-                kind: StreamFrameKind::Snapshot as i32,
-                position: Some(page_position.clone()),
-                snapshot: Some(view.clone()),
-                reset_reason_code: None,
-            })?;
+            let view_position = view
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.position.clone())
+                .ok_or(ClientApprovalWatchError::Protocol(
+                    "approval baseline view position missing",
+                ))?;
+            if view_position.epoch != page_position.epoch
+                || view_position.sequence > page_position.sequence
+            {
+                return Err(ClientApprovalWatchError::Protocol(
+                    "approval baseline view position is outside the page snapshot",
+                ));
+            }
+            SnapshotStreamTracker::default().apply_harness_approval_frame(
+                &HarnessApprovalViewStreamFrame {
+                    kind: StreamFrameKind::Snapshot as i32,
+                    position: Some(view_position),
+                    snapshot: Some(view.clone()),
+                    reset_reason_code: None,
+                },
+            )?;
             if is_actionable_approval(&view)? {
                 actionable.insert(
                     view.approval_request_id.clone(),
@@ -3045,6 +3060,69 @@ mod tests {
             approvals.keys().map(String::as_str).collect::<Vec<_>>(),
             ["approval:a", "approval:z"]
         );
+
+        let global_position = approval_position(9);
+        let newer_view_position = approval_position(8);
+        let older_view_position = approval_position(7);
+        let (actual_position, approvals) = compile_approval_baseline(vec![approval_page(
+            &global_position,
+            vec![
+                approval_view("approval:newer", &newer_view_position, Some(decide)),
+                approval_view("approval:older", &older_view_position, Some(decide)),
+            ],
+            None,
+        )])
+        .expect("unrelated projections may advance the global page position");
+        assert_eq!(actual_position, global_position);
+        assert_eq!(
+            approvals["approval:newer"]
+                .view()
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.position.as_ref()),
+            Some(&newer_view_position)
+        );
+        assert_eq!(
+            approvals["approval:older"]
+                .view()
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.position.as_ref()),
+            Some(&older_view_position)
+        );
+
+        let ahead_position = approval_position(global_position.sequence + 1);
+        assert!(matches!(
+            compile_approval_baseline(vec![approval_page(
+                &global_position,
+                vec![approval_view(
+                    "approval:ahead",
+                    &ahead_position,
+                    Some(decide),
+                )],
+                None,
+            )]),
+            Err(ClientApprovalWatchError::Protocol(
+                "approval baseline view position is outside the page snapshot"
+            ))
+        ));
+
+        let mut foreign_epoch_position = older_view_position.clone();
+        foreign_epoch_position.epoch = "epoch:foreign-approval-watch".to_owned();
+        assert!(matches!(
+            compile_approval_baseline(vec![approval_page(
+                &global_position,
+                vec![approval_view(
+                    "approval:foreign-epoch",
+                    &foreign_epoch_position,
+                    Some(decide),
+                )],
+                None,
+            )]),
+            Err(ClientApprovalWatchError::Protocol(
+                "approval baseline view position is outside the page snapshot"
+            ))
+        ));
 
         let views: Vec<_> = (0..=APPROVAL_WATCH_BASELINE_MAX_VIEWS)
             .map(|index| approval_view(format!("approval:{index:04}"), &position, Some(decide)))

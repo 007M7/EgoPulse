@@ -17,8 +17,9 @@ use crossterm::{
 };
 use egopulse_client_operations::{
     ClientAttachment, ClientContextRevokeError, ClientReadError, ClientWorkError,
-    ContextRevokeInput, PreparedContextRevoke, attach as attach_client, command_metadata,
-    set_policy_digest, set_task_digest, set_verdict_digest, timestamp_after,
+    ContextRevokeInput, GuidedApprovalDecision, GuidedApprovalDecisionInput, PreparedContextRevoke,
+    attach as attach_client, command_metadata, set_task_digest, set_verdict_digest,
+    timestamp_after,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -27,18 +28,14 @@ use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{ContentAddress, HashAlgorithm},
     collaboration::v1::RunStatus,
     common::v1::ContractReference,
-    harness::v1::ApprovalDecision,
     harness::v1::ApprovalRequestLifecycleKind,
     localapi::v1::{
-        AcceptMemoryCommand, AwaitProjectionRequest, DecideHarnessApprovalRequest,
-        ExecuteFounderVerdictRequest, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
-        GetEvidenceGraphRequest, HarnessApprovalView, LocalApiErrorCode, MemoryMutationCommand,
-        MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth, RetrieveMemoryRequest,
-        SourceRevision, SubmitMemoryCandidateCommand, TaskView, await_projection_response,
+        AcceptMemoryCommand, AwaitProjectionRequest, ExecuteFounderVerdictRequest,
+        ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest, GetEvidenceGraphRequest,
+        HarnessApprovalView, LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt,
+        ProjectionAwaitToken, ProjectionHealth, RetrieveMemoryRequest, SourceRevision,
+        SubmitMemoryCandidateCommand, TaskView, await_projection_response,
         get_evidence_graph_response, memory_mutation_command, retrieve_memory_response,
-    },
-    policy::v1::{
-        IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, policy_decision_command,
     },
     task::v1::TaskStatus,
     task::v1::{
@@ -52,6 +49,10 @@ use egopulse_domain_contracts::v01::egopulse::{
     verification::v1::VerificationConclusion,
 };
 use egopulse_local_api::LocalApiClient;
+use egopulse_tui::approval_queue::{
+    ApprovalDecisionReceipt, ApprovalQueueClient, ApprovalQueueController, ApprovalQueueOpenFuture,
+    GuidedApprovalFuture,
+};
 use egopulse_tui::task_watch::{
     TaskWatchClient, TaskWatchController, TaskWatchOpenFuture, TaskWatchPageModel,
 };
@@ -172,14 +173,6 @@ enum TuiCommand {
     /// Submit the user-owned issue_harness_approval_decision branch.
     ApprovalDecide {
         approval_request_id: String,
-        #[arg(long)]
-        expected_action_digest_sha256: String,
-        #[arg(long)]
-        expected_request_observation_id: String,
-        #[arg(long)]
-        expected_request_observation_sequence: u64,
-        #[arg(long)]
-        expected_request_revision: u64,
         #[arg(long)]
         decision: String,
         #[arg(long)]
@@ -488,11 +481,7 @@ impl CommandForm {
             ],
             CommandKind::ApprovalDecide => vec![
                 FormField::required("approval-request-id"),
-                FormField::required("expected-action-digest-sha256"),
-                FormField::required("expected-request-observation-id"),
-                FormField::required("expected-request-observation-sequence"),
-                FormField::required("expected-request-revision"),
-                FormField::required("decision").with_value("allow-once"),
+                FormField::required("decision"),
                 FormField::required("reason-code"),
                 FormField::optional("confirmation-proof-ref"),
             ],
@@ -735,22 +724,6 @@ impl CommandForm {
             }),
             CommandKind::ApprovalDecide => Ok(TuiCommand::ApprovalDecide {
                 approval_request_id: next(&mut values, "approval-request-id")?,
-                expected_action_digest_sha256: next(&mut values, "expected-action-digest-sha256")?,
-                expected_request_observation_id: next(
-                    &mut values,
-                    "expected-request-observation-id",
-                )?,
-                expected_request_observation_sequence: next(
-                    &mut values,
-                    "expected-request-observation-sequence",
-                )?
-                .parse()
-                .map_err(|_| {
-                    "expected-request-observation-sequence must be an integer".to_owned()
-                })?,
-                expected_request_revision: next(&mut values, "expected-request-revision")?
-                    .parse()
-                    .map_err(|_| "expected-request-revision must be an integer".to_owned())?,
                 decision: next(&mut values, "decision")?,
                 reason_code: next(&mut values, "reason-code")?,
                 confirmation_proof_ref: {
@@ -865,6 +838,8 @@ impl CommandForm {
 enum InteractiveMode {
     Dashboard,
     TaskWatch,
+    ApprovalQueue,
+    ApprovalDecisionModal(ApprovalDecisionModal),
     Palette { selected: usize },
     Form(CommandForm),
     ContextRevokeConfirmation(PendingContextRevoke),
@@ -877,7 +852,64 @@ enum InteractiveAction {
     OpenTaskWatch,
     RefetchTaskWatch,
     CloseTaskWatch,
+    OpenApprovalQueue,
+    RefetchApprovalQueue,
+    CloseApprovalQueue,
+    SubmitApprovalDecision,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApprovalModalField {
+    Reason,
+    Proof,
+}
+
+struct ApprovalDecisionModal {
+    approval_request_id: String,
+    decision: Option<GuidedApprovalDecision>,
+    reason_code: String,
+    confirmation_proof_ref: String,
+    active_field: ApprovalModalField,
+    submitting: bool,
+}
+
+impl ApprovalDecisionModal {
+    fn new(approval_request_id: String) -> Self {
+        Self {
+            approval_request_id,
+            decision: None,
+            reason_code: String::new(),
+            confirmation_proof_ref: String::new(),
+            active_field: ApprovalModalField::Reason,
+            submitting: false,
+        }
+    }
+
+    fn cycle_decision(&mut self, forward: bool) {
+        const VALUES: [GuidedApprovalDecision; 3] = [
+            GuidedApprovalDecision::AllowOnce,
+            GuidedApprovalDecision::Deny,
+            GuidedApprovalDecision::CancelAttempt,
+        ];
+        let index = self
+            .decision
+            .and_then(|value| VALUES.iter().position(|candidate| *candidate == value));
+        let next = match (index, forward) {
+            (None, _) => 0,
+            (Some(index), true) => (index + 1) % VALUES.len(),
+            (Some(0), false) => VALUES.len() - 1,
+            (Some(index), false) => index - 1,
+        };
+        self.decision = Some(VALUES[next]);
+    }
+
+    fn active_value_mut(&mut self) -> &mut String {
+        match self.active_field {
+            ApprovalModalField::Reason => &mut self.reason_code,
+            ApprovalModalField::Proof => &mut self.confirmation_proof_ref,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -955,7 +987,7 @@ impl PendingContextRevoke {
     }
 }
 
-trait InteractiveClient: TaskWatchClient {
+trait InteractiveClient: TaskWatchClient + ApprovalQueueClient {
     fn snapshot(&self) -> SnapshotFuture<'_>;
     fn prepare_context_revoke(
         &self,
@@ -1069,6 +1101,19 @@ impl TaskWatchClient for AttachedClient {
         request: egopulse_client_operations::TaskWatchRequest,
     ) -> TaskWatchOpenFuture<'_> {
         TaskWatchClient::open_task_watch(self.0.as_ref(), request)
+    }
+}
+
+impl ApprovalQueueClient for AttachedClient {
+    fn open_approval_queue(&self) -> ApprovalQueueOpenFuture<'_> {
+        ApprovalQueueClient::open_approval_queue(self.0.as_ref())
+    }
+
+    fn decide_guided_approval(
+        &self,
+        input: GuidedApprovalDecisionInput,
+    ) -> GuidedApprovalFuture<'_> {
+        ApprovalQueueClient::decide_guided_approval(self.0.as_ref(), input)
     }
 }
 
@@ -1549,10 +1594,6 @@ async fn run_command_with_output(
         }
         TuiCommand::ApprovalDecide {
             approval_request_id,
-            expected_action_digest_sha256,
-            expected_request_observation_id,
-            expected_request_observation_sequence,
-            expected_request_revision,
             decision,
             reason_code,
             confirmation_proof_ref,
@@ -1560,89 +1601,50 @@ async fn run_command_with_output(
         } => {
             let decision = parse_approval_decision(&decision)?;
             let attached = AttachedClient::open(instance).await?;
-            attached.require_command(
-                "LocalCommandGatewayService/DecideHarnessApproval",
-                "issue_harness_approval_decision",
-            )?;
-            let correlation_id = Uuid::now_v7().to_string();
-            let mut command = PolicyDecisionCommand {
-                command: Some(
-                    policy_decision_command::Command::IssueHarnessApprovalDecision(
-                        IssueHarnessApprovalDecisionCommand {
-                            metadata: Some(command_metadata(
-                                &correlation_id,
-                                "egopulse-tui/approval-decide",
-                            )),
-                            approval_request_id,
-                            expected_action_digest_sha256,
-                            expected_request_observation_id,
-                            expected_request_observation_sequence,
-                            decision,
-                            reason_code,
-                            confirmation_proof_ref,
-                            expected_request_revision,
-                        },
-                    ),
-                ),
-            };
-            set_policy_digest(&mut command);
-            let response = attached
+            let result = attached
                 .0
-                .connection
-                .command_gateway_service()
-                .decide_harness_approval(DecideHarnessApprovalRequest {
-                    client: Some(attached.metadata_with_correlation(correlation_id.clone())?),
-                    command: match command.command {
-                        Some(policy_decision_command::Command::IssueHarnessApprovalDecision(
-                            command,
-                        )) => Some(command),
-                        _ => None,
-                    },
+                .decide_guided_approval(GuidedApprovalDecisionInput {
+                    approval_request_id,
+                    decision,
+                    reason_code,
+                    confirmation_proof_ref,
                 })
                 .await
-                .map_err(|error| error.to_string())?
-                .into_inner();
-            if let Some(error) = response.gateway_error {
-                return Err(local_error_message(error));
-            }
-            let result = response
-                .sanitized_authority_result
-                .ok_or_else(|| "sanitized approval result missing".to_owned())?;
-            if result.error_code != 0 {
-                return Err(format!(
-                    "approval authority rejected: {}",
-                    result.error_code
-                ));
-            }
+                .map_err(|error| error.to_string())?;
             let payload = json!({
                 "schemaVersion": "egopulse.tui-result/v0.1",
                 "ok": true,
                 "operation": "approval.decide",
                 "data": {
-                    "committed": result.committed,
-                    "replayed": result.replayed,
-                    "authorityDecisionRef": result.authority_decision_ref,
-                    "decision": ApprovalDecision::try_from(result.decision)
-                        .map(|value| value.as_str_name())
-                        .unwrap_or("APPROVAL_DECISION_UNSPECIFIED"),
-                    "stateRevision": result.state_revision,
-                    "awaitToken": await_token_json(response.await_token),
+                    "committed": result.committed(),
+                    "replayed": result.replayed(),
+                    "authorityDecisionRef": result.authority_decision_ref(),
+                    "decision": result.decision().contract_name(),
+                    "stateRevision": result.state_revision(),
+                    "awaitToken": await_token_json(result.await_token().cloned()),
+                    "projectionWarning": result.projection_warning().map(|warning| json!({
+                        "code": warning.code,
+                        "retryable": warning.retryable,
+                        "requiredActionCode": warning.required_action_code,
+                        "safeFingerprint": warning.safe_fingerprint,
+                    })),
                 },
-                "correlationId": correlation_id,
+                "correlationId": result.correlation_id(),
             });
             if output == CommandOutput::Console {
                 if json {
                     println!("{}", serde_json::to_string(&payload).unwrap());
                 } else {
                     println!(
-                        "TUI approval decided: ref={} committed={} revision={}",
+                        "TUI approval decided: ref={} - {}",
                         payload["data"]["authorityDecisionRef"]
                             .as_str()
                             .unwrap_or(""),
-                        payload["data"]["committed"].as_bool().unwrap_or(false),
-                        payload["data"]["stateRevision"]
-                            .as_u64()
-                            .unwrap_or_default(),
+                        approval_decision_feedback(
+                            result.state_revision(),
+                            result.replayed(),
+                            result.projection_warning().is_some(),
+                        )
                     );
                 }
             }
@@ -2268,11 +2270,11 @@ fn tui_context_revoke_error(error: ClientContextRevokeError) -> String {
     }
 }
 
-fn parse_approval_decision(value: &str) -> Result<i32, String> {
+fn parse_approval_decision(value: &str) -> Result<GuidedApprovalDecision, String> {
     match value {
-        "allow-once" => Ok(ApprovalDecision::AllowOnce as i32),
-        "deny" => Ok(ApprovalDecision::Deny as i32),
-        "cancel-attempt" => Ok(ApprovalDecision::CancelAttempt as i32),
+        "allow-once" => Ok(GuidedApprovalDecision::AllowOnce),
+        "deny" => Ok(GuidedApprovalDecision::Deny),
+        "cancel-attempt" => Ok(GuidedApprovalDecision::CancelAttempt),
         _ => Err("decision must be allow-once, deny, or cancel-attempt".to_owned()),
     }
 }
@@ -2437,6 +2439,7 @@ struct App {
     refresh_interval: Duration,
     mode: InteractiveMode,
     task_watch: Option<TaskWatchController<dyn InteractiveClient>>,
+    approval_queue: Option<ApprovalQueueController<dyn InteractiveClient>>,
 }
 
 impl App {
@@ -2450,6 +2453,7 @@ impl App {
             refresh_interval: Duration::from_secs(2),
             mode: InteractiveMode::Dashboard,
             task_watch: None,
+            approval_queue: None,
         }
     }
 
@@ -2485,12 +2489,88 @@ impl App {
                 }
                 KeyCode::Char('r') => Ok(None),
                 KeyCode::Char('w') => Ok(Some(InteractiveAction::OpenTaskWatch)),
+                KeyCode::Char('a') => Ok(Some(InteractiveAction::OpenApprovalQueue)),
                 _ => Ok(None),
             },
             InteractiveMode::TaskWatch => match key.code {
                 KeyCode::Esc => Ok(Some(InteractiveAction::CloseTaskWatch)),
                 KeyCode::Char('r') => Ok(Some(InteractiveAction::RefetchTaskWatch)),
                 KeyCode::Char('q') => Ok(Some(InteractiveAction::Quit)),
+                _ => Ok(None),
+            },
+            InteractiveMode::ApprovalQueue => match key.code {
+                KeyCode::Esc => Ok(Some(InteractiveAction::CloseApprovalQueue)),
+                KeyCode::Char('r') => Ok(Some(InteractiveAction::RefetchApprovalQueue)),
+                KeyCode::Char('q') => Ok(Some(InteractiveAction::Quit)),
+                KeyCode::Up => {
+                    if let Some(controller) = &mut self.approval_queue {
+                        controller.select_previous();
+                    }
+                    Ok(None)
+                }
+                KeyCode::Down => {
+                    if let Some(controller) = &mut self.approval_queue {
+                        controller.select_next();
+                    }
+                    Ok(None)
+                }
+                KeyCode::Enter => {
+                    let selected = self
+                        .approval_queue
+                        .as_ref()
+                        .and_then(|controller| controller.model())
+                        .and_then(|model| model.selected_id.clone());
+                    if let Some(selected) = selected {
+                        self.mode = InteractiveMode::ApprovalDecisionModal(
+                            ApprovalDecisionModal::new(selected),
+                        );
+                        self.message = "Choose an explicit decision and enter a reason".to_owned();
+                    }
+                    Ok(None)
+                }
+                _ => Ok(None),
+            },
+            InteractiveMode::ApprovalDecisionModal(modal) => match key.code {
+                KeyCode::Esc => {
+                    self.mode = InteractiveMode::ApprovalQueue;
+                    self.message = "Approval decision cancelled; no command was sent".to_owned();
+                    Ok(None)
+                }
+                KeyCode::Left => {
+                    modal.cycle_decision(false);
+                    Ok(None)
+                }
+                KeyCode::Right => {
+                    modal.cycle_decision(true);
+                    Ok(None)
+                }
+                KeyCode::Tab => {
+                    modal.active_field = match modal.active_field {
+                        ApprovalModalField::Reason => ApprovalModalField::Proof,
+                        ApprovalModalField::Proof => ApprovalModalField::Reason,
+                    };
+                    Ok(None)
+                }
+                KeyCode::Backspace => {
+                    modal.active_value_mut().pop();
+                    Ok(None)
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    modal.active_value_mut().push(character);
+                    Ok(None)
+                }
+                KeyCode::Enter
+                    if !modal.submitting
+                        && modal.decision.is_some()
+                        && !modal.reason_code.trim().is_empty() =>
+                {
+                    modal.submitting = true;
+                    Ok(Some(InteractiveAction::SubmitApprovalDecision))
+                }
                 _ => Ok(None),
             },
             InteractiveMode::Palette { selected } => match key.code {
@@ -2675,6 +2755,7 @@ impl App {
 
     async fn start_task_watch(&mut self) -> Result<(), String> {
         self.stop_task_watch().await;
+        self.stop_approval_queue().await;
         self.ensure_task_watch_client().await?;
         let client = Arc::clone(self.client.as_ref().expect("Task watch client is attached"));
         let mut controller = TaskWatchController::new(client);
@@ -2707,6 +2788,76 @@ impl App {
         self.snapshot = Some(snapshot_from_task_watch_model(model));
         self.message = model.message.clone();
         Ok(())
+    }
+
+    async fn start_approval_queue(&mut self) -> Result<(), String> {
+        self.stop_task_watch().await;
+        self.stop_approval_queue().await;
+        self.ensure_task_watch_client().await?;
+        let client = Arc::clone(
+            self.client
+                .as_ref()
+                .expect("Approval Queue client is attached"),
+        );
+        let mut controller = ApprovalQueueController::new(client);
+        controller.start().await?;
+        self.message = controller
+            .model()
+            .ok_or_else(|| "Approval Queue controller omitted its baseline".to_owned())?
+            .message
+            .clone();
+        self.approval_queue = Some(controller);
+        self.mode = InteractiveMode::ApprovalQueue;
+        Ok(())
+    }
+
+    async fn stop_approval_queue(&mut self) {
+        if let Some(mut controller) = self.approval_queue.take() {
+            controller.stop().await;
+        }
+    }
+
+    async fn apply_approval_queue_events(&mut self) -> Result<(), String> {
+        let controller = self
+            .approval_queue
+            .as_mut()
+            .ok_or_else(|| "Approval Queue controller is unavailable".to_owned())?;
+        controller.pump().await?;
+        self.message = controller
+            .model()
+            .ok_or_else(|| "Approval Queue controller omitted its page model".to_owned())?
+            .message
+            .clone();
+        Ok(())
+    }
+
+    async fn submit_approval_decision(&mut self) -> Result<ApprovalDecisionReceipt, String> {
+        let mode = std::mem::replace(&mut self.mode, InteractiveMode::ApprovalQueue);
+        let InteractiveMode::ApprovalDecisionModal(modal) = mode else {
+            return Err("Approval decision modal is unavailable".to_owned());
+        };
+        let current_selected = self
+            .approval_queue
+            .as_ref()
+            .and_then(|controller| controller.model())
+            .and_then(|model| model.selected_id.as_deref());
+        if current_selected != Some(modal.approval_request_id.as_str()) {
+            return Err("Approval is no longer actionable; refresh before deciding".to_owned());
+        }
+        let decision = modal
+            .decision
+            .ok_or_else(|| "An explicit approval decision is required".to_owned())?;
+        self.approval_queue
+            .as_mut()
+            .expect("Approval Queue controller is present")
+            .decide_selected(
+                decision,
+                modal.reason_code,
+                (!modal.confirmation_proof_ref.trim().is_empty())
+                    .then_some(modal.confirmation_proof_ref),
+            )
+            .await
+            .map_err(|error| error.to_string())
     }
 
     fn render(&self, frame: &mut Frame<'_>) {
@@ -2788,6 +2939,23 @@ impl App {
                     body[1],
                 ),
             },
+            InteractiveMode::ApprovalQueue | InteractiveMode::ApprovalDecisionModal(_) => {
+                match self
+                    .approval_queue
+                    .as_ref()
+                    .and_then(|controller| controller.model())
+                {
+                    Some(model) => render_approval_queue(frame, body[1], model),
+                    None => frame.render_widget(
+                        Paragraph::new("Approval Queue has no baseline snapshot.")
+                            .block(Block::default().borders(Borders::ALL)),
+                        body[1],
+                    ),
+                }
+                if let InteractiveMode::ApprovalDecisionModal(modal) = &self.mode {
+                    render_approval_decision_modal(frame, body[1], modal);
+                }
+            }
             InteractiveMode::Palette { selected } => {
                 render_command_palette(frame, body[1], *selected)
             }
@@ -2807,7 +2975,7 @@ impl App {
     fn footer_text(&self) -> String {
         if matches!(self.mode, InteractiveMode::Dashboard) {
             return format!(
-                "{} - w Task Watch - c command palette - r refresh - Tab panel - q quit",
+                "{} - w task watch - a approval queue - c command palette - r refresh - Tab panel - q quit",
                 self.message
             );
         }
@@ -2815,6 +2983,14 @@ impl App {
             InteractiveMode::TaskWatch => {
                 format!("{} - Esc dashboard - r refetch - q quit", self.message)
             }
+            InteractiveMode::ApprovalQueue => format!(
+                "{} - Up/Down select - Enter decide - Esc dashboard - r refetch - q quit",
+                self.message
+            ),
+            InteractiveMode::ApprovalDecisionModal(_) => format!(
+                "{} - Left/Right decision - Tab reason/proof - Enter submit - Esc cancel",
+                self.message
+            ),
             InteractiveMode::Dashboard => format!(
                 "{} · c command palette · r refresh · Tab/←/→ panel · q quit",
                 self.message
@@ -2835,6 +3011,89 @@ impl App {
             ),
         }
     }
+}
+
+fn approval_decision_feedback(
+    state_revision: u64,
+    replayed: bool,
+    projection_warning: bool,
+) -> String {
+    if projection_warning {
+        format!(
+            "Authority committed the approval at revision {state_revision} (replayed={replayed}); projection synchronization reported a warning. Do not retry the decision; refresh the queue instead"
+        )
+    } else {
+        format!("Approval committed at revision {state_revision} (replayed={replayed})")
+    }
+}
+
+fn render_approval_queue(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &egopulse_tui::approval_queue::ApprovalQueuePageModel,
+) {
+    let rows = model.items.iter().map(|item| {
+        let selected = model.selected_id.as_deref() == Some(item.approval_request_id.as_str());
+        Row::new([
+            if selected { ">" } else { "" },
+            item.approval_request_id.as_str(),
+            item.task_id.as_str(),
+        ])
+    });
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(2),
+                Constraint::Percentage(55),
+                Constraint::Percentage(45),
+            ],
+        )
+        .header(Row::new(["", "Approval", "Task"]).style(Style::default().fg(Color::Yellow)))
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "Approval Queue - {} - position {}",
+            if model.stale { "stale" } else { "live" },
+            model.position
+        ))),
+        area,
+    );
+}
+
+fn render_approval_decision_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    modal: &ApprovalDecisionModal,
+) {
+    let decision = modal
+        .decision
+        .map(GuidedApprovalDecision::contract_name)
+        .unwrap_or("<choose explicitly>");
+    let reason = if modal.reason_code.is_empty() {
+        "<empty>"
+    } else {
+        "<entered>"
+    };
+    let proof = if modal.confirmation_proof_ref.is_empty() {
+        "<none>"
+    } else {
+        "<entered>"
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!("Approval: {}", modal.approval_request_id)),
+            Line::from(format!("Decision: {decision}")),
+            Line::from(format!("Reason: {reason}")),
+            Line::from(format!("Proof: {proof}")),
+            Line::from("No decision is selected by default."),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Guided approval decision"),
+        ),
+        area,
+    );
 }
 
 fn render_command_palette(frame: &mut Frame<'_>, area: Rect, selected: usize) {
@@ -3121,6 +3380,7 @@ async fn finish_interactive_session<T>(
     result: Result<T, String>,
 ) -> Result<T, String> {
     app.stop_task_watch().await;
+    app.stop_approval_queue().await;
     result
 }
 
@@ -3142,8 +3402,32 @@ async fn execute_interactive_action(
             app.refresh().await;
             *next_refresh = tokio::time::Instant::now() + app.refresh_interval;
         }
+        InteractiveAction::OpenApprovalQueue | InteractiveAction::RefetchApprovalQueue => {
+            if let Err(error) = app.start_approval_queue().await {
+                app.mode = InteractiveMode::Dashboard;
+                app.message = format!("Approval Queue unavailable: {error}");
+            }
+        }
+        InteractiveAction::CloseApprovalQueue => {
+            app.stop_approval_queue().await;
+            app.mode = InteractiveMode::Dashboard;
+            app.refresh().await;
+            *next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+        }
+        InteractiveAction::SubmitApprovalDecision => {
+            app.message = "Submitting guided approval decision...".to_owned();
+            app.message = match app.submit_approval_decision().await {
+                Ok(receipt) => approval_decision_feedback(
+                    receipt.state_revision,
+                    receipt.replayed,
+                    receipt.projection_warning.is_some(),
+                ),
+                Err(error) => format!("Approval rejected: {error}"),
+            };
+        }
         InteractiveAction::Quit => {
             app.stop_task_watch().await;
+            app.stop_approval_queue().await;
             return Ok(InteractiveLoopControl::Quit);
         }
         InteractiveAction::StageContextRevoke(input) => {
@@ -3193,6 +3477,15 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
                 snapshot.stale = true;
             }
             app.message = format!("Task Watch stopped fail-closed: {error}");
+        }
+        if matches!(
+            app.mode,
+            InteractiveMode::ApprovalQueue | InteractiveMode::ApprovalDecisionModal(_)
+        ) && let Err(error) = app.apply_approval_queue_events().await
+        {
+            app.stop_approval_queue().await;
+            app.mode = InteractiveMode::Dashboard;
+            app.message = format!("Approval Queue stopped fail-closed: {error}");
         }
         terminal
             .draw(|frame| app.render(frame))
@@ -3275,7 +3568,13 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
-    use egopulse_client_operations::{ClientTaskWatchError, TaskWatchRequest};
+    use egopulse_client_operations::{
+        ApprovalWatchClassification, ClientTaskWatchError, TaskWatchRequest,
+    };
+    use egopulse_tui::approval_queue::{
+        ApprovalQueueItem, ApprovalQueueNextFuture, ApprovalQueueOpened, ApprovalQueueStream,
+        ApprovalQueueStreamUpdate,
+    };
     use egopulse_tui::task_watch::{TaskWatchNextFuture, TaskWatchStream};
     use std::{
         collections::VecDeque,
@@ -3379,6 +3678,156 @@ mod tests {
         }
     }
 
+    impl ApprovalQueueClient for WatchInteractiveClient {
+        fn open_approval_queue(&self) -> ApprovalQueueOpenFuture<'_> {
+            Box::pin(async {
+                Err(
+                    egopulse_client_operations::ClientApprovalWatchError::Protocol(
+                        "Approval Queue not used by Task Watch test",
+                    ),
+                )
+            })
+        }
+
+        fn decide_guided_approval(
+            &self,
+            _input: GuidedApprovalDecisionInput,
+        ) -> GuidedApprovalFuture<'_> {
+            Box::pin(async {
+                Err(
+                    egopulse_client_operations::ClientGuidedApprovalDecisionError::InvalidInput(
+                        "Approval Queue not used by Task Watch test",
+                    ),
+                )
+            })
+        }
+    }
+
+    enum MainApprovalStreamStep {
+        Update(Vec<ApprovalQueueItem>),
+        Pending,
+    }
+
+    struct MainApprovalStream {
+        steps: VecDeque<MainApprovalStreamStep>,
+        next_calls: Arc<AtomicUsize>,
+    }
+
+    impl ApprovalQueueStream for MainApprovalStream {
+        fn next_update(&mut self) -> ApprovalQueueNextFuture<'_> {
+            self.next_calls.fetch_add(1, Ordering::SeqCst);
+            let step = self
+                .steps
+                .pop_front()
+                .unwrap_or(MainApprovalStreamStep::Pending);
+            Box::pin(async move {
+                match step {
+                    MainApprovalStreamStep::Update(items) => {
+                        Ok(Some(ApprovalQueueStreamUpdate::from_safe_projection(
+                            ApprovalWatchClassification::Applied,
+                            "epoch:approval:2",
+                            items,
+                        )))
+                    }
+                    MainApprovalStreamStep::Pending => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    struct CombinedInteractiveClient {
+        approval_streams: Mutex<VecDeque<VecDeque<MainApprovalStreamStep>>>,
+        approval_next_calls: Arc<AtomicUsize>,
+        approval_decide_calls: AtomicUsize,
+        task_open_calls: AtomicUsize,
+        approval_open_calls: AtomicUsize,
+    }
+
+    impl CombinedInteractiveClient {
+        fn new(approval_streams: VecDeque<VecDeque<MainApprovalStreamStep>>) -> Self {
+            Self {
+                approval_streams: Mutex::new(approval_streams),
+                approval_next_calls: Arc::new(AtomicUsize::new(0)),
+                approval_decide_calls: AtomicUsize::new(0),
+                task_open_calls: AtomicUsize::new(0),
+                approval_open_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl TaskWatchClient for CombinedInteractiveClient {
+        fn task_watch_baseline(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<TaskWatchPageModel, String>> + Send + '_>> {
+            Box::pin(std::future::ready(Ok(snapshot_into_task_watch_model(
+                watch_snapshot("task:mutual", 1, 10),
+            ))))
+        }
+
+        fn open_task_watch(&self, _request: TaskWatchRequest) -> TaskWatchOpenFuture<'_> {
+            self.task_open_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Box::new(ScriptedTaskWatch {
+                    steps: Arc::new(Mutex::new(VecDeque::from([ScriptedWatchStep::Pending]))),
+                    next_calls: Arc::new(AtomicUsize::new(0)),
+                }) as Box<dyn TaskWatchStream>)
+            })
+        }
+    }
+
+    impl ApprovalQueueClient for CombinedInteractiveClient {
+        fn open_approval_queue(&self) -> ApprovalQueueOpenFuture<'_> {
+            self.approval_open_calls.fetch_add(1, Ordering::SeqCst);
+            let steps = self
+                .approval_streams
+                .lock()
+                .expect("read approval streams")
+                .pop_front()
+                .unwrap_or_else(|| VecDeque::from([MainApprovalStreamStep::Pending]));
+            let next_calls = Arc::clone(&self.approval_next_calls);
+            Box::pin(async move {
+                Ok(ApprovalQueueOpened::from_safe_projection(
+                    "epoch:approval:1",
+                    vec![ApprovalQueueItem {
+                        approval_request_id: "approval:main".to_owned(),
+                        task_id: "task:main".to_owned(),
+                    }],
+                    Box::new(MainApprovalStream { steps, next_calls }),
+                ))
+            })
+        }
+
+        fn decide_guided_approval(
+            &self,
+            input: GuidedApprovalDecisionInput,
+        ) -> GuidedApprovalFuture<'_> {
+            self.approval_decide_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(ApprovalDecisionReceipt {
+                    committed: true,
+                    replayed: false,
+                    authority_decision_ref: "decision:main".to_owned(),
+                    decision: input.decision,
+                    state_revision: 2,
+                    projection_warning: None,
+                })
+            })
+        }
+    }
+
+    impl InteractiveClient for CombinedInteractiveClient {
+        fn snapshot(&self) -> SnapshotFuture<'_> {
+            Box::pin(std::future::ready(Ok(watch_snapshot("task:mutual", 1, 10))))
+        }
+
+        fn prepare_context_revoke(
+            &self,
+            _input: ContextRevokeInput,
+        ) -> Result<PendingContextRevoke, String> {
+            Err("Context revoke not used by lifecycle tests".to_owned())
+        }
+    }
+
     fn watch_task(task_id: &str, revision: u64) -> TaskView {
         TaskView {
             task: Some(
@@ -3402,6 +3851,19 @@ mod tests {
             tasks: vec![watch_task(task_id, revision)],
             approvals: Vec::new(),
         }
+    }
+
+    async fn wait_for_test_count(counter: &AtomicUsize, expected: usize) {
+        for _ in 0..100 {
+            if counter.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "counter did not reach {expected}; actual={}",
+            counter.load(Ordering::SeqCst)
+        );
     }
 
     struct FakeContextRevokeCommit {
@@ -3472,6 +3934,31 @@ mod tests {
         }
     }
 
+    impl ApprovalQueueClient for FakeInteractiveClient {
+        fn open_approval_queue(&self) -> ApprovalQueueOpenFuture<'_> {
+            Box::pin(async {
+                Err(
+                    egopulse_client_operations::ClientApprovalWatchError::Protocol(
+                        "Approval Queue not used by Context modal test",
+                    ),
+                )
+            })
+        }
+
+        fn decide_guided_approval(
+            &self,
+            _input: GuidedApprovalDecisionInput,
+        ) -> GuidedApprovalFuture<'_> {
+            Box::pin(async {
+                Err(
+                    egopulse_client_operations::ClientGuidedApprovalDecisionError::InvalidInput(
+                        "Approval Queue not used by Context modal test",
+                    ),
+                )
+            })
+        }
+    }
+
     #[test]
     fn command_form_rejects_missing_required_values() {
         let form = CommandForm::new(CommandKind::TaskCreate);
@@ -3484,10 +3971,6 @@ mod tests {
         let mut form = CommandForm::new(CommandKind::ApprovalDecide);
         for (field, value) in form.fields.iter_mut().zip([
             "approval-1".to_owned(),
-            "a".repeat(64),
-            "observation-1".to_owned(),
-            "7".to_owned(),
-            "3".to_owned(),
             "deny".to_owned(),
             "user-denied".to_owned(),
             String::new(),
@@ -3497,19 +3980,221 @@ mod tests {
         let command = form.into_command().expect("valid approval form");
         match command {
             TuiCommand::ApprovalDecide {
-                expected_request_observation_sequence,
-                expected_request_revision,
                 confirmation_proof_ref,
                 decision,
                 ..
             } => {
-                assert_eq!(expected_request_observation_sequence, 7);
-                assert_eq!(expected_request_revision, 3);
                 assert_eq!(confirmation_proof_ref, None);
                 assert_eq!(decision, "deny");
             }
             _ => panic!("wrong command kind"),
         }
+    }
+
+    #[test]
+    fn approval_form_and_modal_require_an_explicit_decision_and_single_submit() {
+        let mut form = CommandForm::new(CommandKind::ApprovalDecide);
+        assert_eq!(
+            form.fields
+                .iter()
+                .find(|field| field.label == "decision")
+                .expect("decision field")
+                .value,
+            ""
+        );
+        form.fields[0].value = "approval:form:1".to_owned();
+        form.fields[2].value = "founder-reviewed".to_owned();
+        assert!(matches!(
+            form.into_command(),
+            Err(error) if error == "decision is required"
+        ));
+
+        let mut app = App::new("approval-modal".to_owned());
+        app.mode = InteractiveMode::ApprovalDecisionModal(ApprovalDecisionModal::new(
+            "approval:modal:1".to_owned(),
+        ));
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap()
+                .is_none(),
+            "Enter without an explicit decision/reason must not submit"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+        for character in "founder-reviewed".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        let first = app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(
+            first,
+            Some(InteractiveAction::SubmitApprovalDecision)
+        ));
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap()
+                .is_none(),
+            "a second Enter while submission is in flight must be ignored"
+        );
+        let InteractiveMode::ApprovalDecisionModal(modal) = &app.mode else {
+            panic!("approval modal")
+        };
+        assert_eq!(modal.decision, Some(GuidedApprovalDecision::AllowOnce));
+        assert_eq!(modal.reason_code, "founder-reviewed");
+    }
+
+    #[tokio::test]
+    async fn app_keeps_task_watch_and_approval_queue_mutually_exclusive() {
+        let client = Arc::new(CombinedInteractiveClient::new(VecDeque::from([
+            VecDeque::from([MainApprovalStreamStep::Pending]),
+        ])));
+        let mut app = App::new("mutual-watch".to_owned());
+        app.client = Some(Arc::clone(&client) as Arc<dyn InteractiveClient>);
+
+        app.start_task_watch().await.unwrap();
+        wait_for_test_count(&client.task_open_calls, 1).await;
+        assert!(app.task_watch.is_some());
+        assert!(app.approval_queue.is_none());
+
+        app.start_approval_queue().await.unwrap();
+        assert!(app.task_watch.is_none());
+        assert!(app.approval_queue.is_some());
+
+        app.start_task_watch().await.unwrap();
+        wait_for_test_count(&client.task_open_calls, 2).await;
+        assert!(app.task_watch.is_some());
+        assert!(app.approval_queue.is_none());
+        assert_eq!(client.task_open_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(client.approval_open_calls.load(Ordering::SeqCst), 1);
+        app.stop_task_watch().await;
+    }
+
+    #[tokio::test]
+    async fn production_modal_actions_cancel_once_and_reject_a_disappeared_candidate() {
+        let escaped_client = Arc::new(CombinedInteractiveClient::new(VecDeque::from([
+            VecDeque::from([MainApprovalStreamStep::Pending]),
+        ])));
+        let mut escaped = App::new("approval-escape".to_owned());
+        escaped.client = Some(Arc::clone(&escaped_client) as Arc<dyn InteractiveClient>);
+        escaped.start_approval_queue().await.unwrap();
+        assert!(
+            escaped
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            escaped
+                .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            escaped_client.approval_decide_calls.load(Ordering::SeqCst),
+            0
+        );
+        escaped.stop_approval_queue().await;
+
+        let submitted_client = Arc::new(CombinedInteractiveClient::new(VecDeque::from([
+            VecDeque::from([MainApprovalStreamStep::Pending]),
+        ])));
+        let mut submitted = App::new("approval-submit".to_owned());
+        submitted.client = Some(Arc::clone(&submitted_client) as Arc<dyn InteractiveClient>);
+        submitted.start_approval_queue().await.unwrap();
+        submitted
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        submitted
+            .handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+        for character in "founder-reviewed".chars() {
+            submitted
+                .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        let action = submitted
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap()
+            .expect("first Enter submits");
+        assert!(
+            submitted
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap()
+                .is_none(),
+            "second Enter while the modal is submitting must not dispatch"
+        );
+        let mut next_refresh = tokio::time::Instant::now();
+        assert_eq!(
+            execute_interactive_action(&mut submitted, action, &mut next_refresh)
+                .await
+                .unwrap(),
+            InteractiveLoopControl::Continue
+        );
+        assert_eq!(
+            submitted_client
+                .approval_decide_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+        submitted.stop_approval_queue().await;
+
+        let removed_client = Arc::new(CombinedInteractiveClient::new(VecDeque::from([
+            VecDeque::from([
+                MainApprovalStreamStep::Update(Vec::new()),
+                MainApprovalStreamStep::Pending,
+            ]),
+        ])));
+        let mut removed = App::new("approval-removed".to_owned());
+        removed.client = Some(Arc::clone(&removed_client) as Arc<dyn InteractiveClient>);
+        removed.start_approval_queue().await.unwrap();
+        removed
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        removed
+            .handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .unwrap();
+        for character in "founder-reviewed".chars() {
+            removed
+                .handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        let action = removed
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap()
+            .expect("modal seals one action before projection changes");
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            removed.apply_approval_queue_events().await.unwrap();
+            if removed
+                .approval_queue
+                .as_ref()
+                .and_then(|controller| controller.model())
+                .is_some_and(|model| model.items.is_empty())
+            {
+                break;
+            }
+        }
+        assert!(
+            removed
+                .approval_queue
+                .as_ref()
+                .and_then(|controller| controller.model())
+                .is_some_and(|model| model.items.is_empty())
+        );
+        assert_eq!(
+            execute_interactive_action(&mut removed, action, &mut next_refresh)
+                .await
+                .unwrap(),
+            InteractiveLoopControl::Continue
+        );
+        assert!(removed.message.contains("no longer actionable"));
+        assert_eq!(
+            removed_client.approval_decide_calls.load(Ordering::SeqCst),
+            0
+        );
+        removed.stop_approval_queue().await;
     }
 
     #[test]
@@ -4094,6 +4779,24 @@ mod tests {
                 .unwrap(),
             Some(InteractiveAction::Quit)
         ));
+    }
+
+    #[test]
+    fn dashboard_discovers_both_watch_pages_and_projection_warning_prevents_blind_retry() {
+        let app = App::new("approval-feedback".to_owned());
+        let footer = app.footer_text();
+        assert!(footer.contains("w task watch"));
+        assert!(footer.contains("a approval queue"));
+
+        assert_eq!(
+            approval_decision_feedback(7, false, false),
+            "Approval committed at revision 7 (replayed=false)"
+        );
+        let warning = approval_decision_feedback(8, false, true);
+        assert!(warning.contains("Authority committed the approval at revision 8"));
+        assert!(warning.contains("projection synchronization reported a warning"));
+        assert!(warning.contains("Do not retry the decision"));
+        assert!(warning.contains("refresh the queue instead"));
     }
 
     #[test]

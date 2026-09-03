@@ -31,7 +31,7 @@ use egopulse_artifact_authority::{
     ArtifactAuthority, ArtifactAuthorityConfig, ArtifactSqlCipherKey,
 };
 use egopulse_client_kernel::{ClientKernel, api_contract_ref, authorization_contract_ref};
-use egopulse_client_operations::attach as attach_client_operation;
+use egopulse_client_operations::{GuidedApprovalDecision, attach as attach_client_operation};
 use egopulse_codex_adapter::{CODEX_ADAPTER_ID, CODEX_CAPABILITY_PROFILE_ID, FakeCodexDriver};
 use egopulse_cognition_runtime::{
     context_authority::{
@@ -103,7 +103,7 @@ use egopulse_policy_decision_authority::{
     PolicyPrincipalKind, PolicyReferenceRejection, PolicySqlCipherKey,
     ResolvedApprovalAuthorization,
 };
-use egopulse_tui::task_watch::TaskWatchController;
+use egopulse_tui::{approval_queue::ApprovalQueueController, task_watch::TaskWatchController};
 use egopulse_v01_fault_conformance::memory_restart_oracle::MemoryRestartOracle;
 use egopulse_v01_fault_conformance::r8b2c::{
     R8b2cNativeEventRecord, R8b2cWitnessReader, R8b2cWitnessWriter, read_r8b2c_adapter_store,
@@ -6493,7 +6493,7 @@ async fn c5_04_real_cli_fails_closed_on_daemon_restart_and_reconnects() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn c5_04_real_cli_rejects_malformed_await_and_stale_approval_without_partial_commit() {
+async fn c5_04_real_cli_rejects_malformed_await_and_submits_guided_approval() {
     let root = std::env::temp_dir().join(format!(
         "egopulse-c5-04-contract-recovery-{}",
         Uuid::now_v7()
@@ -6516,64 +6516,25 @@ async fn c5_04_real_cli_rejects_malformed_await_and_stale_approval_without_parti
     assert_eq!(malformed_json["error"]["code"], "LOCAL_API_PROTOCOL_ERROR");
     assert_eq!(malformed_json["data"], serde_json::Value::Null);
 
-    let stale = run_cli(
-        &instance,
-        &[
-            "approval",
-            "decide",
-            "approval-c5-03",
-            "--expected-action-digest-sha256",
-            &"33".repeat(32),
-            "--expected-request-observation-id",
-            "observation-c5-03",
-            "--expected-request-observation-sequence",
-            "1",
-            "--expected-request-revision",
-            "2",
-            "--decision",
-            "allow-once",
-            "--reason-code",
-            "c5-04-stale",
-            "--confirmation-proof-ref",
-            "confirmation-c5-04-stale",
-            "--json",
-        ],
-    )
-    .await;
-    assert_eq!(stale.status.code(), Some(6));
-    let stale_json: serde_json::Value =
-        serde_json::from_slice(&stale.stdout).expect("stale approval JSON envelope");
-    assert_eq!(stale_json["operation"], "approval.decide");
-    assert_eq!(stale_json["error"]["code"], "POLICY_AUTHORITY_REJECTED");
-    assert_eq!(stale_json["data"], serde_json::Value::Null);
-
     let accepted = run_cli(
         &instance,
         &[
             "approval",
             "decide",
             "approval-c5-03",
-            "--expected-action-digest-sha256",
-            &"33".repeat(32),
-            "--expected-request-observation-id",
-            "observation-c5-03",
-            "--expected-request-observation-sequence",
-            "1",
-            "--expected-request-revision",
-            "1",
             "--decision",
             "allow-once",
             "--reason-code",
-            "c5-04-accepted-after-stale",
+            "c5-04-guided-accepted",
             "--confirmation-proof-ref",
-            "confirmation-c5-04-accepted",
+            "proof:c5-04:guided-accepted",
             "--json",
         ],
     )
     .await;
     assert!(
         accepted.status.success(),
-        "stale rejection must not consume the approval: stdout={} stderr={}",
+        "guided approval must commit: stdout={} stderr={}",
         String::from_utf8_lossy(&accepted.stdout),
         String::from_utf8_lossy(&accepted.stderr)
     );
@@ -6586,6 +6547,133 @@ async fn c5_04_real_cli_rejects_malformed_await_and_stale_approval_without_parti
     let status = child.wait().await.expect("fixture child exit");
     assert!(status.success(), "fixture child failed: {status}");
     fs::remove_dir_all(&root).expect("remove C5 contract recovery fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u02c_real_daemon_seeded_projection_uses_production_approval_queue_controller() {
+    let root = std::env::temp_dir().join(format!("egopulse-u02c-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create U-02c fixture root");
+    let instance = format!("u02c-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, "allow").await;
+    let _status = wait_for_cli_status_with_child(&instance, &mut child).await;
+
+    let attachment = Arc::new(
+        attach_client_operation(
+            &instance,
+            ClientSurface::Tui,
+            format!("egopulse-u02c-controller-{}", Uuid::now_v7()),
+        )
+        .await
+        .expect("attach production TUI controller to real daemon"),
+    );
+    let mut controller = ApprovalQueueController::new(Arc::clone(&attachment));
+    controller
+        .start()
+        .await
+        .expect("open atomic approval baseline/session");
+    assert!(
+        controller
+            .model()
+            .expect("approval model")
+            .items
+            .iter()
+            .any(|item| {
+                item.approval_request_id == "approval-c5-03" && item.task_id == "task-c5-03"
+            })
+    );
+
+    let receipt = controller
+        .decide_selected(
+            GuidedApprovalDecision::AllowOnce,
+            "u02c-founder-approved".to_owned(),
+            Some("proof:u02c:approval".to_owned()),
+        )
+        .await
+        .expect("submit guided approval through shared operation");
+    assert!(receipt.committed);
+    assert!(
+        controller
+            .model()
+            .expect("approval model after commit")
+            .items
+            .iter()
+            .any(|item| { item.approval_request_id == "approval-c5-03" }),
+        "controller must not optimistically remove a committed approval"
+    );
+
+    timeout(Duration::from_secs(8), async {
+        loop {
+            controller.pump().await.expect("pump approval projection");
+            if !controller
+                .model()
+                .expect("approval model")
+                .items
+                .iter()
+                .any(|item| item.approval_request_id == "approval-c5-03")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("approval projection must remove the no-longer-actionable item");
+
+    let projection = attachment
+        .read_projection_snapshot()
+        .await
+        .expect("read projection after approval decision");
+    let task = projection
+        .tasks
+        .iter()
+        .filter_map(|view| view.task.as_ref())
+        .find(|task| task.task_id == "task-c5-03")
+        .expect("seeded Task projection");
+    assert_eq!(task.status, TaskStatus::Active as i32);
+    assert_ne!(task.status, TaskStatus::Completed as i32);
+
+    controller.stop().await;
+    drop(child.stdin.take());
+    let status = child.wait().await.expect("U-02c fixture child exit");
+    assert!(status.success(), "U-02c fixture child failed: {status}");
+
+    let policy = PolicyDecisionAuthority::open(
+        PolicyAuthorityConfig {
+            database_path: root.join("policy-authority.db"),
+            store_epoch: "c5-00-policy-epoch".to_owned(),
+            key: PolicySqlCipherKey::new([0x12; 32]),
+        },
+        AllowPolicyReferences,
+    )
+    .expect("reopen Policy Authority for typed persistence oracle");
+    let (record, state) = policy
+        .get(&receipt.authority_decision_ref)
+        .expect("read persisted Policy decision")
+        .expect("persisted Policy decision exists");
+    assert_eq!(
+        record
+            .request
+            .as_ref()
+            .expect("persisted approval request binding")
+            .approval_request_id,
+        "approval-c5-03"
+    );
+    assert_eq!(
+        record.decision,
+        egopulse_domain_contracts::v01::egopulse::harness::v1::ApprovalDecision::AllowOnce as i32
+    );
+    assert_eq!(state.revision, receipt.state_revision);
+    let inspection = policy.inspect_store().expect("inspect Policy persistence");
+    assert!(inspection.decision_count >= 1);
+    assert!(inspection.event_count >= 1);
+    assert!(inspection.idempotency_count >= 1);
+
+    drop(policy);
+    drop(projection);
+    drop(receipt);
+    drop(controller);
+    drop(attachment);
+    fs::remove_dir_all(&root).expect("remove U-02c fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7037,21 +7125,12 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
     assert_eq!(task_await_json["data"]["kind"], "task");
     assert_eq!(task_await_json["data"]["view"]["taskId"], task_id);
 
-    let approval_action_sha = "33".repeat(32);
     let approval_output = run_cli(
         &instance,
         &[
             "approval",
             "decide",
             "approval-c5-03",
-            "--expected-action-digest-sha256",
-            approval_action_sha.as_str(),
-            "--expected-request-observation-id",
-            "observation-c5-03",
-            "--expected-request-observation-sequence",
-            "1",
-            "--expected-request-revision",
-            "1",
             "--decision",
             "allow-once",
             "--reason-code",
