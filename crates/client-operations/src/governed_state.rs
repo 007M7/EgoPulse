@@ -29,6 +29,7 @@ pub enum GovernedStateReason {
 }
 
 pub(crate) enum GovernedRecoverableCause {
+    RetryableApiRejected,
     TransportUnavailable,
     UnexpectedEof,
 }
@@ -36,6 +37,7 @@ pub(crate) enum GovernedRecoverableCause {
 impl GovernedRecoverableCause {
     const fn reason(self) -> GovernedStateReason {
         match self {
+            Self::RetryableApiRejected => GovernedStateReason::ApiRejected,
             Self::TransportUnavailable => GovernedStateReason::TransportUnavailable,
             Self::UnexpectedEof => GovernedStateReason::UnexpectedEof,
         }
@@ -1484,6 +1486,42 @@ mod tests {
             assert_eq!(composite.approval().reason(), Some(expected_reason));
             assert_eq!(composite.task(), &task_before);
         }
+
+        let mut task_retryable_api = live_composite(2, 2);
+        let approval_before = task_retryable_api.approval().clone();
+        task_retryable_api.apply_task(GovernedTaskReducerInput::RecoverableFailure {
+            generation: 1,
+            cause: GovernedRecoverableCause::RetryableApiRejected,
+        });
+        assert_eq!(
+            task_retryable_api.task().phase(),
+            GovernedStateDomainPhase::Stale
+        );
+        assert_eq!(
+            task_retryable_api.task().reason(),
+            Some(GovernedStateReason::ApiRejected)
+        );
+        assert_eq!(task_retryable_api.task().generation(), 2);
+        assert_eq!(task_retryable_api.task().recovery_remaining(), 1);
+        assert_eq!(task_retryable_api.approval(), &approval_before);
+
+        let mut approval_retryable_api = live_composite(2, 2);
+        let task_before = approval_retryable_api.task().clone();
+        approval_retryable_api.apply_approval(GovernedApprovalReducerInput::RecoverableFailure {
+            generation: 1,
+            cause: GovernedRecoverableCause::RetryableApiRejected,
+        });
+        assert_eq!(
+            approval_retryable_api.approval().phase(),
+            GovernedStateDomainPhase::Stale
+        );
+        assert_eq!(
+            approval_retryable_api.approval().reason(),
+            Some(GovernedStateReason::ApiRejected)
+        );
+        assert_eq!(approval_retryable_api.approval().generation(), 2);
+        assert_eq!(approval_retryable_api.approval().recovery_remaining(), 1);
+        assert_eq!(approval_retryable_api.task(), &task_before);
 
         let mut task_exhausted = live_composite(1, 2);
         let approval_before = task_exhausted.approval().clone();

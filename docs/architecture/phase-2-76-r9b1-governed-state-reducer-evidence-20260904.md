@@ -48,7 +48,9 @@ mutation capability.
 3. Initial failure is not all-or-nothing: either domain may become `Fatal`
    while the other independently reaches and remains `Live`.
 4. Recoverable failure consumes only the matching domain's finite budget and
-   advances only its generation fence.
+   advances only its generation fence. Transport, EOF, and an API rejection
+   already classified as retryable use distinct internal causes; callers
+   cannot pass an arbitrary public reason into the recoverable path.
 5. Strict forward progress may recover `Stale` to `Live` and refill only the
    matching domain's budget to its own immutable limit.
 6. Replay, Heartbeat, same-position, and stale-generation inputs do not publish
