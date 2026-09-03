@@ -31,6 +31,7 @@ use egopulse_artifact_authority::{
     ArtifactAuthority, ArtifactAuthorityConfig, ArtifactSqlCipherKey,
 };
 use egopulse_client_kernel::{ClientKernel, api_contract_ref, authorization_contract_ref};
+use egopulse_client_operations::attach as attach_client_operation;
 use egopulse_codex_adapter::{CODEX_ADAPTER_ID, CODEX_CAPABILITY_PROFILE_ID, FakeCodexDriver};
 use egopulse_cognition_runtime::{
     context_authority::{
@@ -102,6 +103,7 @@ use egopulse_policy_decision_authority::{
     PolicyPrincipalKind, PolicyReferenceRejection, PolicySqlCipherKey,
     ResolvedApprovalAuthorization,
 };
+use egopulse_tui::task_watch::TaskWatchController;
 use egopulse_v01_fault_conformance::memory_restart_oracle::MemoryRestartOracle;
 use egopulse_v01_fault_conformance::r8b2c::{
     R8b2cNativeEventRecord, R8b2cWitnessReader, R8b2cWitnessWriter, read_r8b2c_adapter_store,
@@ -6584,6 +6586,171 @@ async fn c5_04_real_cli_rejects_malformed_await_and_stale_approval_without_parti
     let status = child.wait().await.expect("fixture child exit");
     assert!(status.success(), "fixture child failed: {status}");
     fs::remove_dir_all(&root).expect("remove C5 contract recovery fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u01b_real_daemon_production_controller_observes_without_task_mutation() {
+    let root = std::env::temp_dir().join(format!("egopulse-u01b-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create U-01b fixture root");
+    let instance = format!("u01b-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, "allow").await;
+    let _status_output = wait_for_cli_status_with_child(&instance, &mut child).await;
+
+    let tui_output = run_tui_once(&instance).await;
+    assert!(
+        tui_output.status.success(),
+        "TUI baseline must use the real daemon: stdout={} stderr={}",
+        String::from_utf8_lossy(&tui_output.stdout),
+        String::from_utf8_lossy(&tui_output.stderr)
+    );
+
+    let attachment = Arc::new(
+        attach_client_operation(
+            &instance,
+            ClientSurface::Tui,
+            format!("egopulse-tui-u01b-{}", Uuid::now_v7()),
+        )
+        .await
+        .expect("attach the production TUI client kernel"),
+    );
+    let mut controller = TaskWatchController::new(Arc::clone(&attachment));
+    controller
+        .start()
+        .await
+        .expect("production controller installs a complete baseline and resumes from it");
+    assert!(controller.is_running());
+
+    let acceptance_sha = "91".repeat(32);
+    let budget_sha = "92".repeat(32);
+    let mutation = run_tui(
+        &instance,
+        &[
+            "--instance",
+            instance.as_str(),
+            "task-create",
+            "--work-type",
+            "u01b-tui-watch",
+            "--input-snapshot-id",
+            "input-u01b-tui-watch",
+            "--target-scope-ref",
+            "scope-u01b-tui-watch",
+            "--acceptance-contract-id",
+            "acceptance-u01b-tui-watch",
+            "--acceptance-contract-version",
+            "v0.1",
+            "--acceptance-contract-sha256",
+            acceptance_sha.as_str(),
+            "--budget-profile-id",
+            "budget-u01b-tui-watch",
+            "--budget-profile-version",
+            "v0.1",
+            "--budget-profile-sha256",
+            budget_sha.as_str(),
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        mutation.status.success(),
+        "governed TUI mutation must trigger the projection: stdout={} stderr={}",
+        String::from_utf8_lossy(&mutation.stdout),
+        String::from_utf8_lossy(&mutation.stderr)
+    );
+    let mutation_json: serde_json::Value =
+        serde_json::from_slice(&mutation.stdout).expect("TUI mutation JSON envelope");
+    let created_task_id = mutation_json["data"]["taskId"]
+        .as_str()
+        .expect("created Task id")
+        .to_owned();
+    let after_external_write = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = attachment
+                .read_projection_snapshot()
+                .await
+                .expect("read projection after governed external mutation");
+            if snapshot.tasks.iter().any(|view| {
+                view.task
+                    .as_ref()
+                    .is_some_and(|task| task.task_id == created_task_id)
+            }) {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("governed Task becomes visible in the complete projection");
+    let durable_before_controller_pump = read_r8b2c_task_oracle(&root, &created_task_id);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            controller
+                .pump()
+                .await
+                .expect("production controller validates the daemon update");
+            if controller.model().is_some_and(|model| {
+                model.tasks.iter().any(|view| {
+                    view.task
+                        .as_ref()
+                        .is_some_and(|task| task.task_id == created_task_id)
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("production controller receives the governed Task projection update");
+    let controller_model = controller
+        .model()
+        .expect("controller retains its authoritative page model");
+    let controller_target = controller_model
+        .tasks
+        .iter()
+        .filter_map(|view| view.task.as_ref())
+        .find(|task| task.task_id == created_task_id)
+        .expect("controller page contains the governed Task");
+    assert_ne!(
+        controller_target.status,
+        TaskStatus::Completed as i32,
+        "observation-only production controller must not false-complete the target Task"
+    );
+    assert_eq!(
+        controller_target, &durable_before_controller_pump.snapshot,
+        "controller page must render the exact durable Task Authority snapshot"
+    );
+    let after = attachment
+        .read_projection_snapshot()
+        .await
+        .expect("read Task projection after observation-only watch");
+    assert_eq!(
+        after.tasks, after_external_write.tasks,
+        "consuming Task Watch must not mutate Tasks beyond the separately committed governed command"
+    );
+    assert_eq!(
+        controller_model.tasks, after.tasks,
+        "production controller page facts must equal the Authority-backed projection"
+    );
+    let target = after
+        .tasks
+        .iter()
+        .filter_map(|view| view.task.as_ref())
+        .find(|task| task.task_id == created_task_id)
+        .expect("target Task remains in the post-watch projection");
+    assert_ne!(target.status, TaskStatus::Completed as i32);
+    assert_eq!(
+        read_r8b2c_task_oracle(&root, &created_task_id),
+        durable_before_controller_pump,
+        "baseline/start/pump/stop observation must not change the durable Task snapshot or event count"
+    );
+    controller.stop().await;
+    assert!(!controller.is_running());
+
+    drop(child.stdin.take());
+    let status = child.wait().await.expect("U-01b fixture child exit");
+    assert!(status.success(), "U-01b fixture child failed: {status}");
+    fs::remove_dir_all(&root).expect("remove U-01b fixture root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

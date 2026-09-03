@@ -52,6 +52,9 @@ use egopulse_domain_contracts::v01::egopulse::{
     verification::v1::VerificationConclusion,
 };
 use egopulse_local_api::LocalApiClient;
+use egopulse_tui::task_watch::{
+    TaskWatchClient, TaskWatchController, TaskWatchOpenFuture, TaskWatchPageModel,
+};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -861,6 +864,7 @@ impl CommandForm {
 
 enum InteractiveMode {
     Dashboard,
+    TaskWatch,
     Palette { selected: usize },
     Form(CommandForm),
     ContextRevokeConfirmation(PendingContextRevoke),
@@ -870,6 +874,16 @@ enum InteractiveAction {
     Command(Box<TuiCommand>),
     StageContextRevoke(ContextRevokeInput),
     ConfirmContextRevoke,
+    OpenTaskWatch,
+    RefetchTaskWatch,
+    CloseTaskWatch,
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveLoopControl {
+    Continue,
+    Quit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -941,7 +955,7 @@ impl PendingContextRevoke {
     }
 }
 
-trait InteractiveClient: Send + Sync {
+trait InteractiveClient: TaskWatchClient {
     fn snapshot(&self) -> SnapshotFuture<'_>;
     fn prepare_context_revoke(
         &self,
@@ -1001,16 +1015,18 @@ impl AttachedClient {
                 ClientReadError::Api(error) => local_error_message(*error),
                 other => other.to_string(),
             })?;
+        let position = projection.metadata.position;
         Ok(Snapshot {
             health: ProjectionHealth::try_from(projection.metadata.health)
                 .map(|value| value.as_str_name().to_owned())
                 .unwrap_or_else(|_| "PROJECTION_HEALTH_UNKNOWN".to_owned()),
             stale: projection.metadata.stale,
-            position: projection
-                .metadata
-                .position
+            position: position
+                .as_ref()
                 .map(|value| format!("{}:{}", value.epoch, value.sequence))
                 .unwrap_or_else(|| "unknown".to_owned()),
+            resume_epoch: position.as_ref().map(|value| value.epoch.clone()),
+            resume_sequence: position.map(|value| value.sequence),
             tasks: projection.tasks,
             approvals: projection.approvals,
         })
@@ -1034,6 +1050,25 @@ impl InteractiveClient for AttachedClient {
             Arc::clone(&self.0),
             prepared,
         ))
+    }
+}
+
+impl TaskWatchClient for AttachedClient {
+    fn task_watch_baseline(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<TaskWatchPageModel, String>> + Send + '_>> {
+        Box::pin(async move {
+            self.read_snapshot()
+                .await
+                .map(snapshot_into_task_watch_model)
+        })
+    }
+
+    fn open_task_watch(
+        &self,
+        request: egopulse_client_operations::TaskWatchRequest,
+    ) -> TaskWatchOpenFuture<'_> {
+        TaskWatchClient::open_task_watch(self.0.as_ref(), request)
     }
 }
 
@@ -2357,12 +2392,40 @@ fn await_token_json(token: Option<ProjectionAwaitToken>) -> serde_json::Value {
     })
 }
 
+#[derive(Clone)]
 struct Snapshot {
     health: String,
     stale: bool,
     position: String,
+    resume_epoch: Option<String>,
+    resume_sequence: Option<u64>,
     tasks: Vec<TaskView>,
     approvals: Vec<HarnessApprovalView>,
+}
+
+fn snapshot_into_task_watch_model(snapshot: Snapshot) -> TaskWatchPageModel {
+    TaskWatchPageModel {
+        health: snapshot.health,
+        stale: snapshot.stale,
+        position: snapshot.position,
+        resume_epoch: snapshot.resume_epoch,
+        resume_sequence: snapshot.resume_sequence,
+        tasks: snapshot.tasks,
+        approvals: snapshot.approvals,
+        message: "Task Watch live; Esc returns, r refetches, q quits".to_owned(),
+    }
+}
+
+fn snapshot_from_task_watch_model(model: &TaskWatchPageModel) -> Snapshot {
+    Snapshot {
+        health: model.health.clone(),
+        stale: model.stale,
+        position: model.position.clone(),
+        resume_epoch: model.resume_epoch.clone(),
+        resume_sequence: model.resume_sequence,
+        tasks: model.tasks.clone(),
+        approvals: model.approvals.clone(),
+    }
 }
 
 struct App {
@@ -2373,6 +2436,7 @@ struct App {
     message: String,
     refresh_interval: Duration,
     mode: InteractiveMode,
+    task_watch: Option<TaskWatchController<dyn InteractiveClient>>,
 }
 
 impl App {
@@ -2385,6 +2449,7 @@ impl App {
             message: "Connecting to local daemon…".to_owned(),
             refresh_interval: Duration::from_secs(2),
             mode: InteractiveMode::Dashboard,
+            task_watch: None,
         }
     }
 
@@ -2419,6 +2484,13 @@ impl App {
                     Ok(None)
                 }
                 KeyCode::Char('r') => Ok(None),
+                KeyCode::Char('w') => Ok(Some(InteractiveAction::OpenTaskWatch)),
+                _ => Ok(None),
+            },
+            InteractiveMode::TaskWatch => match key.code {
+                KeyCode::Esc => Ok(Some(InteractiveAction::CloseTaskWatch)),
+                KeyCode::Char('r') => Ok(Some(InteractiveAction::RefetchTaskWatch)),
+                KeyCode::Char('q') => Ok(Some(InteractiveAction::Quit)),
                 _ => Ok(None),
             },
             InteractiveMode::Palette { selected } => match key.code {
@@ -2594,6 +2666,49 @@ impl App {
         }
     }
 
+    async fn ensure_task_watch_client(&mut self) -> Result<(), String> {
+        if self.client.is_none() {
+            self.client = Some(Arc::new(AttachedClient::open(&self.instance).await?));
+        }
+        Ok(())
+    }
+
+    async fn start_task_watch(&mut self) -> Result<(), String> {
+        self.stop_task_watch().await;
+        self.ensure_task_watch_client().await?;
+        let client = Arc::clone(self.client.as_ref().expect("Task watch client is attached"));
+        let mut controller = TaskWatchController::new(client);
+        controller.start().await?;
+        let model = controller
+            .model()
+            .ok_or_else(|| "Task Watch controller omitted its baseline".to_owned())?;
+        self.snapshot = Some(snapshot_from_task_watch_model(model));
+        self.message = model.message.clone();
+        self.task_watch = Some(controller);
+        self.mode = InteractiveMode::TaskWatch;
+        Ok(())
+    }
+
+    async fn stop_task_watch(&mut self) {
+        if let Some(mut controller) = self.task_watch.take() {
+            controller.stop().await;
+        }
+    }
+
+    async fn apply_task_watch_events(&mut self) -> Result<(), String> {
+        let controller = self
+            .task_watch
+            .as_mut()
+            .ok_or_else(|| "Task Watch controller is unavailable".to_owned())?;
+        controller.pump().await?;
+        let model = controller
+            .model()
+            .ok_or_else(|| "Task Watch controller omitted its page model".to_owned())?;
+        self.snapshot = Some(snapshot_from_task_watch_model(model));
+        self.message = model.message.clone();
+        Ok(())
+    }
+
     fn render(&self, frame: &mut Frame<'_>) {
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -2664,6 +2779,15 @@ impl App {
                     body[1],
                 ),
             },
+            InteractiveMode::TaskWatch => match snapshot {
+                Some(snapshot) => render_task_watch(frame, body[1], snapshot),
+                None => frame.render_widget(
+                    Paragraph::new("Task Watch has no baseline snapshot.")
+                        .block(Block::default().borders(Borders::ALL))
+                        .wrap(Wrap { trim: true }),
+                    body[1],
+                ),
+            },
             InteractiveMode::Palette { selected } => {
                 render_command_palette(frame, body[1], *selected)
             }
@@ -2681,7 +2805,16 @@ impl App {
     }
 
     fn footer_text(&self) -> String {
+        if matches!(self.mode, InteractiveMode::Dashboard) {
+            return format!(
+                "{} - w Task Watch - c command palette - r refresh - Tab panel - q quit",
+                self.message
+            );
+        }
         match &self.mode {
+            InteractiveMode::TaskWatch => {
+                format!("{} - Esc dashboard - r refetch - q quit", self.message)
+            }
             InteractiveMode::Dashboard => format!(
                 "{} · c command palette · r refresh · Tab/←/→ panel · q quit",
                 self.message
@@ -2804,6 +2937,24 @@ fn context_revoke_confirmation_text(pending: &PendingContextRevoke) -> Vec<Strin
         String::new(),
         "Press Enter to revoke, or Esc to cancel without sending a mutation.".to_owned(),
     ]
+}
+
+fn render_task_watch(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "position {} - {} - {} tasks",
+            snapshot.position,
+            if snapshot.stale { "stale" } else { "live" },
+            snapshot.tasks.len()
+        ))
+        .block(Block::default().borders(Borders::ALL).title("Task Watch")),
+        sections[0],
+    );
+    render_tasks(frame, sections[1], &snapshot.tasks);
 }
 
 fn render_tasks(frame: &mut Frame<'_>, area: Rect, tasks: &[TaskView]) {
@@ -2960,13 +3111,89 @@ async fn run_interactive(args: Args) -> Result<(), String> {
     app.refresh().await;
     let mut terminal = init_terminal().map_err(|error| error.to_string())?;
     let result = run_loop(&mut terminal, &mut app).await;
+    let result = finish_interactive_session(&mut app, result).await;
     restore_terminal(&mut terminal).map_err(|error| error.to_string())?;
     result
+}
+
+async fn finish_interactive_session<T>(
+    app: &mut App,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    app.stop_task_watch().await;
+    result
+}
+
+async fn execute_interactive_action(
+    app: &mut App,
+    action: InteractiveAction,
+    next_refresh: &mut tokio::time::Instant,
+) -> Result<InteractiveLoopControl, String> {
+    match action {
+        InteractiveAction::OpenTaskWatch | InteractiveAction::RefetchTaskWatch => {
+            if let Err(error) = app.start_task_watch().await {
+                app.mode = InteractiveMode::Dashboard;
+                app.message = format!("Task Watch unavailable: {error}");
+            }
+        }
+        InteractiveAction::CloseTaskWatch => {
+            app.stop_task_watch().await;
+            app.mode = InteractiveMode::Dashboard;
+            app.refresh().await;
+            *next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+        }
+        InteractiveAction::Quit => {
+            app.stop_task_watch().await;
+            return Ok(InteractiveLoopControl::Quit);
+        }
+        InteractiveAction::StageContextRevoke(input) => {
+            let result = app.stage_context_revoke(input).await;
+            if let Err(error) = result {
+                app.mode = InteractiveMode::Dashboard;
+                app.message = format!("Operation rejected before confirmation: {error}");
+            }
+        }
+        InteractiveAction::Command(command) => {
+            app.message = format!("Executing {}...", command_kind(&command));
+            let result = run_command_quiet(&app.instance, *command).await;
+            app.message = match result {
+                Ok(CommandResult::Completed) => {
+                    "Governed command committed; projection will refresh automatically".to_owned()
+                }
+                Ok(CommandResult::ReadView(view)) => view,
+                Err(error) => format!("Operation rejected: {error}"),
+            };
+            app.refresh().await;
+            *next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+        }
+        InteractiveAction::ConfirmContextRevoke => {
+            app.message = "Submitting the confirmed Context revoke...".to_owned();
+            app.message = match app.confirm_context_revoke().await {
+                Ok(receipt) => format!(
+                    "Context revoked at state revision {} (replayed={})",
+                    receipt.result_state_revision, receipt.replayed
+                ),
+                Err(error) => format!("Operation rejected: {error}"),
+            };
+            app.refresh().await;
+            *next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+        }
+    }
+    Ok(InteractiveLoopControl::Continue)
 }
 
 async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), String> {
     let mut next_refresh = tokio::time::Instant::now();
     loop {
+        if matches!(app.mode, InteractiveMode::TaskWatch)
+            && let Err(error) = app.apply_task_watch_events().await
+        {
+            app.stop_task_watch().await;
+            if let Some(snapshot) = &mut app.snapshot {
+                snapshot.stale = true;
+            }
+            app.message = format!("Task Watch stopped fail-closed: {error}");
+        }
         terminal
             .draw(|frame| app.render(frame))
             .map_err(|error| error.to_string())?;
@@ -2996,43 +3223,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
                 app.panel = app.panel.next();
                 continue;
             }
-            if let Some(action) = app.handle_key(key)? {
-                match action {
-                    InteractiveAction::StageContextRevoke(input) => {
-                        let result = app.stage_context_revoke(input).await;
-                        if let Err(error) = result {
-                            app.mode = InteractiveMode::Dashboard;
-                            app.message =
-                                format!("Operation rejected before confirmation: {error}");
-                        }
-                    }
-                    InteractiveAction::Command(command) => {
-                        app.message = format!("Executing {}…", command_kind(&command));
-                        let result = run_command_quiet(&app.instance, *command).await;
-                        app.message = match result {
-                            Ok(CommandResult::Completed) => {
-                                "Governed command committed; projection will refresh automatically"
-                                    .to_owned()
-                            }
-                            Ok(CommandResult::ReadView(view)) => view,
-                            Err(error) => format!("Operation rejected: {error}"),
-                        };
-                        app.refresh().await;
-                        next_refresh = tokio::time::Instant::now() + app.refresh_interval;
-                    }
-                    InteractiveAction::ConfirmContextRevoke => {
-                        app.message = "Submitting the confirmed Context revoke…".to_owned();
-                        app.message = match app.confirm_context_revoke().await {
-                            Ok(receipt) => format!(
-                                "Context revoked at state revision {} (replayed={})",
-                                receipt.result_state_revision, receipt.replayed
-                            ),
-                            Err(error) => format!("Operation rejected: {error}"),
-                        };
-                        app.refresh().await;
-                        next_refresh = tokio::time::Instant::now() + app.refresh_interval;
-                    }
-                }
+            if let Some(action) = app.handle_key(key)?
+                && execute_interactive_action(app, action, &mut next_refresh).await?
+                    == InteractiveLoopControl::Quit
+            {
+                return Ok(());
             }
         }
     }
@@ -3080,10 +3275,134 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use egopulse_client_operations::{ClientTaskWatchError, TaskWatchRequest};
+    use egopulse_tui::task_watch::{TaskWatchNextFuture, TaskWatchStream};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
+
+    #[derive(Clone)]
+    enum ScriptedWatchStep {
+        Pending,
+    }
+
+    struct ScriptedTaskWatch {
+        steps: Arc<Mutex<VecDeque<ScriptedWatchStep>>>,
+        next_calls: Arc<AtomicUsize>,
+    }
+
+    impl TaskWatchStream for ScriptedTaskWatch {
+        fn next_update(&mut self) -> TaskWatchNextFuture<'_> {
+            self.next_calls.fetch_add(1, Ordering::SeqCst);
+            let step = self
+                .steps
+                .lock()
+                .expect("read scripted Task watch")
+                .pop_front()
+                .unwrap_or(ScriptedWatchStep::Pending);
+            Box::pin(async move {
+                match step {
+                    ScriptedWatchStep::Pending => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    struct WatchInteractiveClient {
+        snapshots: Arc<Mutex<VecDeque<Snapshot>>>,
+        sessions: Arc<Mutex<VecDeque<VecDeque<ScriptedWatchStep>>>>,
+        requests: Arc<Mutex<Vec<TaskWatchRequest>>>,
+        snapshot_calls: Arc<AtomicUsize>,
+        open_calls: Arc<AtomicUsize>,
+        next_calls: Arc<AtomicUsize>,
+    }
+
+    impl TaskWatchClient for WatchInteractiveClient {
+        fn task_watch_baseline(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<TaskWatchPageModel, String>> + Send + '_>> {
+            self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            let result = self
+                .snapshots
+                .lock()
+                .expect("read scripted baselines")
+                .pop_front()
+                .ok_or_else(|| "no scripted baseline".to_owned());
+            Box::pin(std::future::ready(
+                result.map(snapshot_into_task_watch_model),
+            ))
+        }
+
+        fn open_task_watch(&self, request: TaskWatchRequest) -> TaskWatchOpenFuture<'_> {
+            self.open_calls.fetch_add(1, Ordering::SeqCst);
+            self.requests
+                .lock()
+                .expect("capture Task watch request")
+                .push(request);
+            let steps = self
+                .sessions
+                .lock()
+                .expect("read scripted sessions")
+                .pop_front()
+                .unwrap_or_else(|| VecDeque::from([ScriptedWatchStep::Pending]));
+            let next_calls = Arc::clone(&self.next_calls);
+            Box::pin(async move {
+                Ok(Box::new(ScriptedTaskWatch {
+                    steps: Arc::new(Mutex::new(steps)),
+                    next_calls,
+                }) as Box<dyn TaskWatchStream>)
+            })
+        }
+    }
+
+    impl InteractiveClient for WatchInteractiveClient {
+        fn snapshot(&self) -> SnapshotFuture<'_> {
+            self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            let result = self
+                .snapshots
+                .lock()
+                .expect("read scripted baselines")
+                .pop_front()
+                .ok_or_else(|| "no scripted baseline".to_owned());
+            Box::pin(std::future::ready(result))
+        }
+
+        fn prepare_context_revoke(
+            &self,
+            _input: ContextRevokeInput,
+        ) -> Result<PendingContextRevoke, String> {
+            Err("Context revoke not used by Task Watch test".to_owned())
+        }
+    }
+
+    fn watch_task(task_id: &str, revision: u64) -> TaskView {
+        TaskView {
+            task: Some(
+                egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
+                    task_id: task_id.to_owned(),
+                    revision,
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn watch_snapshot(task_id: &str, revision: u64, sequence: u64) -> Snapshot {
+        Snapshot {
+            health: "PROJECTION_HEALTH_READY".to_owned(),
+            stale: false,
+            position: format!("epoch:watch:{sequence}"),
+            resume_epoch: Some("epoch:watch".to_owned()),
+            resume_sequence: Some(sequence),
+            tasks: vec![watch_task(task_id, revision)],
+            approvals: Vec::new(),
+        }
+    }
 
     struct FakeContextRevokeCommit {
         calls: Arc<AtomicUsize>,
@@ -3133,6 +3452,22 @@ mod tests {
                         ..Default::default()
                     },
                 }),
+            })
+        }
+    }
+
+    impl TaskWatchClient for FakeInteractiveClient {
+        fn task_watch_baseline(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<TaskWatchPageModel, String>> + Send + '_>> {
+            Box::pin(async { Err("Task watch not used by Context modal test".to_owned()) })
+        }
+
+        fn open_task_watch(&self, _request: TaskWatchRequest) -> TaskWatchOpenFuture<'_> {
+            Box::pin(async {
+                Err(ClientTaskWatchError::Transport(
+                    "Task watch not used by Context modal test".to_owned(),
+                ))
             })
         }
     }
@@ -3612,6 +3947,153 @@ mod tests {
         assert!(message.contains("LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT"));
         assert!(message.contains("action=RELOAD_CONTEXT_STATE"));
         assert!(message.contains("fingerprint=context-cas-conflict"));
+    }
+
+    #[test]
+    fn task_watch_page_renders_explicit_live_and_stale_state() {
+        let mut app = App::new("watch-render".to_owned());
+        app.mode = InteractiveMode::TaskWatch;
+        app.snapshot = Some(watch_snapshot("task:render", 3, 14));
+        app.message = "Task Watch live".to_owned();
+        let backend = ratatui::backend::TestBackend::new(110, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render Task Watch page");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Task Watch"));
+        assert!(rendered.contains("task:render"));
+        assert!(rendered.contains("live"));
+        assert!(rendered.contains("Esc dashboard"));
+    }
+
+    #[tokio::test]
+    async fn task_watch_production_action_handler_cleans_up_escape_refetch_quit_and_error() {
+        let make_client = |snapshots: VecDeque<Snapshot>, session_count: usize| {
+            Arc::new(WatchInteractiveClient {
+                snapshots: Arc::new(Mutex::new(snapshots)),
+                sessions: Arc::new(Mutex::new(VecDeque::from_iter(
+                    (0..session_count).map(|_| VecDeque::from([ScriptedWatchStep::Pending])),
+                ))),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                snapshot_calls: Arc::new(AtomicUsize::new(0)),
+                open_calls: Arc::new(AtomicUsize::new(0)),
+                next_calls: Arc::new(AtomicUsize::new(0)),
+            }) as Arc<dyn InteractiveClient>
+        };
+
+        let mut escaped = App::new("watch-escape".to_owned());
+        escaped.client = Some(make_client(
+            VecDeque::from([
+                watch_snapshot("task:escape", 1, 60),
+                watch_snapshot("task:escape", 1, 61),
+            ]),
+            1,
+        ));
+        escaped.start_task_watch().await.unwrap();
+        let escape = escaped
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap()
+            .unwrap();
+        let mut next_refresh = tokio::time::Instant::now();
+        assert_eq!(
+            execute_interactive_action(&mut escaped, escape, &mut next_refresh)
+                .await
+                .unwrap(),
+            InteractiveLoopControl::Continue
+        );
+        assert!(matches!(escaped.mode, InteractiveMode::Dashboard));
+        assert!(escaped.task_watch.is_none());
+        assert_eq!(escaped.snapshot.as_ref().unwrap().resume_sequence, Some(61));
+
+        let mut refetched = App::new("watch-refetch".to_owned());
+        refetched.client = Some(make_client(
+            VecDeque::from([
+                watch_snapshot("task:refetch", 1, 70),
+                watch_snapshot("task:refetch", 2, 71),
+            ]),
+            2,
+        ));
+        refetched.start_task_watch().await.unwrap();
+        let refetch = refetched
+            .handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            execute_interactive_action(&mut refetched, refetch, &mut next_refresh)
+                .await
+                .unwrap(),
+            InteractiveLoopControl::Continue
+        );
+        assert!(matches!(refetched.mode, InteractiveMode::TaskWatch));
+        assert_eq!(
+            refetched.snapshot.as_ref().unwrap().resume_sequence,
+            Some(71)
+        );
+
+        let quit = refetched
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            execute_interactive_action(&mut refetched, quit, &mut next_refresh)
+                .await
+                .unwrap(),
+            InteractiveLoopControl::Quit
+        );
+        assert!(refetched.task_watch.is_none());
+
+        let mut failed = App::new("watch-error".to_owned());
+        failed.client = Some(make_client(
+            VecDeque::from([watch_snapshot("task:error", 1, 80)]),
+            1,
+        ));
+        failed.start_task_watch().await.unwrap();
+        let result = finish_interactive_session(&mut failed, Err::<(), _>("boom".to_owned())).await;
+        assert_eq!(result.unwrap_err(), "boom");
+        assert!(failed.task_watch.is_none());
+    }
+
+    #[test]
+    fn task_watch_reconnect_schedule_and_page_keys_are_frozen() {
+        assert_eq!(
+            egopulse_tui::task_watch::TASK_WATCH_RECONNECT_DELAYS,
+            [
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_millis(1_000),
+                Duration::from_millis(2_000),
+                Duration::from_millis(2_000),
+            ]
+        );
+        let mut app = App::new("watch-keys".to_owned());
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE))
+                .unwrap(),
+            Some(InteractiveAction::OpenTaskWatch)
+        ));
+        app.mode = InteractiveMode::TaskWatch;
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .unwrap(),
+            Some(InteractiveAction::CloseTaskWatch)
+        ));
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+                .unwrap(),
+            Some(InteractiveAction::RefetchTaskWatch)
+        ));
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+                .unwrap(),
+            Some(InteractiveAction::Quit)
+        ));
     }
 
     #[test]

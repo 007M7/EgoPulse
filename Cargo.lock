@@ -1058,6 +1058,7 @@ dependencies = [
  "egopulse-local-read-model",
  "egopulse-policy-decision-authority",
  "egopulse-process-supervision",
+ "egopulse-tui",
  "egopulse-v01-fault-conformance",
  "egopulse-verification-authority",
  "hex",
