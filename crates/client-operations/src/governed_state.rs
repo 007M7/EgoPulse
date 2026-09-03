@@ -782,20 +782,484 @@ mod tests {
     use super::*;
 
     fn live_composite(task_budget: u32, approval_budget: u32) -> GovernedStateComposite {
-        let mut task = GovernedTaskDomainState::connecting(NonZeroU32::new(task_budget).unwrap());
-        task.phase = GovernedStateDomainPhase::Live;
-        task.position = Some(GovernedTaskDomainPosition::new("task-epoch", 1));
+        let mut composite = GovernedStateComposite::new(
+            GovernedTaskDomainState::connecting(NonZeroU32::new(task_budget).unwrap()),
+            GovernedApprovalDomainState::connecting(NonZeroU32::new(approval_budget).unwrap()),
+        );
+        composite.apply_task(GovernedTaskReducerInput::CompleteRebaseline {
+            generation: 1,
+            position: GovernedTaskDomainPosition::new("task-epoch", 1),
+            tasks: BTreeMap::new(),
+        });
         let mut approvals = BTreeMap::new();
         approvals.insert(
             "approval:1".to_owned(),
             GovernedApprovalState::new("approval:1", "task:1"),
         );
-        let mut approval =
-            GovernedApprovalDomainState::connecting(NonZeroU32::new(approval_budget).unwrap());
-        approval.phase = GovernedStateDomainPhase::Live;
-        approval.position = Some(GovernedApprovalDomainPosition::new("approval-epoch", 1));
-        approval.approvals = approvals;
-        GovernedStateComposite::new(task, approval)
+        composite.apply_approval(GovernedApprovalReducerInput::CompleteRebaseline {
+            generation: 1,
+            position: GovernedApprovalDomainPosition::new("approval-epoch", 1),
+            approvals,
+        });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(composite.approval().phase(), GovernedStateDomainPhase::Live);
+        composite
+    }
+
+    #[test]
+    fn initial_single_domain_fatal_allows_other_live_symmetrically() {
+        let mut approvals = BTreeMap::new();
+        approvals.insert(
+            "approval:1".to_owned(),
+            GovernedApprovalState::new("approval:1", "task:1"),
+        );
+
+        // Task domain hits an initial fatal while the approval domain reaches Live.
+        let mut composite = GovernedStateComposite::new(
+            GovernedTaskDomainState::connecting(NonZeroU32::new(2).unwrap()),
+            GovernedApprovalDomainState::connecting(NonZeroU32::new(2).unwrap()),
+        );
+        composite.apply_approval(GovernedApprovalReducerInput::CompleteRebaseline {
+            generation: 1,
+            position: GovernedApprovalDomainPosition::new("approval-epoch", 1),
+            approvals: approvals.clone(),
+        });
+        composite.apply_task(GovernedTaskReducerInput::Fatal {
+            generation: 1,
+            cause: GovernedFatalCause::InitialSessionUnavailable,
+        });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Fatal);
+        assert_eq!(
+            composite.task().reason(),
+            Some(GovernedStateReason::SessionUnavailable)
+        );
+        assert_eq!(composite.task().position(), None);
+        assert!(composite.task().tasks().is_empty());
+        // The fatal domain is terminal: even a valid rebaseline is ignored.
+        composite.apply_task(GovernedTaskReducerInput::CompleteRebaseline {
+            generation: 1,
+            position: GovernedTaskDomainPosition::new("task-epoch", 1),
+            tasks: BTreeMap::new(),
+        });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Fatal);
+        // The other domain stays fully live and keeps advancing independently.
+        assert_eq!(composite.approval().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(composite.approval().reason(), None);
+        assert_eq!(composite.approval().generation(), 1);
+        assert_eq!(
+            composite.approval().position(),
+            Some(&GovernedApprovalDomainPosition::new("approval-epoch", 1))
+        );
+        assert_eq!(composite.approval().approvals().len(), 1);
+        composite.apply_approval(GovernedApprovalReducerInput::Applied {
+            generation: 1,
+            position: GovernedApprovalDomainPosition::new("approval-epoch", 2),
+            approval: GovernedApprovalState::new("approval:2", "task:2"),
+        });
+        assert_eq!(composite.approval().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(composite.approval().approvals().len(), 2);
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Fatal);
+
+        // Symmetric: approval domain hits the initial fatal, task domain reaches Live.
+        let mut mirrored = GovernedStateComposite::new(
+            GovernedTaskDomainState::connecting(NonZeroU32::new(2).unwrap()),
+            GovernedApprovalDomainState::connecting(NonZeroU32::new(2).unwrap()),
+        );
+        mirrored.apply_task(GovernedTaskReducerInput::CompleteRebaseline {
+            generation: 1,
+            position: GovernedTaskDomainPosition::new("task-epoch", 1),
+            tasks: BTreeMap::new(),
+        });
+        mirrored.apply_approval(GovernedApprovalReducerInput::Fatal {
+            generation: 1,
+            cause: GovernedFatalCause::PermissionDenied,
+        });
+        assert_eq!(mirrored.approval().phase(), GovernedStateDomainPhase::Fatal);
+        assert_eq!(
+            mirrored.approval().reason(),
+            Some(GovernedStateReason::PermissionDenied)
+        );
+        assert_eq!(mirrored.approval().position(), None);
+        assert_eq!(mirrored.task().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(mirrored.task().reason(), None);
+        assert_eq!(
+            mirrored.task().position(),
+            Some(&GovernedTaskDomainPosition::new("task-epoch", 1))
+        );
+        // The live task domain keeps consuming its own lifecycle events.
+        mirrored.apply_task(GovernedTaskReducerInput::Heartbeat { generation: 1 });
+        assert_eq!(mirrored.task().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(mirrored.task().generation(), 1);
+        assert_eq!(mirrored.approval().phase(), GovernedStateDomainPhase::Fatal);
+    }
+
+    fn sample_task() -> GovernedTaskState {
+        GovernedTaskState {
+            task_id: "task:1".to_owned(),
+            revision: 1,
+            status: crate::DomainTaskStatus::Ready,
+            resume_status: None,
+            hold_reason: None,
+            projection: crate::GovernedProjectionState {
+                position: crate::GovernedProjectionPosition {
+                    epoch: "task-epoch".to_owned(),
+                    sequence: 2,
+                },
+                health: crate::ProjectionHealth::Ready,
+                stale: false,
+                reason: None,
+            },
+            run: None,
+        }
+    }
+
+    #[test]
+    fn every_task_input_preserves_entire_approval() {
+        // Applied (forward progress).
+        let mut composite = live_composite(2, 2);
+        let approval_before = composite.approval().clone();
+        composite.apply_task(GovernedTaskReducerInput::Applied {
+            generation: 1,
+            position: GovernedTaskDomainPosition::new("task-epoch", 2),
+            task: sample_task(),
+        });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(composite.task().tasks().len(), 1);
+        assert_eq!(composite.approval(), &approval_before);
+
+        // Applied at the same position is a no-op.
+        let mut composite = live_composite(2, 2);
+        let approval_before = composite.approval().clone();
+        composite.apply_task(GovernedTaskReducerInput::Applied {
+            generation: 1,
+            position: GovernedTaskDomainPosition::new("task-epoch", 1),
+            task: sample_task(),
+        });
+        assert_eq!(composite.task().tasks().len(), 0);
+        assert_eq!(composite.approval(), &approval_before);
+
+        // Replay never changes facts.
+        let mut composite = live_composite(2, 2);
+        let approval_before = composite.approval().clone();
+        composite.apply_task(GovernedTaskReducerInput::Replay { generation: 1 });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(composite.task().tasks().len(), 0);
+        assert_eq!(composite.approval(), &approval_before);
+
+        // Heartbeat never changes facts.
+        let mut composite = live_composite(2, 2);
+        let approval_before = composite.approval().clone();
+        composite.apply_task(GovernedTaskReducerInput::Heartbeat { generation: 1 });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(composite.task().tasks().len(), 0);
+        assert_eq!(composite.approval(), &approval_before);
+
+        // Recoverable failure transitions the task domain only.
+        let mut composite = live_composite(2, 2);
+        let approval_before = composite.approval().clone();
+        composite.apply_task(GovernedTaskReducerInput::RecoverableFailure {
+            generation: 1,
+            cause: GovernedRecoverableCause::TransportUnavailable,
+        });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Stale);
+        assert_eq!(composite.task().generation(), 2);
+        assert_eq!(composite.task().recovery_remaining(), 1);
+        assert_eq!(composite.approval(), &approval_before);
+
+        // Reset requires a rebaseline in the task domain only.
+        let mut composite = live_composite(2, 2);
+        let approval_before = composite.approval().clone();
+        composite.apply_task(GovernedTaskReducerInput::Reset { generation: 1 });
+        assert_eq!(
+            composite.task().phase(),
+            GovernedStateDomainPhase::ResetRequired
+        );
+        assert_eq!(composite.approval(), &approval_before);
+
+        // A complete rebaseline restores the task domain only.
+        let mut composite = live_composite(2, 2);
+        composite.apply_task(GovernedTaskReducerInput::Reset { generation: 1 });
+        let approval_before = composite.approval().clone();
+        let mut tasks = BTreeMap::new();
+        tasks.insert("task:1".to_owned(), sample_task());
+        composite.apply_task(GovernedTaskReducerInput::CompleteRebaseline {
+            generation: 2,
+            position: GovernedTaskDomainPosition::new("task-epoch:2", 1),
+            tasks,
+        });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(composite.task().tasks().len(), 1);
+        assert_eq!(composite.approval(), &approval_before);
+
+        // A failed rebaseline is fatal in the task domain only.
+        let mut composite = live_composite(2, 2);
+        composite.apply_task(GovernedTaskReducerInput::Reset { generation: 1 });
+        let approval_before = composite.approval().clone();
+        composite.apply_task(GovernedTaskReducerInput::RebaselineFailed {
+            generation: 2,
+            cause: GovernedFatalCause::ApiRejected,
+        });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Fatal);
+        assert_eq!(
+            composite.task().reason(),
+            Some(GovernedStateReason::ApiRejected)
+        );
+        assert_eq!(composite.approval(), &approval_before);
+
+        // A recoverable rebaseline failure keeps the task barrier without recovery refill.
+        let mut composite = live_composite(2, 2);
+        composite.apply_task(GovernedTaskReducerInput::Reset { generation: 1 });
+        let approval_before = composite.approval().clone();
+        composite.apply_task(GovernedTaskReducerInput::RebaselineRecoverableFailure {
+            generation: 2,
+            cause: GovernedRecoverableCause::UnexpectedEof,
+        });
+        assert_eq!(
+            composite.task().phase(),
+            GovernedStateDomainPhase::ResetRequired
+        );
+        assert_eq!(
+            composite.task().reason(),
+            Some(GovernedStateReason::UnexpectedEof)
+        );
+        assert_eq!(composite.task().generation(), 3);
+        assert_eq!(composite.task().recovery_remaining(), 1);
+        assert_eq!(composite.approval(), &approval_before);
+
+        // A partial rebaseline is an integrity failure in the task domain only.
+        let mut composite = live_composite(2, 2);
+        composite.apply_task(GovernedTaskReducerInput::Reset { generation: 1 });
+        let approval_before = composite.approval().clone();
+        composite.apply_task(GovernedTaskReducerInput::RebaselinePartial { generation: 2 });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Fatal);
+        assert_eq!(
+            composite.task().reason(),
+            Some(GovernedStateReason::ProjectionIntegrityFailure)
+        );
+        assert_eq!(composite.approval(), &approval_before);
+
+        // A direct fatal is terminal in the task domain only.
+        let mut composite = live_composite(2, 2);
+        let approval_before = composite.approval().clone();
+        composite.apply_task(GovernedTaskReducerInput::Fatal {
+            generation: 1,
+            cause: GovernedFatalCause::BaselineLimitExceeded,
+        });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Fatal);
+        assert_eq!(
+            composite.task().reason(),
+            Some(GovernedStateReason::BaselineLimitExceeded)
+        );
+        assert_eq!(composite.approval(), &approval_before);
+
+        // A stale generation is fenced off in the task domain only.
+        let mut composite = live_composite(2, 2);
+        let approval_before = composite.approval().clone();
+        composite.apply_task(GovernedTaskReducerInput::Applied {
+            generation: 99,
+            position: GovernedTaskDomainPosition::new("task-epoch", 9),
+            task: sample_task(),
+        });
+        assert_eq!(composite.task().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(composite.task().tasks().len(), 0);
+        assert_eq!(composite.approval(), &approval_before);
+    }
+
+    #[test]
+    fn every_approval_input_preserves_entire_task() {
+        // Applied adds an approval fact.
+        let mut composite = live_composite(2, 2);
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::Applied {
+            generation: 1,
+            position: GovernedApprovalDomainPosition::new("approval-epoch", 2),
+            approval: GovernedApprovalState::new("approval:2", "task:2"),
+        });
+        assert_eq!(composite.approval().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(composite.approval().approvals().len(), 2);
+        assert_eq!(composite.task(), &task_before);
+
+        // Remove drops an approval fact without touching the task domain.
+        let mut composite = live_composite(2, 2);
+        composite.apply_approval(GovernedApprovalReducerInput::Applied {
+            generation: 1,
+            position: GovernedApprovalDomainPosition::new("approval-epoch", 2),
+            approval: GovernedApprovalState::new("approval:2", "task:2"),
+        });
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::Remove {
+            generation: 1,
+            position: GovernedApprovalDomainPosition::new("approval-epoch", 3),
+            approval_request_id: "approval:2".to_owned(),
+        });
+        assert_eq!(composite.approval().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(composite.approval().approvals().len(), 1);
+        assert_eq!(composite.approval().position().unwrap().sequence(), 3);
+        assert_eq!(composite.task(), &task_before);
+
+        // Applied at the same position is a no-op.
+        let mut composite = live_composite(2, 2);
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::Applied {
+            generation: 1,
+            position: GovernedApprovalDomainPosition::new("approval-epoch", 1),
+            approval: GovernedApprovalState::new("approval:dup", "task:dup"),
+        });
+        assert_eq!(composite.approval().approvals().len(), 1);
+        assert_eq!(composite.task(), &task_before);
+
+        // Remove at the same position is a no-op.
+        let mut composite = live_composite(2, 2);
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::Remove {
+            generation: 1,
+            position: GovernedApprovalDomainPosition::new("approval-epoch", 1),
+            approval_request_id: "approval:1".to_owned(),
+        });
+        assert_eq!(composite.approval().approvals().len(), 1);
+        assert_eq!(composite.task(), &task_before);
+
+        // Replay never changes facts.
+        let mut composite = live_composite(2, 2);
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::Replay { generation: 1 });
+        assert_eq!(composite.approval().approvals().len(), 1);
+        assert_eq!(composite.task(), &task_before);
+
+        // Heartbeat never changes facts.
+        let mut composite = live_composite(2, 2);
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::Heartbeat { generation: 1 });
+        assert_eq!(composite.approval().approvals().len(), 1);
+        assert_eq!(composite.task(), &task_before);
+
+        // Recoverable failure transitions the approval domain only.
+        let mut composite = live_composite(2, 2);
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::RecoverableFailure {
+            generation: 1,
+            cause: GovernedRecoverableCause::TransportUnavailable,
+        });
+        assert_eq!(
+            composite.approval().phase(),
+            GovernedStateDomainPhase::Stale
+        );
+        assert_eq!(composite.approval().generation(), 2);
+        assert_eq!(composite.approval().recovery_remaining(), 1);
+        assert_eq!(composite.task(), &task_before);
+
+        // Reset requires a rebaseline in the approval domain only.
+        let mut composite = live_composite(2, 2);
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::Reset { generation: 1 });
+        assert_eq!(
+            composite.approval().phase(),
+            GovernedStateDomainPhase::ResetRequired
+        );
+        assert_eq!(composite.task(), &task_before);
+
+        // A complete rebaseline restores the approval domain only.
+        let mut composite = live_composite(2, 2);
+        composite.apply_approval(GovernedApprovalReducerInput::Reset { generation: 1 });
+        let task_before = composite.task().clone();
+        let mut approvals = BTreeMap::new();
+        approvals.insert(
+            "approval:next".to_owned(),
+            GovernedApprovalState::new("approval:next", "task:next"),
+        );
+        composite.apply_approval(GovernedApprovalReducerInput::CompleteRebaseline {
+            generation: 2,
+            position: GovernedApprovalDomainPosition::new("approval-epoch:2", 1),
+            approvals,
+        });
+        assert_eq!(composite.approval().phase(), GovernedStateDomainPhase::Live);
+        assert_eq!(composite.approval().approvals().len(), 1);
+        assert_eq!(
+            composite.approval().approvals()[0].approval_request_id(),
+            "approval:next"
+        );
+        assert_eq!(composite.task(), &task_before);
+
+        // A failed rebaseline is fatal in the approval domain only.
+        let mut composite = live_composite(2, 2);
+        composite.apply_approval(GovernedApprovalReducerInput::Reset { generation: 1 });
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::RebaselineFailed {
+            generation: 2,
+            cause: GovernedFatalCause::ProjectionIntegrityFailure,
+        });
+        assert_eq!(
+            composite.approval().phase(),
+            GovernedStateDomainPhase::Fatal
+        );
+        assert_eq!(
+            composite.approval().reason(),
+            Some(GovernedStateReason::ProjectionIntegrityFailure)
+        );
+        assert_eq!(composite.task(), &task_before);
+
+        // A recoverable rebaseline failure keeps the approval barrier without refill.
+        let mut composite = live_composite(2, 2);
+        composite.apply_approval(GovernedApprovalReducerInput::Reset { generation: 1 });
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::RebaselineRecoverableFailure {
+            generation: 2,
+            cause: GovernedRecoverableCause::TransportUnavailable,
+        });
+        assert_eq!(
+            composite.approval().phase(),
+            GovernedStateDomainPhase::ResetRequired
+        );
+        assert_eq!(
+            composite.approval().reason(),
+            Some(GovernedStateReason::TransportUnavailable)
+        );
+        assert_eq!(composite.approval().generation(), 3);
+        assert_eq!(composite.approval().recovery_remaining(), 1);
+        assert_eq!(composite.task(), &task_before);
+
+        // A partial rebaseline is an integrity failure in the approval domain only.
+        let mut composite = live_composite(2, 2);
+        composite.apply_approval(GovernedApprovalReducerInput::Reset { generation: 1 });
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::RebaselinePartial { generation: 2 });
+        assert_eq!(
+            composite.approval().phase(),
+            GovernedStateDomainPhase::Fatal
+        );
+        assert_eq!(
+            composite.approval().reason(),
+            Some(GovernedStateReason::ProjectionIntegrityFailure)
+        );
+        assert_eq!(composite.task(), &task_before);
+
+        // A direct fatal is terminal in the approval domain only.
+        let mut composite = live_composite(2, 2);
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::Fatal {
+            generation: 1,
+            cause: GovernedFatalCause::InitialSessionUnavailable,
+        });
+        assert_eq!(
+            composite.approval().phase(),
+            GovernedStateDomainPhase::Fatal
+        );
+        assert_eq!(
+            composite.approval().reason(),
+            Some(GovernedStateReason::SessionUnavailable)
+        );
+        assert_eq!(composite.task(), &task_before);
+
+        // A stale generation is fenced off in the approval domain only.
+        let mut composite = live_composite(2, 2);
+        let task_before = composite.task().clone();
+        composite.apply_approval(GovernedApprovalReducerInput::Applied {
+            generation: 99,
+            position: GovernedApprovalDomainPosition::new("approval-epoch", 9),
+            approval: GovernedApprovalState::new("approval:stale", "task:stale"),
+        });
+        assert_eq!(composite.approval().approvals().len(), 1);
+        assert_eq!(composite.task(), &task_before);
     }
 
     #[test]
