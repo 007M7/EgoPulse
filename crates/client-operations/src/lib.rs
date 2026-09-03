@@ -11,6 +11,7 @@ use egopulse_domain_contracts::{
     context_revoke::ContextRevokeSemanticRequest,
     v01::egopulse::{
         artifact::v1::ArtifactSetStatus,
+        collaboration::v1::{AttemptStatus, RecoveryClass, RunStatus, StepStatus},
         common::v1::CommandMetadata,
         harness::v1::ApprovalDecision,
         localapi::v1::{
@@ -22,10 +23,10 @@ use egopulse_domain_contracts::{
             GetHarnessApprovalViewResponse, GetProjectionStatusRequest, GetTaskViewRequest,
             GetTaskViewResponse, HarnessApprovalAuthorityResult, HarnessApprovalView,
             HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest,
-            ListHarnessApprovalViewsResponse, ListTaskViewsRequest, LocalApiError,
-            PrepareWorkRequest, PrepareWorkResponse, ProjectionAwaitToken, ProjectionHealth,
-            ProjectionMetadata, ProjectionPosition, RevokeContextSnapshotCommand, SourceDomain,
-            SourceRevision, StreamFrameKind, TaskView, TaskViewStreamFrame,
+            ListHarnessApprovalViewsResponse, ListTaskViewsRequest, ListTaskViewsResponse,
+            LocalApiError, PrepareWorkRequest, PrepareWorkResponse, ProjectionAwaitToken,
+            ProjectionHealth, ProjectionMetadata, ProjectionPosition, RevokeContextSnapshotCommand,
+            SourceDomain, SourceRevision, StreamFrameKind, TaskView, TaskViewStreamFrame,
             WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, WorkPreparationPreview,
             WorkSourceRequest, context_mutation_command, execute_context_mutation_response,
             get_evidence_graph_response, get_harness_approval_view_response,
@@ -66,6 +67,11 @@ const GET_TASK_VIEW_RPC: &str = "LocalReadModelService/GetTaskView";
 const GET_EVIDENCE_GRAPH_RPC: &str = "LocalReadModelService/GetEvidenceGraph";
 const PREPARE_WORK_RPC: &str = "LocalCommandGatewayService/PrepareWork";
 const CONFIRM_WORK_RPC: &str = "LocalCommandGatewayService/ConfirmWork";
+const LIST_TASK_VIEWS_RPC: &str = "LocalReadModelService/ListTaskViews";
+const GOVERNED_TASK_BASELINE_PAGE_SIZE: u32 = 100;
+const GOVERNED_TASK_BASELINE_MAX_PAGES: usize = 100;
+const GOVERNED_TASK_BASELINE_MAX_VIEWS: usize = 1_000;
+const GOVERNED_TASK_MAX_IDENTIFIER_BYTES: usize = 256;
 const APPROVAL_WATCH_BASELINE_PAGE_SIZE: u32 = 100;
 const APPROVAL_WATCH_BASELINE_MAX_PAGES: usize = 100;
 const APPROVAL_WATCH_BASELINE_MAX_VIEWS: usize = 1_000;
@@ -264,6 +270,120 @@ pub struct TaskResultReview {
     pub evidence_graph: Option<EvidenceGraphView>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedProjectionPosition {
+    pub epoch: String,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedProjectionState {
+    pub position: GovernedProjectionPosition,
+    pub health: ProjectionHealth,
+    pub stale: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GovernedHoldReason {
+    CancellationOutcomeUnknown,
+    CompensationRequired,
+    ManualRecoveryRequired,
+    IrreversibleOutcomeUnknown,
+    Unclassified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedAttemptState {
+    pub attempt_id: String,
+    pub revision: u64,
+    pub attempt_number: u32,
+    pub status: AttemptStatus,
+    pub recovery_class: RecoveryClass,
+    pub hold_reason: Option<GovernedHoldReason>,
+    pub checkpoint_available: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedStepState {
+    pub step_id: String,
+    pub revision: u64,
+    pub status: StepStatus,
+    pub hold_reason: Option<GovernedHoldReason>,
+    pub current_attempt_id: Option<String>,
+    pub attempts: Vec<GovernedAttemptState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedRunState {
+    pub run_id: String,
+    pub revision: u64,
+    pub status: RunStatus,
+    pub work_revision: u64,
+    pub hold_reason: Option<GovernedHoldReason>,
+    pub steps: Vec<GovernedStepState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedTaskState {
+    pub task_id: String,
+    pub revision: u64,
+    pub status: DomainTaskStatus,
+    pub projection: GovernedProjectionState,
+    pub run: Option<GovernedRunState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedTaskUpdate {
+    pub classification: TaskWatchClassification,
+    pub position: GovernedProjectionPosition,
+    pub task: Option<GovernedTaskState>,
+}
+
+#[derive(Debug, Error)]
+pub enum ClientGovernedTaskError {
+    #[error("client kernel rejected the governed Task read: {0}")]
+    Kernel(#[from] KernelError),
+    #[error("local API governed Task transport failed: {0}")]
+    Transport(String),
+    #[error("local API rejected the governed Task baseline: {0:?}")]
+    Api(Box<LocalApiError>),
+    #[error("governed Task projection integrity failed: {0}")]
+    Protocol(&'static str),
+    #[error("governed Task baseline exceeded the 1000 item integrity limit")]
+    BaselineLimitExceeded,
+    #[error("governed Task watch ended unexpectedly")]
+    UnexpectedEof,
+    #[error("governed Task watch reached a reset barrier and requires baseline refetch")]
+    ResetBarrier,
+}
+
+/// A complete governed Task snapshot. The exact projection position is private
+/// and is consumed when opening the corresponding live session.
+pub struct GovernedTaskBaseline {
+    tasks: BTreeMap<String, GovernedTaskState>,
+    position: GovernedProjectionPosition,
+}
+
+impl GovernedTaskBaseline {
+    #[must_use]
+    pub fn position(&self) -> &GovernedProjectionPosition {
+        &self.position
+    }
+
+    #[must_use]
+    pub fn tasks(&self) -> Vec<&GovernedTaskState> {
+        self.tasks.values().collect()
+    }
+}
+
+/// A governed Task baseline plus a live watch that starts at exactly that
+/// baseline's private projection position.
+pub struct GovernedTaskSession {
+    watch: TaskWatch,
+    tasks: BTreeMap<String, GovernedTaskState>,
+    last_position: GovernedProjectionPosition,
+}
+
 #[derive(Debug, Error)]
 pub enum ClientTaskWatchError {
     #[error("client kernel rejected the Task watch: {0}")]
@@ -276,6 +396,22 @@ pub enum ClientTaskWatchError {
     ResetBarrier,
     #[error("Task watch ended after {received} frames before the requested {expected}")]
     PrematureEof { expected: u32, received: u32 },
+}
+
+impl From<ClientTaskWatchError> for ClientGovernedTaskError {
+    fn from(value: ClientTaskWatchError) -> Self {
+        match value {
+            ClientTaskWatchError::Kernel(error) => Self::Kernel(error),
+            ClientTaskWatchError::Transport(detail) => Self::Transport(detail),
+            ClientTaskWatchError::ResetBarrier => Self::ResetBarrier,
+            ClientTaskWatchError::InvalidResumePair => {
+                Self::Protocol("governed Task baseline position is incomplete")
+            }
+            ClientTaskWatchError::PrematureEof { .. } => {
+                Self::Protocol("governed Task watch frame bound is invalid")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -768,6 +904,57 @@ impl TaskWatch {
     }
 }
 
+impl GovernedTaskSession {
+    #[must_use]
+    pub fn tasks(&self) -> Vec<&GovernedTaskState> {
+        self.tasks.values().collect()
+    }
+
+    #[must_use]
+    pub fn position(&self) -> &GovernedProjectionPosition {
+        &self.last_position
+    }
+
+    pub async fn next_update(&mut self) -> Result<GovernedTaskUpdate, ClientGovernedTaskError> {
+        let TaskWatch { stream, processor } = &mut self.watch;
+        next_governed_task_session_update_via(
+            processor,
+            &mut self.tasks,
+            &mut self.last_position,
+            || async { stream.message().await.map_err(|error| error.to_string()) },
+        )
+        .await
+    }
+}
+
+async fn next_governed_task_session_update_via<F, Fut>(
+    processor: &mut TaskWatchProcessor,
+    tasks: &mut BTreeMap<String, GovernedTaskState>,
+    last_position: &mut GovernedProjectionPosition,
+    next_message: F,
+) -> Result<GovernedTaskUpdate, ClientGovernedTaskError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Option<TaskViewStreamFrame>, String>>,
+{
+    let raw = next_task_watch_update_via(processor, next_message)
+        .await
+        .map_err(ClientGovernedTaskError::from)?
+        .ok_or(ClientGovernedTaskError::UnexpectedEof)?;
+    let update = match governed_task_update_from_watch(raw) {
+        Ok(update) => update,
+        Err(error) => {
+            processor.reset_barrier = true;
+            return Err(error);
+        }
+    };
+    if let Err(error) = apply_governed_task_session_update(tasks, last_position, &update) {
+        processor.reset_barrier = true;
+        return Err(error);
+    }
+    Ok(update)
+}
+
 async fn next_task_watch_update_via<F, Fut>(
     processor: &mut TaskWatchProcessor,
     next_message: F,
@@ -1100,6 +1287,42 @@ impl ClientAttachment {
             .profiles()
             .authorize_command(rpc, oneof, &session.granted_permission_codes)
             .map(|_| ())
+    }
+
+    pub async fn read_governed_task_baseline(
+        &self,
+    ) -> Result<GovernedTaskBaseline, ClientGovernedTaskError> {
+        let client = self.connection.read_model_service();
+        read_governed_task_baseline_via(&self.kernel, SystemTime::now(), move |request| {
+            let mut client = client.clone();
+            async move {
+                client
+                    .list_task_views(request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| error.to_string())
+            }
+        })
+        .await
+    }
+
+    pub async fn open_governed_task_session(
+        &self,
+        baseline: GovernedTaskBaseline,
+    ) -> Result<GovernedTaskSession, ClientGovernedTaskError> {
+        let GovernedTaskBaseline { tasks, position } = baseline;
+        let watch = self
+            .open_task_watch(TaskWatchRequest {
+                resume_epoch: Some(position.epoch.clone()),
+                resume_sequence: Some(position.sequence),
+            })
+            .await
+            .map_err(ClientGovernedTaskError::from)?;
+        Ok(GovernedTaskSession {
+            watch,
+            tasks,
+            last_position: position,
+        })
     }
 
     pub async fn open_task_watch(
@@ -2541,6 +2764,66 @@ fn validate_evidence_graph(
     Ok(())
 }
 
+async fn read_governed_task_baseline_via<F, Fut>(
+    kernel: &ClientKernel,
+    now: SystemTime,
+    mut dispatch: F,
+) -> Result<GovernedTaskBaseline, ClientGovernedTaskError>
+where
+    F: FnMut(ListTaskViewsRequest) -> Fut,
+    Fut: Future<Output = Result<ListTaskViewsResponse, String>>,
+{
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel
+        .profiles()
+        .authorize_rpc(LIST_TASK_VIEWS_RPC, &session.granted_permission_codes)?;
+    let metadata = kernel.request_metadata(Uuid::now_v7().to_string(), None, now)?;
+    let mut pages = Vec::new();
+    let mut page_cursor = None;
+    let mut cursors = BTreeSet::new();
+    let mut baseline_views = 0_usize;
+    loop {
+        if pages.len() >= GOVERNED_TASK_BASELINE_MAX_PAGES {
+            return Err(ClientGovernedTaskError::Protocol(
+                "governed Task baseline page limit exceeded",
+            ));
+        }
+        let response = dispatch(governed_task_baseline_wire_request(
+            metadata.clone(),
+            page_cursor.clone(),
+        ))
+        .await
+        .map_err(ClientGovernedTaskError::Transport)?;
+        if let Some(error) = response.error.as_ref() {
+            return Err(ClientGovernedTaskError::Api(Box::new(error.clone())));
+        }
+        baseline_views = baseline_views
+            .checked_add(response.views.len())
+            .ok_or(ClientGovernedTaskError::BaselineLimitExceeded)?;
+        if baseline_views > GOVERNED_TASK_BASELINE_MAX_VIEWS {
+            return Err(ClientGovernedTaskError::BaselineLimitExceeded);
+        }
+        let next_cursor = response.next_page_cursor.clone();
+        if let Some(next) = next_cursor.as_deref()
+            && (next.trim().is_empty()
+                || next.chars().any(char::is_control)
+                || response.views.is_empty()
+                || !cursors.insert(next.to_owned()))
+        {
+            return Err(ClientGovernedTaskError::Protocol(
+                "governed Task baseline cursor did not advance",
+            ));
+        }
+        pages.push(response);
+        let Some(next) = next_cursor else {
+            break;
+        };
+        page_cursor = Some(next);
+    }
+    let (position, tasks) = compile_governed_task_baseline(pages)?;
+    Ok(GovernedTaskBaseline { tasks, position })
+}
+
 async fn read_actionable_approval_queue_via<F, Fut>(
     kernel: &ClientKernel,
     now: SystemTime,
@@ -2828,6 +3111,19 @@ fn timestamp_from_system_time(
     })
 }
 
+fn governed_task_baseline_wire_request(
+    metadata: ClientRequestMetadata,
+    page_cursor: Option<String>,
+) -> ListTaskViewsRequest {
+    ListTaskViewsRequest {
+        client: Some(metadata),
+        status_filter: Vec::new(),
+        page_size: GOVERNED_TASK_BASELINE_PAGE_SIZE,
+        page_cursor,
+        minimum_position: None,
+    }
+}
+
 fn approval_baseline_wire_request(
     metadata: ClientRequestMetadata,
     page_cursor: Option<String>,
@@ -2961,6 +3257,534 @@ fn compile_approval_baseline(
         position.expect("non-empty pages establish a position"),
         actionable,
     ))
+}
+
+fn compile_governed_task_baseline(
+    pages: Vec<ListTaskViewsResponse>,
+) -> Result<
+    (
+        GovernedProjectionPosition,
+        BTreeMap<String, GovernedTaskState>,
+    ),
+    ClientGovernedTaskError,
+> {
+    if pages.is_empty() {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Task baseline returned no page",
+        ));
+    }
+    let mut position: Option<ProjectionPosition> = None;
+    let mut tasks = BTreeMap::new();
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_cursors = BTreeSet::new();
+    let mut total = 0_usize;
+    let page_count = pages.len();
+    for (page_index, page) in pages.into_iter().enumerate() {
+        if let Some(error) = page.error {
+            return Err(ClientGovernedTaskError::Api(Box::new(error)));
+        }
+        let page_position = page
+            .snapshot_position
+            .ok_or(ClientGovernedTaskError::Protocol(
+                "governed Task baseline position missing",
+            ))?;
+        validate_governed_identifier(&page_position.epoch, "projection epoch is invalid")?;
+        if let Some(expected) = &position {
+            if expected != &page_position {
+                return Err(ClientGovernedTaskError::Protocol(
+                    "governed Task baseline position changed across pages",
+                ));
+            }
+        } else {
+            position = Some(page_position.clone());
+        }
+        total = total
+            .checked_add(page.views.len())
+            .ok_or(ClientGovernedTaskError::BaselineLimitExceeded)?;
+        if total > GOVERNED_TASK_BASELINE_MAX_VIEWS {
+            return Err(ClientGovernedTaskError::BaselineLimitExceeded);
+        }
+        if let Some(cursor) = page.next_page_cursor.as_deref() {
+            if cursor.trim().is_empty()
+                || cursor.chars().any(char::is_control)
+                || page.views.is_empty()
+                || !seen_cursors.insert(cursor.to_owned())
+            {
+                return Err(ClientGovernedTaskError::Protocol(
+                    "governed Task baseline cursor did not advance",
+                ));
+            }
+            if page_index + 1 == page_count {
+                return Err(ClientGovernedTaskError::Protocol(
+                    "governed Task baseline pagination incomplete",
+                ));
+            }
+        } else if page_index + 1 != page_count {
+            return Err(ClientGovernedTaskError::Protocol(
+                "governed Task baseline contained pages after completion",
+            ));
+        }
+        for view in page.views {
+            let view_position = view
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.position.clone())
+                .ok_or(ClientGovernedTaskError::Protocol(
+                    "governed Task baseline view position missing",
+                ))?;
+            if view_position.epoch != page_position.epoch
+                || view_position.sequence > page_position.sequence
+            {
+                return Err(ClientGovernedTaskError::Protocol(
+                    "governed Task baseline view position is outside the page snapshot",
+                ));
+            }
+            let raw_update = TaskWatchProcessor::default()
+                .process(TaskViewStreamFrame {
+                    kind: StreamFrameKind::Snapshot as i32,
+                    position: Some(view_position),
+                    snapshot: Some(view),
+                    reset_reason_code: None,
+                })
+                .map_err(ClientGovernedTaskError::from)?;
+            if raw_update.classification != TaskWatchClassification::Applied {
+                return Err(ClientGovernedTaskError::Protocol(
+                    "governed Task baseline view was not applied",
+                ));
+            }
+            let state = governed_task_update_from_watch(raw_update)?.task.ok_or(
+                ClientGovernedTaskError::Protocol("governed Task baseline view omitted its Task"),
+            )?;
+            if !seen_ids.insert(state.task_id.clone()) {
+                return Err(ClientGovernedTaskError::Protocol(
+                    "governed Task baseline identity is duplicated",
+                ));
+            }
+            tasks.insert(state.task_id.clone(), state);
+        }
+    }
+    let position = position.expect("non-empty pages establish a position");
+    Ok((governed_position(&position)?, tasks))
+}
+
+fn governed_task_update_from_watch(
+    update: TaskWatchUpdate,
+) -> Result<GovernedTaskUpdate, ClientGovernedTaskError> {
+    let position = governed_position(&update.position)?;
+    let task = update
+        .view
+        .as_ref()
+        .map(governed_task_state_from_view)
+        .transpose()?;
+    match update.classification {
+        TaskWatchClassification::Applied if task.is_none() => {
+            return Err(ClientGovernedTaskError::Protocol(
+                "applied governed Task update omitted its Task",
+            ));
+        }
+        TaskWatchClassification::Heartbeat | TaskWatchClassification::ResetRequired
+            if task.is_some() =>
+        {
+            return Err(ClientGovernedTaskError::Protocol(
+                "non-snapshot governed Task update included a Task",
+            ));
+        }
+        _ => {}
+    }
+    if task.as_ref().is_some_and(|state| {
+        state.projection.position.epoch != position.epoch
+            || state.projection.position.sequence != position.sequence
+    }) {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Task update position does not match its Task",
+        ));
+    }
+    Ok(GovernedTaskUpdate {
+        classification: update.classification,
+        position,
+        task,
+    })
+}
+
+fn apply_governed_task_session_update(
+    tasks: &mut BTreeMap<String, GovernedTaskState>,
+    last_position: &mut GovernedProjectionPosition,
+    update: &GovernedTaskUpdate,
+) -> Result<(), ClientGovernedTaskError> {
+    if update.classification == TaskWatchClassification::ResetRequired {
+        return Ok(());
+    }
+    if update.position.epoch != last_position.epoch {
+        return Err(ClientGovernedTaskError::Kernel(
+            KernelError::StreamResetMissing,
+        ));
+    }
+    if update.position.sequence < last_position.sequence {
+        return Err(ClientGovernedTaskError::Kernel(
+            KernelError::StreamOutOfOrder,
+        ));
+    }
+    if update.classification == TaskWatchClassification::Applied {
+        let state = update
+            .task
+            .as_ref()
+            .ok_or(ClientGovernedTaskError::Protocol(
+                "applied governed Task update omitted its Task",
+            ))?;
+        tasks.insert(state.task_id.clone(), state.clone());
+    }
+    if update.position.sequence > last_position.sequence {
+        *last_position = update.position.clone();
+    }
+    Ok(())
+}
+
+fn governed_task_state_from_view(
+    view: &TaskView,
+) -> Result<GovernedTaskState, ClientGovernedTaskError> {
+    let metadata = view
+        .metadata
+        .as_ref()
+        .ok_or(ClientGovernedTaskError::Protocol(
+            "governed Task projection metadata is missing",
+        ))?;
+    let position = metadata
+        .position
+        .as_ref()
+        .ok_or(ClientGovernedTaskError::Protocol(
+            "governed Task projection position is missing",
+        ))?;
+    let health = ProjectionHealth::try_from(metadata.health).map_err(|_| {
+        ClientGovernedTaskError::Protocol("governed Task projection health is unknown")
+    })?;
+    if health == ProjectionHealth::Unspecified {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Task projection health is unspecified",
+        ));
+    }
+    let projection = GovernedProjectionState {
+        position: governed_position(position)?,
+        health,
+        stale: metadata.stale,
+    };
+    let task = view.task.as_ref().ok_or(ClientGovernedTaskError::Protocol(
+        "governed Task snapshot is missing",
+    ))?;
+    validate_governed_identifier(&task.task_id, "governed Task identity is invalid")?;
+    if task.revision == 0 || task.work_revision == 0 {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Task revision binding is invalid",
+        ));
+    }
+    let status = DomainTaskStatus::try_from(task.status)
+        .map_err(|_| ClientGovernedTaskError::Protocol("governed Task status is unknown"))?;
+    if status == DomainTaskStatus::Unspecified {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Task status is unspecified",
+        ));
+    }
+    let current_run_id = validate_optional_governed_identifier(
+        task.current_run_id.as_deref(),
+        "governed Task current Run identity is invalid",
+    )?;
+    let run = match view.collaboration.as_ref() {
+        Some(collaboration) => Some(governed_run_state(
+            collaboration,
+            &task.task_id,
+            task.work_revision,
+            current_run_id.as_deref(),
+        )?),
+        None => {
+            if current_run_id.is_some() && health == ProjectionHealth::Ready && !metadata.stale {
+                return Err(ClientGovernedTaskError::Protocol(
+                    "ready governed Task omitted its current Run projection",
+                ));
+            }
+            None
+        }
+    };
+    validate_governed_source_revisions(metadata, task, run.as_ref())?;
+    Ok(GovernedTaskState {
+        task_id: task.task_id.clone(),
+        revision: task.revision,
+        status,
+        projection,
+        run,
+    })
+}
+
+fn governed_run_state(
+    collaboration: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::CollaborationSnapshot,
+    task_id: &str,
+    task_work_revision: u64,
+    current_run_id: Option<&str>,
+) -> Result<GovernedRunState, ClientGovernedTaskError> {
+    let run = collaboration
+        .run
+        .as_ref()
+        .ok_or(ClientGovernedTaskError::Protocol(
+            "governed Collaboration omitted its Run",
+        ))?;
+    validate_governed_identifier(&run.run_id, "governed Run identity is invalid")?;
+    if current_run_id != Some(run.run_id.as_str()) || run.task_id != task_id {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Run is not bound to the Task",
+        ));
+    }
+    if run.revision == 0 || run.work_revision == 0 || run.work_revision != task_work_revision {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Run revision binding is invalid",
+        ));
+    }
+    let status = RunStatus::try_from(run.status)
+        .map_err(|_| ClientGovernedTaskError::Protocol("governed Run status is unknown"))?;
+    if status == RunStatus::Unspecified {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Run status is unspecified",
+        ));
+    }
+    let hold_reason = governed_hold_reason(run.hold_reason_code.as_deref());
+    let actual_step_ids = collaboration
+        .steps
+        .iter()
+        .map(|step| step.step_id.clone())
+        .collect::<Vec<_>>();
+    if run.step_ids != actual_step_ids {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Run Step order or membership is invalid",
+        ));
+    }
+    let mut step_ids = BTreeSet::new();
+    for step_id in &run.step_ids {
+        validate_governed_identifier(step_id, "governed Step identity is invalid")?;
+        if !step_ids.insert(step_id.clone()) {
+            return Err(ClientGovernedTaskError::Protocol(
+                "governed Run contains duplicate Step identities",
+            ));
+        }
+    }
+    let mut attempt_ids = BTreeSet::new();
+    for attempt in &collaboration.attempts {
+        validate_governed_identifier(&attempt.attempt_id, "governed Attempt identity is invalid")?;
+        if !attempt_ids.insert(attempt.attempt_id.clone()) || !step_ids.contains(&attempt.step_id) {
+            return Err(ClientGovernedTaskError::Protocol(
+                "governed Attempt membership is invalid",
+            ));
+        }
+    }
+    let mut steps = Vec::with_capacity(collaboration.steps.len());
+    for step in &collaboration.steps {
+        if step.run_id != run.run_id || step.revision == 0 {
+            return Err(ClientGovernedTaskError::Protocol(
+                "governed Step lineage or revision is invalid",
+            ));
+        }
+        let step_status = StepStatus::try_from(step.status)
+            .map_err(|_| ClientGovernedTaskError::Protocol("governed Step status is unknown"))?;
+        if step_status == StepStatus::Unspecified {
+            return Err(ClientGovernedTaskError::Protocol(
+                "governed Step status is unspecified",
+            ));
+        }
+        let step_hold_reason = governed_hold_reason(step.hold_reason_code.as_deref());
+        let current_attempt_id = validate_optional_governed_identifier(
+            step.current_attempt_id.as_deref(),
+            "governed current Attempt identity is invalid",
+        )?;
+        let raw_attempts = collaboration
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.step_id == step.step_id)
+            .collect::<Vec<_>>();
+        let actual_attempt_ids = raw_attempts
+            .iter()
+            .map(|attempt| attempt.attempt_id.clone())
+            .collect::<Vec<_>>();
+        if step.attempt_ids != actual_attempt_ids
+            || current_attempt_id
+                .as_ref()
+                .is_some_and(|current| !step.attempt_ids.contains(current))
+        {
+            return Err(ClientGovernedTaskError::Protocol(
+                "governed Step Attempt order or current Attempt is invalid",
+            ));
+        }
+        let attempts = raw_attempts
+            .into_iter()
+            .map(|attempt| governed_attempt_state(attempt, &run.run_id, &step.step_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        steps.push(GovernedStepState {
+            step_id: step.step_id.clone(),
+            revision: step.revision,
+            status: step_status,
+            hold_reason: step_hold_reason,
+            current_attempt_id,
+            attempts,
+        });
+    }
+    Ok(GovernedRunState {
+        run_id: run.run_id.clone(),
+        revision: run.revision,
+        status,
+        work_revision: run.work_revision,
+        hold_reason,
+        steps,
+    })
+}
+
+fn governed_attempt_state(
+    attempt: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::AttemptSnapshot,
+    run_id: &str,
+    step_id: &str,
+) -> Result<GovernedAttemptState, ClientGovernedTaskError> {
+    if attempt.run_id != run_id
+        || attempt.step_id != step_id
+        || attempt.revision == 0
+        || attempt.attempt_number == 0
+    {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Attempt lineage or revision is invalid",
+        ));
+    }
+    let status = AttemptStatus::try_from(attempt.status)
+        .map_err(|_| ClientGovernedTaskError::Protocol("governed Attempt status is unknown"))?;
+    if status == AttemptStatus::Unspecified {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Attempt status is unspecified",
+        ));
+    }
+    let recovery_class = RecoveryClass::try_from(attempt.recovery_class).map_err(|_| {
+        ClientGovernedTaskError::Protocol("governed Attempt recovery class is unknown")
+    })?;
+    if recovery_class == RecoveryClass::Unspecified {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Attempt recovery class is unspecified",
+        ));
+    }
+    let hold_reason = governed_hold_reason(attempt.hold_reason_code.as_deref());
+    let checkpoint_available = match attempt.latest_checkpoint_id.as_deref() {
+        Some(value) => {
+            validate_governed_identifier(value, "governed checkpoint identity is invalid")?;
+            true
+        }
+        None => false,
+    };
+    Ok(GovernedAttemptState {
+        attempt_id: attempt.attempt_id.clone(),
+        revision: attempt.revision,
+        attempt_number: attempt.attempt_number,
+        status,
+        recovery_class,
+        hold_reason,
+        checkpoint_available,
+    })
+}
+
+fn governed_hold_reason(value: Option<&str>) -> Option<GovernedHoldReason> {
+    value.map(|value| match value {
+        "CANCELLATION_OUTCOME_UNKNOWN" => GovernedHoldReason::CancellationOutcomeUnknown,
+        "COMPENSATION_REQUIRED" => GovernedHoldReason::CompensationRequired,
+        "MANUAL_RECOVERY_REQUIRED" => GovernedHoldReason::ManualRecoveryRequired,
+        "IRREVERSIBLE_OUTCOME_UNKNOWN" => GovernedHoldReason::IrreversibleOutcomeUnknown,
+        _ => GovernedHoldReason::Unclassified,
+    })
+}
+
+fn validate_governed_source_revisions(
+    metadata: &ProjectionMetadata,
+    task: &egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot,
+    run: Option<&GovernedRunState>,
+) -> Result<(), ClientGovernedTaskError> {
+    let mut domains = BTreeSet::new();
+    let mut task_source = None;
+    let mut collaboration_source = None;
+    for source in &metadata.source_revisions {
+        let domain = SourceDomain::try_from(source.domain).map_err(|_| {
+            ClientGovernedTaskError::Protocol("governed projection source domain is unknown")
+        })?;
+        if domain == SourceDomain::Unspecified {
+            return Err(ClientGovernedTaskError::Protocol(
+                "governed projection source domain is unspecified",
+            ));
+        }
+        if !domains.insert(source.domain) {
+            return Err(ClientGovernedTaskError::Protocol(
+                "governed projection source domain is duplicated",
+            ));
+        }
+        validate_governed_identifier(
+            &source.aggregate_id,
+            "governed projection source identity is invalid",
+        )?;
+        if source.revision == 0 {
+            return Err(ClientGovernedTaskError::Protocol(
+                "governed projection source revision is zero",
+            ));
+        }
+        match domain {
+            SourceDomain::Task => task_source = Some(source),
+            SourceDomain::Collaboration => collaboration_source = Some(source),
+            _ => {}
+        }
+    }
+    let task_source = task_source.ok_or(ClientGovernedTaskError::Protocol(
+        "governed Task source revision is missing",
+    ))?;
+    if task_source.aggregate_id != task.task_id || task_source.revision != task.revision {
+        return Err(ClientGovernedTaskError::Protocol(
+            "governed Task source revision binding is invalid",
+        ));
+    }
+    match (run, collaboration_source) {
+        (Some(run), Some(source))
+            if source.aggregate_id == run.run_id && source.revision == run.revision =>
+        {
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(ClientGovernedTaskError::Protocol(
+            "governed Collaboration source revision is missing",
+        )),
+        (None, Some(_)) | (Some(_), Some(_)) => Err(ClientGovernedTaskError::Protocol(
+            "governed Collaboration source revision binding is invalid",
+        )),
+    }
+}
+
+fn governed_position(
+    value: &ProjectionPosition,
+) -> Result<GovernedProjectionPosition, ClientGovernedTaskError> {
+    validate_governed_identifier(&value.epoch, "projection epoch is invalid")?;
+    Ok(GovernedProjectionPosition {
+        epoch: value.epoch.clone(),
+        sequence: value.sequence,
+    })
+}
+
+fn validate_governed_identifier(
+    value: &str,
+    error: &'static str,
+) -> Result<(), ClientGovernedTaskError> {
+    if value.trim().is_empty()
+        || value.len() > GOVERNED_TASK_MAX_IDENTIFIER_BYTES
+        || value.chars().any(char::is_control)
+    {
+        Err(ClientGovernedTaskError::Protocol(error))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_optional_governed_identifier(
+    value: Option<&str>,
+    error: &'static str,
+) -> Result<Option<String>, ClientGovernedTaskError> {
+    value
+        .map(|value| {
+            validate_governed_identifier(value, error)?;
+            Ok(value.to_owned())
+        })
+        .transpose()
 }
 
 fn task_watch_resume_after(
@@ -3355,6 +4179,7 @@ mod tests {
             ArtifactDescriptor, ArtifactSet, Claim, ContentAddress, Evidence, LineageBinding,
             Provenance,
         },
+        collaboration::v1::{AttemptSnapshot, CollaborationSnapshot, RunSnapshot, StepSnapshot},
         common::v1::ContractReference,
         localapi::v1::{ProjectionMetadata, RedactedField},
         task::v1::{TaskSnapshot, TaskStatus},
@@ -4592,6 +5417,203 @@ mod tests {
         }
     }
 
+    fn governed_test_view(
+        position: &ProjectionPosition,
+        suffix: &str,
+        task_status: TaskStatus,
+        run_status: RunStatus,
+        step_status: StepStatus,
+        attempt_status: AttemptStatus,
+        recovery_class: RecoveryClass,
+    ) -> TaskView {
+        let task_id = format!("task:{suffix}");
+        let run_id = format!("run:{suffix}");
+        let first_step_id = format!("step:{suffix}");
+        let second_step_id = format!("step:{suffix}:second");
+        let first_history_id = format!("attempt:{suffix}:history");
+        let first_current_id = format!("attempt:{suffix}");
+        let second_history_id = format!("attempt:{suffix}:second:history");
+        let second_current_id = format!("attempt:{suffix}:second");
+        let attempt = |attempt_id: String,
+                       step_id: &str,
+                       attempt_number: u32,
+                       status: AttemptStatus,
+                       recovery: RecoveryClass| AttemptSnapshot {
+            attempt_id,
+            run_id: run_id.clone(),
+            step_id: step_id.to_owned(),
+            revision: u64::from(attempt_number) + 5,
+            attempt_number,
+            status: status as i32,
+            harness_id: "sensitive-harness-canary".to_owned(),
+            capability_profile_ref: Some(ContractReference {
+                contract_id: "sensitive-capability-canary".to_owned(),
+                version: "v1".to_owned(),
+                sha256: "b".repeat(64),
+            }),
+            workspace_ref: "sensitive-workspace-canary".to_owned(),
+            dispatch_id: Some("sensitive-dispatch-canary".to_owned()),
+            dispatch_fingerprint: Some("c".repeat(64)),
+            harness_session_ref: Some("sensitive-session-canary".to_owned()),
+            latest_checkpoint_id: Some("sensitive-checkpoint-canary".to_owned()),
+            recovery_class: recovery as i32,
+            hold_reason_code: (matches!(
+                status,
+                AttemptStatus::OutcomeUnknown | AttemptStatus::Reconciling | AttemptStatus::Held
+            ))
+            .then(|| "MANUAL_RECOVERY_REQUIRED".to_owned()),
+            ..AttemptSnapshot::default()
+        };
+        TaskView {
+            metadata: Some(ProjectionMetadata {
+                schema_ref: Some(ContractReference {
+                    contract_id: "egopulse.localapi.v1/TaskView".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    sha256: "a".repeat(64),
+                }),
+                position: Some(position.clone()),
+                source_revisions: vec![
+                    SourceRevision {
+                        domain: SourceDomain::Task as i32,
+                        aggregate_id: task_id.clone(),
+                        revision: 4,
+                        last_event_id: format!("event:{task_id}:4"),
+                    },
+                    SourceRevision {
+                        domain: SourceDomain::Collaboration as i32,
+                        aggregate_id: run_id.clone(),
+                        revision: 5,
+                        last_event_id: format!("event:{run_id}:5"),
+                    },
+                ],
+                health: ProjectionHealth::Ready as i32,
+                stale: false,
+                safe_health_reason_code: None,
+            }),
+            task: Some(TaskSnapshot {
+                task_id: task_id.clone(),
+                revision: 4,
+                work_revision: 2,
+                status: task_status as i32,
+                current_run_id: Some(run_id.clone()),
+                ..TaskSnapshot::default()
+            }),
+            collaboration: Some(CollaborationSnapshot {
+                run: Some(RunSnapshot {
+                    run_id: run_id.clone(),
+                    revision: 5,
+                    task_id,
+                    task_revision_at_creation: 2,
+                    work_revision: 2,
+                    status: run_status as i32,
+                    step_ids: vec![first_step_id.clone(), second_step_id.clone()],
+                    hold_reason_code: (run_status == RunStatus::Held)
+                        .then(|| "MANUAL_RECOVERY_REQUIRED".to_owned()),
+                    ..RunSnapshot::default()
+                }),
+                steps: vec![
+                    StepSnapshot {
+                        step_id: first_step_id.clone(),
+                        run_id: run_id.clone(),
+                        revision: 3,
+                        status: step_status as i32,
+                        attempt_ids: vec![first_history_id.clone(), first_current_id.clone()],
+                        current_attempt_id: Some(first_current_id.clone()),
+                        hold_reason_code: (step_status == StepStatus::Held)
+                            .then(|| "MANUAL_RECOVERY_REQUIRED".to_owned()),
+                        ..StepSnapshot::default()
+                    },
+                    StepSnapshot {
+                        step_id: second_step_id.clone(),
+                        run_id: run_id.clone(),
+                        revision: 4,
+                        status: step_status as i32,
+                        attempt_ids: vec![second_history_id.clone(), second_current_id.clone()],
+                        current_attempt_id: Some(second_current_id.clone()),
+                        hold_reason_code: (step_status == StepStatus::Held)
+                            .then(|| "MANUAL_RECOVERY_REQUIRED".to_owned()),
+                        ..StepSnapshot::default()
+                    },
+                ],
+                attempts: vec![
+                    attempt(
+                        first_history_id,
+                        &first_step_id,
+                        1,
+                        AttemptStatus::Interrupted,
+                        RecoveryClass::RetryIdempotent,
+                    ),
+                    attempt(
+                        first_current_id,
+                        &first_step_id,
+                        2,
+                        attempt_status,
+                        recovery_class,
+                    ),
+                    attempt(
+                        second_history_id,
+                        &second_step_id,
+                        1,
+                        AttemptStatus::Interrupted,
+                        RecoveryClass::RetryIdempotent,
+                    ),
+                    attempt(
+                        second_current_id,
+                        &second_step_id,
+                        2,
+                        attempt_status,
+                        recovery_class,
+                    ),
+                ],
+            }),
+            ..TaskView::default()
+        }
+    }
+
+    fn governed_no_run_view(position: &ProjectionPosition, task_id: impl Into<String>) -> TaskView {
+        let task_id = task_id.into();
+        TaskView {
+            metadata: Some(ProjectionMetadata {
+                schema_ref: Some(ContractReference {
+                    contract_id: "egopulse.localapi.v1/TaskView".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    sha256: "a".repeat(64),
+                }),
+                position: Some(position.clone()),
+                source_revisions: vec![SourceRevision {
+                    domain: SourceDomain::Task as i32,
+                    aggregate_id: task_id.clone(),
+                    revision: 1,
+                    last_event_id: format!("event:{task_id}:1"),
+                }],
+                health: ProjectionHealth::Ready as i32,
+                stale: false,
+                safe_health_reason_code: None,
+            }),
+            task: Some(TaskSnapshot {
+                task_id,
+                revision: 1,
+                work_revision: 1,
+                status: TaskStatus::Ready as i32,
+                ..TaskSnapshot::default()
+            }),
+            ..TaskView::default()
+        }
+    }
+
+    fn governed_task_page(
+        position: &ProjectionPosition,
+        views: Vec<TaskView>,
+        next_page_cursor: Option<&str>,
+    ) -> ListTaskViewsResponse {
+        ListTaskViewsResponse {
+            views,
+            next_page_cursor: next_page_cursor.map(str::to_owned),
+            snapshot_position: Some(position.clone()),
+            error: None,
+        }
+    }
+
     fn watch_frame(
         kind: StreamFrameKind,
         position: ProjectionPosition,
@@ -4604,6 +5626,705 @@ mod tests {
             snapshot: view,
             reset_reason_code: reset_reason_code.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn governed_task_states_map_execution_and_recovery_without_sensitive_material() {
+        let position = watch_position("epoch:u05", 20);
+        let cases = [
+            (
+                "running",
+                TaskStatus::Active,
+                RunStatus::Active,
+                StepStatus::Active,
+                AttemptStatus::Running,
+                RecoveryClass::ResumeSafe,
+            ),
+            (
+                "outcome-unknown",
+                TaskStatus::Interrupted,
+                RunStatus::Held,
+                StepStatus::Held,
+                AttemptStatus::OutcomeUnknown,
+                RecoveryClass::ReconcileBeforeRetry,
+            ),
+            (
+                "reconciling",
+                TaskStatus::Interrupted,
+                RunStatus::Held,
+                StepStatus::Held,
+                AttemptStatus::Reconciling,
+                RecoveryClass::ReconcileBeforeRetry,
+            ),
+            (
+                "held",
+                TaskStatus::Held,
+                RunStatus::Held,
+                StepStatus::Held,
+                AttemptStatus::Held,
+                RecoveryClass::ManualOnly,
+            ),
+            (
+                "interrupted",
+                TaskStatus::Interrupted,
+                RunStatus::Active,
+                StepStatus::Active,
+                AttemptStatus::Interrupted,
+                RecoveryClass::RetryIdempotent,
+            ),
+        ];
+        for (suffix, task_status, run_status, step_status, attempt_status, recovery_class) in cases
+        {
+            let view = governed_test_view(
+                &position,
+                suffix,
+                task_status,
+                run_status,
+                step_status,
+                attempt_status,
+                recovery_class,
+            );
+            let state = governed_task_state_from_view(&view).expect("valid governed state");
+            assert_eq!(state.status, task_status);
+            assert_eq!(state.projection.health, ProjectionHealth::Ready);
+            assert!(!state.projection.stale);
+            let run = state.run.as_ref().expect("run state");
+            assert_eq!(run.status, run_status);
+            assert_eq!(run.work_revision, 2);
+            assert_eq!(run.steps.len(), 2);
+            for step in &run.steps {
+                assert_eq!(step.status, step_status);
+                assert_eq!(step.attempts.len(), 2);
+                let historical = &step.attempts[0];
+                assert_eq!(historical.attempt_number, 1);
+                assert_eq!(historical.status, AttemptStatus::Interrupted);
+                assert_eq!(historical.recovery_class, RecoveryClass::RetryIdempotent);
+                let current = &step.attempts[1];
+                assert_eq!(
+                    step.current_attempt_id.as_deref(),
+                    Some(current.attempt_id.as_str())
+                );
+                assert_eq!(current.attempt_number, 2);
+                assert_eq!(current.status, attempt_status);
+                assert_eq!(current.recovery_class, recovery_class);
+                assert!(current.checkpoint_available);
+            }
+            let safe_debug = format!("{state:?}");
+            for sensitive in [
+                "sensitive-harness-canary",
+                "sensitive-capability-canary",
+                "sensitive-workspace-canary",
+                "sensitive-dispatch-canary",
+                "sensitive-session-canary",
+                "sensitive-checkpoint-canary",
+            ] {
+                assert!(!safe_debug.contains(sensitive));
+            }
+        }
+
+        let mut unclassified = governed_test_view(
+            &position,
+            "opaque-hold",
+            TaskStatus::Held,
+            RunStatus::Held,
+            StepStatus::Held,
+            AttemptStatus::Held,
+            RecoveryClass::ManualOnly,
+        );
+        let collaboration = unclassified.collaboration.as_mut().expect("collaboration");
+        collaboration.run.as_mut().expect("run").hold_reason_code =
+            Some("sensitive-hold-reason-canary".to_owned());
+        for step in &mut collaboration.steps {
+            step.hold_reason_code = Some("sensitive-hold-reason-canary".to_owned());
+        }
+        for attempt in &mut collaboration.attempts {
+            attempt.hold_reason_code = Some("sensitive-hold-reason-canary".to_owned());
+        }
+        let safe = governed_task_state_from_view(&unclassified).expect("unclassified hold");
+        let run = safe.run.as_ref().expect("run");
+        assert_eq!(run.hold_reason, Some(GovernedHoldReason::Unclassified));
+        assert!(run.steps.iter().all(|step| {
+            step.hold_reason == Some(GovernedHoldReason::Unclassified)
+                && step
+                    .attempts
+                    .iter()
+                    .all(|attempt| attempt.hold_reason == Some(GovernedHoldReason::Unclassified))
+        }));
+        assert!(!format!("{safe:?}").contains("sensitive-hold-reason-canary"));
+
+        let mut stale = governed_test_view(
+            &position,
+            "stale",
+            TaskStatus::Active,
+            RunStatus::Active,
+            StepStatus::Active,
+            AttemptStatus::Running,
+            RecoveryClass::ResumeSafe,
+        );
+        stale.collaboration = None;
+        let metadata = stale.metadata.as_mut().expect("metadata");
+        metadata.stale = true;
+        metadata
+            .source_revisions
+            .retain(|source| source.domain != SourceDomain::Collaboration as i32);
+        let state = governed_task_state_from_view(&stale).expect("stale dependency is explicit");
+        assert!(state.projection.stale);
+        assert!(state.run.is_none());
+        assert_eq!(state.status, TaskStatus::Active);
+
+        stale.metadata.as_mut().expect("metadata").stale = false;
+        assert!(matches!(
+            governed_task_state_from_view(&stale),
+            Err(ClientGovernedTaskError::Protocol(
+                "ready governed Task omitted its current Run projection"
+            ))
+        ));
+    }
+
+    #[test]
+    fn governed_task_mapping_fails_closed_for_unknown_enums_and_lineage_drift() {
+        let position = watch_position("epoch:u05-integrity", 30);
+        let valid = || {
+            governed_test_view(
+                &position,
+                "integrity",
+                TaskStatus::Interrupted,
+                RunStatus::Held,
+                StepStatus::Held,
+                AttemptStatus::OutcomeUnknown,
+                RecoveryClass::ReconcileBeforeRetry,
+            )
+        };
+        let mut invalid = Vec::new();
+
+        for status in [i32::MAX, TaskStatus::Unspecified as i32] {
+            let mut value = valid();
+            value.task.as_mut().expect("task").status = status;
+            invalid.push(value);
+        }
+        let mut value = valid();
+        value.task.as_mut().expect("task").work_revision = 0;
+        invalid.push(value);
+        for status in [i32::MAX, RunStatus::Unspecified as i32] {
+            let mut value = valid();
+            value
+                .collaboration
+                .as_mut()
+                .expect("collaboration")
+                .run
+                .as_mut()
+                .expect("run")
+                .status = status;
+            invalid.push(value);
+        }
+        for status in [i32::MAX, StepStatus::Unspecified as i32] {
+            let mut value = valid();
+            value.collaboration.as_mut().expect("collaboration").steps[0].status = status;
+            invalid.push(value);
+        }
+        for status in [i32::MAX, AttemptStatus::Unspecified as i32] {
+            let mut value = valid();
+            value
+                .collaboration
+                .as_mut()
+                .expect("collaboration")
+                .attempts[0]
+                .status = status;
+            invalid.push(value);
+        }
+        for recovery in [i32::MAX, RecoveryClass::Unspecified as i32] {
+            let mut value = valid();
+            value
+                .collaboration
+                .as_mut()
+                .expect("collaboration")
+                .attempts[0]
+                .recovery_class = recovery;
+            invalid.push(value);
+        }
+        for health in [i32::MAX, ProjectionHealth::Unspecified as i32] {
+            let mut value = valid();
+            value.metadata.as_mut().expect("metadata").health = health;
+            invalid.push(value);
+        }
+        let mut value = valid();
+        value
+            .collaboration
+            .as_mut()
+            .expect("collaboration")
+            .run
+            .as_mut()
+            .expect("run")
+            .task_id = "task:other".to_owned();
+        invalid.push(value);
+        let mut value = valid();
+        value
+            .collaboration
+            .as_mut()
+            .expect("collaboration")
+            .run
+            .as_mut()
+            .expect("run")
+            .step_ids = vec!["step:other".to_owned()];
+        invalid.push(value);
+        let mut value = valid();
+        value.collaboration.as_mut().expect("collaboration").steps[0].run_id =
+            "run:other".to_owned();
+        invalid.push(value);
+        let mut value = valid();
+        value.collaboration.as_mut().expect("collaboration").steps[0].current_attempt_id =
+            Some("attempt:other".to_owned());
+        invalid.push(value);
+        let mut value = valid();
+        value
+            .collaboration
+            .as_mut()
+            .expect("collaboration")
+            .attempts[0]
+            .step_id = "step:other".to_owned();
+        invalid.push(value);
+
+        let mut value = valid();
+        value
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .source_revisions
+            .retain(|source| source.domain != SourceDomain::Task as i32);
+        invalid.push(value);
+        let mut value = valid();
+        let task_source = value.metadata.as_mut().expect("metadata").source_revisions[0].clone();
+        value
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .source_revisions
+            .push(task_source);
+        invalid.push(value);
+        let mut value = valid();
+        value.metadata.as_mut().expect("metadata").source_revisions[0].aggregate_id =
+            "task:other".to_owned();
+        invalid.push(value);
+        let mut value = valid();
+        value.metadata.as_mut().expect("metadata").source_revisions[0].revision += 1;
+        invalid.push(value);
+        let mut value = valid();
+        value
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .source_revisions
+            .retain(|source| source.domain != SourceDomain::Collaboration as i32);
+        invalid.push(value);
+        let mut value = valid();
+        let collaboration_source =
+            value.metadata.as_mut().expect("metadata").source_revisions[1].clone();
+        value
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .source_revisions
+            .push(collaboration_source);
+        invalid.push(value);
+        let mut value = valid();
+        value.metadata.as_mut().expect("metadata").source_revisions[1].aggregate_id =
+            "run:other".to_owned();
+        invalid.push(value);
+        let mut value = valid();
+        value.metadata.as_mut().expect("metadata").source_revisions[1].revision += 1;
+        invalid.push(value);
+
+        for value in invalid {
+            assert!(matches!(
+                governed_task_state_from_view(&value),
+                Err(ClientGovernedTaskError::Protocol(_))
+            ));
+        }
+
+        let mut no_run = governed_no_run_view(&position, "task:no-run");
+        no_run
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .source_revisions
+            .push(SourceRevision {
+                domain: SourceDomain::Artifact as i32,
+                aggregate_id: "artifact-set:safe".to_owned(),
+                revision: 1,
+                last_event_id: "event:artifact-set:safe:1".to_owned(),
+            });
+        assert!(governed_task_state_from_view(&no_run).is_ok());
+
+        let mut duplicate_other_domain = no_run.clone();
+        duplicate_other_domain
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .source_revisions
+            .push(SourceRevision {
+                domain: SourceDomain::Artifact as i32,
+                aggregate_id: "artifact-set:other".to_owned(),
+                revision: 2,
+                last_event_id: "event:artifact-set:other:2".to_owned(),
+            });
+        assert!(matches!(
+            governed_task_state_from_view(&duplicate_other_domain),
+            Err(ClientGovernedTaskError::Protocol(
+                "governed projection source domain is duplicated"
+            ))
+        ));
+
+        let mut unexpected_collaboration = governed_no_run_view(&position, "task:no-run");
+        unexpected_collaboration
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .source_revisions
+            .push(SourceRevision {
+                domain: SourceDomain::Collaboration as i32,
+                aggregate_id: "run:unexpected".to_owned(),
+                revision: 1,
+                last_event_id: "event:run:unexpected:1".to_owned(),
+            });
+        assert!(matches!(
+            governed_task_state_from_view(&unexpected_collaboration),
+            Err(ClientGovernedTaskError::Protocol(
+                "governed Collaboration source revision binding is invalid"
+            ))
+        ));
+    }
+
+    #[test]
+    fn governed_task_baseline_read_is_permission_first_and_follows_one_snapshot() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(12_000);
+        let kernel = authenticated_kernel("founder:u05", "session:u05", "local.task.read", now);
+        let snapshot = watch_position("epoch:u05-baseline", 100);
+        let older = watch_position("epoch:u05-baseline", 90);
+        let mut pages = VecDeque::from([
+            Ok(governed_task_page(
+                &snapshot,
+                vec![governed_no_run_view(&older, "task:b")],
+                Some("cursor:2"),
+            )),
+            Ok(governed_task_page(
+                &snapshot,
+                vec![governed_no_run_view(&snapshot, "task:a")],
+                None,
+            )),
+        ]);
+        let requests = RefCell::new(Vec::new());
+        let baseline = block_on_ready(read_governed_task_baseline_via(&kernel, now, |request| {
+            requests.borrow_mut().push(request);
+            std::future::ready(pages.pop_front().expect("baseline page"))
+        }))
+        .expect("complete governed Task baseline");
+        assert_eq!(baseline.position().epoch, snapshot.epoch);
+        assert_eq!(baseline.position().sequence, snapshot.sequence);
+        assert_eq!(
+            baseline
+                .tasks()
+                .into_iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["task:a", "task:b"]
+        );
+        let requests = requests.into_inner();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].page_size, 100);
+        assert!(requests[0].status_filter.is_empty());
+        assert!(requests[0].minimum_position.is_none());
+        assert!(requests[0].page_cursor.is_none());
+        assert_eq!(requests[1].page_cursor.as_deref(), Some("cursor:2"));
+        assert_eq!(requests[0].client, requests[1].client);
+        let metadata = requests[0].client.as_ref().expect("client metadata");
+        assert_eq!(metadata.session_id, "session:u05");
+        assert_eq!(metadata.surface, ClientSurface::Cli as i32);
+
+        let denied = authenticated_kernel(
+            "founder:u05",
+            "session:u05-denied",
+            "local.context.revoke",
+            now,
+        );
+        let denied_calls = Cell::new(0_u64);
+        assert!(matches!(
+            block_on_ready(read_governed_task_baseline_via(
+                &denied,
+                now,
+                |_request| {
+                    denied_calls.set(denied_calls.get() + 1);
+                    std::future::ready(Ok(governed_task_page(&snapshot, Vec::new(), None)))
+                },
+            )),
+            Err(ClientGovernedTaskError::Kernel(
+                KernelError::PermissionDenied(permission)
+            )) if permission == "local.task.read"
+        ));
+        assert_eq!(denied_calls.get(), 0);
+    }
+
+    #[test]
+    fn governed_task_baseline_rejects_cursor_identity_position_and_capacity_drift() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(12_100);
+        let kernel =
+            authenticated_kernel("founder:u05", "session:u05-failure", "local.task.read", now);
+        let position = watch_position("epoch:u05-failure", 100);
+        let other_position = watch_position("epoch:u05-failure", 101);
+
+        let mut stalled = VecDeque::from([
+            Ok(governed_task_page(
+                &position,
+                vec![governed_no_run_view(&position, "task:1")],
+                Some("cursor:same"),
+            )),
+            Ok(governed_task_page(
+                &position,
+                vec![governed_no_run_view(&position, "task:2")],
+                Some("cursor:same"),
+            )),
+        ]);
+        assert!(matches!(
+            block_on_ready(read_governed_task_baseline_via(&kernel, now, |_request| {
+                std::future::ready(stalled.pop_front().expect("stalled page"))
+            },)),
+            Err(ClientGovernedTaskError::Protocol(
+                "governed Task baseline cursor did not advance"
+            ))
+        ));
+
+        let duplicate = governed_no_run_view(&position, "task:duplicate");
+        assert!(matches!(
+            compile_governed_task_baseline(vec![
+                governed_task_page(&position, vec![duplicate.clone()], Some("cursor:2")),
+                governed_task_page(&position, vec![duplicate], None),
+            ]),
+            Err(ClientGovernedTaskError::Protocol(
+                "governed Task baseline identity is duplicated"
+            ))
+        ));
+
+        assert!(matches!(
+            compile_governed_task_baseline(vec![
+                governed_task_page(
+                    &position,
+                    vec![governed_no_run_view(&position, "task:position:1")],
+                    Some("cursor:2"),
+                ),
+                governed_task_page(
+                    &other_position,
+                    vec![governed_no_run_view(&other_position, "task:position:2")],
+                    None,
+                ),
+            ]),
+            Err(ClientGovernedTaskError::Protocol(
+                "governed Task baseline position changed across pages"
+            ))
+        ));
+
+        for invalid_cursor in ["   ", "cursor:\ninvalid"] {
+            let mut page = Some(Ok(governed_task_page(
+                &position,
+                vec![governed_no_run_view(&position, "task:cursor")],
+                Some(invalid_cursor),
+            )));
+            assert!(matches!(
+                block_on_ready(read_governed_task_baseline_via(&kernel, now, |_request| {
+                    std::future::ready(page.take().expect("cursor page"))
+                },)),
+                Err(ClientGovernedTaskError::Protocol(
+                    "governed Task baseline cursor did not advance"
+                ))
+            ));
+        }
+
+        let mut empty_page = Some(Ok(governed_task_page(
+            &position,
+            Vec::new(),
+            Some("cursor:empty"),
+        )));
+        assert!(matches!(
+            block_on_ready(read_governed_task_baseline_via(&kernel, now, |_request| {
+                std::future::ready(empty_page.take().expect("empty page"))
+            },)),
+            Err(ClientGovernedTaskError::Protocol(
+                "governed Task baseline cursor did not advance"
+            ))
+        ));
+
+        assert!(matches!(
+            compile_governed_task_baseline(vec![
+                governed_task_page(
+                    &position,
+                    vec![governed_no_run_view(&position, "task:complete")],
+                    None,
+                ),
+                governed_task_page(
+                    &position,
+                    vec![governed_no_run_view(&position, "task:after-complete")],
+                    None,
+                ),
+            ]),
+            Err(ClientGovernedTaskError::Protocol(
+                "governed Task baseline contained pages after completion"
+            ))
+        ));
+
+        let mut exact_limit = VecDeque::new();
+        for page_index in 0..10 {
+            let views = (0..100)
+                .map(|item_index| {
+                    governed_no_run_view(
+                        &position,
+                        format!("task:limit:{page_index:02}:{item_index:03}"),
+                    )
+                })
+                .collect();
+            let next = (page_index < 9).then(|| format!("cursor:limit:{}", page_index + 1));
+            exact_limit.push_back(Ok(governed_task_page(&position, views, next.as_deref())));
+        }
+        let exact_dispatches = Cell::new(0_u64);
+        let exact_baseline =
+            block_on_ready(read_governed_task_baseline_via(&kernel, now, |_request| {
+                exact_dispatches.set(exact_dispatches.get() + 1);
+                std::future::ready(exact_limit.pop_front().expect("exact limit page"))
+            }))
+            .expect("exact 1000-item baseline");
+        assert_eq!(exact_baseline.tasks().len(), 1_000);
+        assert_eq!(exact_dispatches.get(), 10);
+
+        let mut oversized = VecDeque::new();
+        for page_index in 0..=10 {
+            let item_count = if page_index == 10 { 1 } else { 100 };
+            let views = (0..item_count)
+                .map(|item_index| {
+                    governed_no_run_view(&position, format!("task:{page_index:02}:{item_index:03}"))
+                })
+                .collect();
+            let next = (page_index < 10).then(|| format!("cursor:{}", page_index + 1));
+            oversized.push_back(Ok(governed_task_page(&position, views, next.as_deref())));
+        }
+        let dispatches = Cell::new(0_u64);
+        assert!(matches!(
+            block_on_ready(read_governed_task_baseline_via(&kernel, now, |_request| {
+                dispatches.set(dispatches.get() + 1);
+                std::future::ready(oversized.pop_front().expect("oversized page"))
+            },)),
+            Err(ClientGovernedTaskError::BaselineLimitExceeded)
+        ));
+        assert_eq!(dispatches.get(), 11);
+    }
+
+    #[test]
+    fn governed_task_session_applies_once_and_honors_replay_heartbeat_and_reset_barrier() {
+        let floor = watch_position("epoch:u05-session", 100);
+        let next = watch_position("epoch:u05-session", 101);
+        let heartbeat = watch_position("epoch:u05-session", 102);
+        let reset = watch_position("epoch:u05-session", 103);
+        let first_view = governed_no_run_view(&next, "task:a");
+        let second_view = governed_no_run_view(&next, "task:b");
+        let first_frame = watch_frame(
+            StreamFrameKind::Snapshot,
+            next.clone(),
+            Some(first_view.clone()),
+            None,
+        );
+        let mut processor = TaskWatchProcessor::default();
+        let mut tasks = BTreeMap::new();
+        let mut last_position = governed_position(&floor).expect("floor");
+
+        let first = block_on_ready(next_governed_task_session_update_via(
+            &mut processor,
+            &mut tasks,
+            &mut last_position,
+            || std::future::ready(Ok(Some(first_frame.clone()))),
+        ))
+        .expect("first applied update");
+        assert_eq!(first.classification, TaskWatchClassification::Applied);
+        let second = block_on_ready(next_governed_task_session_update_via(
+            &mut processor,
+            &mut tasks,
+            &mut last_position,
+            || {
+                std::future::ready(Ok(Some(watch_frame(
+                    StreamFrameKind::Snapshot,
+                    next.clone(),
+                    Some(second_view),
+                    None,
+                ))))
+            },
+        ))
+        .expect("same-position distinct Task applied");
+        assert_eq!(second.classification, TaskWatchClassification::Applied);
+        assert_eq!(
+            tasks.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["task:a", "task:b"]
+        );
+
+        let facts = tasks.clone();
+        let replay = block_on_ready(next_governed_task_session_update_via(
+            &mut processor,
+            &mut tasks,
+            &mut last_position,
+            || std::future::ready(Ok(Some(first_frame))),
+        ))
+        .expect("exact replay");
+        assert_eq!(replay.classification, TaskWatchClassification::Replay);
+        assert_eq!(tasks, facts);
+
+        let heartbeat_update = block_on_ready(next_governed_task_session_update_via(
+            &mut processor,
+            &mut tasks,
+            &mut last_position,
+            || {
+                std::future::ready(Ok(Some(watch_frame(
+                    StreamFrameKind::Heartbeat,
+                    heartbeat.clone(),
+                    None,
+                    None,
+                ))))
+            },
+        ))
+        .expect("heartbeat");
+        assert_eq!(
+            heartbeat_update.classification,
+            TaskWatchClassification::Heartbeat
+        );
+        assert_eq!(tasks, facts);
+        assert_eq!(last_position.sequence, 102);
+
+        let reset_update = block_on_ready(next_governed_task_session_update_via(
+            &mut processor,
+            &mut tasks,
+            &mut last_position,
+            || {
+                std::future::ready(Ok(Some(watch_frame(
+                    StreamFrameKind::ResetRequired,
+                    reset,
+                    None,
+                    Some("retention-floor-advanced"),
+                ))))
+            },
+        ))
+        .expect("reset frame is reported once");
+        assert_eq!(
+            reset_update.classification,
+            TaskWatchClassification::ResetRequired
+        );
+        assert_eq!(tasks, facts);
+        let polls = Cell::new(0_u64);
+        assert!(matches!(
+            block_on_ready(next_governed_task_session_update_via(
+                &mut processor,
+                &mut tasks,
+                &mut last_position,
+                || {
+                    polls.set(polls.get() + 1);
+                    std::future::ready(Ok(None))
+                },
+            )),
+            Err(ClientGovernedTaskError::ResetBarrier)
+        ));
+        assert_eq!(polls.get(), 0);
     }
 
     #[test]
