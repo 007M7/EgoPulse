@@ -2,7 +2,7 @@
 
 #[allow(
     dead_code,
-    reason = "R9B.1 domain drivers consume this runtime-agnostic reducer in the follow-up slice"
+    reason = "R9B.2 domain drivers consume this runtime-agnostic reducer in the follow-up slice"
 )]
 mod governed_state;
 
