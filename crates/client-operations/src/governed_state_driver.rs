@@ -289,6 +289,130 @@ async fn run_task_worker(
     .await
 }
 
+async fn run_approval_worker_via<Source, Session, Open, Next, Backoff>(
+    source: &mut Source,
+    sender: ApprovalRequestSender,
+    mut cancellation: watch::Receiver<bool>,
+    mut open: Open,
+    mut next: Next,
+    mut backoff: Backoff,
+) -> WorkerExit
+where
+    Source: Send,
+    Session: Send,
+    Open: for<'a> FnMut(
+        &'a mut Source,
+        DriverStage,
+        u64,
+    ) -> BoxFuture<
+        'a,
+        Result<Opened<Session, GovernedApprovalReducerInput>, Box<GovernedApprovalReducerInput>>,
+    >,
+    Next: for<'a> FnMut(&'a mut Session, u64) -> BoxFuture<'a, GovernedApprovalReducerInput>,
+    Backoff: FnMut() -> BoxFuture<'static, ()>,
+{
+    let mut generation = 1_u64;
+    let mut stage = DriverStage::Initial;
+
+    loop {
+        let opened = match cancellable(&mut cancellation, open(source, stage, generation)).await {
+            Ok(opened) => opened,
+            Err(exit) => return exit,
+        };
+        match opened {
+            Ok(Opened {
+                mut session,
+                complete_input,
+            }) => {
+                let ack =
+                    match submit_approval_input(&sender, &mut cancellation, complete_input).await {
+                        Ok(ack) => ack,
+                        Err(exit) => return exit,
+                    };
+                match directive_from_ack(generation, ack) {
+                    WorkerDirective::ContinueLive {
+                        generation: acknowledged_generation,
+                    } => generation = acknowledged_generation,
+                    WorkerDirective::Recover {
+                        generation: recovery_generation,
+                    } => {
+                        generation = recovery_generation;
+                        drop(session);
+                        stage = DriverStage::Recovery;
+                        if let Err(exit) = cancellable(&mut cancellation, backoff()).await {
+                            return exit;
+                        }
+                        continue;
+                    }
+                    WorkerDirective::Stop => return WorkerExit::DomainFatal,
+                }
+
+                loop {
+                    let input = match cancellable(&mut cancellation, next(&mut session, generation))
+                        .await
+                    {
+                        Ok(input) => input,
+                        Err(exit) => return exit,
+                    };
+                    let ack = match submit_approval_input(&sender, &mut cancellation, input).await {
+                        Ok(ack) => ack,
+                        Err(exit) => return exit,
+                    };
+                    match directive_from_ack(generation, ack) {
+                        WorkerDirective::ContinueLive {
+                            generation: acknowledged_generation,
+                        } => generation = acknowledged_generation,
+                        WorkerDirective::Recover {
+                            generation: recovery_generation,
+                        } => {
+                            generation = recovery_generation;
+                            break;
+                        }
+                        WorkerDirective::Stop => return WorkerExit::DomainFatal,
+                    }
+                }
+                drop(session);
+            }
+            Err(input) => {
+                let ack = match submit_approval_input(&sender, &mut cancellation, *input).await {
+                    Ok(ack) => ack,
+                    Err(exit) => return exit,
+                };
+                match directive_from_ack(generation, ack) {
+                    WorkerDirective::Stop => return WorkerExit::DomainFatal,
+                    WorkerDirective::ContinueLive {
+                        generation: acknowledged_generation,
+                    }
+                    | WorkerDirective::Recover {
+                        generation: acknowledged_generation,
+                    } => generation = acknowledged_generation,
+                }
+            }
+        }
+
+        stage = DriverStage::Recovery;
+        if let Err(exit) = cancellable(&mut cancellation, backoff()).await {
+            return exit;
+        }
+    }
+}
+
+async fn run_approval_worker(
+    source: &mut ApprovalSource,
+    sender: ApprovalRequestSender,
+    cancellation: watch::Receiver<bool>,
+) -> WorkerExit {
+    run_approval_worker_via(
+        source,
+        sender,
+        cancellation,
+        |source, stage, generation| Box::pin(source.open(stage, generation)),
+        |session, generation| Box::pin(next_approval_live_input(generation, session)),
+        || Box::pin(tokio::time::sleep(Duration::from_millis(100))),
+    )
+    .await
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GovernedStateUpdate {
     domain: GovernedStateDomain,
