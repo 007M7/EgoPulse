@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, future::Future, num::NonZeroU32, sync::Arc};
+use std::{
+    collections::BTreeMap, future::Future, num::NonZeroU32, pin::Pin, sync::Arc, time::Duration,
+};
 
 use egopulse_client_kernel::KernelError;
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::LocalApiErrorCode;
@@ -19,6 +21,8 @@ use crate::{
 };
 
 const GOVERNED_STATE_REQUEST_CAPACITY: usize = 1;
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DomainAck {
@@ -42,6 +46,14 @@ enum WorkerDirective {
     ContinueLive { generation: u64 },
     Recover { generation: u64 },
     Stop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerExit {
+    Cancelled,
+    DomainFatal,
+    RequestChannelClosed,
+    AcknowledgementLost,
 }
 
 type TaskRequestSender = mpsc::Sender<TaskRequest>;
@@ -84,28 +96,28 @@ async fn submit_with_ack<T, F>(
     sender: &mpsc::Sender<T>,
     cancellation: &mut watch::Receiver<bool>,
     make_request: F,
-) -> Option<DomainAck>
+) -> Result<DomainAck, WorkerExit>
 where
     F: FnOnce(oneshot::Sender<DomainAck>) -> T,
 {
     if cancellation_requested(cancellation) {
-        return None;
+        return Err(WorkerExit::Cancelled);
     }
     let permit = tokio::select! {
         biased;
-        _ = wait_for_cancellation(cancellation) => return None,
-        permit = sender.reserve() => permit.ok()?,
+        _ = wait_for_cancellation(cancellation) => return Err(WorkerExit::Cancelled),
+        permit = sender.reserve() => permit.map_err(|_| WorkerExit::RequestChannelClosed)?,
     };
     if cancellation_requested(cancellation) {
-        return None;
+        return Err(WorkerExit::Cancelled);
     }
 
     let (ack_sender, ack_receiver) = oneshot::channel();
     permit.send(make_request(ack_sender));
     tokio::select! {
         biased;
-        _ = wait_for_cancellation(cancellation) => None,
-        ack = ack_receiver => ack.ok(),
+        _ = wait_for_cancellation(cancellation) => Err(WorkerExit::Cancelled),
+        ack = ack_receiver => ack.map_err(|_| WorkerExit::AcknowledgementLost),
     }
 }
 
@@ -113,7 +125,7 @@ async fn submit_task_input(
     sender: &TaskRequestSender,
     cancellation: &mut watch::Receiver<bool>,
     input: GovernedTaskReducerInput,
-) -> Option<DomainAck> {
+) -> Result<DomainAck, WorkerExit> {
     submit_with_ack(sender, cancellation, |ack| TaskRequest { input, ack }).await
 }
 
@@ -121,7 +133,7 @@ async fn submit_approval_input(
     sender: &ApprovalRequestSender,
     cancellation: &mut watch::Receiver<bool>,
     input: GovernedApprovalReducerInput,
-) -> Option<DomainAck> {
+) -> Result<DomainAck, WorkerExit> {
     submit_with_ack(sender, cancellation, |ack| ApprovalRequest { input, ack }).await
 }
 
@@ -140,6 +152,141 @@ fn directive_from_ack(captured_generation: u64, ack: DomainAck) -> WorkerDirecti
             generation: ack.generation,
         },
     }
+}
+
+async fn cancellable<T>(
+    cancellation: &mut watch::Receiver<bool>,
+    future: impl Future<Output = T>,
+) -> Result<T, WorkerExit> {
+    tokio::select! {
+        biased;
+        _ = wait_for_cancellation(cancellation) => Err(WorkerExit::Cancelled),
+        output = future => Ok(output),
+    }
+}
+
+async fn run_task_worker_via<Source, Session, Open, Next, Backoff>(
+    source: &mut Source,
+    sender: TaskRequestSender,
+    mut cancellation: watch::Receiver<bool>,
+    mut open: Open,
+    mut next: Next,
+    mut backoff: Backoff,
+) -> WorkerExit
+where
+    Source: Send,
+    Session: Send,
+    Open: for<'a> FnMut(
+        &'a mut Source,
+        DriverStage,
+        u64,
+    ) -> BoxFuture<
+        'a,
+        Result<Opened<Session, GovernedTaskReducerInput>, Box<GovernedTaskReducerInput>>,
+    >,
+    Next: for<'a> FnMut(&'a mut Session, u64) -> BoxFuture<'a, GovernedTaskReducerInput>,
+    Backoff: FnMut() -> BoxFuture<'static, ()>,
+{
+    let mut generation = 1_u64;
+    let mut stage = DriverStage::Initial;
+
+    loop {
+        let opened = match cancellable(&mut cancellation, open(source, stage, generation)).await {
+            Ok(opened) => opened,
+            Err(exit) => return exit,
+        };
+        match opened {
+            Ok(Opened {
+                mut session,
+                complete_input,
+            }) => {
+                let ack = match submit_task_input(&sender, &mut cancellation, complete_input).await
+                {
+                    Ok(ack) => ack,
+                    Err(exit) => return exit,
+                };
+                match directive_from_ack(generation, ack) {
+                    WorkerDirective::ContinueLive {
+                        generation: acknowledged_generation,
+                    } => generation = acknowledged_generation,
+                    WorkerDirective::Recover {
+                        generation: recovery_generation,
+                    } => {
+                        generation = recovery_generation;
+                        drop(session);
+                        stage = DriverStage::Recovery;
+                        if let Err(exit) = cancellable(&mut cancellation, backoff()).await {
+                            return exit;
+                        }
+                        continue;
+                    }
+                    WorkerDirective::Stop => return WorkerExit::DomainFatal,
+                }
+
+                loop {
+                    let input = match cancellable(&mut cancellation, next(&mut session, generation))
+                        .await
+                    {
+                        Ok(input) => input,
+                        Err(exit) => return exit,
+                    };
+                    let ack = match submit_task_input(&sender, &mut cancellation, input).await {
+                        Ok(ack) => ack,
+                        Err(exit) => return exit,
+                    };
+                    match directive_from_ack(generation, ack) {
+                        WorkerDirective::ContinueLive {
+                            generation: acknowledged_generation,
+                        } => generation = acknowledged_generation,
+                        WorkerDirective::Recover {
+                            generation: recovery_generation,
+                        } => {
+                            generation = recovery_generation;
+                            break;
+                        }
+                        WorkerDirective::Stop => return WorkerExit::DomainFatal,
+                    }
+                }
+                drop(session);
+            }
+            Err(input) => {
+                let ack = match submit_task_input(&sender, &mut cancellation, *input).await {
+                    Ok(ack) => ack,
+                    Err(exit) => return exit,
+                };
+                match directive_from_ack(generation, ack) {
+                    WorkerDirective::Stop => return WorkerExit::DomainFatal,
+                    WorkerDirective::ContinueLive {
+                        generation: acknowledged_generation,
+                    }
+                    | WorkerDirective::Recover {
+                        generation: acknowledged_generation,
+                    } => generation = acknowledged_generation,
+                }
+            }
+        }
+
+        stage = DriverStage::Recovery;
+        if let Err(exit) = cancellable(&mut cancellation, backoff()).await {
+            return exit;
+        }
+    }
+}
+
+async fn run_task_worker(
+    source: &mut TaskSource,
+    sender: TaskRequestSender,
+    cancellation: watch::Receiver<bool>,
+) -> WorkerExit {
+    run_task_worker_via(
+        source,
+        sender,
+        cancellation,
+        |source, stage, generation| Box::pin(source.open(stage, generation)),
+        |session, generation| Box::pin(next_task_live_input(generation, session)),
+        || Box::pin(tokio::time::sleep(Duration::from_millis(100))),
+    )
+    .await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -843,10 +990,14 @@ fn classify_api_error(code: i32, retryable: bool) -> DriverFailure {
 mod tests {
     use std::{
         cell::{Cell, RefCell},
+        collections::VecDeque,
         future::Future,
         num::NonZeroU32,
         pin::pin,
-        sync::Arc,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         task::{Context, Poll, Waker},
     };
 
@@ -858,9 +1009,9 @@ mod tests {
 
     use super::{
         ApprovalRequest, DomainAck, DriverFailure, DriverStage, GovernedStateSessionCore, Opened,
-        TaskRequest, WorkerDirective, approval_complete_input_from_parts, approval_failure_input,
-        approval_live_input_from_parts, approval_live_input_from_result, classify_approval_error,
-        classify_task_error, clone_shared_pair, directive_from_ack,
+        TaskRequest, WorkerDirective, WorkerExit, approval_complete_input_from_parts,
+        approval_failure_input, approval_live_input_from_parts, approval_live_input_from_result,
+        classify_approval_error, classify_task_error, clone_shared_pair, directive_from_ack,
         governed_state_request_channels, open_source_via, submit_approval_input, submit_task_input,
         task_complete_input_from_parts, task_failure_input, task_live_input_from_result,
         task_live_input_from_update,
@@ -929,6 +1080,677 @@ mod tests {
             },
             run: None,
         }
+    }
+
+    struct WorkerTestOpening {
+        next: Option<GovernedTaskReducerInput>,
+    }
+
+    struct WorkerTestSource {
+        openings: VecDeque<WorkerTestOpening>,
+        open_calls: Arc<Mutex<Vec<(DriverStage, u64)>>>,
+        next_calls: Arc<AtomicUsize>,
+        dropped_sessions: Arc<AtomicUsize>,
+    }
+
+    struct WorkerTestSession {
+        next: Option<GovernedTaskReducerInput>,
+        next_calls: Arc<AtomicUsize>,
+        dropped_sessions: Arc<AtomicUsize>,
+    }
+
+    impl Drop for WorkerTestSession {
+        fn drop(&mut self) {
+            self.dropped_sessions.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn worker_test_open(
+        source: &mut WorkerTestSource,
+        stage: DriverStage,
+        generation: u64,
+    ) -> super::BoxFuture<
+        '_,
+        Result<Opened<WorkerTestSession, GovernedTaskReducerInput>, Box<GovernedTaskReducerInput>>,
+    > {
+        source
+            .open_calls
+            .lock()
+            .expect("worker open-call log mutex must not be poisoned")
+            .push((stage, generation));
+        let opening = source
+            .openings
+            .pop_front()
+            .expect("worker test must provide an opening");
+        let session = WorkerTestSession {
+            next: opening.next,
+            next_calls: Arc::clone(&source.next_calls),
+            dropped_sessions: Arc::clone(&source.dropped_sessions),
+        };
+        Box::pin(std::future::ready(Ok(Opened {
+            session,
+            complete_input: GovernedTaskReducerInput::CompleteRebaseline {
+                generation,
+                position: super::GovernedTaskDomainPosition::new(
+                    format!("epoch:worker:{generation}"),
+                    generation,
+                ),
+                tasks: std::collections::BTreeMap::new(),
+            },
+        })))
+    }
+
+    fn worker_test_next(
+        session: &mut WorkerTestSession,
+        _generation: u64,
+    ) -> super::BoxFuture<'_, GovernedTaskReducerInput> {
+        session.next_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::ready(
+            session
+                .next
+                .take()
+                .expect("worker test session must provide one live outcome"),
+        ))
+    }
+
+    fn pending_worker_next(
+        session: &mut WorkerTestSession,
+        _generation: u64,
+    ) -> super::BoxFuture<'_, GovernedTaskReducerInput> {
+        session.next_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::pending())
+    }
+
+    fn ready_worker_backoff() -> super::BoxFuture<'static, ()> {
+        Box::pin(std::future::ready(()))
+    }
+
+    struct PendingWorkerOpenSource {
+        open_calls: Arc<AtomicUsize>,
+    }
+
+    fn pending_worker_open(
+        source: &mut PendingWorkerOpenSource,
+        _stage: DriverStage,
+        _generation: u64,
+    ) -> super::BoxFuture<
+        '_,
+        Result<Opened<WorkerTestSession, GovernedTaskReducerInput>, Box<GovernedTaskReducerInput>>,
+    > {
+        source.open_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::pending())
+    }
+
+    #[test]
+    fn r9b2b_task_worker_cancellation_interrupts_pending_open_without_request() {
+        let open_calls = Arc::new(AtomicUsize::new(0));
+        let mut source = PendingWorkerOpenSource {
+            open_calls: Arc::clone(&open_calls),
+        };
+        let (task_sender, mut task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        let (cancel_sender, cancellation) = tokio::sync::watch::channel(false);
+        let mut worker = pin!(super::run_task_worker_via(
+            &mut source,
+            task_sender,
+            cancellation,
+            pending_worker_open,
+            worker_test_next,
+            ready_worker_backoff,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            task_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        assert!(cancel_sender.send(true).is_ok());
+        assert!(matches!(
+            worker.as_mut().poll(&mut context),
+            Poll::Ready(WorkerExit::Cancelled)
+        ));
+        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            task_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn r9b2b_task_worker_cancellation_interrupts_pending_live_next_without_second_request() {
+        let open_calls = Arc::new(Mutex::new(Vec::new()));
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let dropped_sessions = Arc::new(AtomicUsize::new(0));
+        let mut source = WorkerTestSource {
+            openings: VecDeque::from([WorkerTestOpening { next: None }]),
+            open_calls,
+            next_calls: Arc::clone(&next_calls),
+            dropped_sessions: Arc::clone(&dropped_sessions),
+        };
+        let (task_sender, mut task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        let (cancel_sender, cancellation) = tokio::sync::watch::channel(false);
+        let mut worker = pin!(super::run_task_worker_via(
+            &mut source,
+            task_sender,
+            cancellation,
+            worker_test_open,
+            pending_worker_next,
+            ready_worker_backoff,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let complete = task_receiver
+            .try_recv()
+            .expect("initial open must submit complete rebaseline");
+        assert!(
+            complete
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Live,
+                    generation: 1,
+                    recovery_remaining: 3,
+                })
+                .is_ok()
+        );
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(next_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped_sessions.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            task_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        assert!(cancel_sender.send(true).is_ok());
+        assert!(matches!(
+            worker.as_mut().poll(&mut context),
+            Poll::Ready(WorkerExit::Cancelled)
+        ));
+        assert_eq!(next_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped_sessions.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            task_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn r9b2b_task_worker_cancellation_interrupts_pending_backoff_without_recovery_open() {
+        let open_calls = Arc::new(Mutex::new(Vec::new()));
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let dropped_sessions = Arc::new(AtomicUsize::new(0));
+        let backoff_calls = Arc::new(AtomicUsize::new(0));
+        let mut source = WorkerTestSource {
+            openings: VecDeque::from([WorkerTestOpening {
+                next: Some(GovernedTaskReducerInput::RecoverableFailure {
+                    generation: 1,
+                    cause: GovernedRecoverableCause::TransportUnavailable,
+                }),
+            }]),
+            open_calls: Arc::clone(&open_calls),
+            next_calls: Arc::clone(&next_calls),
+            dropped_sessions: Arc::clone(&dropped_sessions),
+        };
+        let (task_sender, mut task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        let (cancel_sender, cancellation) = tokio::sync::watch::channel(false);
+        let pending_backoff = {
+            let backoff_calls = Arc::clone(&backoff_calls);
+            move || {
+                backoff_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(std::future::pending()) as super::BoxFuture<'static, ()>
+            }
+        };
+        let mut worker = pin!(super::run_task_worker_via(
+            &mut source,
+            task_sender,
+            cancellation,
+            worker_test_open,
+            worker_test_next,
+            pending_backoff,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let complete = task_receiver
+            .try_recv()
+            .expect("initial open must submit complete rebaseline");
+        assert!(
+            complete
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Live,
+                    generation: 1,
+                    recovery_remaining: 3,
+                })
+                .is_ok()
+        );
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let failure = task_receiver
+            .try_recv()
+            .expect("live next must submit its recoverable failure");
+        assert!(matches!(
+            failure.input,
+            GovernedTaskReducerInput::RecoverableFailure { generation: 1, .. }
+        ));
+        assert!(
+            failure
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Stale,
+                    generation: 2,
+                    recovery_remaining: 2,
+                })
+                .is_ok()
+        );
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(backoff_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dropped_sessions.load(Ordering::SeqCst), 1);
+        assert_eq!(next_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *open_calls
+                .lock()
+                .expect("worker open-call log mutex must not be poisoned"),
+            vec![(DriverStage::Initial, 1)]
+        );
+        assert!(matches!(
+            task_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        assert!(cancel_sender.send(true).is_ok());
+        assert!(matches!(
+            worker.as_mut().poll(&mut context),
+            Poll::Ready(WorkerExit::Cancelled)
+        ));
+        assert_eq!(backoff_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *open_calls
+                .lock()
+                .expect("worker open-call log mutex must not be poisoned"),
+            vec![(DriverStage::Initial, 1)]
+        );
+        assert!(matches!(
+            task_receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn r9b2b_task_worker_reports_request_channel_closed_without_poll_or_backoff() {
+        let open_calls = Arc::new(Mutex::new(Vec::new()));
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let dropped_sessions = Arc::new(AtomicUsize::new(0));
+        let backoff_calls = Arc::new(AtomicUsize::new(0));
+        let mut source = WorkerTestSource {
+            openings: VecDeque::from([WorkerTestOpening { next: None }]),
+            open_calls: Arc::clone(&open_calls),
+            next_calls: Arc::clone(&next_calls),
+            dropped_sessions: Arc::clone(&dropped_sessions),
+        };
+        let (task_sender, task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        drop(task_receiver);
+        let (_cancel_sender, cancellation) = tokio::sync::watch::channel(false);
+        let counted_backoff = {
+            let backoff_calls = Arc::clone(&backoff_calls);
+            move || {
+                backoff_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(std::future::ready(())) as super::BoxFuture<'static, ()>
+            }
+        };
+        let mut worker = pin!(super::run_task_worker_via(
+            &mut source,
+            task_sender,
+            cancellation,
+            worker_test_open,
+            worker_test_next,
+            counted_backoff,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            worker.as_mut().poll(&mut context),
+            Poll::Ready(WorkerExit::RequestChannelClosed)
+        ));
+        assert_eq!(
+            *open_calls
+                .lock()
+                .expect("worker open-call log mutex must not be poisoned"),
+            vec![(DriverStage::Initial, 1)]
+        );
+        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backoff_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped_sessions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn r9b2b_task_worker_reports_acknowledgement_lost_without_poll_or_backoff() {
+        let open_calls = Arc::new(Mutex::new(Vec::new()));
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let dropped_sessions = Arc::new(AtomicUsize::new(0));
+        let backoff_calls = Arc::new(AtomicUsize::new(0));
+        let mut source = WorkerTestSource {
+            openings: VecDeque::from([WorkerTestOpening { next: None }]),
+            open_calls: Arc::clone(&open_calls),
+            next_calls: Arc::clone(&next_calls),
+            dropped_sessions: Arc::clone(&dropped_sessions),
+        };
+        let (task_sender, mut task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        let (_cancel_sender, cancellation) = tokio::sync::watch::channel(false);
+        let counted_backoff = {
+            let backoff_calls = Arc::clone(&backoff_calls);
+            move || {
+                backoff_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(std::future::ready(())) as super::BoxFuture<'static, ()>
+            }
+        };
+        let mut worker = pin!(super::run_task_worker_via(
+            &mut source,
+            task_sender,
+            cancellation,
+            worker_test_open,
+            worker_test_next,
+            counted_backoff,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let complete = task_receiver
+            .try_recv()
+            .expect("initial open must submit complete rebaseline");
+        drop(complete);
+        assert!(matches!(
+            worker.as_mut().poll(&mut context),
+            Poll::Ready(WorkerExit::AcknowledgementLost)
+        ));
+        assert_eq!(
+            *open_calls
+                .lock()
+                .expect("worker open-call log mutex must not be poisoned"),
+            vec![(DriverStage::Initial, 1)]
+        );
+        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backoff_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped_sessions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn r9b2b_task_worker_generation_mismatch_retires_session_and_recovers_at_ack_generation() {
+        let open_calls = Arc::new(Mutex::new(Vec::new()));
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let dropped_sessions = Arc::new(AtomicUsize::new(0));
+        let backoff_calls = Arc::new(AtomicUsize::new(0));
+        let mut source = WorkerTestSource {
+            openings: VecDeque::from([
+                WorkerTestOpening {
+                    next: Some(GovernedTaskReducerInput::Heartbeat { generation: 1 }),
+                },
+                WorkerTestOpening { next: None },
+            ]),
+            open_calls: Arc::clone(&open_calls),
+            next_calls: Arc::clone(&next_calls),
+            dropped_sessions: Arc::clone(&dropped_sessions),
+        };
+        let (task_sender, mut task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        let (_cancel_sender, cancellation) = tokio::sync::watch::channel(false);
+        let counted_backoff = {
+            let backoff_calls = Arc::clone(&backoff_calls);
+            move || {
+                backoff_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(std::future::ready(())) as super::BoxFuture<'static, ()>
+            }
+        };
+        let mut worker = pin!(super::run_task_worker_via(
+            &mut source,
+            task_sender,
+            cancellation,
+            worker_test_open,
+            worker_test_next,
+            counted_backoff,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let complete = task_receiver
+            .try_recv()
+            .expect("initial open must submit complete rebaseline");
+        assert!(
+            complete
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Live,
+                    generation: 2,
+                    recovery_remaining: 3,
+                })
+                .is_ok()
+        );
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let recovered = task_receiver
+            .try_recv()
+            .expect("generation mismatch must reopen recovery at ack generation");
+        assert!(matches!(
+            recovered.input,
+            GovernedTaskReducerInput::CompleteRebaseline { generation: 2, .. }
+        ));
+        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped_sessions.load(Ordering::SeqCst), 1);
+        assert_eq!(backoff_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *open_calls
+                .lock()
+                .expect("worker open-call log mutex must not be poisoned"),
+            vec![(DriverStage::Initial, 1), (DriverStage::Recovery, 2)]
+        );
+
+        assert!(
+            recovered
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Fatal,
+                    generation: 2,
+                    recovery_remaining: 0,
+                })
+                .is_ok()
+        );
+        assert!(matches!(
+            worker.as_mut().poll(&mut context),
+            Poll::Ready(WorkerExit::DomainFatal)
+        ));
+        assert_eq!(dropped_sessions.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn r9b2b_task_worker_opens_completes_then_reads_live_once_after_ack() {
+        let open_calls = Arc::new(Mutex::new(Vec::new()));
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let dropped_sessions = Arc::new(AtomicUsize::new(0));
+        let mut source = WorkerTestSource {
+            openings: VecDeque::from([WorkerTestOpening {
+                next: Some(GovernedTaskReducerInput::Heartbeat { generation: 1 }),
+            }]),
+            open_calls: Arc::clone(&open_calls),
+            next_calls: Arc::clone(&next_calls),
+            dropped_sessions: Arc::clone(&dropped_sessions),
+        };
+        let (task_sender, mut task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        let (_cancel_sender, cancellation) = tokio::sync::watch::channel(false);
+        let mut worker = pin!(super::run_task_worker_via(
+            &mut source,
+            task_sender,
+            cancellation,
+            worker_test_open,
+            worker_test_next,
+            ready_worker_backoff,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let complete = task_receiver
+            .try_recv()
+            .expect("initial open must submit one complete rebaseline");
+        assert!(matches!(
+            complete.input,
+            GovernedTaskReducerInput::CompleteRebaseline { generation: 1, .. }
+        ));
+        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            complete
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Live,
+                    generation: 1,
+                    recovery_remaining: 3,
+                })
+                .is_ok()
+        );
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let live = task_receiver
+            .try_recv()
+            .expect("matching live ack must permit exactly one next read");
+        assert!(matches!(
+            live.input,
+            GovernedTaskReducerInput::Heartbeat { generation: 1 }
+        ));
+        assert_eq!(next_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            live.ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Fatal,
+                    generation: 1,
+                    recovery_remaining: 0,
+                })
+                .is_ok()
+        );
+        assert!(matches!(
+            worker.as_mut().poll(&mut context),
+            Poll::Ready(WorkerExit::DomainFatal)
+        ));
+        assert_eq!(
+            *open_calls
+                .lock()
+                .expect("worker open-call log mutex must not be poisoned"),
+            vec![(DriverStage::Initial, 1)]
+        );
+        assert_eq!(dropped_sessions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn r9b2b_task_worker_drops_live_session_before_backoff_and_recovery_open() {
+        let open_calls = Arc::new(Mutex::new(Vec::new()));
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let dropped_sessions = Arc::new(AtomicUsize::new(0));
+        let backoff_calls = Arc::new(AtomicUsize::new(0));
+        let mut source = WorkerTestSource {
+            openings: VecDeque::from([
+                WorkerTestOpening {
+                    next: Some(GovernedTaskReducerInput::RecoverableFailure {
+                        generation: 1,
+                        cause: GovernedRecoverableCause::TransportUnavailable,
+                    }),
+                },
+                WorkerTestOpening { next: None },
+            ]),
+            open_calls: Arc::clone(&open_calls),
+            next_calls: Arc::clone(&next_calls),
+            dropped_sessions: Arc::clone(&dropped_sessions),
+        };
+        let (task_sender, mut task_receiver, _approval_sender, _approval_receiver) =
+            governed_state_request_channels();
+        let (_cancel_sender, cancellation) = tokio::sync::watch::channel(false);
+        let counted_backoff = {
+            let backoff_calls = Arc::clone(&backoff_calls);
+            move || {
+                backoff_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(std::future::ready(())) as super::BoxFuture<'static, ()>
+            }
+        };
+        let mut worker = pin!(super::run_task_worker_via(
+            &mut source,
+            task_sender,
+            cancellation,
+            worker_test_open,
+            worker_test_next,
+            counted_backoff,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let complete = task_receiver
+            .try_recv()
+            .expect("initial open must submit complete rebaseline");
+        assert!(
+            complete
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Live,
+                    generation: 1,
+                    recovery_remaining: 3,
+                })
+                .is_ok()
+        );
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let failure = task_receiver
+            .try_recv()
+            .expect("live read must submit its recoverable failure");
+        assert!(matches!(
+            failure.input,
+            GovernedTaskReducerInput::RecoverableFailure { generation: 1, .. }
+        ));
+        assert!(
+            failure
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Stale,
+                    generation: 2,
+                    recovery_remaining: 2,
+                })
+                .is_ok()
+        );
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let recovered = task_receiver
+            .try_recv()
+            .expect("recovery open must submit a complete rebaseline");
+        assert!(matches!(
+            recovered.input,
+            GovernedTaskReducerInput::CompleteRebaseline { generation: 2, .. }
+        ));
+        assert_eq!(dropped_sessions.load(Ordering::SeqCst), 1);
+        assert_eq!(backoff_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(next_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *open_calls
+                .lock()
+                .expect("worker open-call log mutex must not be poisoned"),
+            vec![(DriverStage::Initial, 1), (DriverStage::Recovery, 2)]
+        );
+        assert!(
+            recovered
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Fatal,
+                    generation: 2,
+                    recovery_remaining: 0,
+                })
+                .is_ok()
+        );
+        assert!(matches!(
+            worker.as_mut().poll(&mut context),
+            Poll::Ready(WorkerExit::DomainFatal)
+        ));
+        assert_eq!(dropped_sessions.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1204,7 +2026,7 @@ mod tests {
         assert!(request.ack.send(expected).is_ok());
         assert!(matches!(
             submit.as_mut().poll(&mut context),
-            Poll::Ready(Some(actual)) if actual == expected
+            Poll::Ready(Ok(actual)) if actual == expected
         ));
     }
 
@@ -1233,7 +2055,7 @@ mod tests {
         assert!(cancel_sender.send(true).is_ok());
         assert!(matches!(
             submit.as_mut().poll(&mut context),
-            Poll::Ready(None)
+            Poll::Ready(Err(WorkerExit::Cancelled))
         ));
         let _prefilled = task_receiver
             .try_recv()
@@ -1267,7 +2089,7 @@ mod tests {
         drop(cancel_sender);
         assert!(matches!(
             submit.as_mut().poll(&mut context),
-            Poll::Ready(None)
+            Poll::Ready(Err(WorkerExit::Cancelled))
         ));
         assert!(
             request
@@ -1310,7 +2132,7 @@ mod tests {
         assert!(cancel_sender.send(true).is_ok());
         assert!(matches!(
             submit.as_mut().poll(&mut context),
-            Poll::Ready(None)
+            Poll::Ready(Err(WorkerExit::Cancelled))
         ));
     }
 
@@ -1339,7 +2161,7 @@ mod tests {
         drop(cancel_sender);
         assert!(matches!(
             submit.as_mut().poll(&mut context),
-            Poll::Ready(None)
+            Poll::Ready(Err(WorkerExit::Cancelled))
         ));
         let _prefilled = task_receiver
             .try_recv()
