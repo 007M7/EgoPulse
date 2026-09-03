@@ -12,8 +12,10 @@ use crate::governed_state::{
     GovernedTaskDomainState, GovernedTaskReducerInput,
 };
 use crate::{
-    ApprovalQueueSession, ClientApprovalWatchError, ClientAttachment, ClientGovernedTaskError,
-    GovernedProjectionPosition, GovernedTaskSession, GovernedTaskState,
+    ApprovalQueueSession, ApprovalWatchClassification, ApprovalWatchUpdate,
+    ClientApprovalWatchError, ClientAttachment, ClientGovernedTaskError,
+    GovernedProjectionPosition, GovernedTaskSession, GovernedTaskState, GovernedTaskUpdate,
+    TaskWatchClassification,
 };
 
 const GOVERNED_STATE_REQUEST_CAPACITY: usize = 1;
@@ -440,6 +442,52 @@ pub(crate) fn task_complete_input_from_session(
     task_complete_input_from_parts(generation, session.position(), session.tasks())
 }
 
+async fn next_task_live_input(
+    generation: u64,
+    session: &mut GovernedTaskSession,
+) -> GovernedTaskReducerInput {
+    task_live_input_from_result(generation, session.next_update().await)
+}
+
+fn task_live_input_from_result(
+    generation: u64,
+    result: Result<GovernedTaskUpdate, ClientGovernedTaskError>,
+) -> GovernedTaskReducerInput {
+    match result {
+        Ok(update) => task_live_input_from_update(generation, update),
+        Err(error) => task_failure_input(
+            DriverStage::Live,
+            generation,
+            classify_task_error(DriverStage::Live, &error),
+        ),
+    }
+}
+
+fn task_live_input_from_update(
+    generation: u64,
+    update: GovernedTaskUpdate,
+) -> GovernedTaskReducerInput {
+    match update.classification {
+        TaskWatchClassification::Applied => match update.task {
+            Some(task) => GovernedTaskReducerInput::Applied {
+                generation,
+                position: GovernedTaskDomainPosition::new(
+                    update.position.epoch,
+                    update.position.sequence,
+                ),
+                task,
+            },
+            None => GovernedTaskReducerInput::Fatal {
+                generation,
+                cause: GovernedFatalCause::ProjectionIntegrityFailure,
+            },
+        },
+        TaskWatchClassification::Replay => GovernedTaskReducerInput::Replay { generation },
+        TaskWatchClassification::Heartbeat => GovernedTaskReducerInput::Heartbeat { generation },
+        TaskWatchClassification::ResetRequired => GovernedTaskReducerInput::Reset { generation },
+    }
+}
+
 fn task_complete_input_from_parts<'a>(
     generation: u64,
     position: &GovernedProjectionPosition,
@@ -488,6 +536,127 @@ fn approval_complete_input_from_parts<'a>(
         generation,
         position: GovernedApprovalDomainPosition::new(position.epoch.clone(), position.sequence),
         approvals,
+    }
+}
+
+async fn next_approval_live_input(
+    generation: u64,
+    session: &mut ApprovalQueueSession,
+) -> GovernedApprovalReducerInput {
+    let result = session.next_update().await;
+    approval_live_input_from_result(generation, result, |approval_request_id| {
+        session
+            .actionable_approvals()
+            .into_iter()
+            .find_map(|approval| {
+                let view = approval.view();
+                (view.approval_request_id == approval_request_id).then(|| {
+                    GovernedApprovalState::new(
+                        view.approval_request_id.as_str(),
+                        view.task_id.as_str(),
+                    )
+                })
+            })
+    })
+}
+
+fn approval_live_input_from_result<F>(
+    generation: u64,
+    result: Result<Option<ApprovalWatchUpdate>, ClientApprovalWatchError>,
+    lookup_safe: F,
+) -> GovernedApprovalReducerInput
+where
+    F: FnOnce(&str) -> Option<GovernedApprovalState>,
+{
+    match result {
+        Ok(Some(update)) => match update.classification {
+            ApprovalWatchClassification::Applied => {
+                let Some(view) = update.view.as_ref() else {
+                    return GovernedApprovalReducerInput::Fatal {
+                        generation,
+                        cause: GovernedFatalCause::ProjectionIntegrityFailure,
+                    };
+                };
+                let approval_request_id = view.approval_request_id.as_str();
+                approval_live_input_from_parts(
+                    generation,
+                    ApprovalWatchClassification::Applied,
+                    &update.position,
+                    Some(approval_request_id),
+                    lookup_safe(approval_request_id),
+                )
+            }
+            classification => approval_live_input_from_parts(
+                generation,
+                classification,
+                &update.position,
+                None,
+                None,
+            ),
+        },
+        Ok(None) => {
+            let error = ClientApprovalWatchError::UnexpectedEof;
+            approval_failure_input(
+                DriverStage::Live,
+                generation,
+                classify_approval_error(DriverStage::Live, &error),
+            )
+        }
+        Err(error) => approval_failure_input(
+            DriverStage::Live,
+            generation,
+            classify_approval_error(DriverStage::Live, &error),
+        ),
+    }
+}
+
+fn approval_live_input_from_parts(
+    generation: u64,
+    classification: ApprovalWatchClassification,
+    position: &ProjectionPosition,
+    applied_approval_request_id: Option<&str>,
+    actionable: Option<GovernedApprovalState>,
+) -> GovernedApprovalReducerInput {
+    match classification {
+        ApprovalWatchClassification::Applied => {
+            let Some(approval_request_id) = applied_approval_request_id else {
+                return GovernedApprovalReducerInput::Fatal {
+                    generation,
+                    cause: GovernedFatalCause::ProjectionIntegrityFailure,
+                };
+            };
+            match actionable {
+                Some(approval) if approval.approval_request_id() == approval_request_id => {
+                    GovernedApprovalReducerInput::Applied {
+                        generation,
+                        position: GovernedApprovalDomainPosition::new(
+                            position.epoch.clone(),
+                            position.sequence,
+                        ),
+                        approval,
+                    }
+                }
+                Some(_) => GovernedApprovalReducerInput::Fatal {
+                    generation,
+                    cause: GovernedFatalCause::ProjectionIntegrityFailure,
+                },
+                None => GovernedApprovalReducerInput::Remove {
+                    generation,
+                    position: GovernedApprovalDomainPosition::new(
+                        position.epoch.clone(),
+                        position.sequence,
+                    ),
+                    approval_request_id: approval_request_id.to_owned(),
+                },
+            }
+        }
+        ApprovalWatchClassification::Replay => GovernedApprovalReducerInput::Replay { generation },
+        ApprovalWatchClassification::Heartbeat => {
+            GovernedApprovalReducerInput::Heartbeat { generation }
+        }
+        ApprovalWatchClassification::ResetRequired => {
+            GovernedApprovalReducerInput::Reset { generation }
+        }
     }
 }
 
@@ -606,18 +775,20 @@ mod tests {
     use super::{
         ApprovalRequest, DomainAck, DriverFailure, DriverStage, GovernedStateSessionCore, Opened,
         TaskRequest, approval_complete_input_from_parts, approval_failure_input,
-        classify_approval_error, classify_task_error, clone_shared_pair, open_source_via,
-        task_complete_input_from_parts, task_failure_input,
+        approval_live_input_from_parts, approval_live_input_from_result, classify_approval_error,
+        classify_task_error, clone_shared_pair, open_source_via, task_complete_input_from_parts,
+        task_failure_input, task_live_input_from_result, task_live_input_from_update,
     };
     use crate::governed_state::{
-        GovernedApprovalDomainState, GovernedApprovalReducerInput, GovernedFatalCause,
-        GovernedRecoverableCause, GovernedStateComposite, GovernedStateDomain,
+        GovernedApprovalDomainState, GovernedApprovalReducerInput, GovernedApprovalState,
+        GovernedFatalCause, GovernedRecoverableCause, GovernedStateComposite, GovernedStateDomain,
         GovernedStateDomainPhase, GovernedStateReason, GovernedTaskDomainState,
         GovernedTaskReducerInput,
     };
     use crate::{
-        ClientApprovalWatchError, ClientGovernedTaskError, GovernedProjectionPosition,
-        GovernedProjectionState, GovernedTaskState,
+        ApprovalWatchClassification, ClientApprovalWatchError, ClientGovernedTaskError,
+        GovernedProjectionPosition, GovernedProjectionState, GovernedTaskState, GovernedTaskUpdate,
+        TaskWatchClassification,
     };
 
     const STAGES: [DriverStage; 3] = [
@@ -672,6 +843,219 @@ mod tests {
             },
             run: None,
         }
+    }
+
+    #[test]
+    fn r9b2b_task_live_update_maps_all_classifications_and_rejects_missing_applied_task() {
+        let position = GovernedProjectionPosition {
+            epoch: "epoch:task-live".to_owned(),
+            sequence: 17,
+        };
+        let task = governed_task("task:live", &position);
+
+        let applied = task_live_input_from_update(
+            5,
+            GovernedTaskUpdate {
+                classification: TaskWatchClassification::Applied,
+                position: position.clone(),
+                task: Some(task.clone()),
+            },
+        );
+        assert!(matches!(
+            applied,
+            GovernedTaskReducerInput::Applied {
+                generation: 5,
+                position: ref mapped_position,
+                task: ref mapped_task,
+            } if mapped_position.epoch() == "epoch:task-live"
+                && mapped_position.sequence() == 17
+                && mapped_task == &task
+        ));
+
+        assert!(matches!(
+            task_live_input_from_update(
+                5,
+                GovernedTaskUpdate {
+                    classification: TaskWatchClassification::Replay,
+                    position: position.clone(),
+                    task: None,
+                },
+            ),
+            GovernedTaskReducerInput::Replay { generation: 5 }
+        ));
+        assert!(matches!(
+            task_live_input_from_update(
+                5,
+                GovernedTaskUpdate {
+                    classification: TaskWatchClassification::Heartbeat,
+                    position: position.clone(),
+                    task: None,
+                },
+            ),
+            GovernedTaskReducerInput::Heartbeat { generation: 5 }
+        ));
+        assert!(matches!(
+            task_live_input_from_update(
+                5,
+                GovernedTaskUpdate {
+                    classification: TaskWatchClassification::ResetRequired,
+                    position: position.clone(),
+                    task: None,
+                },
+            ),
+            GovernedTaskReducerInput::Reset { generation: 5 }
+        ));
+
+        assert!(matches!(
+            task_live_input_from_update(
+                5,
+                GovernedTaskUpdate {
+                    classification: TaskWatchClassification::Applied,
+                    position,
+                    task: None,
+                },
+            ),
+            GovernedTaskReducerInput::Fatal {
+                generation: 5,
+                cause: GovernedFatalCause::ProjectionIntegrityFailure,
+            }
+        ));
+    }
+
+    #[test]
+    fn r9b2b_approval_live_update_maps_applied_remove_replay_heartbeat_reset_and_eof() {
+        let position = ProjectionPosition {
+            epoch: "epoch:approval-live".to_owned(),
+            sequence: 23,
+            projected_at: None,
+        };
+
+        assert!(matches!(
+            approval_live_input_from_parts(
+                9,
+                ApprovalWatchClassification::Applied,
+                &position,
+                Some("approval:1"),
+                Some(GovernedApprovalState::new("approval:1", "task:1")),
+            ),
+            GovernedApprovalReducerInput::Applied {
+                generation: 9,
+                position: ref mapped_position,
+                approval: ref mapped_approval,
+            } if mapped_position.epoch() == "epoch:approval-live"
+                && mapped_position.sequence() == 23
+                && mapped_approval.approval_request_id() == "approval:1"
+                && mapped_approval.task_id() == "task:1"
+        ));
+        assert!(matches!(
+            approval_live_input_from_parts(
+                9,
+                ApprovalWatchClassification::Applied,
+                &position,
+                Some("approval:1"),
+                None,
+            ),
+            GovernedApprovalReducerInput::Remove {
+                generation: 9,
+                position: ref mapped_position,
+                ref approval_request_id,
+            } if mapped_position.epoch() == "epoch:approval-live"
+                && mapped_position.sequence() == 23
+                && approval_request_id == "approval:1"
+        ));
+        assert!(matches!(
+            approval_live_input_from_parts(
+                9,
+                ApprovalWatchClassification::Replay,
+                &position,
+                None,
+                None,
+            ),
+            GovernedApprovalReducerInput::Replay { generation: 9 }
+        ));
+        assert!(matches!(
+            approval_live_input_from_parts(
+                9,
+                ApprovalWatchClassification::Heartbeat,
+                &position,
+                None,
+                None,
+            ),
+            GovernedApprovalReducerInput::Heartbeat { generation: 9 }
+        ));
+        assert!(matches!(
+            approval_live_input_from_parts(
+                9,
+                ApprovalWatchClassification::ResetRequired,
+                &position,
+                None,
+                None,
+            ),
+            GovernedApprovalReducerInput::Reset { generation: 9 }
+        ));
+        assert!(matches!(
+            approval_live_input_from_parts(
+                9,
+                ApprovalWatchClassification::Applied,
+                &position,
+                None,
+                None,
+            ),
+            GovernedApprovalReducerInput::Fatal {
+                generation: 9,
+                cause: GovernedFatalCause::ProjectionIntegrityFailure,
+            }
+        ));
+        assert!(matches!(
+            approval_failure_input(
+                DriverStage::Live,
+                9,
+                DriverFailure::Recoverable(GovernedRecoverableCause::UnexpectedEof),
+            ),
+            GovernedApprovalReducerInput::RecoverableFailure {
+                generation: 9,
+                cause: GovernedRecoverableCause::UnexpectedEof,
+            }
+        ));
+    }
+
+    #[test]
+    fn r9b2b_live_result_seams_fix_error_and_eof_mapping_to_live_stage() {
+        assert!(matches!(
+            task_live_input_from_result(12, Err(ClientGovernedTaskError::UnexpectedEof)),
+            GovernedTaskReducerInput::RecoverableFailure {
+                generation: 12,
+                cause: GovernedRecoverableCause::UnexpectedEof,
+            }
+        ));
+
+        let lookup_calls = Cell::new(0_u32);
+        let eof = approval_live_input_from_result(13, Ok(None), |_| {
+            lookup_calls.set(lookup_calls.get() + 1);
+            None
+        });
+        assert!(matches!(
+            eof,
+            GovernedApprovalReducerInput::RecoverableFailure {
+                generation: 13,
+                cause: GovernedRecoverableCause::UnexpectedEof,
+            }
+        ));
+        assert_eq!(lookup_calls.get(), 0);
+
+        let reset = approval_live_input_from_result(
+            14,
+            Err(ClientApprovalWatchError::ResetBarrier),
+            |_| {
+                lookup_calls.set(lookup_calls.get() + 1);
+                None
+            },
+        );
+        assert!(matches!(
+            reset,
+            GovernedApprovalReducerInput::Reset { generation: 14 }
+        ));
+        assert_eq!(lookup_calls.get(), 0);
     }
 
     #[test]
