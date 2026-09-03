@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use egopulse_client_kernel::KernelError;
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::LocalApiErrorCode;
@@ -10,9 +10,120 @@ use crate::governed_state::{
     GovernedTaskReducerInput,
 };
 use crate::{
-    ApprovalQueueSession, ClientApprovalWatchError, ClientGovernedTaskError,
+    ApprovalQueueSession, ClientApprovalWatchError, ClientAttachment, ClientGovernedTaskError,
     GovernedProjectionPosition, GovernedTaskSession, GovernedTaskState,
 };
+
+struct GovernedStateSources {
+    task: TaskSource,
+    approval: ApprovalSource,
+}
+
+impl GovernedStateSources {
+    fn new(attachment: Arc<ClientAttachment>) -> Self {
+        let (task, approval) = clone_shared_pair(attachment);
+        Self {
+            task: TaskSource { attachment: task },
+            approval: ApprovalSource {
+                attachment: approval,
+            },
+        }
+    }
+}
+
+struct TaskSource {
+    attachment: Arc<ClientAttachment>,
+}
+
+struct ApprovalSource {
+    attachment: Arc<ClientAttachment>,
+}
+
+struct Opened<Session, Input> {
+    session: Session,
+    complete_input: Input,
+}
+
+type OpenedTaskSource = Opened<GovernedTaskSession, GovernedTaskReducerInput>;
+type OpenedApprovalSource = Opened<ApprovalQueueSession, GovernedApprovalReducerInput>;
+
+fn clone_shared_pair<T>(shared: Arc<T>) -> (Arc<T>, Arc<T>) {
+    (Arc::clone(&shared), shared)
+}
+
+async fn open_source_via<
+    Baseline,
+    Session,
+    Input,
+    Error,
+    ReadBaseline,
+    ReadFuture,
+    OpenSession,
+    OpenFuture,
+    CompleteFromSession,
+    MapError,
+>(
+    read_baseline: ReadBaseline,
+    open_session: OpenSession,
+    complete_from_session: CompleteFromSession,
+    mut map_error: MapError,
+) -> Result<Opened<Session, Input>, Box<Input>>
+where
+    ReadBaseline: FnOnce() -> ReadFuture,
+    ReadFuture: Future<Output = Result<Baseline, Error>>,
+    OpenSession: FnOnce(Baseline) -> OpenFuture,
+    OpenFuture: Future<Output = Result<Session, Error>>,
+    CompleteFromSession: FnOnce(&Session) -> Input,
+    MapError: FnMut(Error) -> Input,
+{
+    let baseline = match read_baseline().await {
+        Ok(baseline) => baseline,
+        Err(error) => return Err(Box::new(map_error(error))),
+    };
+    let session = match open_session(baseline).await {
+        Ok(session) => session,
+        Err(error) => return Err(Box::new(map_error(error))),
+    };
+    let complete_input = complete_from_session(&session);
+    Ok(Opened {
+        session,
+        complete_input,
+    })
+}
+
+impl TaskSource {
+    async fn open(
+        &self,
+        stage: DriverStage,
+        generation: u64,
+    ) -> Result<OpenedTaskSource, Box<GovernedTaskReducerInput>> {
+        open_source_via(
+            || self.attachment.read_governed_task_baseline(),
+            |baseline| self.attachment.open_governed_task_session(baseline),
+            |session| task_complete_input_from_session(generation, session),
+            |error| task_failure_input(stage, generation, classify_task_error(stage, &error)),
+        )
+        .await
+    }
+}
+
+impl ApprovalSource {
+    async fn open(
+        &self,
+        stage: DriverStage,
+        generation: u64,
+    ) -> Result<OpenedApprovalSource, Box<GovernedApprovalReducerInput>> {
+        open_source_via(
+            || self.attachment.read_actionable_approval_queue(),
+            |baseline| self.attachment.open_approval_queue_from(baseline),
+            |session| approval_complete_input_from_session(generation, session),
+            |error| {
+                approval_failure_input(stage, generation, classify_approval_error(stage, &error))
+            },
+        )
+        .await
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DriverStage {
@@ -253,7 +364,14 @@ fn classify_api_error(code: i32, retryable: bool) -> DriverFailure {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::{
+        cell::{Cell, RefCell},
+        future::Future,
+        num::NonZeroU32,
+        pin::pin,
+        sync::Arc,
+        task::{Context, Poll, Waker},
+    };
 
     use egopulse_client_kernel::{KernelError, KernelServerError};
     use egopulse_domain_contracts::v01::egopulse::{
@@ -262,9 +380,9 @@ mod tests {
     };
 
     use super::{
-        DriverFailure, DriverStage, approval_complete_input_from_parts, approval_failure_input,
-        classify_approval_error, classify_task_error, task_complete_input_from_parts,
-        task_failure_input,
+        DriverFailure, DriverStage, Opened, approval_complete_input_from_parts,
+        approval_failure_input, classify_approval_error, classify_task_error, clone_shared_pair,
+        open_source_via, task_complete_input_from_parts, task_failure_input,
     };
     use crate::governed_state::{
         GovernedApprovalDomainState, GovernedApprovalReducerInput, GovernedFatalCause,
@@ -281,6 +399,15 @@ mod tests {
         DriverStage::Recovery,
         DriverStage::Live,
     ];
+
+    fn poll_ready_once<F: Future>(future: F) -> F::Output {
+        let mut context = Context::from_waker(Waker::noop());
+        let mut future = pin!(future);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("ready test future unexpectedly returned Pending"),
+        }
+    }
 
     fn local_api_error(code: i32, retryable: bool) -> LocalApiError {
         LocalApiError {
@@ -319,6 +446,111 @@ mod tests {
             },
             run: None,
         }
+    }
+
+    #[test]
+    fn r9b2a_sources_clone_one_shared_attachment_identity() {
+        let shared = Arc::new(());
+        let (task, approval) = clone_shared_pair(Arc::clone(&shared));
+
+        assert!(Arc::ptr_eq(&shared, &task));
+        assert!(Arc::ptr_eq(&shared, &approval));
+        assert!(Arc::ptr_eq(&task, &approval));
+    }
+
+    #[test]
+    fn r9b2a_open_source_via_orders_read_open_and_complete() {
+        let calls = RefCell::new(Vec::new());
+        let opened = poll_ready_once(open_source_via(
+            || {
+                calls.borrow_mut().push("read");
+                std::future::ready(Ok::<_, ()>("baseline"))
+            },
+            |baseline| {
+                assert_eq!(baseline, "baseline");
+                calls.borrow_mut().push("open");
+                std::future::ready(Ok::<_, ()>("session"))
+            },
+            |session| {
+                assert_eq!(*session, "session");
+                calls.borrow_mut().push("complete");
+                "complete-input"
+            },
+            |()| "mapped-error",
+        ))
+        .expect("ready source opens");
+        let Opened {
+            session,
+            complete_input,
+        } = opened;
+
+        assert_eq!(session, "session");
+        assert_eq!(complete_input, "complete-input");
+        assert_eq!(*calls.borrow(), ["read", "open", "complete"]);
+    }
+
+    #[test]
+    fn r9b2a_task_permission_denial_does_not_open_or_block_approval_source() {
+        let task_open_calls = Cell::new(0_u64);
+        let task_complete_calls = Cell::new(0_u64);
+        let task_result = poll_ready_once(open_source_via(
+            || {
+                std::future::ready(Err::<&str, _>(ClientGovernedTaskError::Kernel(
+                    KernelError::PermissionDenied("task.read".to_owned()),
+                )))
+            },
+            |_baseline| {
+                task_open_calls.set(task_open_calls.get() + 1);
+                std::future::ready(Ok::<_, ClientGovernedTaskError>("task-session"))
+            },
+            |_session| {
+                task_complete_calls.set(task_complete_calls.get() + 1);
+                panic!("permission failure must not complete a Task source")
+            },
+            |error| {
+                task_failure_input(
+                    DriverStage::Initial,
+                    3,
+                    classify_task_error(DriverStage::Initial, &error),
+                )
+            },
+        ));
+        let Err(task_failure) = task_result else {
+            panic!("permission failure must fail the Task source");
+        };
+        assert!(matches!(
+            *task_failure,
+            GovernedTaskReducerInput::Fatal {
+                generation: 3,
+                cause: GovernedFatalCause::PermissionDenied
+            }
+        ));
+        assert_eq!(task_open_calls.get(), 0);
+        assert_eq!(task_complete_calls.get(), 0);
+
+        let approval_calls = RefCell::new(Vec::new());
+        let approval = poll_ready_once(open_source_via(
+            || {
+                approval_calls.borrow_mut().push("read");
+                std::future::ready(Ok::<_, ClientApprovalWatchError>("approval-baseline"))
+            },
+            |baseline| {
+                assert_eq!(baseline, "approval-baseline");
+                approval_calls.borrow_mut().push("open");
+                std::future::ready(Ok::<_, ClientApprovalWatchError>("approval-session"))
+            },
+            |session| {
+                assert_eq!(*session, "approval-session");
+                approval_calls.borrow_mut().push("complete");
+                "approval-input"
+            },
+            |_error| "approval-error",
+        ))
+        .expect("Approval source remains independent");
+
+        assert_eq!(approval.session, "approval-session");
+        assert_eq!(approval.complete_input, "approval-input");
+        assert_eq!(*approval_calls.borrow(), ["read", "open", "complete"]);
     }
 
     fn assert_local_api_classification(code: i32, retryable: bool, expected: DriverFailure) {
