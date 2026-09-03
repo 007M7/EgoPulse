@@ -23,11 +23,11 @@ use egopulse_domain_contracts::{
             GetTaskViewResponse, HarnessApprovalAuthorityResult, HarnessApprovalView,
             HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest,
             ListHarnessApprovalViewsResponse, ListTaskViewsRequest, LocalApiError,
-            PrepareWorkRequest, ProjectionAwaitToken, ProjectionHealth, ProjectionMetadata,
-            ProjectionPosition, RevokeContextSnapshotCommand, SourceDomain, SourceRevision,
-            StreamFrameKind, TaskView, TaskViewStreamFrame, WatchHarnessApprovalViewsRequest,
-            WatchTaskViewsRequest, WorkPreparationPreview, WorkSourceRequest,
-            context_mutation_command, execute_context_mutation_response,
+            PrepareWorkRequest, PrepareWorkResponse, ProjectionAwaitToken, ProjectionHealth,
+            ProjectionMetadata, ProjectionPosition, RevokeContextSnapshotCommand, SourceDomain,
+            SourceRevision, StreamFrameKind, TaskView, TaskViewStreamFrame,
+            WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, WorkPreparationPreview,
+            WorkSourceRequest, context_mutation_command, execute_context_mutation_response,
             get_evidence_graph_response, get_harness_approval_view_response,
             get_task_view_response,
         },
@@ -35,7 +35,9 @@ use egopulse_domain_contracts::{
             HarnessApprovalDecisionStateKind, IssueHarnessApprovalDecisionCommand,
             PolicyDecisionCommand, PolicyDecisionErrorCode, policy_decision_command,
         },
-        task::v1::{TaskCommand, TaskStatus as DomainTaskStatus, task_command},
+        task::v1::{
+            TaskCommand, TaskStatus as DomainTaskStatus, task_command, task_command_result,
+        },
         verdict::v1::{
             FounderVerdictDecision, FounderVerdictStateKind, VerdictCommand, verdict_command,
         },
@@ -62,9 +64,14 @@ const APPROVAL_DECISION_IDEMPOTENCY_SCOPE: &str = "approval-decision";
 const GUIDED_APPROVAL_IDEMPOTENCY_DOMAIN: &[u8] = b"egopulse/guided-approval/v1\0";
 const GET_TASK_VIEW_RPC: &str = "LocalReadModelService/GetTaskView";
 const GET_EVIDENCE_GRAPH_RPC: &str = "LocalReadModelService/GetEvidenceGraph";
+const PREPARE_WORK_RPC: &str = "LocalCommandGatewayService/PrepareWork";
+const CONFIRM_WORK_RPC: &str = "LocalCommandGatewayService/ConfirmWork";
 const APPROVAL_WATCH_BASELINE_PAGE_SIZE: u32 = 100;
 const APPROVAL_WATCH_BASELINE_MAX_PAGES: usize = 100;
 const APPROVAL_WATCH_BASELINE_MAX_VIEWS: usize = 1_000;
+const GUIDED_WORK_MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
+const GUIDED_WORK_MAX_ROUTING_BYTES: usize = 4 * 1024;
+const GUIDED_WORK_MAX_SOURCES: usize = 256;
 
 /// A local client that has completed the frozen session and contract handshake.
 ///
@@ -793,6 +800,204 @@ pub enum ClientWorkError {
     Protocol(&'static str),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuidedWorkSource {
+    pub source_ref: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuidedWorkInput {
+    pub intent: String,
+    pub work_type: String,
+    pub target_scope_ref: String,
+    pub sources: Vec<GuidedWorkSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GuidedWorkNonGoal {
+    ProviderSelectionDeferred,
+    MemoryMutationExcluded,
+}
+
+impl GuidedWorkNonGoal {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ProviderSelectionDeferred => {
+                "provider/model selection is not made by preparation"
+            }
+            Self::MemoryMutationExcluded => "memory is not mutated by preparation",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GovernedWorkNotice {
+    ContextSourceEmpty,
+    ContextSourceOutsideWorkspace,
+    ContextSourceUnreadable,
+    ContextSourceTooLarge,
+}
+
+impl GovernedWorkNotice {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ContextSourceEmpty => "CONTEXT_SOURCE_EMPTY",
+            Self::ContextSourceOutsideWorkspace => "CONTEXT_SOURCE_OUTSIDE_WORKSPACE",
+            Self::ContextSourceUnreadable => "CONTEXT_SOURCE_UNREADABLE",
+            Self::ContextSourceTooLarge => "CONTEXT_SOURCE_TOO_LARGE",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuidedWorkPreview {
+    normalized_intent: String,
+    work_type: String,
+    target_scope_ref: String,
+    non_goals: Vec<GuidedWorkNonGoal>,
+    included_source_count: usize,
+    excluded_source_count: usize,
+    blockers: Vec<GovernedWorkNotice>,
+    gate_ready: bool,
+    ready_for_founder_confirmation: bool,
+}
+
+impl GuidedWorkPreview {
+    #[must_use]
+    pub fn normalized_intent(&self) -> &str {
+        &self.normalized_intent
+    }
+
+    #[must_use]
+    pub fn work_type(&self) -> &str {
+        &self.work_type
+    }
+
+    #[must_use]
+    pub fn target_scope_ref(&self) -> &str {
+        &self.target_scope_ref
+    }
+
+    #[must_use]
+    pub fn non_goals(&self) -> &[GuidedWorkNonGoal] {
+        &self.non_goals
+    }
+
+    #[must_use]
+    pub const fn included_source_count(&self) -> usize {
+        self.included_source_count
+    }
+
+    #[must_use]
+    pub const fn excluded_source_count(&self) -> usize {
+        self.excluded_source_count
+    }
+
+    #[must_use]
+    pub fn blockers(&self) -> &[GovernedWorkNotice] {
+        &self.blockers
+    }
+
+    #[must_use]
+    pub const fn gate_ready(&self) -> bool {
+        self.gate_ready
+    }
+
+    #[must_use]
+    pub const fn ready_for_founder_confirmation(&self) -> bool {
+        self.ready_for_founder_confirmation
+    }
+}
+
+/// A daemon-produced work preview sealed to the authenticated session and to
+/// the exact confirmation command. It is deliberately non-cloneable and has
+/// no public constructor or mutation surface.
+pub struct PreparedWork {
+    authenticated_principal_id: String,
+    session_id: String,
+    preview: WorkPreparationPreview,
+    safe_preview: GuidedWorkPreview,
+    prepare_idempotency_key: String,
+    confirm_idempotency_key: String,
+}
+
+impl PreparedWork {
+    #[must_use]
+    pub fn preview(&self) -> &GuidedWorkPreview {
+        &self.safe_preview
+    }
+}
+
+/// The exact already-sealed confirmation command retained after an uncertain
+/// transport outcome. Replaying this value never prepares again or changes
+/// the idempotency key.
+pub struct RecoverableWorkConfirmation {
+    authenticated_principal_id: String,
+    session_id: String,
+    request: ConfirmWorkRequest,
+    expected_snapshot_id: String,
+    expected_confirmation_binding_sha256: String,
+    expected_work_type: String,
+    expected_target_scope_ref: String,
+}
+
+pub struct RecoverableWorkPreparation {
+    authenticated_principal_id: String,
+    session_id: String,
+    request: PrepareWorkRequest,
+    confirm_idempotency_key: String,
+}
+
+pub enum GuidedWorkPreparationAttempt {
+    Prepared(Box<PreparedWork>),
+    OutcomeUnknown(Box<RecoverableWorkPreparation>),
+}
+
+#[cfg(test)]
+impl GuidedWorkPreparationAttempt {
+    fn expect_prepared(self) -> PreparedWork {
+        match self {
+            Self::Prepared(prepared) => *prepared,
+            Self::OutcomeUnknown(_) => panic!("expected prepared work"),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ClientGuidedWorkError {
+    #[error("client kernel rejected the guided work operation: {0}")]
+    Kernel(#[from] KernelError),
+    #[error("guided work input is invalid: {0}")]
+    InvalidInput(&'static str),
+    #[error("the prepared work is blocked and cannot be confirmed")]
+    Blocked,
+    #[error("authenticated work session changed after preparation")]
+    SessionChanged,
+    #[error("the prepared work binding changed before confirmation")]
+    BindingChanged,
+    #[error("guided work preparation outcome is unknown: {0}")]
+    PreparationOutcomeUnknown(String),
+    #[error("guided work confirmation outcome is unknown: {0}")]
+    ConfirmationOutcomeUnknown(String),
+    #[error("local API rejected the guided work operation: {0:?}")]
+    Api(Box<LocalApiError>),
+    #[error("Task Authority rejected the guided work confirmation")]
+    Authority {
+        error_code: i32,
+        safe_detail_code: String,
+    },
+    #[error("local API returned an incomplete guided work response: {0}")]
+    Protocol(&'static str),
+}
+
+pub enum GuidedWorkConfirmationAttempt {
+    Confirmed(Box<ConfirmedWork>),
+    OutcomeUnknown(Box<RecoverableWorkConfirmation>),
+}
+
 #[derive(Debug, Error)]
 pub enum ClientContextRevokeError {
     #[error("client kernel rejected the Context revoke: {0}")]
@@ -1160,6 +1365,84 @@ impl ClientAttachment {
         .await
     }
 
+    /// Prepares a guided work start from user-owned intent only. Both
+    /// idempotency keys are generated once here and remain private.
+    pub async fn prepare_guided_work(
+        &self,
+        input: GuidedWorkInput,
+    ) -> Result<GuidedWorkPreparationAttempt, ClientGuidedWorkError> {
+        let mut client = self.connection.command_gateway_service();
+        prepare_guided_work_via(
+            &self.kernel,
+            input,
+            SystemTime::now(),
+            move |request| async move {
+                client
+                    .prepare_work(request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    pub async fn replay_guided_work_preparation(
+        &self,
+        recovery: &RecoverableWorkPreparation,
+    ) -> Result<PreparedWork, ClientGuidedWorkError> {
+        let mut client = self.connection.command_gateway_service();
+        replay_guided_work_preparation_via(&self.kernel, recovery, move |request| async move {
+            client
+                .prepare_work(request)
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Consumes one prepared preview and sends its exact sealed confirmation
+    /// command once. A transport failure returns the sealed command so the
+    /// caller can explicitly replay it without preparing again.
+    pub async fn confirm_guided_work(
+        &self,
+        prepared: PreparedWork,
+    ) -> Result<GuidedWorkConfirmationAttempt, ClientGuidedWorkError> {
+        let mut client = self.connection.command_gateway_service();
+        confirm_guided_work_via(
+            &self.kernel,
+            prepared,
+            SystemTime::now(),
+            move |request| async move {
+                client
+                    .confirm_work(request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    /// Replays the exact previously sealed confirmation request. The recovery
+    /// value is borrowed, so another uncertain transport outcome cannot erase
+    /// the only replayable command.
+    pub async fn replay_guided_work_confirmation(
+        &self,
+        recovery: &RecoverableWorkConfirmation,
+    ) -> Result<ConfirmedWork, ClientGuidedWorkError> {
+        let mut client = self.connection.command_gateway_service();
+        replay_guided_work_confirmation_via(&self.kernel, recovery, move |request| async move {
+            client
+                .confirm_work(request)
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
     /// The shared client operation for both CLI and TUI. The request contains
     /// only user intent, scope and explicit source references; all governance
     /// facts are returned by the daemon-owned preparation compiler.
@@ -1224,6 +1507,484 @@ impl ClientAttachment {
             None => Err(ClientWorkError::Protocol("confirm outcome missing")),
         }
     }
+}
+
+async fn prepare_guided_work_via<F, Fut>(
+    kernel: &ClientKernel,
+    input: GuidedWorkInput,
+    now: SystemTime,
+    send: F,
+) -> Result<GuidedWorkPreparationAttempt, ClientGuidedWorkError>
+where
+    F: FnOnce(PrepareWorkRequest) -> Fut,
+    Fut: Future<Output = Result<PrepareWorkResponse, String>>,
+{
+    validate_guided_work_input(&input)?;
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel
+        .profiles()
+        .authorize_rpc(PREPARE_WORK_RPC, &session.granted_permission_codes)?;
+    kernel
+        .profiles()
+        .authorize_rpc(CONFIRM_WORK_RPC, &session.granted_permission_codes)?;
+    let client = kernel.request_metadata(Uuid::now_v7().to_string(), None, now)?;
+    let prepare_idempotency_key = format!("guided-work-prepare:{}", Uuid::now_v7());
+    let request = PrepareWorkRequest {
+        client: Some(client),
+        intent: input.intent,
+        work_type: input.work_type.clone(),
+        target_scope_ref: input.target_scope_ref.clone(),
+        sources: input
+            .sources
+            .into_iter()
+            .map(|source| WorkSourceRequest {
+                source_ref: source.source_ref,
+                label: source.label,
+            })
+            .collect(),
+        idempotency_key: prepare_idempotency_key,
+    };
+    let recovery = RecoverableWorkPreparation {
+        authenticated_principal_id: session.authenticated_principal_id.clone(),
+        session_id: session.session_id.clone(),
+        request,
+        confirm_idempotency_key: format!("guided-work-confirm:{}", Uuid::now_v7()),
+    };
+    match send(recovery.request.clone()).await {
+        Ok(response) => match parse_guided_work_preparation(response, &recovery) {
+            Ok(prepared) => Ok(GuidedWorkPreparationAttempt::Prepared(Box::new(prepared))),
+            // PrepareWork can return a gateway error after Context Authority
+            // committed but input-bundle persistence failed. Preserve the
+            // exact request so callers can replay it instead of preparing a
+            // replacement with a new idempotency key.
+            Err(ClientGuidedWorkError::PreparationOutcomeUnknown(_)) => Ok(
+                GuidedWorkPreparationAttempt::OutcomeUnknown(Box::new(recovery)),
+            ),
+            Err(error) => Err(error),
+        },
+        Err(_) => Ok(GuidedWorkPreparationAttempt::OutcomeUnknown(Box::new(
+            recovery,
+        ))),
+    }
+}
+
+fn parse_guided_work_preparation(
+    response: PrepareWorkResponse,
+    recovery: &RecoverableWorkPreparation,
+) -> Result<PreparedWork, ClientGuidedWorkError> {
+    let preview = match response.outcome {
+        Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::prepare_work_response::Outcome::Preview(preview)) => preview,
+        Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::prepare_work_response::Outcome::Error(_)) => {
+            return Err(ClientGuidedWorkError::PreparationOutcomeUnknown(
+                "prepare response did not prove whether Context commit completed".to_owned(),
+            ));
+        }
+        None => return Err(ClientGuidedWorkError::Protocol("prepare outcome missing")),
+    };
+    validate_guided_work_preview(
+        &preview,
+        &recovery.request.work_type,
+        &recovery.request.target_scope_ref,
+    )?;
+    let safe_preview = guided_work_safe_preview(&preview)?;
+    Ok(PreparedWork {
+        authenticated_principal_id: recovery.authenticated_principal_id.clone(),
+        session_id: recovery.session_id.clone(),
+        preview,
+        safe_preview,
+        prepare_idempotency_key: recovery.request.idempotency_key.clone(),
+        confirm_idempotency_key: recovery.confirm_idempotency_key.clone(),
+    })
+}
+
+fn verify_guided_work_preparation_session(
+    kernel: &ClientKernel,
+    recovery: &RecoverableWorkPreparation,
+) -> Result<(), ClientGuidedWorkError> {
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel
+        .profiles()
+        .authorize_rpc(PREPARE_WORK_RPC, &session.granted_permission_codes)?;
+    kernel
+        .profiles()
+        .authorize_rpc(CONFIRM_WORK_RPC, &session.granted_permission_codes)?;
+    if session.session_id != recovery.session_id
+        || session.authenticated_principal_id != recovery.authenticated_principal_id
+    {
+        return Err(ClientGuidedWorkError::SessionChanged);
+    }
+    Ok(())
+}
+
+async fn replay_guided_work_preparation_via<F, Fut>(
+    kernel: &ClientKernel,
+    recovery: &RecoverableWorkPreparation,
+    send: F,
+) -> Result<PreparedWork, ClientGuidedWorkError>
+where
+    F: FnOnce(PrepareWorkRequest) -> Fut,
+    Fut: Future<Output = Result<PrepareWorkResponse, String>>,
+{
+    verify_guided_work_preparation_session(kernel, recovery)?;
+    let response = send(recovery.request.clone())
+        .await
+        .map_err(ClientGuidedWorkError::PreparationOutcomeUnknown)?;
+    parse_guided_work_preparation(response, recovery)
+}
+
+pub fn validate_guided_work_input(input: &GuidedWorkInput) -> Result<(), ClientGuidedWorkError> {
+    if !is_guided_work_text(&input.intent, GUIDED_WORK_MAX_TEXT_BYTES) {
+        return Err(ClientGuidedWorkError::InvalidInput(
+            "intent must not be empty",
+        ));
+    }
+    if !is_guided_work_text(&input.work_type, GUIDED_WORK_MAX_ROUTING_BYTES) {
+        return Err(ClientGuidedWorkError::InvalidInput(
+            "work_type is incomplete or too large",
+        ));
+    }
+    if !is_guided_work_text(&input.target_scope_ref, GUIDED_WORK_MAX_ROUTING_BYTES) {
+        return Err(ClientGuidedWorkError::InvalidInput(
+            "target_scope_ref is incomplete or too large",
+        ));
+    }
+    if input.sources.is_empty()
+        || input.sources.len() > GUIDED_WORK_MAX_SOURCES
+        || input.sources.iter().any(|source| {
+            !is_guided_work_text(&source.source_ref, GUIDED_WORK_MAX_ROUTING_BYTES)
+                || !is_guided_work_text(&source.label, GUIDED_WORK_MAX_ROUTING_BYTES)
+        })
+    {
+        return Err(ClientGuidedWorkError::InvalidInput(
+            "source count or source fields are invalid",
+        ));
+    }
+    let mut total_bytes = input
+        .intent
+        .len()
+        .checked_add(input.work_type.len())
+        .and_then(|value| value.checked_add(input.target_scope_ref.len()));
+    for source in &input.sources {
+        total_bytes = total_bytes
+            .and_then(|value| value.checked_add(source.source_ref.len()))
+            .and_then(|value| value.checked_add(source.label.len()));
+    }
+    if !matches!(total_bytes, Some(total) if total <= GUIDED_WORK_MAX_TEXT_BYTES) {
+        return Err(ClientGuidedWorkError::InvalidInput(
+            "guided work input is too large",
+        ));
+    }
+    Ok(())
+}
+
+fn is_guided_work_text(value: &str, max_bytes: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn validate_guided_work_preview(
+    preview: &WorkPreparationPreview,
+    expected_work_type: &str,
+    expected_scope: &str,
+) -> Result<(), ClientGuidedWorkError> {
+    let canonical_snapshot_id = preview
+        .snapshot_id
+        .strip_prefix("ctx:")
+        .is_some_and(is_canonical_sha256);
+    if !canonical_snapshot_id
+        || preview.snapshot_revision == 0
+        || preview.context_state_revision == 0
+        || preview.work_type != expected_work_type
+        || preview.target_scope_ref != expected_scope
+        || !is_canonical_sha256(&preview.compiled_context_sha256)
+        || !is_canonical_sha256(&preview.confirmation_binding_sha256)
+        || preview.included_sources.len() > GUIDED_WORK_MAX_SOURCES
+        || preview.excluded_sources.len() > GUIDED_WORK_MAX_SOURCES
+        || preview
+            .included_sources
+            .len()
+            .checked_add(preview.excluded_sources.len())
+            .is_none_or(|count| count > GUIDED_WORK_MAX_SOURCES)
+        || preview.blockers.len() > GUIDED_WORK_MAX_SOURCES
+        || preview.warnings.len() > GUIDED_WORK_MAX_SOURCES
+        || preview.non_goals
+            != [
+                "provider/model selection is not made by preparation",
+                "memory is not mutated by preparation",
+            ]
+        || !is_guided_work_text(&preview.normalized_intent, GUIDED_WORK_MAX_TEXT_BYTES)
+        || preview
+            .non_goals
+            .iter()
+            .any(|value| safe_guided_work_non_goal(value).is_none())
+        || preview.included_sources.iter().any(|source| {
+            !is_guided_work_response_text(&source.source_ref)
+                || !is_guided_work_response_text(&source.label)
+                || source.authority != "project"
+                || !is_canonical_sha256(&source.content_sha256)
+                || !source.included
+        })
+        || preview
+            .excluded_sources
+            .iter()
+            .any(|notice| !is_valid_guided_work_excluded_source(notice))
+        || preview.blockers != preview.excluded_sources
+        || preview
+            .blockers
+            .iter()
+            .any(|notice| safe_guided_work_blocker(&notice.code).is_none())
+        || !preview.warnings.is_empty()
+        || preview.gate_ready != preview.ready_for_founder_confirmation
+        || preview.gate_ready
+            != (preview.excluded_sources.is_empty() && !preview.included_sources.is_empty())
+    {
+        return Err(ClientGuidedWorkError::Protocol(
+            "prepared work binding is incomplete",
+        ));
+    }
+    Ok(())
+}
+
+fn is_guided_work_response_text(value: &str) -> bool {
+    value == value.trim() && is_guided_work_text(value, GUIDED_WORK_MAX_ROUTING_BYTES)
+}
+
+fn safe_guided_work_blocker(value: &str) -> Option<GovernedWorkNotice> {
+    match value {
+        "CONTEXT_SOURCE_EMPTY" => Some(GovernedWorkNotice::ContextSourceEmpty),
+        "CONTEXT_SOURCE_OUTSIDE_WORKSPACE" => {
+            Some(GovernedWorkNotice::ContextSourceOutsideWorkspace)
+        }
+        "CONTEXT_SOURCE_UNREADABLE" => Some(GovernedWorkNotice::ContextSourceUnreadable),
+        "CONTEXT_SOURCE_TOO_LARGE" => Some(GovernedWorkNotice::ContextSourceTooLarge),
+        _ => None,
+    }
+}
+
+fn safe_guided_work_non_goal(value: &str) -> Option<GuidedWorkNonGoal> {
+    match value {
+        "provider/model selection is not made by preparation" => {
+            Some(GuidedWorkNonGoal::ProviderSelectionDeferred)
+        }
+        "memory is not mutated by preparation" => Some(GuidedWorkNonGoal::MemoryMutationExcluded),
+        _ => None,
+    }
+}
+
+fn is_valid_guided_work_excluded_source(
+    notice: &egopulse_domain_contracts::v01::egopulse::localapi::v1::WorkGateNotice,
+) -> bool {
+    match safe_guided_work_blocker(&notice.code) {
+        Some(GovernedWorkNotice::ContextSourceEmpty) => {
+            notice.source_ref.is_empty() && notice.detail == "source_ref must not be empty"
+        }
+        Some(_) => {
+            is_guided_work_response_text(&notice.source_ref) && notice.detail == notice.source_ref
+        }
+        None => false,
+    }
+}
+
+fn guided_work_safe_preview(
+    preview: &WorkPreparationPreview,
+) -> Result<GuidedWorkPreview, ClientGuidedWorkError> {
+    let non_goals = preview
+        .non_goals
+        .iter()
+        .map(|value| safe_guided_work_non_goal(value))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(ClientGuidedWorkError::Protocol(
+            "prepared work contains an unknown non-goal",
+        ))?;
+    let blockers = preview
+        .blockers
+        .iter()
+        .map(|notice| safe_guided_work_blocker(&notice.code))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(ClientGuidedWorkError::Protocol(
+            "prepared work contains an unknown blocker",
+        ))?;
+    if !preview.warnings.is_empty() {
+        return Err(ClientGuidedWorkError::Protocol(
+            "prepared work contains an unknown warning",
+        ));
+    }
+    Ok(GuidedWorkPreview {
+        normalized_intent: preview.normalized_intent.clone(),
+        work_type: preview.work_type.clone(),
+        target_scope_ref: preview.target_scope_ref.clone(),
+        non_goals,
+        included_source_count: preview.included_sources.len(),
+        excluded_source_count: preview.excluded_sources.len(),
+        blockers,
+        gate_ready: preview.gate_ready,
+        ready_for_founder_confirmation: preview.ready_for_founder_confirmation,
+    })
+}
+
+fn seal_guided_work_confirmation(
+    kernel: &ClientKernel,
+    prepared: PreparedWork,
+    now: SystemTime,
+) -> Result<RecoverableWorkConfirmation, ClientGuidedWorkError> {
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel
+        .profiles()
+        .authorize_rpc(CONFIRM_WORK_RPC, &session.granted_permission_codes)?;
+    if session.session_id != prepared.session_id
+        || session.authenticated_principal_id != prepared.authenticated_principal_id
+    {
+        return Err(ClientGuidedWorkError::SessionChanged);
+    }
+    validate_guided_work_preview(
+        &prepared.preview,
+        &prepared.safe_preview.work_type,
+        &prepared.safe_preview.target_scope_ref,
+    )?;
+    if guided_work_safe_preview(&prepared.preview)? != prepared.safe_preview {
+        return Err(ClientGuidedWorkError::BindingChanged);
+    }
+    if prepared.prepare_idempotency_key.trim().is_empty() {
+        return Err(ClientGuidedWorkError::BindingChanged);
+    }
+    if !prepared.preview.gate_ready
+        || !prepared.preview.ready_for_founder_confirmation
+        || !prepared.preview.blockers.is_empty()
+    {
+        return Err(ClientGuidedWorkError::Blocked);
+    }
+    let request = ConfirmWorkRequest {
+        client: Some(kernel.request_metadata(Uuid::now_v7().to_string(), None, now)?),
+        snapshot_id: prepared.preview.snapshot_id.clone(),
+        confirmation_binding_sha256: prepared.preview.confirmation_binding_sha256,
+        idempotency_key: prepared.confirm_idempotency_key,
+    };
+    Ok(RecoverableWorkConfirmation {
+        authenticated_principal_id: prepared.authenticated_principal_id,
+        session_id: prepared.session_id,
+        expected_snapshot_id: request.snapshot_id.clone(),
+        expected_confirmation_binding_sha256: request.confirmation_binding_sha256.clone(),
+        expected_work_type: prepared.preview.work_type,
+        expected_target_scope_ref: prepared.preview.target_scope_ref,
+        request,
+    })
+}
+
+async fn confirm_guided_work_via<F, Fut>(
+    kernel: &ClientKernel,
+    prepared: PreparedWork,
+    now: SystemTime,
+    send: F,
+) -> Result<GuidedWorkConfirmationAttempt, ClientGuidedWorkError>
+where
+    F: FnOnce(ConfirmWorkRequest) -> Fut,
+    Fut: Future<Output = Result<ConfirmWorkResponse, String>>,
+{
+    let recovery = seal_guided_work_confirmation(kernel, prepared, now)?;
+    match send(recovery.request.clone()).await {
+        Ok(response) => match parse_guided_work_confirmation(response, &recovery) {
+            Ok(confirmed) => Ok(GuidedWorkConfirmationAttempt::Confirmed(Box::new(
+                confirmed,
+            ))),
+            // ConfirmWork can return a gateway error after Task Authority
+            // committed but await-token creation failed. Preserve the exact
+            // command; the caller must replay it, not prepare again.
+            Err(ClientGuidedWorkError::ConfirmationOutcomeUnknown(_)) => Ok(
+                GuidedWorkConfirmationAttempt::OutcomeUnknown(Box::new(recovery)),
+            ),
+            Err(error) => Err(error),
+        },
+        Err(_) => Ok(GuidedWorkConfirmationAttempt::OutcomeUnknown(Box::new(
+            recovery,
+        ))),
+    }
+}
+
+async fn replay_guided_work_confirmation_via<F, Fut>(
+    kernel: &ClientKernel,
+    recovery: &RecoverableWorkConfirmation,
+    send: F,
+) -> Result<ConfirmedWork, ClientGuidedWorkError>
+where
+    F: FnOnce(ConfirmWorkRequest) -> Fut,
+    Fut: Future<Output = Result<ConfirmWorkResponse, String>>,
+{
+    verify_guided_work_recovery_session(kernel, recovery)?;
+    let response = send(recovery.request.clone())
+        .await
+        .map_err(ClientGuidedWorkError::ConfirmationOutcomeUnknown)?;
+    parse_guided_work_confirmation(response, recovery)
+}
+
+fn verify_guided_work_recovery_session(
+    kernel: &ClientKernel,
+    recovery: &RecoverableWorkConfirmation,
+) -> Result<(), ClientGuidedWorkError> {
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel
+        .profiles()
+        .authorize_rpc(CONFIRM_WORK_RPC, &session.granted_permission_codes)?;
+    if session.session_id != recovery.session_id
+        || session.authenticated_principal_id != recovery.authenticated_principal_id
+    {
+        return Err(ClientGuidedWorkError::SessionChanged);
+    }
+    if recovery.request.snapshot_id != recovery.expected_snapshot_id
+        || recovery.request.confirmation_binding_sha256
+            != recovery.expected_confirmation_binding_sha256
+        || !is_canonical_sha256(&recovery.expected_confirmation_binding_sha256)
+        || recovery.request.idempotency_key.trim().is_empty()
+    {
+        return Err(ClientGuidedWorkError::BindingChanged);
+    }
+    Ok(())
+}
+
+fn parse_guided_work_confirmation(
+    response: ConfirmWorkResponse,
+    recovery: &RecoverableWorkConfirmation,
+) -> Result<ConfirmedWork, ClientGuidedWorkError> {
+    let accepted = match response.outcome {
+        Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Accepted(accepted)) => accepted,
+        Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Error(_)) => {
+            return Err(ClientGuidedWorkError::ConfirmationOutcomeUnknown(
+                "confirm response did not prove whether Task commit completed".to_owned(),
+            ));
+        }
+        None => return Err(ClientGuidedWorkError::Protocol("confirm outcome missing")),
+    };
+    let result = accepted
+        .authority_result
+        .ok_or(ClientGuidedWorkError::Protocol(
+            "confirmed task result missing",
+        ))?;
+    match result.outcome.as_ref() {
+        Some(task_command_result::Outcome::Task(task))
+            if task.task_id.trim().is_empty()
+                || task.input_snapshot_id != recovery.expected_snapshot_id
+                || task.work_type != recovery.expected_work_type
+                || task.target_scope_ref != recovery.expected_target_scope_ref =>
+        {
+            return Err(ClientGuidedWorkError::Protocol(
+                "confirmed task binding changed",
+            ));
+        }
+        Some(task_command_result::Outcome::Task(_)) => {}
+        Some(task_command_result::Outcome::Error(error)) => {
+            return Err(ClientGuidedWorkError::Authority {
+                error_code: error.code,
+                safe_detail_code: error.safe_detail_code.clone(),
+            });
+        }
+        None => {
+            return Err(ClientGuidedWorkError::Protocol(
+                "confirmed task authority outcome missing",
+            ));
+        }
+    }
+    Ok(ConfirmedWork {
+        result,
+        await_token: accepted.await_token,
+    })
 }
 
 async fn open_approval_stream_via<F, Fut, S>(
@@ -2713,6 +3474,691 @@ mod tests {
             )
             .expect("accepted session");
         kernel
+    }
+
+    fn guided_work_input() -> GuidedWorkInput {
+        GuidedWorkInput {
+            intent: "sensitive-intent-sentinel".to_owned(),
+            work_type: "implementation".to_owned(),
+            target_scope_ref: "project:guided".to_owned(),
+            sources: vec![GuidedWorkSource {
+                source_ref: "source:sensitive-sentinel".to_owned(),
+                label: "label-sensitive-sentinel".to_owned(),
+            }],
+        }
+    }
+
+    fn guided_work_preview(blocked: bool) -> WorkPreparationPreview {
+        let excluded_sources = blocked
+            .then(
+                || egopulse_domain_contracts::v01::egopulse::localapi::v1::WorkGateNotice {
+                    code: "CONTEXT_SOURCE_UNREADABLE".to_owned(),
+                    detail: "source:sensitive-sentinel".to_owned(),
+                    source_ref: "source:sensitive-sentinel".to_owned(),
+                },
+            )
+            .into_iter()
+            .collect::<Vec<_>>();
+        WorkPreparationPreview {
+            snapshot_id: format!("ctx:{}", "1".repeat(64)),
+            snapshot_revision: 1,
+            context_state_revision: 1,
+            normalized_intent: "sensitive-intent-sentinel".to_owned(),
+            work_type: "implementation".to_owned(),
+            target_scope_ref: "project:guided".to_owned(),
+            compiled_context_sha256: "a".repeat(64),
+            confirmation_binding_sha256: "b".repeat(64),
+            included_sources: vec![
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::WorkSourceFact {
+                    source_ref: "source:sensitive-sentinel".to_owned(),
+                    label: "label-sensitive-sentinel".to_owned(),
+                    authority: "project".to_owned(),
+                    content_sha256: "c".repeat(64),
+                    included: true,
+                },
+            ],
+            excluded_sources: excluded_sources.clone(),
+            blockers: excluded_sources,
+            non_goals: vec![
+                "provider/model selection is not made by preparation".to_owned(),
+                "memory is not mutated by preparation".to_owned(),
+            ],
+            gate_ready: !blocked,
+            ready_for_founder_confirmation: !blocked,
+            ..WorkPreparationPreview::default()
+        }
+    }
+
+    fn guided_prepare_response(blocked: bool) -> PrepareWorkResponse {
+        PrepareWorkResponse {
+            outcome: Some(
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::prepare_work_response::Outcome::Preview(
+                    guided_work_preview(blocked),
+                ),
+            ),
+        }
+    }
+
+    fn guided_confirm_response(replayed: bool) -> ConfirmWorkResponse {
+        ConfirmWorkResponse {
+            outcome: Some(
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Accepted(
+                    egopulse_domain_contracts::v01::egopulse::localapi::v1::ConfirmWorkAccepted {
+                        authority_result: Some(
+                            egopulse_domain_contracts::v01::egopulse::task::v1::TaskCommandResult {
+                                replayed,
+                                outcome: Some(task_command_result::Outcome::Task(
+                                    egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
+                                        task_id: "task:guided:1".to_owned(),
+                                        revision: 1,
+                                        work_revision: 1,
+                                        status: DomainTaskStatus::Ready as i32,
+                                        work_type: "implementation".to_owned(),
+                                        input_snapshot_id: format!("ctx:{}", "1".repeat(64)),
+                                        target_scope_ref: "project:guided".to_owned(),
+                                        ..Default::default()
+                                    },
+                                )),
+                                committed_event: None,
+                            },
+                        ),
+                        await_token: None,
+                    },
+                ),
+            ),
+        }
+    }
+
+    #[test]
+    fn guided_work_prepares_opaque_safe_preview_and_enforces_input_bounds_before_dispatch() {
+        let now = SystemTime::now();
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided",
+            "session:guided",
+            &["local.work.prepare", "local.work.confirm"],
+            ClientSurface::Cli,
+            now,
+        );
+        let dispatched = Cell::new(0_u64);
+        let captured = RefCell::new(None);
+        let prepared = block_on_ready(prepare_guided_work_via(
+            &kernel,
+            guided_work_input(),
+            now,
+            |request| {
+                dispatched.set(dispatched.get() + 1);
+                captured.replace(Some(request));
+                async { Ok(guided_prepare_response(false)) }
+            },
+        ))
+        .expect("guided prepare")
+        .expect_prepared();
+        assert_eq!(dispatched.get(), 1);
+        let request = captured.borrow();
+        let request = request.as_ref().expect("captured prepare request");
+        assert_eq!(request.intent, "sensitive-intent-sentinel");
+        assert!(request.idempotency_key.starts_with("guided-work-prepare:"));
+        assert_eq!(prepared.preview().work_type(), "implementation");
+        let safe_debug = format!("{:?}", prepared.preview());
+        for secret in [
+            "source:sensitive-sentinel",
+            "label-sensitive-sentinel",
+            "sensitive-detail-sentinel",
+            &"b".repeat(64),
+        ] {
+            assert!(!safe_debug.contains(secret));
+        }
+        assert_eq!(
+            prepared.preview().non_goals(),
+            &[
+                GuidedWorkNonGoal::ProviderSelectionDeferred,
+                GuidedWorkNonGoal::MemoryMutationExcluded,
+            ]
+        );
+
+        for invalid in [
+            GuidedWorkInput {
+                intent: "\n".to_owned(),
+                ..guided_work_input()
+            },
+            GuidedWorkInput {
+                work_type: "x".repeat(GUIDED_WORK_MAX_ROUTING_BYTES + 1),
+                ..guided_work_input()
+            },
+            GuidedWorkInput {
+                sources: vec![],
+                ..guided_work_input()
+            },
+            GuidedWorkInput {
+                sources: (0..=GUIDED_WORK_MAX_SOURCES)
+                    .map(|index| GuidedWorkSource {
+                        source_ref: format!("source:{index}"),
+                        label: format!("source:{index}"),
+                    })
+                    .collect(),
+                ..guided_work_input()
+            },
+            GuidedWorkInput {
+                sources: vec![GuidedWorkSource {
+                    source_ref: "source\0bad".to_owned(),
+                    label: "source".to_owned(),
+                }],
+                ..guided_work_input()
+            },
+        ] {
+            let calls = Cell::new(0_u64);
+            let result = block_on_ready(prepare_guided_work_via(&kernel, invalid, now, |_| {
+                calls.set(calls.get() + 1);
+                async { Ok(guided_prepare_response(false)) }
+            }));
+            assert!(matches!(
+                result,
+                Err(ClientGuidedWorkError::InvalidInput(_))
+            ));
+            assert_eq!(calls.get(), 0);
+        }
+
+        let mut oversized = guided_work_preview(false);
+        oversized.warnings = (0..=GUIDED_WORK_MAX_SOURCES)
+            .map(
+                |index| egopulse_domain_contracts::v01::egopulse::localapi::v1::WorkGateNotice {
+                    code: format!("WARNING_{index}"),
+                    ..Default::default()
+                },
+            )
+            .collect();
+        assert!(matches!(
+            validate_guided_work_preview(&oversized, "implementation", "project:guided"),
+            Err(ClientGuidedWorkError::Protocol(_))
+        ));
+        let mut malformed_snapshot = guided_work_preview(false);
+        malformed_snapshot.snapshot_id = "ctx:ABC".to_owned();
+        assert!(matches!(
+            validate_guided_work_preview(&malformed_snapshot, "implementation", "project:guided"),
+            Err(ClientGuidedWorkError::Protocol(_))
+        ));
+
+        let mut unknown_non_goal = guided_work_preview(false);
+        unknown_non_goal.non_goals = vec!["raw-provider-canary".to_owned()];
+        assert!(matches!(
+            guided_work_safe_preview(&unknown_non_goal),
+            Err(ClientGuidedWorkError::Protocol(
+                "prepared work contains an unknown non-goal"
+            ))
+        ));
+        for non_goals in [
+            vec!["provider/model selection is not made by preparation".to_owned()],
+            vec![
+                "memory is not mutated by preparation".to_owned(),
+                "provider/model selection is not made by preparation".to_owned(),
+            ],
+            vec![
+                "provider/model selection is not made by preparation".to_owned(),
+                "memory is not mutated by preparation".to_owned(),
+                "memory is not mutated by preparation".to_owned(),
+            ],
+        ] {
+            let mut invalid_non_goals = guided_work_preview(false);
+            invalid_non_goals.non_goals = non_goals;
+            assert!(matches!(
+                validate_guided_work_preview(
+                    &invalid_non_goals,
+                    "implementation",
+                    "project:guided"
+                ),
+                Err(ClientGuidedWorkError::Protocol(_))
+            ));
+        }
+        let mut unknown_blocker = guided_work_preview(true);
+        unknown_blocker.blockers[0].code = "RAW_CONTEXT_CANARY".to_owned();
+        unknown_blocker.excluded_sources[0].code = "RAW_CONTEXT_CANARY".to_owned();
+        assert!(matches!(
+            guided_work_safe_preview(&unknown_blocker),
+            Err(ClientGuidedWorkError::Protocol(
+                "prepared work contains an unknown blocker"
+            ))
+        ));
+        let mut unknown_warning = guided_work_preview(false);
+        unknown_warning.warnings.push(
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::WorkGateNotice {
+                code: "RAW_WARNING_CANARY".to_owned(),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            guided_work_safe_preview(&unknown_warning),
+            Err(ClientGuidedWorkError::Protocol(
+                "prepared work contains an unknown warning"
+            ))
+        ));
+
+        let source_mutations: [fn(&mut WorkPreparationPreview); 5] = [
+            |preview: &mut WorkPreparationPreview| {
+                preview.included_sources[0].source_ref = "bad\0ref".to_owned();
+            },
+            |preview: &mut WorkPreparationPreview| {
+                preview.included_sources[0].label = " ".to_owned();
+            },
+            |preview: &mut WorkPreparationPreview| {
+                preview.included_sources[0].authority = "provider".to_owned();
+            },
+            |preview: &mut WorkPreparationPreview| {
+                preview.included_sources[0].content_sha256 = "ABC".to_owned();
+            },
+            |preview: &mut WorkPreparationPreview| {
+                preview.included_sources[0].included = false;
+            },
+        ];
+        for mutate in source_mutations {
+            let mut invalid_source = guided_work_preview(false);
+            mutate(&mut invalid_source);
+            assert!(matches!(
+                validate_guided_work_preview(&invalid_source, "implementation", "project:guided"),
+                Err(ClientGuidedWorkError::Protocol(_))
+            ));
+        }
+        let mut invalid_excluded = guided_work_preview(true);
+        invalid_excluded.excluded_sources[0].detail = "raw-detail-canary".to_owned();
+        invalid_excluded.blockers = invalid_excluded.excluded_sources.clone();
+        assert!(matches!(
+            validate_guided_work_preview(&invalid_excluded, "implementation", "project:guided"),
+            Err(ClientGuidedWorkError::Protocol(_))
+        ));
+        let mut mismatched_blocker = guided_work_preview(true);
+        mismatched_blocker.blockers.clear();
+        assert!(matches!(
+            validate_guided_work_preview(&mismatched_blocker, "implementation", "project:guided"),
+            Err(ClientGuidedWorkError::Protocol(_))
+        ));
+        let mut inconsistent_gate = guided_work_preview(false);
+        inconsistent_gate.gate_ready = false;
+        assert!(matches!(
+            validate_guided_work_preview(&inconsistent_gate, "implementation", "project:guided"),
+            Err(ClientGuidedWorkError::Protocol(_))
+        ));
+        let mut inconsistent_confirmation = guided_work_preview(false);
+        inconsistent_confirmation.ready_for_founder_confirmation = false;
+        assert!(matches!(
+            validate_guided_work_preview(
+                &inconsistent_confirmation,
+                "implementation",
+                "project:guided"
+            ),
+            Err(ClientGuidedWorkError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn guided_work_blocks_confirmation_and_permission_failures_before_dispatch() {
+        let now = SystemTime::now();
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided",
+            "session:guided",
+            &["local.work.prepare", "local.work.confirm"],
+            ClientSurface::Cli,
+            now,
+        );
+        let prepared = block_on_ready(prepare_guided_work_via(
+            &kernel,
+            guided_work_input(),
+            now,
+            |_| async { Ok(guided_prepare_response(true)) },
+        ))
+        .unwrap()
+        .expect_prepared();
+        let confirm_calls = Cell::new(0_u64);
+        let result = block_on_ready(confirm_guided_work_via(&kernel, prepared, now, |_| {
+            confirm_calls.set(confirm_calls.get() + 1);
+            async { Ok(guided_confirm_response(false)) }
+        }));
+        assert!(matches!(result, Err(ClientGuidedWorkError::Blocked)));
+        assert_eq!(confirm_calls.get(), 0);
+
+        let denied = authenticated_kernel(
+            "founder:guided",
+            "session:guided",
+            "local.work.confirm",
+            now,
+        );
+        let prepare_calls = Cell::new(0_u64);
+        let result = block_on_ready(prepare_guided_work_via(
+            &denied,
+            guided_work_input(),
+            now,
+            |_| {
+                prepare_calls.set(prepare_calls.get() + 1);
+                async { Ok(guided_prepare_response(false)) }
+            },
+        ));
+        assert!(matches!(
+            result,
+            Err(ClientGuidedWorkError::Kernel(
+                KernelError::PermissionDenied(_)
+            ))
+        ));
+        assert_eq!(prepare_calls.get(), 0);
+
+        let missing_confirm = authenticated_kernel(
+            "founder:guided",
+            "session:guided",
+            "local.work.prepare",
+            now,
+        );
+        let prepare_calls = Cell::new(0_u64);
+        let result = block_on_ready(prepare_guided_work_via(
+            &missing_confirm,
+            guided_work_input(),
+            now,
+            |_| {
+                prepare_calls.set(prepare_calls.get() + 1);
+                async { Ok(guided_prepare_response(false)) }
+            },
+        ));
+        assert!(matches!(
+            result,
+            Err(ClientGuidedWorkError::Kernel(
+                KernelError::PermissionDenied(_)
+            ))
+        ));
+        assert_eq!(prepare_calls.get(), 0);
+    }
+
+    #[test]
+    fn guided_work_transport_unknown_replays_the_exact_sealed_command_once() {
+        let now = SystemTime::now();
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided",
+            "session:guided",
+            &["local.work.prepare", "local.work.confirm"],
+            ClientSurface::Cli,
+            now,
+        );
+        let prepare_error_request = RefCell::new(None);
+        let prepare_error_attempt = block_on_ready(prepare_guided_work_via(
+            &kernel,
+            guided_work_input(),
+            now,
+            |request| {
+                prepare_error_request.replace(Some(request));
+                async {
+                    Ok(PrepareWorkResponse {
+                        outcome: Some(
+                            egopulse_domain_contracts::v01::egopulse::localapi::v1::prepare_work_response::Outcome::Error(
+                                LocalApiError::default(),
+                            ),
+                        ),
+                    })
+                }
+            },
+        ))
+        .unwrap();
+        let GuidedWorkPreparationAttempt::OutcomeUnknown(prepare_error_recovery) =
+            prepare_error_attempt
+        else {
+            panic!("prepare error response must retain the sealed request")
+        };
+        assert!(matches!(
+            block_on_ready(replay_guided_work_preparation_via(
+                &kernel,
+                &prepare_error_recovery,
+                |_| async {
+                    Ok(PrepareWorkResponse {
+                        outcome: Some(
+                            egopulse_domain_contracts::v01::egopulse::localapi::v1::prepare_work_response::Outcome::Error(
+                                LocalApiError::default(),
+                            ),
+                        ),
+                    })
+                },
+            )),
+            Err(ClientGuidedWorkError::PreparationOutcomeUnknown(_))
+        ));
+        let prepare_error_replay_request = RefCell::new(None);
+        let prepared_after_error = block_on_ready(replay_guided_work_preparation_via(
+            &kernel,
+            &prepare_error_recovery,
+            |request| {
+                prepare_error_replay_request.replace(Some(request));
+                async { Ok(guided_prepare_response(false)) }
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            prepare_error_request
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .encode_to_vec(),
+            prepare_error_replay_request
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .encode_to_vec()
+        );
+        assert_eq!(
+            prepared_after_error.confirm_idempotency_key,
+            prepare_error_recovery.confirm_idempotency_key
+        );
+        let order = RefCell::new(Vec::new());
+        let uncertain_prepare = RefCell::new(None);
+        let preparation = block_on_ready(prepare_guided_work_via(
+            &kernel,
+            guided_work_input(),
+            now,
+            |request| {
+                uncertain_prepare.replace(Some(request));
+                async { Err("prepare connection closed after write".to_owned()) }
+            },
+        ))
+        .unwrap();
+        let GuidedWorkPreparationAttempt::OutcomeUnknown(preparation_recovery) = preparation else {
+            panic!("prepare transport failure must retain the sealed request")
+        };
+        let sealed_confirm_idempotency = preparation_recovery.confirm_idempotency_key.clone();
+        let replayed_prepare = RefCell::new(None);
+        let replayed_prepared = block_on_ready(replay_guided_work_preparation_via(
+            &kernel,
+            &preparation_recovery,
+            |request| {
+                replayed_prepare.replace(Some(request));
+                async { Ok(guided_prepare_response(false)) }
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            uncertain_prepare.borrow().as_ref().unwrap().encode_to_vec(),
+            replayed_prepare.borrow().as_ref().unwrap().encode_to_vec()
+        );
+        assert_eq!(
+            replayed_prepared.prepare_idempotency_key,
+            preparation_recovery.request.idempotency_key
+        );
+        assert_eq!(
+            replayed_prepared.confirm_idempotency_key,
+            sealed_confirm_idempotency
+        );
+        let changed_prepare_session = authenticated_kernel_with_permissions(
+            "founder:guided",
+            "session:other",
+            &["local.work.prepare", "local.work.confirm"],
+            ClientSurface::Cli,
+            now,
+        );
+        let prepare_replay_calls = Cell::new(0_u64);
+        assert!(matches!(
+            block_on_ready(replay_guided_work_preparation_via(
+                &changed_prepare_session,
+                &preparation_recovery,
+                |_| {
+                    prepare_replay_calls.set(prepare_replay_calls.get() + 1);
+                    async { Ok(guided_prepare_response(false)) }
+                },
+            )),
+            Err(ClientGuidedWorkError::SessionChanged)
+        ));
+        assert_eq!(prepare_replay_calls.get(), 0);
+        assert!(matches!(
+            block_on_ready(replay_guided_work_preparation_via(
+                &kernel,
+                &preparation_recovery,
+                |_| async { Err("private prepare replay transport".to_owned()) },
+            )),
+            Err(ClientGuidedWorkError::PreparationOutcomeUnknown(detail))
+                if detail == "private prepare replay transport"
+        ));
+        let prepared = replayed_prepared;
+        let first_request = RefCell::new(None);
+        let attempt = block_on_ready(confirm_guided_work_via(&kernel, prepared, now, |request| {
+            order.borrow_mut().push("confirm");
+            first_request.replace(Some(request));
+            async { Err("connection closed after write".to_owned()) }
+        }))
+        .unwrap();
+        let GuidedWorkConfirmationAttempt::OutcomeUnknown(recovery) = attempt else {
+            panic!("transport failure must retain exact confirmation")
+        };
+        assert!(matches!(
+            block_on_ready(replay_guided_work_confirmation_via(
+                &kernel,
+                &recovery,
+                |_| async {
+                    Ok(ConfirmWorkResponse {
+                        outcome: Some(
+                            egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Error(
+                                LocalApiError::default(),
+                            ),
+                        ),
+                    })
+                },
+            )),
+            Err(ClientGuidedWorkError::ConfirmationOutcomeUnknown(_))
+        ));
+        let replay_request = RefCell::new(None);
+        let confirmed = block_on_ready(replay_guided_work_confirmation_via(
+            &kernel,
+            &recovery,
+            |request| {
+                order.borrow_mut().push("replay");
+                replay_request.replace(Some(request));
+                async { Ok(guided_confirm_response(true)) }
+            },
+        ))
+        .unwrap();
+        assert!(confirmed.result.replayed);
+        assert_eq!(*order.borrow(), ["confirm", "replay"]);
+        assert_eq!(
+            first_request.borrow().as_ref().unwrap().encode_to_vec(),
+            replay_request.borrow().as_ref().unwrap().encode_to_vec()
+        );
+        assert!(
+            first_request
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .idempotency_key
+                .starts_with("guided-work-confirm:")
+        );
+
+        let changed_session = authenticated_kernel_with_permissions(
+            "founder:guided",
+            "session:other",
+            &["local.work.confirm"],
+            ClientSurface::Cli,
+            now,
+        );
+        let replay_calls = Cell::new(0_u64);
+        let result = block_on_ready(replay_guided_work_confirmation_via(
+            &changed_session,
+            &recovery,
+            |_| {
+                replay_calls.set(replay_calls.get() + 1);
+                async { Ok(guided_confirm_response(true)) }
+            },
+        ));
+        assert!(matches!(result, Err(ClientGuidedWorkError::SessionChanged)));
+        assert_eq!(replay_calls.get(), 0);
+        assert!(matches!(
+            block_on_ready(replay_guided_work_confirmation_via(
+                &kernel,
+                &recovery,
+                |_| async { Err("private confirm replay transport".to_owned()) },
+            )),
+            Err(ClientGuidedWorkError::ConfirmationOutcomeUnknown(detail))
+                if detail == "private confirm replay transport"
+        ));
+    }
+
+    #[test]
+    fn guided_work_confirmation_rejects_binding_drift_and_non_task_outcomes() {
+        let now = SystemTime::now();
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided",
+            "session:guided",
+            &["local.work.prepare", "local.work.confirm"],
+            ClientSurface::Cli,
+            now,
+        );
+        let prepared = block_on_ready(prepare_guided_work_via(
+            &kernel,
+            guided_work_input(),
+            now,
+            |_| async { Ok(guided_prepare_response(false)) },
+        ))
+        .unwrap()
+        .expect_prepared();
+        let mut recovery = seal_guided_work_confirmation(&kernel, prepared, now).unwrap();
+        recovery.request.confirmation_binding_sha256 = "d".repeat(64);
+        let calls = Cell::new(0_u64);
+        let result = block_on_ready(replay_guided_work_confirmation_via(
+            &kernel,
+            &recovery,
+            |_| {
+                calls.set(calls.get() + 1);
+                async { Ok(guided_confirm_response(false)) }
+            },
+        ));
+        assert!(matches!(result, Err(ClientGuidedWorkError::BindingChanged)));
+        assert_eq!(calls.get(), 0);
+
+        recovery.request.confirmation_binding_sha256 = "b".repeat(64);
+        let missing = ConfirmWorkResponse {
+            outcome: Some(
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Accepted(
+                    egopulse_domain_contracts::v01::egopulse::localapi::v1::ConfirmWorkAccepted {
+                        authority_result: Some(Default::default()),
+                        await_token: None,
+                    },
+                ),
+            ),
+        };
+        assert!(matches!(
+            parse_guided_work_confirmation(missing, &recovery),
+            Err(ClientGuidedWorkError::Protocol(
+                "confirmed task authority outcome missing"
+            ))
+        ));
+
+        let gateway_error = ConfirmWorkResponse {
+            outcome: Some(
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Error(
+                    LocalApiError::default(),
+                ),
+            ),
+        };
+        let prepared = block_on_ready(prepare_guided_work_via(
+            &kernel,
+            guided_work_input(),
+            now,
+            |_| async { Ok(guided_prepare_response(false)) },
+        ))
+        .unwrap()
+        .expect_prepared();
+        assert!(matches!(
+            block_on_ready(confirm_guided_work_via(&kernel, prepared, now, |_| async {
+                Ok(gateway_error)
+            },)),
+            Ok(GuidedWorkConfirmationAttempt::OutcomeUnknown(_))
+        ));
     }
 
     fn normalized_context_revoke_mutation_bytes(request: ExecuteContextMutationRequest) -> Vec<u8> {

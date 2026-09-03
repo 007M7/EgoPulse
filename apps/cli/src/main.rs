@@ -9,19 +9,25 @@ use std::{
     io::{self, IsTerminal, Write},
     pin::Pin,
     process::ExitCode,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::{Parser, Subcommand};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use egopulse_client_kernel::KernelError;
 use egopulse_client_operations::{
     ApprovalWatch, ApprovalWatchClassification, ApprovalWatchCursor, ApprovalWatchUpdate,
     AttachError, ClientApprovalWatchError, ClientAttachment, ClientContextRevokeError,
-    ClientGuidedApprovalDecisionError, ClientTaskResultReviewError, ClientTaskWatchError,
-    ClientWorkError, ContextRevokeInput, GuidedApprovalDecision, GuidedApprovalDecisionInput,
-    TaskResultReview, TaskResultReviewStage, TaskWatch, TaskWatchClassification, TaskWatchRequest,
-    TaskWatchUpdate, attach as attach_client, command_metadata, set_task_digest,
-    set_verdict_digest, timestamp_after,
+    ClientGuidedApprovalDecisionError, ClientGuidedWorkError, ClientTaskResultReviewError,
+    ClientTaskWatchError, ClientWorkError, ContextRevokeInput, GuidedApprovalDecision,
+    GuidedApprovalDecisionInput, GuidedWorkConfirmationAttempt, GuidedWorkInput,
+    GuidedWorkPreparationAttempt, GuidedWorkPreview, GuidedWorkSource, TaskResultReview,
+    TaskResultReviewStage, TaskWatch, TaskWatchClassification, TaskWatchRequest, TaskWatchUpdate,
+    attach as attach_client, command_metadata, set_task_digest, set_verdict_digest,
+    timestamp_after, validate_guided_work_input,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -156,6 +162,25 @@ enum ContextCommand {
 
 #[derive(Debug, Subcommand)]
 enum WorkCommand {
+    /// Prepare and explicitly confirm one governed work request.
+    Start {
+        #[arg(long)]
+        intent: String,
+        #[arg(long)]
+        scope: String,
+        #[arg(long)]
+        work_type: String,
+        #[arg(long = "context-ref", required = true)]
+        context_refs: Vec<String>,
+        /// Explicitly confirm after the safe preview (required without a TTY).
+        #[arg(long, conflicts_with = "cancel")]
+        confirm: bool,
+        /// Cancel before attachment or preparation; no RPC is sent.
+        #[arg(long, conflicts_with = "confirm")]
+        cancel: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Normalize Founder intent and show the context/gate/event-packet preview.
     Plan {
         /// Natural-language work intent from the Founder.
@@ -834,6 +859,7 @@ fn command_json(command: &Command) -> bool {
         Command::Work {
             command:
                 WorkCommand::Plan { json, .. }
+                | WorkCommand::Start { json, .. }
                 | WorkCommand::Prepare { json, .. }
                 | WorkCommand::Confirm { json, .. },
         }
@@ -1106,6 +1132,34 @@ fn render_context_revoke_receipt(
 
 async fn work(command: WorkCommand) -> Result<(), CliFailure> {
     match command {
+        WorkCommand::Start {
+            intent,
+            scope,
+            work_type,
+            context_refs,
+            confirm,
+            cancel,
+            json,
+        } => {
+            guided_work_start(
+                GuidedWorkInput {
+                    intent,
+                    work_type,
+                    target_scope_ref: scope,
+                    sources: context_refs
+                        .into_iter()
+                        .map(|source_ref| GuidedWorkSource {
+                            label: source_ref.clone(),
+                            source_ref,
+                        })
+                        .collect(),
+                },
+                confirm,
+                cancel,
+                json,
+            )
+            .await
+        }
         WorkCommand::Plan {
             intent,
             scope,
@@ -1279,6 +1333,369 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
     }
 }
 
+async fn guided_work_start(
+    input: GuidedWorkInput,
+    explicit_confirm: bool,
+    explicit_cancel: bool,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    let mode = guided_work_start_mode(
+        &input,
+        explicit_confirm,
+        explicit_cancel,
+        json_output,
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+    )?;
+    if mode == GuidedWorkStartMode::Cancel {
+        render_guided_work_cancelled(json_output);
+        return Ok(());
+    }
+    if mode == GuidedWorkStartMode::Interactive
+        && !bounded_confirmation_prompt(
+            "Type PREVIEW to prepare the governed preview, or press Enter to cancel: ",
+            "PREVIEW",
+            Duration::from_secs(60),
+        )?
+    {
+        render_guided_work_cancelled(json_output);
+        return Ok(());
+    }
+
+    let attached = attach("work.start").await?;
+    let prepared = match attached
+        .0
+        .prepare_guided_work(input)
+        .await
+        .map_err(guided_work_failure)?
+    {
+        GuidedWorkPreparationAttempt::Prepared(prepared) => *prepared,
+        GuidedWorkPreparationAttempt::OutcomeUnknown(recovery) => attached
+            .0
+            .replay_guided_work_preparation(&recovery)
+            .await
+            .map_err(guided_work_failure)?,
+    };
+    render_guided_work_preview(prepared.preview(), false);
+
+    if mode == GuidedWorkStartMode::Interactive
+        && !bounded_confirmation_prompt(
+            "Type CONFIRM to create the Task, or press Enter to cancel: ",
+            "CONFIRM",
+            Duration::from_secs(60),
+        )?
+    {
+        render_guided_work_cancelled(json_output);
+        return Ok(());
+    }
+
+    let confirmed = match attached
+        .0
+        .confirm_guided_work(prepared)
+        .await
+        .map_err(guided_work_failure)?
+    {
+        GuidedWorkConfirmationAttempt::Confirmed(confirmed) => *confirmed,
+        GuidedWorkConfirmationAttempt::OutcomeUnknown(recovery) => attached
+            .0
+            .replay_guided_work_confirmation(&recovery)
+            .await
+            .map_err(guided_work_failure)?,
+    };
+    let task = match confirmed.result.outcome {
+        Some(task_command_result::Outcome::Task(task)) => task,
+        _ => {
+            return Err(CliFailure::protocol("guided work task outcome missing")
+                .for_operation("work.start"));
+        }
+    };
+    let status = TaskStatus::try_from(task.status)
+        .map(|status| status.as_str_name())
+        .unwrap_or("TASK_STATUS_UNSPECIFIED");
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "schemaVersion": "egopulse.cli-result/v0.1",
+                "ok": true,
+                "operation": "work.start",
+                "data": {
+                    "createdTaskId": task.task_id,
+                    "revision": task.revision,
+                    "status": status,
+                    "replayed": confirmed.result.replayed,
+                    "awaitToken": await_token_json(confirmed.await_token),
+                },
+                "correlationId": Uuid::now_v7().to_string(),
+            }))
+            .unwrap()
+        );
+    } else {
+        println!(
+            "Work started: task={} revision={} status={} replayed={}",
+            task.task_id, task.revision, status, confirmed.result.replayed
+        );
+        println!("Next: egopulse task watch --frames 1");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuidedWorkStartMode {
+    Cancel,
+    ExplicitConfirm,
+    Interactive,
+}
+
+fn guided_work_start_mode(
+    input: &GuidedWorkInput,
+    explicit_confirm: bool,
+    explicit_cancel: bool,
+    json_output: bool,
+    interactive_terminal: bool,
+) -> Result<GuidedWorkStartMode, CliFailure> {
+    validate_guided_work_input(input).map_err(guided_work_failure)?;
+    if explicit_confirm && explicit_cancel {
+        return Err(
+            CliFailure::protocol("--confirm and --cancel conflict").for_operation("work.start")
+        );
+    }
+    if explicit_cancel {
+        return Ok(GuidedWorkStartMode::Cancel);
+    }
+    if explicit_confirm {
+        return Ok(GuidedWorkStartMode::ExplicitConfirm);
+    }
+    if json_output || !interactive_terminal {
+        return Err(CliFailure::protocol(
+            "non-interactive work start requires --confirm or --cancel",
+        )
+        .for_operation("work.start"));
+    }
+    Ok(GuidedWorkStartMode::Interactive)
+}
+
+fn bounded_confirmation_prompt(
+    prompt: &'static str,
+    expected: &'static str,
+    timeout: Duration,
+) -> Result<bool, CliFailure> {
+    eprint!("{prompt}");
+    io::stderr().flush().map_err(|error| {
+        CliFailure::protocol(format!("confirmation prompt failed: {error}"))
+            .for_operation("work.start")
+    })?;
+    let _raw_mode = RawModeGuard::enter().map_err(|error| {
+        CliFailure::protocol(format!("confirmation terminal setup failed: {error}"))
+            .for_operation("work.start")
+    })?;
+    let deadline = Instant::now() + timeout;
+    let mut value = String::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()
+            || !event::poll(remaining).map_err(|error| {
+                CliFailure::protocol(format!("confirmation input polling failed: {error}"))
+                    .for_operation("work.start")
+            })?
+        {
+            return Err(CliFailure::protocol(
+                "confirmation input timed out before Task confirmation was sent",
+            )
+            .for_operation("work.start"));
+        }
+        let Event::Key(key) = event::read().map_err(|error| {
+            CliFailure::protocol(format!("confirmation input failed: {error}"))
+                .for_operation("work.start")
+        })?
+        else {
+            continue;
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            continue;
+        }
+        match apply_confirmation_key(&mut value, expected, key) {
+            ConfirmationKeyAction::Continue(Some(character)) => {
+                eprint!("{character}");
+                io::stderr().flush().map_err(|error| {
+                    CliFailure::protocol(format!("confirmation prompt failed: {error}"))
+                        .for_operation("work.start")
+                })?;
+            }
+            ConfirmationKeyAction::Continue(None) => {}
+            ConfirmationKeyAction::Backspace => {
+                eprint!("\u{8} \u{8}");
+                io::stderr().flush().map_err(|error| {
+                    CliFailure::protocol(format!("confirmation prompt failed: {error}"))
+                        .for_operation("work.start")
+                })?;
+            }
+            ConfirmationKeyAction::Submit(confirmed) => {
+                eprintln!();
+                return Ok(confirmed);
+            }
+            ConfirmationKeyAction::Cancel => {
+                eprintln!();
+                return Ok(false);
+            }
+        }
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfirmationKeyAction {
+    Continue(Option<char>),
+    Backspace,
+    Submit(bool),
+    Cancel,
+}
+
+fn apply_confirmation_key(
+    value: &mut String,
+    expected: &str,
+    key: KeyEvent,
+) -> ConfirmationKeyAction {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
+        return ConfirmationKeyAction::Cancel;
+    }
+    match key.code {
+        KeyCode::Esc => ConfirmationKeyAction::Cancel,
+        KeyCode::Enter => ConfirmationKeyAction::Submit(value == expected),
+        KeyCode::Backspace => {
+            if value.pop().is_some() {
+                ConfirmationKeyAction::Backspace
+            } else {
+                ConfirmationKeyAction::Continue(None)
+            }
+        }
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && !character.is_control()
+                && value.len() < 64 =>
+        {
+            value.push(character);
+            ConfirmationKeyAction::Continue(Some(character))
+        }
+        _ => ConfirmationKeyAction::Continue(None),
+    }
+}
+
+fn render_guided_work_preview(preview: &GuidedWorkPreview, json_output: bool) {
+    let value = guided_work_preview_json(preview);
+    if json_output {
+        println!("{}", serde_json::to_string(&value).unwrap());
+    } else {
+        eprintln!(
+            "Governed preview: intent={} work_type={} scope={} included_sources={} excluded_sources={} gate_ready={} founder_confirmable={}",
+            preview.normalized_intent(),
+            preview.work_type(),
+            preview.target_scope_ref(),
+            preview.included_source_count(),
+            preview.excluded_source_count(),
+            preview.gate_ready(),
+            preview.ready_for_founder_confirmation(),
+        );
+        for non_goal in preview.non_goals() {
+            eprintln!("Non-goal: {}", non_goal.as_str());
+        }
+        for blocker in preview.blockers() {
+            eprintln!("Blocker: {}", blocker.as_str());
+        }
+    }
+}
+
+fn guided_work_preview_json(preview: &GuidedWorkPreview) -> serde_json::Value {
+    let non_goals = preview
+        .non_goals()
+        .iter()
+        .map(|value| value.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let blocker_codes = preview
+        .blockers()
+        .iter()
+        .map(|value| value.as_str().to_owned())
+        .collect::<Vec<_>>();
+    guided_work_preview_value(
+        preview.normalized_intent(),
+        preview.work_type(),
+        preview.target_scope_ref(),
+        &non_goals,
+        preview.included_source_count(),
+        preview.excluded_source_count(),
+        preview.gate_ready(),
+        preview.ready_for_founder_confirmation(),
+        &blocker_codes,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn guided_work_preview_value(
+    normalized_intent: &str,
+    work_type: &str,
+    target_scope_ref: &str,
+    non_goals: &[String],
+    included_source_count: usize,
+    excluded_source_count: usize,
+    gate_ready: bool,
+    ready_for_founder_confirmation: bool,
+    blocker_codes: &[String],
+    warning_codes: &[String],
+) -> serde_json::Value {
+    json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": "work.start.preview",
+        "data": {
+            "normalizedIntent": normalized_intent,
+            "workType": work_type,
+            "targetScopeRef": target_scope_ref,
+            "nonGoals": non_goals,
+            "includedSourceCount": included_source_count,
+            "excludedSourceCount": excluded_source_count,
+            "gateReady": gate_ready,
+            "readyForFounderConfirmation": ready_for_founder_confirmation,
+            "blockerCodes": blocker_codes,
+            "warningCodes": warning_codes,
+        }
+    })
+}
+
+fn render_guided_work_cancelled(json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "schemaVersion": "egopulse.cli-result/v0.1",
+                "ok": true,
+                "operation": "work.start",
+                "data": { "cancelled": true, "taskCreated": false },
+                "correlationId": Uuid::now_v7().to_string(),
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("Work start cancelled; no Task confirmation was sent.");
+    }
+}
+
 fn client_work_failure(error: ClientWorkError, operation: &'static str) -> CliFailure {
     match error {
         ClientWorkError::Api(error) => {
@@ -1289,6 +1706,46 @@ fn client_work_failure(error: ClientWorkError, operation: &'static str) -> CliFa
             CliFailure::protocol(detail.to_string()).for_operation(operation)
         }
         ClientWorkError::Protocol(detail) => CliFailure::protocol(detail).for_operation(operation),
+    }
+}
+
+fn guided_work_failure(error: ClientGuidedWorkError) -> CliFailure {
+    match error {
+        ClientGuidedWorkError::Kernel(KernelError::PermissionDenied(_)) => {
+            CliFailure::permission("work.start", "guided work permission denied")
+        }
+        ClientGuidedWorkError::Kernel(error) => {
+            CliFailure::protocol(error.to_string()).for_operation("work.start")
+        }
+        ClientGuidedWorkError::InvalidInput(detail) => {
+            CliFailure::protocol(detail).for_operation("work.start")
+        }
+        ClientGuidedWorkError::Blocked => {
+            CliFailure::protocol("the governed preview is blocked; no Task confirmation was sent")
+                .for_operation("work.start")
+        }
+        ClientGuidedWorkError::SessionChanged | ClientGuidedWorkError::BindingChanged => {
+            CliFailure::protocol("the prepared work binding is stale; prepare a new preview")
+                .for_operation("work.start")
+        }
+        ClientGuidedWorkError::PreparationOutcomeUnknown(_) => CliFailure::daemon_unavailable(
+            "guided work preparation outcome remains unknown; do not prepare a replacement",
+        )
+        .for_operation("work.start"),
+        ClientGuidedWorkError::ConfirmationOutcomeUnknown(_) => CliFailure::daemon_unavailable(
+            "guided work confirmation outcome remains unknown; do not prepare a replacement",
+        )
+        .for_operation("work.start"),
+        ClientGuidedWorkError::Api(error) => {
+            CliFailure::from_local_api_error(*error).for_operation("work.start")
+        }
+        ClientGuidedWorkError::Authority {
+            error_code,
+            safe_detail_code,
+        } => CliFailure::task_authority(error_code, safe_detail_code, "work.start"),
+        ClientGuidedWorkError::Protocol(detail) => {
+            CliFailure::protocol(detail).for_operation("work.start")
+        }
     }
 }
 
@@ -4307,6 +4764,217 @@ mod tests {
         ])
         .expect_err("preview must never also execute");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    fn guided_cli_input() -> GuidedWorkInput {
+        GuidedWorkInput {
+            intent: "implement bounded work start".to_owned(),
+            work_type: "implementation".to_owned(),
+            target_scope_ref: "project:guided".to_owned(),
+            sources: vec![GuidedWorkSource {
+                source_ref: "docs/brief.md".to_owned(),
+                label: "docs/brief.md".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn work_start_cli_accepts_only_high_level_inputs_and_requires_explicit_non_tty_choice() {
+        let cli = Cli::try_parse_from([
+            "egopulse",
+            "work",
+            "start",
+            "--intent",
+            "implement bounded work start",
+            "--scope",
+            "project:guided",
+            "--work-type",
+            "implementation",
+            "--context-ref",
+            "docs/brief.md",
+            "--confirm",
+            "--json",
+        ])
+        .expect("guided work start CLI");
+        assert!(matches!(
+            cli.command,
+            Command::Work {
+                command: WorkCommand::Start {
+                    confirm: true,
+                    cancel: false,
+                    json: true,
+                    ..
+                }
+            }
+        ));
+        for forbidden in [
+            "--snapshot-id",
+            "--confirmation-binding-sha256",
+            "--context-state-revision",
+            "--idempotency-key",
+            "--principal-id",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "egopulse",
+                    "work",
+                    "start",
+                    "--intent",
+                    "work",
+                    "--scope",
+                    "project:guided",
+                    "--work-type",
+                    "implementation",
+                    "--context-ref",
+                    "docs/brief.md",
+                    "--confirm",
+                    forbidden,
+                    "forged",
+                ])
+                .is_err()
+            );
+        }
+
+        assert!(matches!(
+            guided_work_start_mode(&guided_cli_input(), false, false, false, false),
+            Err(CliFailure {
+                reason_code: "LOCAL_API_PROTOCOL_ERROR",
+                ..
+            })
+        ));
+        assert_eq!(
+            guided_work_start_mode(&guided_cli_input(), false, true, false, false).unwrap(),
+            GuidedWorkStartMode::Cancel
+        );
+        assert_eq!(
+            guided_work_start_mode(&guided_cli_input(), true, false, true, false).unwrap(),
+            GuidedWorkStartMode::ExplicitConfirm
+        );
+        assert_eq!(
+            guided_work_start_mode(&guided_cli_input(), false, false, false, true).unwrap(),
+            GuidedWorkStartMode::Interactive
+        );
+    }
+
+    #[test]
+    fn work_start_safe_preview_excludes_authority_and_sensitive_binding_fields() {
+        let value = guided_work_preview_value(
+            "normalized safe intent",
+            "implementation",
+            "project:guided",
+            &["not-a-provider-task".to_owned()],
+            2,
+            1,
+            true,
+            true,
+            &["SOURCE_BLOCKED".to_owned()],
+            &["REVIEW_REQUIRED".to_owned()],
+        );
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(encoded.contains("implementation"));
+        assert!(encoded.contains("project:guided"));
+        for forbidden in [
+            "snapshotId",
+            "confirmationBindingSha256",
+            "contextStateRevision",
+            "compiledContextSha256",
+            "principal",
+            "idempotency",
+            "sensitive-intent-sentinel",
+            "source:sensitive-sentinel",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn work_start_confirmation_keys_are_bounded_and_cancellable_without_a_reader_thread() {
+        let mut value = String::new();
+        for character in "CONFIRX".chars() {
+            assert_eq!(
+                apply_confirmation_key(
+                    &mut value,
+                    "CONFIRM",
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                ),
+                ConfirmationKeyAction::Continue(Some(character))
+            );
+        }
+        assert_eq!(
+            apply_confirmation_key(
+                &mut value,
+                "CONFIRM",
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            ),
+            ConfirmationKeyAction::Backspace
+        );
+        assert_eq!(
+            apply_confirmation_key(
+                &mut value,
+                "CONFIRM",
+                KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE),
+            ),
+            ConfirmationKeyAction::Continue(Some('M'))
+        );
+        assert_eq!(
+            apply_confirmation_key(
+                &mut value,
+                "CONFIRM",
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ),
+            ConfirmationKeyAction::Submit(true)
+        );
+        assert_eq!(
+            apply_confirmation_key(
+                &mut value,
+                "CONFIRM",
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            ),
+            ConfirmationKeyAction::Cancel
+        );
+        assert_eq!(
+            apply_confirmation_key(
+                &mut value,
+                "CONFIRM",
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ),
+            ConfirmationKeyAction::Cancel
+        );
+    }
+
+    #[test]
+    fn work_start_failures_preserve_blocked_session_authority_and_transport_categories() {
+        let blocked = guided_work_failure(ClientGuidedWorkError::Blocked);
+        assert_eq!(blocked.operation, "work.start");
+        assert!(blocked.message.contains("no Task confirmation"));
+        let session = guided_work_failure(ClientGuidedWorkError::SessionChanged);
+        assert!(session.message.contains("stale"));
+        let authority = guided_work_failure(ClientGuidedWorkError::Authority {
+            error_code: TaskErrorCode::IdempotencyConflict as i32,
+            safe_detail_code: "task/idempotency-conflict/v1".to_owned(),
+        });
+        assert_eq!(authority.reason_code, "TASK_AUTHORITY_REJECTED");
+        let preparation_transport =
+            guided_work_failure(ClientGuidedWorkError::PreparationOutcomeUnknown(
+                "private preparation transport sentinel".to_owned(),
+            ));
+        assert_eq!(preparation_transport.reason_code, "DAEMON_UNAVAILABLE");
+        assert!(
+            preparation_transport
+                .message
+                .contains("preparation outcome")
+        );
+        assert!(
+            !preparation_transport
+                .message
+                .contains("private preparation transport sentinel")
+        );
+        let transport = guided_work_failure(ClientGuidedWorkError::ConfirmationOutcomeUnknown(
+            "private transport sentinel".to_owned(),
+        ));
+        assert_eq!(transport.reason_code, "DAEMON_UNAVAILABLE");
+        assert!(transport.message.contains("confirmation outcome"));
+        assert!(!transport.message.contains("private transport sentinel"));
     }
 
     #[test]
