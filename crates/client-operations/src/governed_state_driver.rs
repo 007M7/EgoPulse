@@ -165,26 +165,31 @@ async fn cancellable<T>(
     }
 }
 
-async fn run_task_worker_via<Source, Session, Open, Next, Backoff>(
+async fn run_domain_worker_via<Source, Session, Input, Sender, Open, Next, Submit, Backoff>(
     source: &mut Source,
-    sender: TaskRequestSender,
+    sender: Sender,
     mut cancellation: watch::Receiver<bool>,
     mut open: Open,
     mut next: Next,
+    mut submit: Submit,
     mut backoff: Backoff,
 ) -> WorkerExit
 where
     Source: Send,
     Session: Send,
+    Input: Send,
+    Sender: Send,
     Open: for<'a> FnMut(
         &'a mut Source,
         DriverStage,
         u64,
-    ) -> BoxFuture<
-        'a,
-        Result<Opened<Session, GovernedTaskReducerInput>, Box<GovernedTaskReducerInput>>,
-    >,
-    Next: for<'a> FnMut(&'a mut Session, u64) -> BoxFuture<'a, GovernedTaskReducerInput>,
+    ) -> BoxFuture<'a, Result<Opened<Session, Input>, Box<Input>>>,
+    Next: for<'a> FnMut(&'a mut Session, u64) -> BoxFuture<'a, Input>,
+    Submit: for<'a> FnMut(
+        &'a Sender,
+        &'a mut watch::Receiver<bool>,
+        Input,
+    ) -> BoxFuture<'a, Result<DomainAck, WorkerExit>>,
     Backoff: FnMut() -> BoxFuture<'static, ()>,
 {
     let mut generation = 1_u64;
@@ -200,8 +205,7 @@ where
                 mut session,
                 complete_input,
             }) => {
-                let ack = match submit_task_input(&sender, &mut cancellation, complete_input).await
-                {
+                let ack = match submit(&sender, &mut cancellation, complete_input).await {
                     Ok(ack) => ack,
                     Err(exit) => return exit,
                 };
@@ -230,7 +234,7 @@ where
                         Ok(input) => input,
                         Err(exit) => return exit,
                     };
-                    let ack = match submit_task_input(&sender, &mut cancellation, input).await {
+                    let ack = match submit(&sender, &mut cancellation, input).await {
                         Ok(ack) => ack,
                         Err(exit) => return exit,
                     };
@@ -250,7 +254,7 @@ where
                 drop(session);
             }
             Err(input) => {
-                let ack = match submit_task_input(&sender, &mut cancellation, *input).await {
+                let ack = match submit(&sender, &mut cancellation, *input).await {
                     Ok(ack) => ack,
                     Err(exit) => return exit,
                 };
@@ -271,6 +275,40 @@ where
             return exit;
         }
     }
+}
+
+async fn run_task_worker_via<Source, Session, Open, Next, Backoff>(
+    source: &mut Source,
+    sender: TaskRequestSender,
+    cancellation: watch::Receiver<bool>,
+    open: Open,
+    next: Next,
+    backoff: Backoff,
+) -> WorkerExit
+where
+    Source: Send,
+    Session: Send,
+    Open: for<'a> FnMut(
+        &'a mut Source,
+        DriverStage,
+        u64,
+    ) -> BoxFuture<
+        'a,
+        Result<Opened<Session, GovernedTaskReducerInput>, Box<GovernedTaskReducerInput>>,
+    >,
+    Next: for<'a> FnMut(&'a mut Session, u64) -> BoxFuture<'a, GovernedTaskReducerInput>,
+    Backoff: FnMut() -> BoxFuture<'static, ()>,
+{
+    run_domain_worker_via(
+        source,
+        sender,
+        cancellation,
+        open,
+        next,
+        |sender, cancellation, input| Box::pin(submit_task_input(sender, cancellation, input)),
+        backoff,
+    )
+    .await
 }
 
 async fn run_task_worker(
@@ -292,10 +330,10 @@ async fn run_task_worker(
 async fn run_approval_worker_via<Source, Session, Open, Next, Backoff>(
     source: &mut Source,
     sender: ApprovalRequestSender,
-    mut cancellation: watch::Receiver<bool>,
-    mut open: Open,
-    mut next: Next,
-    mut backoff: Backoff,
+    cancellation: watch::Receiver<bool>,
+    open: Open,
+    next: Next,
+    backoff: Backoff,
 ) -> WorkerExit
 where
     Source: Send,
@@ -311,90 +349,16 @@ where
     Next: for<'a> FnMut(&'a mut Session, u64) -> BoxFuture<'a, GovernedApprovalReducerInput>,
     Backoff: FnMut() -> BoxFuture<'static, ()>,
 {
-    let mut generation = 1_u64;
-    let mut stage = DriverStage::Initial;
-
-    loop {
-        let opened = match cancellable(&mut cancellation, open(source, stage, generation)).await {
-            Ok(opened) => opened,
-            Err(exit) => return exit,
-        };
-        match opened {
-            Ok(Opened {
-                mut session,
-                complete_input,
-            }) => {
-                let ack =
-                    match submit_approval_input(&sender, &mut cancellation, complete_input).await {
-                        Ok(ack) => ack,
-                        Err(exit) => return exit,
-                    };
-                match directive_from_ack(generation, ack) {
-                    WorkerDirective::ContinueLive {
-                        generation: acknowledged_generation,
-                    } => generation = acknowledged_generation,
-                    WorkerDirective::Recover {
-                        generation: recovery_generation,
-                    } => {
-                        generation = recovery_generation;
-                        drop(session);
-                        stage = DriverStage::Recovery;
-                        if let Err(exit) = cancellable(&mut cancellation, backoff()).await {
-                            return exit;
-                        }
-                        continue;
-                    }
-                    WorkerDirective::Stop => return WorkerExit::DomainFatal,
-                }
-
-                loop {
-                    let input = match cancellable(&mut cancellation, next(&mut session, generation))
-                        .await
-                    {
-                        Ok(input) => input,
-                        Err(exit) => return exit,
-                    };
-                    let ack = match submit_approval_input(&sender, &mut cancellation, input).await {
-                        Ok(ack) => ack,
-                        Err(exit) => return exit,
-                    };
-                    match directive_from_ack(generation, ack) {
-                        WorkerDirective::ContinueLive {
-                            generation: acknowledged_generation,
-                        } => generation = acknowledged_generation,
-                        WorkerDirective::Recover {
-                            generation: recovery_generation,
-                        } => {
-                            generation = recovery_generation;
-                            break;
-                        }
-                        WorkerDirective::Stop => return WorkerExit::DomainFatal,
-                    }
-                }
-                drop(session);
-            }
-            Err(input) => {
-                let ack = match submit_approval_input(&sender, &mut cancellation, *input).await {
-                    Ok(ack) => ack,
-                    Err(exit) => return exit,
-                };
-                match directive_from_ack(generation, ack) {
-                    WorkerDirective::Stop => return WorkerExit::DomainFatal,
-                    WorkerDirective::ContinueLive {
-                        generation: acknowledged_generation,
-                    }
-                    | WorkerDirective::Recover {
-                        generation: acknowledged_generation,
-                    } => generation = acknowledged_generation,
-                }
-            }
-        }
-
-        stage = DriverStage::Recovery;
-        if let Err(exit) = cancellable(&mut cancellation, backoff()).await {
-            return exit;
-        }
-    }
+    run_domain_worker_via(
+        source,
+        sender,
+        cancellation,
+        open,
+        next,
+        |sender, cancellation, input| Box::pin(submit_approval_input(sender, cancellation, input)),
+        backoff,
+    )
+    .await
 }
 
 async fn run_approval_worker(
@@ -1285,8 +1249,141 @@ mod tests {
         Box::pin(std::future::pending())
     }
 
+    struct ApprovalWorkerTestSource {
+        open_calls: Arc<Mutex<Vec<(DriverStage, u64)>>>,
+        next_calls: Arc<AtomicUsize>,
+        dropped_sessions: Arc<AtomicUsize>,
+    }
+
+    struct ApprovalWorkerTestSession {
+        next_calls: Arc<AtomicUsize>,
+        dropped_sessions: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ApprovalWorkerTestSession {
+        fn drop(&mut self) {
+            self.dropped_sessions.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn approval_worker_test_open(
+        source: &mut ApprovalWorkerTestSource,
+        stage: DriverStage,
+        generation: u64,
+    ) -> super::BoxFuture<
+        '_,
+        Result<
+            Opened<ApprovalWorkerTestSession, GovernedApprovalReducerInput>,
+            Box<GovernedApprovalReducerInput>,
+        >,
+    > {
+        source
+            .open_calls
+            .lock()
+            .expect("approval worker open-call log mutex must not be poisoned")
+            .push((stage, generation));
+        Box::pin(std::future::ready(Ok(Opened {
+            session: ApprovalWorkerTestSession {
+                next_calls: Arc::clone(&source.next_calls),
+                dropped_sessions: Arc::clone(&source.dropped_sessions),
+            },
+            complete_input: GovernedApprovalReducerInput::CompleteRebaseline {
+                generation,
+                position: super::GovernedApprovalDomainPosition::new(
+                    format!("epoch:approval-worker:{generation}"),
+                    generation,
+                ),
+                approvals: std::collections::BTreeMap::new(),
+            },
+        })))
+    }
+
+    fn approval_worker_test_next(
+        session: &mut ApprovalWorkerTestSession,
+        generation: u64,
+    ) -> super::BoxFuture<'_, GovernedApprovalReducerInput> {
+        session.next_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::ready(
+            GovernedApprovalReducerInput::Heartbeat { generation },
+        ))
+    }
+
     fn ready_worker_backoff() -> super::BoxFuture<'static, ()> {
         Box::pin(std::future::ready(()))
+    }
+
+    #[test]
+    fn r9b2b_approval_worker_opens_completes_then_reads_live_once_after_ack() {
+        let open_calls = Arc::new(Mutex::new(Vec::new()));
+        let next_calls = Arc::new(AtomicUsize::new(0));
+        let dropped_sessions = Arc::new(AtomicUsize::new(0));
+        let mut source = ApprovalWorkerTestSource {
+            open_calls: Arc::clone(&open_calls),
+            next_calls: Arc::clone(&next_calls),
+            dropped_sessions: Arc::clone(&dropped_sessions),
+        };
+        let (_task_sender, _task_receiver, approval_sender, mut approval_receiver) =
+            governed_state_request_channels();
+        let (_cancel_sender, cancellation) = tokio::sync::watch::channel(false);
+        let mut worker = pin!(super::run_approval_worker_via(
+            &mut source,
+            approval_sender,
+            cancellation,
+            approval_worker_test_open,
+            approval_worker_test_next,
+            ready_worker_backoff,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let complete = approval_receiver
+            .try_recv()
+            .expect("initial approval open must submit complete rebaseline");
+        assert!(matches!(
+            complete.input,
+            GovernedApprovalReducerInput::CompleteRebaseline { generation: 1, .. }
+        ));
+        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            complete
+                .ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Live,
+                    generation: 1,
+                    recovery_remaining: 3,
+                })
+                .is_ok()
+        );
+
+        assert!(matches!(worker.as_mut().poll(&mut context), Poll::Pending));
+        let live = approval_receiver
+            .try_recv()
+            .expect("matching live ack must permit one approval next read");
+        assert!(matches!(
+            live.input,
+            GovernedApprovalReducerInput::Heartbeat { generation: 1 }
+        ));
+        assert_eq!(next_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            live.ack
+                .send(DomainAck {
+                    phase: GovernedStateDomainPhase::Fatal,
+                    generation: 1,
+                    recovery_remaining: 0,
+                })
+                .is_ok()
+        );
+        assert!(matches!(
+            worker.as_mut().poll(&mut context),
+            Poll::Ready(WorkerExit::DomainFatal)
+        ));
+        assert_eq!(
+            *open_calls
+                .lock()
+                .expect("approval worker open-call log mutex must not be poisoned"),
+            vec![(DriverStage::Initial, 1)]
+        );
+        assert_eq!(dropped_sessions.load(Ordering::SeqCst), 1);
     }
 
     struct PendingWorkerOpenSource {
