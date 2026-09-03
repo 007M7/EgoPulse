@@ -4024,4 +4024,147 @@ mod tests {
         assert!(*cancellation_observer.borrow());
         require_worker_drops(&drop_count, 2).await;
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_approval_worker_panic_fails_only_approval_and_task_keeps_advancing() {
+        let (core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+        drop(approval_sender);
+        let task_before = core.state().task().clone();
+        let (cancellation, _cancellation_receiver) = tokio::sync::watch::channel(false);
+        let (panic_started, panic_started_rx) = tokio::sync::oneshot::channel();
+        let approval_worker = tokio::spawn(async move {
+            let _ = panic_started.send(());
+            panic!("intentional approval worker panic witness");
+            #[allow(unreachable_code)]
+            WorkerExit::DomainFatal
+        });
+        panic_started_rx
+            .await
+            .expect("approval panic worker must start");
+        let mut session = GovernedStateSession {
+            core,
+            cancellation,
+            task_worker: None,
+            approval_worker: Some(approval_worker),
+        };
+
+        let approval_update = session
+            .next_update()
+            .await
+            .expect("approval panic must publish one safe domain update");
+        assert_eq!(approval_update.domain(), GovernedStateDomain::Approval);
+        assert_eq!(session.state().task(), &task_before);
+        assert_eq!(
+            session.state().approval().phase(),
+            GovernedStateDomainPhase::Fatal
+        );
+        assert_eq!(
+            session.state().approval().reason(),
+            Some(GovernedStateReason::ProjectionIntegrityFailure)
+        );
+
+        let (task_ack, task_ack_rx) = tokio::sync::oneshot::channel();
+        task_sender
+            .send(TaskRequest {
+                input: GovernedTaskReducerInput::RecoverableFailure {
+                    generation: 1,
+                    cause: GovernedRecoverableCause::TransportUnavailable,
+                },
+                ack: task_ack,
+            })
+            .await
+            .expect("task request must remain accepted after approval failure");
+        let task_update = session
+            .next_update()
+            .await
+            .expect("task domain must continue after approval failure");
+        assert_eq!(task_update.domain(), GovernedStateDomain::Task);
+        assert_eq!(
+            task_ack_rx
+                .await
+                .expect("task request must be acknowledged"),
+            DomainAck {
+                phase: GovernedStateDomainPhase::Stale,
+                generation: 2,
+                recovery_remaining: 2,
+            }
+        );
+        drop(task_sender);
+        assert!(session.next_update().await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r9b2b_domain_fatal_worker_retires_without_duplicate_task_update() {
+        let (core, task_sender, approval_sender) = GovernedStateSessionCore::new();
+        let (cancellation, _cancellation_receiver) = tokio::sync::watch::channel(false);
+        let (task_request_queued, task_request_queued_rx) = tokio::sync::oneshot::channel();
+        let task_worker = tokio::spawn(async move {
+            let (ack, ack_receiver) = tokio::sync::oneshot::channel();
+            task_sender
+                .send(TaskRequest {
+                    input: GovernedTaskReducerInput::Fatal {
+                        generation: 1,
+                        cause: GovernedFatalCause::ProjectionIntegrityFailure,
+                    },
+                    ack,
+                })
+                .await
+                .expect("task fatal request must reach the coordinator");
+            let _ = task_request_queued.send(());
+            let _ = ack_receiver.await;
+            WorkerExit::DomainFatal
+        });
+        task_request_queued_rx
+            .await
+            .expect("task worker must queue its fatal request");
+        let mut session = GovernedStateSession {
+            core,
+            cancellation,
+            task_worker: Some(task_worker),
+            approval_worker: None,
+        };
+
+        let task_update = session
+            .next_update()
+            .await
+            .expect("task fatal request must publish exactly one task update");
+        assert_eq!(task_update.domain(), GovernedStateDomain::Task);
+        assert_eq!(
+            session.state().task().phase(),
+            GovernedStateDomainPhase::Fatal
+        );
+
+        let (approval_ack, approval_ack_rx) = tokio::sync::oneshot::channel();
+        approval_sender
+            .send(ApprovalRequest {
+                input: GovernedApprovalReducerInput::RecoverableFailure {
+                    generation: 1,
+                    cause: GovernedRecoverableCause::TransportUnavailable,
+                },
+                ack: approval_ack,
+            })
+            .await
+            .expect("approval request must remain accepted after task fatal");
+        let approval_update = session
+            .next_update()
+            .await
+            .expect("approval domain must publish after task fatal retirement");
+        assert_eq!(approval_update.domain(), GovernedStateDomain::Approval);
+        assert_eq!(
+            approval_ack_rx
+                .await
+                .expect("approval request must be acknowledged"),
+            DomainAck {
+                phase: GovernedStateDomainPhase::Stale,
+                generation: 2,
+                recovery_remaining: 2,
+            }
+        );
+        assert_eq!(
+            session.state().task().phase(),
+            GovernedStateDomainPhase::Fatal
+        );
+        drop(approval_sender);
+        assert!(session.next_update().await.is_none());
+    }
 }
