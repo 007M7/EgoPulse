@@ -625,6 +625,8 @@ pub struct SafeArtifactRelationContent {
 pub struct SafeContentMarker {
     #[prost(enumeration = "HarnessContentMarkerKind", tag = "1")]
     pub kind: i32,
+    #[prost(enumeration = "HarnessContentLimitKind", tag = "2")]
+    pub limit_kind: i32,
 }
 /// Adapter Edge owns this exact safe record and its replay identity. Internal
 /// lineage is trusted-store derived, never copied from the Provider candidate.
@@ -1936,6 +1938,46 @@ impl HarnessContentMarkerKind {
                 Some(Self::ProfileChangedHistoryUnavailable)
             }
             "HARNESS_CONTENT_MARKER_KIND_COMPACTED" => Some(Self::Compacted),
+            _ => None,
+        }
+    }
+}
+/// Closed reason carried only by LIMIT_REACHED safe markers. The selected
+/// value is part of the marker payload and stable safe-record identity;
+/// UNSPECIFIED is required for every non-limit marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HarnessContentLimitKind {
+    Unspecified = 0,
+    AttemptTextBytes = 1,
+    AttemptRecords = 2,
+    TaskTextBytes = 3,
+    TaskRecords = 4,
+}
+impl HarnessContentLimitKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "HARNESS_CONTENT_LIMIT_KIND_UNSPECIFIED",
+            Self::AttemptTextBytes => "HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_TEXT_BYTES",
+            Self::AttemptRecords => "HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_RECORDS",
+            Self::TaskTextBytes => "HARNESS_CONTENT_LIMIT_KIND_TASK_TEXT_BYTES",
+            Self::TaskRecords => "HARNESS_CONTENT_LIMIT_KIND_TASK_RECORDS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HARNESS_CONTENT_LIMIT_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_TEXT_BYTES" => {
+                Some(Self::AttemptTextBytes)
+            }
+            "HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_RECORDS" => Some(Self::AttemptRecords),
+            "HARNESS_CONTENT_LIMIT_KIND_TASK_TEXT_BYTES" => Some(Self::TaskTextBytes),
+            "HARNESS_CONTENT_LIMIT_KIND_TASK_RECORDS" => Some(Self::TaskRecords),
             _ => None,
         }
     }

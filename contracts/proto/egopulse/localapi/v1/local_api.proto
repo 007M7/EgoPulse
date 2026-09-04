@@ -371,6 +371,10 @@ message HarnessArtifactRelationView {
 
 message HarnessContentMarkerView {
   egopulse.harness.v1.HarnessContentMarkerKind kind = 1;
+  // LIMIT_REACHED exposes the deterministic winning bound; every other
+  // marker carries UNSPECIFIED. The Local API must not force clients to infer
+  // this Authority-owned disclosure fact from counters or record position.
+  egopulse.harness.v1.HarnessContentLimitKind limit_kind = 2;
 }
 
 // Public, post-disclosure DTO. Raw/native identifiers, raw evidence, route

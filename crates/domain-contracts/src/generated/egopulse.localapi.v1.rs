@@ -482,6 +482,14 @@ pub struct HarnessContentMarkerView {
         tag = "1"
     )]
     pub kind: i32,
+    /// LIMIT_REACHED exposes the deterministic winning bound; every other
+    /// marker carries UNSPECIFIED. The Local API must not force clients to infer
+    /// this Authority-owned disclosure fact from counters or record position.
+    #[prost(
+        enumeration = "super::super::harness::v1::HarnessContentLimitKind",
+        tag = "2"
+    )]
+    pub limit_kind: i32,
 }
 /// Public, post-disclosure DTO. Raw/native identifiers, raw evidence, route
 /// binding, raw cumulative digests and credential commitments are intentionally

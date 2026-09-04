@@ -405,6 +405,22 @@ only after deterministic UTF-8 splitting, followed by that marker. Later text
 candidates create no safe rows or outbox messages; existing native evidence
 retention and one bounded aggregate omission fact remain separate.
 
+If one admitted safe part reaches more than one bound at the same point, the
+single public winner is selected in this exact order:
+`TASK_RECORDS`, `TASK_TEXT_BYTES`, `ATTEMPT_RECORDS`,
+`ATTEMPT_TEXT_BYTES`. Task scope precedes Attempt scope because it also governs
+future Attempts; within one scope, the record bound precedes the text bound so
+the reserved terminal slot remains structural. The winner is carried by the
+closed `HarnessContentLimitKind` and participates in both marker and safe-record
+identity. Every limit that stops or truncates that same next safe part is
+atomically marked terminal even though only one public winner is emitted. This
+includes a byte limit whose remaining budget cannot hold the next complete
+UTF-8 scalar; exact numeric exhaustion is not required. `LIMIT_REACHED` must be
+the single, zero-text, final record of that safe commit; any later candidate in
+a terminal scope creates neither a safe-ledger row nor an outbox message. Every
+non-limit marker carries `UNSPECIFIED` as its limit kind. The Local API exposes
+both marker kind and limit kind and never asks a client to infer the winner.
+
 Pagination includes only whole records. The record limit is applied first and
 the byte limit second. `next_page_cursor` is the sequence of the last returned
 record at the fixed snapshot position, with `has_more=true`; a page cannot be

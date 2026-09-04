@@ -222,6 +222,14 @@ class HarnessContentMarkerKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper
     HARNESS_CONTENT_MARKER_KIND_PROFILE_CHANGED_HISTORY_UNAVAILABLE: _ClassVar[HarnessContentMarkerKind]
     HARNESS_CONTENT_MARKER_KIND_COMPACTED: _ClassVar[HarnessContentMarkerKind]
 
+class HarnessContentLimitKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    HARNESS_CONTENT_LIMIT_KIND_UNSPECIFIED: _ClassVar[HarnessContentLimitKind]
+    HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_TEXT_BYTES: _ClassVar[HarnessContentLimitKind]
+    HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_RECORDS: _ClassVar[HarnessContentLimitKind]
+    HARNESS_CONTENT_LIMIT_KIND_TASK_TEXT_BYTES: _ClassVar[HarnessContentLimitKind]
+    HARNESS_CONTENT_LIMIT_KIND_TASK_RECORDS: _ClassVar[HarnessContentLimitKind]
+
 class HarnessContentCompactionReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     HARNESS_CONTENT_COMPACTION_REASON_UNSPECIFIED: _ClassVar[HarnessContentCompactionReason]
@@ -373,6 +381,11 @@ HARNESS_CONTENT_MARKER_KIND_REDACTION_INPUT_UNAVAILABLE: HarnessContentMarkerKin
 HARNESS_CONTENT_MARKER_KIND_LIMIT_REACHED: HarnessContentMarkerKind
 HARNESS_CONTENT_MARKER_KIND_PROFILE_CHANGED_HISTORY_UNAVAILABLE: HarnessContentMarkerKind
 HARNESS_CONTENT_MARKER_KIND_COMPACTED: HarnessContentMarkerKind
+HARNESS_CONTENT_LIMIT_KIND_UNSPECIFIED: HarnessContentLimitKind
+HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_TEXT_BYTES: HarnessContentLimitKind
+HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_RECORDS: HarnessContentLimitKind
+HARNESS_CONTENT_LIMIT_KIND_TASK_TEXT_BYTES: HarnessContentLimitKind
+HARNESS_CONTENT_LIMIT_KIND_TASK_RECORDS: HarnessContentLimitKind
 HARNESS_CONTENT_COMPACTION_REASON_UNSPECIFIED: HarnessContentCompactionReason
 HARNESS_CONTENT_COMPACTION_REASON_OWNER_HISTORY_FLOOR_ADVANCED: HarnessContentCompactionReason
 HARNESS_CONTENT_RETENTION_REASON_UNSPECIFIED: HarnessContentRetentionReason
@@ -945,10 +958,12 @@ class SafeArtifactRelationContent(_message.Message):
     def __init__(self, safe_content_differs_from_artifact: _Optional[bool] = ..., artifact: _Optional[_Union[SafeArtifactIdentity, _Mapping]] = ...) -> None: ...
 
 class SafeContentMarker(_message.Message):
-    __slots__ = ("kind",)
+    __slots__ = ("kind", "limit_kind")
     KIND_FIELD_NUMBER: _ClassVar[int]
+    LIMIT_KIND_FIELD_NUMBER: _ClassVar[int]
     kind: HarnessContentMarkerKind
-    def __init__(self, kind: _Optional[_Union[HarnessContentMarkerKind, str]] = ...) -> None: ...
+    limit_kind: HarnessContentLimitKind
+    def __init__(self, kind: _Optional[_Union[HarnessContentMarkerKind, str]] = ..., limit_kind: _Optional[_Union[HarnessContentLimitKind, str]] = ...) -> None: ...
 
 class SafeHarnessContentRecord(_message.Message):
     __slots__ = ("record_id", "record_digest_sha256", "content_event_id", "task_id", "run_id", "step_id", "attempt_id", "dispatch_id", "fencing_token", "route_binding_sha256", "disclosure_profile_ref", "provider_family_alias", "model_alias", "collaboration_role", "safety_flags", "assistant_text", "lifecycle", "usage", "approval_required", "artifact_relation", "marker")

@@ -221,6 +221,17 @@ enum HarnessContentMarkerKind {
   HARNESS_CONTENT_MARKER_KIND_COMPACTED = 7;
 }
 
+// Closed reason carried only by LIMIT_REACHED safe markers. The selected
+// value is part of the marker payload and stable safe-record identity;
+// UNSPECIFIED is required for every non-limit marker.
+enum HarnessContentLimitKind {
+  HARNESS_CONTENT_LIMIT_KIND_UNSPECIFIED = 0;
+  HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_TEXT_BYTES = 1;
+  HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_RECORDS = 2;
+  HARNESS_CONTENT_LIMIT_KIND_TASK_TEXT_BYTES = 3;
+  HARNESS_CONTENT_LIMIT_KIND_TASK_RECORDS = 4;
+}
+
 enum HarnessContentCompactionReason {
   HARNESS_CONTENT_COMPACTION_REASON_UNSPECIFIED = 0;
   HARNESS_CONTENT_COMPACTION_REASON_OWNER_HISTORY_FLOOR_ADVANCED = 1;
@@ -584,6 +595,7 @@ message SafeArtifactRelationContent {
 
 message SafeContentMarker {
   HarnessContentMarkerKind kind = 1;
+  HarnessContentLimitKind limit_kind = 2;
 }
 
 // Adapter Edge owns this exact safe record and its replay identity. Internal

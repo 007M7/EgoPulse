@@ -366,6 +366,18 @@ from D01-D12. R9C.0 records that acceptance before schema work starts.
   eligibility and must not fall back to a recomputed current config.
 - The two stores migrate independently but content projection is enabled only
   after both schema/profile digests pass startup validation.
+- The D08 typed-limit correction advances the disclosure contract from
+  `0.1.0` to `0.1.1`. Any pre-correction safe history remains immutable under
+  its original profile digest; activation of `0.1.1` starts a new content
+  epoch and never rewrites, re-redacts or backfills those bytes.
+- At this correction point, `0.1.0` had no merged runtime writer and therefore
+  produced zero product safe-history rows. It remains an auditable contract
+  candidate in Git history rather than a loadable first-release profile. If
+  contrary external write evidence is ever discovered, activation must stop
+  until the exact legacy profile and vectors are restored for read-only replay.
+- The additive Local API correction exposing the selected limit kind advances
+  the implementation candidate from `draft.20` to `draft.21`. It changes no
+  Authority, write owner, database migration or retrospective history rule.
 - A coordinated pre-migration backup is required for the real Windows C5
   upgrade test.
 

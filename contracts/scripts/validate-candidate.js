@@ -380,8 +380,8 @@ function validateHarnessFixture(file) {
       safeCumulativeSha256: '51b7cf9b02c27b407880e537b5bfa722bcd3e82e284c8d9152ab613894568e77',
       safeMessageIdSha256: 'b060407711409ba70a1affd38e053f313e27c549d9bfb6c2312415adf28f229a',
       safeAssistantPayloadSha256: '3fa3a43ce8a169fdf2082ea69d45ac3fd9c8e66fb88eb9edfebe161cda100d40',
-      safeRecordIdSha256: '461422ff77f6fbc2dfde772af0415b46fd5dd5a2957c0b9533e7d55a5c570c9d',
-      safeRecordSha256: 'de7d51fb8cdcffb028a7ac8d505f7615a53c03009d52ef15fb9bfb6843b8c397',
+      safeRecordIdSha256: '2d4a8740678287b4b680b1370cf550b45d579c18f54f2d7f1508386ec4486d6d',
+      safeRecordSha256: 'f79bac6dba76c3045be2dca16cddcda1cf9f1414e2037d7c0b66b3b5b8b73c83',
     };
     for (const [field, expectedValue] of Object.entries(exactVectors)) if (vectors[field] !== expectedValue) fail(prefix + 'R9C independent canonical vector drifted: ' + field);
     for (const [hexField, digestField] of [['routeBindingHex', 'routeBindingSha256'], ['textPayloadHex', 'textPayloadSha256'], ['previousRawCumulativeHex', 'previousRawCumulativeSha256'], ['rawCumulativeHex', 'rawCumulativeSha256'], ['safeCumulativeHex', 'safeCumulativeSha256'], ['safeMessageIdHex', 'safeMessageIdSha256'], ['safeAssistantPayloadHex', 'safeAssistantPayloadSha256'], ['safeRecordIdHex', 'safeRecordIdSha256'], ['safeRecordHex', 'safeRecordSha256']]) {
@@ -389,7 +389,7 @@ function validateHarnessFixture(file) {
     }
     const safe = value.safeProjection || {};
     if (safe.recordId !== 'hcr_' + vectors.safeRecordIdSha256 || safe.recordDigestSha256 !== vectors.safeRecordSha256 || safe.assistantText?.safeMessageId !== 'hcm_' + vectors.safeMessageIdSha256 || safe.assistantText?.safeCumulativeDigestSha256 !== vectors.safeCumulativeSha256 || safe.assistantText?.safeTextUtf8 !== 'Hello,\nworld!    ') fail(prefix + 'safe record identity/payload vector drifted');
-    if (safe.disclosureProfileRef?.sha256 !== 'f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc') fail(prefix + 'safe record must bind the exact disclosure profile');
+      if (safe.disclosureProfileRef?.sha256 !== 'c969c9eda5394617aa8bcbca4ed0086eb0dd61ced2519818db830cc73ed1e58f') fail(prefix + 'safe record must bind the exact disclosure profile');
     const additional = value.additionalCandidateVectors || {};
     const candidateVectors = [
       [additional.usage, '352f85c3425505cb13a12321dde2cb6ab84e42b184d287165496fb1341a8e4a8'],
@@ -399,6 +399,23 @@ function validateHarnessFixture(file) {
     for (const [candidateVector, expectedDigest] of candidateVectors) {
       if (!candidateVector || candidateVector.candidateDigestSha256 !== expectedDigest || crypto.createHash('sha256').update(Buffer.from(candidateVector.canonicalHex, 'hex')).digest('hex') !== expectedDigest) fail(prefix + 'non-text candidate canonical vector drifted');
     }
+    const expectedLimitVectors = [
+      ['TASK_RECORDS', '861b25e0c57b767079b3eb609c66ba1923e91dd1bb1ba967f26c0595e74ea7eb', 'e6f3d3093fe75193b649326af78eaeccb09633b694847b3171249735df3e73e8', 'e4ef140f91e8a6b4ace4ce83dcc268dc6287cc8675f4004c8e3e7a41633d4947', '3ab4aac60da9db1f1f3f46c16e78fe85a6006b4f12574f290dc2f8c8575ac7b4', 'a233bc845e7e3bed65600500e85cd7f441c3ad59a02887777250f9a2595d12d0', '08be61f20b1550e945207b1706722cf7f775ccfdc50255a46d7fa3ca0ff803d9'],
+      ['TASK_TEXT_BYTES', '42cc6bf0012b6c3dc499df285062c341c31673fd315c0f7d1b1eb42ace1fa3f3', '6474d56beba548de01410b8ab4cefad64398a2461f0818f468356c9cd0f1ecdf', '25ab677b2521dd1ecebd32358bd366e287d0ed41e2befbe3998286a5b2ef1fd7', 'd43d02f800f028893f0068d1eeb14e52bd66c864c75762a2d0b9e9ca75f80e64', 'cfcbe0b6b6d72a82156bdbe106d3dc87004bdce4a2dabf5e43972ee253659f5c', '80e444a092fb61b38a82cc2d33fecad4e17dd06e51fac8affa100122cf77cdc8'],
+      ['ATTEMPT_RECORDS', '09a1ae4833a218680f4bc1f3bd50401c339dc3b7efdacad57c8ca86c18247220', '0b988e97b633dd43207e301c6f56a8534c19a53733155dde50274f73984ec861', 'ec485b26b5e42e5721ec86a045ac00e4e9725c775a82404077a0b2108f92ac51', '8d4286dcd69317bef53d090a7063fab0a58fc91f3bd1b137de2f2a67dbd9688d', 'efcffc4b76cc80795aeeebe48ef99b02e37c555b894b8ae9a6a881a1161ac735', '67d6256335956da34c502a35c89f6a995d8d4445ee311b571f7c63fa19cdeca4'],
+      ['ATTEMPT_TEXT_BYTES', '9c72be1b92ce53711d44198810b469071053489bc3229e8f49416d515b50454a', 'd2392bcf8f68a56d151dc2fd5485827da436f3b01e7e4932fed2ad710f25ba79', '881ba0e7bf0b06dee5b54d80daa254a88723df696990a857ab36d15305478967', 'ab8cd3d5ea7f8dfbd979309b1822ff67dcc765939876dac0818e0b170b123bbf', 'bc49dbdafe598620f742a3f96f8c3c32cf8fb42a129eb1d095c2ac6bf446649d', '627a9ea294a8124c4459909c2afe7724f5a16965466ccfa081c2d2a017b7beea'],
+    ];
+    const limitVectors = value.limitMarkerCanonicalVectors || [];
+    if (limitVectors.length !== expectedLimitVectors.length) fail(prefix + 'typed limit marker vector inventory drifted');
+    const limitRecordIds = new Set();
+    for (let index = 0; index < expectedLimitVectors.length; index += 1) {
+      const vector = limitVectors[index] || {};
+      const [limitKind, markerDigest, recordIdDigest, recordDigest, projectionDigest, markerOnlyDigest, prefixThenMarkerDigest] = expectedLimitVectors[index];
+      if (vector.markerKind !== 'LIMIT_REACHED' || vector.limitKind !== limitKind || vector.markerSha256 !== markerDigest || vector.recordIdSha256 !== recordIdDigest || vector.recordSha256 !== recordDigest || vector.projectionEventSha256 !== projectionDigest || vector.markerOnlyCommittedRecordsSha256 !== markerOnlyDigest || vector.prefixThenMarkerCommittedRecordsSha256 !== prefixThenMarkerDigest) fail(prefix + 'typed limit marker identity drifted: ' + limitKind);
+      if (crypto.createHash('sha256').update(Buffer.from(vector.markerHex, 'hex')).digest('hex') !== markerDigest || crypto.createHash('sha256').update(Buffer.from(vector.recordIdHex, 'hex')).digest('hex') !== recordIdDigest) fail(prefix + 'typed limit marker literal bytes drifted: ' + limitKind);
+      limitRecordIds.add(recordIdDigest);
+    }
+    if (limitRecordIds.size !== expectedLimitVectors.length) fail(prefix + 'typed limit marker record IDs must be distinct');
     const credentialVectors = value.credentialVariantVectors || [];
     if (credentialVectors.length !== 2) fail(prefix + 'managed credential literal vector inventory drifted');
     for (const vector of credentialVectors) {
@@ -759,7 +776,7 @@ function validateLocalApiFixture(file) {
   }
   if (operationName === 'listHarnessContent' && expected.outcome === 'ok') {
     if (expected.operationRecordStream !== true || expected.completeSnapshotFrame !== false || expected.wholeRecordsOnly !== true || expected.nextPageCursorBoundToSnapshotAndFilters !== true) fail(prefix + 'content baseline must use fixed-position whole operation records');
-    if (expected.profileRef?.contractId !== 'egopulse.harness-content-disclosure.v1' || expected.profileRef?.version !== '0.1.0' || expected.profileRef?.sha256 !== sha256(path.join(root, harnessContentProfileRelative))) fail(prefix + 'content baseline profile reference must bind the exact disclosure profile');
+      if (expected.profileRef?.contractId !== 'egopulse.harness-content-disclosure.v1' || expected.profileRef?.version !== '0.1.1' || expected.profileRef?.sha256 !== sha256(path.join(root, harnessContentProfileRelative))) fail(prefix + 'content baseline profile reference must bind the exact disclosure profile');
     for (const field of ['rawNativeIdentifiersReturned', 'rawEvidenceReturned', 'rawCumulativeDigestReturned', 'credentialCommitmentReturned']) if (expected[field] !== false) fail(prefix + 'content baseline exposes private Adapter field: ' + field);
     if (value.fixtureId === 'localapi-valid-harness-content-baseline') {
       const boundary = value.boundaryCases || {};
@@ -779,10 +796,10 @@ function validateLocalApiFixture(file) {
     if (expected.ownerTombstoneTyped !== true || expected.ownerTombstoneContainsText !== false || expected.rawEvidenceRebuildAttempted !== false || expected.expiredContentResurrected !== false) fail(prefix + 'retention tombstone must be typed, text-free and prevent raw-evidence resurrection');
     const tombstone = value.ownerRetentionTombstone || {};
     const vectors = value.canonicalVectors || {};
-    if (tombstone.tombstoneId !== 'hrt_' + vectors.retentionTombstoneIdSha256 || tombstone.tombstoneDigestSha256 !== vectors.retentionTombstoneSha256 || tombstone.disclosureProfileRef?.sha256 !== 'f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc' || tombstone.reason !== 'HARNESS_CONTENT_RETENTION_REASON_TERMINAL_MINIMUM_EXPIRED') fail(prefix + 'typed retention tombstone identity drifted');
+      if (tombstone.tombstoneId !== 'hrt_' + vectors.retentionTombstoneIdSha256 || tombstone.tombstoneDigestSha256 !== vectors.retentionTombstoneSha256 || tombstone.disclosureProfileRef?.sha256 !== 'c969c9eda5394617aa8bcbca4ed0086eb0dd61ced2519818db830cc73ed1e58f' || tombstone.reason !== 'HARNESS_CONTENT_RETENTION_REASON_TERMINAL_MINIMUM_EXPIRED') fail(prefix + 'typed retention tombstone identity drifted');
     for (const [hexField, digestField, expectedDigest] of [
-      ['retentionTombstoneIdHex', 'retentionTombstoneIdSha256', 'c3974d6b10d5934defe7cecf331300ecb3f7292676bf52d2abf170e27283bd8f'],
-      ['retentionTombstoneHex', 'retentionTombstoneSha256', '9e66456fca02fc3c3603e6fa2988c5edcd6c813c4b56d61a4361f7e10aa8c642'],
+      ['retentionTombstoneIdHex', 'retentionTombstoneIdSha256', 'a5ea102e29b1eeac1fa461732090071030bae1bc1fc3ab80970c39ca428c3365'],
+      ['retentionTombstoneHex', 'retentionTombstoneSha256', 'd0ea91476deef69179199243da72410861300ea4698e033460a5e5c18e07f68e'],
     ]) {
       if (vectors[digestField] !== expectedDigest || crypto.createHash('sha256').update(Buffer.from(vectors[hexField], 'hex')).digest('hex') !== expectedDigest) fail(prefix + 'retention tombstone canonical vector drifted: ' + digestField);
     }
@@ -902,10 +919,10 @@ function validatePersistenceFixture(file) {
     for (const field of ['safeLedgerWriteCount', 'outboxWriteCount', 'consumerWriteCount', 'authorityBusinessWriteCount', 'taskAuthorityWriteCount', 'collaborationAuthorityWriteCount', 'policyAuthorityWriteCount', 'artifactAuthorityWriteCount', 'verificationAuthorityWriteCount', 'founderVerdictAuthorityWriteCount', 'contextAuthorityWriteCount', 'memoryAuthorityWriteCount']) if (expected[field] !== 0) fail(prefix + 'safe content recovery must perform zero duplicate/Authority writes: ' + field);
     const compaction = value.typedHistoryCompaction || {};
     const vectors = value.canonicalVectors || {};
-    if (expected.typedHistoryCompactionRecord !== true || compaction.compactionRecordId !== 'hcc_' + vectors.historyCompactionRecordIdSha256 || compaction.compactionRecordDigestSha256 !== vectors.historyCompactionRecordSha256 || compaction.disclosureProfileRef?.sha256 !== 'f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc' || compaction.reason !== 'HARNESS_CONTENT_COMPACTION_REASON_OWNER_HISTORY_FLOOR_ADVANCED') fail(prefix + 'typed owner history compaction record drifted');
+      if (expected.typedHistoryCompactionRecord !== true || compaction.compactionRecordId !== 'hcc_' + vectors.historyCompactionRecordIdSha256 || compaction.compactionRecordDigestSha256 !== vectors.historyCompactionRecordSha256 || compaction.disclosureProfileRef?.sha256 !== 'c969c9eda5394617aa8bcbca4ed0086eb0dd61ced2519818db830cc73ed1e58f' || compaction.reason !== 'HARNESS_CONTENT_COMPACTION_REASON_OWNER_HISTORY_FLOOR_ADVANCED') fail(prefix + 'typed owner history compaction record drifted');
     for (const [hexField, digestField, expectedDigest] of [
-      ['historyCompactionRecordIdHex', 'historyCompactionRecordIdSha256', '7650d9dc119bb7d9b1e101279fd7174e9fceabb316d2a76b0693f03f9babdb20'],
-      ['historyCompactionRecordHex', 'historyCompactionRecordSha256', '9774b8410cd8e52e0e0855a200b32331d5f69a81b82da841600872e95fc694ca'],
+      ['historyCompactionRecordIdHex', 'historyCompactionRecordIdSha256', '86ee58c2c699af284440e94a3a4fbcea0e5acbf44f47d971eef5a5cf4b2499ce'],
+      ['historyCompactionRecordHex', 'historyCompactionRecordSha256', '9d4289be5038e132b948c0b125ce2051f05d0a169f586d2d29d30d97f38013c0'],
     ]) {
       if (vectors[digestField] !== expectedDigest || crypto.createHash('sha256').update(Buffer.from(vectors[hexField], 'hex')).digest('hex') !== expectedDigest) fail(prefix + 'history compaction canonical vector drifted: ' + digestField);
     }
@@ -916,7 +933,7 @@ function validatePersistenceFixture(file) {
 function main() {
   const manifest = readJson(manifestPath);
   if (manifest.schemaVersion !== 'v01-gate3-contract-candidate-manifest/v0.1') fail('manifest schemaVersion');
-  if (manifest.candidateVersion !== '0.1.0-draft.20' || manifest.status !== 'targeted_revision_r9c_contract_founder_frozen_locally_verified') fail('R-9C draft.20 candidate identity drifted');
+  if (manifest.candidateVersion !== '0.1.0-draft.21' || manifest.status !== 'targeted_revision_r9c_contract_founder_frozen_locally_verified') fail('R-9C draft.21 candidate identity drifted');
   if (manifest.contextRevokeSchemeCAuthorityRef !== 'conversation:2026-08-31:founder-r9a-gate11-scheme-c') fail('R-9A Scheme C authority drifted');
   if (manifest.r9cHarnessContentAuthorityRef !== r9cAuthorityRef) fail('R-9C Founder freeze authority drifted');
   const manifestPaths = new Set(manifest.artifacts.map((artifact) => artifact.path.replace(/\\/g, '/')));
@@ -996,7 +1013,7 @@ function main() {
   for (const required of ['package egopulse.collaboration.v1', 'enum RunStatus', 'enum StepStatus', 'enum AttemptStatus', 'enum AttemptCancellationDisposition', 'message Lease', 'message CheckpointReference', 'string task_id = 14', 'uint64 work_revision = 15', 'message CollaborationSnapshot', 'message CollaborationCommand', 'message CollaborationEvent', 'service CollaborationControlService']) {
     if (!collaborationProto.includes(required)) fail('collaboration proto missing: ' + required);
   }
-  for (const required of ['package egopulse.harness.v1', 'enum SupportLevel', 'enum CancellationSemantics', 'enum ResumeSemantics', 'enum ApprovalRequestLifecycleKind', 'enum ContentMutationOperation', 'enum HarnessContentSafetyFlag', 'enum HarnessContentMarkerKind', 'enum HarnessContentCompactionReason', 'enum HarnessContentRetentionReason', 'message CapabilityProfile', 'governed_user_visible_content = 11', 'message DispatchRouteBinding', 'DispatchRouteBinding route_binding = 23', 'message UserVisibleContentCandidate', 'message HarnessContentSignalObservation', 'message SafeHarnessContentRecord', 'message HarnessContentHistoryCompactionRecord', 'message HarnessContentRetentionTombstone', 'message SafeHarnessContentProjectionEvent', 'message DispatchContextConsumptionProof', 'HarnessContentSignalObservation content_signal = 27', 'message DispatchEnvelope', 'message HarnessObservation', 'message ApprovalDecisionEnvelope', 'message CancelExecutionEnvelope', 'message ResumeExecutionEnvelope', 'message ArtifactReturnObservation', 'service HarnessAdapterService', 'service HarnessRegistryService']) {
+  for (const required of ['package egopulse.harness.v1', 'enum SupportLevel', 'enum CancellationSemantics', 'enum ResumeSemantics', 'enum ApprovalRequestLifecycleKind', 'enum ContentMutationOperation', 'enum HarnessContentSafetyFlag', 'enum HarnessContentMarkerKind', 'enum HarnessContentLimitKind', 'enum HarnessContentCompactionReason', 'enum HarnessContentRetentionReason', 'message CapabilityProfile', 'governed_user_visible_content = 11', 'message DispatchRouteBinding', 'DispatchRouteBinding route_binding = 23', 'message UserVisibleContentCandidate', 'message HarnessContentSignalObservation', 'message SafeHarnessContentRecord', 'message SafeContentMarker', 'HarnessContentLimitKind limit_kind = 2', 'message HarnessContentHistoryCompactionRecord', 'message HarnessContentRetentionTombstone', 'message SafeHarnessContentProjectionEvent', 'message DispatchContextConsumptionProof', 'HarnessContentSignalObservation content_signal = 27', 'message DispatchEnvelope', 'message HarnessObservation', 'message ApprovalDecisionEnvelope', 'message CancelExecutionEnvelope', 'message ResumeExecutionEnvelope', 'message ArtifactReturnObservation', 'service HarnessAdapterService', 'service HarnessRegistryService']) {
     if (!harnessProto.includes(required)) fail('harness proto missing: ' + required);
   }
   const ownerArtifactRelation = harnessProto.slice(harnessProto.indexOf('message SafeArtifactRelationContent'), harnessProto.indexOf('message SafeContentMarker'));
@@ -1062,7 +1079,7 @@ function main() {
   const clientKernelProfile = readJson(path.join(root, clientKernelProfileRelative));
   if (clientKernelProfile.schemaVersion !== 'egopulse.client-kernel-profile/v0.1' || clientKernelProfile.contractId !== 'egopulse.client-kernel.v1' || clientKernelProfile.contractVersion !== '0.1.0') fail('client-kernel profile identity drifted');
   if (clientKernelProfile.authorityRef !== r9cAuthorityRef) fail('client-kernel profile missing latest Founder authority');
-  if (clientKernelProfile.localApiCompatibility?.contractId !== 'egopulse.localapi.v1' || clientKernelProfile.localApiCompatibility?.minimumVersion !== '0.1.0-draft.20' || clientKernelProfile.localApiCompatibility?.maximumVersionExclusive !== '0.2.0' || clientKernelProfile.localApiCompatibility?.runtimeReferenceRequired !== true) fail('client-kernel Local API compatibility binding invalid');
+  if (clientKernelProfile.localApiCompatibility?.contractId !== 'egopulse.localapi.v1' || clientKernelProfile.localApiCompatibility?.minimumVersion !== '0.1.0-draft.21' || clientKernelProfile.localApiCompatibility?.maximumVersionExclusive !== '0.2.0' || clientKernelProfile.localApiCompatibility?.runtimeReferenceRequired !== true) fail('client-kernel Local API compatibility binding invalid');
   const kernelBoundary = clientKernelProfile.implementationBoundary || {};
   const expectedSurfaces = new Set(['cli', 'tui', 'desktop_tauri_backend']);
   if (kernelBoundary.sharedKernelLanguage !== 'rust' || kernelBoundary.typescriptBusinessKernelAllowed !== false || kernelBoundary.transport !== 'tonic_grpc_http2_semantics_over_named_pipe_or_uds_no_tcp' || new Set(kernelBoundary.surfaces || []).size !== expectedSurfaces.size || [...expectedSurfaces].some((surface) => !(kernelBoundary.surfaces || []).includes(surface))) fail('client-kernel implementation boundary drifted');
@@ -1146,7 +1163,7 @@ function main() {
   const fixedContextRevoke = readJson(path.join(localApiFixtureRoot, 'valid-context-revoke-semantic-digest.json')).operation.executeContextMutation;
   if (fixedContextRevoke.requestDigestSha256 !== '08d5c9f548acdef1cf739b73205510084c6c3ecd010ece536881a155eff3befc' || fixedContextRevoke.canonicalBytesHex !== '1a0000000000000065676f70756c73652f636f6e746578742d7265766f6b652f76310f000000000000006f732d757365723a666f756e64657244000000000000006374783a30313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566080000000000000001000000000000001100000000000000666f756e6465722d77697468647261776e08000000000000000100000000000000120000000000000065766964656e63653a7265766965773a34321300000000000000636f6e6669726d6174696f6e3a636c693a3031') fail('Context revoke fixed digest/canonical bytes vector drifted');
   const harnessContentProfile = readJson(path.join(root, harnessContentProfileRelative));
-  if (harnessContentProfile.schemaVersion !== 'egopulse.harness-content-disclosure-profile/v0.1' || harnessContentProfile.contractId !== 'egopulse.harness-content-disclosure.v1' || harnessContentProfile.contractVersion !== '0.1.0' || harnessContentProfile.profileId !== 'harness-content-disclosure-v01-default' || harnessContentProfile.authorityRef !== r9cAuthorityRef) fail('Harness content disclosure profile identity drifted');
+  if (harnessContentProfile.schemaVersion !== 'egopulse.harness-content-disclosure-profile/v0.1' || harnessContentProfile.contractId !== 'egopulse.harness-content-disclosure.v1' || harnessContentProfile.contractVersion !== '0.1.1' || harnessContentProfile.profileId !== 'harness-content-disclosure-v01-default' || harnessContentProfile.authorityRef !== r9cAuthorityRef) fail('Harness content disclosure profile identity drifted');
   if (JSON.stringify(harnessContentProfile.contractBindings) !== JSON.stringify({ harnessContractId: 'egopulse.harness.v1', localApiContractId: 'egopulse.localapi.v1', capabilityField: 'governed_user_visible_content', permissionCode: 'local.harness.content.read' })) fail('Harness content contract bindings drifted');
   const sourceAdmission = harnessContentProfile.sourceAdmission || {};
   requireExactSet(sourceAdmission.contextProofBranches || [], ['NOT_CONTEXT_BOUND', 'AUTHORIZED_CONTEXT'], 'Harness content Context proof branches drifted');
@@ -1166,7 +1183,7 @@ function main() {
   if (JSON.stringify(canonical.safePayloadDiscriminators) !== JSON.stringify({ assistantText: 'ASSISTANT_TEXT', lifecycle: 'LIFECYCLE', usage: 'USAGE', approvalRequired: 'APPROVAL_REQUIRED', artifactRelation: 'ARTIFACT_RELATION', marker: 'MARKER' })) fail('Harness content safe payload discriminator catalog drifted');
   if (JSON.stringify(canonical.projectionEventDiscriminators) !== JSON.stringify({ contentRecord: 'CONTENT_RECORD', historyCompaction: 'HISTORY_COMPACTION', retentionTombstone: 'RETENTION_TOMBSTONE' })) fail('Harness content projection-event discriminator catalog drifted');
   if (JSON.stringify(canonical.identifierFormats) !== JSON.stringify({ safeMessageId: 'hcm_<lowercase_hex_64>', safeRecordId: 'hcr_<lowercase_hex_64>', historyCompactionRecordId: 'hcc_<lowercase_hex_64>', retentionTombstoneId: 'hrt_<lowercase_hex_64>' })) fail('Harness content identifier formats drifted');
-  if (JSON.stringify(canonical.digestRules) !== JSON.stringify({ candidateDigest: 'sha256_of_selected_candidate_payload_canonical_bytes', safePayloadDigest: 'sha256_of_selected_safe_payload_canonical_bytes', safeRecordDigest: 'sha256_of_safe_record_canonical_bytes_excluding_record_digest_sha256', historyCompactionDigest: 'sha256_of_history_compaction_canonical_bytes_excluding_compaction_record_digest_sha256', retentionTombstoneDigest: 'sha256_of_retention_tombstone_canonical_bytes_excluding_tombstone_digest_sha256', safetyFlags: 'ascending_numeric_unique', nonTextPartIndexForRecordId: 0 })) fail('Harness content digest/self-exclusion rules drifted');
+  if (JSON.stringify(canonical.digestRules) !== JSON.stringify({ candidateDigest: 'sha256_of_selected_candidate_payload_canonical_bytes', safePayloadDigest: 'sha256_of_selected_safe_payload_canonical_bytes', safeRecordDigest: 'sha256_of_safe_record_canonical_bytes_excluding_record_digest_sha256', historyCompactionDigest: 'sha256_of_history_compaction_canonical_bytes_excluding_compaction_record_digest_sha256', retentionTombstoneDigest: 'sha256_of_retention_tombstone_canonical_bytes_excluding_tombstone_digest_sha256', safetyFlags: 'ascending_numeric_unique', nonTextPartIndexForRecordId: 0, nonLimitRecordIdLimitKind: 'UNSPECIFIED', limitMarkerInvariant: 'LIMIT_REACHED_requires_typed_limit_kind_non_limit_markers_require_UNSPECIFIED' })) fail('Harness content digest/self-exclusion rules drifted');
   const expectedDomains = {
     routeBinding: 'egopulse/harness-content/route-binding/v1',
     textPayload: 'egopulse/harness-content/text-payload/v1',
@@ -1206,14 +1223,14 @@ function main() {
     approvalRequiredCandidateFieldOrder: ['domain_separator'],
     blockedSourceCandidateFieldOrder: ['domain_separator', 'marker_kind'],
     contentEventIdFieldOrder: ['domain_separator', 'delivered_receipt_id', 'delivered_receipt_digest_sha256', 'context_proof_branch', 'context_authorization_id', 'context_authorization_request_digest_sha256', 'dispatch_route_binding_sha256', 'attempt_id', 'dispatch_id', 'fencing_token', 'capability_profile_id', 'native_event_id', 'native_event_digest_sha256', 'native_sequence', 'candidate_digest_sha256'],
-    safeRecordIdFieldOrder: ['domain_separator', 'content_event_id', 'disclosure_profile_contract_id', 'disclosure_profile_version', 'disclosure_profile_sha256', 'payload_discriminator', 'part_index'],
+    safeRecordIdFieldOrder: ['domain_separator', 'content_event_id', 'disclosure_profile_contract_id', 'disclosure_profile_version', 'disclosure_profile_sha256', 'payload_discriminator', 'limit_kind', 'part_index'],
     safeRecordFieldOrder: ['domain_separator', 'record_id', 'content_event_id', 'task_id', 'run_id', 'step_id', 'attempt_id', 'dispatch_id', 'fencing_token', 'route_binding_sha256', 'disclosure_profile_contract_id', 'disclosure_profile_version', 'disclosure_profile_sha256', 'provider_family_alias', 'model_alias', 'collaboration_role', 'safety_flags_count', 'safety_flags_ascending_numeric', 'payload_discriminator', 'payload_digest_sha256'],
     safeAssistantTextFieldOrder: ['domain_separator', 'safe_message_id', 'revision', 'previous_revision', 'operation', 'safe_text_utf8', 'safe_cumulative_digest_sha256', 'part_index', 'part_count'],
     safeLifecycleFieldOrder: ['domain_separator', 'lifecycle_kind', 'side_effect_certainty', 'native_will_retry_presence', 'native_will_retry_value'],
     safeUsageFieldOrder: ['domain_separator', 'input_tokens', 'output_tokens', 'cached_input_tokens_presence', 'cached_input_tokens_value'],
     safeApprovalRequiredFieldOrder: ['domain_separator'],
     safeArtifactRelationFieldOrder: ['domain_separator', 'safe_content_differs_from_artifact', 'artifact_id', 'artifact_digest_sha256'],
-    safeMarkerFieldOrder: ['domain_separator', 'marker_kind'],
+    safeMarkerFieldOrder: ['domain_separator', 'marker_kind', 'limit_kind'],
     historyCompactionRecordIdFieldOrder: ['domain_separator', 'task_id', 'attempt_id', 'final_epoch', 'final_sequence', 'disclosure_profile_sha256', 'reason'],
     historyCompactionRecordFieldOrder: ['domain_separator', 'compaction_record_id', 'task_id', 'attempt_id', 'final_epoch', 'final_sequence', 'final_safe_content_digest_sha256', 'owner_snapshot_digest_sha256', 'disclosure_profile_contract_id', 'disclosure_profile_version', 'disclosure_profile_sha256', 'compacted_at_seconds', 'compacted_at_nanos', 'reason'],
     retentionTombstoneIdFieldOrder: ['domain_separator', 'task_id', 'attempt_id', 'final_epoch', 'final_sequence', 'disclosure_profile_sha256', 'reason'],
@@ -1230,7 +1247,7 @@ function main() {
   requireExactSet(secrets.variants || [], ['raw_ascii', 'canonical_json_content_escape', 'canonical_percent_uppercase', 'base64_standard_padded', 'base64_standard_unpadded', 'base64url_padded', 'base64url_unpadded'], 'Harness content credential variant set drifted');
   if (secrets.credentialMode !== 'api_key_environment' || secrets.maxNonEmptyValues !== 32 || secrets.maxValueBytes !== 1024 || secrets.valueEncoding !== 'printable_ascii' || secrets.maxEncodedPatternBytes !== 3072 || secrets.maxWithheldSuffixBytes !== 3071 || secrets.matcher !== 'deterministic_streaming_multi_pattern_longest_match' || secrets.commitment !== 'domain_separated_hmac_sha256_from_adapter_store_key' || secrets.persistedSecretMaterial !== 'commitment_only' || secrets.oversizeBehavior !== 'structured_only_attempt_execution_continues' || secrets.restartMismatchBehavior !== 'REDACTION_INPUT_UNAVAILABLE_then_structured_only' || secrets.harnessAccountGuarantee !== 'forbidden_source_and_daemon_managed_secret_bytes_only') fail('Harness content managed-credential redaction contract drifted');
   const limits = harnessContentProfile.resourceLimits || {};
-  if (limits.candidateTextBytes !== 65536 || limits.safePartBytes !== 65536 || limits.serializedFrameBytes !== 81920 || limits.attemptSafeTextBytes !== 16777216 || limits.attemptSafeRecords !== 16384 || limits.taskSafeTextBytes !== 67108864 || limits.taskSafeRecords !== 65536 || limits.baselinePageRecords !== 256 || limits.baselinePageTextBytes !== 1048576 || limits.reservedFinalRecordSlot !== 'LIMIT_REACHED' || limits.byteAccounting !== 'safe_normalized_redacted_utf8_before_proto' || limits.paginationWholeRecordsOnly !== true) fail('Harness content resource limits drifted');
+  if (limits.candidateTextBytes !== 65536 || limits.safePartBytes !== 65536 || limits.serializedFrameBytes !== 81920 || limits.attemptSafeTextBytes !== 16777216 || limits.attemptSafeRecords !== 16384 || limits.taskSafeTextBytes !== 67108864 || limits.taskSafeRecords !== 65536 || limits.baselinePageRecords !== 256 || limits.baselinePageTextBytes !== 1048576 || limits.reservedFinalRecordSlot !== 'LIMIT_REACHED' || JSON.stringify(limits.simultaneousLimitPrecedence) !== JSON.stringify(['TASK_RECORDS', 'TASK_TEXT_BYTES', 'ATTEMPT_RECORDS', 'ATTEMPT_TEXT_BYTES']) || limits.terminalScopes !== 'all_scopes_exhausted_by_admitted_prefix_and_marker' || limits.byteAccounting !== 'safe_normalized_redacted_utf8_before_proto' || limits.paginationWholeRecordsOnly !== true) fail('Harness content resource limits drifted');
   const recovery = harnessContentProfile.recoveryAndRetention || {};
   if (recovery.projectionDomain !== 'independent_harness_content' || recovery.delivery !== 'at_least_once_idempotent' || recovery.stableIdentity !== 'content_event_id_and_record_digest' || recovery.rebuildSource !== 'adapter_safe_ledger_or_owner_snapshot_only' || recovery.rerunRedactionOnReplay !== false || recovery.profileChange !== 'new_epoch_reset_old_text_excluded_history_unavailable_tombstone' || recovery.minimumSecondsAfterTaskTerminal !== 2592000 || recovery.compaction !== 'owner_snapshot_floor_delete_and_typed_record_atomic' || recovery.tombstonePreventsResurrection !== true || recovery.unknownGap !== 'ResetRequired') fail('Harness content recovery/retention contract drifted');
   const contentAuthorization = harnessContentProfile.authorization || {};
@@ -1242,6 +1259,9 @@ function main() {
   const grantedCodes = [...(openSessionFixture.expected?.grantedReadCapabilities || []), ...(openSessionFixture.expected?.grantedWriteCapabilities || [])];
   if (grantedCodes.some((code) => !permissionCodes.has(code))) fail('open-session fixture grants permission outside authorization profile');
   if (!(openSessionFixture.expected?.grantedReadCapabilities || []).includes('local.harness.content.read')) fail('open-session fixture must negotiate the R-9C content permission');
+  const contentBaselineFixture = readJson(path.join(localApiFixtureRoot, 'valid-harness-content-baseline.json'));
+  const publicLimitMarker = contentBaselineFixture.expected?.publicLimitMarkerExample || {};
+  if (publicLimitMarker.kind !== 'HARNESS_CONTENT_MARKER_KIND_LIMIT_REACHED' || publicLimitMarker.limitKind !== 'HARNESS_CONTENT_LIMIT_KIND_TASK_RECORDS' || publicLimitMarker.clientInferenceRequired !== false) fail('Local API must expose the typed D08 limit winner without client inference');
   const validation = manifest.validation || {};
   for (const field of ['bufLint', 'bufBuild', 'protocCompile', 'crossLanguageGeneration', 'faultConformance', 'qualityBudgetProfile', 'clientKernelProfile', 'authorizationCapabilityProfile', 'contextRevokeSemanticProfile', 'harnessContentDisclosureProfile', 'r9cContractGate']) {
     if (typeof validation[field] !== 'string' || !validation[field].startsWith('passed_')) fail('toolchain evidence is not passed: ' + field);
@@ -1264,7 +1284,7 @@ function main() {
   const expectedR9aAcceptanceGates = 'passed_gate7_existing_adapter_receipt_and_task_run_step_attempt_unchanged_after_revoke;gate9_authorization_first_and_revoke_first_restart_paths_use_independent_external_side_effect_witness;gate10_context_paths_do_not_create_or_advance_founder_verdict;gate11_scheme_c_new_commit_validation_and_exact_historical_replay_zero_writes_with_changed_semantics_conflict';
   if (validation.r9aAcceptanceGates !== expectedR9aAcceptanceGates) fail('R-9A Gate 7/9/10/11 evidence drifted');
   console.log(`candidate validation passed: ${taskFixtureFiles.length} task fixtures, ${collaborationFixtureFiles.length} collaboration fixtures, ${harnessFixtureFiles.length} harness fixtures, ${artifactFixtureFiles.length} artifact fixtures, ${verificationFixtureFiles.length} verification fixtures, ${verdictFixtureFiles.length} verdict fixtures, ${policyFixtureFiles.length} policy fixtures, ${localApiFixtureFiles.length} localapi fixtures, ${persistenceFixtureFiles.length} persistence fixtures, ${manifest.artifacts.length} digests`);
-  console.log('proto_toolchain_status=passed; draft.20 Buf/protoc and Rust/TypeScript/Python generation are verified');
+  console.log('proto_toolchain_status=passed; draft.21 Buf/protoc and Rust/TypeScript/Python generation are verified');
   console.log('r9c_contract_status=founder_frozen_locally_verified; R9C-D01..D12 and phase-2-82 section 7 are pinned');
 }
 

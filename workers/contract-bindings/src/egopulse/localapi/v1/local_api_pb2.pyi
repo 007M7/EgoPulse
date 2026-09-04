@@ -592,10 +592,12 @@ class HarnessArtifactRelationView(_message.Message):
     def __init__(self, safe_content_differs_from_artifact: _Optional[bool] = ..., available: _Optional[_Union[HarnessArtifactIdentityView, _Mapping]] = ..., available_redacted: _Optional[_Union[HarnessArtifactAvailableRedactedView, _Mapping]] = ...) -> None: ...
 
 class HarnessContentMarkerView(_message.Message):
-    __slots__ = ("kind",)
+    __slots__ = ("kind", "limit_kind")
     KIND_FIELD_NUMBER: _ClassVar[int]
+    LIMIT_KIND_FIELD_NUMBER: _ClassVar[int]
     kind: _harness_pb2.HarnessContentMarkerKind
-    def __init__(self, kind: _Optional[_Union[_harness_pb2.HarnessContentMarkerKind, str]] = ...) -> None: ...
+    limit_kind: _harness_pb2.HarnessContentLimitKind
+    def __init__(self, kind: _Optional[_Union[_harness_pb2.HarnessContentMarkerKind, str]] = ..., limit_kind: _Optional[_Union[_harness_pb2.HarnessContentLimitKind, str]] = ...) -> None: ...
 
 class HarnessContentRecordView(_message.Message):
     __slots__ = ("record_id", "record_digest_sha256", "content_sequence", "task_id", "attempt_id", "provider_family_alias", "model_alias", "collaboration_role", "disclosure_profile_ref", "projected_at", "safety_flags", "assistant_text", "lifecycle", "usage", "approval_required", "artifact_relation", "marker")

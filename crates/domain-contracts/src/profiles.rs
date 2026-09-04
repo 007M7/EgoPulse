@@ -10,22 +10,22 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const API_CONTRACT_ID: &str = "egopulse.localapi.v1";
-pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.20";
+pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.21";
 pub const API_CONTRACT_DIGEST_SHA256: &str =
-    "60bebde781107232f39bce625beaf4ecf86050c46dfbd70777d52a718dd85483";
+    "4cc9b870812c6dd6543ab74ebd7ac736e9201bd56a215efa72ed55424fe2cb81";
 pub const CLIENT_KERNEL_CONTRACT_ID: &str = "egopulse.client-kernel.v1";
 pub const CLIENT_KERNEL_CONTRACT_VERSION: &str = "0.1.0";
 pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =
-    "10a0f4b05d2f799667c08af3514f855315076ac85785f59c81e1b9b60e2350e4";
+    "62390a1fe45374e3d73d6dce6d695aeabe460d9421ecf78a334f437bd8832116";
 pub const AUTHORIZATION_CONTRACT_ID: &str = "egopulse.authorization.v1";
 pub const AUTHORIZATION_CONTRACT_VERSION: &str = "0.1.0";
 pub const AUTHORIZATION_PROFILE_DIGEST_SHA256: &str =
     "948c2abb84cf7249dcff23213772cbc7aa136630a3b254aa592f8099223e58d2";
 pub const HARNESS_CONTENT_DISCLOSURE_CONTRACT_ID: &str = "egopulse.harness-content-disclosure.v1";
-pub const HARNESS_CONTENT_DISCLOSURE_CONTRACT_VERSION: &str = "0.1.0";
+pub const HARNESS_CONTENT_DISCLOSURE_CONTRACT_VERSION: &str = "0.1.1";
 pub const HARNESS_CONTENT_DISCLOSURE_PROFILE_ID: &str = "harness-content-disclosure-v01-default";
 pub const HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256: &str =
-    "f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc";
+    "c969c9eda5394617aa8bcbca4ed0086eb0dd61ced2519818db830cc73ed1e58f";
 const R9C_PROFILE_AUTHORITY_REF: &str =
     "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7";
 
@@ -275,6 +275,8 @@ pub struct HarnessContentDigestRules {
     pub retention_tombstone_digest: String,
     pub safety_flags: String,
     pub non_text_part_index_for_record_id: u64,
+    pub non_limit_record_id_limit_kind: String,
+    pub limit_marker_invariant: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -352,6 +354,8 @@ pub struct HarnessContentResourceLimits {
     pub baseline_page_records: u64,
     pub baseline_page_text_bytes: u64,
     pub reserved_final_record_slot: String,
+    pub simultaneous_limit_precedence: Vec<String>,
+    pub terminal_scopes: String,
     pub byte_accounting: String,
     pub pagination_whole_records_only: bool,
 }
@@ -805,6 +809,9 @@ fn harness_content_canonical_encoding_is_exact(encoding: &HarnessContentCanonica
             == "sha256_of_retention_tombstone_canonical_bytes_excluding_tombstone_digest_sha256"
         && rules.safety_flags == "ascending_numeric_unique"
         && rules.non_text_part_index_for_record_id == 0
+        && rules.non_limit_record_id_limit_kind == "UNSPECIFIED"
+        && rules.limit_marker_invariant
+            == "LIMIT_REACHED_requires_typed_limit_kind_non_limit_markers_require_UNSPECIFIED"
         && separators.safe_cumulative == "egopulse/harness-content/safe-cumulative/v1"
         && separators.safe_message_id == "egopulse/harness-content/safe-message-id/v1"
         && separators.lifecycle_candidate == "egopulse/harness-content/lifecycle-candidate/v1"
@@ -876,6 +883,7 @@ fn harness_content_canonical_encoding_is_exact(encoding: &HarnessContentCanonica
                 "disclosure_profile_version",
                 "disclosure_profile_sha256",
                 "payload_discriminator",
+                "limit_kind",
                 "part_index",
             ],
         )
@@ -953,7 +961,7 @@ fn harness_content_canonical_encoding_is_exact(encoding: &HarnessContentCanonica
         )
         && exact_strings(
             &encoding.safe_marker_field_order,
-            &["domain_separator", "marker_kind"],
+            &["domain_separator", "marker_kind", "limit_kind"],
         )
         && exact_strings(
             &encoding.history_compaction_record_id_field_order,
@@ -1242,6 +1250,16 @@ fn validate_harness_content_disclosure_profile(
         || limits.baseline_page_records != 256
         || limits.baseline_page_text_bytes != 1_048_576
         || limits.reserved_final_record_slot != "LIMIT_REACHED"
+        || !exact_strings(
+            &limits.simultaneous_limit_precedence,
+            &[
+                "TASK_RECORDS",
+                "TASK_TEXT_BYTES",
+                "ATTEMPT_RECORDS",
+                "ATTEMPT_TEXT_BYTES",
+            ],
+        )
+        || limits.terminal_scopes != "all_scopes_exhausted_by_admitted_prefix_and_marker"
         || limits.byte_accounting != "safe_normalized_redacted_utf8_before_proto"
         || !limits.pagination_whole_records_only
         || recovery.projection_domain != "independent_harness_content"
@@ -1392,8 +1410,8 @@ mod tests {
 
     #[test]
     fn r9c_harness_content_profile_and_permission_are_exact_and_independent() {
-        let profiles = ContractProfiles::embedded().expect("draft.20 profiles load");
-        assert_eq!(API_CONTRACT_VERSION, "0.1.0-draft.20");
+        let profiles = ContractProfiles::embedded().expect("draft.21 profiles load");
+        assert_eq!(API_CONTRACT_VERSION, "0.1.0-draft.21");
         assert_eq!(
             profiles.harness_content_disclosure.contract_id,
             HARNESS_CONTENT_DISCLOSURE_CONTRACT_ID

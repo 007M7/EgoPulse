@@ -7,13 +7,13 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
 const contractsRoot = join(repositoryRoot, "contracts");
 const manifestPath = join(contractsRoot, "manifest.json");
-const expectedManifestSha256 = "fda010018357bc5f5677e0ca731bb0b468a442ad19b52f9ece4f80b9190ee3da";
+const expectedManifestSha256 = "09ba9771e14091b41fdb57a0e82493875f313ede3f3377c9c20b8c3d10a5dfc2";
 const expectedArtifactCount = 268;
 const expectedFixtureCount = 200;
-const expectedClientKernelProfileSha256 = "10a0f4b05d2f799667c08af3514f855315076ac85785f59c81e1b9b60e2350e4";
+const expectedClientKernelProfileSha256 = "62390a1fe45374e3d73d6dce6d695aeabe460d9421ecf78a334f437bd8832116";
 const expectedAuthorizationProfileSha256 = "948c2abb84cf7249dcff23213772cbc7aa136630a3b254aa592f8099223e58d2";
 const expectedContextRevokeProfileSha256 = "ee77f4894dfd64394f674d37634a29383bf453dc68494f3d75268e85df2590e4";
-const expectedHarnessContentProfileSha256 = "f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc";
+const expectedHarnessContentProfileSha256 = "c969c9eda5394617aa8bcbca4ed0086eb0dd61ced2519818db830cc73ed1e58f";
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -39,7 +39,7 @@ const manifestSha256 = sha256(manifestBytes);
 assert(manifestSha256 === expectedManifestSha256, `manifest digest mismatch: ${manifestSha256}`);
 
 const manifest = JSON.parse(manifestBytes.toString("utf8"));
-assert(manifest.candidateVersion === "0.1.0-draft.20", "unexpected V-01 implementation contract version");
+assert(manifest.candidateVersion === "0.1.0-draft.21", "unexpected V-01 implementation contract version");
 assert(manifest.status === "targeted_revision_r9c_contract_founder_frozen_locally_verified", "unexpected R-9C contract status");
 assert(manifest.targetedRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3", "missing Founder authority for targeted revision");
 assert(manifest.approvalReadModelRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a", "missing Founder authority for approval read model revision");

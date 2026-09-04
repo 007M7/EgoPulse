@@ -1,7 +1,7 @@
 {
   "schemaVersion": "egopulse.harness-content-disclosure-profile/v0.1",
   "contractId": "egopulse.harness-content-disclosure.v1",
-  "contractVersion": "0.1.0",
+  "contractVersion": "0.1.1",
   "profileId": "harness-content-disclosure-v01-default",
   "authorityRef": "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7",
   "contractBindings": {
@@ -134,7 +134,9 @@
       "historyCompactionDigest": "sha256_of_history_compaction_canonical_bytes_excluding_compaction_record_digest_sha256",
       "retentionTombstoneDigest": "sha256_of_retention_tombstone_canonical_bytes_excluding_tombstone_digest_sha256",
       "safetyFlags": "ascending_numeric_unique",
-      "nonTextPartIndexForRecordId": 0
+      "nonTextPartIndexForRecordId": 0,
+      "nonLimitRecordIdLimitKind": "UNSPECIFIED",
+      "limitMarkerInvariant": "LIMIT_REACHED_requires_typed_limit_kind_non_limit_markers_require_UNSPECIFIED"
     },
     "domainSeparators": {
       "routeBinding": "egopulse/harness-content/route-binding/v1",
@@ -246,6 +248,7 @@
       "disclosure_profile_version",
       "disclosure_profile_sha256",
       "payload_discriminator",
+      "limit_kind",
       "part_index"
     ],
     "safeRecordFieldOrder": [
@@ -306,7 +309,8 @@
     ],
     "safeMarkerFieldOrder": [
       "domain_separator",
-      "marker_kind"
+      "marker_kind",
+      "limit_kind"
     ],
     "historyCompactionRecordIdFieldOrder": [
       "domain_separator",
@@ -411,6 +415,13 @@
     "baselinePageRecords": 256,
     "baselinePageTextBytes": 1048576,
     "reservedFinalRecordSlot": "LIMIT_REACHED",
+    "simultaneousLimitPrecedence": [
+      "TASK_RECORDS",
+      "TASK_TEXT_BYTES",
+      "ATTEMPT_RECORDS",
+      "ATTEMPT_TEXT_BYTES"
+    ],
+    "terminalScopes": "all_scopes_exhausted_by_admitted_prefix_and_marker",
     "byteAccounting": "safe_normalized_redacted_utf8_before_proto",
     "paginationWholeRecordsOnly": true
   },

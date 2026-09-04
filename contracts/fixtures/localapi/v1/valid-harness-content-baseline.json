@@ -52,8 +52,13 @@
     "completeSnapshotFrame": false,
     "profileRef": {
       "contractId": "egopulse.harness-content-disclosure.v1",
-      "version": "0.1.0",
-      "sha256": "f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc"
+      "version": "0.1.1",
+      "sha256": "c969c9eda5394617aa8bcbca4ed0086eb0dd61ced2519818db830cc73ed1e58f"
+    },
+    "publicLimitMarkerExample": {
+      "kind": "HARNESS_CONTENT_MARKER_KIND_LIMIT_REACHED",
+      "limitKind": "HARNESS_CONTENT_LIMIT_KIND_TASK_RECORDS",
+      "clientInferenceRequired": false
     },
     "rawNativeIdentifiersReturned": false,
     "rawEvidenceReturned": false,

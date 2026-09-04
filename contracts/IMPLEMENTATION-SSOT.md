@@ -1,6 +1,6 @@
 # V-01 implementation contract provenance and targeted revision
 
-The original 198-artifact Gate 3 import remains auditable as `0.1.0-draft.11`. The current implementation contract candidate is `0.1.0-draft.20`; it preserves the complete R-9A closure and adds the Founder-frozen R-9C contract truth for governed Harness content.
+The original 198-artifact Gate 3 import remains auditable as `0.1.0-draft.11`. The current implementation contract candidate is `0.1.0-draft.21`; it preserves the complete R-9A closure and adds the Founder-frozen R-9C contract truth for governed Harness content.
 
 - Accepted candidate: `0.1.0-draft.11`
 - Accepted manifest SHA-256: `adbcba96ee023f886ba6ea8de0083d7f09c2f5db67b60ddd6db6b231932fbe66`
@@ -22,5 +22,7 @@ Draft.12 removed the client-authored Adapter approval envelope from Local API, r
 Draft.19 does not change that draft.18 wire checkpoint, any Proto field/tag/RPC, Context Authority SQL schema/migration, or the semantic digest algorithm and fixed vectors. It freezes lowercase ASCII reason slugs and namespaced evidence/proof references for new commits, rejects rather than normalizes raw or encoded Context/Provider content, preserves exact historical replay for the same authenticated principal, idempotency key and full semantic digest with zero writes, and returns idempotency conflict for changed semantics before applying new-commit validation. Gate 7 preserves existing receipt and Task/Run/Step/Attempt facts, Gate 9 proves both commit orders with an independent external witness, Gate 10 proves zero Founder Verdict advancement, and Gate 11 closes Scheme C/history compatibility.
 
 Draft.20 freezes R9C-D01 through R9C-D12 and the separately confirmed phase-2-82 section 7 migration/rollback contract. It adds an immutable dispatch route binding, normalized pre-disclosure content candidates, Adapter-owned safe records, a deterministic disclosure profile, an independent Harness-content baseline/watch protocol, and `local.harness.content.read`. Task and Approval streams remain complete snapshots; content is an independently positioned operation-record stream. The revision adds no Authority service, command/write owner, third database, retrospective backfill or automatic down-migration. Adapter Edge and Local Read Model may each receive one later additive migration only after this contract Gate closes.
+
+Draft.21 is a monotonic D08 contract correction under the same Founder freeze. It exposes the closed `HarnessContentLimitKind` on the Local API marker view and defines every limit that stops or truncates the same next safe part—including an incomplete UTF-8 scalar fit—as atomically terminal. The public winner remains singular and deterministic. At correction time, draft.20 had no merged runtime safe-content writer and produced no product safe-history rows, so no data migration or backfill is authorized or required.
 
 The imported `README.md` retains its historical candidate-time wording. `EgoPulse/contracts/` remains the implementation-period machine-contract SSOT; every manifest-controlled change requires an explicit revision authority and regenerated digest evidence.

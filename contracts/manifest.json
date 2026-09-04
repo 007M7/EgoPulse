@@ -1,7 +1,7 @@
 {
   "schemaVersion": "v01-gate3-contract-candidate-manifest/v0.1",
   "candidateId": "v01-gate3-contracts",
-  "candidateVersion": "0.1.0-draft.20",
+  "candidateVersion": "0.1.0-draft.21",
   "status": "targeted_revision_r9c_contract_founder_frozen_locally_verified",
   "ssotRole": "implementation_contract_ssot",
   "featureId": "v01-governed-single-harness-work-loop",
@@ -406,7 +406,7 @@
     },
     {
       "path": "fixtures/harness/v1/valid-content-append-not-context-bound.json",
-      "sha256": "7d06d253224a7ce663926ce2902adc345ce7c9965725ab46b07d397e6018a68c"
+      "sha256": "e667eec2a99469a37821fd9651bba8e5f8530422fa7c88c3e3941f114be71ab5"
     },
     {
       "path": "fixtures/harness/v1/valid-content-authorized-context.json",
@@ -514,7 +514,7 @@
     },
     {
       "path": "fixtures/localapi/v1/recovery-harness-content-retention-reset.json",
-      "sha256": "750c1b27e1a90188aa46edfe9c4f6e8d893c91f96cbaadfffb7283105feeaa8e"
+      "sha256": "eebc45bbe597f74bec07d5e60fcf6a00b1c33d6b05580897ace9cc9f173ffa62"
     },
     {
       "path": "fixtures/localapi/v1/recovery-projector-rebuild-new-epoch.json",
@@ -594,7 +594,7 @@
     },
     {
       "path": "fixtures/localapi/v1/valid-harness-content-baseline.json",
-      "sha256": "bb1cc73b222e7a048e60d832555c278a822e3ad16ad8fc2d1f6dc3de669498b5"
+      "sha256": "d2af3de7792f8d95c4bff66a6ae51dcf50060a74451ead6fa1a58833e7466618"
     },
     {
       "path": "fixtures/localapi/v1/valid-harness-content-watch.json",
@@ -610,7 +610,7 @@
     },
     {
       "path": "fixtures/localapi/v1/valid-open-desktop-session.json",
-      "sha256": "e69d5908b58e18b67907647f515aacee2e29da256e255cd062758285ee23022a"
+      "sha256": "114f8a24166edcd8165fe500a14af095c6d66ea33365e40976a8ded5b5fa59f1"
     },
     {
       "path": "fixtures/localapi/v1/valid-task-command-authority-result.json",
@@ -734,7 +734,7 @@
     },
     {
       "path": "fixtures/persistence/v1/recovery-safe-content-outbox-after-consumer-commit.json",
-      "sha256": "3d6517da892f9d31f0d2cd4021d80e9bbbf68bd61f0a5680a30ed1a860eb8ed2"
+      "sha256": "326d75af7479b878a85f20f2ce6102dba0f67feb891c68a41a4670b8a8cf0659"
     },
     {
       "path": "fixtures/persistence/v1/stale-backup-domain-watermark.json",
@@ -1006,7 +1006,7 @@
     },
     {
       "path": "harness-content-disclosure-profile.schema.json",
-      "sha256": "8df2c25d19b57b622d7e8ab031c7600c09714ccd05937ff2d5cf68759fca7b9c"
+      "sha256": "4fa4655f871c12bc5c2e3aaccc19338ff4736b9b42605b0a0f5456c8bf3351a2"
     },
     {
       "path": "harness-fixture-envelope.schema.json",
@@ -1014,11 +1014,11 @@
     },
     {
       "path": "IMPLEMENTATION-SSOT.json",
-      "sha256": "00c45d3284d165fba4f59c3f66f51764895127fda2cdb7c75d4ccdb536bb07db"
+      "sha256": "c96e6af63133ba5c9322732d32f88a64168c25627fa13a5965b79bfbc0a68cce"
     },
     {
       "path": "IMPLEMENTATION-SSOT.md",
-      "sha256": "0096eb403acf6aa122924dda280dc5696ee824669803a0cbfd1458f5314200b6"
+      "sha256": "150b6bfec4e607d7ed2e8df736f152ff5671c008bf65ae2fcd3d13dce6b42f14"
     },
     {
       "path": "json-schema/foundation-health.schema.json",
@@ -1042,7 +1042,7 @@
     },
     {
       "path": "profiles/client-kernel/v1/v01-default.json",
-      "sha256": "10a0f4b05d2f799667c08af3514f855315076ac85785f59c81e1b9b60e2350e4"
+      "sha256": "62390a1fe45374e3d73d6dce6d695aeabe460d9421ecf78a334f437bd8832116"
     },
     {
       "path": "profiles/context-revoke/v1/v01-default.json",
@@ -1050,7 +1050,7 @@
     },
     {
       "path": "profiles/harness-content-disclosure/v1/v01-default.json",
-      "sha256": "f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc"
+      "sha256": "c969c9eda5394617aa8bcbca4ed0086eb0dd61ced2519818db830cc73ed1e58f"
     },
     {
       "path": "profiles/quality-budget/v1/v01-default.json",
@@ -1074,11 +1074,11 @@
     },
     {
       "path": "proto/egopulse/harness/v1/harness.proto",
-      "sha256": "da7133aad7a981620e0c842b6d923bc30c2248997f55e0c53fd94aa377008a4c"
+      "sha256": "4b02839c5b33edae2b203b730c0cc8c44c270329a0f79480b6fc24fc30faf1dd"
     },
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
-      "sha256": "60bebde781107232f39bce625beaf4ecf86050c46dfbd70777d52a718dd85483"
+      "sha256": "4cc9b870812c6dd6543ab74ebd7ac736e9201bd56a215efa72ed55424fe2cb81"
     },
     {
       "path": "proto/egopulse/memory/v1/memory.proto",
@@ -1118,7 +1118,7 @@
     },
     {
       "path": "scripts/validate-candidate.js",
-      "sha256": "91a9406a13b98716533bac40079568703b025a54fda53943d354f22173a6ea95"
+      "sha256": "5cdfc3321a0706de80f93d995ea93939f04b8eb9bcf7037c569fb2ab87042592"
     },
     {
       "path": "scripts/verify-faults.ps1",

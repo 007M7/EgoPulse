@@ -3,14 +3,17 @@ use std::collections::BTreeSet;
 use egopulse_domain_contracts::{
     profiles::{ContractProfileError, ContractProfiles},
     v01::egopulse::{
+        common::v1::ContractReference,
         harness::v1::{
             AssistantTextContentCandidate, ContentMutationOperation,
             DispatchContextConsumptionProof, DispatchRouteBinding, HarnessContentCompactionReason,
-            HarnessContentHistoryCompactionRecord, HarnessContentMarkerKind,
-            HarnessContentRetentionReason, HarnessContentRetentionTombstone,
-            HarnessContentSafetyFlag, LifecycleContentCandidate, LifecycleKind,
-            SafeAssistantTextContent, SafeContentMarker, SafeHarnessContentProjectionEvent,
-            SafeHarnessContentRecord, SideEffectCertainty, UserVisibleContentCandidate,
+            HarnessContentHistoryCompactionRecord, HarnessContentLimitKind,
+            HarnessContentMarkerKind, HarnessContentRetentionReason,
+            HarnessContentRetentionTombstone, HarnessContentSafetyFlag, LifecycleContentCandidate,
+            LifecycleKind, SafeAssistantTextContent, SafeContentMarker,
+            SafeHarnessContentProjectionEvent, SafeHarnessContentRecord, SideEffectCertainty,
+            UserVisibleContentCandidate, safe_harness_content_projection_event,
+            safe_harness_content_record,
         },
         localapi::v1::{
             HarnessArtifactRelationView, HarnessContentRecordView, HarnessContentResetReason,
@@ -103,6 +106,62 @@ fn framed_i64(out: &mut Vec<u8>, value: i64) {
 
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn safe_record_canonical_bytes(
+    record: &SafeHarnessContentRecord,
+    payload_discriminator: &str,
+    payload_digest_sha256: &str,
+) -> Vec<u8> {
+    let profile = record
+        .disclosure_profile_ref
+        .as_ref()
+        .expect("safe record profile");
+    let mut bytes = Vec::new();
+    for value in [
+        "egopulse/harness-content/safe-record/v1",
+        record.record_id.as_str(),
+        record.content_event_id.as_str(),
+        record.task_id.as_str(),
+        record.run_id.as_str(),
+        record.step_id.as_str(),
+        record.attempt_id.as_str(),
+        record.dispatch_id.as_str(),
+    ] {
+        framed_text(&mut bytes, value);
+    }
+    framed_u64(&mut bytes, record.fencing_token);
+    for value in [
+        record.route_binding_sha256.as_str(),
+        profile.contract_id.as_str(),
+        profile.version.as_str(),
+        profile.sha256.as_str(),
+        record.provider_family_alias.as_str(),
+        record.model_alias.as_str(),
+        record.collaboration_role.as_str(),
+    ] {
+        framed_text(&mut bytes, value);
+    }
+    framed_u64(&mut bytes, record.safety_flags.len() as u64);
+    for flag in &record.safety_flags {
+        framed_u64(
+            &mut bytes,
+            u64::try_from(*flag).expect("non-negative safety flag"),
+        );
+    }
+    framed_text(&mut bytes, payload_discriminator);
+    framed_text(&mut bytes, payload_digest_sha256);
+    bytes
+}
+
+fn committed_records_canonical_bytes(records: &[SafeHarnessContentRecord]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    framed_text(&mut bytes, "egopulse/harness-content/committed-records/v1");
+    framed_u64(&mut bytes, records.len() as u64);
+    for record in records {
+        framed(&mut bytes, &record.encode_to_vec());
+    }
+    bytes
 }
 
 fn canonical_json_content_escape(value: &str) -> String {
@@ -342,6 +401,22 @@ fn r9c_d01_provider_neutral_safe_model_excludes_raw_terminal_shape() {
             "field|artifact_digest_sha256|2|string",
         ],
     );
+    assert_exact_message_inventory(
+        LOCAL_API_PROTO,
+        "HarnessContentMarkerView",
+        &[
+            "field|kind|1|egopulse.harness.v1.HarnessContentMarkerKind",
+            "field|limit_kind|2|egopulse.harness.v1.HarnessContentLimitKind",
+        ],
+    );
+    assert_exact_message_inventory(
+        HARNESS_PROTO,
+        "SafeContentMarker",
+        &[
+            "field|kind|1|HarnessContentMarkerKind",
+            "field|limit_kind|2|HarnessContentLimitKind",
+        ],
+    );
 }
 
 #[test]
@@ -567,6 +642,40 @@ fn r9c_d04_allowlist_denylist_and_unknown_enums_fail_closed() {
     assert!(ContentMutationOperation::try_from(safe_text.operation).is_err());
     let marker = SafeContentMarker::decode([0x08, 0x7f].as_slice()).unwrap();
     assert!(HarnessContentMarkerKind::try_from(marker.kind).is_err());
+    let limit = SafeContentMarker::decode([0x10, 0x7f].as_slice()).unwrap();
+    assert!(HarnessContentLimitKind::try_from(limit.limit_kind).is_err());
+    let marker_contract_is_valid = |value: &SafeContentMarker| {
+        let Ok(marker_kind) = HarnessContentMarkerKind::try_from(value.kind) else {
+            return false;
+        };
+        let Ok(limit_kind) = HarnessContentLimitKind::try_from(value.limit_kind) else {
+            return false;
+        };
+        if marker_kind == HarnessContentMarkerKind::Unspecified {
+            return false;
+        }
+        if marker_kind == HarnessContentMarkerKind::LimitReached {
+            limit_kind != HarnessContentLimitKind::Unspecified
+        } else {
+            limit_kind == HarnessContentLimitKind::Unspecified
+        }
+    };
+    assert!(marker_contract_is_valid(&SafeContentMarker {
+        kind: HarnessContentMarkerKind::LimitReached as i32,
+        limit_kind: HarnessContentLimitKind::TaskRecords as i32,
+    }));
+    assert!(marker_contract_is_valid(&SafeContentMarker {
+        kind: HarnessContentMarkerKind::InvalidText as i32,
+        limit_kind: HarnessContentLimitKind::Unspecified as i32,
+    }));
+    assert!(!marker_contract_is_valid(&SafeContentMarker {
+        kind: HarnessContentMarkerKind::LimitReached as i32,
+        limit_kind: HarnessContentLimitKind::Unspecified as i32,
+    }));
+    assert!(!marker_contract_is_valid(&SafeContentMarker {
+        kind: HarnessContentMarkerKind::InvalidText as i32,
+        limit_kind: HarnessContentLimitKind::TaskRecords as i32,
+    }));
     let compaction =
         HarnessContentHistoryCompactionRecord::decode([0x58, 0x7f].as_slice()).unwrap();
     assert!(HarnessContentCompactionReason::try_from(compaction.reason).is_err());
@@ -754,6 +863,7 @@ fn r9c_d05_disclosure_profile_and_literal_transform_vectors_are_frozen() {
         profile_ref["version"].as_str().unwrap(),
         profile_ref["sha256"].as_str().unwrap(),
         "ASSISTANT_TEXT",
+        "UNSPECIFIED",
     ] {
         framed_text(&mut record_id, value);
     }
@@ -802,6 +912,157 @@ fn r9c_d05_disclosure_profile_and_literal_transform_vectors_are_frozen() {
     assert_eq!(hex::encode(&record), vectors["safeRecordHex"]);
     assert_eq!(digest(&record), vectors["safeRecordSha256"]);
     assert_eq!(digest(&record), safe["recordDigestSha256"]);
+
+    let limit_vectors = fixture["limitMarkerCanonicalVectors"]
+        .as_array()
+        .expect("typed limit vectors");
+    let expected_limit_order = [
+        "TASK_RECORDS",
+        "TASK_TEXT_BYTES",
+        "ATTEMPT_RECORDS",
+        "ATTEMPT_TEXT_BYTES",
+    ];
+    assert_eq!(limit_vectors.len(), expected_limit_order.len());
+    let typed_profile_ref = ContractReference {
+        contract_id: profile_ref["contractId"].as_str().unwrap().to_owned(),
+        version: profile_ref["version"].as_str().unwrap().to_owned(),
+        sha256: profile_ref["sha256"].as_str().unwrap().to_owned(),
+    };
+    let typed_assistant_record = SafeHarnessContentRecord {
+        record_id: safe["recordId"].as_str().unwrap().to_owned(),
+        record_digest_sha256: safe["recordDigestSha256"].as_str().unwrap().to_owned(),
+        content_event_id: safe["contentEventId"].as_str().unwrap().to_owned(),
+        task_id: safe["taskId"].as_str().unwrap().to_owned(),
+        run_id: safe["runId"].as_str().unwrap().to_owned(),
+        step_id: safe["stepId"].as_str().unwrap().to_owned(),
+        attempt_id: safe["attemptId"].as_str().unwrap().to_owned(),
+        dispatch_id: safe["dispatchId"].as_str().unwrap().to_owned(),
+        fencing_token: safe["fencingToken"].as_u64().unwrap(),
+        route_binding_sha256: safe["routeBindingSha256"].as_str().unwrap().to_owned(),
+        disclosure_profile_ref: Some(typed_profile_ref.clone()),
+        provider_family_alias: safe["providerFamilyAlias"].as_str().unwrap().to_owned(),
+        model_alias: safe["modelAlias"].as_str().unwrap().to_owned(),
+        collaboration_role: safe["collaborationRole"].as_str().unwrap().to_owned(),
+        safety_flags: vec![
+            HarnessContentSafetyFlag::ControlRedacted as i32,
+            HarnessContentSafetyFlag::CredentialRedacted as i32,
+            HarnessContentSafetyFlag::Provisional as i32,
+        ],
+        payload: Some(safe_harness_content_record::Payload::AssistantText(
+            SafeAssistantTextContent {
+                safe_message_id: safe["assistantText"]["safeMessageId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                revision: safe["assistantText"]["revision"].as_u64().unwrap(),
+                previous_revision: safe["assistantText"]["previousRevision"].as_u64().unwrap(),
+                operation: ContentMutationOperation::Append as i32,
+                safe_text_utf8: safe["assistantText"]["safeTextUtf8"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                safe_cumulative_digest_sha256: safe["assistantText"]["safeCumulativeDigestSha256"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                part_index: 0,
+                part_count: 1,
+            },
+        )),
+    };
+    let mut limit_record_ids = BTreeSet::new();
+    for (vector, expected_limit_kind) in limit_vectors.iter().zip(expected_limit_order) {
+        assert_eq!(vector["markerKind"], "LIMIT_REACHED");
+        assert_eq!(vector["limitKind"], expected_limit_kind);
+
+        let mut marker = Vec::new();
+        for value in [
+            "egopulse/harness-content/safe-marker/v1",
+            "LIMIT_REACHED",
+            expected_limit_kind,
+        ] {
+            framed_text(&mut marker, value);
+        }
+        assert_eq!(hex::encode(&marker), vector["markerHex"]);
+        assert_eq!(digest(&marker), vector["markerSha256"]);
+
+        let mut limit_record_id = Vec::new();
+        for value in [
+            "egopulse/harness-content/safe-record-id/v1",
+            safe["contentEventId"].as_str().unwrap(),
+            profile_ref["contractId"].as_str().unwrap(),
+            profile_ref["version"].as_str().unwrap(),
+            profile_ref["sha256"].as_str().unwrap(),
+            "MARKER",
+            expected_limit_kind,
+        ] {
+            framed_text(&mut limit_record_id, value);
+        }
+        framed_u32(&mut limit_record_id, 0);
+        assert_eq!(hex::encode(&limit_record_id), vector["recordIdHex"]);
+        assert_eq!(digest(&limit_record_id), vector["recordIdSha256"]);
+        assert!(limit_record_ids.insert(digest(&limit_record_id)));
+
+        let typed_limit_kind = match expected_limit_kind {
+            "TASK_RECORDS" => HarnessContentLimitKind::TaskRecords,
+            "TASK_TEXT_BYTES" => HarnessContentLimitKind::TaskTextBytes,
+            "ATTEMPT_RECORDS" => HarnessContentLimitKind::AttemptRecords,
+            "ATTEMPT_TEXT_BYTES" => HarnessContentLimitKind::AttemptTextBytes,
+            other => panic!("unexpected limit kind {other}"),
+        };
+        let marker_payload_digest = digest(&marker);
+        let mut typed_marker_record = SafeHarnessContentRecord {
+            record_id: format!("hcr_{}", vector["recordIdSha256"].as_str().unwrap()),
+            content_event_id: safe["contentEventId"].as_str().unwrap().to_owned(),
+            task_id: safe["taskId"].as_str().unwrap().to_owned(),
+            run_id: safe["runId"].as_str().unwrap().to_owned(),
+            step_id: safe["stepId"].as_str().unwrap().to_owned(),
+            attempt_id: safe["attemptId"].as_str().unwrap().to_owned(),
+            dispatch_id: safe["dispatchId"].as_str().unwrap().to_owned(),
+            fencing_token: safe["fencingToken"].as_u64().unwrap(),
+            route_binding_sha256: safe["routeBindingSha256"].as_str().unwrap().to_owned(),
+            disclosure_profile_ref: Some(typed_profile_ref.clone()),
+            provider_family_alias: safe["providerFamilyAlias"].as_str().unwrap().to_owned(),
+            model_alias: safe["modelAlias"].as_str().unwrap().to_owned(),
+            collaboration_role: safe["collaborationRole"].as_str().unwrap().to_owned(),
+            payload: Some(safe_harness_content_record::Payload::Marker(
+                SafeContentMarker {
+                    kind: HarnessContentMarkerKind::LimitReached as i32,
+                    limit_kind: typed_limit_kind as i32,
+                },
+            )),
+            ..SafeHarnessContentRecord::default()
+        };
+        let typed_record_bytes =
+            safe_record_canonical_bytes(&typed_marker_record, "MARKER", &marker_payload_digest);
+        assert_eq!(digest(&typed_record_bytes), vector["recordSha256"]);
+        typed_marker_record.record_digest_sha256 = digest(&typed_record_bytes);
+
+        let projection_event = SafeHarnessContentProjectionEvent {
+            payload: Some(
+                safe_harness_content_projection_event::Payload::ContentRecord(
+                    typed_marker_record.clone(),
+                ),
+            ),
+        };
+        assert_eq!(
+            digest(&projection_event.encode_to_vec()),
+            vector["projectionEventSha256"]
+        );
+        assert_eq!(
+            digest(&committed_records_canonical_bytes(&[
+                typed_marker_record.clone()
+            ])),
+            vector["markerOnlyCommittedRecordsSha256"]
+        );
+        assert_eq!(
+            digest(&committed_records_canonical_bytes(&[
+                typed_assistant_record.clone(),
+                typed_marker_record,
+            ])),
+            vector["prefixThenMarkerCommittedRecordsSha256"]
+        );
+    }
 
     let additional = &fixture["additionalCandidateVectors"];
     let usage = &additional["usage"];
@@ -1353,7 +1614,7 @@ fn r9c_d11_descriptor_footprint_adds_no_authority_or_store() {
 #[test]
 fn r9c_d12_manifest_fixture_and_cross_language_bindings_are_pinned() {
     let manifest = json(MANIFEST);
-    assert_eq!(manifest["candidateVersion"], "0.1.0-draft.20");
+    assert_eq!(manifest["candidateVersion"], "0.1.0-draft.21");
     assert_eq!(manifest["r9cHarnessContentAuthorityRef"], R9C_AUTHORITY);
     let artifacts = manifest["artifacts"]
         .as_array()

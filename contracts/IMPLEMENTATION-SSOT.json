@@ -9,7 +9,7 @@
   "gate3AuthorityRef": "conversation:2026-08-23:founder-v01-gate3-pass",
   "gate4DriAuthorityRef": "conversation:2026-08-23:founder-v01-gate4-dri-confirmation",
   "implementationSsotAfterVerifiedImport": true,
-  "currentContractVersion": "0.1.0-draft.20",
+  "currentContractVersion": "0.1.0-draft.21",
   "targetedRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3",
   "approvalReadModelRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a",
   "g408cSupportProfilesAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
@@ -20,5 +20,5 @@
   "contextRevokeSchemeCAuthorityRef": "conversation:2026-08-31:founder-r9a-gate11-scheme-c",
   "r9cHarnessContentAuthorityRef": "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7",
   "targetedRevisionScope": ["C-03", "C-07", "C-08", "G4-07A", "G4-08A", "G4-08C-A1", "G4-08C-A3", "M-01..M-06", "M-07..M-10", "R-9A", "R-9C.1"],
-  "note": "Draft.11 remains the immutable accepted Gate 3 import. Draft.12 inserted Policy Decision Authority. Draft.13 added the independently rebuildable Harness Approval Read Model. Draft.14 added digest-addressed client and authorization profiles. Draft.15 froze the Memory/RAG Worker contract. Draft.16 froze governed Memory retrieval. Draft.17 added PrepareWork/ConfirmWork. Draft.18 froze additive Context revoke. Draft.19 closed complete R-9A with Scheme C validation and historical replay compatibility. Draft.20 freezes R9C-D01 through R9C-D12 plus phase-2-82 section 7: additive Harness content candidates and immutable route binding, deterministic disclosure profile, independent operation-record Local API, one read permission, bounded recovery/retention, and generated Rust/Python/TypeScript bindings. It authorizes no new Authority, send path, third database or retrospective content backfill."
+  "note": "Draft.11 remains the immutable accepted Gate 3 import. Draft.12 inserted Policy Decision Authority. Draft.13 added the independently rebuildable Harness Approval Read Model. Draft.14 added digest-addressed client and authorization profiles. Draft.15 froze the Memory/RAG Worker contract. Draft.16 froze governed Memory retrieval. Draft.17 added PrepareWork/ConfirmWork. Draft.18 froze additive Context revoke. Draft.19 closed complete R-9A with Scheme C validation and historical replay compatibility. Draft.20 froze R9C-D01 through R9C-D12 plus phase-2-82 section 7. Draft.21 is the monotonic D08 correction: it exposes the typed LIMIT_REACHED winner through Local API and makes every limit that stops or truncates the same next safe part atomically terminal. It authorizes no new Authority, send path, third database or retrospective content backfill."
 }

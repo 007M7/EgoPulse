@@ -25,7 +25,7 @@
   "properties": {
     "schemaVersion": { "const": "egopulse.harness-content-disclosure-profile/v0.1" },
     "contractId": { "const": "egopulse.harness-content-disclosure.v1" },
-    "contractVersion": { "const": "0.1.0" },
+    "contractVersion": { "const": "0.1.1" },
     "profileId": { "type": "string", "minLength": 1 },
     "authorityRef": { "type": "string", "minLength": 1 },
     "contractBindings": {
@@ -175,7 +175,7 @@
         "digestRules": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["candidateDigest", "safePayloadDigest", "safeRecordDigest", "historyCompactionDigest", "retentionTombstoneDigest", "safetyFlags", "nonTextPartIndexForRecordId"],
+          "required": ["candidateDigest", "safePayloadDigest", "safeRecordDigest", "historyCompactionDigest", "retentionTombstoneDigest", "safetyFlags", "nonTextPartIndexForRecordId", "nonLimitRecordIdLimitKind", "limitMarkerInvariant"],
           "properties": {
             "candidateDigest": { "const": "sha256_of_selected_candidate_payload_canonical_bytes" },
             "safePayloadDigest": { "const": "sha256_of_selected_safe_payload_canonical_bytes" },
@@ -183,7 +183,9 @@
             "historyCompactionDigest": { "const": "sha256_of_history_compaction_canonical_bytes_excluding_compaction_record_digest_sha256" },
             "retentionTombstoneDigest": { "const": "sha256_of_retention_tombstone_canonical_bytes_excluding_tombstone_digest_sha256" },
             "safetyFlags": { "const": "ascending_numeric_unique" },
-            "nonTextPartIndexForRecordId": { "const": 0 }
+            "nonTextPartIndexForRecordId": { "const": 0 },
+            "nonLimitRecordIdLimitKind": { "const": "UNSPECIFIED" },
+            "limitMarkerInvariant": { "const": "LIMIT_REACHED_requires_typed_limit_kind_non_limit_markers_require_UNSPECIFIED" }
           }
         },
         "domainSeparators": {
@@ -228,14 +230,14 @@
         "approvalRequiredCandidateFieldOrder": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "type": "string" } },
         "blockedSourceCandidateFieldOrder": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "type": "string" } },
         "contentEventIdFieldOrder": { "type": "array", "minItems": 15, "maxItems": 15, "uniqueItems": true, "items": { "type": "string" } },
-        "safeRecordIdFieldOrder": { "type": "array", "minItems": 7, "maxItems": 7, "uniqueItems": true, "items": { "type": "string" } },
+        "safeRecordIdFieldOrder": { "type": "array", "minItems": 8, "maxItems": 8, "uniqueItems": true, "items": { "type": "string" } },
         "safeRecordFieldOrder": { "type": "array", "minItems": 20, "maxItems": 20, "uniqueItems": true, "items": { "type": "string" } },
         "safeAssistantTextFieldOrder": { "type": "array", "minItems": 9, "maxItems": 9, "uniqueItems": true, "items": { "type": "string" } },
         "safeLifecycleFieldOrder": { "type": "array", "minItems": 5, "maxItems": 5, "uniqueItems": true, "items": { "type": "string" } },
         "safeUsageFieldOrder": { "type": "array", "minItems": 5, "maxItems": 5, "uniqueItems": true, "items": { "type": "string" } },
         "safeApprovalRequiredFieldOrder": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "type": "string" } },
         "safeArtifactRelationFieldOrder": { "type": "array", "minItems": 4, "maxItems": 4, "uniqueItems": true, "items": { "type": "string" } },
-        "safeMarkerFieldOrder": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "type": "string" } },
+        "safeMarkerFieldOrder": { "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true, "items": { "type": "string" } },
         "historyCompactionRecordIdFieldOrder": { "type": "array", "minItems": 7, "maxItems": 7, "uniqueItems": true, "items": { "type": "string" } },
         "historyCompactionRecordFieldOrder": { "type": "array", "minItems": 14, "maxItems": 14, "uniqueItems": true, "items": { "type": "string" } },
         "retentionTombstoneIdFieldOrder": { "type": "array", "minItems": 7, "maxItems": 7, "uniqueItems": true, "items": { "type": "string" } },
@@ -283,7 +285,7 @@
     "resourceLimits": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["candidateTextBytes", "safePartBytes", "serializedFrameBytes", "attemptSafeTextBytes", "attemptSafeRecords", "taskSafeTextBytes", "taskSafeRecords", "baselinePageRecords", "baselinePageTextBytes", "reservedFinalRecordSlot", "byteAccounting", "paginationWholeRecordsOnly"],
+      "required": ["candidateTextBytes", "safePartBytes", "serializedFrameBytes", "attemptSafeTextBytes", "attemptSafeRecords", "taskSafeTextBytes", "taskSafeRecords", "baselinePageRecords", "baselinePageTextBytes", "reservedFinalRecordSlot", "simultaneousLimitPrecedence", "terminalScopes", "byteAccounting", "paginationWholeRecordsOnly"],
       "properties": {
         "candidateTextBytes": { "const": 65536 },
         "safePartBytes": { "const": 65536 },
@@ -295,6 +297,22 @@
         "baselinePageRecords": { "const": 256 },
         "baselinePageTextBytes": { "const": 1048576 },
         "reservedFinalRecordSlot": { "const": "LIMIT_REACHED" },
+        "simultaneousLimitPrecedence": {
+          "type": "array",
+          "prefixItems": [
+            { "const": "TASK_RECORDS" },
+            { "const": "TASK_TEXT_BYTES" },
+            { "const": "ATTEMPT_RECORDS" },
+            { "const": "ATTEMPT_TEXT_BYTES" }
+          ],
+          "items": false,
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "terminalScopes": {
+          "const": "all_scopes_exhausted_by_admitted_prefix_and_marker",
+          "description": "Exhausted means unable to admit the same next complete safe part, including when remaining bytes cannot hold its next complete UTF-8 scalar; exact numeric exhaustion is not required."
+        },
         "byteAccounting": { "const": "safe_normalized_redacted_utf8_before_proto" },
         "paginationWholeRecordsOnly": { "const": true }
       }
