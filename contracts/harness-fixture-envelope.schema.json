@@ -4,7 +4,7 @@
   "title": "V-01 Gate 3 Harness Adapter Contract Fixture Envelope",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "fixtureId", "category", "requirementRefs", "principal", "startingState", "resolvedReferences", "command", "expected"],
+  "required": ["schemaVersion", "fixtureId", "category", "requirementRefs", "principal", "startingState", "command", "expected"],
   "properties": {
     "schemaVersion": { "const": "v01-harness-fixture/v0.1" },
     "fixtureId": { "type": "string", "minLength": 1 },
@@ -23,6 +23,13 @@
     "startingState": { "type": ["object", "null"] },
     "resolvedReferences": { "type": "object" },
     "command": { "type": "object", "minProperties": 1, "maxProperties": 1 },
+    "safeProjection": { "type": "object" },
+    "credentialVariantVectors": { "type": "array" },
+    "streamingCredentialBoundaryContract": { "type": "object" },
+    "additionalCandidateVectors": { "type": "object" },
+    "limitMarkerCanonicalVectors": { "type": "array" },
+    "canonicalVectors": { "type": "object" },
+    "canonicalVector": { "type": "object" },
     "expected": {
       "type": "object",
       "additionalProperties": true,

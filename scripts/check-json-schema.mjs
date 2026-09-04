@@ -1,76 +1,233 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-function fail(path, message) {
-  throw new Error(`${path}: ${message}`);
+import Ajv2020 from "ajv/dist/2020.js";
+
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+function normalizePath(path) {
+  return path.replaceAll("\\", "/");
 }
 
-function sameJson(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
+function absolutePath(relativePath) {
+  return resolve(repositoryRoot, ...relativePath.split("/"));
 }
 
-function validate(schema, value, path = "$") {
-  if (Object.hasOwn(schema, "const") && !sameJson(value, schema.const)) {
-    fail(path, `must equal ${JSON.stringify(schema.const)}`);
+function readJson(relativePath) {
+  try {
+    return JSON.parse(readFileSync(absolutePath(relativePath), "utf8"));
+  } catch (error) {
+    throw new Error(`${relativePath}: ${error.message}`, { cause: error });
   }
-  if (schema.enum && !schema.enum.some((candidate) => sameJson(value, candidate))) {
-    fail(path, `must be one of ${JSON.stringify(schema.enum)}`);
+}
+
+function listJsonFiles(relativeDirectory) {
+  const directory = absolutePath(relativeDirectory);
+  return readdirSync(directory, { withFileTypes: true })
+    .flatMap((entry) => {
+      const relativeEntry = normalizePath(join(relativeDirectory, entry.name));
+      return entry.isDirectory()
+        ? listJsonFiles(relativeEntry)
+        : entry.name.endsWith(".json")
+          ? [relativeEntry]
+          : [];
+    })
+    .sort();
+}
+
+function listSchemaFiles() {
+  const rootSchemas = readdirSync(absolutePath("contracts"), { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".schema.json"))
+    .map((entry) => `contracts/${entry.name}`);
+  return [...rootSchemas, ...listJsonFiles("contracts/json-schema")]
+    .filter((path) => path.endsWith(".schema.json"))
+    .sort();
+}
+
+function formatValidationErrors(errors) {
+  return (errors ?? [])
+    .map((error) => {
+      const location = error.instancePath || "$";
+      const details = Object.keys(error.params ?? {}).length
+        ? ` (${JSON.stringify(error.params)})`
+        : "";
+      return `${location} ${error.message ?? error.keyword}${details}`;
+    })
+    .join("; ");
+}
+
+function compileSchema(schemaPath) {
+  const schema = readJson(schemaPath);
+  if (schema.$schema !== "https://json-schema.org/draft/2020-12/schema") {
+    throw new Error(`${schemaPath}: must declare JSON Schema 2020-12`);
   }
 
-  if (schema.type === "object") {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) {
-      fail(path, "must be an object");
+  const ajv = new Ajv2020({
+    allErrors: true,
+    allowUnionTypes: true,
+    strict: true,
+    validateSchema: true,
+  });
+  return ajv.compile(schema);
+}
+
+function documentValidationFailure(
+  validate,
+  schemaPath,
+  documentPath,
+  value = readJson(documentPath),
+) {
+  if (!validate(value)) {
+    return `${documentPath}: does not satisfy ${schemaPath}: ${formatValidationErrors(validate.errors)}`;
+  }
+  return undefined;
+}
+
+function assertSamePaths(label, expected, actual) {
+  const expectedSet = new Set(expected);
+  const actualSet = new Set(actual);
+  const missing = [...expectedSet].filter((path) => !actualSet.has(path));
+  const unexpected = [...actualSet].filter((path) => !expectedSet.has(path));
+  if (missing.length || unexpected.length) {
+    throw new Error(
+      `${label}: mapping is incomplete; missing=[${missing.join(", ")}], unexpected=[${unexpected.join(", ")}]`,
+    );
+  }
+}
+
+function contractAssignments() {
+  return [
+    {
+      schema: "contracts/json-schema/foundation-health.schema.json",
+      documents: ["contracts/fixtures/foundation-health.valid.json"],
+    },
+    {
+      schema: "contracts/fixture-envelope.schema.json",
+      documents: listJsonFiles("contracts/fixtures/task/v1"),
+    },
+    {
+      schema: "contracts/collaboration-fixture-envelope.schema.json",
+      documents: listJsonFiles("contracts/fixtures/collaboration/v1"),
+    },
+    {
+      schema: "contracts/harness-fixture-envelope.schema.json",
+      documents: listJsonFiles("contracts/fixtures/harness/v1"),
+    },
+    {
+      schema: "contracts/artifact-fixture-envelope.schema.json",
+      documents: listJsonFiles("contracts/fixtures/artifact/v1"),
+    },
+    {
+      schema: "contracts/verification-fixture-envelope.schema.json",
+      documents: listJsonFiles("contracts/fixtures/verification/v1"),
+    },
+    {
+      schema: "contracts/verdict-fixture-envelope.schema.json",
+      documents: listJsonFiles("contracts/fixtures/verdict/v1"),
+    },
+    {
+      schema: "contracts/policy-fixture-envelope.schema.json",
+      documents: listJsonFiles("contracts/fixtures/policy/v1"),
+    },
+    {
+      schema: "contracts/localapi-fixture-envelope.schema.json",
+      documents: listJsonFiles("contracts/fixtures/localapi/v1"),
+    },
+    {
+      schema: "contracts/persistence-fixture-envelope.schema.json",
+      documents: listJsonFiles("contracts/fixtures/persistence/v1"),
+    },
+    {
+      schema: "contracts/authorization-capability-profile.schema.json",
+      documents: ["contracts/profiles/authorization/v1/v01-default.json"],
+    },
+    {
+      schema: "contracts/client-kernel-profile.schema.json",
+      documents: ["contracts/profiles/client-kernel/v1/v01-default.json"],
+    },
+    {
+      schema: "contracts/context-revoke-semantic-profile.schema.json",
+      documents: ["contracts/profiles/context-revoke/v1/v01-default.json"],
+    },
+    {
+      schema: "contracts/harness-content-disclosure-profile.schema.json",
+      documents: ["contracts/profiles/harness-content-disclosure/v1/v01-default.json"],
+    },
+    {
+      schema: "contracts/quality-budget-profile.schema.json",
+      documents: ["contracts/profiles/quality-budget/v1/v01-default.json"],
+    },
+  ];
+}
+
+function assertStandardKeywordsAreEnforced(compiledSchemas) {
+  const authorizationPath = "contracts/profiles/authorization/v1/v01-default.json";
+  const invalidAuthorization = structuredClone(readJson(authorizationPath));
+  invalidAuthorization.contractVersion = "not-semver";
+  const authorizationValidator = compiledSchemas.get(
+    "contracts/authorization-capability-profile.schema.json",
+  );
+  if (authorizationValidator(invalidAuthorization)) {
+    throw new Error("JSON Schema regression: pattern constraints are not enforced");
+  }
+  if (!authorizationValidator.errors?.some((error) => error.keyword === "pattern")) {
+    throw new Error("JSON Schema regression: invalid contractVersion did not fail by pattern");
+  }
+
+  const artifactPath = "contracts/fixtures/artifact/v1/valid-create-atomic-artifact-set.json";
+  const invalidArtifact = structuredClone(readJson(artifactPath));
+  invalidArtifact.expected.businessWriteCount = 2;
+  const artifactValidator = compiledSchemas.get(
+    "contracts/artifact-fixture-envelope.schema.json",
+  );
+  if (artifactValidator(invalidArtifact)) {
+    throw new Error("JSON Schema regression: numeric maximum constraints are not enforced");
+  }
+  if (!artifactValidator.errors?.some((error) => error.keyword === "maximum")) {
+    throw new Error("JSON Schema regression: invalid businessWriteCount did not fail by maximum");
+  }
+}
+
+function main() {
+  const assignments = contractAssignments();
+  const assignedSchemas = assignments.map(({ schema }) => schema).sort();
+  const assignedDocuments = assignments.flatMap(({ documents }) => documents).sort();
+  const repositoryDocuments = [
+    ...listJsonFiles("contracts/fixtures"),
+    ...listJsonFiles("contracts/profiles"),
+  ].sort();
+
+  assertSamePaths("JSON Schema files", listSchemaFiles(), assignedSchemas);
+  assertSamePaths("JSON Schema documents", repositoryDocuments, assignedDocuments);
+
+  const compiledSchemas = new Map();
+  const validationFailures = [];
+  for (const { schema, documents } of assignments) {
+    let validate;
+    try {
+      validate = compileSchema(schema);
+    } catch (error) {
+      validationFailures.push(`${schema}: invalid JSON Schema: ${error.message}`);
+      continue;
     }
-    for (const key of schema.required ?? []) {
-      if (!Object.hasOwn(value, key)) fail(`${path}.${key}`, "is required");
+    compiledSchemas.set(schema, validate);
+    for (const document of documents) {
+      const failure = documentValidationFailure(validate, schema, document);
+      if (failure) validationFailures.push(failure);
     }
-    if (schema.additionalProperties === false) {
-      const known = new Set(Object.keys(schema.properties ?? {}));
-      for (const key of Object.keys(value)) {
-        if (!known.has(key)) fail(`${path}.${key}`, "is an unknown property");
-      }
-    }
-    for (const [key, childSchema] of Object.entries(schema.properties ?? {})) {
-      if (Object.hasOwn(value, key)) validate(childSchema, value[key], `${path}.${key}`);
-    }
-    return;
   }
 
-  if (schema.type === "array") {
-    if (!Array.isArray(value)) fail(path, "must be an array");
-    if (schema.minItems !== undefined && value.length < schema.minItems) fail(path, `must contain at least ${schema.minItems} items`);
-    if (schema.maxItems !== undefined && value.length > schema.maxItems) fail(path, `must contain at most ${schema.maxItems} items`);
-    if (schema.uniqueItems && new Set(value.map((entry) => JSON.stringify(entry))).size !== value.length) fail(path, "must contain unique items");
-    value.forEach((entry, index) => validate(schema.items ?? {}, entry, `${path}[${index}]`));
-    return;
+  if (validationFailures.length) {
+    throw new Error(
+      `JSON Schema document validation failed (${validationFailures.length}):\n${validationFailures.join("\n")}`,
+    );
   }
 
-  if (schema.type === "string") {
-    if (typeof value !== "string") fail(path, "must be a string");
-    if (schema.minLength !== undefined && value.length < schema.minLength) fail(path, `must contain at least ${schema.minLength} characters`);
-    return;
-  }
-
-  if (schema.type === "integer" && !Number.isInteger(value)) fail(path, "must be an integer");
-  if (schema.type === "number" && typeof value !== "number") fail(path, "must be a number");
-  if (schema.type === "boolean" && typeof value !== "boolean") fail(path, "must be a boolean");
+  assertStandardKeywordsAreEnforced(compiledSchemas);
+  console.log(
+    `JSON Schema 2020-12 checks passed: schemas=${assignedSchemas.length}, documents=${assignedDocuments.length}, regression_cases=2`,
+  );
 }
 
-function readJson(path) {
-  return JSON.parse(readFileSync(path, "utf8"));
-}
-
-const foundationSchema = readJson("contracts/json-schema/foundation-health.schema.json");
-const foundationFixture = readJson("contracts/fixtures/foundation-health.valid.json");
-if (foundationSchema.$schema !== "https://json-schema.org/draft/2020-12/schema") {
-  throw new Error("Foundation schema must use JSON Schema 2020-12");
-}
-validate(foundationSchema, foundationFixture, "foundation-health.valid.json");
-
-const disclosureSchema = readJson("contracts/harness-content-disclosure-profile.schema.json");
-const disclosureProfile = readJson("contracts/profiles/harness-content-disclosure/v1/v01-default.json");
-if (disclosureSchema.$schema !== "https://json-schema.org/draft/2020-12/schema") {
-  throw new Error("Harness content disclosure schema must use JSON Schema 2020-12");
-}
-validate(disclosureSchema, disclosureProfile, "harness-content-disclosure/v01-default.json");
-
-console.log("JSON Schema fixture/profile checks passed");
+main();

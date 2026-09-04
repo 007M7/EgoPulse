@@ -1010,7 +1010,7 @@
     },
     {
       "path": "harness-fixture-envelope.schema.json",
-      "sha256": "fd55cd3eefa3b2610473dfafc8a73d163a8fa12c3b6412fec552fa8e9829d6e0"
+      "sha256": "7dc8a8d2bda3593c3073ac21e9d58e2ab2fac7e9ab6ccf389d0418c58b340052"
     },
     {
       "path": "IMPLEMENTATION-SSOT.json",
@@ -1026,11 +1026,11 @@
     },
     {
       "path": "localapi-fixture-envelope.schema.json",
-      "sha256": "a64d571032b5fe09699dcb9d3e50a37a79594ad5dfe3e84e97d0d85f27c3012f"
+      "sha256": "44ac6281cd15018c1d2d7888a463e545923cf7558ca78e756355cae7718364ef"
     },
     {
       "path": "persistence-fixture-envelope.schema.json",
-      "sha256": "f94687c97fd8be1c001be123026bf973dd6b6a3a4bf5926a675610df1a0f7e43"
+      "sha256": "cee5535c2ca90d6329b62ffd2bb9d66c4c975c11924c329581f2b9340e2244ba"
     },
     {
       "path": "policy-fixture-envelope.schema.json",
@@ -1106,7 +1106,7 @@
     },
     {
       "path": "quality-budget-profile.schema.json",
-      "sha256": "79984e27669306ad914166f2e1a04885dc87b5c202d88436547febbcb89bfdb2"
+      "sha256": "e7aa5014ab8662fb577439194e197cb73efea1f04a9209fe08ca85e06f2918ee"
     },
     {
       "path": "README.md",
