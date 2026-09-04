@@ -623,7 +623,24 @@ impl ProductionBootstrapConfig {
                 self.memory_candidate_producers,
             )?;
         }
-        providers = providers.with_codex_harness(self.codex, artifact, verification)?;
+        let codex_provider_profile = self
+            .provider_profiles
+            .iter()
+            .find(|profile| {
+                profile.provider == ProviderId::Gpt
+                    && profile.harness == ProviderHarnessKind::CodexAppServer
+                    && profile.admission == ProviderAdmission::Production
+            })
+            .cloned()
+            .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_codex_route_binding",
+            ))?;
+        providers = providers.with_codex_harness(
+            self.codex,
+            codex_provider_profile,
+            artifact,
+            verification,
+        )?;
         // The production dispatch cycle settles committed collaboration
         // recovery facts (run cancelled / harness outcome unknown) into the
         // Task Authority through the existing single-writer path.

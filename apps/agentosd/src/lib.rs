@@ -32,7 +32,8 @@ use egopulse_domain_contracts::{
 };
 use egopulse_harness_adapter::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeKey, GovernedHarnessAdapter,
-    NativeHarnessDriver, SystemAdapterClock, validate_capability_binding,
+    GovernedHarnessContentProjector, HarnessContentDrain, NativeHarnessDriver, SystemAdapterClock,
+    validate_capability_binding,
 };
 use egopulse_local_api::{
     cognition_gateway::{
@@ -62,7 +63,8 @@ use egopulse_local_ide_control::collaboration_control::{
     CompositeHarnessDispatchRunner, GovernedTaskActivationRunner, HarnessDispatchCycleError,
     HarnessDispatchRunner, SingleHarnessWorkConfig, SingleHarnessWorkflowResolution,
     SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError, SystemAuthorityClock,
-    TaskActivationGuardSet, TaskActivationSource,
+    TaskActivationGuardSet, TaskActivationSource, TrustedDispatchRouteProfile,
+    build_dispatch_route_binding,
 };
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
@@ -341,6 +343,8 @@ pub struct DaemonProviders {
     pub memory_candidate_producers: Arc<MemoryCandidateProducerRegistry>,
     pub work_preparation_port: Arc<dyn WorkPreparationPort>,
     context_authority: Option<Arc<Mutex<ContextAuthority>>>,
+    harness_content_projectors:
+        Vec<Arc<Mutex<GovernedHarnessContentProjector<SystemAdapterClock>>>>,
 }
 
 /// Explicit workflow configuration boundary for the first vertical. Reviewed
@@ -352,6 +356,7 @@ pub struct DaemonProviders {
 pub struct ConfiguredSingleHarnessWorkflow {
     config: SingleHarnessWorkConfig,
     context_authority: Option<Arc<Mutex<ContextAuthority>>>,
+    route_profile: Option<TrustedDispatchRouteProfile>,
 }
 
 impl ConfiguredSingleHarnessWorkflow {
@@ -360,12 +365,22 @@ impl ConfiguredSingleHarnessWorkflow {
         Self {
             config,
             context_authority: None,
+            route_profile: None,
         }
     }
 
     #[must_use]
     pub fn with_context_authority(mut self, context: Arc<Mutex<ContextAuthority>>) -> Self {
         self.context_authority = Some(context);
+        self
+    }
+
+    #[must_use]
+    pub fn with_trusted_dispatch_route_profile(
+        mut self,
+        profile: TrustedDispatchRouteProfile,
+    ) -> Self {
+        self.route_profile = Some(profile);
         self
     }
 }
@@ -421,7 +436,17 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
             }
             config.material.input_bundle_sha256 = digest.to_owned();
         }
-        Ok(SingleHarnessWorkflowResolution::Resolved(Box::new(config)))
+        match self.route_profile.as_ref() {
+            Some(profile) => {
+                let route_binding = build_dispatch_route_binding(profile)
+                    .map_err(|_| SingleHarnessWorkflowResolverError::InvalidConfiguration)?;
+                Ok(SingleHarnessWorkflowResolution::ResolvedWithRouteBinding {
+                    config: Box::new(config),
+                    route_binding: Box::new(route_binding),
+                })
+            }
+            None => Ok(SingleHarnessWorkflowResolution::Resolved(Box::new(config))),
+        }
     }
 }
 
@@ -480,6 +505,8 @@ pub struct ProfiledNativeHarnessComposition {
     pub config: NativeHarnessCompositionConfig,
     pub profile: NativeHarnessCompositionProfile,
     pub driver: Box<dyn NativeHarnessDriver + Send>,
+    route_profile: Option<TrustedDispatchRouteProfile>,
+    disclosure_credentials: egopulse_harness_adapter::ManagedDisclosureCredentials,
 }
 
 /// Provider-neutral identity that binds a native driver to the capability
@@ -564,6 +591,69 @@ impl NativeHarnessCompositionProfile {
             ));
         }
         Ok(())
+    }
+}
+
+fn trusted_codex_route_profile(
+    profile: &ProviderBootstrapProfile,
+    native: &NativeHarnessCompositionConfig,
+) -> Result<TrustedDispatchRouteProfile, DaemonCompositionError> {
+    if profile.provider != bootstrap::ProviderId::Gpt
+        || profile.harness != bootstrap::ProviderHarnessKind::CodexAppServer
+        || profile.admission != bootstrap::ProviderAdmission::Production
+        || native.default_model.as_deref() != Some(profile.exact_model.as_str())
+    {
+        return Err(DaemonCompositionError::InvalidConfiguration(
+            "production Codex dispatch route profile",
+        ));
+    }
+    let model = profile
+        .models
+        .iter()
+        .find(|model| model.harness_model_id == profile.exact_model)
+        .ok_or(DaemonCompositionError::InvalidConfiguration(
+            "production Codex provider model binding",
+        ))?;
+    Ok(TrustedDispatchRouteProfile {
+        provider_bootstrap_profile_id: profile.profile_id.clone(),
+        selected_harness_id: "codex_app_server".to_owned(),
+        provider_model_id: model.provider_model_id.clone(),
+        catalog_snapshot_sha256: profile
+            .catalog_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.evidence_digest_sha256.clone()),
+        capability_profile_id: native.workflow.capability_profile_ref.contract_id.clone(),
+    })
+}
+
+fn codex_disclosure_credentials(
+    profile: &ProviderBootstrapProfile,
+    environment_overrides: &[(String, String)],
+) -> egopulse_harness_adapter::ManagedDisclosureCredentials {
+    use egopulse_harness_adapter::ManagedDisclosureCredentials;
+
+    match &profile.credential {
+        bootstrap::ProviderCredentialReference::HarnessAccount
+            if environment_overrides.is_empty() =>
+        {
+            ManagedDisclosureCredentials::harness_account()
+        }
+        bootstrap::ProviderCredentialReference::ApiKeyEnvironment { target_env, .. } => {
+            let mut matching = environment_overrides
+                .iter()
+                .filter(|(name, _)| name == target_env);
+            match (
+                matching.next(),
+                matching.next(),
+                environment_overrides.len(),
+            ) {
+                (Some((_, value)), None, 1) => {
+                    ManagedDisclosureCredentials::managed_available(vec![value.clone()])
+                }
+                _ => ManagedDisclosureCredentials::managed_unavailable(),
+            }
+        }
+        _ => ManagedDisclosureCredentials::managed_unavailable(),
     }
 }
 
@@ -653,6 +743,7 @@ impl DaemonProviders {
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
             context_authority: None,
+            harness_content_projectors: Vec::new(),
         }
     }
 
@@ -729,6 +820,7 @@ impl DaemonProviders {
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
             context_authority: None,
+            harness_content_projectors: Vec::new(),
         }
     }
 
@@ -779,6 +871,7 @@ impl DaemonProviders {
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
             context_authority: None,
+            harness_content_projectors: Vec::new(),
         }
     }
 
@@ -915,6 +1008,7 @@ impl DaemonProviders {
     pub fn with_codex_harness(
         self,
         config: CodexHarnessCompositionConfig,
+        provider_profile: ProviderBootstrapProfile,
         artifact_authority: Arc<
             Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
         >,
@@ -926,15 +1020,29 @@ impl DaemonProviders {
             codex_executable,
             environment_overrides,
         } = config;
+        let disclosure_credentials =
+            codex_disclosure_credentials(&provider_profile, &environment_overrides);
         let mut process = CodexAppServerConfig::new(codex_executable);
         for (name, value) in environment_overrides {
             process = process.with_environment_override(name, value);
         }
-        self.with_native_harness_driver(
-            native,
+        let route_profile = trusted_codex_route_profile(&provider_profile, &native)?;
+        let capability_profile_ref = native.workflow.capability_profile_ref.clone();
+        self.with_profiled_native_harness_drivers(
+            vec![ProfiledNativeHarnessComposition {
+                config: native,
+                profile: NativeHarnessCompositionProfile {
+                    adapter_id: CODEX_ADAPTER_ID.to_owned(),
+                    capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
+                    capability_profile_ref,
+                    observed_protocol: codex_protocol_fingerprint(),
+                },
+                driver: Box::new(CodexAppServerDriver::new(process)),
+                route_profile: Some(route_profile),
+                disclosure_credentials,
+            }],
             artifact_authority,
             verification,
-            CodexAppServerDriver::new(process),
         )
     }
 
@@ -994,6 +1102,9 @@ impl DaemonProviders {
                 config,
                 profile,
                 driver: Box::new(driver),
+                route_profile: None,
+                disclosure_credentials:
+                    egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(),
             }],
             artifact_authority,
             verification,
@@ -1052,6 +1163,8 @@ impl DaemonProviders {
                 config,
                 profile,
                 driver,
+                route_profile,
+                disclosure_credentials,
             } = composition;
             let NativeHarnessCompositionProfile {
                 adapter_id,
@@ -1067,6 +1180,13 @@ impl DaemonProviders {
             })
             .map_err(DaemonCompositionError::AdapterEdge)?;
             let collector_edge = AdapterEdge::open(AdapterEdgeConfig {
+                database_path: config.adapter_database_path.clone(),
+                adapter_id: adapter_id.clone(),
+                store_epoch: config.adapter_store_epoch.clone(),
+                key: AdapterEdgeKey::new(config.adapter_key),
+            })
+            .map_err(DaemonCompositionError::AdapterEdge)?;
+            let content_edge = AdapterEdge::open(AdapterEdgeConfig {
                 database_path: config.adapter_database_path.clone(),
                 adapter_id: adapter_id.clone(),
                 store_epoch: config.adapter_store_epoch.clone(),
@@ -1096,18 +1216,18 @@ impl DaemonProviders {
                 SystemAuthorityClock,
             )
             .map_err(DaemonCompositionError::Collaboration)?;
-            let file_material = match config.default_model {
+            let file_material = match config.default_model.as_ref() {
                 Some(model) => FileDispatchMaterialResolver::new(
                     config.input_bundle_root,
                     config.workspace_root,
                 )
-                .with_default_model(model),
+                .with_default_model(model.clone()),
                 None => FileDispatchMaterialResolver::new(
                     config.input_bundle_root,
                     config.workspace_root,
                 ),
             };
-            let adapter = GovernedHarnessAdapter::new(
+            let mut adapter = GovernedHarnessAdapter::new(
                 adapter_id,
                 capability_profile_id,
                 observed_protocol,
@@ -1116,6 +1236,27 @@ impl DaemonProviders {
                 driver,
                 SystemAdapterClock,
             );
+            self.harness_content_projectors.push(Arc::new(Mutex::new(
+                GovernedHarnessContentProjector::new(
+                    content_edge,
+                    disclosure_credentials,
+                    SystemAdapterClock,
+                ),
+            )));
+            if let Some(route_profile) = route_profile.as_ref() {
+                adapter = adapter.with_dispatch_route_binding(
+                    build_dispatch_route_binding(route_profile).map_err(|_| {
+                        DaemonCompositionError::InvalidConfiguration(
+                            "native Harness dispatch route binding",
+                        )
+                    })?,
+                    config.default_model.clone().ok_or(
+                        DaemonCompositionError::InvalidConfiguration(
+                            "native Harness dispatch route model",
+                        ),
+                    )?,
+                );
+            }
             let adapter = match self.context_authority.as_ref() {
                 Some(context) => adapter
                     .with_dispatch_context_authorization_gate(
@@ -1135,6 +1276,10 @@ impl DaemonProviders {
             };
             let capability_profile_ref = config.workflow.capability_profile_ref.clone();
             let resolver = ConfiguredSingleHarnessWorkflow::new(config.workflow);
+            let resolver = match route_profile {
+                Some(route_profile) => resolver.with_trusted_dispatch_route_profile(route_profile),
+                None => resolver,
+            };
             let resolver = match self.context_authority.as_ref() {
                 Some(context) => resolver.with_context_authority(Arc::clone(context)),
                 None => resolver,
@@ -1253,6 +1398,8 @@ pub struct DaemonComposition {
     verification_interval: Duration,
     founder_verdict_consume_worker: Option<Arc<dyn FounderVerdictConsumeWorker>>,
     verdict_consumption_interval: Duration,
+    harness_content_projectors:
+        Vec<Arc<Mutex<GovernedHarnessContentProjector<SystemAdapterClock>>>>,
 }
 
 impl DaemonComposition {
@@ -1339,6 +1486,7 @@ impl DaemonComposition {
         let harness_dispatch_runner = providers.harness_dispatch_runner;
         let verification_worker = providers.verification_worker;
         let founder_verdict_consume_worker = providers.founder_verdict_consume_worker;
+        let harness_content_projectors = providers.harness_content_projectors;
 
         Ok(Self {
             address,
@@ -1354,6 +1502,7 @@ impl DaemonComposition {
             verification_interval: config.verification_interval,
             founder_verdict_consume_worker,
             verdict_consumption_interval: config.verdict_consumption_interval,
+            harness_content_projectors,
         })
     }
 
@@ -1379,6 +1528,7 @@ impl DaemonComposition {
             verification_interval,
             founder_verdict_consume_worker,
             verdict_consumption_interval,
+            harness_content_projectors,
             ..
         } = self;
         let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
@@ -1405,6 +1555,7 @@ impl DaemonComposition {
             verification_interval,
             founder_verdict_consume_worker,
             verdict_consumption_interval,
+            harness_content_projectors,
             stop: stop_receiver,
         }));
         tokio::select! {
@@ -1433,6 +1584,8 @@ struct BackgroundWorkerInputs {
     verification_interval: Duration,
     founder_verdict_consume_worker: Option<Arc<dyn FounderVerdictConsumeWorker>>,
     verdict_consumption_interval: Duration,
+    harness_content_projectors:
+        Vec<Arc<Mutex<GovernedHarnessContentProjector<SystemAdapterClock>>>>,
     stop: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -1445,6 +1598,7 @@ async fn run_background_workers(inputs: BackgroundWorkerInputs) -> Result<(), Da
         verification_interval,
         founder_verdict_consume_worker,
         verdict_consumption_interval,
+        harness_content_projectors,
         stop,
     } = inputs;
     let mut workers = tokio::task::JoinSet::new();
@@ -1485,6 +1639,13 @@ async fn run_background_workers(inputs: BackgroundWorkerInputs) -> Result<(), Da
             .map_err(DaemonServeError::FounderVerdictConsume)
         });
     }
+    for projector in harness_content_projectors {
+        let stop_for_worker = stop.clone();
+        workers.spawn(async move {
+            run_harness_content_worker(projector, stop_for_worker).await;
+            Ok(())
+        });
+    }
     if workers.is_empty() {
         let mut stop = stop;
         loop {
@@ -1504,6 +1665,58 @@ async fn run_background_workers(inputs: BackgroundWorkerInputs) -> Result<(), Da
         }
     } else {
         Err(DaemonServeError::BackgroundStopped)
+    }
+}
+
+const HARNESS_CONTENT_DRAIN_BATCH: usize = 32;
+const HARNESS_CONTENT_DRAIN_INTERVAL: Duration = Duration::from_millis(100);
+
+async fn run_harness_content_worker(
+    projector: Arc<Mutex<GovernedHarnessContentProjector<SystemAdapterClock>>>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(HARNESS_CONTENT_DRAIN_INTERVAL);
+    ticker.tick().await;
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let mut fatal = false;
+        for _ in 0..HARNESS_CONTENT_DRAIN_BATCH {
+            let result = match projector.lock() {
+                Ok(mut projector) => projector.drain_once(),
+                Err(_) => {
+                    tracing::error!("Harness content projector lock failed closed");
+                    fatal = true;
+                    break;
+                }
+            };
+            match result {
+                Ok(HarnessContentDrain::Idle) => break,
+                Ok(
+                    HarnessContentDrain::Committed(_)
+                    | HarnessContentDrain::Replayed
+                    | HarnessContentDrain::Quarantined { .. },
+                ) => {}
+                Err(_) => {
+                    tracing::error!("Harness content projector stopped in its isolated domain");
+                    fatal = true;
+                    break;
+                }
+            }
+        }
+        if fatal {
+            while !*stop.borrow() && stop.changed().await.is_ok() {}
+            return;
+        }
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+            _ = ticker.tick() => {}
+        }
     }
 }
 
@@ -2378,6 +2591,8 @@ mod tests {
                         driver: Box::new(CodexAppServerDriver::new(CodexAppServerConfig::new(
                             PathBuf::from("codex"),
                         ))),
+                        route_profile: None,
+                        disclosure_credentials: egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(),
                     },
                     ProfiledNativeHarnessComposition {
                         profile: multi_native_profile_with_protocol(
@@ -2391,6 +2606,8 @@ mod tests {
                                 PathBuf::from("workspace-dsh-candidate"),
                             ),
                         )),
+                        route_profile: None,
+                        disclosure_credentials: egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(),
                     },
                 ],
                 artifact,
@@ -2429,6 +2646,10 @@ mod tests {
                     driver: Box::new(CodexAppServerDriver::new(CodexAppServerConfig::new(
                         PathBuf::from("codex"),
                     ))),
+                    route_profile: None,
+                    disclosure_credentials:
+                        egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(
+                        ),
                 },
                 ProfiledNativeHarnessComposition {
                     profile: multi_native_profile(&config_b),
@@ -2436,6 +2657,10 @@ mod tests {
                     driver: Box::new(CodexAppServerDriver::new(CodexAppServerConfig::new(
                         PathBuf::from("codex"),
                     ))),
+                    route_profile: None,
+                    disclosure_credentials:
+                        egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(
+                        ),
                 },
             ],
             artifact,
@@ -2629,6 +2854,260 @@ mod tests {
         ));
         drop(daemon);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn r9c_background_workers_start_the_independent_content_projector() {
+        use egopulse_domain_contracts::v01::egopulse::harness::v1::{
+            DeliveryDisposition, DispatchContextConsumptionProof, DispatchEnvelope,
+            DispatchReceipt, DispatchRouteBinding, HarnessContentSignalObservation,
+            HarnessObservation, NotContextBoundProof, ObservationCriticality,
+            dispatch_context_consumption_proof, dispatch_route_binding, harness_observation,
+        };
+        use egopulse_harness_adapter::{
+            ManagedDisclosureCredentials, assistant_text_content_candidate, bind_content_signal,
+            canonical_dispatch_route_binding_digest,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "egopulse-agentosd-r9c-content-worker-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).expect("create content worker test root");
+        let database_path = root.join("adapter.sqlcipher");
+        let open_edge = || {
+            AdapterEdge::open(AdapterEdgeConfig {
+                database_path: database_path.clone(),
+                adapter_id: "codex-adapter".to_owned(),
+                store_epoch: "r9c-content-worker-v4".to_owned(),
+                key: AdapterEdgeKey::new([0x5c; 32]),
+            })
+        };
+        let mut binding = DispatchRouteBinding {
+            provider_bootstrap_profile_id: "gpt-codex-default".to_owned(),
+            selected_harness_id: "codex_app_server".to_owned(),
+            provider_model_id: "gpt-5.6-sol".to_owned(),
+            catalog_snapshot: Some(
+                dispatch_route_binding::CatalogSnapshot::CatalogSnapshotSha256("a".repeat(64)),
+            ),
+            capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
+            route_binding_sha256: String::new(),
+        };
+        binding.route_binding_sha256 = canonical_dispatch_route_binding_digest(&binding)
+            .expect("canonical test route binding");
+        let dispatch = DispatchEnvelope {
+            run_id: "run-r9c-worker".to_owned(),
+            run_revision: 1,
+            step_id: "step-r9c-worker".to_owned(),
+            step_revision: 1,
+            attempt_id: "attempt-r9c-worker".to_owned(),
+            attempt_revision: 1,
+            dispatch_id: "dispatch-r9c-worker".to_owned(),
+            dispatch_fingerprint: "d".repeat(64),
+            fencing_token: 7,
+            capability_profile_ref: Some(ContractReference {
+                contract_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
+                version: "0.1.0".to_owned(),
+                sha256: "c".repeat(64),
+            }),
+            input_bundle_ref: "input-r9c-worker.json".to_owned(),
+            input_bundle_sha256: "e".repeat(64),
+            route_binding: Some(binding.clone()),
+            ..DispatchEnvelope::default()
+        };
+        let mut receipt = DispatchReceipt {
+            receipt_id: "receipt-r9c-worker".to_owned(),
+            disposition: DeliveryDisposition::Delivered as i32,
+            attempt_id: dispatch.attempt_id.clone(),
+            dispatch_id: dispatch.dispatch_id.clone(),
+            fencing_token: dispatch.fencing_token,
+            adapter_id: "codex-adapter".to_owned(),
+            capability_profile_id: binding.capability_profile_id.clone(),
+            evidence_ref: "adapter-edge:test".to_owned(),
+            ..DispatchReceipt::default()
+        };
+        receipt.receipt_digest_sha256 = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            prost::Message::encode_to_vec(&receipt),
+        ));
+        let raw = b"independent-content-worker-event";
+        let mut observation = HarnessObservation {
+            attempt_id: dispatch.attempt_id.clone(),
+            dispatch_id: dispatch.dispatch_id.clone(),
+            fencing_token: dispatch.fencing_token,
+            native_event_id: Some("native-r9c-worker-1".to_owned()),
+            native_sequence: Some(1),
+            native_event_digest_sha256: hex::encode(<sha2::Sha256 as sha2::Digest>::digest(raw)),
+            capability_profile_id: binding.capability_profile_id.clone(),
+            criticality: ObservationCriticality::Informational as i32,
+            payload: Some(harness_observation::Payload::ContentSignal(
+                HarnessContentSignalObservation {
+                    candidate: assistant_text_content_candidate(
+                        "message-r9c-worker",
+                        b"safe worker text".to_vec(),
+                    ),
+                    ..HarnessContentSignalObservation::default()
+                },
+            )),
+            ..HarnessObservation::default()
+        };
+        let source = observation.clone();
+        let Some(harness_observation::Payload::ContentSignal(signal)) =
+            observation.payload.as_mut()
+        else {
+            panic!("content signal fixture")
+        };
+        bind_content_signal(
+            &source,
+            signal,
+            &receipt.receipt_id,
+            &receipt.receipt_digest_sha256,
+            &binding.route_binding_sha256,
+            DispatchContextConsumptionProof {
+                branch: Some(dispatch_context_consumption_proof::Branch::NotContextBound(
+                    NotContextBoundProof {},
+                )),
+            },
+        )
+        .expect("bind exact worker content source tuple");
+
+        {
+            let mut edge = open_edge().expect("open writer Edge");
+            edge.prepare_dispatch(&dispatch, 10).expect("prepare");
+            edge.begin_delivery(&dispatch.dispatch_id, 11)
+                .expect("begin delivery");
+            edge.record_dispatch_receipt(&receipt, b"delivery-evidence", 12)
+                .expect("record delivered receipt");
+            edge.bind_dispatch_task_lineage(&dispatch.dispatch_id, "task-r9c-worker", 1, 1, 13)
+                .expect("bind task lineage");
+            edge.append_observation(
+                &dispatch.dispatch_id,
+                "content:worker:1",
+                raw,
+                observation,
+                14,
+            )
+            .expect("persist pending content candidate");
+            let before = edge.inspect().expect("inspect pending content");
+            assert_eq!(before.pending_content_candidate_count, 1);
+            assert_eq!(before.safe_content_ledger_count, 0);
+        }
+
+        let projector_edge = open_edge().expect("open projector Edge");
+        let projector = Arc::new(Mutex::new(GovernedHarnessContentProjector::new(
+            projector_edge,
+            ManagedDisclosureCredentials::harness_account(),
+            SystemAdapterClock,
+        )));
+        let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
+        let background = tokio::spawn(run_background_workers(BackgroundWorkerInputs {
+            projection_pump: None,
+            harness_dispatch_runner: None,
+            harness_dispatch_interval: Duration::from_millis(25),
+            verification_worker: None,
+            verification_interval: Duration::from_millis(25),
+            founder_verdict_consume_worker: None,
+            verdict_consumption_interval: Duration::from_millis(25),
+            harness_content_projectors: vec![projector],
+            stop: stop_receiver,
+        }));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let inspection = open_edge()
+                    .expect("open observer Edge")
+                    .inspect()
+                    .expect("inspect content worker result");
+                if inspection.safe_content_ledger_count == 1 {
+                    assert_eq!(inspection.pending_content_candidate_count, 0);
+                    assert_eq!(inspection.pending_content_projection_count, 1);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("independent content worker bounded completion");
+        stop_sender.send(true).expect("stop content worker");
+        tokio::time::timeout(Duration::from_secs(2), background)
+            .await
+            .expect("background worker bounded stop")
+            .expect("background worker task")
+            .expect("background worker result");
+        fs::remove_dir_all(root).expect("remove content worker test root");
+    }
+
+    #[test]
+    fn r9c_production_credential_composition_distinguishes_all_disclosure_states() {
+        fn profile(credential: bootstrap::ProviderCredentialReference) -> ProviderBootstrapProfile {
+            ProviderBootstrapProfile {
+                profile_id: "gpt-codex-default".to_owned(),
+                provider: bootstrap::ProviderId::Gpt,
+                harness: bootstrap::ProviderHarnessKind::CodexAppServer,
+                admission: bootstrap::ProviderAdmission::Production,
+                models: vec![bootstrap::ProviderModelBinding {
+                    harness_model_id: "gpt-5.6-sol".to_owned(),
+                    provider_model_id: "gpt-5.6-sol".to_owned(),
+                }],
+                catalog_snapshot: None,
+                exact_model: "gpt-5.6-sol".to_owned(),
+                executable: PathBuf::from("codex"),
+                credential,
+                hold_reason: None,
+            }
+        }
+
+        let harness_account = profile(bootstrap::ProviderCredentialReference::HarnessAccount);
+        assert!(matches!(
+            codex_disclosure_credentials(&harness_account, &[]),
+            egopulse_harness_adapter::ManagedDisclosureCredentials::HarnessAccount
+        ));
+        assert!(matches!(
+            codex_disclosure_credentials(
+                &harness_account,
+                &[("UNEXPECTED".to_owned(), "not-forwarded".to_owned())]
+            ),
+            egopulse_harness_adapter::ManagedDisclosureCredentials::ManagedUnavailable
+        ));
+
+        let managed = profile(bootstrap::ProviderCredentialReference::ApiKeyEnvironment {
+            source_env: "EGOPULSE_TEST_SOURCE".to_owned(),
+            target_env: "EGOPULSE_TEST_TARGET".to_owned(),
+        });
+        let available = codex_disclosure_credentials(
+            &managed,
+            &[(
+                "EGOPULSE_TEST_TARGET".to_owned(),
+                "ephemeral-test-secret".to_owned(),
+            )],
+        );
+        assert!(matches!(
+            available,
+            egopulse_harness_adapter::ManagedDisclosureCredentials::ManagedAvailable(ref values)
+                if values.as_slice() == ["ephemeral-test-secret"]
+        ));
+        assert!(matches!(
+            codex_disclosure_credentials(&managed, &[]),
+            egopulse_harness_adapter::ManagedDisclosureCredentials::ManagedUnavailable
+        ));
+        assert!(matches!(
+            codex_disclosure_credentials(
+                &managed,
+                &[
+                    (
+                        "EGOPULSE_TEST_TARGET".to_owned(),
+                        "ephemeral-test-secret".to_owned(),
+                    ),
+                    ("UNEXPECTED".to_owned(), "other".to_owned()),
+                ]
+            ),
+            egopulse_harness_adapter::ManagedDisclosureCredentials::ManagedUnavailable
+        ));
+        assert!(matches!(
+            codex_disclosure_credentials(
+                &managed,
+                &[("EGOPULSE_TEST_TARGET".to_owned(), "x".repeat(100_000))]
+            ),
+            egopulse_harness_adapter::ManagedDisclosureCredentials::ManagedOutOfBounds
+        ));
     }
 
     #[allow(dead_code)]

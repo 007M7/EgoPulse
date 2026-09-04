@@ -1277,8 +1277,10 @@ dependencies = [
 name = "egopulse-harness-adapter"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "egopulse-domain-contracts",
  "hex",
+ "hmac",
  "prost",
  "prost-types",
  "rusqlite",

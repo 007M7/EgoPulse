@@ -16,6 +16,7 @@ pub use harness_dispatch::{
 pub use ingestion::{HarnessFactIngestionDisposition, HarnessFactIngestionResult};
 pub use single_harness_workflow::{
     SingleHarnessWorkConfig, SingleHarnessWorkError, SingleHarnessWorkResult,
+    TrustedDispatchRouteProfile, build_dispatch_route_binding, canonical_route_binding_digest,
     start_single_harness_workflow,
 };
 pub use task_activation_guard::{
@@ -395,6 +396,11 @@ pub enum SingleHarnessWorkflowResolverError {
 pub enum SingleHarnessWorkflowResolution {
     NotApplicable,
     Resolved(Box<SingleHarnessWorkConfig>),
+    ResolvedWithRouteBinding {
+        config: Box<SingleHarnessWorkConfig>,
+        route_binding:
+            Box<egopulse_domain_contracts::v01::egopulse::harness::v1::DispatchRouteBinding>,
+    },
 }
 
 pub trait SingleHarnessWorkflowResolver: Send + Sync {

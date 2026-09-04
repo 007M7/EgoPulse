@@ -2,17 +2,30 @@
 #![allow(async_fn_in_trait)]
 
 mod capability;
+mod disclosure;
 mod edge;
 mod runtime;
 
 pub use capability::{
     CapabilityBindingError, validate_capability_binding, validate_step_capability_binding,
 };
+pub use disclosure::{
+    ContentAssemblyCheckpoint, ContentDisclosureError, SafeContentProjection,
+    TrustedContentLineage, approval_required_content_candidate, assistant_text_content_candidate,
+    assistant_text_mutation_candidate, bind_content_signal, blocked_source_content_candidate,
+    canonical_dispatch_route_binding_digest, canonical_safe_record_digest,
+    lifecycle_content_candidate, project_safe_content, project_structured_only_content,
+    usage_content_candidate,
+};
 pub use edge::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeInspection, AdapterEdgeKey,
-    AdapterObservationEvidence, DispatchPreparation, DispatchTaskLineage, DurableWritePreparation,
-    NativeExecutionBinding, NormalObservationRecoveryView, ObservationAppend,
-    PendingAdapterApprovalProjection, PendingTerminalOutputCandidate,
+    AdapterObservationEvidence, ContentDisclosureMode, ContentRetentionCompactionReceipt,
+    ContentRetentionCompactionRequest, DispatchPreparation, DispatchTaskLineage,
+    DurableWritePreparation, NativeExecutionBinding, NormalObservationRecoveryView,
+    ObservationAppend, PendingAdapterApprovalProjection, PendingContentCandidate,
+    PendingTerminalOutputCandidate, RetainedSafeContent, SafeContentAssemblyCheckpoint,
+    SafeContentBudgetSnapshot, SafeContentBudgetUsage, SafeContentCommit, SafeContentOwnerRecord,
+    SafeContentOwnerSnapshot, SafeContentProjectionMessage,
 };
 pub use runtime::{
     AdapterClock, AdapterReconciliationEvidence, AuthorizedDispatchContext,
@@ -20,8 +33,9 @@ pub use runtime::{
     DispatchContextAuthorizationReceipt, DispatchContextBinding, DispatchContextRecovery,
     DispatchContextRecoveryGate, DispatchContextReference, DispatchMaterialResolver,
     DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, GovernedAdapterError,
-    GovernedHarnessAdapter, HistoricalDispatchContext, HistoricalDispatchContextBinding,
-    HistoricalDispatchContextState, NativeHarnessDriver, NativeHarnessFuture, ProbeValidationError,
+    GovernedHarnessAdapter, GovernedHarnessContentProjector, HarnessContentDrain,
+    HistoricalDispatchContext, HistoricalDispatchContextBinding, HistoricalDispatchContextState,
+    ManagedDisclosureCredentials, NativeHarnessDriver, NativeHarnessFuture, ProbeValidationError,
     ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial, SystemAdapterClock,
     TerminalOutputCandidate, classify_dispatch_context_reference, validate_probe_result,
 };

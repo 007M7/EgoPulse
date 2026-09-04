@@ -1,15 +1,20 @@
 use crate::{
-    AdapterEdge, AdapterEdgeError, AdapterObservationEvidence, DispatchPreparation,
-    DurableWritePreparation, NormalObservationRecoveryView, PendingAdapterApprovalProjection,
+    AdapterEdge, AdapterEdgeError, AdapterObservationEvidence, ContentDisclosureError,
+    ContentDisclosureMode, DispatchPreparation, DurableWritePreparation,
+    NormalObservationRecoveryView, PendingAdapterApprovalProjection, SafeContentCommit,
+    TrustedContentLineage, bind_content_signal, canonical_safe_record_digest, project_safe_content,
+    project_structured_only_content,
 };
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ApprovalDecisionEnvelope, ApprovalDecisionReceipt, ApprovalDecisionResult,
-    CancelExecutionEnvelope, CancelExecutionReceipt, CancelExecutionResult,
-    CancellationDeliveryDisposition, DeliveryDisposition, DiagnosticObservation, DispatchEnvelope,
-    DispatchReceipt, DispatchResult, HarnessError, HarnessErrorCode, HarnessObservation,
-    HarnessReadiness, LifecycleKind, NativeProtocolFingerprint, ObservationCriticality,
-    ProbeHarnessRequest, ProbeHarnessResult, ResumeExecutionEnvelope, ResumeExecutionResult,
-    approval_decision_result, cancel_execution_result, dispatch_result, harness_observation,
+    AuthorizedContextConsumptionProof, CancelExecutionEnvelope, CancelExecutionReceipt,
+    CancelExecutionResult, CancellationDeliveryDisposition, DeliveryDisposition,
+    DiagnosticObservation, DispatchContextConsumptionProof, DispatchEnvelope, DispatchReceipt,
+    DispatchResult, DispatchRouteBinding, HarnessError, HarnessErrorCode, HarnessObservation,
+    HarnessReadiness, LifecycleKind, NativeProtocolFingerprint, NotContextBoundProof,
+    ObservationCriticality, ProbeHarnessRequest, ProbeHarnessResult, ResumeExecutionEnvelope,
+    ResumeExecutionResult, approval_decision_result, cancel_execution_result,
+    dispatch_context_consumption_proof, dispatch_result, harness_observation,
     resume_execution_result,
 };
 use prost::Message;
@@ -19,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{future::Future, path::PathBuf, pin::Pin};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 pub trait AdapterClock {
     fn now(&self) -> Timestamp;
@@ -440,6 +446,8 @@ pub enum GovernedAdapterError {
     InvalidDeliveredRecoveryEvidence,
     #[error("native terminal output candidate extraction failed")]
     TerminalOutputCandidate,
+    #[error("Harness content disclosure failed closed")]
+    ContentDisclosure(#[from] ContentDisclosureError),
 }
 
 pub struct GovernedHarnessAdapter<R, D, C> {
@@ -453,6 +461,247 @@ pub struct GovernedHarnessAdapter<R, D, C> {
     context_authorization_gate: Box<dyn DispatchContextAuthorizationGate>,
     context_authorization_gate_installed: bool,
     context_recovery_gate: Box<dyn DispatchContextRecoveryGate>,
+    expected_route_binding: Option<ExpectedDispatchRouteBinding>,
+    disclosure_credentials: ManagedDisclosureCredentials,
+}
+
+pub enum ManagedDisclosureCredentials {
+    HarnessAccount,
+    ManagedAvailable(Zeroizing<Vec<String>>),
+    ManagedUnavailable,
+    ManagedOutOfBounds,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HarnessContentDrain {
+    Idle,
+    Committed(crate::SafeContentCommit),
+    Replayed,
+    Quarantined { reason_code: &'static str },
+}
+
+/// Content-only projector. It owns a separate Adapter Edge connection and has
+/// no Driver or material resolver, so content failures cannot escape through
+/// the execution/Task/Approval pump.
+pub struct GovernedHarnessContentProjector<C> {
+    edge: AdapterEdge,
+    disclosure_credentials: ManagedDisclosureCredentials,
+    clock: C,
+}
+
+impl<C> GovernedHarnessContentProjector<C>
+where
+    C: AdapterClock,
+{
+    #[must_use]
+    pub fn new(
+        edge: AdapterEdge,
+        disclosure_credentials: ManagedDisclosureCredentials,
+        clock: C,
+    ) -> Self {
+        Self {
+            edge,
+            disclosure_credentials,
+            clock,
+        }
+    }
+
+    #[must_use]
+    pub const fn edge(&self) -> &AdapterEdge {
+        &self.edge
+    }
+
+    pub fn drain_once(&mut self) -> Result<HarnessContentDrain, GovernedAdapterError> {
+        let Some(pending) = self.edge.pending_content_candidates()?.into_iter().next() else {
+            return Ok(HarnessContentDrain::Idle);
+        };
+        let now_seconds = self.clock.now().seconds;
+        let dispatch_id = pending.observation.dispatch_id.as_str();
+        let envelope = self
+            .edge
+            .dispatch_envelope(dispatch_id)?
+            .ok_or(ContentDisclosureError::SourceBinding)?;
+        let route_binding = self
+            .edge
+            .dispatch_route_binding(dispatch_id)?
+            .filter(|binding| envelope.route_binding.as_ref() == Some(binding))
+            .ok_or(ContentDisclosureError::SourceBinding)?;
+        let receipt = self
+            .edge
+            .delivered_dispatch_receipt(dispatch_id)?
+            .filter(|receipt| {
+                let recorded_digest = receipt.receipt_digest_sha256.as_str();
+                let mut canonical = receipt.clone();
+                canonical.receipt_digest_sha256.clear();
+                receipt.receipt_id == pending.signal.delivered_receipt_id
+                    && recorded_digest == pending.signal.delivered_receipt_digest_sha256
+                    && canonical_sha256_is_valid(recorded_digest)
+                    && canonical_digest(&canonical) == recorded_digest
+                    && receipt.disposition == DeliveryDisposition::Delivered as i32
+                    && receipt.dispatch_id == envelope.dispatch_id
+                    && receipt.attempt_id == envelope.attempt_id
+                    && receipt.fencing_token == envelope.fencing_token
+                    && receipt.adapter_id == self.edge.adapter_id()
+                    && envelope
+                        .capability_profile_ref
+                        .as_ref()
+                        .is_some_and(|profile| profile.contract_id == receipt.capability_profile_id)
+            })
+            .ok_or(ContentDisclosureError::SourceBinding)?;
+        let lineage = self
+            .edge
+            .dispatch_task_lineage(dispatch_id)?
+            .ok_or(ContentDisclosureError::SourceBinding)?;
+        if pending.observation.attempt_id != envelope.attempt_id
+            || pending.observation.fencing_token != envelope.fencing_token
+            || pending.observation.capability_profile_id != receipt.capability_profile_id
+            || pending.signal.dispatch_route_binding_sha256 != route_binding.route_binding_sha256
+            || crate::canonical_dispatch_route_binding_digest(&route_binding).as_deref()
+                != Some(route_binding.route_binding_sha256.as_str())
+        {
+            return Err(ContentDisclosureError::SourceBinding.into());
+        }
+        let trusted_lineage = TrustedContentLineage {
+            task_id: lineage.task_id,
+            run_id: envelope.run_id.clone(),
+            step_id: envelope.step_id.clone(),
+        };
+        if let Some(limit_kind) = self
+            .edge
+            .content_scope_limit_kind(&trusted_lineage.task_id, &pending.observation.attempt_id)?
+        {
+            let candidate = pending
+                .signal
+                .candidate
+                .as_ref()
+                .ok_or(ContentDisclosureError::CandidateIntegrity)?;
+            crate::disclosure::validate_candidate_semantics(candidate)?;
+            self.edge.settle_limited_content_candidate(
+                &pending.signal.content_event_id,
+                &candidate.candidate_digest_sha256,
+                limit_kind,
+                now_seconds,
+            )?;
+            return Ok(HarnessContentDrain::Committed(
+                SafeContentCommit::Suppressed {
+                    content_event_id: pending.signal.content_event_id,
+                },
+            ));
+        }
+        let previous = self
+            .edge
+            .content_projection_checkpoint(dispatch_id, &pending.signal)?;
+        if let (
+            Some(previous),
+            Some(egopulse_domain_contracts::v01::egopulse::harness::v1::user_visible_content_candidate::Payload::AssistantText(text)),
+            Some(candidate),
+        ) = (
+            previous.as_ref(),
+            pending.signal.candidate.as_ref().and_then(|candidate| candidate.payload.as_ref()),
+            pending.signal.candidate.as_ref(),
+        ) && text.revision == previous.current_revision
+        {
+            if candidate.candidate_digest_sha256 == previous.candidate_digest_sha256 {
+                self.edge.settle_replayed_content_candidate(
+                    &pending.signal.content_event_id,
+                    now_seconds,
+                )?;
+                return Ok(HarnessContentDrain::Replayed);
+            }
+            self.edge.quarantine_content_candidate(
+                &pending.signal.content_event_id,
+                "CONTENT_REVISION_DIGEST_CONFLICT",
+                now_seconds,
+            )?;
+            return Ok(HarnessContentDrain::Quarantined {
+                reason_code: "CONTENT_REVISION_DIGEST_CONFLICT",
+            });
+        }
+        let disclosure_mode = self.edge.verify_or_bind_content_disclosure(
+            dispatch_id,
+            self.disclosure_credentials.values(),
+            now_seconds,
+        )?;
+        let projection = match disclosure_mode {
+            ContentDisclosureMode::Full => project_safe_content(
+                &pending.observation,
+                &pending.signal,
+                &route_binding,
+                &trusted_lineage,
+                self.disclosure_credentials
+                    .values()
+                    .ok_or(ContentDisclosureError::CredentialInput)?,
+                previous.as_ref(),
+            ),
+            ContentDisclosureMode::StructuredOnly => project_structured_only_content(
+                &pending.observation,
+                &pending.signal,
+                &route_binding,
+                &trusted_lineage,
+                previous.as_ref(),
+            ),
+        };
+        let projection = match projection {
+            Ok(projection) => projection,
+            Err(ContentDisclosureError::CandidateIntegrity) => {
+                self.edge.quarantine_content_candidate(
+                    &pending.signal.content_event_id,
+                    "CONTENT_CANDIDATE_INTEGRITY",
+                    now_seconds,
+                )?;
+                return Ok(HarnessContentDrain::Quarantined {
+                    reason_code: "CONTENT_CANDIDATE_INTEGRITY",
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if projection.records().iter().any(|record| {
+            canonical_safe_record_digest(record).as_deref()
+                != Some(record.record_digest_sha256.as_str())
+        }) {
+            return Err(ContentDisclosureError::CandidateIntegrity.into());
+        }
+        self.edge
+            .commit_safe_content_projection(&projection, now_seconds)
+            .map(HarnessContentDrain::Committed)
+            .map_err(Into::into)
+    }
+}
+
+impl ManagedDisclosureCredentials {
+    #[must_use]
+    pub const fn harness_account() -> Self {
+        Self::HarnessAccount
+    }
+
+    #[must_use]
+    pub fn managed_available(values: Vec<String>) -> Self {
+        let values = Zeroizing::new(values);
+        if crate::disclosure::canonical_credential_variants(values.as_slice()).is_ok() {
+            Self::ManagedAvailable(values)
+        } else {
+            Self::ManagedOutOfBounds
+        }
+    }
+
+    #[must_use]
+    pub const fn managed_unavailable() -> Self {
+        Self::ManagedUnavailable
+    }
+
+    fn values(&self) -> Option<&[String]> {
+        match self {
+            Self::HarnessAccount => Some(&[]),
+            Self::ManagedAvailable(values) => Some(values.as_slice()),
+            Self::ManagedUnavailable | Self::ManagedOutOfBounds => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ExpectedDispatchRouteBinding {
+    binding: DispatchRouteBinding,
+    harness_model_id: String,
 }
 
 impl<R, D, C> GovernedHarnessAdapter<R, D, C>
@@ -482,7 +731,47 @@ where
             context_authorization_gate: Box::new(RejectContextAuthorizationGate),
             context_authorization_gate_installed: false,
             context_recovery_gate: Box::new(RejectContextRecoveryGate),
+            expected_route_binding: None,
+            disclosure_credentials: ManagedDisclosureCredentials::ManagedUnavailable,
         }
+    }
+
+    /// Installs the immutable route selected by trusted daemon composition.
+    /// The Adapter only verifies it; it never enriches a persisted envelope.
+    #[must_use]
+    pub fn with_dispatch_route_binding(
+        mut self,
+        binding: DispatchRouteBinding,
+        harness_model_id: impl Into<String>,
+    ) -> Self {
+        self.expected_route_binding = Some(ExpectedDispatchRouteBinding {
+            binding,
+            harness_model_id: harness_model_id.into(),
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_managed_disclosure_credentials(mut self, values: Vec<String>) -> Self {
+        self.disclosure_credentials = ManagedDisclosureCredentials::managed_available(values);
+        self
+    }
+
+    /// Declares that authentication is owned by the Harness account and that
+    /// no daemon-managed secret is expected for disclosure redaction.
+    #[must_use]
+    pub fn with_harness_account_disclosure(mut self) -> Self {
+        self.disclosure_credentials = ManagedDisclosureCredentials::HarnessAccount;
+        self
+    }
+
+    #[must_use]
+    pub fn with_disclosure_credentials(
+        mut self,
+        credentials: ManagedDisclosureCredentials,
+    ) -> Self {
+        self.disclosure_credentials = credentials;
+        self
     }
 
     /// Installs the production Context Authority bridge. Static dispatches are
@@ -604,6 +893,9 @@ where
                 None,
             )));
         }
+        if let Err(error) = self.validate_resolved_route(envelope, &material) {
+            return Ok(dispatch_error(error));
+        }
 
         let context_authorization = match self
             .context_authorization_gate
@@ -684,7 +976,7 @@ where
         } else {
             None
         };
-        let observation = HarnessObservation {
+        let mut observation = HarnessObservation {
             observation_id: String::new(),
             adapter_id: self.adapter_id.clone(),
             attempt_id: envelope.attempt_id.clone(),
@@ -701,6 +993,13 @@ where
             adapter_received_at: Some(received_at),
             payload: Some(event.payload),
         };
+        observation.native_event_digest_sha256 = sha256(&event.raw_event);
+        if matches!(
+            observation.payload.as_ref(),
+            Some(harness_observation::Payload::ContentSignal(_))
+        ) {
+            self.bind_content_observation(envelope, &mut observation)?;
+        }
         let appended = self.edge.append_observation_with_terminal_output(
             &envelope.dispatch_id,
             &event.native_key,
@@ -1317,6 +1616,85 @@ where
         validate_context_authorization(envelope, &reference, authorization).map(|_| ())
     }
 
+    fn content_context_proof(
+        &self,
+        envelope: &DispatchEnvelope,
+    ) -> Result<DispatchContextConsumptionProof, HarnessError> {
+        let reference = classify_dispatch_context_reference(&envelope.input_bundle_ref);
+        if reference == DispatchContextReference::InvalidContextBinding {
+            return Err(context_binding_error(
+                HarnessErrorCode::ConfigInvalid,
+                "CONTEXT_BINDING_INVALID",
+                false,
+            ));
+        }
+        let authorization = self
+            .context_authorization_gate
+            .verify_existing_dispatch(envelope)?;
+        let authorized = validate_context_authorization(envelope, &reference, authorization)?;
+        Ok(DispatchContextConsumptionProof {
+            branch: Some(match authorized {
+                Some(value) => dispatch_context_consumption_proof::Branch::AuthorizedContext(
+                    AuthorizedContextConsumptionProof {
+                        authorization_id: value.receipt.authorization_id,
+                        committed_request_digest_sha256: value.receipt.request_digest_sha256,
+                    },
+                ),
+                None => dispatch_context_consumption_proof::Branch::NotContextBound(
+                    NotContextBoundProof {},
+                ),
+            }),
+        })
+    }
+
+    fn bind_content_observation(
+        &self,
+        envelope: &DispatchEnvelope,
+        observation: &mut HarnessObservation,
+    ) -> Result<(), GovernedAdapterError> {
+        let route_binding = self
+            .edge
+            .dispatch_route_binding(&envelope.dispatch_id)?
+            .filter(|binding| envelope.route_binding.as_ref() == Some(binding))
+            .ok_or(ContentDisclosureError::SourceBinding)?;
+        if crate::canonical_dispatch_route_binding_digest(&route_binding).as_deref()
+            != Some(route_binding.route_binding_sha256.as_str())
+        {
+            return Err(ContentDisclosureError::SourceBinding.into());
+        }
+        let receipt = self
+            .edge
+            .delivered_dispatch_receipt(&envelope.dispatch_id)?
+            .filter(|receipt| {
+                receipt.dispatch_id == envelope.dispatch_id
+                    && receipt.attempt_id == envelope.attempt_id
+                    && receipt.fencing_token == envelope.fencing_token
+                    && receipt.adapter_id == self.adapter_id
+                    && receipt.capability_profile_id == self.capability_profile_id
+                    && receipt.disposition == DeliveryDisposition::Delivered as i32
+                    && canonical_sha256_is_valid(&receipt.receipt_digest_sha256)
+            })
+            .ok_or(ContentDisclosureError::SourceBinding)?;
+        let proof = self.content_context_proof(envelope).map_err(|_| {
+            GovernedAdapterError::ContentDisclosure(ContentDisclosureError::SourceBinding)
+        })?;
+        let source_observation = observation.clone();
+        let Some(harness_observation::Payload::ContentSignal(signal)) =
+            observation.payload.as_mut()
+        else {
+            return Err(ContentDisclosureError::CandidateIntegrity.into());
+        };
+        bind_content_signal(
+            &source_observation,
+            signal,
+            &receipt.receipt_id,
+            &receipt.receipt_digest_sha256,
+            &route_binding.route_binding_sha256,
+            proof,
+        )?;
+        Ok(())
+    }
+
     fn validate_dispatch(&self, envelope: &DispatchEnvelope) -> Option<HarnessError> {
         let profile = envelope.capability_profile_ref.as_ref();
         if envelope.dispatch_id.trim().is_empty()
@@ -1337,6 +1715,49 @@ where
             ));
         }
         None
+    }
+
+    fn validate_resolved_route(
+        &self,
+        envelope: &DispatchEnvelope,
+        material: &ResolvedDispatchMaterial,
+    ) -> Result<(), HarnessError> {
+        let Some(expected) = self.expected_route_binding.as_ref() else {
+            if envelope.route_binding.is_none() {
+                return Ok(());
+            }
+            return Err(harness_error(
+                HarnessErrorCode::ConfigInvalid,
+                "DISPATCH_ROUTE_UNAVAILABLE",
+                false,
+                false,
+                None,
+            ));
+        };
+        let Some(actual) = envelope.route_binding.as_ref() else {
+            return Err(harness_error(
+                HarnessErrorCode::IntegrityFailure,
+                "DISPATCH_ROUTE_BINDING_MISSING",
+                false,
+                false,
+                None,
+            ));
+        };
+        if actual != &expected.binding
+            || crate::canonical_dispatch_route_binding_digest(actual).as_deref()
+                != Some(actual.route_binding_sha256.as_str())
+            || material.model.as_deref() != Some(expected.harness_model_id.as_str())
+            || actual.capability_profile_id != self.capability_profile_id
+        {
+            return Err(harness_error(
+                HarnessErrorCode::IntegrityFailure,
+                "DISPATCH_ROUTE_BINDING_MISMATCH",
+                false,
+                false,
+                None,
+            ));
+        }
+        Ok(())
     }
 
     fn delivery_receipt(
@@ -3467,5 +3888,30 @@ mod delivered_recovery_tests {
                 Err(GovernedAdapterError::InvalidDeliveredRecoveryEvidence)
             ));
         }
+    }
+
+    #[test]
+    fn r9c_managed_credential_states_are_explicit_and_fail_closed() {
+        let harness_account = ManagedDisclosureCredentials::harness_account();
+        assert_eq!(harness_account.values(), Some(&[][..]));
+
+        let available = ManagedDisclosureCredentials::managed_available(vec![
+            "credential-for-ephemeral-matching".to_owned(),
+        ]);
+        assert_eq!(
+            available.values(),
+            Some(["credential-for-ephemeral-matching".to_owned()].as_slice())
+        );
+
+        let unavailable = ManagedDisclosureCredentials::managed_unavailable();
+        assert_eq!(unavailable.values(), None);
+
+        let out_of_bounds =
+            ManagedDisclosureCredentials::managed_available(vec!["x".repeat(100_000)]);
+        assert!(matches!(
+            out_of_bounds,
+            ManagedDisclosureCredentials::ManagedOutOfBounds
+        ));
+        assert_eq!(out_of_bounds.values(), None);
     }
 }

@@ -476,8 +476,13 @@ where
                     .map_err(|_| HarnessDispatchCycleError::TaskActivationResolver)?
                 {
                     SingleHarnessWorkflowResolution::NotApplicable => continue,
-                    SingleHarnessWorkflowResolution::Resolved(config) => *config,
+                    SingleHarnessWorkflowResolution::Resolved(config) => (*config, None),
+                    SingleHarnessWorkflowResolution::ResolvedWithRouteBinding {
+                        config,
+                        route_binding,
+                    } => (*config, Some(*route_binding)),
                 };
+                let (config, route_binding) = config;
                 if !workflow_matches_profile(&config, self.capability_profile_filter.as_ref()) {
                     continue;
                 }
@@ -488,9 +493,15 @@ where
                             "activation reference binding failed".to_owned(),
                         )
                     })?;
-                super::start_single_harness_workflow(control, &activation.task, &config).map_err(
-                    |error| HarnessDispatchCycleError::TaskActivationWorkflow(error.to_string()),
-                )?;
+                super::single_harness_workflow::start_single_harness_workflow_with_route_binding(
+                    control,
+                    &activation.task,
+                    &config,
+                    route_binding.as_ref(),
+                )
+                .map_err(|error| {
+                    HarnessDispatchCycleError::TaskActivationWorkflow(error.to_string())
+                })?;
                 if !source
                     .acknowledge_task_activation(
                         &activation.message_id,
