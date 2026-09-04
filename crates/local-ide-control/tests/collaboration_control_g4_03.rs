@@ -1317,6 +1317,7 @@ fn dispatch_material() -> DispatchMaterial {
         session_strategy: NativeSessionStrategy::CreateNew,
         native_session_ref: None,
         checkpoint_ref: None,
+        route_binding: None,
         evidence_refs: vec!["dispatch-material:verified".to_owned()],
     }
 }

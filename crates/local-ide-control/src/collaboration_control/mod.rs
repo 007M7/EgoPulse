@@ -37,7 +37,7 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    DispatchEnvelope, NativeSessionStrategy,
+    DispatchEnvelope, DispatchRouteBinding, NativeSessionStrategy,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -168,6 +168,7 @@ pub struct DispatchMaterial {
     pub session_strategy: NativeSessionStrategy,
     pub native_session_ref: Option<String>,
     pub checkpoint_ref: Option<String>,
+    pub route_binding: Option<DispatchRouteBinding>,
     pub evidence_refs: Vec<String>,
 }
 
@@ -1197,6 +1198,14 @@ where
             Err(rejection) => return Ok(guard_error(rejection)),
         };
         if !dispatch_material_is_complete(&material) {
+            return Ok(guard_error(ReferenceGuardRejection::ContractMismatch));
+        }
+        if material.route_binding.as_ref().is_some_and(|binding| {
+            attempt
+                .capability_profile_ref
+                .as_ref()
+                .is_none_or(|reference| reference.contract_id != binding.capability_profile_id)
+        }) {
             return Ok(guard_error(ReferenceGuardRejection::ContractMismatch));
         }
         let run_previous = snapshot.run.as_ref().expect("stored run").revision;
@@ -2614,7 +2623,7 @@ fn build_dispatch_envelope(
         session_strategy: material.session_strategy as i32,
         native_session_ref: material.native_session_ref.clone(),
         checkpoint_ref: material.checkpoint_ref.clone(),
-        route_binding: None,
+        route_binding: material.route_binding.clone(),
     }
 }
 
@@ -2713,6 +2722,20 @@ fn dispatch_material_is_complete(material: &DispatchMaterial) -> bool {
         && contract_reference_is_complete(&material.data_egress_policy_ref)
         && contract_reference_is_complete(&material.approval_policy_ref)
         && material.session_strategy != NativeSessionStrategy::Unspecified
+        && material
+            .route_binding
+            .as_ref()
+            .is_none_or(dispatch_route_binding_is_complete)
+}
+
+fn dispatch_route_binding_is_complete(binding: &DispatchRouteBinding) -> bool {
+    !binding.provider_bootstrap_profile_id.trim().is_empty()
+        && !binding.selected_harness_id.trim().is_empty()
+        && !binding.provider_model_id.trim().is_empty()
+        && !binding.capability_profile_id.trim().is_empty()
+        && sha256_is_complete(&binding.route_binding_sha256)
+        && canonical_route_binding_digest(binding)
+            .is_ok_and(|digest| digest == binding.route_binding_sha256)
 }
 
 fn metadata_is_complete(meta: &CommandMetadata) -> bool {

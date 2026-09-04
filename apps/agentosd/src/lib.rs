@@ -500,6 +500,7 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
             Some(profile) => {
                 let route_binding = build_dispatch_route_binding(profile)
                     .map_err(|_| SingleHarnessWorkflowResolverError::InvalidConfiguration)?;
+                config.material.route_binding = Some(route_binding.clone());
                 Ok(SingleHarnessWorkflowResolution::ResolvedWithRouteBinding {
                     config: Box::new(config),
                     route_binding: Box::new(route_binding),
@@ -567,6 +568,51 @@ pub struct ProfiledNativeHarnessComposition {
     pub driver: Box<dyn NativeHarnessDriver + Send>,
     route_profile: Option<TrustedDispatchRouteProfile>,
     disclosure_credentials: egopulse_harness_adapter::ManagedDisclosureCredentials,
+}
+
+impl ProfiledNativeHarnessComposition {
+    /// Builds one already-attested provider composition. The safe default has
+    /// no route and no disclosure input, so callers must opt into both facts
+    /// explicitly before user-visible content can cross the Adapter boundary.
+    pub fn new<D>(
+        config: NativeHarnessCompositionConfig,
+        profile: NativeHarnessCompositionProfile,
+        driver: D,
+    ) -> Self
+    where
+        D: NativeHarnessDriver + Send + 'static,
+    {
+        Self {
+            config,
+            profile,
+            driver: Box::new(driver),
+            route_profile: None,
+            disclosure_credentials:
+                egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(),
+        }
+    }
+
+    /// Binds the immutable, trusted provider/model route used by dispatch and
+    /// safe-content identity. This does not perform Provider admission.
+    #[must_use]
+    pub fn with_trusted_dispatch_route_profile(
+        mut self,
+        route_profile: TrustedDispatchRouteProfile,
+    ) -> Self {
+        self.route_profile = Some(route_profile);
+        self
+    }
+
+    /// Supplies the already-resolved disclosure mode without exposing it to
+    /// the driver or any Local API surface.
+    #[must_use]
+    pub fn with_disclosure_credentials(
+        mut self,
+        credentials: egopulse_harness_adapter::ManagedDisclosureCredentials,
+    ) -> Self {
+        self.disclosure_credentials = credentials;
+        self
+    }
 }
 
 /// Provider-neutral identity that binds a native driver to the capability
@@ -2429,6 +2475,7 @@ mod tests {
                             session_strategy: egopulse_domain_contracts::v01::egopulse::harness::v1::NativeSessionStrategy::CreateNew,
                             native_session_ref: None,
                             checkpoint_ref: None,
+                            route_binding: None,
                             evidence_refs: vec!["evidence".to_owned()],
                         },
                     task_authority_principal_id: "task".to_owned(),
@@ -2613,6 +2660,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configured_workflow_carries_one_route_binding_in_trusted_dispatch_material() {
+        let config = multi_native_config(std::path::Path::new("."), "route-material").workflow;
+        let activation = egopulse_local_ide_control::collaboration_control::TaskActivationHandoff {
+            message_id: "message-route-material".to_owned(),
+            payload_digest_sha256: "payload-route-material".to_owned(),
+            task: egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
+                current_run_id: Some(config.run_id.clone()),
+                input_snapshot_id: "static-snapshot".to_owned(),
+                ..Default::default()
+            },
+        };
+        let profile = TrustedDispatchRouteProfile {
+            provider_bootstrap_profile_id: "gpt-codex-route-material".to_owned(),
+            selected_harness_id: "codex_app_server".to_owned(),
+            provider_model_id: "provider/model".to_owned(),
+            catalog_snapshot_sha256: Some("ef".repeat(32)),
+            capability_profile_id: config.capability_profile_ref.contract_id.clone(),
+        };
+        let expected = build_dispatch_route_binding(&profile).expect("build trusted route binding");
+
+        let resolved = ConfiguredSingleHarnessWorkflow::new(config)
+            .with_trusted_dispatch_route_profile(profile)
+            .resolve(&activation)
+            .expect("resolve routed workflow");
+        let SingleHarnessWorkflowResolution::ResolvedWithRouteBinding {
+            config,
+            route_binding,
+        } = resolved
+        else {
+            panic!("routed workflow must carry a route binding");
+        };
+
+        assert_eq!(*route_binding, expected);
+        assert_eq!(config.material.route_binding, Some(expected));
+    }
+
     struct EmptyTaskActivationSource;
 
     impl TaskActivationSource for EmptyTaskActivationSource {
@@ -2676,6 +2760,7 @@ mod tests {
                         session_strategy: egopulse_domain_contracts::v01::egopulse::harness::v1::NativeSessionStrategy::CreateNew,
                         native_session_ref: None,
                         checkpoint_ref: None,
+                        route_binding: None,
                         evidence_refs: vec!["evidence".to_owned()],
                     },
                 task_authority_principal_id: format!("{suffix}-task"),

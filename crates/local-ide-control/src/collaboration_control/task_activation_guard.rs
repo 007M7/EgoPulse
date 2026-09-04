@@ -444,6 +444,7 @@ mod tests {
                 session_strategy: NativeSessionStrategy::CreateNew,
                 native_session_ref: None,
                 checkpoint_ref: None,
+                route_binding: None,
                 evidence_refs: vec!["material:verified".to_owned()],
             },
             task_authority_principal_id: "task-authority:001".to_owned(),

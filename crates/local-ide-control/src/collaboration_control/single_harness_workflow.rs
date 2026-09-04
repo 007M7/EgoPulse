@@ -161,6 +161,11 @@ where
     C: AuthorityClock,
 {
     validate_config(task, config)?;
+    if config.material.route_binding.as_ref() != route_binding {
+        return Err(SingleHarnessWorkError::InvalidConfiguration(
+            "dispatch route material",
+        ));
+    }
     if let Some(binding) = route_binding {
         let digest = canonical_route_binding_digest(binding)?;
         if binding.route_binding_sha256 != digest
@@ -205,7 +210,7 @@ where
         &acquire_lease_command(&attempt, &step_id, config)?,
         &supervisor_principal,
     )?;
-    let dispatch_command = dispatch_intent_command(&leased, &step_id, config, route_binding)?;
+    let dispatch_command = dispatch_intent_command(&leased, &step_id, config)?;
     snapshot_after(control, &dispatch_command, &collaboration_principal)?;
     let pending = control.pending_dispatches(&harness_principal)?;
     let envelope = pending
@@ -389,7 +394,6 @@ fn dispatch_intent_command(
     snapshot: &CollaborationSnapshot,
     step_id: &str,
     config: &SingleHarnessWorkConfig,
-    route_binding: Option<&DispatchRouteBinding>,
 ) -> Result<CollaborationCommand, SingleHarnessWorkError> {
     let run = snapshot
         .run
@@ -448,7 +452,7 @@ fn dispatch_intent_command(
         session_strategy: config.material.session_strategy as i32,
         native_session_ref: config.material.native_session_ref.clone(),
         checkpoint_ref: config.material.checkpoint_ref.clone(),
-        route_binding: route_binding.cloned(),
+        route_binding: config.material.route_binding.clone(),
     };
     let fingerprint = canonical_dispatch_fingerprint(&envelope);
     envelope.dispatch_fingerprint = fingerprint.clone();

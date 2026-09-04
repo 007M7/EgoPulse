@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     future::Future,
     io::{Read, Write},
@@ -25,8 +25,9 @@ use egopulse_agentosd::{
     ConfiguredArtifactAdmissionGuardConfig, ConfiguredTaskTransitionGuard,
     ConfiguredWorkPreparationPort, ContextMutationPortAdapter, DaemonComposition, DaemonConfig,
     DaemonProviders, DenyVerificationReferences, GovernedReturnCollectorConfig,
-    MemoryRetrievalCompositionConfig, NativeHarnessCompositionConfig, OwnerProjectionSource,
-    PendingOwnerProjection, ProjectionPump, ProjectionSourceFailure,
+    MemoryRetrievalCompositionConfig, NativeHarnessCompositionConfig,
+    NativeHarnessCompositionProfile, OwnerProjectionSource, PendingOwnerProjection,
+    ProfiledNativeHarnessComposition, ProjectionPump, ProjectionSourceFailure,
     SharedAuthorityCompositionInputs, VerificationProjectionSource,
 };
 use egopulse_artifact_authority::{
@@ -41,7 +42,10 @@ use egopulse_client_operations::{
     ClientTaskResultReviewError, GovernedStateDomain, GuidedApprovalDecision,
     TaskResultReviewStage, attach as attach_client_operation,
 };
-use egopulse_codex_adapter::{CODEX_ADAPTER_ID, CODEX_CAPABILITY_PROFILE_ID, FakeCodexDriver};
+use egopulse_codex_adapter::{
+    CODEX_ADAPTER_ID, CODEX_CAPABILITY_PROFILE_ID, FakeCodexDriver, codex_protocol_fingerprint,
+    codex_user_visible_content_mutations,
+};
 use egopulse_cognition_runtime::{
     context_authority::{
         AuthenticatedContextPrincipal, ContextAuthority, ContextAuthorityConfig,
@@ -77,9 +81,12 @@ use egopulse_domain_contracts::v01::egopulse::{
     common::v1::{CommandMetadata, ContractReference},
     harness::v1::{
         ApprovalDecisionEnvelope, ApprovalKind, ApprovalRequestLifecycleKind,
-        ApprovalRequestObservation, CancelExecutionEnvelope, DeliveryDisposition, DispatchEnvelope,
-        HarnessErrorCode, HarnessObservation, NativeSessionStrategy, ObservationCriticality,
-        ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
+        ApprovalRequestObservation, AttestationLevel, CancelExecutionEnvelope,
+        CapabilityDeclaration, CapabilityProfile, CapabilityProfileStatus,
+        ContentMutationOperation, DeliveryDisposition, DispatchEnvelope,
+        HarnessContentSignalObservation, HarnessErrorCode, HarnessObservation,
+        NativeSessionStrategy, ObservationCriticality, ProbeHarnessRequest, ProbeHarnessResult,
+        harness_observation,
     },
     localapi::v1::{
         ClientSurface, ConfirmWorkRequest, EvidenceGraphView, ExecuteMemoryMutationRequest,
@@ -122,8 +129,8 @@ use egopulse_founder_verdict_authority::{
 };
 use egopulse_harness_adapter::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeKey, DriverDelivery, DriverError,
-    DriverErrorCertainty, DriverEvent, NativeHarnessDriver, NativeHarnessFuture,
-    ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
+    DriverErrorCertainty, DriverEvent, ManagedDisclosureCredentials, NativeHarnessDriver,
+    NativeHarnessFuture, ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
 };
 use egopulse_local_api::session::{
     FixedProjectionPosition, LocalSessionEndpoint, NoopSessionAuditSink, PrincipalGrant,
@@ -150,7 +157,7 @@ use egopulse_local_ide_control::collaboration_control::{
     HarnessDispatchCycleReport, HarnessDispatchRunner, HarnessEvidenceResolver, LeaseAuthorization,
     ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
     ResolvedHarnessEvidence, ResolvedStepReturn, SingleHarnessWorkConfig,
-    canonical_dispatch_fingerprint,
+    TrustedDispatchRouteProfile, canonical_dispatch_fingerprint,
 };
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{
@@ -205,7 +212,7 @@ use portable_pty::{CommandBuilder as PtyCommandBuilder, PtySize, native_pty_syst
 use prost::Message;
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::{Child, Command},
     time::{sleep, timeout},
 };
@@ -225,6 +232,12 @@ const R9A3D_EXTERNAL_SEND_MODE: &str = "dynamic-r9a3d-external-send";
 const R9A3D_EXTERNAL_RECOVERY_MODE: &str = "dynamic-r9a3d-external-recovery";
 const R9A3E_PREAUTH_UNAVAILABLE_MODE: &str = "dynamic-r9a3e-preauth-unavailable";
 const R9A3E_REVOKED_READY_MODE: &str = "dynamic-r9a3e-revoked-ready";
+const R9C_CONTENT_MODE: &str = "dynamic-r9c-content";
+const R9C_CONTENT_RELEASE_FILE: &str = "r9c-content-release";
+const R9C_VISIBLE_PREFIX: &str = "R9C governed stream ";
+const R9C_VISIBLE_SUFFIX: &str = "reaches both clients.";
+const R9C_RAW_ONLY_CANARY: &str = "R9C_RAW_NATIVE_EVENT_NEVER_RENDER";
+const R9C_MESSAGE_ID: &str = "r9c-agent-message";
 const U03C_RESULT_REVIEW_MODE: &str = "u03c-result-review";
 const U03C_RESULT_REVIEW_DENY_MODE: &str = "u03c-result-review-deny";
 const U03C_RESULT_REVIEW_STALE_MODE: &str = "u03c-result-review-stale";
@@ -1220,6 +1233,136 @@ impl NativeHarnessDriver for RecordingFixtureDriver {
     }
 }
 
+struct R9cContentFixtureDriver {
+    inner: RecordingFixtureDriver,
+    release_path: PathBuf,
+    events: VecDeque<DriverEvent>,
+}
+
+impl R9cContentFixtureDriver {
+    fn new(root: &Path) -> Self {
+        let first = codex_user_visible_content_mutations(
+            "agentMessage",
+            R9C_MESSAGE_ID,
+            0,
+            &[],
+            ContentMutationOperation::Append,
+            R9C_VISIBLE_PREFIX,
+        )
+        .expect("R-9C first Codex content mutation");
+        let second = codex_user_visible_content_mutations(
+            "agentMessage",
+            R9C_MESSAGE_ID,
+            1,
+            R9C_VISIBLE_PREFIX.as_bytes(),
+            ContentMutationOperation::Append,
+            R9C_VISIBLE_SUFFIX,
+        )
+        .expect("R-9C second Codex content mutation");
+        let full_text = format!("{R9C_VISIBLE_PREFIX}{R9C_VISIBLE_SUFFIX}");
+        let finalized = codex_user_visible_content_mutations(
+            "agentMessage",
+            R9C_MESSAGE_ID,
+            2,
+            full_text.as_bytes(),
+            ContentMutationOperation::Finalize,
+            "",
+        )
+        .expect("R-9C Codex content finalization");
+        let candidates = first
+            .into_iter()
+            .chain(second)
+            .chain(finalized)
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 3);
+        let events = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let sequence = u64::try_from(index + 1).expect("R-9C native sequence");
+                DriverEvent {
+                    native_key: format!("item/agentMessage/content:{R9C_MESSAGE_ID}:{sequence}"),
+                    native_event_id: Some(R9C_MESSAGE_ID.to_owned()),
+                    native_sequence: Some(sequence),
+                    native_observed_at: prost_types::Timestamp {
+                        seconds: 1_788_547_200,
+                        nanos: 0,
+                    },
+                    criticality: ObservationCriticality::Informational,
+                    payload: harness_observation::Payload::ContentSignal(
+                        HarnessContentSignalObservation {
+                            candidate: Some(candidate),
+                            ..HarnessContentSignalObservation::default()
+                        },
+                    ),
+                    raw_event: format!(
+                        "{{\"method\":\"item/agentMessage/content\",\"rawOnly\":\"{R9C_RAW_ONLY_CANARY}\",\"sequence\":{sequence}}}"
+                    )
+                    .into_bytes(),
+                }
+            })
+            .collect();
+        Self {
+            inner: RecordingFixtureDriver::new(root),
+            release_path: root.join(R9C_CONTENT_RELEASE_FILE),
+            events,
+        }
+    }
+}
+
+impl NativeHarnessDriver for R9cContentFixtureDriver {
+    fn probe<'a>(
+        &'a mut self,
+        request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        self.inner.probe(request)
+    }
+
+    fn send_dispatch<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+        material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        self.inner.send_dispatch(envelope, material)
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        Box::pin(async move {
+            if !self.inner.observation_forwarded {
+                return self.inner.next_event(envelope).await;
+            }
+            if !self.release_path.is_file() {
+                return Ok(None);
+            }
+            Ok(self.events.pop_front())
+        })
+    }
+
+    fn decide_approval<'a>(
+        &'a mut self,
+        envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        self.inner.decide_approval(envelope)
+    }
+
+    fn cancel<'a>(
+        &'a mut self,
+        envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        self.inner.cancel(envelope)
+    }
+
+    fn reconcile<'a>(
+        &'a mut self,
+        context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        self.inner.reconcile(context)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum R8b2cDriverMode {
     BeginDeliveryBlock,
@@ -1887,6 +2030,7 @@ impl CollaborationReferenceGuard for U03cCollaborationGuard {
             session_strategy: NativeSessionStrategy::CreateNew,
             native_session_ref: None,
             checkpoint_ref: None,
+            route_binding: None,
             evidence_refs: vec!["dispatch-material:u03c@reviewed".to_owned()],
         })
     }
@@ -3043,6 +3187,7 @@ fn dynamic_fixture_mode() -> bool {
             | R9A3D_EXTERNAL_RECOVERY_MODE
             | R9A3E_PREAUTH_UNAVAILABLE_MODE
             | R9A3E_REVOKED_READY_MODE
+            | R9C_CONTENT_MODE
     )
 }
 
@@ -3126,6 +3271,7 @@ fn r8a_native_config(root: &Path) -> NativeHarnessCompositionConfig {
                 session_strategy: NativeSessionStrategy::CreateNew,
                 native_session_ref: None,
                 checkpoint_ref: None,
+                route_binding: None,
                 evidence_refs: vec!["fixture:r8a-reviewed-material".to_owned()],
             },
             task_authority_principal_id: "task-authority:r8a".to_owned(),
@@ -3146,6 +3292,55 @@ fn r8a_native_config(root: &Path) -> NativeHarnessCompositionConfig {
             artifact_authority_principal_id: "artifact-authority:r8a".to_owned(),
         },
     }
+}
+
+fn r9c_native_profile(native: &NativeHarnessCompositionConfig) -> NativeHarnessCompositionProfile {
+    let required = native.workflow.capability_profile_ref.clone();
+    let observed_protocol = codex_protocol_fingerprint();
+    let capability = CapabilityProfile {
+        profile_id: required.contract_id.clone(),
+        revision: 1,
+        digest_sha256: required.sha256.clone(),
+        status: CapabilityProfileStatus::Active as i32,
+        declaration: Some(CapabilityDeclaration {
+            adapter_id: CODEX_ADAPTER_ID.to_owned(),
+            harness_id: "codex_app_server".to_owned(),
+            model_family_selectors: vec!["codex".to_owned()],
+            native_protocol: Some(observed_protocol.clone()),
+            ..CapabilityDeclaration::default()
+        }),
+        attestation_level: AttestationLevel::ProbeVerified as i32,
+        attestation_evidence_refs: vec!["fixture://r9c/codex-probe".to_owned()],
+        ..CapabilityProfile::default()
+    };
+    NativeHarnessCompositionProfile::from_attested_capability(
+        &required,
+        "codex",
+        &capability,
+        observed_protocol,
+        &prost_types::Timestamp::default(),
+    )
+    .expect("R-9C probe-attested Codex composition profile")
+}
+
+fn r9c_profiled_composition(
+    native: NativeHarnessCompositionConfig,
+    root: &Path,
+) -> ProfiledNativeHarnessComposition {
+    let profile = r9c_native_profile(&native);
+    let provider_model_id = native
+        .default_model
+        .clone()
+        .expect("R-9C exact fixture model");
+    ProfiledNativeHarnessComposition::new(native, profile, R9cContentFixtureDriver::new(root))
+        .with_trusted_dispatch_route_profile(TrustedDispatchRouteProfile {
+            provider_bootstrap_profile_id: "gpt-codex-r9c-fixture".to_owned(),
+            selected_harness_id: "codex_app_server".to_owned(),
+            provider_model_id,
+            catalog_snapshot_sha256: Some("67".repeat(32)),
+            capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
+        })
+        .with_disclosure_credentials(ManagedDisclosureCredentials::harness_account())
 }
 
 fn r8a_authorities(
@@ -4528,6 +4723,7 @@ fn open_fixture_providers(root: &Path) -> DaemonProviders {
             | R9A3D_EXTERNAL_RECOVERY_MODE
             | R9A3E_PREAUTH_UNAVAILABLE_MODE
             | R9A3E_REVOKED_READY_MODE
+            | R9C_CONTENT_MODE
             | U04C_PREPARE_POST_COMMIT_MODE
             | U04C_CONFIRM_POST_COMMIT_MODE
     ) {
@@ -4720,7 +4916,15 @@ where
         .expect("R-8A governed workspace should exist");
     let (artifact, verification) = r8a_authorities(root, &native.return_collector);
     let mode = fixture_mode();
-    let providers = if r8b2c_fixture_mode() {
+    let providers = if mode == R9C_CONTENT_MODE {
+        providers
+            .with_profiled_native_harness_drivers(
+                vec![r9c_profiled_composition(native, root)],
+                artifact,
+                verification,
+            )
+            .expect("R-9C native Harness content composition")
+    } else if r8b2c_fixture_mode() {
         let driver_mode = if mode == R8B2C_BEGIN_DELIVERY_MODE {
             R8b2cDriverMode::BeginDeliveryBlock
         } else {
@@ -4867,6 +5071,7 @@ async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Chi
                     | R9A3D_EXTERNAL_RECOVERY_MODE
                     | R9A3E_PREAUTH_UNAVAILABLE_MODE
                     | R9A3E_REVOKED_READY_MODE
+                    | R9C_CONTENT_MODE
                     | U03C_RESULT_REVIEW_MODE
                     | U03C_RESULT_REVIEW_DENY_MODE
                     | U03C_RESULT_REVIEW_STALE_MODE
@@ -13372,4 +13577,265 @@ async fn u04c_real_windows_conpty_drives_normal_tui_from_dashboard_to_exact_task
     drop(terminal);
     stop_u04c_fixture(&mut daemon, "U-04c ConPTY daemon").await;
     fs::remove_dir_all(&root).expect("remove U-04c ConPTY fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r9c_real_daemon_cli_and_tui_share_one_governed_harness_content_stream() {
+    let root = std::env::temp_dir().join(format!("egopulse-r9c-c5-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create R-9C C5 fixture root");
+    fs::write(
+        root.join("context.md"),
+        "R-9C reviewed input that never becomes a client content source",
+    )
+    .expect("write R-9C Context source");
+    let instance = format!("r9c-c5-{}", Uuid::now_v7());
+    let mut daemon = spawn_fixture_with_mode(&root, &instance, R9C_CONTENT_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut daemon).await;
+
+    let prepare = run_cli(
+        &instance,
+        &[
+            "work",
+            "prepare",
+            "--intent",
+            "stream one governed Codex assistant message",
+            "--scope",
+            "scope:r9c-c5",
+            "--work-type",
+            "governed_repository_change",
+            "--context-ref",
+            "context.md",
+            "--idempotency-key",
+            "r9c-c5-prepare",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        prepare.status.success(),
+        "R-9C prepare failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&prepare.stdout),
+        String::from_utf8_lossy(&prepare.stderr)
+    );
+    let prepared: serde_json::Value =
+        serde_json::from_slice(&prepare.stdout).expect("R-9C prepare JSON");
+    let snapshot_id = prepared["data"]["snapshotId"]
+        .as_str()
+        .expect("R-9C snapshot id")
+        .to_owned();
+    let confirmation_binding = prepared["data"]["confirmationBindingSha256"]
+        .as_str()
+        .expect("R-9C confirmation binding")
+        .to_owned();
+
+    let confirm = run_cli(
+        &instance,
+        &[
+            "work",
+            "confirm",
+            snapshot_id.as_str(),
+            "--confirmation-binding-sha256",
+            confirmation_binding.as_str(),
+            "--idempotency-key",
+            "r9c-c5-confirm",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        confirm.status.success(),
+        "R-9C confirm failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&confirm.stdout),
+        String::from_utf8_lossy(&confirm.stderr)
+    );
+    let confirmed: serde_json::Value =
+        serde_json::from_slice(&confirm.stdout).expect("R-9C confirm JSON");
+    let task_id = confirmed["data"]["taskId"]
+        .as_str()
+        .expect("R-9C Task identity")
+        .to_owned();
+    assert_eq!(
+        confirmed["data"]["status"],
+        TaskStatus::Active.as_str_name()
+    );
+
+    let driver_record_path = root.join(R8A_DRIVER_RECORD);
+    timeout(Duration::from_secs(8), async {
+        loop {
+            if driver_record_path.is_file() {
+                break;
+            }
+            if let Some(status) = daemon
+                .try_wait()
+                .expect("inspect R-9C daemon before dispatch")
+            {
+                panic!("R-9C daemon exited before dispatch: {status}");
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("R-9C governed dispatch deadline");
+
+    let mut content_command = Command::new(cli_executable());
+    content_command
+        .env("EGOPULSE_IPC_INSTANCE", &instance)
+        .args([
+            "content",
+            "watch",
+            task_id.as_str(),
+            "--frames",
+            "1",
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut content_cli = content_command
+        .spawn()
+        .expect("spawn real R-9C content CLI");
+    let stdout = content_cli.stdout.take().expect("capture R-9C CLI stdout");
+    let stderr = content_cli.stderr.take().expect("capture R-9C CLI stderr");
+    let mut stdout = BufReader::new(stdout);
+    let mut baseline_line = String::new();
+    timeout(Duration::from_secs(8), stdout.read_line(&mut baseline_line))
+        .await
+        .expect("R-9C CLI baseline deadline")
+        .expect("read R-9C CLI baseline");
+    let baseline: serde_json::Value =
+        serde_json::from_str(baseline_line.trim()).expect("R-9C CLI baseline JSON");
+    assert_eq!(baseline["event"], "baseline_complete");
+    assert_eq!(baseline["recordCount"], 0);
+    assert!(
+        content_cli
+            .try_wait()
+            .expect("inspect waiting R-9C CLI")
+            .is_none(),
+        "content CLI must be attached and waiting before native content is released"
+    );
+
+    let authority_before = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9C Authority state before content release");
+    fs::write(root.join(R9C_CONTENT_RELEASE_FILE), b"release")
+        .expect("release R-9C native content events");
+
+    let stdout_reader = tokio::spawn(async move {
+        let mut tail = Vec::new();
+        stdout.read_to_end(&mut tail).await.map(|_| tail)
+    });
+    let stderr_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let mut stderr = stderr;
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let cli_status = timeout(Duration::from_secs(10), content_cli.wait())
+        .await
+        .expect("R-9C content CLI completion deadline")
+        .expect("wait for R-9C content CLI");
+    let mut cli_stdout = baseline_line.into_bytes();
+    cli_stdout.extend(
+        stdout_reader
+            .await
+            .expect("join R-9C CLI stdout reader")
+            .expect("read R-9C CLI stdout tail"),
+    );
+    let cli_stderr = stderr_reader
+        .await
+        .expect("join R-9C CLI stderr reader")
+        .expect("read R-9C CLI stderr");
+    assert!(
+        cli_status.success(),
+        "R-9C content CLI failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&cli_stdout),
+        String::from_utf8_lossy(&cli_stderr)
+    );
+    let cli_text = String::from_utf8(cli_stdout).expect("R-9C CLI stdout UTF-8");
+    assert!(!cli_text.contains(R9C_RAW_ONLY_CANARY));
+    assert!(!String::from_utf8_lossy(&cli_stderr).contains(R9C_RAW_ONLY_CANARY));
+    let records = cli_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("R-9C CLI NDJSON"))
+        .filter(|value| value["record"]["payload"]["kind"] == "assistant_text")
+        .collect::<Vec<_>>();
+    let streamed = records
+        .first()
+        .expect("R-9C CLI must receive a live safe assistant record");
+    assert_eq!(streamed["event"], "record");
+    assert_eq!(streamed["record"]["taskId"], task_id);
+    assert_eq!(streamed["record"]["attemptId"], "r8a-attempt");
+    assert_eq!(streamed["record"]["source"]["providerFamily"], "openai");
+    assert_eq!(streamed["record"]["source"]["model"], "fixture/model");
+    assert_eq!(streamed["record"]["source"]["collaborationRole"], "primary");
+    assert!(
+        streamed["record"]["payload"]["safeText"]
+            .as_str()
+            .is_some_and(|text| text.contains(R9C_VISIBLE_PREFIX))
+    );
+    let safe_message_id = streamed["record"]["payload"]["safeMessageId"]
+        .as_str()
+        .expect("R-9C CLI safe message identity")
+        .to_owned();
+    assert!(safe_message_id.starts_with("hcm_"));
+
+    assert_u04c_conpty_host_available(&instance).await;
+    let mut terminal = U04cConptySession::spawn(&instance);
+    terminal.wait_for_checkpoint("w task watch").await;
+    terminal.send_keys(b"w");
+    terminal.wait_for_checkpoint("Task Watch").await;
+    terminal.wait_for_checkpoint(&task_id).await;
+    terminal.send_keys(b"h");
+    terminal.wait_for_checkpoint("Harness content - live").await;
+    let full_text = format!("{R9C_VISIBLE_PREFIX}{R9C_VISIBLE_SUFFIX}");
+    terminal.wait_for_checkpoint(&full_text).await;
+    let tui_screen = terminal.screen_text();
+    let compact_screen = tui_screen
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(
+        tui_screen.contains("openai / fixture/model"),
+        "{tui_screen}"
+    );
+    assert!(tui_screen.contains("primary / r8a-attempt"), "{tui_screen}");
+    assert!(
+        tui_screen.contains("[finalized | revision 3"),
+        "{tui_screen}"
+    );
+    assert!(
+        compact_screen.contains(&safe_message_id),
+        "the real TUI must display the same safe message identity as the CLI: {tui_screen}"
+    );
+    assert!(!terminal.output_text().contains(R9C_RAW_ONLY_CANARY));
+    terminal.finish_successfully().await;
+
+    let task = run_cli(&instance, &["task", "get", task_id.as_str(), "--json"]).await;
+    assert!(task.status.success());
+    let task: serde_json::Value =
+        serde_json::from_slice(&task.stdout).expect("R-9C Task projection JSON");
+    assert_eq!(task["data"]["status"], TaskStatus::Active.as_str_name());
+    let authority_after = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9C Authority state after client observations");
+    assert_eq!(authority_after, authority_before);
+
+    stop_u04c_fixture(&mut daemon, "R-9C content daemon").await;
+    let adapter = AdapterEdge::open(AdapterEdgeConfig {
+        database_path: root.join("r8a-adapter.db"),
+        adapter_id: CODEX_ADAPTER_ID.to_owned(),
+        store_epoch: "r8a-adapter-epoch".to_owned(),
+        key: AdapterEdgeKey::new([0x32; 32]),
+    })
+    .expect("reopen R-9C Adapter Edge");
+    let inspection = adapter.inspect().expect("inspect R-9C Adapter Edge");
+    assert_eq!(inspection.dispatch_count, 1);
+    assert_eq!(inspection.observation_count, 4);
+    assert_eq!(inspection.content_candidate_count, 3);
+    assert_eq!(inspection.pending_content_candidate_count, 0);
+    assert_eq!(inspection.quarantined_content_candidate_count, 0);
+    assert_eq!(inspection.safe_content_ledger_count, 3);
+    assert_eq!(inspection.pending_content_projection_count, 0);
+    assert!(adapter.integrity_is_ok().expect("R-9C Adapter integrity"));
+    drop(adapter);
+    fs::remove_dir_all(&root).expect("remove R-9C C5 fixture root");
 }

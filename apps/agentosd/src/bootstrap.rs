@@ -2115,6 +2115,7 @@ impl MaterialFile {
             session_strategy,
             native_session_ref: self.native_session_ref,
             checkpoint_ref: self.checkpoint_ref,
+            route_binding: None,
             evidence_refs: self.evidence_refs,
         })
     }
