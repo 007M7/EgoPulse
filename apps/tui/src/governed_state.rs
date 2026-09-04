@@ -307,22 +307,17 @@ impl GovernedStateController {
         let Some(runtime) = self.runtime.as_mut() else {
             return;
         };
-        loop {
-            match runtime.events.try_recv() {
-                Ok(GovernedStateWorkerEvent::Updated { domain, snapshot }) => {
-                    self.model = GovernedStatePageModel::updated_from_snapshot(
-                        self.model.update_index.saturating_add(1),
-                        domain,
-                        *snapshot,
-                    );
-                }
-                Ok(GovernedStateWorkerEvent::Stopped) => self.model.mark_stopped(),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    self.model.mark_stopped();
-                    break;
-                }
+        match runtime.events.try_recv() {
+            Ok(GovernedStateWorkerEvent::Updated { domain, snapshot }) => {
+                self.model = GovernedStatePageModel::updated_from_snapshot(
+                    self.model.update_index.saturating_add(1),
+                    domain,
+                    *snapshot,
+                );
             }
+            Ok(GovernedStateWorkerEvent::Stopped) => self.model.mark_stopped(),
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => self.model.mark_stopped(),
         }
     }
 
@@ -494,7 +489,7 @@ mod tests {
     use super::*;
 
     enum ScriptedNext {
-        Update(GovernedStateDomain, GovernedStateSnapshot),
+        Update(GovernedStateDomain, Box<GovernedStateSnapshot>),
         Eof,
         Pending,
     }
@@ -518,7 +513,7 @@ mod tests {
                 self.next_calls.fetch_add(1, Ordering::SeqCst);
                 match self.outcomes.pop_front().unwrap_or(ScriptedNext::Pending) {
                     ScriptedNext::Update(domain, snapshot) => {
-                        self.snapshot = snapshot;
+                        self.snapshot = *snapshot;
                         Some(domain)
                     }
                     ScriptedNext::Eof => None,
@@ -675,7 +670,13 @@ mod tests {
         assert!(controller.model().task.facts.is_empty());
         assert!(controller.model().approval.facts.is_empty());
 
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while next_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("governed state worker should poll its stream");
         assert_eq!(next_calls.load(Ordering::SeqCst), 1);
         controller.stop().await;
         assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
@@ -697,10 +698,16 @@ mod tests {
         let (client, _, shutdowns) = scripted_client(
             connecting_snapshot(),
             vec![
-                ScriptedNext::Update(GovernedStateDomain::Task, task_live.clone()),
-                ScriptedNext::Update(GovernedStateDomain::Approval, approval_live.clone()),
-                ScriptedNext::Update(GovernedStateDomain::Task, task_fatal.clone()),
-                ScriptedNext::Update(GovernedStateDomain::Approval, approval_after_fatal.clone()),
+                ScriptedNext::Update(GovernedStateDomain::Task, Box::new(task_live.clone())),
+                ScriptedNext::Update(
+                    GovernedStateDomain::Approval,
+                    Box::new(approval_live.clone()),
+                ),
+                ScriptedNext::Update(GovernedStateDomain::Task, Box::new(task_fatal.clone())),
+                ScriptedNext::Update(
+                    GovernedStateDomain::Approval,
+                    Box::new(approval_after_fatal.clone()),
+                ),
                 ScriptedNext::Eof,
             ],
         );
@@ -734,9 +741,13 @@ mod tests {
         let (client, next_calls, shutdowns) =
             scripted_client(connecting_snapshot(), vec![ScriptedNext::Pending]);
         let mut controller = GovernedStateController::start(client).expect("controller start");
-        while next_calls.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while next_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("governed state worker should enter its pending receive");
 
         controller.stop().await;
         controller.stop().await;
@@ -747,13 +758,53 @@ mod tests {
         assert!(!controller.is_running());
     }
 
+    #[test]
+    fn controller_pump_applies_at_most_one_event_per_ui_tick() {
+        let (sender, events) = mpsc::channel(2);
+        let (cancel, _cancel_receiver) = watch::channel(false);
+        sender
+            .try_send(GovernedStateWorkerEvent::Updated {
+                domain: GovernedStateDomain::Task,
+                snapshot: Box::new(live_snapshot(2, 1)),
+            })
+            .expect("queue first governed state event");
+        sender
+            .try_send(GovernedStateWorkerEvent::Updated {
+                domain: GovernedStateDomain::Approval,
+                snapshot: Box::new(live_snapshot(2, 2)),
+            })
+            .expect("queue second governed state event");
+        let mut controller = GovernedStateController {
+            model: GovernedStatePageModel::initial_from_snapshot(connecting_snapshot()),
+            runtime: Some(GovernedStateRuntime {
+                events,
+                cancel,
+                worker: None,
+            }),
+        };
+
+        controller.pump();
+        assert_eq!(controller.model().update_index, 1);
+        assert_eq!(
+            controller.model().changed_domain,
+            Some(GovernedStateDomain::Task)
+        );
+
+        controller.pump();
+        assert_eq!(controller.model().update_index, 2);
+        assert_eq!(
+            controller.model().changed_domain,
+            Some(GovernedStateDomain::Approval)
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn full_event_channel_cancellation_leaves_no_worker_or_second_event() {
         let (client, next_calls, shutdowns) = scripted_client(
             connecting_snapshot(),
             vec![
-                ScriptedNext::Update(GovernedStateDomain::Task, live_snapshot(2, 1)),
-                ScriptedNext::Update(GovernedStateDomain::Approval, live_snapshot(2, 2)),
+                ScriptedNext::Update(GovernedStateDomain::Task, Box::new(live_snapshot(2, 1))),
+                ScriptedNext::Update(GovernedStateDomain::Approval, Box::new(live_snapshot(2, 2))),
                 ScriptedNext::Pending,
             ],
         );

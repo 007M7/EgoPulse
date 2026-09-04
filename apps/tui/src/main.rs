@@ -54,6 +54,10 @@ use egopulse_tui::approval_queue::{
     ApprovalDecisionReceipt, ApprovalQueueClient, ApprovalQueueController, ApprovalQueueOpenFuture,
     GuidedApprovalFuture,
 };
+use egopulse_tui::governed_state::{
+    GovernedStateClient, GovernedStateController, GovernedStateControllerStartError,
+    GovernedStatePageModel, GovernedStateStream, domain_label,
+};
 use egopulse_tui::result_review::{
     RESULT_REVIEW_NOTICE, ResultReviewController, ResultReviewPageModel, TaskResultReviewClient,
     TaskResultReviewFuture,
@@ -844,6 +848,7 @@ impl CommandForm {
 
 enum InteractiveMode {
     Dashboard,
+    GovernedState,
     WorkStart,
     TaskWatch,
     ResultReview,
@@ -859,6 +864,8 @@ enum InteractiveAction {
     StageContextRevoke(ContextRevokeInput),
     ConfirmContextRevoke,
     OpenWorkStart,
+    OpenGovernedState,
+    CloseGovernedState,
     CloseWorkStart,
     PrepareWorkStart,
     ReplayWorkPreparation,
@@ -1280,6 +1287,19 @@ impl TaskResultReviewClient for AttachedClient {
     fn read_task_result_review<'a>(&'a self, task_id: &'a str) -> TaskResultReviewFuture<'a> {
         TaskResultReviewClient::read_task_result_review(self.0.as_ref(), task_id)
     }
+}
+
+impl GovernedStateClient for AttachedClient {
+    fn start_governed_state_stream(
+        self: &Arc<Self>,
+    ) -> Result<Box<dyn GovernedStateStream>, GovernedStateControllerStartError> {
+        GovernedStateClient::start_governed_state_stream(&self.0)
+    }
+}
+
+fn shared_attached_client_pair<Client>(client: Client) -> (Arc<Client>, Arc<Client>) {
+    let client = Arc::new(client);
+    (client.clone(), client)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2571,6 +2591,7 @@ struct Snapshot {
 struct App {
     instance: String,
     client: Option<Arc<dyn InteractiveClient>>,
+    governed_state_client: Option<Arc<AttachedClient>>,
     snapshot: Option<Snapshot>,
     panel: Panel,
     message: String,
@@ -2580,6 +2601,7 @@ struct App {
     approval_queue: Option<ApprovalQueueController<dyn InteractiveClient>>,
     result_review: Option<ResultReviewController<dyn InteractiveClient>>,
     work_start: Option<WorkStartController>,
+    governed_state: Option<GovernedStateController>,
     pending_task_watch_selection: Option<String>,
 }
 
@@ -2588,6 +2610,7 @@ impl App {
         Self {
             instance,
             client: None,
+            governed_state_client: None,
             snapshot: None,
             panel: Panel::Tasks,
             message: "Connecting to local daemon…".to_owned(),
@@ -2597,6 +2620,7 @@ impl App {
             approval_queue: None,
             result_review: None,
             work_start: None,
+            governed_state: None,
             pending_task_watch_selection: None,
         }
     }
@@ -2635,7 +2659,13 @@ impl App {
                 KeyCode::Char('w') => Ok(Some(InteractiveAction::OpenTaskWatch)),
                 KeyCode::Char('a') => Ok(Some(InteractiveAction::OpenApprovalQueue)),
                 KeyCode::Char('n') => Ok(Some(InteractiveAction::OpenWorkStart)),
+                KeyCode::Char('g') => Ok(Some(InteractiveAction::OpenGovernedState)),
                 KeyCode::Char('q') | KeyCode::Esc => Ok(Some(InteractiveAction::Quit)),
+                _ => Ok(None),
+            },
+            InteractiveMode::GovernedState => match key.code {
+                KeyCode::Esc => Ok(Some(InteractiveAction::CloseGovernedState)),
+                KeyCode::Char('q') => Ok(Some(InteractiveAction::Quit)),
                 _ => Ok(None),
             },
             InteractiveMode::WorkStart => {
@@ -3017,9 +3047,7 @@ impl App {
     }
 
     async fn stage_context_revoke(&mut self, input: ContextRevokeInput) -> Result<(), String> {
-        if self.client.is_none() {
-            self.client = Some(Arc::new(AttachedClient::open(&self.instance).await?));
-        }
+        self.ensure_task_watch_client().await?;
         let pending = self
             .client
             .as_ref()
@@ -3046,7 +3074,7 @@ impl App {
     async fn refresh(&mut self) {
         if self.client.is_none() {
             match AttachedClient::open(&self.instance).await {
-                Ok(client) => self.client = Some(Arc::new(client)),
+                Ok(client) => self.install_attached_client(client),
                 Err(error) => {
                     self.message = error;
                     return;
@@ -3070,15 +3098,75 @@ impl App {
             }
             Err(error) => {
                 self.message = format!("Disconnected: {error} · press r to reconnect");
+                self.stop_governed_state().await;
                 self.client = None;
+                self.governed_state_client = None;
             }
         }
     }
 
     async fn ensure_task_watch_client(&mut self) -> Result<(), String> {
         if self.client.is_none() {
-            self.client = Some(Arc::new(AttachedClient::open(&self.instance).await?));
+            let client = AttachedClient::open(&self.instance).await?;
+            self.install_attached_client(client);
         }
+        Ok(())
+    }
+
+    fn install_attached_client(&mut self, client: AttachedClient) {
+        let (interactive, governed_state) = shared_attached_client_pair(client);
+        self.client = Some(interactive);
+        self.governed_state_client = Some(governed_state);
+    }
+
+    async fn start_governed_state(&mut self) -> Result<(), String> {
+        if self.work_start.is_some() {
+            return Err(
+                "Work Start must be resumed and settled before opening governed state".to_owned(),
+            );
+        }
+        self.stop_task_watch().await;
+        self.stop_approval_queue().await;
+        self.stop_result_review().await;
+        self.stop_governed_state().await;
+        self.ensure_task_watch_client().await?;
+        let client = Arc::clone(
+            self.governed_state_client
+                .as_ref()
+                .expect("governed state client is attached"),
+        );
+        self.install_governed_state_controller(client)?;
+        Ok(())
+    }
+
+    fn install_governed_state_controller<Client>(
+        &mut self,
+        client: Arc<Client>,
+    ) -> Result<(), String>
+    where
+        Client: GovernedStateClient + ?Sized + 'static,
+    {
+        let controller = GovernedStateController::start(client)
+            .map_err(|_| "governed state runtime is unavailable".to_owned())?;
+        self.message = governed_state_message(controller.model());
+        self.governed_state = Some(controller);
+        self.mode = InteractiveMode::GovernedState;
+        Ok(())
+    }
+
+    async fn stop_governed_state(&mut self) {
+        if let Some(mut controller) = self.governed_state.take() {
+            controller.stop().await;
+        }
+    }
+
+    fn apply_governed_state_events(&mut self) -> Result<(), String> {
+        let controller = self
+            .governed_state
+            .as_mut()
+            .ok_or_else(|| "Governed State controller is unavailable".to_owned())?;
+        controller.pump();
+        self.message = governed_state_message(controller.model());
         Ok(())
     }
 
@@ -3087,6 +3175,7 @@ impl App {
             self.stop_task_watch().await;
             self.stop_approval_queue().await;
             self.stop_result_review().await;
+            self.stop_governed_state().await;
             let controller = self
                 .work_start
                 .as_ref()
@@ -3098,6 +3187,7 @@ impl App {
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
         self.stop_result_review().await;
+        self.stop_governed_state().await;
         self.ensure_task_watch_client().await?;
         let controller = self
             .client
@@ -3231,6 +3321,7 @@ impl App {
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
         self.stop_result_review().await;
+        self.stop_governed_state().await;
         self.ensure_task_watch_client().await?;
         let client = Arc::clone(self.client.as_ref().expect("Task watch client is attached"));
         let mut controller = TaskWatchController::new(client);
@@ -3300,6 +3391,7 @@ impl App {
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
         self.stop_result_review().await;
+        self.stop_governed_state().await;
         self.ensure_task_watch_client().await?;
         let client = Arc::clone(
             self.client
@@ -3353,6 +3445,7 @@ impl App {
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
         self.stop_result_review().await;
+        self.stop_governed_state().await;
         self.ensure_task_watch_client().await?;
         let client = Arc::clone(
             self.client
@@ -3505,6 +3598,19 @@ impl App {
                     body[1],
                 ),
             },
+            InteractiveMode::GovernedState => match self.governed_state.as_ref() {
+                Some(controller) => render_governed_state(frame, body[1], controller.model()),
+                None => frame.render_widget(
+                    Paragraph::new("Governed State session is unavailable.")
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title("Governed State"),
+                        )
+                        .wrap(Wrap { trim: true }),
+                    body[1],
+                ),
+            },
             InteractiveMode::TaskWatch => {
                 if let Some(model) = self
                     .task_watch
@@ -3582,11 +3688,15 @@ impl App {
     fn footer_text(&self) -> String {
         if matches!(self.mode, InteractiveMode::Dashboard) {
             return format!(
-                "{} - n new work - w task watch - a approval queue - c command palette - r refresh - Tab panel - q quit",
+                "{} - n new work - w task watch - a approval queue - g governed state - c command palette - r refresh - Tab panel - q quit",
                 self.message
             );
         }
         match &self.mode {
+            InteractiveMode::GovernedState => format!(
+                "{} - Esc dashboard - q quit; this page is observation-only",
+                self.message
+            ),
             InteractiveMode::TaskWatch => {
                 format!(
                     "{} - Up/Down select - Enter review - Esc dashboard - r refetch - q quit",
@@ -3849,6 +3959,96 @@ fn render_task_watch(frame: &mut Frame<'_>, area: Rect, model: &TaskWatchPageMod
         ))
         .wrap(Wrap { trim: false }),
         sections[2],
+    );
+}
+
+fn governed_state_message(model: &GovernedStatePageModel) -> String {
+    if model.stopped {
+        "Governed State stream stopped; displayed facts remain observation-only".to_owned()
+    } else {
+        format!(
+            "Governed State {} record {}",
+            model.kind.label(),
+            model.update_index
+        )
+    }
+}
+
+fn governed_domain_position(epoch: Option<&str>, sequence: Option<u64>) -> String {
+    match (epoch, sequence) {
+        (Some(epoch), Some(sequence)) => format!("{epoch}:{sequence}"),
+        _ => "none".to_owned(),
+    }
+}
+
+fn render_governed_state(frame: &mut Frame<'_>, area: Rect, model: &GovernedStatePageModel) {
+    let changed_domain = model.changed_domain.map_or("none", domain_label);
+    let mut lines = vec![
+        format!(
+            "kind={}  update_index={}  changed_domain={}  stopped={}",
+            model.kind.label(),
+            model.update_index,
+            changed_domain,
+            model.stopped
+        ),
+        "Task and Approval positions are independent; no atomic snapshot or global cursor is represented."
+            .to_owned(),
+        String::new(),
+        format!(
+            "Task domain: phase={} reason={} generation={} recovery={}/{} position={}",
+            model.task.view.phase,
+            model.task.view.reason.as_deref().unwrap_or("none"),
+            model.task.view.generation,
+            model.task.view.recovery_remaining,
+            model.task.view.recovery_limit,
+            governed_domain_position(
+                model.task.view.epoch.as_deref(),
+                model.task.view.sequence,
+            )
+        ),
+    ];
+    if model.task.facts.is_empty() {
+        lines.push("  no safe Task facts".to_owned());
+    } else {
+        lines.extend(model.task.facts.iter().map(|task| {
+            format!(
+                "  task={} revision={} status={}",
+                task.task_id, task.revision, task.status
+            )
+        }));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Approval domain: phase={} reason={} generation={} recovery={}/{} position={}",
+        model.approval.view.phase,
+        model.approval.view.reason.as_deref().unwrap_or("none"),
+        model.approval.view.generation,
+        model.approval.view.recovery_remaining,
+        model.approval.view.recovery_limit,
+        governed_domain_position(
+            model.approval.view.epoch.as_deref(),
+            model.approval.view.sequence,
+        )
+    ));
+    if model.approval.facts.is_empty() {
+        lines.push("  no safe Approval facts".to_owned());
+    } else {
+        lines.extend(model.approval.facts.iter().map(|approval| {
+            format!(
+                "  approval={} task={}",
+                approval.approval_request_id, approval.task_id
+            )
+        }));
+    }
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Governed State"),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
     );
 }
 
@@ -4236,6 +4436,7 @@ async fn finish_interactive_session<T>(
     app.stop_task_watch().await;
     app.stop_approval_queue().await;
     app.stop_result_review().await;
+    app.stop_governed_state().await;
     result
 }
 
@@ -4245,6 +4446,18 @@ async fn execute_interactive_action(
     next_refresh: &mut tokio::time::Instant,
 ) -> Result<InteractiveLoopControl, String> {
     match action {
+        InteractiveAction::OpenGovernedState => {
+            if let Err(error) = app.start_governed_state().await {
+                app.mode = InteractiveMode::Dashboard;
+                app.message = format!("Governed State unavailable: {error}");
+            }
+        }
+        InteractiveAction::CloseGovernedState => {
+            app.stop_governed_state().await;
+            app.mode = InteractiveMode::Dashboard;
+            app.message = "Governed State closed; no Authority state was changed".to_owned();
+            *next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+        }
         InteractiveAction::OpenWorkStart => {
             if let Err(error) = app.start_work_start().await {
                 app.mode = InteractiveMode::Dashboard;
@@ -4400,6 +4613,7 @@ async fn execute_interactive_action(
             app.stop_task_watch().await;
             app.stop_approval_queue().await;
             app.stop_result_review().await;
+            app.stop_governed_state().await;
             return Ok(InteractiveLoopControl::Quit);
         }
         InteractiveAction::StageContextRevoke(input) => {
@@ -4445,6 +4659,11 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
             && let Err(error) = app.apply_work_start_events().await
         {
             app.message = format!("Work Start stopped fail-closed: {error}");
+        }
+        if matches!(app.mode, InteractiveMode::GovernedState)
+            && let Err(error) = app.apply_governed_state_events()
+        {
+            app.message = format!("Governed State stopped fail-closed: {error}");
         }
         if matches!(app.mode, InteractiveMode::TaskWatch)
             && let Err(error) = app.apply_task_watch_events().await
@@ -4549,14 +4768,288 @@ mod tests {
         ApprovalQueueItem, ApprovalQueueNextFuture, ApprovalQueueOpened, ApprovalQueueStream,
         ApprovalQueueStreamUpdate,
     };
+    use egopulse_tui::governed_state::{
+        ApprovalDomainPage, ApprovalFactView, DomainView, GovernedStateSnapshot, RecordKind,
+        TaskDomainPage, TaskFactView,
+    };
     use egopulse_tui::task_watch::{TaskWatchBaseline, TaskWatchNextFuture, TaskWatchStream};
     use std::{
         collections::VecDeque,
+        future::pending,
         sync::{
             Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
+
+    fn governed_snapshot(
+        task_phase: &str,
+        approval_phase: &str,
+        task_sequence: u64,
+        approval_sequence: u64,
+    ) -> GovernedStateSnapshot {
+        GovernedStateSnapshot {
+            task: TaskDomainPage {
+                view: DomainView {
+                    phase: task_phase.to_owned(),
+                    reason: None,
+                    generation: 1,
+                    recovery_limit: 3,
+                    recovery_remaining: 3,
+                    epoch: Some("epoch:task".to_owned()),
+                    sequence: Some(task_sequence),
+                },
+                facts: vec![TaskFactView {
+                    task_id: "task:governed".to_owned(),
+                    revision: 7,
+                    status: "task_status_active".to_owned(),
+                }],
+            },
+            approval: ApprovalDomainPage {
+                view: DomainView {
+                    phase: approval_phase.to_owned(),
+                    reason: None,
+                    generation: 1,
+                    recovery_limit: 3,
+                    recovery_remaining: 2,
+                    epoch: Some("epoch:approval".to_owned()),
+                    sequence: Some(approval_sequence),
+                },
+                facts: vec![ApprovalFactView {
+                    approval_request_id: "approval:governed".to_owned(),
+                    task_id: "task:governed".to_owned(),
+                }],
+            },
+        }
+    }
+
+    struct MainGovernedStateStream {
+        snapshot: GovernedStateSnapshot,
+        updates: VecDeque<(
+            egopulse_client_operations::GovernedStateDomain,
+            GovernedStateSnapshot,
+        )>,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    impl GovernedStateStream for MainGovernedStateStream {
+        fn safe_snapshot(&self) -> GovernedStateSnapshot {
+            self.snapshot.clone()
+        }
+
+        fn next_update(
+            &mut self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Option<egopulse_client_operations::GovernedStateDomain>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                if let Some((domain, snapshot)) = self.updates.pop_front() {
+                    self.snapshot = snapshot;
+                    Some(domain)
+                } else {
+                    pending().await
+                }
+            })
+        }
+
+        fn shutdown(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+    }
+
+    struct MainGovernedStateClient {
+        initial: GovernedStateSnapshot,
+        updates: Mutex<
+            Option<
+                VecDeque<(
+                    egopulse_client_operations::GovernedStateDomain,
+                    GovernedStateSnapshot,
+                )>,
+            >,
+        >,
+        starts: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    impl GovernedStateClient for MainGovernedStateClient {
+        fn start_governed_state_stream(
+            self: &Arc<Self>,
+        ) -> Result<Box<dyn GovernedStateStream>, GovernedStateControllerStartError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(MainGovernedStateStream {
+                snapshot: self.initial.clone(),
+                updates: self
+                    .updates
+                    .lock()
+                    .expect("lock governed updates")
+                    .take()
+                    .unwrap_or_default(),
+                shutdowns: Arc::clone(&self.shutdowns),
+            }))
+        }
+    }
+
+    fn governed_client(
+        updates: VecDeque<(
+            egopulse_client_operations::GovernedStateDomain,
+            GovernedStateSnapshot,
+        )>,
+    ) -> (
+        Arc<MainGovernedStateClient>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(MainGovernedStateClient {
+                initial: governed_snapshot("connecting", "connecting", 10, 20),
+                updates: Mutex::new(Some(updates)),
+                starts: Arc::clone(&starts),
+                shutdowns: Arc::clone(&shutdowns),
+            }),
+            starts,
+            shutdowns,
+        )
+    }
+
+    #[test]
+    fn governed_state_dashboard_keys_open_and_escape_closes() {
+        let mut app = App::new("governed-keys".to_owned());
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE))
+                .expect("map dashboard key"),
+            Some(InteractiveAction::OpenGovernedState)
+        ));
+        app.mode = InteractiveMode::GovernedState;
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .expect("map governed escape"),
+            Some(InteractiveAction::CloseGovernedState)
+        ));
+        assert!(app.footer_text().contains("Esc dashboard"));
+        app.mode = InteractiveMode::Dashboard;
+        assert!(app.footer_text().contains("g governed state"));
+    }
+
+    #[test]
+    fn production_attachment_pair_uses_one_arc_identity() {
+        let (interactive, governed) = shared_attached_client_pair("same-attachment");
+        assert!(Arc::ptr_eq(&interactive, &governed));
+    }
+
+    #[tokio::test]
+    async fn governed_state_app_starts_pumps_renders_and_close_shuts_down_once() {
+        let (client, starts, shutdowns) = governed_client(VecDeque::from([(
+            egopulse_client_operations::GovernedStateDomain::Task,
+            governed_snapshot("live", "connecting", 11, 20),
+        )]));
+        let mut app = App::new("governed-controller".to_owned());
+        app.install_governed_state_controller(client)
+            .expect("start governed state controller");
+        assert!(matches!(app.mode, InteractiveMode::GovernedState));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.governed_state
+                .as_ref()
+                .expect("controller")
+                .model()
+                .kind,
+            RecordKind::Initial
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                app.apply_governed_state_events().expect("pump update");
+                if app
+                    .governed_state
+                    .as_ref()
+                    .expect("controller")
+                    .model()
+                    .kind
+                    == RecordKind::Update
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("governed state update must arrive within one second");
+        let model = app.governed_state.as_ref().expect("controller").model();
+        assert_eq!(model.kind, RecordKind::Update);
+        assert_eq!(model.update_index, 1);
+        assert_eq!(model.task.view.phase, "live");
+        assert_eq!(model.approval.view.phase, "connecting");
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("create terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render page");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("kind=update"), "rendered={rendered}");
+        assert!(rendered.contains("changed_domain=task"));
+        assert!(rendered.contains("Task domain: phase=live"));
+        assert!(rendered.contains("Approval domain: phase=connecting"));
+        assert!(rendered.contains("positions are independent"));
+        assert!(rendered.contains("no atomic snapshot or global cursor"));
+        assert!(!rendered.contains("completed"));
+
+        let mut next_refresh = tokio::time::Instant::now();
+        execute_interactive_action(
+            &mut app,
+            InteractiveAction::CloseGovernedState,
+            &mut next_refresh,
+        )
+        .await
+        .expect("close governed state");
+        assert!(matches!(app.mode, InteractiveMode::Dashboard));
+        assert!(app.governed_state.is_none());
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn governed_state_finish_and_quit_each_shutdown_exactly_once() {
+        let (finish_client, _, finish_shutdowns) = governed_client(VecDeque::new());
+        let mut finished = App::new("governed-finish".to_owned());
+        finished
+            .install_governed_state_controller(finish_client)
+            .expect("start finish controller");
+        assert_eq!(
+            finish_interactive_session(&mut finished, Ok::<_, String>(7))
+                .await
+                .expect("finish session"),
+            7
+        );
+        assert_eq!(finish_shutdowns.load(Ordering::SeqCst), 1);
+
+        let (quit_client, _, quit_shutdowns) = governed_client(VecDeque::new());
+        let mut quitting = App::new("governed-quit".to_owned());
+        quitting
+            .install_governed_state_controller(quit_client)
+            .expect("start quit controller");
+        let mut next_refresh = tokio::time::Instant::now();
+        assert_eq!(
+            execute_interactive_action(&mut quitting, InteractiveAction::Quit, &mut next_refresh,)
+                .await
+                .expect("quit"),
+            InteractiveLoopControl::Quit
+        );
+        assert_eq!(quit_shutdowns.load(Ordering::SeqCst), 1);
+    }
 
     #[derive(Clone)]
     enum ScriptedWatchStep {
