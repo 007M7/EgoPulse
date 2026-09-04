@@ -1,4 +1,4 @@
-# R-9C user-visible Harness content disclosure decision candidate
+# R-9C user-visible Harness content disclosure contract
 
 - Date: 2026-09-04
 - Status: `founder_frozen_r9c_implementation_authorized`
@@ -76,8 +76,8 @@ client architecture.
 
 ## 4. Founder-frozen decision package
 
-Every item in this section remains `recommended_pending_founder` until the
-Founder explicitly confirms `R9C-D01` through `R9C-D12`.
+Every item in this section is frozen as one package by the conversation
+authority reference recorded above and in section 7.
 
 ### R9C-D01 - product shape
 
