@@ -757,7 +757,15 @@ fn select_permission_option(params: &Value, accepted_kinds: &[&str]) -> Result<V
 }
 
 async fn spawn_process(config: &KimiAcpConfig) -> Result<SupervisedProcess, DriverError> {
-    let mut spec = SupervisedProcessSpec::new(&config.executable, &config.working_directory);
+    SupervisedProcess::spawn(&process_spec(config))
+        .await
+        .map_err(|error| driver_error("KIMI_ACP_SPAWN_FAILED", format!("{error:?}").as_bytes()))
+}
+
+fn process_spec(config: &KimiAcpConfig) -> SupervisedProcessSpec {
+    let mut spec = SupervisedProcessSpec::new(&config.executable, &config.working_directory)
+        .with_minimal_user_environment()
+        .with_inherited_environment("KIMI_HOME");
     spec.arguments = vec!["acp".to_owned()];
     if let Some(directory) = &config.share_directory {
         spec = spec.with_environment_override("KIMI_SHARE_DIR", directory.display().to_string());
@@ -765,9 +773,7 @@ async fn spawn_process(config: &KimiAcpConfig) -> Result<SupervisedProcess, Driv
     for (name, value) in &config.environment_overrides {
         spec = spec.with_environment_override(name.clone(), value.clone());
     }
-    SupervisedProcess::spawn(&spec)
-        .await
-        .map_err(|error| driver_error("KIMI_ACP_SPAWN_FAILED", format!("{error:?}").as_bytes()))
+    spec
 }
 
 fn initialize_request() -> Vec<u8> {
@@ -1126,6 +1132,24 @@ fn lifecycle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_environment_is_isolated_and_credentials_are_explicit() {
+        let config = KimiAcpConfig::new(r"C:\kimi.exe", r"C:\workspace")
+            .with_environment_override("KIMI_MODEL_API_KEY", "managed-secret");
+        let spec = process_spec(&config);
+
+        assert!(spec.clear_environment);
+        assert!(
+            spec.inherited_environment
+                .iter()
+                .all(|name| !name.starts_with("EGOPULSE_") && !name.ends_with("_API_KEY"))
+        );
+        assert_eq!(
+            spec.environment_overrides,
+            vec![("KIMI_MODEL_API_KEY".to_owned(), "managed-secret".to_owned())]
+        );
+    }
 
     #[test]
     fn initialize_response_is_reachable_but_not_probe_verified_without_schema_digest() {

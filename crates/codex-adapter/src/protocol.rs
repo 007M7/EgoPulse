@@ -159,9 +159,12 @@ impl CodexAppServerConfig {
 }
 
 fn apply_environment_overrides(
-    mut spec: SupervisedProcessSpec,
+    spec: SupervisedProcessSpec,
     overrides: &[(String, String)],
 ) -> SupervisedProcessSpec {
+    let mut spec = spec
+        .with_minimal_user_environment()
+        .with_inherited_environment("CODEX_HOME");
     for (name, value) in overrides {
         spec = spec.with_environment_override(name.clone(), value.clone());
     }
@@ -1667,6 +1670,25 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_environment_is_isolated_and_credentials_are_explicit() {
+        let spec = apply_environment_overrides(
+            SupervisedProcessSpec::new(r"C:\codex.exe", r"C:\workspace"),
+            &[("OPENAI_API_KEY".to_owned(), "managed-secret".to_owned())],
+        );
+
+        assert!(spec.clear_environment);
+        assert!(
+            spec.inherited_environment
+                .iter()
+                .all(|name| !name.starts_with("EGOPULSE_") && !name.ends_with("_API_KEY"))
+        );
+        assert_eq!(
+            spec.environment_overrides,
+            vec![("OPENAI_API_KEY".to_owned(), "managed-secret".to_owned())]
+        );
+    }
     use egopulse_domain_contracts::v01::egopulse::harness::v1::{
         AssistantTextContentCandidate, user_visible_content_candidate,
     };
