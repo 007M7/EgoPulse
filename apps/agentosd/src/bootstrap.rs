@@ -37,6 +37,7 @@ use egopulse_policy_decision_authority::{
     PolicyAuthorityConfig, PolicyAuthorityFailure, PolicyDecisionAuthority, PolicyPrincipalKind,
     PolicySqlCipherKey,
 };
+use egopulse_process_supervision::is_supported_executable_file;
 use egopulse_verification_authority::{
     ArtifactBackedReferenceResolver, ReferenceRejection, ResolvedVerificationInput,
     SegoFindingEvidenceBinding, SegoMapperPolicy, VerificationAuthority,
@@ -315,40 +316,39 @@ fn provider_executable_available(executable: &Path) -> bool {
     resolve_provider_executable(executable).is_some()
 }
 
+fn provider_command_extensions(executable: &Path) -> Vec<String> {
+    if !cfg!(windows) || executable.extension().is_some() {
+        return Vec::new();
+    }
+    std::env::var_os("PATHEXT")
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
+        .to_string_lossy()
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn resolve_provider_executable(executable: &Path) -> Option<PathBuf> {
     // An extension does not make a command an explicit path: `codex.cmd` is
     // still a valid PATH lookup on Windows. Only a path-like value should be
     // checked relative to the current filesystem location.
     if executable.components().count() > 1 {
-        return executable
-            .is_file()
-            .then(|| fs::canonicalize(executable).ok())
-            .flatten();
+        let candidate = fs::canonicalize(executable).ok()?;
+        return is_supported_executable_file(&candidate).then_some(candidate);
     }
     let path_value = std::env::var_os("PATH")?;
     let candidates =
         std::env::split_paths(&path_value).flat_map(|directory| {
             let direct = directory.join(executable);
-            let extensions = if cfg!(windows) {
-                std::env::var_os("PATHEXT")
-                    .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
-                    .to_string_lossy()
-                    .split(';')
-                    .filter(|extension| !extension.is_empty())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+            let extensions = provider_command_extensions(executable);
             std::iter::once(direct).chain(extensions.into_iter().map(move |extension| {
                 directory.join(format!("{}{}", executable.display(), extension))
             }))
         });
     candidates.into_iter().find_map(|candidate| {
-        candidate
-            .is_file()
-            .then(|| fs::canonicalize(candidate).ok())
-            .flatten()
+        let candidate = fs::canonicalize(candidate).ok()?;
+        is_supported_executable_file(&candidate).then_some(candidate)
     })
 }
 
@@ -2441,6 +2441,17 @@ mod tests {
             Uuid::now_v7()
         ));
         assert_eq!(resolve_provider_executable(&missing), None);
+
+        let ordinary_file = std::env::temp_dir().join(format!(
+            "egopulse-non-executable-provider-{}.txt",
+            Uuid::now_v7()
+        ));
+        fs::write(&ordinary_file, b"not an executable").expect("write ordinary file");
+        assert_eq!(resolve_provider_executable(&ordinary_file), None);
+        fs::remove_file(ordinary_file).expect("remove ordinary file");
+
+        assert!(provider_command_extensions(Path::new("codex.exe")).is_empty());
+        assert!(provider_command_extensions(Path::new("codex.cmd")).is_empty());
     }
 
     #[test]

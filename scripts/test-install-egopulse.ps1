@@ -149,6 +149,11 @@ try {
     Assert-Condition ($invalid.ExitCode -ne 0) 'invalid IpcInstance unexpectedly succeeded'
     Assert-Condition (-not (Test-Path -LiteralPath $invalidDataRoot)) 'invalid IpcInstance wrote DataRoot before validation failed'
 
+    $missingHarness = Invoke-HermeticInstaller -InstallerPath $installerPath -PackageRoot $packageRoot -DataRoot $dataRoot -IpcInstance $ipcInstance
+    Assert-Condition ($missingHarness.ExitCode -ne 0) 'installer unexpectedly accepted a missing production Harness'
+    Assert-Condition (-not $missingHarness.Stdout.Contains('egopulse_installation=passed')) 'missing production Harness emitted the installer success marker'
+    Assert-Condition (($missingHarness.Stdout + $missingHarness.Stderr).Contains('Production Harness executable is unavailable')) 'missing production Harness failure was not actionable'
+
     Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32/where.exe') -Destination (Join-Path $harnessBin 'codex.exe')
     $env:PATH = "$harnessBin;$env:PATH"
     $result = Invoke-HermeticInstaller -InstallerPath $installerPath -PackageRoot $packageRoot -DataRoot $dataRoot -IpcInstance $ipcInstance

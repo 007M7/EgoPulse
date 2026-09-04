@@ -1413,9 +1413,11 @@ name = "egopulse-process-supervision"
 version = "0.1.0"
 dependencies = [
  "egopulse-domain-contracts",
+ "egopulse-local-ipc-platform",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

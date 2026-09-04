@@ -41,6 +41,12 @@ application before installation can complete. If `uv` is absent, install it
 from `https://docs.astral.sh/uv/` first. A configured command is resolved to an
 absolute executable before daemon process supervision; an unavailable
 production Harness fails installation instead of surfacing on the first Task.
+EgoPulse repeats executable-file validation immediately before every child
+process spawn and assigns the process tree to a Windows Job Object so timeout,
+cancellation, and daemon loss also terminate Harness descendants. The
+early-access local threat model still trusts software under the signed-in
+Windows user's own Harness installation path; it does not claim binary pinning
+or protection from that same user replacing the Harness file.
 
 After installation, open a new PowerShell window so the user environment is
 loaded and run:
