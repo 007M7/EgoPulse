@@ -1,176 +1,323 @@
-# ADR 0004: Provider/Model runtime selection ownership
+# ADR 0004: Provider/model setup and governed work-route selection
 
 - Status: `pending_founder_decision`
-- Date: 2026-08-27
 - Decision owner: Founder
-- Scope: Stage 3 Provider/Model user-facing read and selection capability
-- Affected surfaces: CLI, TUI, Desktop, `agentosd` bootstrap and native dispatch
+- Scope: Stage 3 Provider/Harness/Model user-facing capability
+- Evidence baseline: commit `48b4bfb86c3cd9504b9fb5a5978cace1380337a0`
+- Affected boundaries: user configuration, Local API, Work preparation,
+  reviewed workflow routing, CLI and TUI
 
-This ADR is a decision package, not a contract freeze. It records the
-remaining choice before the frozen Local API can be extended.
+This file is a decision package, not an accepted architecture or a frozen
+contract. It replaces the earlier assumption that one restart-based
+`SelectProviderModel` operation would also solve work-level multi-model
+selection.
 
-## Decision to make
+## Decision that must be made
 
-How should a user inspect configured Provider/Model profiles and change the
-exact selected model used by the next AgentOS daemon startup?
+EgoPulse needs to support two different user actions without conflating them:
 
-The current implementation already has a typed, redacted configuration
-profile and `agentosd --check-config --json`. It does not yet expose a
-runtime client operation. The daemon loads the user-owned JSON at startup,
-and the current production route rejects unapproved Provider admission. A
-successful model selection must therefore never imply Provider promotion,
-live authentication success or silent fallback.
+1. **Setup preference**: inspect configured Provider/Harness/model data and set
+   the default capability proposed for future work.
+2. **Work-route choice**: explicitly choose, or accept an approved policy's
+   choice of, one admitted exact execution route for a particular work item.
 
-## Confirmed constraints
+The first action is mutable user configuration. The second becomes an
+immutable governed workflow fact. A global JSON edit cannot safely stand in
+for both.
 
-- Provider identity, Harness identity and Model identity remain separate.
-- Dispatch must bind an exact Harness model identifier.
-- Candidate and held profiles may be listed and selected as configuration,
-  but cannot become production routes without independent admission evidence.
-- Credential values must never cross a Local API response, log or serialized
-  configuration projection.
-- CLI, TUI and Desktop must converge on one selection semantic and one
-  optimistic-concurrency rule.
-- A stale selection must fail closed rather than overwrite a newer choice.
-- A model catalog refresh must not silently change `selected_model`.
-- The frozen Local API contract is the only machine-contract source; any
-  extension requires generated bindings, compatibility evidence and a new
-  revision authority.
+## Confirmed facts
 
-## Candidate A — daemon-owned configuration service (recommended)
+The following are code or frozen-contract facts at the evidence baseline:
 
-Add an additive `LocalProviderConfigurationService` to the Local API:
+- `provider_profiles[]` already separates Provider, Harness and model
+  identities, exposes a redacted catalog, and stores one `selected_model` per
+  profile.
+- `agentosd --check-config --json` is a read-only preflight. It does not open
+  Authority stores, authenticate a Harness or prove production admission.
+- Codex is the only production-admitted Harness. DeepSeek/DSH, Kimi and
+  GLM/OpenCode are visible held candidates.
+- The active Codex model is duplicated in
+  `provider_profiles[].selected_model` and the compatibility field
+  `codex.default_model`; startup rejects drift between them.
+- `PrepareWork` deliberately does not select a Provider or model. Its Context
+  snapshot records this as a non-goal.
+- The frozen multi-Harness routing rule binds Task activation and dispatch to
+  an exact capability-profile reference `(contract_id, version, sha256)`.
+  UI state, prompt text, provider availability and model output cannot choose
+  or rewrite that route.
+- The current production Work facade activates a configured run identity. It
+  does not yet persist a user capability preference into a reviewed
+  RunPlan/StepPlan.
+- A route change must not alter an in-flight or recoverable Task's model,
+  capability evidence, Adapter Edge or native receipt expectation.
+
+## Architectural classification
+
+This is an architecture decision, not a UI or framework choice. It determines
+the single writer for user configuration, the owner of a work's route fact,
+cross-surface semantics, recovery behavior and the long-lived Local API
+boundary.
+
+## Non-negotiable constraints
+
+- Provider identity, Harness identity and exact model identity remain
+  separate.
+- Candidate or held configuration never becomes a dispatchable route without
+  independent admission evidence.
+- Catalog refresh never changes a default or an existing work route.
+- There is no silent model fallback or provider substitution.
+- Credential values never cross Local API responses, logs, evidence or
+  serialized read projections. Only secret references may be stored.
+- CLI and TUI use one Rust client operation and one daemon semantic. Desktop
+  may consume it later but is not a first-release blocker.
+- A confirmed work route is immutable for the Task/recovery lifetime.
+- Configuration concurrency fails closed instead of overwriting a newer user
+  choice.
+
+## Candidate A: mutate one profile's selected model and restart
+
+Add a daemon-owned configuration service:
 
 ```text
 ListProviderProfiles
-  -> redacted profiles + config_revision + restart_required=false
+  -> redacted profiles + config_revision
 
-SelectProviderModel(profile_id, exact_harness_model_id, expected_config_revision)
-  -> accepted/rejected + new_config_revision + restart_required=true
+SelectProviderModel(profile_id, exact_harness_model_id,
+                    expected_config_revision)
+  -> configuration receipt + restart_required=true
 ```
 
-The daemon is the single writer for the user-owned provider configuration.
-Selection validates that the profile and exact Harness model exist, checks the
-expected file revision, writes a complete temporary file, flushes it and
-atomically replaces the user file. The daemon returns a configuration receipt;
-the new selection becomes active only after a controlled daemon restart. The
-existing startup validator remains the final authority before composition.
+The daemon atomically updates the complete user configuration. For the active
+Codex compatibility profile, it must update both `selected_model` and
+`codex.default_model` in one write.
 
-Read projection fields should include only:
+### Why it is viable
 
-- profile ID;
-- Provider and Harness IDs;
-- admission state and hold reason;
-- Harness/provider model ID pairs;
-- selected exact Harness model;
-- executable reference;
-- credential mode and optional source environment-variable name;
-- configuration revision and restart-required state.
+- It is the smallest extension of the current bootstrap format.
+- One daemon writer gives CLI and TUI the same concurrency, redaction and
+  backup behavior.
+- Restart keeps the active runtime deterministic and avoids mid-dispatch hot
+  mutation.
 
-The operation must not include resolved secrets or claim that an executable
-or credential is reachable unless a separate authenticated probe has proved
-it.
+### Cost and sacrifice
 
-Why this option: one writer gives all three surfaces the same ownership,
-concurrency and redaction semantics. Restart-required behavior is explicit,
-so startup composition remains deterministic and no live route is mutated in
-the middle of a Task.
+- It changes a route behind a stable profile ID. Recoverable work created
+  under the prior model may no longer have a matching composed runner after
+  restart.
+- It only changes a global default; it does not implement explicit per-work
+  multi-model selection.
+- It preserves the duplicated Codex model fields and their synchronization
+  burden.
+- Safe use requires either blocking changes while any affected work is
+  recoverable or retaining old route generations. Either rule adds lifecycle
+  semantics that the apparently small API does not expose.
 
-Cost and sacrifice:
+Candidate A is no longer recommended as the complete Stage 3 solution.
 
-- adds a Local API service and generated bindings;
-- adds Windows atomic-replace, crash-recovery and file-lock tests;
-- model changes are not instant and require a daemon restart;
-- the daemon becomes responsible for a user-owned settings file, so backup,
-  permissions and migration behavior must be maintained;
-- a later live reload feature would require a separate decision rather than
-  being inferred from this operation.
+## Candidate B: immutable admitted routes plus future-work preference
+   (recommended)
 
-## Candidate B — each surface edits the user JSON directly
+Treat a production execution route as an immutable, versioned configuration
+record. A route binds:
 
-CLI, TUI and Desktop share a small Rust configuration editor. Each acquires a
-file lock, checks a revision, writes atomically and asks the user to restart
-the daemon.
+```text
+route identity
+  + Provider profile identity
+  + Harness identity
+  + exact Harness and provider model identities
+  + exact capability-profile reference
+  + catalog/admission evidence references
+  + native composition generation
+```
 
-Why it is viable: no Local API extension is needed and setup can work while
-the daemon is stopped.
+A mutable default is only a pointer used when preparing **future** work. A
+work request either names one public admitted capability choice or requests
+the configured default. The daemon resolves that preference, presents the
+resolved Provider/model in the Founder preview, and confirmation binds the
+exact immutable route into the reviewed workflow. Existing work retains its
+route even if the future-work default changes.
 
-Cost and sacrifice:
+The user-facing semantic is:
 
-- configuration ownership is spread across three clients and setup tools;
-- every client must reproduce lock, encoding, migration, permissions and
-  recovery semantics;
-- a client can show a state different from the daemon it is attached to;
-- future remote/local session policy cannot govern the operation uniformly;
-- a fourth surface or installer creates another writer unless the editor is
-  treated as a hidden shared service.
+```text
+ListWorkCapabilities
+  -> redacted configured profiles
+  -> admitted immutable route choices
+  -> held/candidate diagnostics
+  -> current future-work default + preference revision
 
-This option is cheaper for the first implementation but creates a global
-consistency boundary outside the existing governed local API.
+SetDefaultWorkCapability(choice_id, expected_preference_revision)
+  -> preference receipt
+  -> affects future preparation only
 
-## Candidate C — hot-reload selection into the running daemon
+Prepare work(explicit choice | approved default policy)
+  -> daemon resolves an admitted route
+  -> preview shows Provider + Harness + exact model aliases
+  -> Founder confirmation binds the exact route/profile digest
+```
 
-Add a configuration authority and live route registry. A successful selection
-would update the active Provider route without restart, subject to an idle
-Task boundary and route-version fencing.
+Clients never supply a native executable, credential, capability digest,
+Adapter store or dispatch route. A public `choice_id` is a lookup key, not the
+authoritative route fact; the daemon resolves and binds the latter.
 
-Why it is viable: model changes appear immediately and the UX is strongest.
+### Why this option
 
-Cost and sacrifice:
+- It preserves the already frozen exact-profile activation and dispatch
+  boundary instead of creating a competing UI/config routing path.
+- It supports actual per-work multi-model use, not merely a global model
+  toggle.
+- Default changes cannot rewrite in-flight or recoverable work.
+- Candidate visibility and production eligibility remain separate.
+- The same operation naturally supports CLI, TUI and a later Desktop surface.
 
-- requires defining what happens to in-flight Tasks, retries and recovery;
-- expands the authority/state machine and the audit surface;
-- creates a second concurrency problem between config revision and active
-  dispatch revision;
-- increases the blast radius of a bad model selection;
-- delays the first multi-Provider release and is not needed for local BYOK
-  configuration.
+### Cost and sacrifice
 
-This is not recommended for the initial release.
+- The bootstrap schema needs an explicit immutable route collection and a
+  separate mutable future-work preference.
+- Work preparation/confirmation and the reviewed workflow must persist the
+  resolved route reference; generated Rust, TypeScript and Python bindings
+  change additively.
+- Composition must retain every route generation referenced by active or
+  recoverable work, or fail it closed with an explicit unavailable-route
+  recovery state.
+- A newly downloaded catalog model is not immediately selectable. It must
+  first obtain route-specific admission evidence.
+- This costs more before the second Provider is released, but avoids a later
+  migration from global mutable state to governed per-work routing.
+
+## Candidate C: arbitrary dispatch-time model selection and hot reload
+
+Allow each work or dispatch to provide any model currently visible in a live
+catalog and update active runners without restart.
+
+### Why it is viable
+
+- It offers the fastest model switching and the broadest visible catalog.
+- It minimizes up-front route records.
+
+### Cost and sacrifice
+
+- Catalog visibility would become dangerously close to admission.
+- In-flight retries and recovery could observe a different model or runner
+  generation.
+- It introduces separate concurrency domains for configuration, active
+  runtime, Task route and dispatch route.
+- It expands the blast radius of provider drift and weakens reproducible
+  evidence.
+
+Candidate C conflicts with the frozen deterministic routing and recovery
+quality attributes and is not recommended for the first release.
 
 ## Comparison
 
-| Dimension | A: daemon service | B: client file editor | C: hot reload |
-|---|---|---|---|
-| Single configuration writer | strong | weak unless carefully shared | strong |
-| CLI/TUI/Desktop semantic parity | strong | medium | strong |
-| Frozen-contract impact | additive API | none | additive API plus runtime state |
-| Restart/recovery complexity | medium | medium in every client | high |
-| In-flight Task risk | low, restart fence | low if restart enforced | high |
-| First-release suitability | high | medium | low |
-| Future live reconfiguration | explicit follow-up | migration required | built in |
+| Dimension | A: mutable profile + restart | B: immutable route + work choice | C: hot arbitrary route |
+| --- | --- | --- | --- |
+| Preserves existing exact-profile rule | partial | strong | weak |
+| True per-work multi-model | no | yes | yes |
+| In-flight/recovery stability | requires extra blocking/versioning | strong | weak |
+| First implementation effort | low/medium | medium/high | high |
+| Candidate cannot masquerade as admitted | medium | strong | weak |
+| CLI/TUI semantic parity | strong | strong | strong |
+| Long-term migration burden | high when multi-model arrives | lower | high |
 
 ## Recommendation
 
-Recommend Candidate A for Stage 3. Keep the first implementation restart
-based, daemon-owned and exact-model-only. Treat selection as a configuration
-mutation, not as Provider admission and not as an authority fact such as a
-Task or Memory record. Keep catalog refresh separate from selection, and keep
-all candidate/held profiles non-dispatchable.
+Recommend Candidate B.
+
+The stable architecture point is not a particular model catalog or Harness.
+It is the distinction between mutable setup preference and immutable governed
+work route. Provider catalogs, exact models and adapter implementations remain
+replaceable data and technology choices behind that boundary.
+
+For the first implementation:
+
+- list all configured profiles, but expose work choices only for admitted
+  immutable routes;
+- held/candidate profiles remain visible with exact blockers and cannot be
+  selected for a real work dispatch;
+- make the default affect future work only;
+- do not implement live reload;
+- keep Codex as the compatibility route while the schema migration is
+  introduced;
+- admit DeepSeek, Kimi or GLM routes only after their independent real-process
+  evidence closes.
+
+## Migration and rollback candidate for B
+
+1. Read the existing v2 configuration without changing current behavior.
+2. Derive one immutable Codex compatibility route from the matching
+   `provider_profiles[]` entry and `codex.default_model`; reject any drift as
+   today.
+3. Add a versioned route/default representation and an explicit migration
+   preview. Do not mutate the user file during daemon startup.
+4. On confirmed migration, write a complete temporary file, flush it, retain
+   the prior file as a bounded backup and atomically replace the target.
+5. Existing active/recoverable work continues to reference its original route
+   generation. A route cannot be deleted while such references exist.
+6. Rollback restores the prior complete configuration and returns to the
+   single Codex compatibility route. Authority stores are not migrated by
+   this configuration change.
+
+The exact v3 JSON shape, backup retention count and Windows replacement API
+are implementation details to freeze in the contract unit after Candidate B
+is approved; they are not silently accepted by this recommendation.
+
+## Verification gates if B is accepted
+
+- Local API compatibility and regenerated Rust/TypeScript/Python bindings;
+- owner-only list, preference mutation and work confirmation;
+- no credential value in projections, logs, errors, fixtures or evidence;
+- unknown, stale, held and candidate choice rejection for work routing;
+- stale preference revision and concurrent writer rejection;
+- catalog refresh preserves defaults and all existing work routes;
+- Founder preview displays the resolved aliases before confirmation;
+- confirmation binds the exact route/profile reference and model identity;
+- dispatch receipt matches that route without fallback;
+- changing the default does not alter active, interrupted or recoverable work;
+- Windows atomic-write interruption, backup restore and migration rollback;
+- shared CLI/TUI E2E over the same client operation;
+- real authenticated lifecycle evidence for each newly admitted route.
 
 ## Required Founder response
 
 ```text
-Decision: A / B / C
+Architecture: A / B / C
+Default affects future work only: yes / no
+Held/candidate profiles visible but not selectable for work: yes / no
 Live reload in first release: yes / no
-Candidate/held profiles selectable as configuration: yes / no
+Introduce the route/default configuration migration before second-provider
+admission: yes / no
 ```
 
-Until this response is recorded, the repository may implement redacted
-preflight and admission probes, but must not freeze or silently add the
-runtime Provider/Model selection contract.
+Recommended response:
 
-## Verification and rollback if A is accepted
+```text
+Architecture: B
+Default affects future work only: yes
+Held/candidate profiles visible but not selectable for work: yes
+Live reload in first release: no
+Introduce the route/default configuration migration before second-provider
+admission: yes
+```
 
-- contract compatibility and regenerated Rust/TypeScript/Python bindings;
-- owner-only session authorization for list and select;
-- unknown profile/model rejection;
-- held/candidate selection accepted only as configuration, never dispatch;
-- stale `config_revision` rejection;
-- concurrent writer rejection;
-- crash/interruption atomic-write recovery;
-- restart loads the exact selected model;
-- dispatch receipt matches the selected Harness model;
-- no API key value in output, logs, files or evidence;
-- restore the previous complete configuration from the last accepted backup;
-- local CLI/TUI/Desktop E2E evidence over the shared client semantics.
+Until the Founder response is recorded, the repository may retain the
+redacted read-only preflight and candidate probes, but must not add a mutable
+runtime selection API or claim per-work multi-model support.
+
+## Review triggers
+
+Re-open this decision only if one of these facts changes:
+
+- route generations cannot be retained within the local resource budget;
+- a Provider cannot reproduce an exact selected model in its native receipt;
+- the frozen workflow can no longer persist the exact capability reference;
+- a real user workflow proves restart-only setup is preferable to per-work
+  choice;
+- live route replacement becomes a Founder-approved product requirement.
+
+## Decision status
+
+- Founder-confirmed decision: none yet.
+- Current state: `recommended_pending_founder`.
+- Evidence gap: Founder choice and second-provider authenticated admission.
+- No production contract or runtime behavior is changed by this ADR draft.
