@@ -68,7 +68,7 @@ fn route_binding() -> DispatchRouteBinding {
         catalog_snapshot: Some(
             dispatch_route_binding::CatalogSnapshot::CatalogSnapshotSha256("a".repeat(64)),
         ),
-        capability_profile_id: "codex-app-server-v2-0.148.0-alpha.15".to_owned(),
+        capability_profile_id: "reviewed-harness-profile-v1".to_owned(),
         route_binding_sha256: String::new(),
     };
     binding.route_binding_sha256 =
@@ -88,7 +88,7 @@ fn envelope(dispatch_id: &str, binding: Option<DispatchRouteBinding>) -> Dispatc
         dispatch_fingerprint: "d".repeat(64),
         fencing_token: 7,
         capability_profile_ref: Some(ContractReference {
-            contract_id: "codex-app-server-v2-0.148.0-alpha.15".to_owned(),
+            contract_id: "reviewed-harness-profile-v1".to_owned(),
             version: "0.1.0".to_owned(),
             sha256: "c".repeat(64),
         }),
