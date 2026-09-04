@@ -1,17 +1,18 @@
 # R-9C user-visible Harness content disclosure decision candidate
 
 - Date: 2026-09-04
-- Status: `recommended_pending_founder`
+- Status: `founder_frozen_r9c_implementation_authorized`
 - Decision owner: Founder
+- Decision authority: `conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7`
 - Scope: R-9C disclosure contract only
 - Parent decisions:
   - `phase-2-56-context-revoke-and-consumption-linearization.md`
   - `phase-2-75-r9b-governed-state-dual-stream-contract-20260904.md`
   - `phase-2-80-r9b-real-process-c5-evidence-20260904.md`
 
-This document is a decision candidate, not a frozen contract and not an
-implementation authorization. It records repository facts, compares the real
-options, and proposes one complete decision package for Founder review.
+This document is the Founder-frozen R-9C disclosure contract and implementation
+authority. It records repository facts, compares the real options, and fixes
+the accepted decision package that implementation must preserve.
 
 ## 1. Decision required
 
@@ -73,7 +74,7 @@ Candidate C conflicts with the already frozen requirement for a redacted
 user-visible stream and would harden unstable Provider protocols into a global
 client architecture.
 
-## 4. Proposed frozen decision package
+## 4. Founder-frozen decision package
 
 Every item in this section remains `recommended_pending_founder` until the
 Founder explicitly confirms `R9C-D01` through `R9C-D12`.
@@ -618,13 +619,20 @@ candidate contract and pass the same admission Gate. That is the architectural
 value: the stable boundary is ownership and disclosure semantics, not one
 current Provider SDK or streaming event format.
 
-## 7. Founder action
+## 7. Founder freeze record
 
-Implementation remains `NO-GO` until the Founder either:
+The Founder supplied the following explicit authority in conversation on
+2026-09-04:
 
-- confirms `R9C-D01` through `R9C-D12` as one package; or
-- names the exact decision IDs and replacement text to revise.
+```text
+确认冻结 R9C-D01～R9C-D12，并确认 phase-2-82 7 迁移与回滚合同
+```
 
-After confirmation, this document must be changed from
-`recommended_pending_founder` to a Founder-frozen status with an explicit
-conversation authority reference before production contracts are edited.
+`phase-2-82 7` is recorded as section 7 of phase 2-82: the complete migration
+and rollback contract. There is no competing numbered object in the referenced
+document. The effective acceptance is therefore:
+
+- `R9C-D01` through `R9C-D12` as one indivisible package;
+- phase 2-82 section 7 in full;
+- R9C.0 complete and R9C.1 production contract work authorized, subject to the
+  isolated-worktree and exact-Gate controls in phase 2-82.

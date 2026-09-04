@@ -1,37 +1,37 @@
 # R-9C implementation readiness and traceability plan
 
 - Date: 2026-09-04
-- Status: `planning_ready_pending_founder_freeze`
+- Status: `founder_frozen_r9c0_complete_r9c1_authorized`
 - Decision owner: Founder
+- Decision authority: `conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7`
 - Integration DRI: Codex main window
-- Decision candidate: `phase-2-81-r9c-harness-content-disclosure-decision-candidate-20260904.md`
+- Frozen decision contract: `phase-2-81-r9c-harness-content-disclosure-decision-candidate-20260904.md`
 - Planning baseline: `ec00da617cc78acb7b2afcd91cfec31cf7cd0772`
 
-This is a non-authorizing execution plan. It does not freeze `R9C-D01` through
-`R9C-D12`, change a production contract, authorize a migration, or permit a
-runtime implementation to start. Its purpose is to remove implementation
-ambiguity so that, after an explicit Founder confirmation, the approved work
-can begin without reopening architecture or inventing files and Gates while
-coding.
+This plan was non-authorizing when first published. The explicit Founder
+authority recorded below now freezes `R9C-D01` through `R9C-D12`, accepts the
+section 7 migration/rollback contract and authorizes ordered implementation.
+The plan remains the execution boundary: implementation may not reopen the
+architecture or invent files, owners or Gates while coding.
 
 ## 1. Current readiness verdict
 
-**Implementation is NO-GO. Planning is GO.**
+**R9C.0 is complete. R9C.1 is authorized after isolated writer setup.**
 
-The decision package has completed architecture, build and test review with no
-known P0/P1 defect in the candidate itself. The remaining Definition-of-Ready
-blocker is the explicit Founder confirmation required by phase 2-81. A generic
-"continue" instruction is not equivalent to that confirmation.
+The decision package completed architecture, build and test review with no
+known P0/P1 defect. The Founder then explicitly accepted the full decision and
+migration/rollback packages. The acceptance is recorded in phase 2-81 and in
+section 11 below; it is not inferred from a generic continuation instruction.
 
 Before the first production edit, all of the following must be true:
 
-1. the Founder explicitly confirms `R9C-D01` through `R9C-D12` as one package,
-   or supplies exact replacement text for named decision IDs;
-2. phase 2-81 records the conversation authority reference and changes from
-   `recommended_pending_founder` to a Founder-frozen status;
-3. the Founder explicitly confirms the migration activation, pre-R-9C
-   legacy-row and rollback proposal in section 7, and that confirmation is
-   recorded before either SQLCipher schema is edited;
+1. **Satisfied:** the Founder explicitly confirmed `R9C-D01` through
+   `R9C-D12` as one package;
+2. **Satisfied:** phase 2-81 records the conversation authority reference and
+   Founder-frozen status;
+3. **Satisfied:** the Founder explicitly confirmed the migration activation,
+   pre-R-9C legacy-row and rollback contract in section 7 before either
+   SQLCipher schema is edited;
 4. the next monotonic contract draft is allocated from the then-current
    `contracts/manifest.json`; `draft.20` is only the current expected value and
    must not be assumed if another contract revision lands first;
@@ -347,14 +347,13 @@ separate files/worktrees. API/client work waits for the Local API messages and
 LRM access shape. TUI waits for the CLI/shared-driver semantic contract; it is
 an order decision, not a capability reduction.
 
-## 7. Proposed migration and rollback contract
+## 7. Founder-frozen migration and rollback contract
 
-- Status: `proposed_pending_founder`
+- Status: `founder_frozen`
 - Risk acceptance owner: Founder
 
-This section is an architecture-significant proposal, not an implementation
-fact. Confirmation of D01-D12 alone does not silently accept it; R9C.0 records
-the Founder's explicit acceptance of this section before schema work starts.
+This architecture-significant contract was accepted explicitly and separately
+from D01-D12. R9C.0 records that acceptance before schema work starts.
 
 ### 7.1 Forward migration
 
@@ -605,12 +604,13 @@ This planning unit is complete when independent architecture, build and test
 review find no unresolved P0/P1, repository checks pass, and the document is
 committed/pushed without production changes.
 
-Production R-9C remains blocked until the exact Founder action is recorded:
+The Founder action was recorded in conversation on 2026-09-04:
 
 ```text
-确认冻结 R9C-D01～R9C-D12，并确认 phase-2-82 §7 迁移与回滚合同
+确认冻结 R9C-D01～R9C-D12，并确认 phase-2-82 7 迁移与回滚合同
 ```
 
-After that statement, R9C.0 is the only permitted first write. No helper
-window receives a production packet before the freeze record and isolated
-worktrees exist.
+The phrase `phase-2-82 7` unambiguously identifies this document's section 7
+and is normalized by the decision authority reference above. R9C.0 is complete.
+R9C.1 is the next permitted production unit after isolated writer worktrees
+exist; no helper window receives a production packet before that split.
