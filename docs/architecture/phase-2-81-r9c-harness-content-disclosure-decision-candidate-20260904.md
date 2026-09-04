@@ -150,15 +150,22 @@ Both branches still require the durable `Delivered` receipt. The
 `AUTHORIZED_CONTEXT` branch is non-retrospective: later Context revoke does not
 invalidate a dispatch whose exact authorization already committed.
 
-Before Adapter begin-delivery, the Governance Kernel's existing dispatch-
-material resolver constructs a new immutable `DispatchRouteBinding` from the
-selected Provider bootstrap profile. Harness Proto adds this binding to
-`DispatchEnvelope`; Adapter Edge persists it with the dispatch record before
-native send. It contains Provider profile ID, selected harness and Provider
-model IDs, catalog-snapshot digest (or an explicit no-catalog sentinel),
-capability-profile ID and a canonical route-binding digest. Restart and config
-change read the stored binding and never recompute historical identity from the
-current bootstrap file.
+During trusted workflow/profile resolution, before Collaboration commits the
+dispatch intent, the Governance Kernel constructs a new immutable
+`DispatchRouteBinding` from the selected Provider bootstrap profile and catalog
+snapshot. The binding is carried through the resolved `SingleHarnessWorkConfig`
+and included by Collaboration in the original `DispatchEnvelope`. The Adapter
+material resolver validates that exact binding against its selected material/
+profile; it does not enrich an envelope after Adapter Edge preparation.
+Adapter Edge persists the already-bound envelope with the dispatch record
+before native send. Material/profile validation may run after that idempotent
+preparation but must finish before `begin_delivery`; validation failure leaves
+only the unchanged prepared record and causes no native effect. The binding
+contains Provider profile ID, selected harness and Provider model IDs,
+catalog-snapshot digest (or an explicit no-catalog
+sentinel), capability-profile ID and a canonical route-binding digest. Restart
+and config change read the stored binding and never recompute historical
+identity from the current bootstrap file.
 
 The pre-disclosure candidate carries `bytes text_utf8` and a closed operation
 enum: `APPEND`, `REPLACE` or `FINALIZE` (`UNSPECIFIED` is invalid).
