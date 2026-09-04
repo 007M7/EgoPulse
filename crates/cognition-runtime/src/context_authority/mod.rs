@@ -59,6 +59,12 @@ pub struct ContextSourceFact {
 pub struct MemoryPackBinding {
     pub scope_ref: String,
     pub authority_revision: u64,
+    /// Digest of the exact accepted Authority snapshot used to resolve this
+    /// pack. The serde default preserves decode compatibility for historical
+    /// descriptors written before M-13.
+    #[serde(default)]
+    pub accepted_snapshot_sha256: String,
+    /// Digest of the bounded canonical MemoryPack made available to Context.
     pub snapshot_sha256: String,
 }
 
@@ -279,6 +285,30 @@ pub struct MemoryUseReceipt {
     pub replayed: bool,
 }
 
+/// Result of the single Context Authority transaction that linearizes a
+/// dispatch-consumption decision. A Memory-bound snapshot always returns a
+/// receipt; a snapshot without Memory never does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchContextConsumptionCommitReceipt {
+    pub authorization: DispatchContextConsumptionAuthorizationReceipt,
+    pub memory_use: Option<MemoryUseReceipt>,
+}
+
+/// Exact immutable route tuple required to recover a committed Memory-use
+/// receipt. This lookup is intentionally read-only and carries no idempotency
+/// key that could be used to create or bind a new result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryUseReceiptLookup {
+    pub snapshot_id: String,
+    pub expected_scope_ref: String,
+    pub consumer_principal_id: String,
+    pub model_ref: String,
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub memory_authority_revision: u64,
+    pub memory_pack_snapshot_sha256: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContextStoreInspection {
     pub snapshot_count: u64,
@@ -288,6 +318,8 @@ pub struct ContextStoreInspection {
     pub revoke_idempotency_count: u64,
     pub dispatch_authorization_count: u64,
     pub dispatch_authorization_idempotency_count: u64,
+    pub memory_use_receipt_count: u64,
+    pub memory_use_idempotency_count: u64,
     pub last_event_sequence: u64,
 }
 
@@ -401,31 +433,81 @@ impl ContextAuthority {
         principal: &AuthenticatedContextPrincipal,
         request: &DispatchContextConsumptionAuthorizationRequest,
     ) -> Result<DispatchContextConsumptionAuthorizationReceipt, ContextAuthorityFailure> {
+        Ok(self
+            .authorize_dispatch_consumption_and_memory_use(principal, request, None)?
+            .authorization)
+    }
+
+    /// Atomically commits the Context authorization and, when the immutable
+    /// snapshot is Memory-bound, its exact per-route Memory-use receipt.
+    /// Supplying no Memory tuple for a Memory-bound snapshot (or supplying one
+    /// for a non-Memory snapshot) fails before either fact is committed.
+    pub fn authorize_dispatch_consumption_and_memory_use(
+        &mut self,
+        principal: &AuthenticatedContextPrincipal,
+        request: &DispatchContextConsumptionAuthorizationRequest,
+        memory_use: Option<&MemoryUseReceiptRequest>,
+    ) -> Result<DispatchContextConsumptionCommitReceipt, ContextAuthorityFailure> {
         validate_principal(principal)?;
         if principal.kind != ContextPrincipalKind::GovernanceKernel {
             return Err(ContextAuthorityFailure::Unauthorized);
         }
         validate_dispatch_authorization_request(request)?;
+        let prepared_memory = if let Some(memory_use) = memory_use {
+            validate_memory_use_request(memory_use)?;
+            if memory_use.snapshot_id != request.snapshot_id
+                || memory_use.expected_scope_ref != request.expected_scope_ref
+                || memory_use.attempt_id != request.attempt_id
+                || memory_use.dispatch_id != request.dispatch_id
+            {
+                return Err(ContextAuthorityFailure::IntegrityFailure);
+            }
+            let snapshot = self
+                .store
+                .snapshot(&request.snapshot_id)?
+                .ok_or(ContextAuthorityFailure::NotFound)?;
+            validate_memory_use_binding(memory_use, &snapshot)?;
+            Some((
+                memory_use_digest(memory_use, &snapshot),
+                memory_use_receipt_id(memory_use),
+            ))
+        } else {
+            None
+        };
         let committed_at_seconds = current_timestamp()?;
         let request_digest_sha256 = dispatch_authorization_request_digest(request);
+        let memory_commit = memory_use.zip(prepared_memory.as_ref()).map(
+            |(memory_use, (request_digest_sha256, receipt_id))| store::MemoryUseCommit {
+                consumer_principal_id: &memory_use.consumer_principal_id,
+                model_ref: &memory_use.model_ref,
+                memory_authority_revision: memory_use.memory_authority_revision,
+                memory_pack_snapshot_sha256: &memory_use.memory_pack_snapshot_sha256,
+                idempotency_key: &memory_use.idempotency_key,
+                request_digest_sha256,
+                receipt_id,
+            },
+        );
         self.store
-            .authorize_dispatch_consumption(store::DispatchAuthorizationCommit {
-                snapshot_id: &request.snapshot_id,
-                expected_state_revision: request.expected_state_revision,
-                principal_id: &principal.principal_id,
-                command_id: &request.command_id,
-                idempotency_key: &request.idempotency_key,
-                attempt_id: &request.attempt_id,
-                dispatch_id: &request.dispatch_id,
-                input_digest_sha256: &request.input_digest_sha256,
-                expected_scope_ref: &request.expected_scope_ref,
-                correlation_id: &request.correlation_id,
-                causation_id: &request.causation_id,
-                request_digest_sha256: &request_digest_sha256,
-                authorization_id: &format!("ctxauth:{}", Uuid::now_v7()),
-                event_id: &Uuid::now_v7().to_string(),
-                committed_at_seconds,
-            })
+            .authorize_dispatch_consumption(
+                store::DispatchAuthorizationCommit {
+                    snapshot_id: &request.snapshot_id,
+                    expected_state_revision: request.expected_state_revision,
+                    principal_id: &principal.principal_id,
+                    command_id: &request.command_id,
+                    idempotency_key: &request.idempotency_key,
+                    attempt_id: &request.attempt_id,
+                    dispatch_id: &request.dispatch_id,
+                    input_digest_sha256: &request.input_digest_sha256,
+                    expected_scope_ref: &request.expected_scope_ref,
+                    correlation_id: &request.correlation_id,
+                    causation_id: &request.causation_id,
+                    request_digest_sha256: &request_digest_sha256,
+                    authorization_id: &format!("ctxauth:{}", Uuid::now_v7()),
+                    event_id: &Uuid::now_v7().to_string(),
+                    committed_at_seconds,
+                },
+                memory_commit,
+            )
             .map_err(Into::into)
     }
 
@@ -504,6 +586,71 @@ impl ContextAuthority {
             validate_dispatch_authorization_receipt(receipt)?;
         }
         Ok(receipt)
+    }
+
+    /// Recovers the exact authorization/Memory-use pair for Adapter replay.
+    /// This method never creates an authorization, receipt or idempotency
+    /// binding. An already-authorized Memory-bound dispatch with a missing or
+    /// changed receipt is an integrity failure rather than a partial replay.
+    pub fn dispatch_consumption_by_dispatch_id(
+        &self,
+        principal: &AuthenticatedContextPrincipal,
+        lookup: &DispatchContextConsumptionAuthorizationLookup,
+        memory_lookup: Option<&MemoryUseReceiptLookup>,
+    ) -> Result<Option<DispatchContextConsumptionCommitReceipt>, ContextAuthorityFailure> {
+        let Some(authorization) = self.dispatch_authorization_by_dispatch_id(principal, lookup)?
+        else {
+            return Ok(None);
+        };
+        self.verify_dispatch_authorization(principal, &authorization)?;
+        let snapshot = self
+            .store
+            .snapshot(&lookup.snapshot_id)?
+            .ok_or(ContextAuthorityFailure::IntegrityFailure)?;
+        let memory_use = match (snapshot.memory_pack.as_ref(), memory_lookup) {
+            (None, None) => None,
+            (Some(memory_pack), Some(memory_lookup)) => {
+                validate_memory_use_lookup(memory_lookup)?;
+                if memory_lookup.snapshot_id != lookup.snapshot_id
+                    || memory_lookup.expected_scope_ref != lookup.expected_scope_ref
+                    || memory_lookup.attempt_id != lookup.attempt_id
+                    || memory_lookup.dispatch_id != lookup.dispatch_id
+                    || memory_lookup.expected_scope_ref != memory_pack.scope_ref
+                    || memory_lookup.memory_authority_revision != memory_pack.authority_revision
+                    || memory_lookup.memory_pack_snapshot_sha256 != memory_pack.snapshot_sha256
+                {
+                    return Err(ContextAuthorityFailure::IntegrityFailure);
+                }
+                let mut receipt = self
+                    .store
+                    .memory_use_receipt_by_tuple(
+                        &memory_lookup.snapshot_id,
+                        &memory_lookup.model_ref,
+                        &memory_lookup.attempt_id,
+                        &memory_lookup.dispatch_id,
+                    )?
+                    .ok_or(ContextAuthorityFailure::IntegrityFailure)?;
+                if !memory_receipt_matches_lookup(&receipt, memory_lookup, snapshot.revision) {
+                    return Err(ContextAuthorityFailure::IntegrityFailure);
+                }
+                let request_digest_sha256 = memory_use_lookup_digest(memory_lookup, &snapshot);
+                if !self.store.memory_use_receipt_has_request_digest(
+                    &principal.principal_id,
+                    &receipt.receipt_id,
+                    &request_digest_sha256,
+                )? {
+                    return Err(ContextAuthorityFailure::IntegrityFailure);
+                }
+                receipt.request_digest_sha256 = request_digest_sha256;
+                receipt.replayed = true;
+                Some(receipt)
+            }
+            _ => return Err(ContextAuthorityFailure::IntegrityFailure),
+        };
+        Ok(Some(DispatchContextConsumptionCommitReceipt {
+            authorization,
+            memory_use,
+        }))
     }
 
     pub fn governance(
@@ -713,32 +860,9 @@ impl ContextAuthority {
         if principal.kind != ContextPrincipalKind::GovernanceKernel {
             return Err(ContextAuthorityFailure::Unauthorized);
         }
-        validate_routing(&input.consumer_principal_id, "consumer_principal_id")?;
-        validate_routing(&input.model_ref, "model_ref")?;
-        validate_routing(&input.attempt_id, "attempt_id")?;
-        validate_routing(&input.dispatch_id, "dispatch_id")?;
-        validate_routing(&input.idempotency_key, "idempotency_key")?;
-        validate_digest(
-            &input.memory_pack_snapshot_sha256,
-            "memory_pack_snapshot_sha256",
-        )?;
-        if input.memory_authority_revision == 0 {
-            return Err(ContextAuthorityFailure::InvalidArgument(
-                "memory_authority_revision",
-            ));
-        }
+        validate_memory_use_request(input)?;
         let resolved = self.resolve(&input.snapshot_id, &input.expected_scope_ref, now_seconds)?;
-        let memory_pack = resolved
-            .snapshot
-            .memory_pack
-            .as_ref()
-            .ok_or(ContextAuthorityFailure::InvalidArgument("memory_pack"))?;
-        if memory_pack.scope_ref != input.expected_scope_ref
-            || memory_pack.authority_revision != input.memory_authority_revision
-            || memory_pack.snapshot_sha256 != input.memory_pack_snapshot_sha256
-        {
-            return Err(ContextAuthorityFailure::IntegrityFailure);
-        }
+        validate_memory_use_binding(input, &resolved.snapshot)?;
 
         let request_digest = memory_use_digest(input, &resolved.snapshot);
         if let Some(existing) = self
@@ -759,16 +883,7 @@ impl ContextAuthority {
             });
         }
 
-        let receipt_id = format!(
-            "memory-use:{}",
-            sha256(
-                format!(
-                    "{}\n{}\n{}\n{}",
-                    input.snapshot_id, input.model_ref, input.attempt_id, input.dispatch_id
-                )
-                .as_bytes()
-            )
-        );
+        let receipt_id = memory_use_receipt_id(input);
         if let Some(existing) = self.store.memory_use_receipt_by_tuple(
             &input.snapshot_id,
             &input.model_ref,
@@ -1154,6 +1269,10 @@ fn validate_input(input: &IssueContextSnapshot) -> Result<(), ContextAuthorityFa
                 "memory_pack_authority_revision",
             ));
         }
+        validate_digest(
+            &memory_pack.accepted_snapshot_sha256,
+            "memory_pack_accepted_snapshot_sha256",
+        )?;
         validate_digest(&memory_pack.snapshot_sha256, "memory_pack_snapshot_sha256")?;
     }
     if input.compiled_context.is_empty() || input.compiled_context.len() > MAX_CONTEXT_BYTES {
@@ -1239,15 +1358,156 @@ fn snapshot_digest(snapshot: &ContextSnapshot) -> String {
     sha256(&descriptor)
 }
 
+fn validate_memory_use_request(
+    input: &MemoryUseReceiptRequest,
+) -> Result<(), ContextAuthorityFailure> {
+    validate_snapshot_id(&input.snapshot_id)?;
+    for (field, value) in [
+        ("expected_scope_ref", &input.expected_scope_ref),
+        ("consumer_principal_id", &input.consumer_principal_id),
+        ("model_ref", &input.model_ref),
+        ("attempt_id", &input.attempt_id),
+        ("dispatch_id", &input.dispatch_id),
+        ("idempotency_key", &input.idempotency_key),
+    ] {
+        validate_routing(value, field)?;
+    }
+    validate_digest(
+        &input.memory_pack_snapshot_sha256,
+        "memory_pack_snapshot_sha256",
+    )?;
+    if input.memory_authority_revision == 0 {
+        return Err(ContextAuthorityFailure::InvalidArgument(
+            "memory_authority_revision",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_memory_use_lookup(
+    input: &MemoryUseReceiptLookup,
+) -> Result<(), ContextAuthorityFailure> {
+    validate_snapshot_id(&input.snapshot_id)?;
+    for (field, value) in [
+        ("expected_scope_ref", &input.expected_scope_ref),
+        ("consumer_principal_id", &input.consumer_principal_id),
+        ("model_ref", &input.model_ref),
+        ("attempt_id", &input.attempt_id),
+        ("dispatch_id", &input.dispatch_id),
+    ] {
+        validate_routing(value, field)?;
+    }
+    validate_digest(
+        &input.memory_pack_snapshot_sha256,
+        "memory_pack_snapshot_sha256",
+    )?;
+    if input.memory_authority_revision == 0 {
+        return Err(ContextAuthorityFailure::InvalidArgument(
+            "memory_authority_revision",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_memory_use_binding(
+    input: &MemoryUseReceiptRequest,
+    snapshot: &ContextSnapshot,
+) -> Result<(), ContextAuthorityFailure> {
+    let memory_pack = snapshot
+        .memory_pack
+        .as_ref()
+        .ok_or(ContextAuthorityFailure::InvalidArgument("memory_pack"))?;
+    if snapshot.snapshot_id != input.snapshot_id
+        || snapshot.target_scope_ref != input.expected_scope_ref
+        || memory_pack.scope_ref != input.expected_scope_ref
+        || memory_pack.authority_revision != input.memory_authority_revision
+        || memory_pack.snapshot_sha256 != input.memory_pack_snapshot_sha256
+    {
+        return Err(ContextAuthorityFailure::IntegrityFailure);
+    }
+    Ok(())
+}
+
+fn memory_use_receipt_id(input: &MemoryUseReceiptRequest) -> String {
+    format!(
+        "memory-use:{}",
+        sha256(
+            format!(
+                "{}\n{}\n{}\n{}",
+                input.snapshot_id, input.model_ref, input.attempt_id, input.dispatch_id
+            )
+            .as_bytes()
+        )
+    )
+}
+
+fn memory_receipt_matches_lookup(
+    receipt: &MemoryUseReceipt,
+    lookup: &MemoryUseReceiptLookup,
+    snapshot_revision: u64,
+) -> bool {
+    receipt.receipt_id
+        == format!(
+            "memory-use:{}",
+            sha256(
+                format!(
+                    "{}\n{}\n{}\n{}",
+                    lookup.snapshot_id, lookup.model_ref, lookup.attempt_id, lookup.dispatch_id
+                )
+                .as_bytes()
+            )
+        )
+        && receipt.snapshot_id == lookup.snapshot_id
+        && receipt.snapshot_revision == snapshot_revision
+        && receipt.consumer_principal_id == lookup.consumer_principal_id
+        && receipt.model_ref == lookup.model_ref
+        && receipt.attempt_id == lookup.attempt_id
+        && receipt.dispatch_id == lookup.dispatch_id
+        && receipt.memory_authority_revision == lookup.memory_authority_revision
+        && receipt.memory_pack_snapshot_sha256 == lookup.memory_pack_snapshot_sha256
+}
+
 fn memory_use_digest(input: &MemoryUseReceiptRequest, snapshot: &ContextSnapshot) -> String {
+    memory_use_semantic_digest(
+        snapshot,
+        &input.consumer_principal_id,
+        &input.model_ref,
+        &input.attempt_id,
+        &input.dispatch_id,
+        input.memory_authority_revision,
+        &input.memory_pack_snapshot_sha256,
+    )
+}
+
+fn memory_use_lookup_digest(input: &MemoryUseReceiptLookup, snapshot: &ContextSnapshot) -> String {
+    memory_use_semantic_digest(
+        snapshot,
+        &input.consumer_principal_id,
+        &input.model_ref,
+        &input.attempt_id,
+        &input.dispatch_id,
+        input.memory_authority_revision,
+        &input.memory_pack_snapshot_sha256,
+    )
+}
+
+fn memory_use_semantic_digest(
+    snapshot: &ContextSnapshot,
+    consumer_principal_id: &str,
+    model_ref: &str,
+    attempt_id: &str,
+    dispatch_id: &str,
+    memory_authority_revision: u64,
+    memory_pack_snapshot_sha256: &str,
+) -> String {
     let descriptor = serde_json::json!({
         "snapshot": snapshot,
-        "consumer_principal_id": input.consumer_principal_id,
-        "model_ref": input.model_ref,
-        "attempt_id": input.attempt_id,
-        "dispatch_id": input.dispatch_id,
-        "memory_authority_revision": input.memory_authority_revision,
-        "memory_pack_snapshot_sha256": input.memory_pack_snapshot_sha256,
+        "consumer_principal_id": consumer_principal_id,
+        "model_ref": model_ref,
+        "attempt_id": attempt_id,
+        "dispatch_id": dispatch_id,
+        "memory_authority_revision": memory_authority_revision,
+        "memory_pack_snapshot_sha256": memory_pack_snapshot_sha256,
     });
     sha256(&serde_json::to_vec(&descriptor).expect("Memory use descriptor is serializable"))
 }
@@ -1343,11 +1603,7 @@ mod tests {
                 content_sha256: "a".repeat(64),
                 included: true,
             }],
-            memory_pack: Some(MemoryPackBinding {
-                scope_ref: "scope:repo".to_owned(),
-                authority_revision: 3,
-                snapshot_sha256: "b".repeat(64),
-            }),
+            memory_pack: None,
             allowed_read_paths: vec!["docs".to_owned()],
             allowed_write_paths: vec!["src".to_owned()],
             allowed_tools: vec!["git".to_owned()],
@@ -1365,6 +1621,17 @@ mod tests {
             expires_at_seconds: current_timestamp().expect("clock") + 600,
             idempotency_key: idempotency_key.to_owned(),
         }
+    }
+
+    fn input_with_memory(idempotency_key: &str) -> IssueContextSnapshot {
+        let mut input = input(idempotency_key);
+        input.memory_pack = Some(MemoryPackBinding {
+            scope_ref: "scope:repo".to_owned(),
+            authority_revision: 3,
+            accepted_snapshot_sha256: "c".repeat(64),
+            snapshot_sha256: "b".repeat(64),
+        });
+        input
     }
 
     fn compiler() -> AuthenticatedContextPrincipal {
@@ -1458,6 +1725,39 @@ mod tests {
             dispatch_id: request.dispatch_id.clone(),
             input_digest_sha256: request.input_digest_sha256.clone(),
             expected_scope_ref: request.expected_scope_ref.clone(),
+        }
+    }
+
+    fn memory_use_request(
+        snapshot: &ContextSnapshot,
+        authorization: &DispatchContextConsumptionAuthorizationRequest,
+        model_ref: &str,
+        idempotency_key: &str,
+    ) -> MemoryUseReceiptRequest {
+        let memory_pack = snapshot.memory_pack.as_ref().expect("memory pack");
+        MemoryUseReceiptRequest {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            expected_scope_ref: snapshot.target_scope_ref.clone(),
+            consumer_principal_id: "harness:codex".to_owned(),
+            model_ref: model_ref.to_owned(),
+            attempt_id: authorization.attempt_id.clone(),
+            dispatch_id: authorization.dispatch_id.clone(),
+            memory_authority_revision: memory_pack.authority_revision,
+            memory_pack_snapshot_sha256: memory_pack.snapshot_sha256.clone(),
+            idempotency_key: idempotency_key.to_owned(),
+        }
+    }
+
+    fn memory_use_lookup(request: &MemoryUseReceiptRequest) -> MemoryUseReceiptLookup {
+        MemoryUseReceiptLookup {
+            snapshot_id: request.snapshot_id.clone(),
+            expected_scope_ref: request.expected_scope_ref.clone(),
+            consumer_principal_id: request.consumer_principal_id.clone(),
+            model_ref: request.model_ref.clone(),
+            attempt_id: request.attempt_id.clone(),
+            dispatch_id: request.dispatch_id.clone(),
+            memory_authority_revision: request.memory_authority_revision,
+            memory_pack_snapshot_sha256: request.memory_pack_snapshot_sha256.clone(),
         }
     }
 
@@ -1993,6 +2293,8 @@ mod tests {
                 revoke_idempotency_count: 1,
                 dispatch_authorization_count: 1,
                 dispatch_authorization_idempotency_count: 1,
+                memory_use_receipt_count: 0,
+                memory_use_idempotency_count: 0,
                 last_event_sequence: 3,
             }
         );
@@ -2088,6 +2390,8 @@ mod tests {
                 revoke_idempotency_count: 1,
                 dispatch_authorization_count: 0,
                 dispatch_authorization_idempotency_count: 0,
+                memory_use_receipt_count: 0,
+                memory_use_idempotency_count: 0,
                 last_event_sequence: 2,
             }
         );
@@ -2722,7 +3026,7 @@ mod tests {
             ))
         );
 
-        let mut invalid_memory = input("invalid-memory");
+        let mut invalid_memory = input_with_memory("invalid-memory");
         invalid_memory
             .memory_pack
             .as_mut()
@@ -2861,10 +3165,173 @@ mod tests {
     }
 
     #[test]
+    fn memory_bound_dispatch_commits_and_recovers_one_atomic_authorization_pair() {
+        let mut authority = authority();
+        let (_, snapshot) = authority
+            .issue(&input_with_memory("atomic-memory-context"), &compiler())
+            .expect("issue memory-bound context");
+        let authorization = authorization_request(
+            &snapshot.snapshot_id,
+            "attempt:atomic-memory",
+            "dispatch:atomic-memory",
+            "atomic-memory-authorization",
+        );
+        let memory = memory_use_request(
+            &snapshot,
+            &authorization,
+            "gpt-5.3-codex",
+            "atomic-memory-use",
+        );
+        let before = authority.inspect_store().expect("inspect before commit");
+
+        let first = authority
+            .authorize_dispatch_consumption_and_memory_use(
+                &governance_kernel(),
+                &authorization,
+                Some(&memory),
+            )
+            .expect("commit atomic authorization pair");
+        let first_memory = first.memory_use.as_ref().expect("memory receipt");
+        assert!(!first.authorization.replayed);
+        assert!(!first_memory.replayed);
+        assert_eq!(first_memory.snapshot_id, snapshot.snapshot_id);
+        assert_eq!(first_memory.attempt_id, authorization.attempt_id);
+        assert_eq!(first_memory.dispatch_id, authorization.dispatch_id);
+        assert_eq!(first_memory.model_ref, "gpt-5.3-codex");
+        let committed = authority.inspect_store().expect("inspect after commit");
+        assert_eq!(committed.event_count, before.event_count + 1);
+        assert_eq!(committed.dispatch_authorization_count, 1);
+        assert_eq!(committed.dispatch_authorization_idempotency_count, 1);
+        assert_eq!(committed.memory_use_receipt_count, 1);
+        assert_eq!(committed.memory_use_idempotency_count, 1);
+
+        let replay = authority
+            .authorize_dispatch_consumption_and_memory_use(
+                &governance_kernel(),
+                &authorization,
+                Some(&memory),
+            )
+            .expect("replay exact authorization pair");
+        assert!(replay.authorization.replayed);
+        assert!(
+            replay
+                .memory_use
+                .as_ref()
+                .expect("replayed memory")
+                .replayed
+        );
+        assert_eq!(
+            replay.authorization.authorization_id,
+            first.authorization.authorization_id
+        );
+        assert_eq!(
+            replay
+                .memory_use
+                .as_ref()
+                .expect("replayed memory")
+                .receipt_id,
+            first_memory.receipt_id
+        );
+        assert_eq!(
+            authority.inspect_store().expect("inspect replay"),
+            committed
+        );
+
+        let recovered = authority
+            .dispatch_consumption_by_dispatch_id(
+                &governance_kernel(),
+                &authorization_lookup(&authorization),
+                Some(&memory_use_lookup(&memory)),
+            )
+            .expect("read atomic pair")
+            .expect("atomic pair exists");
+        assert_eq!(
+            recovered.authorization.authorization_id,
+            first.authorization.authorization_id
+        );
+        assert_eq!(
+            recovered.memory_use.expect("recovered memory").receipt_id,
+            first_memory.receipt_id
+        );
+        assert_eq!(
+            authority.inspect_store().expect("inspect lookup"),
+            committed
+        );
+    }
+
+    #[test]
+    fn memory_bound_dispatch_rejects_missing_drifted_or_preexisting_partial_receipt() {
+        let mut authority = authority();
+        let (_, snapshot) = authority
+            .issue(&input_with_memory("atomic-memory-negative"), &compiler())
+            .expect("issue memory-bound context");
+        let authorization = authorization_request(
+            &snapshot.snapshot_id,
+            "attempt:atomic-memory-negative",
+            "dispatch:atomic-memory-negative",
+            "atomic-memory-negative-authorization",
+        );
+        let memory = memory_use_request(
+            &snapshot,
+            &authorization,
+            "gpt-5.3-codex",
+            "atomic-memory-negative-use",
+        );
+
+        let before_missing = authority.inspect_store().expect("inspect missing");
+        assert_eq!(
+            authority.authorize_dispatch_consumption(&governance_kernel(), &authorization),
+            Err(ContextAuthorityFailure::IntegrityFailure)
+        );
+        assert_eq!(
+            authority.inspect_store().expect("inspect after missing"),
+            before_missing
+        );
+
+        let mut drifted = memory.clone();
+        drifted.memory_pack_snapshot_sha256 = "f".repeat(64);
+        assert_eq!(
+            authority.authorize_dispatch_consumption_and_memory_use(
+                &governance_kernel(),
+                &authorization,
+                Some(&drifted),
+            ),
+            Err(ContextAuthorityFailure::IntegrityFailure)
+        );
+        assert_eq!(
+            authority.inspect_store().expect("inspect after drift"),
+            before_missing
+        );
+
+        authority
+            .record_memory_use(
+                &memory,
+                &governance_kernel(),
+                current_timestamp().expect("clock"),
+            )
+            .expect("create diagnostic-only receipt");
+        let partial = authority.inspect_store().expect("inspect partial receipt");
+        assert_eq!(partial.dispatch_authorization_count, 0);
+        assert_eq!(partial.memory_use_receipt_count, 1);
+        assert_eq!(
+            authority.authorize_dispatch_consumption_and_memory_use(
+                &governance_kernel(),
+                &authorization,
+                Some(&memory),
+            ),
+            Err(ContextAuthorityFailure::AuthorizationTupleConflict)
+        );
+        assert_eq!(
+            authority.inspect_store().expect("inspect rejected partial"),
+            partial
+        );
+    }
+
+    #[test]
     fn memory_use_receipt_is_bound_per_model_and_replays_idempotently() {
         let mut authority = authority();
         let (_, snapshot) = authority
-            .issue(&input("memory-use-context"), &compiler())
+            .issue(&input_with_memory("memory-use-context"), &compiler())
             .expect("issue");
         let memory_pack = snapshot.memory_pack.as_ref().expect("memory pack");
         let request = MemoryUseReceiptRequest {
@@ -2918,7 +3385,7 @@ mod tests {
     fn memory_use_revision_or_principal_mismatch_fails_closed() {
         let mut authority = authority();
         let (_, snapshot) = authority
-            .issue(&input("memory-use-invalid"), &compiler())
+            .issue(&input_with_memory("memory-use-invalid"), &compiler())
             .expect("issue");
         let memory_pack = snapshot.memory_pack.as_ref().expect("memory pack");
         let mut request = MemoryUseReceiptRequest {

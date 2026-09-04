@@ -159,8 +159,9 @@ impl MemoryMutationPort for UnexpectedCommandPorts {
     }
 }
 
+#[tonic::async_trait]
 impl WorkPreparationPort for UnexpectedCommandPorts {
-    fn prepare(
+    async fn prepare(
         &self,
         _request: &PrepareWorkRequest,
         _principal: &CommandPrincipal,

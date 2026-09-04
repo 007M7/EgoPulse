@@ -3,7 +3,8 @@ use egopulse_cognition_runtime::context_authority::{
     ContextGovernanceState, ContextPrincipalKind, ContextSnapshot,
     DispatchContextConsumptionAuthorizationLookup,
     DispatchContextConsumptionAuthorizationReceipt as AuthorityAuthorizationReceipt,
-    DispatchContextConsumptionAuthorizationRequest, RecoveryContextMaterialRequest,
+    DispatchContextConsumptionAuthorizationRequest, DispatchContextConsumptionCommitReceipt,
+    MemoryUseReceiptLookup, MemoryUseReceiptRequest, RecoveryContextMaterialRequest,
     RecoveryContextPurpose,
 };
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
@@ -12,9 +13,9 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
 use egopulse_harness_adapter::{
     AuthorizedDispatchContext, DispatchContextAuthorization, DispatchContextAuthorizationGate,
     DispatchContextAuthorizationReceipt, DispatchContextBinding, DispatchContextRecovery,
-    DispatchContextRecoveryGate, DispatchContextReference, HistoricalDispatchContext,
-    HistoricalDispatchContextBinding, HistoricalDispatchContextState,
-    classify_dispatch_context_reference,
+    DispatchContextRecoveryGate, DispatchContextReference, DispatchMemoryPackBinding,
+    DispatchMemoryUseReceipt, HistoricalDispatchContext, HistoricalDispatchContextBinding,
+    HistoricalDispatchContextState, classify_dispatch_context_reference,
 };
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
@@ -96,14 +97,12 @@ impl ContextDispatchAuthorizationGate {
             input_digest_sha256: envelope.input_bundle_sha256.clone(),
             expected_scope_ref: snapshot.target_scope_ref.clone(),
         };
-        if let Some(receipt) = authority
-            .dispatch_authorization_by_dispatch_id(&self.principal, &lookup)
+        let memory_lookup = memory_use_lookup(&snapshot, envelope)?;
+        if let Some(committed) = authority
+            .dispatch_consumption_by_dispatch_id(&self.principal, &lookup, memory_lookup.as_ref())
             .map_err(map_authority_failure)?
         {
-            authority
-                .verify_dispatch_authorization(&self.principal, &receipt)
-                .map_err(map_authority_failure)?;
-            return Ok(authorized_context(&snapshot, receipt));
+            return Ok(authorized_context(&snapshot, committed));
         }
         if !allow_authorize {
             return Err(context_error(
@@ -145,13 +144,18 @@ impl ContextDispatchAuthorizationGate {
             correlation_id: stable_correlation_id(envelope),
             causation_id: stable_causation_id(envelope),
         };
-        let receipt = authority
-            .authorize_dispatch_consumption(&self.principal, &request)
+        let memory_request = memory_use_request(&snapshot, envelope)?;
+        let committed = authority
+            .authorize_dispatch_consumption_and_memory_use(
+                &self.principal,
+                &request,
+                memory_request.as_ref(),
+            )
             .map_err(map_authority_failure)?;
         authority
-            .verify_dispatch_authorization(&self.principal, &receipt)
+            .verify_dispatch_authorization(&self.principal, &committed.authorization)
             .map_err(map_authority_failure)?;
-        Ok(authorized_context(&snapshot, receipt))
+        Ok(authorized_context(&snapshot, committed))
     }
 }
 
@@ -246,8 +250,9 @@ impl DispatchContextRecoveryGate for ContextDispatchRecoveryGate {
             input_digest_sha256: envelope.input_bundle_sha256.clone(),
             expected_scope_ref: snapshot.target_scope_ref.clone(),
         };
-        let receipt = authority
-            .dispatch_authorization_by_dispatch_id(&self.principal, &lookup)
+        let memory_lookup = memory_use_lookup(&snapshot, envelope)?;
+        let committed = authority
+            .dispatch_consumption_by_dispatch_id(&self.principal, &lookup, memory_lookup.as_ref())
             .map_err(map_authority_failure)?
             .ok_or_else(|| {
                 context_error(
@@ -256,6 +261,7 @@ impl DispatchContextRecoveryGate for ContextDispatchRecoveryGate {
                     false,
                 )
             })?;
+        let receipt = committed.authorization;
         if !recovery_authorization_matches(&snapshot, envelope, &receipt) {
             return Err(context_error(
                 HarnessErrorCode::IntegrityFailure,
@@ -330,6 +336,79 @@ fn recovery_authorization_matches(
         && receipt.committed_at_seconds > 0
 }
 
+fn memory_route<'a>(
+    snapshot: &'a ContextSnapshot,
+    envelope: &'a DispatchEnvelope,
+) -> Result<
+    Option<(
+        &'a egopulse_cognition_runtime::context_authority::MemoryPackBinding,
+        &'a egopulse_domain_contracts::v01::egopulse::harness::v1::DispatchRouteBinding,
+    )>,
+    HarnessError,
+> {
+    let Some(memory_pack) = snapshot.memory_pack.as_ref() else {
+        return Ok(None);
+    };
+    let route = envelope.route_binding.as_ref().ok_or_else(|| {
+        context_error(
+            HarnessErrorCode::IntegrityFailure,
+            "MEMORY_DISPATCH_ROUTE_MISSING",
+            false,
+        )
+    })?;
+    if memory_pack.scope_ref != snapshot.target_scope_ref
+        || memory_pack.authority_revision == 0
+        || !canonical_sha256_is_valid(&memory_pack.accepted_snapshot_sha256)
+        || !canonical_sha256_is_valid(&memory_pack.snapshot_sha256)
+        || route.selected_harness_id.trim().is_empty()
+        || route.provider_model_id.trim().is_empty()
+    {
+        return Err(context_error(
+            HarnessErrorCode::IntegrityFailure,
+            "MEMORY_DISPATCH_BINDING_INVALID",
+            false,
+        ));
+    }
+    Ok(Some((memory_pack, route)))
+}
+
+fn memory_use_request(
+    snapshot: &ContextSnapshot,
+    envelope: &DispatchEnvelope,
+) -> Result<Option<MemoryUseReceiptRequest>, HarnessError> {
+    Ok(
+        memory_route(snapshot, envelope)?.map(|(memory_pack, route)| MemoryUseReceiptRequest {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            expected_scope_ref: snapshot.target_scope_ref.clone(),
+            consumer_principal_id: route.selected_harness_id.clone(),
+            model_ref: route.provider_model_id.clone(),
+            attempt_id: envelope.attempt_id.clone(),
+            dispatch_id: envelope.dispatch_id.clone(),
+            memory_authority_revision: memory_pack.authority_revision,
+            memory_pack_snapshot_sha256: memory_pack.snapshot_sha256.clone(),
+            idempotency_key: format!("context-memory-use:{}", envelope.dispatch_id),
+        }),
+    )
+}
+
+fn memory_use_lookup(
+    snapshot: &ContextSnapshot,
+    envelope: &DispatchEnvelope,
+) -> Result<Option<MemoryUseReceiptLookup>, HarnessError> {
+    Ok(
+        memory_route(snapshot, envelope)?.map(|(memory_pack, route)| MemoryUseReceiptLookup {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            expected_scope_ref: snapshot.target_scope_ref.clone(),
+            consumer_principal_id: route.selected_harness_id.clone(),
+            model_ref: route.provider_model_id.clone(),
+            attempt_id: envelope.attempt_id.clone(),
+            dispatch_id: envelope.dispatch_id.clone(),
+            memory_authority_revision: memory_pack.authority_revision,
+            memory_pack_snapshot_sha256: memory_pack.snapshot_sha256.clone(),
+        }),
+    )
+}
+
 fn stable_recovery_evidence_ref(
     snapshot: &ContextSnapshot,
     envelope: &DispatchEnvelope,
@@ -358,14 +437,21 @@ fn stable_recovery_evidence_ref(
 
 fn authorized_context(
     snapshot: &egopulse_cognition_runtime::context_authority::ContextSnapshot,
-    receipt: AuthorityAuthorizationReceipt,
+    committed: DispatchContextConsumptionCommitReceipt,
 ) -> DispatchContextAuthorization {
+    let receipt = committed.authorization;
     DispatchContextAuthorization::Authorized(Box::new(AuthorizedDispatchContext {
         binding: DispatchContextBinding {
             snapshot_id: snapshot.snapshot_id.clone(),
             snapshot_revision: snapshot.revision,
             content_digest_sha256: snapshot.compiled_context_sha256.clone(),
             expected_scope_ref: snapshot.target_scope_ref.clone(),
+            memory_pack: snapshot.memory_pack.as_ref().map(|memory_pack| {
+                DispatchMemoryPackBinding {
+                    memory_authority_revision: memory_pack.authority_revision,
+                    memory_pack_snapshot_sha256: memory_pack.snapshot_sha256.clone(),
+                }
+            }),
         },
         receipt: DispatchContextAuthorizationReceipt {
             authorization_id: receipt.authorization_id,
@@ -381,6 +467,21 @@ fn authorized_context(
             committed_at_seconds: receipt.committed_at_seconds,
             replayed: receipt.replayed,
         },
+        memory_use: committed
+            .memory_use
+            .map(|receipt| DispatchMemoryUseReceipt {
+                receipt_id: receipt.receipt_id,
+                snapshot_id: receipt.snapshot_id,
+                snapshot_revision: receipt.snapshot_revision,
+                consumer_principal_id: receipt.consumer_principal_id,
+                model_ref: receipt.model_ref,
+                attempt_id: receipt.attempt_id,
+                dispatch_id: receipt.dispatch_id,
+                memory_authority_revision: receipt.memory_authority_revision,
+                memory_pack_snapshot_sha256: receipt.memory_pack_snapshot_sha256,
+                request_digest_sha256: receipt.request_digest_sha256,
+                replayed: receipt.replayed,
+            }),
     }))
 }
 
@@ -495,8 +596,10 @@ mod tests {
     use super::*;
     use egopulse_cognition_runtime::context_authority::{
         ContextAuthorityConfig, ContextRevokeRequest, ContextStoreInspection, IssueContextSnapshot,
+        MemoryPackBinding,
     };
     use egopulse_cognition_runtime::task_authority::SqlCipherKey;
+    use egopulse_domain_contracts::v01::egopulse::harness::v1::DispatchRouteBinding;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -563,6 +666,30 @@ mod tests {
         authority: &Arc<Mutex<ContextAuthority>>,
         idempotency_key: &str,
     ) -> egopulse_cognition_runtime::context_authority::ContextSnapshot {
+        issue_snapshot_with_memory(authority, idempotency_key, None)
+    }
+
+    fn issue_memory_snapshot(
+        authority: &Arc<Mutex<ContextAuthority>>,
+        idempotency_key: &str,
+    ) -> egopulse_cognition_runtime::context_authority::ContextSnapshot {
+        issue_snapshot_with_memory(
+            authority,
+            idempotency_key,
+            Some(MemoryPackBinding {
+                scope_ref: "scope:repo".to_owned(),
+                authority_revision: 17,
+                accepted_snapshot_sha256: "a".repeat(64),
+                snapshot_sha256: "b".repeat(64),
+            }),
+        )
+    }
+
+    fn issue_snapshot_with_memory(
+        authority: &Arc<Mutex<ContextAuthority>>,
+        idempotency_key: &str,
+        memory_pack: Option<MemoryPackBinding>,
+    ) -> egopulse_cognition_runtime::context_authority::ContextSnapshot {
         let input = IssueContextSnapshot {
             owner_principal_id: founder().principal_id,
             intent: "authorize one governed dispatch".to_owned(),
@@ -570,7 +697,7 @@ mod tests {
             target_scope_ref: "scope:repo".to_owned(),
             compiled_context: br#"{"prompt":"authorized context"}"#.to_vec(),
             sources: Vec::new(),
-            memory_pack: None,
+            memory_pack,
             allowed_read_paths: vec!["workspace".to_owned()],
             allowed_write_paths: Vec::new(),
             allowed_tools: Vec::new(),
@@ -611,6 +738,19 @@ mod tests {
             input_bundle_sha256: snapshot.compiled_context_sha256.clone(),
             ..DispatchEnvelope::default()
         }
+    }
+
+    fn memory_envelope(
+        snapshot: &egopulse_cognition_runtime::context_authority::ContextSnapshot,
+        dispatch_id: &str,
+    ) -> DispatchEnvelope {
+        let mut envelope = envelope(snapshot, dispatch_id);
+        envelope.route_binding = Some(DispatchRouteBinding {
+            selected_harness_id: "fixture-harness-v1".to_owned(),
+            provider_model_id: "openai:gpt-5".to_owned(),
+            ..DispatchRouteBinding::default()
+        });
+        envelope
     }
 
     fn revoke(
@@ -708,6 +848,120 @@ mod tests {
         assert_eq!(error.safe_detail_code, "CONTEXT_SNAPSHOT_REVOKED");
         assert!(!error.retryable_delivery);
         assert_eq!(inspect(&authority), before);
+    }
+
+    #[test]
+    fn memory_bound_dispatch_commits_and_recovers_one_exact_atomic_pair() {
+        let root = FixtureRoot::new("memory-atomic-pair");
+        let authority = open_authority(&root);
+        let snapshot = issue_memory_snapshot(&authority, "issue-memory-atomic-pair");
+        let dispatch = memory_envelope(&snapshot, "dispatch:memory-atomic-pair");
+        let gate = ContextDispatchAuthorizationGate::new(Arc::clone(&authority));
+
+        let first = gate
+            .authorize_ready_dispatch(&dispatch)
+            .expect("authorize Memory-bound dispatch");
+        let DispatchContextAuthorization::Authorized(first) = first else {
+            panic!("Memory-bound Context must be authorized");
+        };
+        let memory_binding = first
+            .binding
+            .memory_pack
+            .as_ref()
+            .expect("Memory pack binding");
+        let memory_receipt = first.memory_use.as_ref().expect("Memory use receipt");
+        assert_eq!(memory_binding.memory_authority_revision, 17);
+        assert_eq!(memory_binding.memory_pack_snapshot_sha256, "b".repeat(64));
+        assert_eq!(memory_receipt.snapshot_id, snapshot.snapshot_id);
+        assert_eq!(memory_receipt.snapshot_revision, snapshot.revision);
+        assert_eq!(memory_receipt.consumer_principal_id, "fixture-harness-v1");
+        assert_eq!(memory_receipt.model_ref, "openai:gpt-5");
+        assert_eq!(memory_receipt.attempt_id, dispatch.attempt_id);
+        assert_eq!(memory_receipt.dispatch_id, dispatch.dispatch_id);
+        assert_eq!(memory_receipt.memory_authority_revision, 17);
+        assert_eq!(memory_receipt.memory_pack_snapshot_sha256, "b".repeat(64));
+        assert!(canonical_sha256_is_valid(
+            &memory_receipt.request_digest_sha256
+        ));
+        assert!(!memory_receipt.replayed);
+
+        let after_authorize = inspect(&authority);
+        assert_eq!(after_authorize.dispatch_authorization_count, 1);
+        assert_eq!(after_authorize.dispatch_authorization_idempotency_count, 1);
+        assert_eq!(after_authorize.memory_use_receipt_count, 1);
+        assert_eq!(after_authorize.memory_use_idempotency_count, 1);
+
+        let replay = gate
+            .verify_existing_dispatch(&dispatch)
+            .expect("recover exact authorization pair without writes");
+        let DispatchContextAuthorization::Authorized(replay) = replay else {
+            panic!("Memory-bound replay must remain authorized");
+        };
+        let replay_memory = replay.memory_use.as_ref().expect("replayed Memory receipt");
+        assert_eq!(
+            replay.receipt.authorization_id,
+            first.receipt.authorization_id
+        );
+        assert_eq!(replay_memory.receipt_id, memory_receipt.receipt_id);
+        assert!(replay_memory.replayed);
+        assert_eq!(inspect(&authority), after_authorize);
+
+        let mut changed_route = dispatch.clone();
+        changed_route
+            .route_binding
+            .as_mut()
+            .expect("dispatch route")
+            .provider_model_id = "openai:gpt-5-mini".to_owned();
+        let error = gate
+            .verify_existing_dispatch(&changed_route)
+            .expect_err("route drift cannot inherit the Memory receipt");
+        assert_eq!(
+            error.safe_detail_code,
+            "CONTEXT_AUTHORITY_INTEGRITY_FAILURE"
+        );
+        assert_eq!(inspect(&authority), after_authorize);
+
+        revoke(&authority, &snapshot, "revoke-memory-after-authorization");
+        let after_revoke = inspect(&authority);
+        gate.verify_existing_dispatch(&dispatch)
+            .expect("post-authorization revoke is non-retroactive for exact replay");
+        let recovered = ContextDispatchRecoveryGate::new(Arc::clone(&authority))
+            .recover_existing_dispatch(&dispatch)
+            .expect("recovery requires and finds the exact authorization pair");
+        assert!(matches!(recovered, DispatchContextRecovery::Historical(_)));
+        assert_eq!(inspect(&authority), after_revoke);
+    }
+
+    #[test]
+    fn memory_revoke_first_and_missing_route_create_no_partial_receipts() {
+        let root = FixtureRoot::new("memory-revoke-first");
+        let authority = open_authority(&root);
+        let snapshot = issue_memory_snapshot(&authority, "issue-memory-revoke-first");
+        let dispatch = memory_envelope(&snapshot, "dispatch:memory-revoke-first");
+        revoke(&authority, &snapshot, "revoke-memory-first");
+        let before_rejected_dispatch = inspect(&authority);
+        let gate = ContextDispatchAuthorizationGate::new(Arc::clone(&authority));
+
+        let error = gate
+            .authorize_ready_dispatch(&dispatch)
+            .expect_err("revoked Memory-bound snapshot must fail closed");
+        assert_eq!(error.safe_detail_code, "CONTEXT_SNAPSHOT_REVOKED");
+        assert_eq!(inspect(&authority), before_rejected_dispatch);
+        assert_eq!(before_rejected_dispatch.dispatch_authorization_count, 0);
+        assert_eq!(before_rejected_dispatch.memory_use_receipt_count, 0);
+
+        let other_root = FixtureRoot::new("memory-route-missing");
+        let other_authority = open_authority(&other_root);
+        let other_snapshot = issue_memory_snapshot(&other_authority, "issue-memory-route-missing");
+        let missing_route = envelope(&other_snapshot, "dispatch:memory-route-missing");
+        let before_missing_route = inspect(&other_authority);
+        let error = ContextDispatchAuthorizationGate::new(Arc::clone(&other_authority))
+            .authorize_ready_dispatch(&missing_route)
+            .expect_err("Memory-bound dispatch requires an exact selected route");
+        assert_eq!(error.safe_detail_code, "MEMORY_DISPATCH_ROUTE_MISSING");
+        assert_eq!(inspect(&other_authority), before_missing_route);
+        assert_eq!(before_missing_route.dispatch_authorization_count, 0);
+        assert_eq!(before_missing_route.memory_use_receipt_count, 0);
     }
 
     #[test]

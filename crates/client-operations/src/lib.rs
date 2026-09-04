@@ -37,6 +37,7 @@ use std::{
 use egopulse_client_kernel::{ClientKernel, KernelError, SnapshotStreamTracker, StreamApply};
 use egopulse_domain_contracts::{
     context_revoke::ContextRevokeSemanticRequest,
+    memory::{WORK_MEMORY_MAX_RESULTS, WORK_MEMORY_MAX_SELECTED_CONTENT_BYTES},
     v01::egopulse::{
         artifact::v1::ArtifactSetStatus,
         collaboration::v1::{AttemptStatus, RecoveryClass, RunStatus, StepStatus},
@@ -55,10 +56,10 @@ use egopulse_domain_contracts::{
             LocalApiError, PrepareWorkRequest, PrepareWorkResponse, ProjectionAwaitToken,
             ProjectionHealth, ProjectionMetadata, ProjectionPosition, RevokeContextSnapshotCommand,
             SourceDomain, SourceRevision, StreamFrameKind, TaskView, TaskViewStreamFrame,
-            WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, WorkPreparationPreview,
-            WorkSourceRequest, context_mutation_command, execute_context_mutation_response,
-            get_evidence_graph_response, get_harness_approval_view_response,
-            get_task_view_response,
+            WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, WorkMemoryMode,
+            WorkPreparationPreview, WorkSourceRequest, context_mutation_command,
+            execute_context_mutation_response, get_evidence_graph_response,
+            get_harness_approval_view_response, get_task_view_response,
         },
         policy::v1::{
             HarnessApprovalDecisionStateKind, IssueHarnessApprovalDecisionCommand,
@@ -1039,12 +1040,31 @@ pub struct GuidedWorkSource {
     pub label: String,
 }
 
+/// Per-work Memory consent. Surfaces choose one of these two user-visible
+/// modes; they cannot choose an algorithm, snapshot, record or Authority
+/// revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuidedWorkMemoryMode {
+    Disabled,
+    GovernedRetrieval,
+}
+
+impl GuidedWorkMemoryMode {
+    const fn wire_value(self) -> i32 {
+        match self {
+            Self::Disabled => WorkMemoryMode::Disabled as i32,
+            Self::GovernedRetrieval => WorkMemoryMode::GovernedRetrieval as i32,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuidedWorkInput {
     pub intent: String,
     pub work_type: String,
     pub target_scope_ref: String,
     pub sources: Vec<GuidedWorkSource>,
+    pub memory_mode: GuidedWorkMemoryMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1071,6 +1091,8 @@ pub enum GovernedWorkNotice {
     ContextSourceOutsideWorkspace,
     ContextSourceUnreadable,
     ContextSourceTooLarge,
+    MemoryRetrievalEmpty,
+    MemoryContentBudgetExcluded,
 }
 
 impl GovernedWorkNotice {
@@ -1081,6 +1103,8 @@ impl GovernedWorkNotice {
             Self::ContextSourceOutsideWorkspace => "CONTEXT_SOURCE_OUTSIDE_WORKSPACE",
             Self::ContextSourceUnreadable => "CONTEXT_SOURCE_UNREADABLE",
             Self::ContextSourceTooLarge => "CONTEXT_SOURCE_TOO_LARGE",
+            Self::MemoryRetrievalEmpty => "MEMORY_RETRIEVAL_EMPTY",
+            Self::MemoryContentBudgetExcluded => "MEMORY_CONTENT_BUDGET_EXCLUDED",
         }
     }
 }
@@ -1094,6 +1118,10 @@ pub struct GuidedWorkPreview {
     included_source_count: usize,
     excluded_source_count: usize,
     blockers: Vec<GovernedWorkNotice>,
+    warnings: Vec<GovernedWorkNotice>,
+    memory_mode: GuidedWorkMemoryMode,
+    memory_authority_revision: Option<u64>,
+    memory_pack_snapshot_sha256: Option<String>,
     gate_ready: bool,
     ready_for_founder_confirmation: bool,
 }
@@ -1132,6 +1160,26 @@ impl GuidedWorkPreview {
     #[must_use]
     pub fn blockers(&self) -> &[GovernedWorkNotice] {
         &self.blockers
+    }
+
+    #[must_use]
+    pub fn warnings(&self) -> &[GovernedWorkNotice] {
+        &self.warnings
+    }
+
+    #[must_use]
+    pub const fn memory_mode(&self) -> GuidedWorkMemoryMode {
+        self.memory_mode
+    }
+
+    #[must_use]
+    pub const fn memory_authority_revision(&self) -> Option<u64> {
+        self.memory_authority_revision
+    }
+
+    #[must_use]
+    pub fn memory_pack_snapshot_sha256(&self) -> Option<&str> {
+        self.memory_pack_snapshot_sha256.as_deref()
     }
 
     #[must_use]
@@ -1721,6 +1769,7 @@ impl ClientAttachment {
         work_type: String,
         target_scope_ref: String,
         sources: Vec<(String, String)>,
+        memory_mode: GuidedWorkMemoryMode,
         idempotency_key: String,
     ) -> Result<WorkPreparationPreview, ClientWorkError> {
         let response = self
@@ -1736,6 +1785,7 @@ impl ClientAttachment {
                     .map(|(source_ref, label)| WorkSourceRequest { source_ref, label })
                     .collect(),
                 idempotency_key,
+                memory_mode: memory_mode.wire_value(),
             })
             .await
             .map_err(|error| ClientWorkError::Transport(error.to_string()))?
@@ -1812,6 +1862,7 @@ where
             })
             .collect(),
         idempotency_key: prepare_idempotency_key,
+        memory_mode: input.memory_mode.wire_value(),
     };
     let recovery = RecoverableWorkPreparation {
         authenticated_principal_id: session.authenticated_principal_id.clone(),
@@ -1854,8 +1905,12 @@ fn parse_guided_work_preparation(
         &preview,
         &recovery.request.work_type,
         &recovery.request.target_scope_ref,
+        guided_memory_mode_from_wire(recovery.request.memory_mode)?,
     )?;
-    let safe_preview = guided_work_safe_preview(&preview)?;
+    let safe_preview = guided_work_safe_preview(
+        &preview,
+        guided_memory_mode_from_wire(recovery.request.memory_mode)?,
+    )?;
     Ok(PreparedWork {
         authenticated_principal_id: recovery.authenticated_principal_id.clone(),
         session_id: recovery.session_id.clone(),
@@ -1917,7 +1972,7 @@ pub fn validate_guided_work_input(input: &GuidedWorkInput) -> Result<(), ClientG
             "target_scope_ref is incomplete or too large",
         ));
     }
-    if input.sources.is_empty()
+    if (input.sources.is_empty() && input.memory_mode == GuidedWorkMemoryMode::Disabled)
         || input.sources.len() > GUIDED_WORK_MAX_SOURCES
         || input.sources.iter().any(|source| {
             !is_guided_work_text(&source.source_ref, GUIDED_WORK_MAX_ROUTING_BYTES)
@@ -1954,11 +2009,47 @@ fn validate_guided_work_preview(
     preview: &WorkPreparationPreview,
     expected_work_type: &str,
     expected_scope: &str,
+    expected_memory_mode: GuidedWorkMemoryMode,
 ) -> Result<(), ClientGuidedWorkError> {
+    let response_source_limit = GUIDED_WORK_MAX_SOURCES
+        + if expected_memory_mode == GuidedWorkMemoryMode::GovernedRetrieval {
+            WORK_MEMORY_MAX_RESULTS as usize
+        } else {
+            0
+        };
+    let project_source_count = preview
+        .included_sources
+        .iter()
+        .filter(|source| source.authority == "project")
+        .count()
+        .checked_add(preview.excluded_sources.len());
+    let memory_source_count = preview
+        .included_sources
+        .iter()
+        .filter(|source| source.authority == "memory")
+        .count();
     let canonical_snapshot_id = preview
         .snapshot_id
         .strip_prefix("ctx:")
         .is_some_and(is_canonical_sha256);
+    let memory_binding_valid = match expected_memory_mode {
+        GuidedWorkMemoryMode::Disabled => {
+            preview.memory_authority_revision.is_none()
+                && preview.memory_pack_snapshot_sha256.is_none()
+        }
+        GuidedWorkMemoryMode::GovernedRetrieval => {
+            preview
+                .memory_authority_revision
+                .is_some_and(|revision| revision > 0)
+                && preview
+                    .memory_pack_snapshot_sha256
+                    .as_deref()
+                    .is_some_and(is_canonical_sha256)
+        }
+    };
+    let expected_gate_ready = preview.excluded_sources.is_empty()
+        && (!preview.included_sources.is_empty()
+            || expected_memory_mode == GuidedWorkMemoryMode::GovernedRetrieval);
     if !canonical_snapshot_id
         || preview.snapshot_revision == 0
         || preview.context_state_revision == 0
@@ -1966,13 +2057,15 @@ fn validate_guided_work_preview(
         || preview.target_scope_ref != expected_scope
         || !is_canonical_sha256(&preview.compiled_context_sha256)
         || !is_canonical_sha256(&preview.confirmation_binding_sha256)
-        || preview.included_sources.len() > GUIDED_WORK_MAX_SOURCES
+        || preview.included_sources.len() > response_source_limit
         || preview.excluded_sources.len() > GUIDED_WORK_MAX_SOURCES
+        || project_source_count.is_none_or(|count| count > GUIDED_WORK_MAX_SOURCES)
+        || memory_source_count > WORK_MEMORY_MAX_RESULTS as usize
         || preview
             .included_sources
             .len()
             .checked_add(preview.excluded_sources.len())
-            .is_none_or(|count| count > GUIDED_WORK_MAX_SOURCES)
+            .is_none_or(|count| count > response_source_limit)
         || preview.blockers.len() > GUIDED_WORK_MAX_SOURCES
         || preview.warnings.len() > GUIDED_WORK_MAX_SOURCES
         || preview.non_goals
@@ -1988,7 +2081,9 @@ fn validate_guided_work_preview(
         || preview.included_sources.iter().any(|source| {
             !is_guided_work_response_text(&source.source_ref)
                 || !is_guided_work_response_text(&source.label)
-                || source.authority != "project"
+                || !matches!(source.authority.as_str(), "project" | "memory")
+                || (source.authority == "memory"
+                    && expected_memory_mode != GuidedWorkMemoryMode::GovernedRetrieval)
                 || !is_canonical_sha256(&source.content_sha256)
                 || !source.included
         })
@@ -2001,16 +2096,30 @@ fn validate_guided_work_preview(
             .blockers
             .iter()
             .any(|notice| safe_guided_work_blocker(&notice.code).is_none())
-        || !preview.warnings.is_empty()
+        || preview
+            .warnings
+            .iter()
+            .any(|notice| !is_valid_guided_work_warning(notice))
+        || (expected_memory_mode == GuidedWorkMemoryMode::Disabled && !preview.warnings.is_empty())
+        || !memory_binding_valid
         || preview.gate_ready != preview.ready_for_founder_confirmation
-        || preview.gate_ready
-            != (preview.excluded_sources.is_empty() && !preview.included_sources.is_empty())
+        || preview.gate_ready != expected_gate_ready
     {
         return Err(ClientGuidedWorkError::Protocol(
             "prepared work binding is incomplete",
         ));
     }
     Ok(())
+}
+
+fn guided_memory_mode_from_wire(value: i32) -> Result<GuidedWorkMemoryMode, ClientGuidedWorkError> {
+    match WorkMemoryMode::try_from(value) {
+        Ok(WorkMemoryMode::Disabled) => Ok(GuidedWorkMemoryMode::Disabled),
+        Ok(WorkMemoryMode::GovernedRetrieval) => Ok(GuidedWorkMemoryMode::GovernedRetrieval),
+        Ok(WorkMemoryMode::Unspecified) | Err(_) => Err(ClientGuidedWorkError::Protocol(
+            "guided work memory mode is incomplete",
+        )),
+    }
 }
 
 fn is_guided_work_response_text(value: &str) -> bool {
@@ -2025,6 +2134,14 @@ fn safe_guided_work_blocker(value: &str) -> Option<GovernedWorkNotice> {
         }
         "CONTEXT_SOURCE_UNREADABLE" => Some(GovernedWorkNotice::ContextSourceUnreadable),
         "CONTEXT_SOURCE_TOO_LARGE" => Some(GovernedWorkNotice::ContextSourceTooLarge),
+        _ => None,
+    }
+}
+
+fn safe_guided_work_warning(value: &str) -> Option<GovernedWorkNotice> {
+    match value {
+        "MEMORY_RETRIEVAL_EMPTY" => Some(GovernedWorkNotice::MemoryRetrievalEmpty),
+        "MEMORY_CONTENT_BUDGET_EXCLUDED" => Some(GovernedWorkNotice::MemoryContentBudgetExcluded),
         _ => None,
     }
 }
@@ -2053,8 +2170,29 @@ fn is_valid_guided_work_excluded_source(
     }
 }
 
+fn is_valid_guided_work_warning(
+    notice: &egopulse_domain_contracts::v01::egopulse::localapi::v1::WorkGateNotice,
+) -> bool {
+    match safe_guided_work_warning(&notice.code) {
+        Some(GovernedWorkNotice::MemoryRetrievalEmpty) => {
+            is_guided_work_response_text(&notice.source_ref)
+                && notice.detail == "governed retrieval completed with no matching accepted records"
+        }
+        Some(GovernedWorkNotice::MemoryContentBudgetExcluded) => {
+            is_guided_work_response_text(&notice.source_ref)
+                && notice.detail
+                    == format!(
+                        "rank-prefix exceeded {} UTF-8 bytes",
+                        WORK_MEMORY_MAX_SELECTED_CONTENT_BYTES
+                    )
+        }
+        Some(_) | None => false,
+    }
+}
+
 fn guided_work_safe_preview(
     preview: &WorkPreparationPreview,
+    memory_mode: GuidedWorkMemoryMode,
 ) -> Result<GuidedWorkPreview, ClientGuidedWorkError> {
     let non_goals = preview
         .non_goals
@@ -2072,11 +2210,14 @@ fn guided_work_safe_preview(
         .ok_or(ClientGuidedWorkError::Protocol(
             "prepared work contains an unknown blocker",
         ))?;
-    if !preview.warnings.is_empty() {
-        return Err(ClientGuidedWorkError::Protocol(
+    let warnings = preview
+        .warnings
+        .iter()
+        .map(|notice| safe_guided_work_warning(&notice.code))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(ClientGuidedWorkError::Protocol(
             "prepared work contains an unknown warning",
-        ));
-    }
+        ))?;
     Ok(GuidedWorkPreview {
         normalized_intent: preview.normalized_intent.clone(),
         work_type: preview.work_type.clone(),
@@ -2085,6 +2226,10 @@ fn guided_work_safe_preview(
         included_source_count: preview.included_sources.len(),
         excluded_source_count: preview.excluded_sources.len(),
         blockers,
+        warnings,
+        memory_mode,
+        memory_authority_revision: preview.memory_authority_revision,
+        memory_pack_snapshot_sha256: preview.memory_pack_snapshot_sha256.clone(),
         gate_ready: preview.gate_ready,
         ready_for_founder_confirmation: preview.ready_for_founder_confirmation,
     })
@@ -2108,8 +2253,11 @@ fn seal_guided_work_confirmation(
         &prepared.preview,
         &prepared.safe_preview.work_type,
         &prepared.safe_preview.target_scope_ref,
+        prepared.safe_preview.memory_mode,
     )?;
-    if guided_work_safe_preview(&prepared.preview)? != prepared.safe_preview {
+    if guided_work_safe_preview(&prepared.preview, prepared.safe_preview.memory_mode)?
+        != prepared.safe_preview
+    {
         return Err(ClientGuidedWorkError::BindingChanged);
     }
     if prepared.prepare_idempotency_key.trim().is_empty() {
@@ -4377,6 +4525,7 @@ mod tests {
                 source_ref: "source:sensitive-sentinel".to_owned(),
                 label: "label-sensitive-sentinel".to_owned(),
             }],
+            memory_mode: GuidedWorkMemoryMode::Disabled,
         }
     }
 
@@ -4489,6 +4638,7 @@ mod tests {
         let request = captured.borrow();
         let request = request.as_ref().expect("captured prepare request");
         assert_eq!(request.intent, "sensitive-intent-sentinel");
+        assert_eq!(request.memory_mode, WorkMemoryMode::Disabled as i32);
         assert!(request.idempotency_key.starts_with("guided-work-prepare:"));
         assert_eq!(prepared.preview().work_type(), "implementation");
         let safe_debug = format!("{:?}", prepared.preview());
@@ -4560,20 +4710,30 @@ mod tests {
             )
             .collect();
         assert!(matches!(
-            validate_guided_work_preview(&oversized, "implementation", "project:guided"),
+            validate_guided_work_preview(
+                &oversized,
+                "implementation",
+                "project:guided",
+                GuidedWorkMemoryMode::Disabled,
+            ),
             Err(ClientGuidedWorkError::Protocol(_))
         ));
         let mut malformed_snapshot = guided_work_preview(false);
         malformed_snapshot.snapshot_id = "ctx:ABC".to_owned();
         assert!(matches!(
-            validate_guided_work_preview(&malformed_snapshot, "implementation", "project:guided"),
+            validate_guided_work_preview(
+                &malformed_snapshot,
+                "implementation",
+                "project:guided",
+                GuidedWorkMemoryMode::Disabled,
+            ),
             Err(ClientGuidedWorkError::Protocol(_))
         ));
 
         let mut unknown_non_goal = guided_work_preview(false);
         unknown_non_goal.non_goals = vec!["raw-provider-canary".to_owned()];
         assert!(matches!(
-            guided_work_safe_preview(&unknown_non_goal),
+            guided_work_safe_preview(&unknown_non_goal, GuidedWorkMemoryMode::Disabled),
             Err(ClientGuidedWorkError::Protocol(
                 "prepared work contains an unknown non-goal"
             ))
@@ -4596,7 +4756,8 @@ mod tests {
                 validate_guided_work_preview(
                     &invalid_non_goals,
                     "implementation",
-                    "project:guided"
+                    "project:guided",
+                    GuidedWorkMemoryMode::Disabled,
                 ),
                 Err(ClientGuidedWorkError::Protocol(_))
             ));
@@ -4605,7 +4766,7 @@ mod tests {
         unknown_blocker.blockers[0].code = "RAW_CONTEXT_CANARY".to_owned();
         unknown_blocker.excluded_sources[0].code = "RAW_CONTEXT_CANARY".to_owned();
         assert!(matches!(
-            guided_work_safe_preview(&unknown_blocker),
+            guided_work_safe_preview(&unknown_blocker, GuidedWorkMemoryMode::Disabled),
             Err(ClientGuidedWorkError::Protocol(
                 "prepared work contains an unknown blocker"
             ))
@@ -4618,7 +4779,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            guided_work_safe_preview(&unknown_warning),
+            guided_work_safe_preview(&unknown_warning, GuidedWorkMemoryMode::Disabled),
             Err(ClientGuidedWorkError::Protocol(
                 "prepared work contains an unknown warning"
             ))
@@ -4645,7 +4806,12 @@ mod tests {
             let mut invalid_source = guided_work_preview(false);
             mutate(&mut invalid_source);
             assert!(matches!(
-                validate_guided_work_preview(&invalid_source, "implementation", "project:guided"),
+                validate_guided_work_preview(
+                    &invalid_source,
+                    "implementation",
+                    "project:guided",
+                    GuidedWorkMemoryMode::Disabled,
+                ),
                 Err(ClientGuidedWorkError::Protocol(_))
             ));
         }
@@ -4653,19 +4819,34 @@ mod tests {
         invalid_excluded.excluded_sources[0].detail = "raw-detail-canary".to_owned();
         invalid_excluded.blockers = invalid_excluded.excluded_sources.clone();
         assert!(matches!(
-            validate_guided_work_preview(&invalid_excluded, "implementation", "project:guided"),
+            validate_guided_work_preview(
+                &invalid_excluded,
+                "implementation",
+                "project:guided",
+                GuidedWorkMemoryMode::Disabled,
+            ),
             Err(ClientGuidedWorkError::Protocol(_))
         ));
         let mut mismatched_blocker = guided_work_preview(true);
         mismatched_blocker.blockers.clear();
         assert!(matches!(
-            validate_guided_work_preview(&mismatched_blocker, "implementation", "project:guided"),
+            validate_guided_work_preview(
+                &mismatched_blocker,
+                "implementation",
+                "project:guided",
+                GuidedWorkMemoryMode::Disabled,
+            ),
             Err(ClientGuidedWorkError::Protocol(_))
         ));
         let mut inconsistent_gate = guided_work_preview(false);
         inconsistent_gate.gate_ready = false;
         assert!(matches!(
-            validate_guided_work_preview(&inconsistent_gate, "implementation", "project:guided"),
+            validate_guided_work_preview(
+                &inconsistent_gate,
+                "implementation",
+                "project:guided",
+                GuidedWorkMemoryMode::Disabled,
+            ),
             Err(ClientGuidedWorkError::Protocol(_))
         ));
         let mut inconsistent_confirmation = guided_work_preview(false);
@@ -4674,7 +4855,124 @@ mod tests {
             validate_guided_work_preview(
                 &inconsistent_confirmation,
                 "implementation",
-                "project:guided"
+                "project:guided",
+                GuidedWorkMemoryMode::Disabled,
+            ),
+            Err(ClientGuidedWorkError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn governed_memory_guided_work_accepts_empty_matches_and_rejects_disabled_mode_warnings() {
+        let now = SystemTime::now();
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-memory",
+            "session:guided-memory",
+            &["local.work.prepare", "local.work.confirm"],
+            ClientSurface::Tui,
+            now,
+        );
+        let mut input = guided_work_input();
+        input.sources.clear();
+        input.memory_mode = GuidedWorkMemoryMode::GovernedRetrieval;
+
+        let empty_warning =
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::WorkGateNotice {
+                code: "MEMORY_RETRIEVAL_EMPTY".to_owned(),
+                detail: "governed retrieval completed with no matching accepted records".to_owned(),
+                source_ref: "project:guided".to_owned(),
+            };
+        let mut preview = guided_work_preview(false);
+        preview.included_sources.clear();
+        preview.memory_authority_revision = Some(7);
+        preview.memory_pack_snapshot_sha256 = Some("d".repeat(64));
+        preview.warnings = vec![empty_warning.clone()];
+        let captured = RefCell::new(None);
+        let prepared = block_on_ready(prepare_guided_work_via(
+            &kernel,
+            input,
+            now,
+            |request| {
+                captured.replace(Some(request));
+                let preview = preview.clone();
+                async move {
+                    Ok(PrepareWorkResponse {
+                        outcome: Some(
+                            egopulse_domain_contracts::v01::egopulse::localapi::v1::prepare_work_response::Outcome::Preview(
+                                preview,
+                            ),
+                        ),
+                    })
+                }
+            },
+        ))
+        .expect("governed Memory preparation")
+        .expect_prepared();
+        assert_eq!(
+            captured
+                .borrow()
+                .as_ref()
+                .expect("captured request")
+                .memory_mode,
+            WorkMemoryMode::GovernedRetrieval as i32
+        );
+        assert_eq!(
+            prepared.preview().memory_mode(),
+            GuidedWorkMemoryMode::GovernedRetrieval
+        );
+        assert_eq!(prepared.preview().memory_authority_revision(), Some(7));
+        assert_eq!(
+            prepared.preview().memory_pack_snapshot_sha256(),
+            Some("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+        );
+        assert_eq!(
+            prepared.preview().warnings(),
+            &[GovernedWorkNotice::MemoryRetrievalEmpty]
+        );
+
+        let mut excessive_projects = guided_work_preview(false);
+        excessive_projects.memory_authority_revision = Some(7);
+        excessive_projects.memory_pack_snapshot_sha256 = Some("d".repeat(64));
+        excessive_projects.included_sources =
+            vec![excessive_projects.included_sources[0].clone(); GUIDED_WORK_MAX_SOURCES + 1];
+        excessive_projects.warnings = vec![empty_warning.clone()];
+        assert!(matches!(
+            validate_guided_work_preview(
+                &excessive_projects,
+                "implementation",
+                "project:guided",
+                GuidedWorkMemoryMode::GovernedRetrieval,
+            ),
+            Err(ClientGuidedWorkError::Protocol(_))
+        ));
+
+        let mut excessive_memory = guided_work_preview(false);
+        excessive_memory.memory_authority_revision = Some(7);
+        excessive_memory.memory_pack_snapshot_sha256 = Some("d".repeat(64));
+        let mut memory_source = excessive_memory.included_sources[0].clone();
+        memory_source.source_ref = "memory:accepted".to_owned();
+        memory_source.label = "accepted Memory".to_owned();
+        memory_source.authority = "memory".to_owned();
+        excessive_memory.included_sources =
+            vec![memory_source; WORK_MEMORY_MAX_RESULTS as usize + 1];
+        assert!(matches!(
+            validate_guided_work_preview(
+                &excessive_memory,
+                "implementation",
+                "project:guided",
+                GuidedWorkMemoryMode::GovernedRetrieval,
+            ),
+            Err(ClientGuidedWorkError::Protocol(_))
+        ));
+
+        let mut disabled_with_memory_warning = guided_work_preview(false);
+        disabled_with_memory_warning.warnings = vec![empty_warning];
+        assert!(matches!(
+            validate_guided_work_preview(
+                &disabled_with_memory_warning,
+                "implementation",
+                "project:guided",
+                GuidedWorkMemoryMode::Disabled,
             ),
             Err(ClientGuidedWorkError::Protocol(_))
         ));

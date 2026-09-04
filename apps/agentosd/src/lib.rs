@@ -113,8 +113,9 @@ pub use memory_mutation::{
     MemoryCandidateProducerRegistry, MemoryCandidateProposal, MemoryMutationPortAdapter,
 };
 pub use memory_retrieval::{
-    ConfiguredMemoryRetrievalPort, FailClosedMemoryRetrievalPort, MemoryRetrievalCompositionConfig,
-    MemoryRetrievalConfigurationError, TracingMemoryRetrievalAuditSink,
+    ConfiguredMemoryRetrievalPort, FailClosedMemoryRetrievalPort, GovernedWorkMemoryRetrieval,
+    MemoryRetrievalCompositionConfig, MemoryRetrievalConfigurationError,
+    TracingMemoryRetrievalAuditSink, WorkMemoryRetrievalPort,
 };
 pub use owners::{
     AuthorityCommandPorts, AuthorityPrincipalResolver, DenyAllAuthorityPrincipalResolver,
@@ -342,6 +343,10 @@ pub struct DaemonProviders {
     pub founder_verdict_consume_worker: Option<Arc<dyn FounderVerdictConsumeWorker>>,
     pub task_activation_source: Option<Arc<dyn TaskActivationSource>>,
     pub memory_retrieval_port: Arc<dyn MemoryRetrievalPort>,
+    /// Same supervised retrieval owner used by Work Preparation. Keeping the
+    /// second trait view here prevents accidental construction of another
+    /// Worker, semaphore, allowlist or Memory Authority handle.
+    work_memory_retrieval_port: Arc<dyn memory_retrieval::WorkMemoryRetrievalPort>,
     pub memory_retrieval_audit: Arc<dyn MemoryRetrievalAuditSink>,
     pub memory_mutation_port: Arc<dyn MemoryMutationPort>,
     pub context_mutation_port: Arc<dyn ContextMutationPort>,
@@ -843,6 +848,7 @@ impl DaemonProviders {
             founder_verdict_consume_worker: None,
             task_activation_source: None,
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
+            work_memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             context_mutation_port: Arc::new(FailClosedContextMutationPort),
@@ -923,6 +929,7 @@ impl DaemonProviders {
             founder_verdict_consume_worker,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
+            work_memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             context_mutation_port: Arc::new(FailClosedContextMutationPort),
@@ -977,6 +984,7 @@ impl DaemonProviders {
             founder_verdict_consume_worker,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
             memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
+            work_memory_retrieval_port: Arc::new(FailClosedMemoryRetrievalPort),
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             context_mutation_port: Arc::new(FailClosedContextMutationPort),
@@ -1079,11 +1087,21 @@ impl DaemonProviders {
         authority: Arc<Mutex<MemoryAuthority>>,
         config: MemoryRetrievalCompositionConfig,
     ) -> Result<Self, DaemonCompositionError> {
-        self.memory_retrieval_port = Arc::new(
+        let port = Arc::new(
             ConfiguredMemoryRetrievalPort::new(authority, config)
                 .map_err(DaemonCompositionError::MemoryRetrieval)?,
         );
+        self.memory_retrieval_port = Arc::clone(&port) as Arc<dyn MemoryRetrievalPort>;
+        self.work_memory_retrieval_port = port;
         Ok(self)
+    }
+
+    /// Returns the Work Preparation view of the already configured retrieval
+    /// owner. The returned Arc points at the same concrete Worker instance as
+    /// the public Local Cognition view.
+    #[must_use]
+    pub fn work_memory_retrieval_port(&self) -> Arc<dyn WorkMemoryRetrievalPort> {
+        Arc::clone(&self.work_memory_retrieval_port)
     }
 
     #[must_use]

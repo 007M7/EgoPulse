@@ -28,11 +28,11 @@ use egopulse_client_operations::{
     GovernedStateComposite, GovernedStateDomain, GovernedStateDomainPhase, GovernedStateReason,
     GovernedStateSession, GovernedTaskBaseline, GovernedTaskSession, GovernedTaskState,
     GovernedTaskUpdate, GuidedApprovalDecision, GuidedApprovalDecisionInput,
-    GuidedWorkConfirmationAttempt, GuidedWorkInput, GuidedWorkPreparationAttempt,
-    GuidedWorkPreview, GuidedWorkSource, HarnessContentFilter, HarnessContentSession,
-    HarnessContentUpdate, HarnessContentUpdateKind, TaskResultReview, TaskResultReviewStage,
-    TaskWatchClassification, attach as attach_client, command_metadata, set_task_digest,
-    set_verdict_digest, timestamp_after, validate_guided_work_input,
+    GuidedWorkConfirmationAttempt, GuidedWorkInput, GuidedWorkMemoryMode,
+    GuidedWorkPreparationAttempt, GuidedWorkPreview, GuidedWorkSource, HarnessContentFilter,
+    HarnessContentSession, HarnessContentUpdate, HarnessContentUpdateKind, TaskResultReview,
+    TaskResultReviewStage, TaskWatchClassification, attach as attach_client, command_metadata,
+    set_task_digest, set_verdict_digest, timestamp_after, validate_guided_work_input,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -218,8 +218,11 @@ enum WorkCommand {
         scope: String,
         #[arg(long)]
         work_type: String,
-        #[arg(long = "context-ref", required = true)]
+        #[arg(long = "context-ref")]
         context_refs: Vec<String>,
+        /// Do not retrieve accepted Memory for this work. Governed retrieval is the default.
+        #[arg(long)]
+        no_memory: bool,
         /// Explicitly confirm after the safe preview (required without a TTY).
         #[arg(long, conflicts_with = "cancel")]
         confirm: bool,
@@ -256,6 +259,9 @@ enum WorkCommand {
         work_type: String,
         #[arg(long = "context-ref")]
         context_refs: Vec<String>,
+        /// Do not retrieve accepted Memory for this work. Governed retrieval is the default.
+        #[arg(long)]
+        no_memory: bool,
         #[arg(long)]
         idempotency_key: String,
         #[arg(long)]
@@ -1274,6 +1280,7 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
             scope,
             work_type,
             context_refs,
+            no_memory,
             confirm,
             cancel,
             json,
@@ -1290,6 +1297,11 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
                             source_ref,
                         })
                         .collect(),
+                    memory_mode: if no_memory {
+                        GuidedWorkMemoryMode::Disabled
+                    } else {
+                        GuidedWorkMemoryMode::GovernedRetrieval
+                    },
                 },
                 confirm,
                 cancel,
@@ -1366,6 +1378,7 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
             scope,
             work_type,
             context_refs,
+            no_memory,
             idempotency_key,
             json,
         } => {
@@ -1381,6 +1394,11 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
                         .into_iter()
                         .map(|value| (value.clone(), value))
                         .collect(),
+                    if no_memory {
+                        GuidedWorkMemoryMode::Disabled
+                    } else {
+                        GuidedWorkMemoryMode::GovernedRetrieval
+                    },
                     idempotency_key,
                 )
                 .await
@@ -1396,11 +1414,19 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
                 println!("{}", serde_json::to_string(&payload).unwrap());
             } else {
                 println!(
-                    "Work prepared: snapshot={} context_state_revision={} gate_ready={} sources={} expires_at={}",
+                    "Work prepared: snapshot={} context_state_revision={} gate_ready={} sources={} memory_revision={} memory_pack={} expires_at={}",
                     preview.snapshot_id,
                     preview.context_state_revision,
                     preview.gate_ready,
                     preview.included_sources.len(),
+                    preview
+                        .memory_authority_revision
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "disabled".to_owned()),
+                    preview
+                        .memory_pack_snapshot_sha256
+                        .as_deref()
+                        .unwrap_or("-"),
                     preview
                         .expires_at
                         .as_ref()
@@ -1755,6 +1781,18 @@ fn render_guided_work_preview(preview: &GuidedWorkPreview, json_output: bool) {
         for blocker in preview.blockers() {
             eprintln!("Blocker: {}", blocker.as_str());
         }
+        for warning in preview.warnings() {
+            eprintln!("Warning: {}", warning.as_str());
+        }
+        eprintln!(
+            "Memory: mode={:?} authority_revision={} pack={}",
+            preview.memory_mode(),
+            preview
+                .memory_authority_revision()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "disabled".to_owned()),
+            preview.memory_pack_snapshot_sha256().unwrap_or("-"),
+        );
     }
 }
 
@@ -1769,6 +1807,11 @@ fn guided_work_preview_json(preview: &GuidedWorkPreview) -> serde_json::Value {
         .iter()
         .map(|value| value.as_str().to_owned())
         .collect::<Vec<_>>();
+    let warning_codes = preview
+        .warnings()
+        .iter()
+        .map(|value| value.as_str().to_owned())
+        .collect::<Vec<_>>();
     guided_work_preview_value(
         preview.normalized_intent(),
         preview.work_type(),
@@ -1779,7 +1822,10 @@ fn guided_work_preview_json(preview: &GuidedWorkPreview) -> serde_json::Value {
         preview.gate_ready(),
         preview.ready_for_founder_confirmation(),
         &blocker_codes,
-        &[],
+        &warning_codes,
+        preview.memory_mode(),
+        preview.memory_authority_revision(),
+        preview.memory_pack_snapshot_sha256(),
     )
 }
 
@@ -1795,6 +1841,9 @@ fn guided_work_preview_value(
     ready_for_founder_confirmation: bool,
     blocker_codes: &[String],
     warning_codes: &[String],
+    memory_mode: GuidedWorkMemoryMode,
+    memory_authority_revision: Option<u64>,
+    memory_pack_snapshot_sha256: Option<&str>,
 ) -> serde_json::Value {
     json!({
         "schemaVersion": "egopulse.cli-result/v0.1",
@@ -1811,6 +1860,12 @@ fn guided_work_preview_value(
             "readyForFounderConfirmation": ready_for_founder_confirmation,
             "blockerCodes": blocker_codes,
             "warningCodes": warning_codes,
+            "memoryMode": match memory_mode {
+                GuidedWorkMemoryMode::Disabled => "disabled",
+                GuidedWorkMemoryMode::GovernedRetrieval => "governed_retrieval",
+            },
+            "memoryAuthorityRevision": memory_authority_revision,
+            "memoryPackSnapshotSha256": memory_pack_snapshot_sha256,
         }
     })
 }
@@ -6466,6 +6521,7 @@ mod tests {
                 source_ref: "docs/brief.md".to_owned(),
                 label: "docs/brief.md".to_owned(),
             }],
+            memory_mode: GuidedWorkMemoryMode::GovernedRetrieval,
         }
     }
 
@@ -6560,6 +6616,9 @@ mod tests {
             true,
             &["SOURCE_BLOCKED".to_owned()],
             &["REVIEW_REQUIRED".to_owned()],
+            GuidedWorkMemoryMode::GovernedRetrieval,
+            Some(7),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         );
         let encoded = serde_json::to_string(&value).unwrap();
         assert!(encoded.contains("implementation"));

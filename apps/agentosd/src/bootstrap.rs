@@ -654,6 +654,7 @@ impl ProductionBootstrapConfig {
         let work_port = ConfiguredWorkPreparationPort::new(
             Arc::clone(&context),
             Arc::clone(&providers.task_port),
+            Arc::clone(&providers.work_memory_retrieval_port),
             self.codex.native.workspace_root.clone(),
             task_guard_config.allowed_work_types,
             task_guard_config.acceptance_contract_ref,

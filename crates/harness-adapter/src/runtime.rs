@@ -97,6 +97,33 @@ pub struct DispatchContextBinding {
     pub snapshot_revision: u64,
     pub content_digest_sha256: String,
     pub expected_scope_ref: String,
+    pub memory_pack: Option<DispatchMemoryPackBinding>,
+}
+
+/// Memory facts embedded in the immutable ContextSnapshot and independently
+/// compared with the Context Authority use receipt before delivery begins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchMemoryPackBinding {
+    pub memory_authority_revision: u64,
+    pub memory_pack_snapshot_sha256: String,
+}
+
+/// Complete durable per-route Memory-use receipt. This is evidence that the
+/// exact pack was made available to this governed dispatch, not evidence of
+/// Provider delivery or model influence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchMemoryUseReceipt {
+    pub receipt_id: String,
+    pub snapshot_id: String,
+    pub snapshot_revision: u64,
+    pub consumer_principal_id: String,
+    pub model_ref: String,
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub memory_authority_revision: u64,
+    pub memory_pack_snapshot_sha256: String,
+    pub request_digest_sha256: String,
+    pub replayed: bool,
 }
 
 /// Complete durable Context dispatch-consumption receipt. Keeping every field
@@ -122,6 +149,7 @@ pub struct DispatchContextAuthorizationReceipt {
 pub struct AuthorizedDispatchContext {
     pub binding: DispatchContextBinding,
     pub receipt: DispatchContextAuthorizationReceipt,
+    pub memory_use: Option<DispatchMemoryUseReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2109,7 +2137,8 @@ fn validate_context_authorization(
                 && canonical_sha256_is_valid(&receipt.input_digest_sha256)
                 && canonical_sha256_is_valid(&receipt.request_digest_sha256)
                 && opaque_reference_is_valid(&receipt.event_id)
-                && receipt.committed_at_seconds > 0;
+                && receipt.committed_at_seconds > 0
+                && memory_authorization_is_valid(envelope, binding, context.memory_use.as_ref());
             if !valid {
                 return Err(context_binding_error(
                     HarnessErrorCode::IntegrityFailure,
@@ -2129,6 +2158,36 @@ fn validate_context_authorization(
             "CONTEXT_AUTHORIZATION_INVALID",
             false,
         )),
+    }
+}
+
+fn memory_authorization_is_valid(
+    envelope: &DispatchEnvelope,
+    context: &DispatchContextBinding,
+    receipt: Option<&DispatchMemoryUseReceipt>,
+) -> bool {
+    match (context.memory_pack.as_ref(), receipt) {
+        (None, None) => true,
+        (Some(memory_pack), Some(receipt)) => {
+            envelope.route_binding.as_ref().is_some_and(|route| {
+                opaque_reference_is_valid(&receipt.receipt_id)
+                    && receipt.snapshot_id == context.snapshot_id
+                    && receipt.snapshot_revision == context.snapshot_revision
+                    && opaque_reference_is_valid(&receipt.consumer_principal_id)
+                    && receipt.consumer_principal_id == route.selected_harness_id
+                    && opaque_reference_is_valid(&receipt.model_ref)
+                    && receipt.model_ref == route.provider_model_id
+                    && receipt.attempt_id == envelope.attempt_id
+                    && receipt.dispatch_id == envelope.dispatch_id
+                    && memory_pack.memory_authority_revision > 0
+                    && receipt.memory_authority_revision == memory_pack.memory_authority_revision
+                    && canonical_sha256_is_valid(&memory_pack.memory_pack_snapshot_sha256)
+                    && receipt.memory_pack_snapshot_sha256
+                        == memory_pack.memory_pack_snapshot_sha256
+                    && canonical_sha256_is_valid(&receipt.request_digest_sha256)
+            })
+        }
+        _ => false,
     }
 }
 
@@ -2520,7 +2579,10 @@ mod probe_tests {
 mod dispatch_context_gate_tests {
     use super::*;
     use crate::{AdapterEdgeConfig, AdapterEdgeKey};
-    use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
+    use egopulse_domain_contracts::v01::egopulse::{
+        common::v1::ContractReference,
+        harness::v1::{DispatchRouteBinding, NoCatalogSnapshot, dispatch_route_binding},
+    };
     use std::fs;
     use std::path::Path;
     use std::sync::{
@@ -2813,6 +2875,7 @@ mod dispatch_context_gate_tests {
                 snapshot_revision: 1,
                 content_digest_sha256: envelope.input_bundle_sha256.clone(),
                 expected_scope_ref: "scope:repo".to_owned(),
+                memory_pack: None,
             },
             receipt: DispatchContextAuthorizationReceipt {
                 authorization_id: "ctxauth:test".to_owned(),
@@ -2828,7 +2891,50 @@ mod dispatch_context_gate_tests {
                 committed_at_seconds: 1_787_488_000,
                 replayed: false,
             },
+            memory_use: None,
         }))
+    }
+
+    fn route_binding() -> DispatchRouteBinding {
+        let mut binding = DispatchRouteBinding {
+            provider_bootstrap_profile_id: "provider:openai".to_owned(),
+            selected_harness_id: "codex".to_owned(),
+            provider_model_id: "gpt-5.3-codex".to_owned(),
+            catalog_snapshot: Some(dispatch_route_binding::CatalogSnapshot::NoCatalogSnapshot(
+                NoCatalogSnapshot {},
+            )),
+            capability_profile_id: PROFILE_ID.to_owned(),
+            route_binding_sha256: String::new(),
+        };
+        binding.route_binding_sha256 = crate::canonical_dispatch_route_binding_digest(&binding)
+            .expect("canonical route binding");
+        binding
+    }
+
+    fn memory_authorization(envelope: &DispatchEnvelope) -> DispatchContextAuthorization {
+        let DispatchContextAuthorization::Authorized(mut context) = authorization(envelope) else {
+            panic!("fixture authorization")
+        };
+        let memory_pack_snapshot_sha256 = "e".repeat(64);
+        context.binding.memory_pack = Some(DispatchMemoryPackBinding {
+            memory_authority_revision: 7,
+            memory_pack_snapshot_sha256: memory_pack_snapshot_sha256.clone(),
+        });
+        let route = envelope.route_binding.as_ref().expect("dispatch route");
+        context.memory_use = Some(DispatchMemoryUseReceipt {
+            receipt_id: "memory-use:test".to_owned(),
+            snapshot_id: context.binding.snapshot_id.clone(),
+            snapshot_revision: context.binding.snapshot_revision,
+            consumer_principal_id: route.selected_harness_id.clone(),
+            model_ref: route.provider_model_id.clone(),
+            attempt_id: envelope.attempt_id.clone(),
+            dispatch_id: envelope.dispatch_id.clone(),
+            memory_authority_revision: 7,
+            memory_pack_snapshot_sha256,
+            request_digest_sha256: "f".repeat(64),
+            replayed: false,
+        });
+        DispatchContextAuthorization::Authorized(context)
     }
 
     fn result_error(result: DispatchResult) -> HarnessError {
@@ -3005,6 +3111,124 @@ mod dispatch_context_gate_tests {
         assert_eq!(ready_calls.load(Ordering::SeqCst), 1);
         assert_eq!(existing_calls.load(Ordering::SeqCst), 0);
         assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_bound_authorization_requires_complete_receipt_and_exact_route_before_send() {
+        let root = FixtureRoot::new("memory-matching");
+        let route = route_binding();
+        let mut resolved = material();
+        resolved.model = Some(route.provider_model_id.clone());
+        let mut dispatch = envelope(&resolved, "dispatch-memory-matching");
+        dispatch.route_binding = Some(route.clone());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut governed = adapter(&root.database(), resolved, Arc::clone(&sends))
+            .with_dispatch_route_binding(route.clone(), route.provider_model_id.clone())
+            .with_dispatch_context_authorization_gate(CountingGate {
+                authorization: memory_authorization(&dispatch),
+                ready_calls: Arc::new(AtomicUsize::new(0)),
+                existing_calls: Arc::new(AtomicUsize::new(0)),
+            });
+
+        let result = governed
+            .dispatch(&dispatch)
+            .await
+            .expect("memory-authorized dispatch");
+        assert!(matches!(
+            result.outcome,
+            Some(dispatch_result::Outcome::Receipt(receipt))
+                if receipt.disposition == DeliveryDisposition::Delivered as i32
+        ));
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+
+        for label in [
+            "missing-receipt",
+            "missing-binding",
+            "consumer-route",
+            "model-route",
+            "memory-revision",
+            "memory-pack",
+            "memory-request-digest",
+            "memory-snapshot",
+        ] {
+            let root = FixtureRoot::new(label);
+            let route = route_binding();
+            let mut resolved = material();
+            resolved.model = Some(route.provider_model_id.clone());
+            let mut dispatch = envelope(&resolved, &format!("dispatch-{label}"));
+            dispatch.route_binding = Some(route.clone());
+            let DispatchContextAuthorization::Authorized(mut context) =
+                memory_authorization(&dispatch)
+            else {
+                panic!("memory fixture authorization")
+            };
+            match label {
+                "missing-receipt" => context.memory_use = None,
+                "missing-binding" => context.binding.memory_pack = None,
+                "consumer-route" => {
+                    context
+                        .memory_use
+                        .as_mut()
+                        .expect("memory receipt")
+                        .consumer_principal_id = "other-harness".to_owned();
+                }
+                "model-route" => {
+                    context
+                        .memory_use
+                        .as_mut()
+                        .expect("memory receipt")
+                        .model_ref = "other-model".to_owned();
+                }
+                "memory-revision" => {
+                    context
+                        .memory_use
+                        .as_mut()
+                        .expect("memory receipt")
+                        .memory_authority_revision += 1;
+                }
+                "memory-pack" => {
+                    context
+                        .memory_use
+                        .as_mut()
+                        .expect("memory receipt")
+                        .memory_pack_snapshot_sha256 = "0".repeat(64);
+                }
+                "memory-request-digest" => {
+                    context
+                        .memory_use
+                        .as_mut()
+                        .expect("memory receipt")
+                        .request_digest_sha256 = "F".repeat(64);
+                }
+                "memory-snapshot" => {
+                    context
+                        .memory_use
+                        .as_mut()
+                        .expect("memory receipt")
+                        .snapshot_id = format!("ctx:{}", "0".repeat(64));
+                }
+                _ => unreachable!(),
+            }
+            let sends = Arc::new(AtomicUsize::new(0));
+            let mut governed = adapter(&root.database(), resolved, Arc::clone(&sends))
+                .with_dispatch_route_binding(route.clone(), route.provider_model_id.clone())
+                .with_dispatch_context_authorization_gate(CountingGate {
+                    authorization: DispatchContextAuthorization::Authorized(context),
+                    ready_calls: Arc::new(AtomicUsize::new(0)),
+                    existing_calls: Arc::new(AtomicUsize::new(0)),
+                });
+
+            let error = result_error(
+                governed
+                    .dispatch(&dispatch)
+                    .await
+                    .expect("tamper is represented as typed result"),
+            );
+            assert_eq!(error.safe_detail_code, "CONTEXT_AUTHORIZATION_INVALID");
+            assert_eq!(sends.load(Ordering::SeqCst), 0);
+            drop(governed);
+            assert_prepared(&root.database(), &dispatch);
+        }
     }
 
     #[tokio::test]

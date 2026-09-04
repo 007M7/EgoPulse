@@ -1,6 +1,7 @@
 use super::{
     ContextGovernanceState, ContextRevokeReceipt, ContextSnapshot, ContextStoreInspection,
-    DispatchContextConsumptionAuthorizationReceipt, MemoryUseReceipt,
+    DispatchContextConsumptionAuthorizationReceipt, DispatchContextConsumptionCommitReceipt,
+    MemoryUseReceipt,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
@@ -243,6 +244,16 @@ pub(super) struct DispatchAuthorizationCommit<'a> {
     pub(super) authorization_id: &'a str,
     pub(super) event_id: &'a str,
     pub(super) committed_at_seconds: i64,
+}
+
+pub(super) struct MemoryUseCommit<'a> {
+    pub(super) consumer_principal_id: &'a str,
+    pub(super) model_ref: &'a str,
+    pub(super) memory_authority_revision: u64,
+    pub(super) memory_pack_snapshot_sha256: &'a str,
+    pub(super) idempotency_key: &'a str,
+    pub(super) request_digest_sha256: &'a str,
+    pub(super) receipt_id: &'a str,
 }
 
 pub(super) struct RecoveryLineageRequest<'a> {
@@ -517,31 +528,7 @@ impl ContextStore {
         &self,
         receipt_id: &str,
     ) -> Result<Option<MemoryUseReceipt>, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT receipt_id, snapshot_id, snapshot_revision,
-                        consumer_principal_id, model_ref, attempt_id, dispatch_id,
-                        memory_authority_revision, memory_pack_snapshot_sha256
-                 FROM context_memory_use_receipts WHERE receipt_id=?1",
-                [receipt_id],
-                |row| {
-                    Ok(MemoryUseReceipt {
-                        receipt_id: row.get(0)?,
-                        snapshot_id: row.get(1)?,
-                        snapshot_revision: row.get::<_, i64>(2)? as u64,
-                        consumer_principal_id: row.get(3)?,
-                        model_ref: row.get(4)?,
-                        attempt_id: row.get(5)?,
-                        dispatch_id: row.get(6)?,
-                        memory_authority_revision: row.get::<_, i64>(7)? as u64,
-                        memory_pack_snapshot_sha256: row.get(8)?,
-                        request_digest_sha256: String::new(),
-                        replayed: false,
-                    })
-                },
-            )
-            .optional()
-            .map_err(StoreError::from)
+        memory_use_receipt_row(&self.connection, receipt_id)
     }
 
     pub(super) fn memory_use_receipt_by_tuple(
@@ -564,6 +551,24 @@ impl ContextStore {
             .map(|value| self.memory_use_receipt(&value))
             .transpose()
             .map(|value| value.flatten())
+    }
+
+    pub(super) fn memory_use_receipt_has_request_digest(
+        &self,
+        principal_id: &str,
+        receipt_id: &str,
+        expected_request_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        let (count, matching, distinct): (i64, i64, i64) = self.connection.query_row(
+            "SELECT count(*),
+                    coalesce(sum(CASE WHEN request_digest_sha256=?3 THEN 1 ELSE 0 END),0),
+                    count(DISTINCT request_digest_sha256)
+             FROM context_memory_use_idempotency
+             WHERE principal_id=?1 AND receipt_id=?2",
+            params![principal_id, receipt_id, expected_request_digest_sha256],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(count > 0 && matching == count && distinct == 1)
     }
 
     pub(super) fn bind_memory_use_idempotency(
@@ -847,7 +852,8 @@ impl ContextStore {
     pub(super) fn authorize_dispatch_consumption(
         &mut self,
         commit: DispatchAuthorizationCommit<'_>,
-    ) -> Result<DispatchContextConsumptionAuthorizationReceipt, StoreError> {
+        memory: Option<MemoryUseCommit<'_>>,
+    ) -> Result<DispatchContextConsumptionCommitReceipt, StoreError> {
         #[cfg(test)]
         let test_write_hook = self.test_write_hook.clone();
         #[cfg(test)]
@@ -905,8 +911,17 @@ impl ContextStore {
             {
                 return Err(StoreError::IntegrityFailure);
             }
+            let memory_use = recover_committed_memory_use(
+                &transaction,
+                &commit,
+                &stored.snapshot,
+                memory.as_ref(),
+            )?;
             transaction.commit()?;
-            return Ok(receipt);
+            return Ok(DispatchContextConsumptionCommitReceipt {
+                authorization: receipt,
+                memory_use,
+            });
         }
 
         if transaction
@@ -937,6 +952,10 @@ impl ContextStore {
         }
         if stored.snapshot.compiled_context_sha256 != commit.input_digest_sha256 {
             return Err(StoreError::AuthorizationTupleConflict);
+        }
+        validate_memory_commit_binding(&commit, &stored.snapshot, memory.as_ref())?;
+        if let Some(memory) = memory.as_ref() {
+            reject_existing_memory_use(&transaction, &commit, memory)?;
         }
 
         let sequence = insert_context_event(
@@ -987,21 +1006,35 @@ impl ContextStore {
                 commit.authorization_id,
             ],
         )?;
+        let memory_use = memory
+            .as_ref()
+            .map(|memory| {
+                insert_memory_use_in_transaction(
+                    &transaction,
+                    &commit,
+                    memory,
+                    stored.snapshot.revision,
+                )
+            })
+            .transpose()?;
         update_event_sequence(&transaction, sequence)?;
         transaction.commit()?;
-        Ok(DispatchContextConsumptionAuthorizationReceipt {
-            authorization_id: commit.authorization_id.to_owned(),
-            snapshot_id: commit.snapshot_id.to_owned(),
-            snapshot_revision: stored.snapshot.revision,
-            observed_state_revision: stored.state_revision,
-            attempt_id: commit.attempt_id.to_owned(),
-            dispatch_id: commit.dispatch_id.to_owned(),
-            input_digest_sha256: commit.input_digest_sha256.to_owned(),
-            expected_scope_ref: commit.expected_scope_ref.to_owned(),
-            request_digest_sha256: commit.request_digest_sha256.to_owned(),
-            event_id: commit.event_id.to_owned(),
-            committed_at_seconds: commit.committed_at_seconds,
-            replayed: false,
+        Ok(DispatchContextConsumptionCommitReceipt {
+            authorization: DispatchContextConsumptionAuthorizationReceipt {
+                authorization_id: commit.authorization_id.to_owned(),
+                snapshot_id: commit.snapshot_id.to_owned(),
+                snapshot_revision: stored.snapshot.revision,
+                observed_state_revision: stored.state_revision,
+                attempt_id: commit.attempt_id.to_owned(),
+                dispatch_id: commit.dispatch_id.to_owned(),
+                input_digest_sha256: commit.input_digest_sha256.to_owned(),
+                expected_scope_ref: commit.expected_scope_ref.to_owned(),
+                request_digest_sha256: commit.request_digest_sha256.to_owned(),
+                event_id: commit.event_id.to_owned(),
+                committed_at_seconds: commit.committed_at_seconds,
+                replayed: false,
+            },
+            memory_use,
         })
     }
 
@@ -1128,6 +1161,10 @@ impl ContextStore {
             dispatch_authorization_idempotency_count: scalar(
                 "SELECT count(*) FROM context_dispatch_authorization_idempotency",
             )?,
+            memory_use_receipt_count: scalar("SELECT count(*) FROM context_memory_use_receipts")?,
+            memory_use_idempotency_count: scalar(
+                "SELECT count(*) FROM context_memory_use_idempotency",
+            )?,
             last_event_sequence,
         })
     }
@@ -1212,6 +1249,209 @@ fn test_busy_handler(_retry_count: i32) -> bool {
             false
         }
     })
+}
+
+fn validate_memory_commit_binding(
+    authorization: &DispatchAuthorizationCommit<'_>,
+    snapshot: &ContextSnapshot,
+    memory: Option<&MemoryUseCommit<'_>>,
+) -> Result<(), StoreError> {
+    match (snapshot.memory_pack.as_ref(), memory) {
+        (None, None) => Ok(()),
+        (Some(binding), Some(memory))
+            if binding.scope_ref == authorization.expected_scope_ref
+                && binding.authority_revision == memory.memory_authority_revision
+                && binding.snapshot_sha256 == memory.memory_pack_snapshot_sha256 =>
+        {
+            Ok(())
+        }
+        _ => Err(StoreError::IntegrityFailure),
+    }
+}
+
+fn reject_existing_memory_use(
+    transaction: &Transaction<'_>,
+    authorization: &DispatchAuthorizationCommit<'_>,
+    memory: &MemoryUseCommit<'_>,
+) -> Result<(), StoreError> {
+    let idempotency_exists = transaction
+        .query_row(
+            "SELECT 1 FROM context_memory_use_idempotency
+             WHERE principal_id=?1 AND idempotency_key=?2",
+            params![authorization.principal_id, memory.idempotency_key],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    let tuple_exists = transaction
+        .query_row(
+            "SELECT 1 FROM context_memory_use_receipts
+             WHERE receipt_id=?1 OR
+                   (snapshot_id=?2 AND model_ref=?3 AND attempt_id=?4 AND dispatch_id=?5)",
+            params![
+                memory.receipt_id,
+                authorization.snapshot_id,
+                memory.model_ref,
+                authorization.attempt_id,
+                authorization.dispatch_id,
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if idempotency_exists || tuple_exists {
+        return Err(StoreError::AuthorizationTupleConflict);
+    }
+    Ok(())
+}
+
+fn recover_committed_memory_use(
+    transaction: &Transaction<'_>,
+    authorization: &DispatchAuthorizationCommit<'_>,
+    snapshot: &ContextSnapshot,
+    memory: Option<&MemoryUseCommit<'_>>,
+) -> Result<Option<MemoryUseReceipt>, StoreError> {
+    validate_memory_commit_binding(authorization, snapshot, memory)?;
+    let Some(memory) = memory else {
+        let count: i64 = transaction.query_row(
+            "SELECT count(*) FROM context_memory_use_receipts
+             WHERE snapshot_id=?1 AND attempt_id=?2 AND dispatch_id=?3",
+            params![
+                authorization.snapshot_id,
+                authorization.attempt_id,
+                authorization.dispatch_id
+            ],
+            |row| row.get(0),
+        )?;
+        return if count == 0 {
+            Ok(None)
+        } else {
+            Err(StoreError::IntegrityFailure)
+        };
+    };
+    let idempotency: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT request_digest_sha256,receipt_id
+             FROM context_memory_use_idempotency
+             WHERE principal_id=?1 AND idempotency_key=?2",
+            params![authorization.principal_id, memory.idempotency_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((request_digest_sha256, receipt_id)) = idempotency else {
+        return Err(StoreError::IntegrityFailure);
+    };
+    if request_digest_sha256 != memory.request_digest_sha256 || receipt_id != memory.receipt_id {
+        return Err(StoreError::IntegrityFailure);
+    }
+    let mut receipt =
+        memory_use_receipt_row(transaction, &receipt_id)?.ok_or(StoreError::IntegrityFailure)?;
+    if !memory_use_commit_matches_receipt(authorization, memory, snapshot.revision, &receipt) {
+        return Err(StoreError::IntegrityFailure);
+    }
+    receipt.request_digest_sha256 = request_digest_sha256;
+    receipt.replayed = true;
+    Ok(Some(receipt))
+}
+
+fn insert_memory_use_in_transaction(
+    transaction: &Transaction<'_>,
+    authorization: &DispatchAuthorizationCommit<'_>,
+    memory: &MemoryUseCommit<'_>,
+    snapshot_revision: u64,
+) -> Result<MemoryUseReceipt, StoreError> {
+    let receipt = MemoryUseReceipt {
+        receipt_id: memory.receipt_id.to_owned(),
+        snapshot_id: authorization.snapshot_id.to_owned(),
+        snapshot_revision,
+        consumer_principal_id: memory.consumer_principal_id.to_owned(),
+        model_ref: memory.model_ref.to_owned(),
+        attempt_id: authorization.attempt_id.to_owned(),
+        dispatch_id: authorization.dispatch_id.to_owned(),
+        memory_authority_revision: memory.memory_authority_revision,
+        memory_pack_snapshot_sha256: memory.memory_pack_snapshot_sha256.to_owned(),
+        request_digest_sha256: memory.request_digest_sha256.to_owned(),
+        replayed: false,
+    };
+    transaction.execute(
+        "INSERT INTO context_memory_use_receipts(
+         receipt_id,snapshot_id,snapshot_revision,consumer_principal_id,model_ref,
+         attempt_id,dispatch_id,memory_authority_revision,memory_pack_snapshot_sha256,
+         committed_at_seconds)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            receipt.receipt_id,
+            receipt.snapshot_id,
+            receipt.snapshot_revision as i64,
+            receipt.consumer_principal_id,
+            receipt.model_ref,
+            receipt.attempt_id,
+            receipt.dispatch_id,
+            receipt.memory_authority_revision as i64,
+            receipt.memory_pack_snapshot_sha256,
+            authorization.committed_at_seconds,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO context_memory_use_idempotency(
+         principal_id,idempotency_key,request_digest_sha256,receipt_id)
+         VALUES(?1,?2,?3,?4)",
+        params![
+            authorization.principal_id,
+            memory.idempotency_key,
+            memory.request_digest_sha256,
+            memory.receipt_id,
+        ],
+    )?;
+    Ok(receipt)
+}
+
+fn memory_use_commit_matches_receipt(
+    authorization: &DispatchAuthorizationCommit<'_>,
+    memory: &MemoryUseCommit<'_>,
+    snapshot_revision: u64,
+    receipt: &MemoryUseReceipt,
+) -> bool {
+    receipt.receipt_id == memory.receipt_id
+        && receipt.snapshot_id == authorization.snapshot_id
+        && receipt.snapshot_revision == snapshot_revision
+        && receipt.consumer_principal_id == memory.consumer_principal_id
+        && receipt.model_ref == memory.model_ref
+        && receipt.attempt_id == authorization.attempt_id
+        && receipt.dispatch_id == authorization.dispatch_id
+        && receipt.memory_authority_revision == memory.memory_authority_revision
+        && receipt.memory_pack_snapshot_sha256 == memory.memory_pack_snapshot_sha256
+}
+
+fn memory_use_receipt_row(
+    connection: &Connection,
+    receipt_id: &str,
+) -> Result<Option<MemoryUseReceipt>, StoreError> {
+    connection
+        .query_row(
+            "SELECT receipt_id, snapshot_id, snapshot_revision,
+                    consumer_principal_id, model_ref, attempt_id, dispatch_id,
+                    memory_authority_revision, memory_pack_snapshot_sha256
+             FROM context_memory_use_receipts WHERE receipt_id=?1",
+            [receipt_id],
+            |row| {
+                Ok(MemoryUseReceipt {
+                    receipt_id: row.get(0)?,
+                    snapshot_id: row.get(1)?,
+                    snapshot_revision: row.get::<_, i64>(2)? as u64,
+                    consumer_principal_id: row.get(3)?,
+                    model_ref: row.get(4)?,
+                    attempt_id: row.get(5)?,
+                    dispatch_id: row.get(6)?,
+                    memory_authority_revision: row.get::<_, i64>(7)? as u64,
+                    memory_pack_snapshot_sha256: row.get(8)?,
+                    request_digest_sha256: String::new(),
+                    replayed: false,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
 }
 
 fn snapshot_in_transaction(

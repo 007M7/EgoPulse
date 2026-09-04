@@ -18,9 +18,9 @@ use crossterm::{
 use egopulse_client_operations::{
     ClientAttachment, ClientContextRevokeError, ClientReadError, ClientWorkError,
     ContextRevokeInput, GovernedHoldReason, GovernedProjectionReason, GovernedTaskState,
-    GuidedApprovalDecision, GuidedApprovalDecisionInput, HarnessContentFilter,
-    PreparedContextRevoke, attach as attach_client, command_metadata, set_task_digest,
-    set_verdict_digest, timestamp_after,
+    GuidedApprovalDecision, GuidedApprovalDecisionInput, GuidedWorkMemoryMode,
+    HarnessContentFilter, PreparedContextRevoke, attach as attach_client, command_metadata,
+    set_task_digest, set_verdict_digest, timestamp_after,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -123,6 +123,9 @@ enum TuiCommand {
         work_type: String,
         #[arg(long = "context-ref")]
         context_refs: Vec<String>,
+        /// Do not retrieve accepted Memory for this work. Governed retrieval is the default.
+        #[arg(long)]
+        no_memory: bool,
         #[arg(long)]
         idempotency_key: String,
         #[arg(long)]
@@ -694,6 +697,7 @@ impl CommandForm {
                         .into_iter()
                         .collect()
                 },
+                no_memory: false,
                 idempotency_key: next(&mut values, "idempotency-key")?,
                 json: false,
             }),
@@ -899,6 +903,7 @@ enum WorkStartKeyIntent {
     NextField,
     PreviousField,
     Backspace,
+    ToggleMemory,
     Push(char),
     Prepare,
     WaitForPreparation,
@@ -1001,6 +1006,7 @@ fn work_start_key_intent(
         (WorkStartStage::Editing, KeyCode::Tab) => WorkStartKeyIntent::NextField,
         (WorkStartStage::Editing, KeyCode::BackTab) => WorkStartKeyIntent::PreviousField,
         (WorkStartStage::Editing, KeyCode::Backspace) => WorkStartKeyIntent::Backspace,
+        (WorkStartStage::Editing, KeyCode::F(2)) => WorkStartKeyIntent::ToggleMemory,
         (WorkStartStage::Editing, KeyCode::Char(character))
             if !key
                 .modifiers
@@ -1409,6 +1415,7 @@ async fn run_command_with_output(
             scope,
             work_type,
             context_refs,
+            no_memory,
             idempotency_key,
             json,
         } => {
@@ -1424,6 +1431,11 @@ async fn run_command_with_output(
                         .into_iter()
                         .map(|value| (value.clone(), value))
                         .collect(),
+                    if no_memory {
+                        GuidedWorkMemoryMode::Disabled
+                    } else {
+                        GuidedWorkMemoryMode::GovernedRetrieval
+                    },
                     idempotency_key,
                 )
                 .await
@@ -1443,20 +1455,31 @@ async fn run_command_with_output(
                             "readyForFounderConfirmation": preview.ready_for_founder_confirmation,
                             "compiledContextSha256": preview.compiled_context_sha256,
                             "confirmationBindingSha256": preview.confirmation_binding_sha256,
+                            "memoryAuthorityRevision": preview.memory_authority_revision,
+                            "memoryPackSnapshotSha256": preview.memory_pack_snapshot_sha256,
                             "includedSources": preview.included_sources.iter().map(|source| json!({"sourceRef": source.source_ref, "label": source.label, "contentSha256": source.content_sha256, "authority": source.authority, "included": source.included})).collect::<Vec<_>>(),
                             "excludedSources": preview.excluded_sources.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
                             "blockers": preview.blockers.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
+                            "warnings": preview.warnings.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
                         }
                     }))
                     .unwrap()
                 );
             } else {
                 println!(
-                    "Work prepared: snapshot={} context_state_revision={} gate_ready={} sources={}",
+                    "Work prepared: snapshot={} context_state_revision={} gate_ready={} sources={} memory_revision={} memory_pack={}",
                     preview.snapshot_id,
                     preview.context_state_revision,
                     preview.gate_ready,
-                    preview.included_sources.len()
+                    preview.included_sources.len(),
+                    preview
+                        .memory_authority_revision
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "disabled".to_owned()),
+                    preview
+                        .memory_pack_snapshot_sha256
+                        .as_deref()
+                        .unwrap_or("-")
                 );
                 println!("Next: review the preview, then run work-confirm with its binding.");
             }
@@ -2708,6 +2731,14 @@ impl App {
                             .expect("Work Start controller exists")
                             .model_mut()
                             .backspace();
+                        Ok(None)
+                    }
+                    WorkStartKeyIntent::ToggleMemory => {
+                        self.work_start
+                            .as_mut()
+                            .expect("Work Start controller exists")
+                            .model_mut()
+                            .toggle_memory();
                         Ok(None)
                     }
                     WorkStartKeyIntent::Push(character) => {
@@ -6317,6 +6348,7 @@ mod tests {
                 scope,
                 work_type,
                 context_refs,
+                no_memory: false,
                 idempotency_key,
                 json: false,
             } if intent == "整理当前项目的 Memory 治理"
@@ -6964,6 +6996,10 @@ mod tests {
         assert_eq!(
             work_start_key_intent(WorkStartStage::Editing, key(KeyCode::Backspace)),
             WorkStartKeyIntent::Backspace
+        );
+        assert_eq!(
+            work_start_key_intent(WorkStartStage::Editing, key(KeyCode::F(2))),
+            WorkStartKeyIntent::ToggleMemory
         );
         assert_eq!(
             work_start_key_intent(WorkStartStage::Editing, key(KeyCode::Esc)),

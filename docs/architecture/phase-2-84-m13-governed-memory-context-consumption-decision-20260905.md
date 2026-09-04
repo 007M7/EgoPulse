@@ -1,8 +1,9 @@
 # Phase 2-84: M-13 governed Memory context consumption decision
 
 - Date: 2026-09-05
-- Status: `recommended_pending_founder`
+- Status: `founder_frozen_implementation_authorized`
 - Decision owner: Founder
+- Decision authority: `conversation:2026-09-05:founder-resume-after-m13-decision-package`
 - Integration DRI: Codex main window
 - Repository baseline: `a494df68f61e76810ff167f8a385d7acf1a84861`
 - Scope: one coherent product capability, not a collection of independent
@@ -125,8 +126,8 @@ one decision, not separately scheduled product features.
 
 ## 5. Recommended M-13 contract
 
-The following clauses are recommended as one package and remain
-`pending_founder_decision` until explicitly confirmed.
+The following clauses are frozen as one package by the decision authority
+recorded above.
 
 ### M13-01 — explicit use mode and compatibility
 
@@ -341,14 +342,15 @@ failure.
   semantic profile passes the existing evaluation gate and is proposed for
   admission.
 
-## 9. Founder decision requested
+## 9. Founder decision
 
-Recommended decision:
+Frozen decision:
 
 > Confirm M13-01 through M13-08 as one governed Memory context-consumption
 > contract, including non-retroactive post-confirmation Memory revoke semantics,
 > the initial bounded lexical profile and the migration/rollback rules in
 > section 8.
 
-Until that explicit confirmation exists, this document remains a decision
-candidate and no production contract/runtime edit is authorized by it.
+The Founder resumed the active implementation goal after this complete package
+was presented. That continuation is recorded as the single package authority;
+it does not authorize any capability outside the boundaries in section 6.

@@ -2,7 +2,7 @@
   "schemaVersion": "egopulse.authorization-capability-profile/v0.1",
   "contractId": "egopulse.authorization.v1",
   "contractVersion": "0.1.0",
-  "authorityRef": "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7",
+  "authorityRef": "conversation:2026-09-05:founder-resume-after-m13-decision-package",
   "localApiContractId": "egopulse.localapi.v1",
   "defaults": {
     "unknownPermission": "fail_closed",
@@ -24,7 +24,7 @@
     { "code": "local.memory.govern", "kind": "write", "description": "Accept or revoke a Memory candidate under Founder governance." },
     { "code": "local.context.revoke", "kind": "write", "description": "Revoke an owned Context snapshot through Context Authority with full semantic-digest confirmation." },
     { "code": "local.task.create", "kind": "write", "description": "Submit the user-owned create_task command branch." },
-    { "code": "local.work.prepare", "kind": "write", "description": "Prepare an Authority-owned work snapshot from explicit Founder intent and sources." },
+    { "code": "local.work.prepare", "kind": "write", "description": "Prepare an Authority-owned work snapshot from explicit Founder intent, sources and an optional governed accepted-Memory retrieval." },
     { "code": "local.work.confirm", "kind": "write", "description": "Confirm an unexpired work snapshot for Task Authority creation." },
     { "code": "local.task.cancellation.request", "kind": "write", "description": "Submit the user-owned request_task_cancellation branch." },
     { "code": "local.approval.decide", "kind": "write", "description": "Submit an issue_harness_approval_decision intent." },

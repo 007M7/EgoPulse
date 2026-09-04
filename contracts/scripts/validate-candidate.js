@@ -24,6 +24,7 @@ const contextRevokeSchemaRelative = 'context-revoke-semantic-profile.schema.json
 const harnessContentProfileRelative = 'profiles/harness-content-disclosure/v1/v01-default.json';
 const harnessContentSchemaRelative = 'harness-content-disclosure-profile.schema.json';
 const r9cAuthorityRef = 'conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7';
+const m13AuthorityRef = 'conversation:2026-09-05:founder-resume-after-m13-decision-package';
 const requiredCategories = new Set(['valid', 'invalid', 'duplicate', 'stale', 'unauthorized', 'recovery']);
 const taskCommandNames = new Set([
   'createTask', 'activateTask', 'submitTaskEvidence', 'recordTaskVerification',
@@ -698,6 +699,13 @@ function validateLocalApiFixture(file) {
   if (operationName === 'executeTaskCommand' && expected.outcome === 'ok') {
     if (expected.writeOwner !== 'TaskAuthority' || expected.projectionAwaitTokenCreated !== true || expected.projectedViewReturnedAsCurrent !== false || expected.localApiFactWritten !== false) fail(prefix + 'gateway must preserve Task authority and projection lag');
   }
+  if (value.fixtureId === 'localapi-valid-governed-memory-work-preparation') {
+    const operation = value.operation.prepareWork || {};
+    const boundary = value.boundaryCases || {};
+    if (operation.memoryMode !== 'WORK_MEMORY_MODE_GOVERNED_RETRIEVAL' || operation.clientSelectableAlgorithm !== false || operation.clientSelectableSnapshot !== false || operation.clientSelectableAuthorityRevision !== false) fail(prefix + 'M-13 request must expose only the closed use mode');
+    if (boundary.omittedMemoryMode !== 'WORK_MEMORY_MODE_DISABLED' || boundary.unspecifiedMemoryMode !== 'WORK_MEMORY_MODE_DISABLED' || boundary.governedRetrievalRunsAt !== 'prepare_work_only' || boundary.confirmRerunsRetrieval !== false || boundary.dispatchRerunsRetrieval !== false) fail(prefix + 'M-13 compatibility or execution boundary drifted');
+    if (expected.writeOwner !== 'ContextAuthority' || expected.acceptedMemoryOnly !== true || expected.workerWritesAuthorityState !== false || expected.previewBindsExactMemoryPack !== true || expected.founderConfirmationRequired !== true || expected.providerSendCount !== 0) fail(prefix + 'M-13 preview ownership or no-send boundary drifted');
+  }
   if (operationName === 'executeFounderVerdict' && expected.outcome === 'ok') {
     if (expected.writeOwner !== 'FounderVerdictAuthority' || expected.localApiReinterpretedDecision !== false) fail(prefix + 'gateway cannot reinterpret Founder verdict');
   }
@@ -933,9 +941,10 @@ function validatePersistenceFixture(file) {
 function main() {
   const manifest = readJson(manifestPath);
   if (manifest.schemaVersion !== 'v01-gate3-contract-candidate-manifest/v0.1') fail('manifest schemaVersion');
-  if (manifest.candidateVersion !== '0.1.0-draft.21' || manifest.status !== 'targeted_revision_r9c_contract_founder_frozen_locally_verified') fail('R-9C draft.21 candidate identity drifted');
+  if (manifest.candidateVersion !== '0.1.0-draft.22' || manifest.status !== 'targeted_revision_m13_contract_founder_frozen_implementation_authorized') fail('M-13 draft.22 candidate identity drifted');
   if (manifest.contextRevokeSchemeCAuthorityRef !== 'conversation:2026-08-31:founder-r9a-gate11-scheme-c') fail('R-9A Scheme C authority drifted');
   if (manifest.r9cHarnessContentAuthorityRef !== r9cAuthorityRef) fail('R-9C Founder freeze authority drifted');
+  if (manifest.m13MemoryContextAuthorityRef !== m13AuthorityRef) fail('M-13 Founder freeze authority drifted');
   const manifestPaths = new Set(manifest.artifacts.map((artifact) => artifact.path.replace(/\\/g, '/')));
   const taskCategories = new Set();
   const taskFixtureFiles = fs.readdirSync(taskFixtureRoot).filter((name) => name.endsWith('.json')).sort();
@@ -1078,12 +1087,12 @@ function main() {
   }
   const clientKernelProfile = readJson(path.join(root, clientKernelProfileRelative));
   if (clientKernelProfile.schemaVersion !== 'egopulse.client-kernel-profile/v0.1' || clientKernelProfile.contractId !== 'egopulse.client-kernel.v1' || clientKernelProfile.contractVersion !== '0.1.0') fail('client-kernel profile identity drifted');
-  if (clientKernelProfile.authorityRef !== r9cAuthorityRef) fail('client-kernel profile missing latest Founder authority');
-  if (clientKernelProfile.localApiCompatibility?.contractId !== 'egopulse.localapi.v1' || clientKernelProfile.localApiCompatibility?.minimumVersion !== '0.1.0-draft.21' || clientKernelProfile.localApiCompatibility?.maximumVersionExclusive !== '0.2.0' || clientKernelProfile.localApiCompatibility?.runtimeReferenceRequired !== true) fail('client-kernel Local API compatibility binding invalid');
+  if (clientKernelProfile.authorityRef !== m13AuthorityRef) fail('client-kernel profile missing latest Founder authority');
+  if (clientKernelProfile.localApiCompatibility?.contractId !== 'egopulse.localapi.v1' || clientKernelProfile.localApiCompatibility?.minimumVersion !== '0.1.0-draft.22' || clientKernelProfile.localApiCompatibility?.maximumVersionExclusive !== '0.2.0' || clientKernelProfile.localApiCompatibility?.runtimeReferenceRequired !== true) fail('client-kernel Local API compatibility binding invalid');
   const kernelBoundary = clientKernelProfile.implementationBoundary || {};
   const expectedSurfaces = new Set(['cli', 'tui', 'desktop_tauri_backend']);
   if (kernelBoundary.sharedKernelLanguage !== 'rust' || kernelBoundary.typescriptBusinessKernelAllowed !== false || kernelBoundary.transport !== 'tonic_grpc_http2_semantics_over_named_pipe_or_uds_no_tcp' || new Set(kernelBoundary.surfaces || []).size !== expectedSurfaces.size || [...expectedSurfaces].some((surface) => !(kernelBoundary.surfaces || []).includes(surface))) fail('client-kernel implementation boundary drifted');
-  const requiredKernelCapabilities = ['session_negotiation', 'query', 'list', 'watch_complete_snapshots', 'content_baseline_pagination', 'watch_operation_records', 'await_projection', 'memory_retrieval', 'context_revoke_full_digest_confirmation', 'typed_command', 'stable_cursor', 'reset_and_refetch', 'read_your_write', 'typed_error', 'frame_deduplication', 'content_generation_fencing'];
+  const requiredKernelCapabilities = ['session_negotiation', 'query', 'list', 'watch_complete_snapshots', 'content_baseline_pagination', 'watch_operation_records', 'await_projection', 'memory_retrieval', 'governed_memory_work_preparation', 'context_revoke_full_digest_confirmation', 'typed_command', 'stable_cursor', 'reset_and_refetch', 'read_your_write', 'typed_error', 'frame_deduplication', 'content_generation_fencing'];
   requireExactSet(clientKernelProfile.capabilities || [], requiredKernelCapabilities, 'client-kernel conformance capability catalog drifted');
   const streamSemantics = clientKernelProfile.streamSemantics || {};
   requireExactSet(streamSemantics.completeSnapshotDomains || [], ['task_views', 'harness_approval_views'], 'client-kernel complete-snapshot domain catalog drifted');
@@ -1094,7 +1103,7 @@ function main() {
 
   const authorizationProfile = readJson(path.join(root, authorizationProfileRelative));
   if (authorizationProfile.schemaVersion !== 'egopulse.authorization-capability-profile/v0.1' || authorizationProfile.contractId !== 'egopulse.authorization.v1' || authorizationProfile.contractVersion !== '0.1.0' || authorizationProfile.localApiContractId !== 'egopulse.localapi.v1') fail('authorization profile identity drifted');
-  if (authorizationProfile.authorityRef !== r9cAuthorityRef) fail('authorization profile missing latest Founder authority');
+  if (authorizationProfile.authorityRef !== m13AuthorityRef) fail('authorization profile missing latest Founder authority');
   const authorizationDefaults = authorizationProfile.defaults || {};
   if (authorizationDefaults.unknownPermission !== 'fail_closed' || authorizationDefaults.unknownRpc !== 'fail_closed' || authorizationDefaults.unknownCommandOneof !== 'fail_closed' || authorizationDefaults.surfaceNeutral !== true || authorizationDefaults.sessionGrantIsFinalAuthorization !== false || authorizationDefaults.owningAuthorityRevalidationRequired !== true) fail('authorization fail-closed defaults drifted');
   const expectedPermissionCodes = new Set(['local.task.read', 'local.evidence.read', 'local.approval.read', 'local.harness.content.read', 'local.projection.status.read', 'local.projection.await', 'local.memory.retrieve', 'local.memory.candidate.submit', 'local.memory.govern', 'local.context.revoke', 'local.task.create', 'local.work.prepare', 'local.work.confirm', 'local.task.cancellation.request', 'local.approval.decide', 'local.founder-verdict.issue', 'local.founder-verdict.revoke', 'local.founder-verdict.apply']);
@@ -1263,7 +1272,7 @@ function main() {
   const publicLimitMarker = contentBaselineFixture.expected?.publicLimitMarkerExample || {};
   if (publicLimitMarker.kind !== 'HARNESS_CONTENT_MARKER_KIND_LIMIT_REACHED' || publicLimitMarker.limitKind !== 'HARNESS_CONTENT_LIMIT_KIND_TASK_RECORDS' || publicLimitMarker.clientInferenceRequired !== false) fail('Local API must expose the typed D08 limit winner without client inference');
   const validation = manifest.validation || {};
-  for (const field of ['bufLint', 'bufBuild', 'protocCompile', 'crossLanguageGeneration', 'faultConformance', 'qualityBudgetProfile', 'clientKernelProfile', 'authorizationCapabilityProfile', 'contextRevokeSemanticProfile', 'harnessContentDisclosureProfile', 'r9cContractGate']) {
+  for (const field of ['bufLint', 'bufBuild', 'protocCompile', 'crossLanguageGeneration', 'faultConformance', 'qualityBudgetProfile', 'clientKernelProfile', 'authorizationCapabilityProfile', 'contextRevokeSemanticProfile', 'harnessContentDisclosureProfile', 'r9cContractGate', 'm13ContractGate']) {
     if (typeof validation[field] !== 'string' || !validation[field].startsWith('passed_')) fail('toolchain evidence is not passed: ' + field);
   }
   if (typeof validation.bufBreaking !== 'string' || (!validation.bufBreaking.startsWith('passed_') && !validation.bufBreaking.startsWith('not_applicable_initial_contract_'))) {
@@ -1281,11 +1290,14 @@ function main() {
   if (!r9a2 || r9a2.status !== 'founder_confirmed_locally_verified') fail('R-9A.2 must be locally verified under the Founder-confirmed contract');
   const r9c1 = manifest.groups.find((group) => group.id === 'R-9C.1');
   if (!r9c1 || r9c1.status !== 'founder_frozen_contract_locally_verified' || r9c1.founderDecisionRequired !== true) fail('R-9C.1 must carry the explicit Founder freeze and local Contract Gate evidence');
+  const m13 = manifest.groups.find((group) => group.id === 'M-13');
+  if (!m13 || m13.status !== 'founder_frozen_implementation_authorized' || m13.founderDecisionRequired !== true) fail('M-13 must carry the single-package Founder freeze and implementation authority');
   const expectedR9aAcceptanceGates = 'passed_gate7_existing_adapter_receipt_and_task_run_step_attempt_unchanged_after_revoke;gate9_authorization_first_and_revoke_first_restart_paths_use_independent_external_side_effect_witness;gate10_context_paths_do_not_create_or_advance_founder_verdict;gate11_scheme_c_new_commit_validation_and_exact_historical_replay_zero_writes_with_changed_semantics_conflict';
   if (validation.r9aAcceptanceGates !== expectedR9aAcceptanceGates) fail('R-9A Gate 7/9/10/11 evidence drifted');
   console.log(`candidate validation passed: ${taskFixtureFiles.length} task fixtures, ${collaborationFixtureFiles.length} collaboration fixtures, ${harnessFixtureFiles.length} harness fixtures, ${artifactFixtureFiles.length} artifact fixtures, ${verificationFixtureFiles.length} verification fixtures, ${verdictFixtureFiles.length} verdict fixtures, ${policyFixtureFiles.length} policy fixtures, ${localApiFixtureFiles.length} localapi fixtures, ${persistenceFixtureFiles.length} persistence fixtures, ${manifest.artifacts.length} digests`);
-  console.log('proto_toolchain_status=passed; draft.21 Buf/protoc and Rust/TypeScript/Python generation are verified');
+  console.log('proto_toolchain_status=passed; draft.22 Buf/protoc and Rust/TypeScript/Python generation are verified');
   console.log('r9c_contract_status=founder_frozen_locally_verified; R9C-D01..D12 and phase-2-82 section 7 are pinned');
+  console.log('m13_contract_status=founder_frozen_implementation_authorized; governed Memory work preparation is pinned');
 }
 
 main();

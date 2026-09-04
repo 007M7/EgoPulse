@@ -190,8 +190,8 @@ use egopulse_v01_fault_conformance::r9a3::{
     write_send_request_frame as write_r9a3_send_request_frame,
 };
 use egopulse_v01_fault_conformance::r9a3_context::{
-    R9a3ContextGovernanceState, R9a3VerdictAuthorityCounts, read_r9a3_context_authority_store,
-    read_r9a3_verdict_authority_counts,
+    R9a3ContextGovernanceState, R9a3VerdictAuthorityCounts, read_m13_memory_dispatch_pair,
+    read_r9a3_context_authority_store, read_r9a3_verdict_authority_counts,
 };
 use egopulse_v01_fault_conformance::r9b_governed_state::read_r9b_governed_state_authorities;
 use egopulse_v01_fault_conformance::u03c_result_review::{
@@ -233,6 +233,7 @@ const R9A3D_EXTERNAL_RECOVERY_MODE: &str = "dynamic-r9a3d-external-recovery";
 const R9A3E_PREAUTH_UNAVAILABLE_MODE: &str = "dynamic-r9a3e-preauth-unavailable";
 const R9A3E_REVOKED_READY_MODE: &str = "dynamic-r9a3e-revoked-ready";
 const R9C_CONTENT_MODE: &str = "dynamic-r9c-content";
+const M13_MEMORY_DISPATCH_MODE: &str = "dynamic-m13-memory-dispatch";
 const R9C_CONTENT_RELEASE_FILE: &str = "r9c-content-release";
 const R9C_VISIBLE_PREFIX: &str = "R9C governed stream ";
 const R9C_VISIBLE_SUFFIX: &str = "reaches both clients.";
@@ -1174,6 +1175,7 @@ impl NativeHarnessDriver for RecordingFixtureDriver {
                 Sha256::digest(material.canonical_input_bundle.as_slice())
             );
             let record = serde_json::json!({
+                "processId": std::process::id(),
                 "dispatchCount": self.dispatch_count,
                 "dispatchId": envelope.dispatch_id,
                 "runId": envelope.run_id,
@@ -3093,16 +3095,28 @@ impl U04cPostCommitUnavailableWorkPort {
     }
 }
 
+#[tonic::async_trait]
 impl WorkPreparationPort for U04cPostCommitUnavailableWorkPort {
-    fn prepare(
+    async fn prepare(
         &self,
         request: &PrepareWorkRequest,
         principal: &CommandPrincipal,
     ) -> Result<WorkPreparationPreview, CommandPortFailure> {
         if self.operation != U04cInjectedOperation::Prepare {
-            return self.inner.prepare(request, principal);
+            return self.inner.prepare(request, principal).await;
         }
         let encoded = request.encode_to_vec();
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+            if state.calls >= 2 {
+                return Err(CommandPortFailure::IntegrityFailure);
+            }
+        }
+        let response = self.inner.prepare(request, principal).await?;
+        let durability = self.durability(Some(response.snapshot_id.as_str()), None);
         let mut state = self
             .state
             .lock()
@@ -3110,8 +3124,6 @@ impl WorkPreparationPort for U04cPostCommitUnavailableWorkPort {
         if state.calls >= 2 {
             return Err(CommandPortFailure::IntegrityFailure);
         }
-        let response = self.inner.prepare(request, principal)?;
-        let durability = self.durability(Some(response.snapshot_id.as_str()), None);
         if state.calls == 0 {
             state.calls = 1;
             state.request = encoded;
@@ -3178,6 +3190,7 @@ fn dynamic_fixture_mode() -> bool {
     matches!(
         fixture_mode().as_str(),
         R8A_FIXTURE_MODE
+            | M13_MEMORY_DISPATCH_MODE
             | R8B_PAUSE_BEFORE_RUNNER_MODE
             | R8B2C_BEGIN_DELIVERY_MODE
             | R8B2C_UNKNOWN_RECOVERY_MODE
@@ -3338,6 +3351,26 @@ fn r9c_profiled_composition(
             selected_harness_id: "codex_app_server".to_owned(),
             provider_model_id,
             catalog_snapshot_sha256: Some("67".repeat(32)),
+            capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
+        })
+        .with_disclosure_credentials(ManagedDisclosureCredentials::harness_account())
+}
+
+fn m13_profiled_composition(
+    native: NativeHarnessCompositionConfig,
+    root: &Path,
+) -> ProfiledNativeHarnessComposition {
+    let profile = r9c_native_profile(&native);
+    let provider_model_id = native
+        .default_model
+        .clone()
+        .expect("M-13 exact fixture model");
+    ProfiledNativeHarnessComposition::new(native, profile, RecordingFixtureDriver::new(root))
+        .with_trusted_dispatch_route_profile(TrustedDispatchRouteProfile {
+            provider_bootstrap_profile_id: "gpt-codex-m13-fixture".to_owned(),
+            selected_harness_id: "codex_app_server".to_owned(),
+            provider_model_id,
+            catalog_snapshot_sha256: Some("68".repeat(32)),
             capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
         })
         .with_disclosure_credentials(ManagedDisclosureCredentials::harness_account())
@@ -4714,6 +4747,7 @@ fn open_fixture_providers(root: &Path) -> DaemonProviders {
             | R9B_DENY_TASK_READ_MODE
             | R9B_DENY_APPROVAL_READ_MODE
             | R8A_FIXTURE_MODE
+            | M13_MEMORY_DISPATCH_MODE
             | R8B_PAUSE_BEFORE_RUNNER_MODE
             | R8B2C_BEGIN_DELIVERY_MODE
             | R8B2C_UNKNOWN_RECOVERY_MODE
@@ -4867,6 +4901,7 @@ where
     let mut work_port = ConfiguredWorkPreparationPort::new(
         Arc::clone(&context),
         Arc::clone(&providers.task_port),
+        providers.work_memory_retrieval_port(),
         root.to_owned(),
         BTreeSet::from(["governed_repository_change".to_owned()]),
         ContractReference {
@@ -4916,7 +4951,15 @@ where
         .expect("R-8A governed workspace should exist");
     let (artifact, verification) = r8a_authorities(root, &native.return_collector);
     let mode = fixture_mode();
-    let providers = if mode == R9C_CONTENT_MODE {
+    let providers = if mode == M13_MEMORY_DISPATCH_MODE {
+        providers
+            .with_profiled_native_harness_drivers(
+                vec![m13_profiled_composition(native, root)],
+                artifact,
+                verification,
+            )
+            .expect("M-13 routed native Harness composition")
+    } else if mode == R9C_CONTENT_MODE {
         providers
             .with_profiled_native_harness_drivers(
                 vec![r9c_profiled_composition(native, root)],
@@ -5062,6 +5105,7 @@ async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Chi
             if matches!(
                 mode,
                 R8A_FIXTURE_MODE
+                    | M13_MEMORY_DISPATCH_MODE
                     | R8B_PAUSE_BEFORE_RUNNER_MODE
                     | R8B2C_BEGIN_DELIVERY_MODE
                     | R8B2C_UNKNOWN_RECOVERY_MODE
@@ -5593,6 +5637,7 @@ async fn prepare_and_confirm_r8b2c_work(
             "governed_repository_change",
             "--context-ref",
             "context.md",
+            "--no-memory",
             "--idempotency-key",
             &prepare_key,
             "--json",
@@ -9525,6 +9570,7 @@ async fn c5_06_real_cli_prepare_confirm_creates_task_only_after_founder_binding(
             "governed_repository_change",
             "--context-ref",
             "context.md",
+            "--no-memory",
             "--idempotency-key",
             "c5-06-prepare",
             "--json",
@@ -9635,6 +9681,7 @@ async fn r8a_cli_prepare_tui_confirm_dispatches_context_material_once() {
             "governed_repository_change",
             "--context-ref",
             "context.md",
+            "--no-memory",
             "--idempotency-key",
             "r8a-prepare",
             "--json",
@@ -9833,6 +9880,7 @@ async fn r8b_activation_outbox_survives_daemon_kill_and_dispatches_once_after_re
             "governed_repository_change",
             "--context-ref",
             "context.md",
+            "--no-memory",
             "--idempotency-key",
             "r8b-1-prepare",
             "--json",
@@ -10072,6 +10120,7 @@ async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without
             "governed_repository_change",
             "--context-ref",
             "context.md",
+            "--no-memory",
             "--idempotency-key",
             "r9a3e-prepare",
             "--json",
@@ -10456,6 +10505,7 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
             "governed_repository_change",
             "--context-ref",
             "context.md",
+            "--no-memory",
             "--idempotency-key",
             "r9a3d-prepare",
             "--json",
@@ -13201,6 +13251,7 @@ async fn u04c_real_cli_cancel_blocked_and_happy_have_exact_task_durability() {
                 "governed_repository_change",
                 "--context-ref",
                 "context.md",
+                "--no-memory",
                 action,
                 "--json",
             ],
@@ -13284,6 +13335,7 @@ async fn u04c_post_commit_unavailable_exact_replays_without_authority_growth() {
                 draft.work_type = "governed_repository_change".to_owned();
                 draft.target_scope_ref = "scope:u04c-replay".to_owned();
                 draft.context_references = "context.md".to_owned();
+                draft.memory_enabled = false;
             }
             controller.prepare().await.expect("start U-04c prepare");
             timeout(Duration::from_secs(8), async {
@@ -13330,6 +13382,7 @@ async fn u04c_post_commit_unavailable_exact_replays_without_authority_growth() {
                     "governed_repository_change",
                     "--context-ref",
                     "context.md",
+                    "--no-memory",
                     "--confirm",
                     "--json",
                 ],
@@ -13420,6 +13473,7 @@ async fn u04c_production_tui_controllers_share_attachment_and_select_exact_confi
         draft.work_type = "governed_repository_change".to_owned();
         draft.target_scope_ref = "scope:u04c-controller".to_owned();
         draft.context_references = "context.md".to_owned();
+        draft.memory_enabled = false;
     }
     work.prepare().await.expect("start U-04c preparation");
     timeout(Duration::from_secs(8), async {
@@ -13511,7 +13565,7 @@ async fn u04c_real_windows_conpty_drives_normal_tui_from_dashboard_to_exact_task
     terminal.send_keys(b"n");
     terminal.wait_for_checkpoint("Stage: Editing").await;
     terminal.send_keys(
-        b"start one governed U-04c ConPTY task\tgoverned_repository_change\tscope:u04c-conpty\tcontext.md\r",
+        b"start one governed U-04c ConPTY task\tgoverned_repository_change\tscope:u04c-conpty\tcontext.md\x1bOQ\r",
     );
     terminal
         .wait_for_checkpoint("Review the governed preview; Enter")
@@ -13605,6 +13659,7 @@ async fn r9c_real_daemon_cli_and_tui_share_one_governed_harness_content_stream()
             "governed_repository_change",
             "--context-ref",
             "context.md",
+            "--no-memory",
             "--idempotency-key",
             "r9c-c5-prepare",
             "--json",
@@ -13838,4 +13893,234 @@ async fn r9c_real_daemon_cli_and_tui_share_one_governed_harness_content_stream()
     assert!(adapter.integrity_is_ok().expect("R-9C Adapter integrity"));
     drop(adapter);
     fs::remove_dir_all(&root).expect("remove R-9C C5 fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m13_real_daemon_cli_tui_dispatch_and_restart_preserve_one_memory_pair() {
+    const MEMORY_TEXT: &str = "EgoPulse governed Memory is Founder accepted.";
+    const INTENT: &str = "Use EgoPulse governed Memory for this repository change";
+    const SCOPE: &str = "scope:founder";
+
+    let root = std::env::temp_dir().join(format!("egopulse-m13-c5-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create M-13 C5 fixture root");
+    fs::write(
+        root.join("context.md"),
+        "M-13 reviewed project context remains separate from governed Memory.",
+    )
+    .expect("write M-13 project source");
+    let instance = format!("m13-c5-{}", Uuid::now_v7());
+    let mut daemon = spawn_fixture_with_mode(&root, &instance, M13_MEMORY_DISPATCH_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut daemon).await;
+
+    let cli_prepare = run_cli(
+        &instance,
+        &[
+            "work",
+            "prepare",
+            "--intent",
+            INTENT,
+            "--scope",
+            SCOPE,
+            "--work-type",
+            "governed_repository_change",
+            "--context-ref",
+            "context.md",
+            "--idempotency-key",
+            "m13-cli-prepare",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        cli_prepare.status.success(),
+        "M-13 CLI prepare failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&cli_prepare.stdout),
+        String::from_utf8_lossy(&cli_prepare.stderr)
+    );
+    let cli_preview: serde_json::Value =
+        serde_json::from_slice(&cli_prepare.stdout).expect("M-13 CLI preview JSON");
+    assert_eq!(cli_preview["data"]["gateReady"], true);
+    assert_eq!(cli_preview["data"]["readyForFounderConfirmation"], true);
+    assert!(
+        cli_preview["data"]["includedSources"]
+            .as_array()
+            .is_some_and(|sources| sources.iter().any(|source| {
+                source["authority"] == "memory" && source["sourceRef"] == "memory-c5-accepted"
+            }))
+    );
+    let snapshot_id = cli_preview["data"]["snapshotId"]
+        .as_str()
+        .expect("M-13 snapshot id")
+        .to_owned();
+    let compiled_digest = cli_preview["data"]["compiledContextSha256"]
+        .as_str()
+        .expect("M-13 compiled Context digest")
+        .to_owned();
+    let confirmation_binding = cli_preview["data"]["confirmationBindingSha256"]
+        .as_str()
+        .expect("M-13 confirmation binding")
+        .to_owned();
+    let memory_revision = cli_preview["data"]["memoryAuthorityRevision"]
+        .as_u64()
+        .expect("M-13 Memory Authority revision");
+    let memory_pack = cli_preview["data"]["memoryPackSnapshotSha256"]
+        .as_str()
+        .expect("M-13 Memory pack digest")
+        .to_owned();
+    assert_eq!(snapshot_id, format!("ctx:{compiled_digest}"));
+    assert_eq!(memory_pack.len(), 64);
+
+    let tui_prepare = run_tui(
+        &instance,
+        &[
+            "--instance",
+            &instance,
+            "work-prepare",
+            "--intent",
+            INTENT,
+            "--scope",
+            SCOPE,
+            "--work-type",
+            "governed_repository_change",
+            "--context-ref",
+            "context.md",
+            "--idempotency-key",
+            "m13-tui-prepare",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        tui_prepare.status.success(),
+        "M-13 TUI prepare failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&tui_prepare.stdout),
+        String::from_utf8_lossy(&tui_prepare.stderr)
+    );
+    let tui_preview: serde_json::Value =
+        serde_json::from_slice(&tui_prepare.stdout).expect("M-13 TUI preview JSON");
+    assert_eq!(tui_preview["data"]["snapshotId"], snapshot_id);
+    assert_eq!(
+        tui_preview["data"]["memoryAuthorityRevision"],
+        memory_revision
+    );
+    assert_eq!(tui_preview["data"]["memoryPackSnapshotSha256"], memory_pack);
+    assert_eq!(
+        tui_preview["data"]["includedSources"],
+        cli_preview["data"]["includedSources"]
+    );
+
+    let confirm = run_tui(
+        &instance,
+        &[
+            "--instance",
+            &instance,
+            "work-confirm",
+            snapshot_id.as_str(),
+            "--confirmation-binding-sha256",
+            confirmation_binding.as_str(),
+            "--idempotency-key",
+            "m13-tui-confirm",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        confirm.status.success(),
+        "M-13 TUI confirm failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&confirm.stdout),
+        String::from_utf8_lossy(&confirm.stderr)
+    );
+    let confirmed: serde_json::Value =
+        serde_json::from_slice(&confirm.stdout).expect("M-13 confirmation JSON");
+    assert_eq!(
+        confirmed["data"]["status"],
+        TaskStatus::Active.as_str_name()
+    );
+
+    let record_path = root.join(R8A_DRIVER_RECORD);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if record_path.is_file() {
+                break;
+            }
+            if let Some(status) = daemon
+                .try_wait()
+                .expect("inspect M-13 daemon before dispatch")
+            {
+                panic!("M-13 daemon exited before dispatch evidence: {status}");
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("M-13 governed dispatch deadline");
+    let first_driver_bytes = fs::read(&record_path).expect("read M-13 driver evidence");
+    let driver: serde_json::Value =
+        serde_json::from_slice(&first_driver_bytes).expect("decode M-13 driver evidence");
+    assert_eq!(driver["dispatchCount"], 1);
+    assert_eq!(driver["model"], "fixture/model");
+    assert!(
+        driver["canonicalInputBundleUtf8"]
+            .as_str()
+            .is_some_and(|value| value.contains(MEMORY_TEXT))
+    );
+    assert!(driver["prompt"].as_str().is_some_and(|value| {
+        value.contains("GOVERNED MEMORY REFERENCE DATA (UNTRUSTED)") && value.contains(MEMORY_TEXT)
+    }));
+
+    stop_u04c_fixture(&mut daemon, "M-13 first daemon").await;
+    let first_pair = read_m13_memory_dispatch_pair(
+        &root.join("context-authority.db"),
+        &[0x15; 32],
+        "c5-context-epoch",
+        &snapshot_id,
+        "r8a-dispatch",
+    )
+    .expect("read first M-13 Context/Memory pair");
+    assert_eq!(first_pair.content_digest_sha256, compiled_digest);
+    assert_eq!(first_pair.target_scope_ref, SCOPE);
+    assert_eq!(first_pair.memory_scope_ref, SCOPE);
+    assert_eq!(first_pair.memory_authority_revision, memory_revision);
+    assert_eq!(first_pair.memory_pack_snapshot_sha256, memory_pack);
+    assert_eq!(first_pair.consumer_principal_id, "codex_app_server");
+    assert_eq!(first_pair.model_ref, "fixture/model");
+    assert_eq!(first_pair.attempt_id, "r8a-attempt");
+    assert_eq!(first_pair.dispatch_id, "r8a-dispatch");
+    let first_adapter =
+        read_r8b2c_adapter_store(&root.join("r8a-adapter.db"), &[0x32; 32], "r8a-dispatch")
+            .expect("read first M-13 Adapter evidence");
+    assert_eq!(first_adapter.dispatch_count, 1);
+    assert_eq!(first_adapter.delivery_unknown_count, 0);
+
+    let mut restarted = spawn_fixture_with_mode(&root, &instance, M13_MEMORY_DISPATCH_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut restarted).await;
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        restarted
+            .try_wait()
+            .expect("inspect restarted M-13 daemon")
+            .is_none()
+    );
+    stop_u04c_fixture(&mut restarted, "M-13 restarted daemon").await;
+
+    let second_pair = read_m13_memory_dispatch_pair(
+        &root.join("context-authority.db"),
+        &[0x15; 32],
+        "c5-context-epoch",
+        &snapshot_id,
+        "r8a-dispatch",
+    )
+    .expect("read restarted M-13 Context/Memory pair");
+    let second_adapter =
+        read_r8b2c_adapter_store(&root.join("r8a-adapter.db"), &[0x32; 32], "r8a-dispatch")
+            .expect("read restarted M-13 Adapter evidence");
+    assert_eq!(second_pair, first_pair);
+    assert_eq!(second_adapter, first_adapter);
+    assert_eq!(
+        fs::read(&record_path).expect("read stable M-13 driver evidence"),
+        first_driver_bytes,
+        "restart recovery must not call the native driver again"
+    );
+
+    fs::remove_dir_all(&root).expect("remove M-13 C5 fixture root");
 }

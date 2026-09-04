@@ -21,6 +21,15 @@ enum ClientSurface {
   CLIENT_SURFACE_TUI = 3;
 }
 
+// Per-work user intent. UNSPECIFIED deliberately preserves the pre-draft.22
+// no-Memory behavior for older clients; only GOVERNED_RETRIEVAL invokes the
+// daemon-owned accepted-snapshot retrieval path.
+enum WorkMemoryMode {
+  WORK_MEMORY_MODE_UNSPECIFIED = 0;
+  WORK_MEMORY_MODE_DISABLED = 1;
+  WORK_MEMORY_MODE_GOVERNED_RETRIEVAL = 2;
+}
+
 enum ProjectionHealth {
   PROJECTION_HEALTH_UNSPECIFIED = 0;
   PROJECTION_HEALTH_READY = 1;
@@ -240,6 +249,7 @@ message PrepareWorkRequest {
   string target_scope_ref = 4;
   repeated WorkSourceRequest sources = 5;
   string idempotency_key = 6;
+  WorkMemoryMode memory_mode = 7;
 }
 
 message PrepareWorkResponse {

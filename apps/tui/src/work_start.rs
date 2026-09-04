@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use egopulse_client_operations::{
     ClientAttachment, ClientGuidedWorkError, ConfirmedWork, GovernedWorkNotice,
-    GuidedWorkConfirmationAttempt, GuidedWorkInput, GuidedWorkNonGoal,
+    GuidedWorkConfirmationAttempt, GuidedWorkInput, GuidedWorkMemoryMode, GuidedWorkNonGoal,
     GuidedWorkPreparationAttempt, GuidedWorkPreview, GuidedWorkSource, PreparedWork,
     RecoverableWorkConfirmation, RecoverableWorkPreparation,
 };
@@ -62,7 +62,7 @@ impl WorkStartPrepared {
 }
 
 enum WorkStartPreparationOutcome {
-    Prepared(WorkStartPrepared),
+    Prepared(Box<WorkStartPrepared>),
     OutcomeUnknown(Arc<dyn WorkStartPreparationRecovery>),
 }
 
@@ -80,6 +80,10 @@ pub struct WorkStartPreview {
     included_source_count: usize,
     excluded_source_count: usize,
     blockers: Vec<GovernedWorkNotice>,
+    warnings: Vec<GovernedWorkNotice>,
+    memory_mode: GuidedWorkMemoryMode,
+    memory_authority_revision: Option<u64>,
+    memory_pack_snapshot_sha256: Option<String>,
     gate_ready: bool,
     ready_for_founder_confirmation: bool,
 }
@@ -94,6 +98,12 @@ impl WorkStartPreview {
             included_source_count: preview.included_source_count(),
             excluded_source_count: preview.excluded_source_count(),
             blockers: preview.blockers().to_vec(),
+            warnings: preview.warnings().to_vec(),
+            memory_mode: preview.memory_mode(),
+            memory_authority_revision: preview.memory_authority_revision(),
+            memory_pack_snapshot_sha256: preview
+                .memory_pack_snapshot_sha256()
+                .map(ToOwned::to_owned),
             gate_ready: preview.gate_ready(),
             ready_for_founder_confirmation: preview.ready_for_founder_confirmation(),
         }
@@ -139,6 +149,26 @@ impl WorkStartPreview {
     }
 
     #[must_use]
+    pub fn warnings(&self) -> &[GovernedWorkNotice] {
+        &self.warnings
+    }
+
+    #[must_use]
+    pub const fn memory_mode(&self) -> GuidedWorkMemoryMode {
+        self.memory_mode
+    }
+
+    #[must_use]
+    pub const fn memory_authority_revision(&self) -> Option<u64> {
+        self.memory_authority_revision
+    }
+
+    #[must_use]
+    pub fn memory_pack_snapshot_sha256(&self) -> Option<&str> {
+        self.memory_pack_snapshot_sha256.as_deref()
+    }
+
+    #[must_use]
     pub const fn gate_ready(&self) -> bool {
         self.gate_ready
     }
@@ -158,9 +188,8 @@ impl WorkStartClient for ProductionWorkStartClient {
         Box::pin(async move {
             match self.attachment.prepare_guided_work(input).await {
                 Ok(GuidedWorkPreparationAttempt::Prepared(prepared)) => {
-                    Ok(WorkStartPreparationOutcome::Prepared(production_prepared(
-                        Arc::clone(&self.attachment),
-                        *prepared,
+                    Ok(WorkStartPreparationOutcome::Prepared(Box::new(
+                        production_prepared(Arc::clone(&self.attachment), *prepared),
                     )))
                 }
                 Ok(GuidedWorkPreparationAttempt::OutcomeUnknown(recovery)) => {
@@ -334,12 +363,25 @@ impl WorkStartField {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Default)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkStartDraft {
     pub intent: String,
     pub work_type: String,
     pub target_scope_ref: String,
     pub context_references: String,
+    pub memory_enabled: bool,
+}
+
+impl Default for WorkStartDraft {
+    fn default() -> Self {
+        Self {
+            intent: String::new(),
+            work_type: String::new(),
+            target_scope_ref: String::new(),
+            context_references: String::new(),
+            memory_enabled: true,
+        }
+    }
 }
 
 impl WorkStartDraft {
@@ -358,6 +400,11 @@ impl WorkStartDraft {
                     label: value.to_owned(),
                 })
                 .collect(),
+            memory_mode: if self.memory_enabled {
+                GuidedWorkMemoryMode::GovernedRetrieval
+            } else {
+                GuidedWorkMemoryMode::Disabled
+            },
         }
     }
 }
@@ -437,6 +484,15 @@ impl WorkStartPageModel {
         self.active_value_mut().pop();
     }
 
+    pub fn toggle_memory(&mut self) {
+        self.draft.memory_enabled = !self.draft.memory_enabled;
+        self.message = if self.draft.memory_enabled {
+            "Governed Memory retrieval enabled for this work".to_owned()
+        } else {
+            "Memory disabled for this work".to_owned()
+        };
+    }
+
     fn active_value_mut(&mut self) -> &mut String {
         match self.active_field {
             WorkStartField::Intent => &mut self.draft.intent,
@@ -480,6 +536,14 @@ pub fn render_work_start_page(frame: &mut Frame<'_>, area: Rect, model: &WorkSta
             marker(WorkStartField::ContextReferences),
             draft.context_references
         )),
+        Line::from(format!(
+            "  Memory: {} (F2 toggles before preparation)",
+            if draft.memory_enabled {
+                "governed retrieval"
+            } else {
+                "disabled"
+            }
+        )),
         Line::from(format!("Status: {}", model.message())),
     ];
     if let Some(preview) = model.preview() {
@@ -501,12 +565,24 @@ pub fn render_work_start_page(frame: &mut Frame<'_>, area: Rect, model: &WorkSta
                 preview.gate_ready(),
                 preview.ready_for_founder_confirmation()
             )),
+            Line::from(format!(
+                "Memory: {:?} / authority revision: {} / pack: {}",
+                preview.memory_mode(),
+                preview
+                    .memory_authority_revision()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "disabled".to_owned()),
+                preview.memory_pack_snapshot_sha256().unwrap_or("-")
+            )),
         ]);
         for non_goal in preview.non_goals() {
             lines.push(Line::from(format!("Non-goal: {}", non_goal.as_str())));
         }
         for blocker in preview.blockers() {
             lines.push(Line::from(format!("Blocker: {}", blocker.as_str())));
+        }
+        for warning in preview.warnings() {
+            lines.push(Line::from(format!("Warning: {}", warning.as_str())));
         }
     }
     frame.render_widget(
@@ -635,7 +711,7 @@ impl<C: WorkStartClient + ?Sized + 'static> WorkStartControllerCore<C> {
                 Ok(WorkStartPreparationOutcome::Prepared(prepared)) => {
                     WorkStartWorkerEvent::Prepared {
                         generation,
-                        prepared,
+                        prepared: *prepared,
                     }
                 }
                 Ok(WorkStartPreparationOutcome::OutcomeUnknown(recovery)) => {
@@ -1106,6 +1182,10 @@ mod tests {
                 .then_some(GovernedWorkNotice::ContextSourceUnreadable)
                 .into_iter()
                 .collect(),
+            warnings: Vec::new(),
+            memory_mode: GuidedWorkMemoryMode::Disabled,
+            memory_authority_revision: None,
+            memory_pack_snapshot_sha256: None,
             gate_ready: ready,
             ready_for_founder_confirmation: ready,
         }
@@ -1131,6 +1211,7 @@ mod tests {
             work_type: "implementation".to_owned(),
             target_scope_ref: "project:test".to_owned(),
             context_references: "docs/one.md, docs/two.md".to_owned(),
+            memory_enabled: true,
         };
         controller
     }
@@ -1163,9 +1244,11 @@ mod tests {
     #[tokio::test]
     async fn prepared_work_is_confirmed_once_and_navigates_with_real_task_identity() {
         let confirms = Arc::new(AtomicU64::new(0));
-        let mut controller = controller_for(Ok(WorkStartPreparationOutcome::Prepared(prepared(
-            Arc::clone(&confirms),
-            WorkStartConfirmationOutcome::Confirmed("task:real".to_owned()),
+        let mut controller = controller_for(Ok(WorkStartPreparationOutcome::Prepared(Box::new(
+            prepared(
+                Arc::clone(&confirms),
+                WorkStartConfirmationOutcome::Confirmed("task:real".to_owned()),
+            ),
         ))));
         controller.prepare().await.unwrap();
         pump_until_settled(&mut controller).await;
@@ -1188,7 +1271,8 @@ mod tests {
             WorkStartConfirmationOutcome::Confirmed("task:blocked".to_owned()),
         );
         blocked.preview = preview(false);
-        let mut controller = controller_for(Ok(WorkStartPreparationOutcome::Prepared(blocked)));
+        let mut controller =
+            controller_for(Ok(WorkStartPreparationOutcome::Prepared(Box::new(blocked))));
         controller.prepare().await.unwrap();
         pump_until_settled(&mut controller).await;
         assert!(controller.confirm().await.is_err());
@@ -1262,9 +1346,9 @@ mod tests {
         let client = Arc::new(PendingClient {
             calls: Arc::clone(&prepare_calls),
             release: Arc::clone(&prepare_release),
-            result: Mutex::new(Some(Ok(WorkStartPreparationOutcome::Prepared(
+            result: Mutex::new(Some(Ok(WorkStartPreparationOutcome::Prepared(Box::new(
                 pending_confirmation,
-            )))),
+            ))))),
         });
         let mut controller = WorkStartControllerCore::new(client);
         controller.prepare().await.unwrap();

@@ -243,6 +243,8 @@ pub struct PrepareWorkRequest {
     pub sources: ::prost::alloc::vec::Vec<WorkSourceRequest>,
     #[prost(string, tag = "6")]
     pub idempotency_key: ::prost::alloc::string::String,
+    #[prost(enumeration = "WorkMemoryMode", tag = "7")]
+    pub memory_mode: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrepareWorkResponse {
@@ -1239,6 +1241,38 @@ impl ClientSurface {
             "CLIENT_SURFACE_DESKTOP" => Some(Self::Desktop),
             "CLIENT_SURFACE_CLI" => Some(Self::Cli),
             "CLIENT_SURFACE_TUI" => Some(Self::Tui),
+            _ => None,
+        }
+    }
+}
+/// Per-work user intent. UNSPECIFIED deliberately preserves the pre-draft.22
+/// no-Memory behavior for older clients; only GOVERNED_RETRIEVAL invokes the
+/// daemon-owned accepted-snapshot retrieval path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WorkMemoryMode {
+    Unspecified = 0,
+    Disabled = 1,
+    GovernedRetrieval = 2,
+}
+impl WorkMemoryMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WORK_MEMORY_MODE_UNSPECIFIED",
+            Self::Disabled => "WORK_MEMORY_MODE_DISABLED",
+            Self::GovernedRetrieval => "WORK_MEMORY_MODE_GOVERNED_RETRIEVAL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WORK_MEMORY_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "WORK_MEMORY_MODE_DISABLED" => Some(Self::Disabled),
+            "WORK_MEMORY_MODE_GOVERNED_RETRIEVAL" => Some(Self::GovernedRetrieval),
             _ => None,
         }
     }

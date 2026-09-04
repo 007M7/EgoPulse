@@ -26,6 +26,12 @@ class ClientSurface(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CLIENT_SURFACE_CLI: _ClassVar[ClientSurface]
     CLIENT_SURFACE_TUI: _ClassVar[ClientSurface]
 
+class WorkMemoryMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    WORK_MEMORY_MODE_UNSPECIFIED: _ClassVar[WorkMemoryMode]
+    WORK_MEMORY_MODE_DISABLED: _ClassVar[WorkMemoryMode]
+    WORK_MEMORY_MODE_GOVERNED_RETRIEVAL: _ClassVar[WorkMemoryMode]
+
 class ProjectionHealth(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     PROJECTION_HEALTH_UNSPECIFIED: _ClassVar[ProjectionHealth]
@@ -107,6 +113,9 @@ CLIENT_SURFACE_UNSPECIFIED: ClientSurface
 CLIENT_SURFACE_DESKTOP: ClientSurface
 CLIENT_SURFACE_CLI: ClientSurface
 CLIENT_SURFACE_TUI: ClientSurface
+WORK_MEMORY_MODE_UNSPECIFIED: WorkMemoryMode
+WORK_MEMORY_MODE_DISABLED: WorkMemoryMode
+WORK_MEMORY_MODE_GOVERNED_RETRIEVAL: WorkMemoryMode
 PROJECTION_HEALTH_UNSPECIFIED: ProjectionHealth
 PROJECTION_HEALTH_READY: ProjectionHealth
 PROJECTION_HEALTH_CATCHING_UP: ProjectionHealth
@@ -378,20 +387,22 @@ class WorkPreparationPreview(_message.Message):
     def __init__(self, snapshot_id: _Optional[str] = ..., snapshot_revision: _Optional[int] = ..., normalized_intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., compiled_context_sha256: _Optional[str] = ..., included_sources: _Optional[_Iterable[_Union[WorkSourceFact, _Mapping]]] = ..., excluded_sources: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., non_goals: _Optional[_Iterable[str]] = ..., allowed_read_paths: _Optional[_Iterable[str]] = ..., allowed_write_paths: _Optional[_Iterable[str]] = ..., allowed_tools: _Optional[_Iterable[str]] = ..., external_resources: _Optional[_Iterable[str]] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., memory_authority_revision: _Optional[int] = ..., memory_pack_snapshot_sha256: _Optional[str] = ..., recovery_entry: _Optional[str] = ..., visibility: _Optional[str] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., confirmation_binding_sha256: _Optional[str] = ..., gate_ready: _Optional[bool] = ..., blockers: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., warnings: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., required_confirmations: _Optional[_Iterable[str]] = ..., evidence_required: _Optional[_Iterable[str]] = ..., ready_for_founder_confirmation: _Optional[bool] = ..., deadline: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., context_state_revision: _Optional[int] = ...) -> None: ...
 
 class PrepareWorkRequest(_message.Message):
-    __slots__ = ("client", "intent", "work_type", "target_scope_ref", "sources", "idempotency_key")
+    __slots__ = ("client", "intent", "work_type", "target_scope_ref", "sources", "idempotency_key", "memory_mode")
     CLIENT_FIELD_NUMBER: _ClassVar[int]
     INTENT_FIELD_NUMBER: _ClassVar[int]
     WORK_TYPE_FIELD_NUMBER: _ClassVar[int]
     TARGET_SCOPE_REF_FIELD_NUMBER: _ClassVar[int]
     SOURCES_FIELD_NUMBER: _ClassVar[int]
     IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_MODE_FIELD_NUMBER: _ClassVar[int]
     client: ClientRequestMetadata
     intent: str
     work_type: str
     target_scope_ref: str
     sources: _containers.RepeatedCompositeFieldContainer[WorkSourceRequest]
     idempotency_key: str
-    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., sources: _Optional[_Iterable[_Union[WorkSourceRequest, _Mapping]]] = ..., idempotency_key: _Optional[str] = ...) -> None: ...
+    memory_mode: WorkMemoryMode
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., sources: _Optional[_Iterable[_Union[WorkSourceRequest, _Mapping]]] = ..., idempotency_key: _Optional[str] = ..., memory_mode: _Optional[_Union[WorkMemoryMode, str]] = ...) -> None: ...
 
 class PrepareWorkResponse(_message.Message):
     __slots__ = ("preview", "error")

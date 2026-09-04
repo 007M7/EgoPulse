@@ -115,6 +115,10 @@ pub struct MemoryMutationReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AcceptedMemorySnapshot {
     pub scope_ref: String,
+    /// Monotonic Authority state revision observed in the same read
+    /// transaction as `records`. Revision 1 represents an empty initial
+    /// store; every committed Memory event advances it once.
+    pub authority_revision: u64,
     pub records: Vec<MemoryRecord>,
     pub snapshot_sha256: String,
 }
@@ -335,15 +339,16 @@ impl MemoryAuthority {
         scope_ref: &str,
     ) -> Result<AcceptedMemorySnapshot, MemoryAuthorityFailure> {
         validate_text(scope_ref, "scope_ref")?;
-        let records = self
-            .store
-            .accepted_memories(scope_ref)?
+        let (authority_revision, stored_records) =
+            self.store.accepted_memories_with_revision(scope_ref)?;
+        let records = stored_records
             .into_iter()
             .map(to_record)
             .collect::<Result<Vec<_>, _>>()?;
         let snapshot_sha256 = digest_records(scope_ref, &records);
         Ok(AcceptedMemorySnapshot {
             scope_ref: scope_ref.to_owned(),
+            authority_revision,
             records,
             snapshot_sha256,
         })

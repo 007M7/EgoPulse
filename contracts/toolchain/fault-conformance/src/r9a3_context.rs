@@ -74,6 +74,30 @@ pub struct R9a3ContextAuthoritySnapshot {
     pub counts: R9a3ContextAuthorityCounts,
 }
 
+/// Read-only M-13 evidence for the exact Context authorization/Memory-use
+/// pair committed before one governed Adapter dispatch. This is a conformance
+/// projection only; it owns no migration or write capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct M13MemoryDispatchPair {
+    pub snapshot_id: String,
+    pub snapshot_revision: u64,
+    pub content_digest_sha256: String,
+    pub target_scope_ref: String,
+    pub memory_scope_ref: String,
+    pub memory_authority_revision: u64,
+    pub accepted_snapshot_sha256: String,
+    pub memory_pack_snapshot_sha256: String,
+    pub authorization_id: String,
+    pub authorization_request_digest_sha256: String,
+    pub receipt_id: String,
+    pub consumer_principal_id: String,
+    pub model_ref: String,
+    pub attempt_id: String,
+    pub dispatch_id: String,
+    pub memory_request_digest_sha256: String,
+    pub committed_at_seconds: i64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct R9a3VerdictAuthorityCounts {
     pub last_event_sequence: u64,
@@ -294,6 +318,289 @@ pub fn read_r9a3_context_authority_store(
         dispatch_authorization,
         counts,
     })
+}
+
+/// Reads and validates one complete M-13 dispatch pair through a SQLCipher
+/// read-only, query-only transaction. Missing or duplicate halves fail closed.
+pub fn read_m13_memory_dispatch_pair(
+    path: &Path,
+    key: &[u8; 32],
+    expected_store_epoch: &str,
+    snapshot_id: &str,
+    dispatch_id: &str,
+) -> FaultConformanceResult<M13MemoryDispatchPair> {
+    validate_identity("expected_store_epoch", expected_store_epoch)?;
+    validate_identity("snapshot_id", snapshot_id)?;
+    validate_identity("dispatch_id", dispatch_id)?;
+
+    let mut connection = open_context_store_read_only(path, key)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let metadata: (i64, String, String, String) = transaction.query_row(
+        "SELECT count(*), min(store_epoch), min(schema_profile_id),
+                min(schema_profile_sha256)
+         FROM context_store_metadata WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if metadata.0 != 1
+        || metadata.1 != expected_store_epoch
+        || metadata.2 != CONTEXT_STORE_PROFILE_ID
+        || !is_sha256(&metadata.3)
+    {
+        return Err(FaultConformanceError::invariant(
+            "M-13 Context store metadata is invalid",
+        ));
+    }
+
+    let snapshot: (
+        i64,
+        Vec<u8>,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ) = transaction
+        .query_row(
+            "SELECT revision, compiled_context, compiled_context_sha256,
+                    json_extract(descriptor, '$.target_scope_ref'),
+                    json_extract(descriptor, '$.memory_pack.scope_ref'),
+                    json_extract(descriptor, '$.memory_pack.authority_revision'),
+                    json_extract(descriptor, '$.memory_pack.accepted_snapshot_sha256'),
+                    json_extract(descriptor, '$.memory_pack.snapshot_sha256')
+             FROM context_snapshots WHERE snapshot_id = ?1",
+            [snapshot_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| FaultConformanceError::invariant("M-13 Context snapshot was not found"))?;
+    let snapshot_revision = positive(snapshot.0, "M-13 snapshot revision")?;
+    let memory_scope_ref = snapshot
+        .4
+        .ok_or_else(|| FaultConformanceError::invariant("M-13 Memory binding is missing"))?;
+    let memory_authority_revision = positive(
+        snapshot
+            .5
+            .ok_or_else(|| FaultConformanceError::invariant("M-13 Memory revision is missing"))?,
+        "M-13 Memory Authority revision",
+    )?;
+    let accepted_snapshot_sha256 = snapshot.6.ok_or_else(|| {
+        FaultConformanceError::invariant("M-13 accepted snapshot digest is missing")
+    })?;
+    let memory_pack_snapshot_sha256 = snapshot
+        .7
+        .ok_or_else(|| FaultConformanceError::invariant("M-13 pack digest is missing"))?;
+    if !is_sha256(&snapshot.2)
+        || hex::encode(Sha256::digest(&snapshot.1)) != snapshot.2
+        || snapshot_id != format!("ctx:{}", snapshot.2)
+        || snapshot.3 != memory_scope_ref
+        || !is_sha256(&accepted_snapshot_sha256)
+        || !is_sha256(&memory_pack_snapshot_sha256)
+    {
+        return Err(FaultConformanceError::invariant(
+            "M-13 immutable Context/Memory binding is invalid",
+        ));
+    }
+
+    let authorization: (
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+    ) = transaction
+        .query_row(
+            "SELECT authorization_id, event_id, snapshot_revision, principal_id,
+                    attempt_id, input_digest_sha256, expected_scope_ref,
+                    request_digest_sha256, committed_at_seconds
+             FROM context_dispatch_authorizations
+             WHERE snapshot_id = ?1 AND dispatch_id = ?2",
+            [snapshot_id, dispatch_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            FaultConformanceError::invariant("M-13 dispatch authorization is missing")
+        })?;
+    let receipt: (
+        String,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        i64,
+    ) = transaction
+        .query_row(
+            "SELECT receipt_id, snapshot_revision, consumer_principal_id, model_ref,
+                    attempt_id, dispatch_id, memory_authority_revision,
+                    memory_pack_snapshot_sha256, committed_at_seconds
+             FROM context_memory_use_receipts
+             WHERE snapshot_id = ?1 AND dispatch_id = ?2",
+            [snapshot_id, dispatch_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| FaultConformanceError::invariant("M-13 Memory-use receipt is missing"))?;
+
+    for (label, value) in [
+        ("authorization_id", authorization.0.as_str()),
+        ("authorization_event_id", authorization.1.as_str()),
+        ("authorization_principal_id", authorization.3.as_str()),
+        ("attempt_id", authorization.4.as_str()),
+        ("receipt_id", receipt.0.as_str()),
+        ("consumer_principal_id", receipt.2.as_str()),
+        ("model_ref", receipt.3.as_str()),
+    ] {
+        validate_identity(label, value)?;
+    }
+    let authorization_snapshot_revision = positive(authorization.2, "M-13 authorization revision")?;
+    let receipt_snapshot_revision = positive(receipt.1, "M-13 receipt snapshot revision")?;
+    let receipt_memory_revision = positive(receipt.6, "M-13 receipt Memory revision")?;
+    if authorization_snapshot_revision != snapshot_revision
+        || receipt_snapshot_revision != snapshot_revision
+        || authorization.4 != receipt.4
+        || receipt.5 != dispatch_id
+        || authorization.5 != snapshot.2
+        || authorization.6 != snapshot.3
+        || receipt_memory_revision != memory_authority_revision
+        || receipt.7 != memory_pack_snapshot_sha256
+        || authorization.8 != receipt.8
+        || authorization.8 <= 0
+        || !is_sha256(&authorization.7)
+    {
+        return Err(FaultConformanceError::invariant(
+            "M-13 authorization/receipt tuple is not exact",
+        ));
+    }
+
+    let authorization_event: Option<(String, String, String, String)> = transaction
+        .query_row(
+            "SELECT operation, snapshot_id, principal_id, request_digest_sha256
+             FROM context_events WHERE event_id = ?1",
+            [&authorization.1],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    if authorization_event
+        != Some((
+            "authorize-dispatch-consumption".to_owned(),
+            snapshot_id.to_owned(),
+            authorization.3.clone(),
+            authorization.7.clone(),
+        ))
+    {
+        return Err(FaultConformanceError::invariant(
+            "M-13 authorization event binding is invalid",
+        ));
+    }
+
+    let authorization_idempotency: Vec<(String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT principal_id, request_digest_sha256
+             FROM context_dispatch_authorization_idempotency
+             WHERE authorization_id = ?1",
+        )?;
+        statement
+            .query_map([&authorization.0], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let memory_idempotency: Vec<(String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT principal_id, request_digest_sha256
+             FROM context_memory_use_idempotency WHERE receipt_id = ?1",
+        )?;
+        statement
+            .query_map([&receipt.0], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if authorization_idempotency != [(authorization.3.clone(), authorization.7.clone())]
+        || memory_idempotency.len() != 1
+        || memory_idempotency[0].0 != authorization.3
+        || !is_sha256(&memory_idempotency[0].1)
+    {
+        return Err(FaultConformanceError::invariant(
+            "M-13 atomic pair idempotency binding is invalid",
+        ));
+    }
+    let pair_counts: (i64, i64) = transaction.query_row(
+        "SELECT
+           (SELECT count(*) FROM context_dispatch_authorizations
+            WHERE snapshot_id = ?1 AND dispatch_id = ?2),
+           (SELECT count(*) FROM context_memory_use_receipts
+            WHERE snapshot_id = ?1 AND dispatch_id = ?2)",
+        [snapshot_id, dispatch_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if pair_counts != (1, 1) {
+        return Err(FaultConformanceError::invariant(
+            "M-13 dispatch does not have exactly one atomic pair",
+        ));
+    }
+
+    let result = M13MemoryDispatchPair {
+        snapshot_id: snapshot_id.to_owned(),
+        snapshot_revision,
+        content_digest_sha256: snapshot.2,
+        target_scope_ref: snapshot.3,
+        memory_scope_ref,
+        memory_authority_revision,
+        accepted_snapshot_sha256,
+        memory_pack_snapshot_sha256,
+        authorization_id: authorization.0,
+        authorization_request_digest_sha256: authorization.7,
+        receipt_id: receipt.0,
+        consumer_principal_id: receipt.2,
+        model_ref: receipt.3,
+        attempt_id: receipt.4,
+        dispatch_id: receipt.5,
+        memory_request_digest_sha256: memory_idempotency[0].1.clone(),
+        committed_at_seconds: receipt.8,
+    };
+    transaction.commit()?;
+    Ok(result)
 }
 
 fn open_context_store_read_only(path: &Path, key: &[u8; 32]) -> FaultConformanceResult<Connection> {

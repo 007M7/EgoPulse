@@ -7,11 +7,11 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
 const contractsRoot = join(repositoryRoot, "contracts");
 const manifestPath = join(contractsRoot, "manifest.json");
-const expectedManifestSha256 = "7216449c1960915f21d333bbd46dd4c85e3b18c5f99aa94b57683a4556d74a52";
-const expectedArtifactCount = 268;
-const expectedFixtureCount = 200;
-const expectedClientKernelProfileSha256 = "62390a1fe45374e3d73d6dce6d695aeabe460d9421ecf78a334f437bd8832116";
-const expectedAuthorizationProfileSha256 = "948c2abb84cf7249dcff23213772cbc7aa136630a3b254aa592f8099223e58d2";
+const expectedManifestSha256 = "f55a751a14cd4eff3f65a1ca2c13f08312a7f0a1a5e42615a785ecf00c2122b0";
+const expectedArtifactCount = 269;
+const expectedFixtureCount = 201;
+const expectedClientKernelProfileSha256 = "d1eee23877a6b55cbfe12a7b90041a86a1eaebbdb4a6a863e924ba101ad694bc";
+const expectedAuthorizationProfileSha256 = "8426ece110ca30ca64bc384daee0bd1b6b2ab1966eed2b3b8c1a17cea5f0cc06";
 const expectedContextRevokeProfileSha256 = "ee77f4894dfd64394f674d37634a29383bf453dc68494f3d75268e85df2590e4";
 const expectedHarnessContentProfileSha256 = "c969c9eda5394617aa8bcbca4ed0086eb0dd61ced2519818db830cc73ed1e58f";
 
@@ -39,14 +39,15 @@ const manifestSha256 = sha256(manifestBytes);
 assert(manifestSha256 === expectedManifestSha256, `manifest digest mismatch: ${manifestSha256}`);
 
 const manifest = JSON.parse(manifestBytes.toString("utf8"));
-assert(manifest.candidateVersion === "0.1.0-draft.21", "unexpected V-01 implementation contract version");
-assert(manifest.status === "targeted_revision_r9c_contract_founder_frozen_locally_verified", "unexpected R-9C contract status");
+assert(manifest.candidateVersion === "0.1.0-draft.22", "unexpected V-01 implementation contract version");
+assert(manifest.status === "targeted_revision_m13_contract_founder_frozen_implementation_authorized", "unexpected M-13 contract status");
 assert(manifest.targetedRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3", "missing Founder authority for targeted revision");
 assert(manifest.approvalReadModelRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a", "missing Founder authority for approval read model revision");
 assert(manifest.g408cSupportProfilesAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3", "missing Founder authority for G4-08C support profiles");
 assert(manifest.contextRevokeLinearizationAuthorityRef === "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze", "missing Founder authority for R-9A Context revoke linearization");
 assert(manifest.contextRevokeSchemeCAuthorityRef === "conversation:2026-08-31:founder-r9a-gate11-scheme-c", "missing Founder authority for R-9A Scheme C validation and historical replay");
 assert(manifest.r9cHarnessContentAuthorityRef === "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7", "missing Founder authority for R-9C Harness content and migration/rollback contract");
+assert(manifest.m13MemoryContextAuthorityRef === "conversation:2026-09-05:founder-resume-after-m13-decision-package", "missing Founder authority for M-13 governed Memory consumption");
 assert(manifest.artifacts.length === expectedArtifactCount, "unexpected V-01 artifact count");
 
 let fixtureCount = 0;

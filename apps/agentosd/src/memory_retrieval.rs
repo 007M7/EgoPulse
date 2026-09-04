@@ -6,7 +6,7 @@ use std::{
 };
 
 use egopulse_cognition_runtime::{
-    memory_authority::{MemoryAuthority, MemoryAuthorityFailure},
+    memory_authority::{AcceptedMemorySnapshot, MemoryAuthority, MemoryAuthorityFailure},
     memory_rag::{MemoryRagWorker, MemoryRagWorkerFailure},
 };
 use egopulse_domain_contracts::{
@@ -127,14 +127,26 @@ impl ConfiguredMemoryRetrievalPort {
             .get(principal_id)
             .is_some_and(|scopes| scopes.contains(scope_ref))
     }
-}
 
-#[tonic::async_trait]
-impl MemoryRetrievalPort for ConfiguredMemoryRetrievalPort {
-    async fn retrieve(
+    fn accepted_snapshot(
+        &self,
+        principal_id: &str,
+        scope_ref: &str,
+    ) -> Result<AcceptedMemorySnapshot, MemoryRetrievalPortError> {
+        if !self.scope_allowed(principal_id, scope_ref) {
+            return Err(MemoryRetrievalPortError::ScopeDenied);
+        }
+        self.authority
+            .lock()
+            .map_err(|_| MemoryRetrievalPortError::AuthorityUnavailable)?
+            .accepted_snapshot(scope_ref)
+            .map_err(map_authority_failure)
+    }
+
+    async fn retrieve_governed(
         &self,
         request: MemoryRetrievalInput,
-    ) -> Result<RetrievalResponse, MemoryRetrievalPortError> {
+    ) -> Result<GovernedWorkMemoryRetrieval, MemoryRetrievalPortError> {
         if !self.scope_allowed(&request.authenticated_principal_id, &request.scope_ref) {
             return Err(MemoryRetrievalPortError::ScopeDenied);
         }
@@ -155,7 +167,8 @@ impl MemoryRetrievalPort for ConfiguredMemoryRetrievalPort {
         .map_err(|_| MemoryRetrievalPortError::AuthorityUnavailable)?
         .map_err(map_authority_failure)?;
 
-        self.worker
+        let response = self
+            .worker
             .retrieve(
                 &snapshot,
                 &request.query,
@@ -163,7 +176,61 @@ impl MemoryRetrievalPort for ConfiguredMemoryRetrievalPort {
                 request.min_score,
             )
             .await
-            .map_err(map_worker_failure)
+            .map_err(map_worker_failure)?;
+        Ok(GovernedWorkMemoryRetrieval { snapshot, response })
+    }
+}
+
+/// Internal preparation result. The Worker response remains reference-only;
+/// the exact Authority snapshot is retained so the Context compiler can
+/// resolve and bind selected bytes without trusting Worker-owned content.
+#[derive(Clone, Debug)]
+pub struct GovernedWorkMemoryRetrieval {
+    pub snapshot: AcceptedMemorySnapshot,
+    pub response: RetrievalResponse,
+}
+
+#[tonic::async_trait]
+pub trait WorkMemoryRetrievalPort: Send + Sync + 'static {
+    async fn retrieve_for_work(
+        &self,
+        request: MemoryRetrievalInput,
+    ) -> Result<GovernedWorkMemoryRetrieval, MemoryRetrievalPortError>;
+
+    fn revalidate_accepted_snapshot(
+        &self,
+        principal_id: &str,
+        scope_ref: &str,
+    ) -> Result<AcceptedMemorySnapshot, MemoryRetrievalPortError>;
+}
+
+#[tonic::async_trait]
+impl MemoryRetrievalPort for ConfiguredMemoryRetrievalPort {
+    async fn retrieve(
+        &self,
+        request: MemoryRetrievalInput,
+    ) -> Result<RetrievalResponse, MemoryRetrievalPortError> {
+        self.retrieve_governed(request)
+            .await
+            .map(|retrieval| retrieval.response)
+    }
+}
+
+#[tonic::async_trait]
+impl WorkMemoryRetrievalPort for ConfiguredMemoryRetrievalPort {
+    async fn retrieve_for_work(
+        &self,
+        request: MemoryRetrievalInput,
+    ) -> Result<GovernedWorkMemoryRetrieval, MemoryRetrievalPortError> {
+        self.retrieve_governed(request).await
+    }
+
+    fn revalidate_accepted_snapshot(
+        &self,
+        principal_id: &str,
+        scope_ref: &str,
+    ) -> Result<AcceptedMemorySnapshot, MemoryRetrievalPortError> {
+        self.accepted_snapshot(principal_id, scope_ref)
     }
 }
 
@@ -176,6 +243,24 @@ impl MemoryRetrievalPort for FailClosedMemoryRetrievalPort {
         &self,
         _request: MemoryRetrievalInput,
     ) -> Result<RetrievalResponse, MemoryRetrievalPortError> {
+        Err(MemoryRetrievalPortError::WorkerUnavailable)
+    }
+}
+
+#[tonic::async_trait]
+impl WorkMemoryRetrievalPort for FailClosedMemoryRetrievalPort {
+    async fn retrieve_for_work(
+        &self,
+        _request: MemoryRetrievalInput,
+    ) -> Result<GovernedWorkMemoryRetrieval, MemoryRetrievalPortError> {
+        Err(MemoryRetrievalPortError::WorkerUnavailable)
+    }
+
+    fn revalidate_accepted_snapshot(
+        &self,
+        _principal_id: &str,
+        _scope_ref: &str,
+    ) -> Result<AcceptedMemorySnapshot, MemoryRetrievalPortError> {
         Err(MemoryRetrievalPortError::WorkerUnavailable)
     }
 }

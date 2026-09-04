@@ -253,8 +253,9 @@ impl MemoryMutationPort for FailClosedMemoryMutationPort {
 /// The Local API deliberately has no Context/Task store and cannot compile a
 /// client-authored snapshot. Implementations must prove the snapshot and then
 /// delegate confirmation to the Task Authority.
+#[tonic::async_trait]
 pub trait WorkPreparationPort: Send + Sync + 'static {
-    fn prepare(
+    async fn prepare(
         &self,
         request: &PrepareWorkRequest,
         principal: &CommandPrincipal,
@@ -270,8 +271,9 @@ pub trait WorkPreparationPort: Send + Sync + 'static {
 #[derive(Default)]
 pub struct FailClosedWorkPreparationPort;
 
+#[tonic::async_trait]
 impl WorkPreparationPort for FailClosedWorkPreparationPort {
-    fn prepare(
+    async fn prepare(
         &self,
         _request: &PrepareWorkRequest,
         _principal: &CommandPrincipal,
@@ -388,7 +390,7 @@ impl CommandGatewayApplication {
         }
     }
 
-    pub fn prepare_work(
+    pub async fn prepare_work(
         &self,
         peer: Option<&PeerConnectionInfo>,
         request: PrepareWorkRequest,
@@ -404,7 +406,7 @@ impl CommandGatewayApplication {
                 };
             }
         };
-        match self.work_port.prepare(&request, &context.principal) {
+        match self.work_port.prepare(&request, &context.principal).await {
             Ok(preview) => PrepareWorkResponse {
                 outcome: Some(prepare_work_response::Outcome::Preview(preview)),
             },
@@ -949,7 +951,8 @@ impl LocalCommandGatewayService for LocalCommandGatewayEndpoint {
         let peer = Self::peer(&request);
         Ok(Response::new(
             self.application
-                .prepare_work(peer.as_ref(), request.into_inner()),
+                .prepare_work(peer.as_ref(), request.into_inner())
+                .await,
         ))
     }
 

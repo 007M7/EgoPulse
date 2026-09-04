@@ -345,11 +345,37 @@ impl MemoryStore {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(super) fn accepted_memories(
         &self,
         scope_ref: &str,
     ) -> Result<Vec<StoredMemory>, StoreError> {
         self.memories_in_state(scope_ref, "accepted")
+    }
+
+    /// Reads the Authority revision and accepted rows from one SQLite read
+    /// transaction. This prevents a concurrent Authority process from
+    /// advancing the event sequence between the revision read and the record
+    /// projection.
+    pub(super) fn accepted_memories_with_revision(
+        &self,
+        scope_ref: &str,
+    ) -> Result<(u64, Vec<StoredMemory>), StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let last_sequence: i64 = transaction.query_row(
+            "SELECT last_event_sequence FROM memory_store_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if last_sequence < 0 {
+            return Err(StoreError::IntegrityFailure);
+        }
+        let authority_revision = (last_sequence as u64)
+            .checked_add(1)
+            .ok_or(StoreError::IntegrityFailure)?;
+        let records = memories_in_state(&transaction, scope_ref, "accepted")?;
+        transaction.commit()?;
+        Ok((authority_revision, records))
     }
 
     pub(super) fn candidate_memories(
@@ -364,47 +390,7 @@ impl MemoryStore {
         scope_ref: &str,
         state: &str,
     ) -> Result<Vec<StoredMemory>, StoreError> {
-        let bounds: (i64, i64, i64, i64, i64) = self.connection.query_row(
-            "SELECT count(*),
-                    COALESCE(sum(length(CAST(content AS BLOB))), 0),
-                    COALESCE(max(length(CAST(memory_id AS BLOB))), 0),
-                    COALESCE(max(length(CAST(source_ref AS BLOB))), 0),
-                    COALESCE(max(length(CAST(scope_ref AS BLOB))), 0)
-             FROM memories WHERE scope_ref=?1 AND state=?2",
-            params![scope_ref, state],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )?;
-        if bounds.0 < 0
-            || bounds.0 as usize > MEMORY_MAX_RECORDS
-            || bounds.1 < 0
-            || bounds.1 as usize > MEMORY_MAX_TOTAL_CONTENT_BYTES
-            || bounds.2 < 0
-            || bounds.2 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
-            || bounds.3 < 0
-            || bounds.3 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
-            || bounds.4 < 0
-            || bounds.4 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
-        {
-            return Err(StoreError::SnapshotBounds);
-        }
-
-        let mut statement = self.connection.prepare(
-            "SELECT memory_id,revision,content,content_sha256,source_ref,scope_ref,state,
-                    created_at_seconds,updated_at_seconds
-             FROM memories WHERE scope_ref=?1 AND state=?2
-             ORDER BY memory_id",
-        )?;
-        let rows = statement.query_map(params![scope_ref, state], memory_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
+        memories_in_state(&self.connection, scope_ref, state)
     }
 
     pub(super) fn inspect(&self) -> Result<super::MemoryStoreInspection, StoreError> {
@@ -431,6 +417,54 @@ impl MemoryStore {
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         Ok(integrity == "ok")
     }
+}
+
+fn memories_in_state(
+    connection: &Connection,
+    scope_ref: &str,
+    state: &str,
+) -> Result<Vec<StoredMemory>, StoreError> {
+    let bounds: (i64, i64, i64, i64, i64) = connection.query_row(
+        "SELECT count(*),
+                    COALESCE(sum(length(CAST(content AS BLOB))), 0),
+                    COALESCE(max(length(CAST(memory_id AS BLOB))), 0),
+                    COALESCE(max(length(CAST(source_ref AS BLOB))), 0),
+                    COALESCE(max(length(CAST(scope_ref AS BLOB))), 0)
+             FROM memories WHERE scope_ref=?1 AND state=?2",
+        params![scope_ref, state],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    if bounds.0 < 0
+        || bounds.0 as usize > MEMORY_MAX_RECORDS
+        || bounds.1 < 0
+        || bounds.1 as usize > MEMORY_MAX_TOTAL_CONTENT_BYTES
+        || bounds.2 < 0
+        || bounds.2 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
+        || bounds.3 < 0
+        || bounds.3 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
+        || bounds.4 < 0
+        || bounds.4 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
+    {
+        return Err(StoreError::SnapshotBounds);
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT memory_id,revision,content,content_sha256,source_ref,scope_ref,state,
+                    created_at_seconds,updated_at_seconds
+             FROM memories WHERE scope_ref=?1 AND state=?2
+             ORDER BY memory_id",
+    )?;
+    let rows = statement.query_map(params![scope_ref, state], memory_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
 }
 
 fn memory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemory> {
