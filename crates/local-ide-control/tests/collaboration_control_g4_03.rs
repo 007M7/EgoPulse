@@ -1632,6 +1632,7 @@ fn dispatch_command_with_ids(
         session_strategy: NativeSessionStrategy::CreateNew as i32,
         native_session_ref: None,
         checkpoint_ref: None,
+        route_binding: None,
     };
     let fingerprint = canonical_dispatch_fingerprint(&envelope);
     envelope.dispatch_fingerprint = fingerprint.clone();

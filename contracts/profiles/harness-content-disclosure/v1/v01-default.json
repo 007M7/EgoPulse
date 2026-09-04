@@ -1,0 +1,453 @@
+{
+  "schemaVersion": "egopulse.harness-content-disclosure-profile/v0.1",
+  "contractId": "egopulse.harness-content-disclosure.v1",
+  "contractVersion": "0.1.0",
+  "profileId": "harness-content-disclosure-v01-default",
+  "authorityRef": "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7",
+  "contractBindings": {
+    "harnessContractId": "egopulse.harness.v1",
+    "localApiContractId": "egopulse.localapi.v1",
+    "capabilityField": "governed_user_visible_content",
+    "permissionCode": "local.harness.content.read"
+  },
+  "sourceAdmission": {
+    "requiredDeliveryDisposition": "DELIVERY_DISPOSITION_DELIVERED",
+    "candidateIdentitySource": "trusted_stores_only",
+    "contextProofBranches": ["NOT_CONTEXT_BOUND", "AUTHORIZED_CONTEXT"],
+    "missingRouteBinding": "fail_closed_no_text_disclosure",
+    "legacyDispatch": "never_backfill_from_current_configuration",
+    "providerCapabilityRequired": true,
+    "unknownOneof": "fail_closed"
+  },
+  "contentCategories": {
+    "allowed": [
+      "assistant_text",
+      "lifecycle_activity_code",
+      "usage_counters",
+      "approval_required_code",
+      "final_artifact_relation",
+      "redacted_marker",
+      "blocked_marker",
+      "truncated_marker",
+      "content_domain_status_marker"
+    ],
+    "forbidden": [
+      "hidden_reasoning",
+      "chain_of_thought",
+      "system_prompt",
+      "developer_prompt",
+      "provider_request_payload",
+      "context_source_field",
+      "memory_source_field",
+      "rag_query",
+      "embedding",
+      "proof",
+      "source_reference",
+      "tool_arguments",
+      "tool_results",
+      "command_stdout",
+      "command_stderr",
+      "ansi_or_terminal_control",
+      "file_content",
+      "workspace_path",
+      "raw_native_event",
+      "raw_evidence_reference",
+      "native_routing_identifier",
+      "native_session_identifier",
+      "native_execution_identifier",
+      "credential_or_token",
+      "private_key",
+      "environment_value",
+      "secret_store_material",
+      "unknown_category"
+    ],
+    "unknownCategory": "blocked_marker_no_source_bytes"
+  },
+  "messageProtocol": {
+    "operations": ["APPEND", "REPLACE", "FINALIZE"],
+    "revisionStartsAt": 1,
+    "sameRevisionSameDigest": "idempotent_no_op",
+    "sameRevisionDifferentDigest": "quarantine_integrity_conflict",
+    "revisionGap": "fail_closed",
+    "invalidPredecessor": "fail_closed",
+    "secondFinalize": "fail_closed",
+    "updateAfterFinalize": "fail_closed",
+    "replaceMatcherState": "reset_from_complete_replacement",
+    "finalizeMatcherState": "flush_non_secret_suffix"
+  },
+  "canonicalEncoding": {
+    "digestAlgorithm": "SHA-256",
+    "digestOutput": "lowercase_hex_64",
+    "lengthPrefix": "u64_little_endian_byte_length",
+    "integerEncoding": "u64_little_endian",
+    "signedIntegerEncoding": "i64_little_endian",
+    "uint32Encoding": "u32_little_endian",
+    "booleanEncoding": "u64_little_endian_zero_or_one",
+    "stringEncoding": "utf8_no_normalization",
+    "enumEncoding": "canonical_short_name_utf8",
+    "optionalEncoding": "presence_NONE_or_SOME_utf8_then_empty_or_encoded_value",
+    "collectionEncoding": "count_u64_then_each_value_in_declared_order",
+    "timestampEncoding": "seconds_i64_little_endian_then_nanos_u32_little_endian_each_framed",
+    "catalogSnapshotKinds": {
+      "digest": "DIGEST",
+      "noCatalog": "NO_CATALOG",
+      "noCatalogValue": ""
+    },
+    "contextProofCanonicalization": {
+      "notContextBoundBranch": "NOT_CONTEXT_BOUND",
+      "notContextBoundAuthorizationId": "",
+      "notContextBoundRequestDigestSha256": "",
+      "authorizedContextBranch": "AUTHORIZED_CONTEXT",
+      "authorizedContextRequiresAuthorizationId": true,
+      "authorizedContextRequiresRequestDigestSha256": true
+    },
+    "candidatePayloadDiscriminators": {
+      "assistantText": "ASSISTANT_TEXT",
+      "lifecycle": "LIFECYCLE",
+      "usage": "USAGE",
+      "approvalRequired": "APPROVAL_REQUIRED",
+      "blockedSource": "BLOCKED_SOURCE"
+    },
+    "safePayloadDiscriminators": {
+      "assistantText": "ASSISTANT_TEXT",
+      "lifecycle": "LIFECYCLE",
+      "usage": "USAGE",
+      "approvalRequired": "APPROVAL_REQUIRED",
+      "artifactRelation": "ARTIFACT_RELATION",
+      "marker": "MARKER"
+    },
+    "projectionEventDiscriminators": {
+      "contentRecord": "CONTENT_RECORD",
+      "historyCompaction": "HISTORY_COMPACTION",
+      "retentionTombstone": "RETENTION_TOMBSTONE"
+    },
+    "identifierFormats": {
+      "safeMessageId": "hcm_<lowercase_hex_64>",
+      "safeRecordId": "hcr_<lowercase_hex_64>",
+      "historyCompactionRecordId": "hcc_<lowercase_hex_64>",
+      "retentionTombstoneId": "hrt_<lowercase_hex_64>"
+    },
+    "digestRules": {
+      "candidateDigest": "sha256_of_selected_candidate_payload_canonical_bytes",
+      "safePayloadDigest": "sha256_of_selected_safe_payload_canonical_bytes",
+      "safeRecordDigest": "sha256_of_safe_record_canonical_bytes_excluding_record_digest_sha256",
+      "historyCompactionDigest": "sha256_of_history_compaction_canonical_bytes_excluding_compaction_record_digest_sha256",
+      "retentionTombstoneDigest": "sha256_of_retention_tombstone_canonical_bytes_excluding_tombstone_digest_sha256",
+      "safetyFlags": "ascending_numeric_unique",
+      "nonTextPartIndexForRecordId": 0
+    },
+    "domainSeparators": {
+      "routeBinding": "egopulse/harness-content/route-binding/v1",
+      "textPayload": "egopulse/harness-content/text-payload/v1",
+      "rawCumulative": "egopulse/harness-content/raw-cumulative/v1",
+      "safeCumulative": "egopulse/harness-content/safe-cumulative/v1",
+      "safeMessageId": "egopulse/harness-content/safe-message-id/v1",
+      "textCandidate": "egopulse/harness-content/text-candidate/v1",
+      "lifecycleCandidate": "egopulse/harness-content/lifecycle-candidate/v1",
+      "usageCandidate": "egopulse/harness-content/usage-candidate/v1",
+      "approvalRequiredCandidate": "egopulse/harness-content/approval-required-candidate/v1",
+      "blockedSourceCandidate": "egopulse/harness-content/blocked-source-candidate/v1",
+      "contentEvent": "egopulse/harness-content/event/v1",
+      "safeRecordId": "egopulse/harness-content/safe-record-id/v1",
+      "safeRecord": "egopulse/harness-content/safe-record/v1",
+      "safeAssistantText": "egopulse/harness-content/safe-assistant-text/v1",
+      "safeLifecycle": "egopulse/harness-content/safe-lifecycle/v1",
+      "safeUsage": "egopulse/harness-content/safe-usage/v1",
+      "safeApprovalRequired": "egopulse/harness-content/safe-approval-required/v1",
+      "safeArtifactRelation": "egopulse/harness-content/safe-artifact-relation/v1",
+      "safeMarker": "egopulse/harness-content/safe-marker/v1",
+      "historyCompactionRecordId": "egopulse/harness-content/history-compaction-id/v1",
+      "historyCompactionRecord": "egopulse/harness-content/history-compaction/v1",
+      "retentionTombstoneId": "egopulse/harness-content/retention-tombstone-id/v1",
+      "retentionTombstone": "egopulse/harness-content/retention-tombstone/v1",
+      "credentialCommitment": "egopulse/harness-content/credential-set/v1"
+    },
+    "routeBindingFieldOrder": [
+      "domain_separator",
+      "provider_bootstrap_profile_id",
+      "selected_harness_id",
+      "provider_model_id",
+      "catalog_snapshot_kind",
+      "catalog_snapshot_value",
+      "capability_profile_id"
+    ],
+    "textPayloadFieldOrder": [
+      "domain_separator",
+      "text_utf8"
+    ],
+    "rawCumulativeFieldOrder": [
+      "domain_separator",
+      "raw_cumulative_text_utf8"
+    ],
+    "safeCumulativeFieldOrder": [
+      "domain_separator",
+      "safe_cumulative_text_utf8"
+    ],
+    "safeMessageIdFieldOrder": [
+      "domain_separator",
+      "attempt_id",
+      "dispatch_id",
+      "route_binding_sha256",
+      "candidate_message_id"
+    ],
+    "textCandidateFieldOrder": [
+      "domain_separator",
+      "message_id",
+      "revision",
+      "previous_revision",
+      "operation",
+      "text_utf8",
+      "delta_or_snapshot_digest_sha256",
+      "previous_raw_cumulative_digest_sha256",
+      "raw_cumulative_digest_sha256"
+    ],
+    "lifecycleCandidateFieldOrder": [
+      "domain_separator",
+      "lifecycle_kind",
+      "side_effect_certainty",
+      "native_will_retry_presence",
+      "native_will_retry_value"
+    ],
+    "usageCandidateFieldOrder": [
+      "domain_separator",
+      "input_tokens",
+      "output_tokens",
+      "cached_input_tokens_presence",
+      "cached_input_tokens_value"
+    ],
+    "approvalRequiredCandidateFieldOrder": [
+      "domain_separator"
+    ],
+    "blockedSourceCandidateFieldOrder": [
+      "domain_separator",
+      "marker_kind"
+    ],
+    "contentEventIdFieldOrder": [
+      "domain_separator",
+      "delivered_receipt_id",
+      "delivered_receipt_digest_sha256",
+      "context_proof_branch",
+      "context_authorization_id",
+      "context_authorization_request_digest_sha256",
+      "dispatch_route_binding_sha256",
+      "attempt_id",
+      "dispatch_id",
+      "fencing_token",
+      "capability_profile_id",
+      "native_event_id",
+      "native_event_digest_sha256",
+      "native_sequence",
+      "candidate_digest_sha256"
+    ],
+    "safeRecordIdFieldOrder": [
+      "domain_separator",
+      "content_event_id",
+      "disclosure_profile_contract_id",
+      "disclosure_profile_version",
+      "disclosure_profile_sha256",
+      "payload_discriminator",
+      "part_index"
+    ],
+    "safeRecordFieldOrder": [
+      "domain_separator",
+      "record_id",
+      "content_event_id",
+      "task_id",
+      "run_id",
+      "step_id",
+      "attempt_id",
+      "dispatch_id",
+      "fencing_token",
+      "route_binding_sha256",
+      "disclosure_profile_contract_id",
+      "disclosure_profile_version",
+      "disclosure_profile_sha256",
+      "provider_family_alias",
+      "model_alias",
+      "collaboration_role",
+      "safety_flags_count",
+      "safety_flags_ascending_numeric",
+      "payload_discriminator",
+      "payload_digest_sha256"
+    ],
+    "safeAssistantTextFieldOrder": [
+      "domain_separator",
+      "safe_message_id",
+      "revision",
+      "previous_revision",
+      "operation",
+      "safe_text_utf8",
+      "safe_cumulative_digest_sha256",
+      "part_index",
+      "part_count"
+    ],
+    "safeLifecycleFieldOrder": [
+      "domain_separator",
+      "lifecycle_kind",
+      "side_effect_certainty",
+      "native_will_retry_presence",
+      "native_will_retry_value"
+    ],
+    "safeUsageFieldOrder": [
+      "domain_separator",
+      "input_tokens",
+      "output_tokens",
+      "cached_input_tokens_presence",
+      "cached_input_tokens_value"
+    ],
+    "safeApprovalRequiredFieldOrder": [
+      "domain_separator"
+    ],
+    "safeArtifactRelationFieldOrder": [
+      "domain_separator",
+      "safe_content_differs_from_artifact",
+      "artifact_id",
+      "artifact_digest_sha256"
+    ],
+    "safeMarkerFieldOrder": [
+      "domain_separator",
+      "marker_kind"
+    ],
+    "historyCompactionRecordIdFieldOrder": [
+      "domain_separator",
+      "task_id",
+      "attempt_id",
+      "final_epoch",
+      "final_sequence",
+      "disclosure_profile_sha256",
+      "reason"
+    ],
+    "historyCompactionRecordFieldOrder": [
+      "domain_separator",
+      "compaction_record_id",
+      "task_id",
+      "attempt_id",
+      "final_epoch",
+      "final_sequence",
+      "final_safe_content_digest_sha256",
+      "owner_snapshot_digest_sha256",
+      "disclosure_profile_contract_id",
+      "disclosure_profile_version",
+      "disclosure_profile_sha256",
+      "compacted_at_seconds",
+      "compacted_at_nanos",
+      "reason"
+    ],
+    "retentionTombstoneIdFieldOrder": [
+      "domain_separator",
+      "task_id",
+      "attempt_id",
+      "final_epoch",
+      "final_sequence",
+      "disclosure_profile_sha256",
+      "reason"
+    ],
+    "retentionTombstoneFieldOrder": [
+      "domain_separator",
+      "tombstone_id",
+      "task_id",
+      "attempt_id",
+      "final_epoch",
+      "final_sequence",
+      "final_safe_content_digest_sha256",
+      "disclosure_profile_contract_id",
+      "disclosure_profile_version",
+      "disclosure_profile_sha256",
+      "terminal_committed_at_seconds",
+      "terminal_committed_at_nanos",
+      "compacted_at_seconds",
+      "compacted_at_nanos",
+      "reason"
+    ],
+    "credentialCommitmentFieldOrder": [
+      "domain_separator",
+      "variant_value_count",
+      "variant_values_sorted_unsigned_byte_lexicographic"
+    ]
+  },
+  "textSafety": {
+    "invalidUtf8": "INVALID_TEXT_marker_no_text",
+    "newlineNormalization": "crlf_and_cr_to_lf",
+    "tabReplacementSpaces": 4,
+    "unicodeLineSeparatorsToLf": ["U+2028", "U+2029"],
+    "replacementScalar": "U+FFFD",
+    "c0Allowed": ["LF"],
+    "replaceDel": true,
+    "replaceC1": true,
+    "bidiControlScalars": ["U+061C", "U+200E", "U+200F", "U+202A-U+202E", "U+2066-U+2069"],
+    "ansiInterpretation": "forbidden"
+  },
+  "managedCredentialRedaction": {
+    "credentialMode": "api_key_environment",
+    "maxNonEmptyValues": 32,
+    "maxValueBytes": 1024,
+    "valueEncoding": "printable_ascii",
+    "variants": [
+      "raw_ascii",
+      "canonical_json_content_escape",
+      "canonical_percent_uppercase",
+      "base64_standard_padded",
+      "base64_standard_unpadded",
+      "base64url_padded",
+      "base64url_unpadded"
+    ],
+    "maxEncodedPatternBytes": 3072,
+    "maxWithheldSuffixBytes": 3071,
+    "matcher": "deterministic_streaming_multi_pattern_longest_match",
+    "commitment": "domain_separated_hmac_sha256_from_adapter_store_key",
+    "persistedSecretMaterial": "commitment_only",
+    "oversizeBehavior": "structured_only_attempt_execution_continues",
+    "restartMismatchBehavior": "REDACTION_INPUT_UNAVAILABLE_then_structured_only",
+    "harnessAccountGuarantee": "forbidden_source_and_daemon_managed_secret_bytes_only"
+  },
+  "resourceLimits": {
+    "candidateTextBytes": 65536,
+    "safePartBytes": 65536,
+    "serializedFrameBytes": 81920,
+    "attemptSafeTextBytes": 16777216,
+    "attemptSafeRecords": 16384,
+    "taskSafeTextBytes": 67108864,
+    "taskSafeRecords": 65536,
+    "baselinePageRecords": 256,
+    "baselinePageTextBytes": 1048576,
+    "reservedFinalRecordSlot": "LIMIT_REACHED",
+    "byteAccounting": "safe_normalized_redacted_utf8_before_proto",
+    "paginationWholeRecordsOnly": true
+  },
+  "recoveryAndRetention": {
+    "projectionDomain": "independent_harness_content",
+    "delivery": "at_least_once_idempotent",
+    "stableIdentity": "content_event_id_and_record_digest",
+    "rebuildSource": "adapter_safe_ledger_or_owner_snapshot_only",
+    "rerunRedactionOnReplay": false,
+    "profileChange": "new_epoch_reset_old_text_excluded_history_unavailable_tombstone",
+    "minimumSecondsAfterTaskTerminal": 2592000,
+    "compaction": "owner_snapshot_floor_delete_and_typed_record_atomic",
+    "tombstonePreventsResurrection": true,
+    "unknownGap": "ResetRequired"
+  },
+  "authorization": {
+    "permissionCode": "local.harness.content.read",
+    "scopeSource": "trusted_task_and_attempt_lineage",
+    "revalidateAfterSendReservation": true,
+    "maxFramesInFlight": 1,
+    "postChangeExposureFrames": 1,
+    "artifactIdentityPermissionCode": "local.evidence.read",
+    "failureIsolation": "content_domain_only"
+  },
+  "fixtureRefs": [
+    "fixtures/harness/v1/valid-content-append-not-context-bound.json",
+    "fixtures/harness/v1/valid-content-authorized-context.json",
+    "fixtures/harness/v1/valid-route-binding-no-catalog.json",
+    "fixtures/harness/v1/invalid-content-forbidden-category.json",
+    "fixtures/harness/v1/invalid-content-source-binding-drift.json",
+    "fixtures/harness/v1/invalid-content-revision-digest-drift.json",
+    "fixtures/harness/v1/duplicate-content-exact-replay.json",
+    "fixtures/localapi/v1/valid-harness-content-baseline.json",
+    "fixtures/localapi/v1/valid-harness-content-watch.json",
+    "fixtures/localapi/v1/invalid-harness-content-frame-combination.json",
+    "fixtures/localapi/v1/unauthorized-harness-content-read.json",
+    "fixtures/localapi/v1/recovery-harness-content-retention-reset.json",
+    "fixtures/persistence/v1/recovery-safe-content-outbox-after-consumer-commit.json"
+  ]
+}

@@ -36,6 +36,10 @@ pub struct CapabilitySemantics {
     pub resume: ::prost::alloc::vec::Vec<i32>,
     #[prost(enumeration = "EventOrderingGuarantee", tag = "10")]
     pub event_ordering: i32,
+    /// Independent from structured_events. A Provider that leaves this
+    /// unspecified is not admitted for governed assistant-text disclosure.
+    #[prost(enumeration = "SupportLevel", tag = "11")]
+    pub governed_user_visible_content: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CapabilityDeclaration {
@@ -218,6 +222,39 @@ pub struct ProbeHarnessResult {
     #[prost(message, optional, tag = "6")]
     pub observed_at: ::core::option::Option<::prost_types::Timestamp>,
 }
+/// Presence is the explicit no-catalog sentinel. It is mutually exclusive with
+/// a catalog digest and therefore cannot be confused with an empty digest.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NoCatalogSnapshot {}
+/// Constructed from trusted bootstrap/catalog state before Collaboration
+/// commits the dispatch intent. A Provider candidate cannot author this value.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DispatchRouteBinding {
+    #[prost(string, tag = "1")]
+    pub provider_bootstrap_profile_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub selected_harness_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub provider_model_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub capability_profile_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub route_binding_sha256: ::prost::alloc::string::String,
+    #[prost(oneof = "dispatch_route_binding::CatalogSnapshot", tags = "4, 5")]
+    pub catalog_snapshot: ::core::option::Option<
+        dispatch_route_binding::CatalogSnapshot,
+    >,
+}
+/// Nested message and enum types in `DispatchRouteBinding`.
+pub mod dispatch_route_binding {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum CatalogSnapshot {
+        #[prost(string, tag = "4")]
+        CatalogSnapshotSha256(::prost::alloc::string::String),
+        #[prost(message, tag = "5")]
+        NoCatalogSnapshot(super::NoCatalogSnapshot),
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DispatchEnvelope {
     #[prost(message, optional, tag = "1")]
@@ -276,6 +313,8 @@ pub struct DispatchEnvelope {
     pub native_session_ref: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "22")]
     pub checkpoint_ref: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "23")]
+    pub route_binding: ::core::option::Option<DispatchRouteBinding>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DispatchReceipt {
@@ -403,6 +442,327 @@ pub struct DiagnosticObservation {
     #[prost(bool, tag = "3")]
     pub recovery_required: bool,
 }
+/// Closed proof branch resolved against the already-persisted dispatch. The
+/// not-context-bound branch is validated by re-running the trusted classifier
+/// over that stored envelope. The authorized branch reuses the existing R-9A
+/// authorization identity and committed request digest; it does not invent a
+/// bearer token or a second receipt digest.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NotContextBoundProof {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AuthorizedContextConsumptionProof {
+    #[prost(string, tag = "1")]
+    pub authorization_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub committed_request_digest_sha256: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DispatchContextConsumptionProof {
+    #[prost(oneof = "dispatch_context_consumption_proof::Branch", tags = "1, 2")]
+    pub branch: ::core::option::Option<dispatch_context_consumption_proof::Branch>,
+}
+/// Nested message and enum types in `DispatchContextConsumptionProof`.
+pub mod dispatch_context_consumption_proof {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Branch {
+        #[prost(message, tag = "1")]
+        NotContextBound(super::NotContextBoundProof),
+        #[prost(message, tag = "2")]
+        AuthorizedContext(super::AuthorizedContextConsumptionProof),
+    }
+}
+/// This type is inside the Adapter trust boundary. text_utf8 may contain bytes
+/// that the deterministic disclosure projector later blocks or redacts.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AssistantTextContentCandidate {
+    #[prost(string, tag = "1")]
+    pub message_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub revision: u64,
+    #[prost(uint64, tag = "3")]
+    pub previous_revision: u64,
+    #[prost(enumeration = "ContentMutationOperation", tag = "4")]
+    pub operation: i32,
+    #[prost(bytes = "vec", tag = "5")]
+    pub text_utf8: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "6")]
+    pub delta_or_snapshot_digest_sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub previous_raw_cumulative_digest_sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub raw_cumulative_digest_sha256: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LifecycleContentCandidate {
+    #[prost(enumeration = "LifecycleKind", tag = "1")]
+    pub kind: i32,
+    #[prost(enumeration = "SideEffectCertainty", tag = "2")]
+    pub side_effect_certainty: i32,
+    #[prost(bool, optional, tag = "3")]
+    pub native_will_retry: ::core::option::Option<bool>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UsageContentCandidate {
+    #[prost(uint64, tag = "1")]
+    pub input_tokens: u64,
+    #[prost(uint64, tag = "2")]
+    pub output_tokens: u64,
+    #[prost(uint64, optional, tag = "3")]
+    pub cached_input_tokens: ::core::option::Option<u64>,
+}
+/// Request identity/details remain exclusively in the Approval projection.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ApprovalRequiredContentCandidate {}
+/// Adapter-generated classification result for a denied or unknown native
+/// source. It carries a closed marker only; source bytes remain raw evidence and
+/// can never cross into a safe record through this branch.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BlockedSourceContentCandidate {
+    #[prost(enumeration = "HarnessContentMarkerKind", tag = "1")]
+    pub reason: i32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UserVisibleContentCandidate {
+    #[prost(string, tag = "10")]
+    pub candidate_digest_sha256: ::prost::alloc::string::String,
+    #[prost(oneof = "user_visible_content_candidate::Payload", tags = "1, 2, 3, 4, 5")]
+    pub payload: ::core::option::Option<user_visible_content_candidate::Payload>,
+}
+/// Nested message and enum types in `UserVisibleContentCandidate`.
+pub mod user_visible_content_candidate {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "1")]
+        AssistantText(super::AssistantTextContentCandidate),
+        #[prost(message, tag = "2")]
+        Lifecycle(super::LifecycleContentCandidate),
+        #[prost(message, tag = "3")]
+        Usage(super::UsageContentCandidate),
+        #[prost(message, tag = "4")]
+        ApprovalRequired(super::ApprovalRequiredContentCandidate),
+        #[prost(message, tag = "5")]
+        BlockedSource(super::BlockedSourceContentCandidate),
+    }
+}
+/// Paired with the outer durable HarnessObservation tuple. It carries no Task,
+/// Provider or model identity supplied by the Provider candidate.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessContentSignalObservation {
+    #[prost(string, tag = "1")]
+    pub content_event_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub delivered_receipt_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub delivered_receipt_digest_sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub dispatch_route_binding_sha256: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub context_consumption_proof: ::core::option::Option<
+        DispatchContextConsumptionProof,
+    >,
+    #[prost(message, optional, tag = "6")]
+    pub candidate: ::core::option::Option<UserVisibleContentCandidate>,
+}
+/// The following payloads have crossed the deterministic safe-record boundary.
+/// They deliberately omit raw evidence, native routing/session identifiers,
+/// raw cumulative digests and credential material.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SafeAssistantTextContent {
+    #[prost(string, tag = "1")]
+    pub safe_message_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub revision: u64,
+    #[prost(uint64, tag = "3")]
+    pub previous_revision: u64,
+    #[prost(enumeration = "ContentMutationOperation", tag = "4")]
+    pub operation: i32,
+    #[prost(string, tag = "5")]
+    pub safe_text_utf8: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub safe_cumulative_digest_sha256: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "7")]
+    pub part_index: u32,
+    #[prost(uint32, tag = "8")]
+    pub part_count: u32,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SafeLifecycleContent {
+    #[prost(enumeration = "LifecycleKind", tag = "1")]
+    pub kind: i32,
+    #[prost(enumeration = "SideEffectCertainty", tag = "2")]
+    pub side_effect_certainty: i32,
+    #[prost(bool, optional, tag = "3")]
+    pub native_will_retry: ::core::option::Option<bool>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SafeUsageContent {
+    #[prost(uint64, tag = "1")]
+    pub input_tokens: u64,
+    #[prost(uint64, tag = "2")]
+    pub output_tokens: u64,
+    #[prost(uint64, optional, tag = "3")]
+    pub cached_input_tokens: ::core::option::Option<u64>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SafeApprovalRequiredContent {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SafeArtifactIdentity {
+    #[prost(string, tag = "1")]
+    pub artifact_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub artifact_digest_sha256: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SafeArtifactRelationContent {
+    #[prost(bool, tag = "1")]
+    pub safe_content_differs_from_artifact: bool,
+    /// Owner-side immutable identity. Per-principal visibility is applied only by
+    /// the Local API and is never persisted as an Adapter disclosure choice.
+    #[prost(message, optional, tag = "2")]
+    pub artifact: ::core::option::Option<SafeArtifactIdentity>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SafeContentMarker {
+    #[prost(enumeration = "HarnessContentMarkerKind", tag = "1")]
+    pub kind: i32,
+}
+/// Adapter Edge owns this exact safe record and its replay identity. Internal
+/// lineage is trusted-store derived, never copied from the Provider candidate.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SafeHarnessContentRecord {
+    #[prost(string, tag = "1")]
+    pub record_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub record_digest_sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub content_event_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub run_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub step_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub attempt_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub dispatch_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "9")]
+    pub fencing_token: u64,
+    #[prost(string, tag = "10")]
+    pub route_binding_sha256: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "11")]
+    pub disclosure_profile_ref: ::core::option::Option<
+        super::super::common::v1::ContractReference,
+    >,
+    #[prost(string, tag = "12")]
+    pub provider_family_alias: ::prost::alloc::string::String,
+    #[prost(string, tag = "13")]
+    pub model_alias: ::prost::alloc::string::String,
+    #[prost(string, tag = "14")]
+    pub collaboration_role: ::prost::alloc::string::String,
+    #[prost(enumeration = "HarnessContentSafetyFlag", repeated, tag = "15")]
+    pub safety_flags: ::prost::alloc::vec::Vec<i32>,
+    #[prost(
+        oneof = "safe_harness_content_record::Payload",
+        tags = "30, 31, 32, 33, 34, 35"
+    )]
+    pub payload: ::core::option::Option<safe_harness_content_record::Payload>,
+}
+/// Nested message and enum types in `SafeHarnessContentRecord`.
+pub mod safe_harness_content_record {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "30")]
+        AssistantText(super::SafeAssistantTextContent),
+        #[prost(message, tag = "31")]
+        Lifecycle(super::SafeLifecycleContent),
+        #[prost(message, tag = "32")]
+        Usage(super::SafeUsageContent),
+        #[prost(message, tag = "33")]
+        ApprovalRequired(super::SafeApprovalRequiredContent),
+        #[prost(message, tag = "34")]
+        ArtifactRelation(super::SafeArtifactRelationContent),
+        #[prost(message, tag = "35")]
+        Marker(super::SafeContentMarker),
+    }
+}
+/// Owner-side compaction fact emitted only after the current-message/baseline
+/// snapshot and history floor advance commit atomically. It carries no text.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessContentHistoryCompactionRecord {
+    #[prost(string, tag = "1")]
+    pub compaction_record_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub compaction_record_digest_sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub attempt_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub final_epoch: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "6")]
+    pub final_sequence: u64,
+    #[prost(string, tag = "7")]
+    pub final_safe_content_digest_sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub owner_snapshot_digest_sha256: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "9")]
+    pub disclosure_profile_ref: ::core::option::Option<
+        super::super::common::v1::ContractReference,
+    >,
+    #[prost(message, optional, tag = "10")]
+    pub compacted_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(enumeration = "HarnessContentCompactionReason", tag = "11")]
+    pub reason: i32,
+}
+/// Terminal-retention tombstone. It is sufficient to prevent a rebuild from
+/// resurrecting expired content and deliberately contains no source or text.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessContentRetentionTombstone {
+    #[prost(string, tag = "1")]
+    pub tombstone_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub tombstone_digest_sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub attempt_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub final_epoch: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "6")]
+    pub final_sequence: u64,
+    #[prost(string, tag = "7")]
+    pub final_safe_content_digest_sha256: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "8")]
+    pub disclosure_profile_ref: ::core::option::Option<
+        super::super::common::v1::ContractReference,
+    >,
+    #[prost(message, optional, tag = "9")]
+    pub terminal_committed_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(message, optional, tag = "10")]
+    pub compacted_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(enumeration = "HarnessContentRetentionReason", tag = "11")]
+    pub reason: i32,
+}
+/// Exact acknowledged-outbox payload. Closed branches prevent a consumer from
+/// interpreting a history floor or retention tombstone as display content.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SafeHarnessContentProjectionEvent {
+    #[prost(oneof = "safe_harness_content_projection_event::Payload", tags = "1, 2, 3")]
+    pub payload: ::core::option::Option<safe_harness_content_projection_event::Payload>,
+}
+/// Nested message and enum types in `SafeHarnessContentProjectionEvent`.
+pub mod safe_harness_content_projection_event {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "1")]
+        ContentRecord(super::SafeHarnessContentRecord),
+        #[prost(message, tag = "2")]
+        HistoryCompaction(super::HarnessContentHistoryCompactionRecord),
+        #[prost(message, tag = "3")]
+        RetentionTombstone(super::HarnessContentRetentionTombstone),
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HarnessObservation {
     #[prost(string, tag = "1")]
@@ -433,7 +793,10 @@ pub struct HarnessObservation {
     pub native_observed_at: ::core::option::Option<::prost_types::Timestamp>,
     #[prost(message, optional, tag = "14")]
     pub adapter_received_at: ::core::option::Option<::prost_types::Timestamp>,
-    #[prost(oneof = "harness_observation::Payload", tags = "20, 21, 22, 23, 24, 25, 26")]
+    #[prost(
+        oneof = "harness_observation::Payload",
+        tags = "20, 21, 22, 23, 24, 25, 26, 27"
+    )]
     pub payload: ::core::option::Option<harness_observation::Payload>,
 }
 /// Nested message and enum types in `HarnessObservation`.
@@ -454,6 +817,8 @@ pub mod harness_observation {
         ArtifactReturn(super::ArtifactReturnObservation),
         #[prost(message, tag = "26")]
         Diagnostic(super::DiagnosticObservation),
+        #[prost(message, tag = "27")]
+        ContentSignal(super::HarnessContentSignalObservation),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1445,6 +1810,192 @@ impl HarnessErrorCode {
             "HARNESS_ERROR_CODE_PROFILE_NOT_ACTIVE" => Some(Self::ProfileNotActive),
             "HARNESS_ERROR_CODE_NOT_FOUND" => Some(Self::NotFound),
             "HARNESS_ERROR_CODE_INTERNAL" => Some(Self::Internal),
+            _ => None,
+        }
+    }
+}
+/// Closed mutation semantics for one explicitly user-visible assistant message.
+/// UNSPECIFIED is always invalid for a content candidate or safe text record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ContentMutationOperation {
+    Unspecified = 0,
+    Append = 1,
+    Replace = 2,
+    Finalize = 3,
+}
+impl ContentMutationOperation {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CONTENT_MUTATION_OPERATION_UNSPECIFIED",
+            Self::Append => "CONTENT_MUTATION_OPERATION_APPEND",
+            Self::Replace => "CONTENT_MUTATION_OPERATION_REPLACE",
+            Self::Finalize => "CONTENT_MUTATION_OPERATION_FINALIZE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CONTENT_MUTATION_OPERATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "CONTENT_MUTATION_OPERATION_APPEND" => Some(Self::Append),
+            "CONTENT_MUTATION_OPERATION_REPLACE" => Some(Self::Replace),
+            "CONTENT_MUTATION_OPERATION_FINALIZE" => Some(Self::Finalize),
+            _ => None,
+        }
+    }
+}
+/// Safe, non-secret disclosure facts. Unknown values fail closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HarnessContentSafetyFlag {
+    Unspecified = 0,
+    ControlRedacted = 1,
+    CredentialRedacted = 2,
+    Truncated = 3,
+    Provisional = 4,
+}
+impl HarnessContentSafetyFlag {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "HARNESS_CONTENT_SAFETY_FLAG_UNSPECIFIED",
+            Self::ControlRedacted => "HARNESS_CONTENT_SAFETY_FLAG_CONTROL_REDACTED",
+            Self::CredentialRedacted => "HARNESS_CONTENT_SAFETY_FLAG_CREDENTIAL_REDACTED",
+            Self::Truncated => "HARNESS_CONTENT_SAFETY_FLAG_TRUNCATED",
+            Self::Provisional => "HARNESS_CONTENT_SAFETY_FLAG_PROVISIONAL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HARNESS_CONTENT_SAFETY_FLAG_UNSPECIFIED" => Some(Self::Unspecified),
+            "HARNESS_CONTENT_SAFETY_FLAG_CONTROL_REDACTED" => Some(Self::ControlRedacted),
+            "HARNESS_CONTENT_SAFETY_FLAG_CREDENTIAL_REDACTED" => {
+                Some(Self::CredentialRedacted)
+            }
+            "HARNESS_CONTENT_SAFETY_FLAG_TRUNCATED" => Some(Self::Truncated),
+            "HARNESS_CONTENT_SAFETY_FLAG_PROVISIONAL" => Some(Self::Provisional),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HarnessContentMarkerKind {
+    Unspecified = 0,
+    InvalidText = 1,
+    ForbiddenCategory = 2,
+    UnknownCategory = 3,
+    RedactionInputUnavailable = 4,
+    LimitReached = 5,
+    ProfileChangedHistoryUnavailable = 6,
+    Compacted = 7,
+}
+impl HarnessContentMarkerKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "HARNESS_CONTENT_MARKER_KIND_UNSPECIFIED",
+            Self::InvalidText => "HARNESS_CONTENT_MARKER_KIND_INVALID_TEXT",
+            Self::ForbiddenCategory => "HARNESS_CONTENT_MARKER_KIND_FORBIDDEN_CATEGORY",
+            Self::UnknownCategory => "HARNESS_CONTENT_MARKER_KIND_UNKNOWN_CATEGORY",
+            Self::RedactionInputUnavailable => {
+                "HARNESS_CONTENT_MARKER_KIND_REDACTION_INPUT_UNAVAILABLE"
+            }
+            Self::LimitReached => "HARNESS_CONTENT_MARKER_KIND_LIMIT_REACHED",
+            Self::ProfileChangedHistoryUnavailable => {
+                "HARNESS_CONTENT_MARKER_KIND_PROFILE_CHANGED_HISTORY_UNAVAILABLE"
+            }
+            Self::Compacted => "HARNESS_CONTENT_MARKER_KIND_COMPACTED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HARNESS_CONTENT_MARKER_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "HARNESS_CONTENT_MARKER_KIND_INVALID_TEXT" => Some(Self::InvalidText),
+            "HARNESS_CONTENT_MARKER_KIND_FORBIDDEN_CATEGORY" => {
+                Some(Self::ForbiddenCategory)
+            }
+            "HARNESS_CONTENT_MARKER_KIND_UNKNOWN_CATEGORY" => Some(Self::UnknownCategory),
+            "HARNESS_CONTENT_MARKER_KIND_REDACTION_INPUT_UNAVAILABLE" => {
+                Some(Self::RedactionInputUnavailable)
+            }
+            "HARNESS_CONTENT_MARKER_KIND_LIMIT_REACHED" => Some(Self::LimitReached),
+            "HARNESS_CONTENT_MARKER_KIND_PROFILE_CHANGED_HISTORY_UNAVAILABLE" => {
+                Some(Self::ProfileChangedHistoryUnavailable)
+            }
+            "HARNESS_CONTENT_MARKER_KIND_COMPACTED" => Some(Self::Compacted),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HarnessContentCompactionReason {
+    Unspecified = 0,
+    OwnerHistoryFloorAdvanced = 1,
+}
+impl HarnessContentCompactionReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "HARNESS_CONTENT_COMPACTION_REASON_UNSPECIFIED",
+            Self::OwnerHistoryFloorAdvanced => {
+                "HARNESS_CONTENT_COMPACTION_REASON_OWNER_HISTORY_FLOOR_ADVANCED"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HARNESS_CONTENT_COMPACTION_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "HARNESS_CONTENT_COMPACTION_REASON_OWNER_HISTORY_FLOOR_ADVANCED" => {
+                Some(Self::OwnerHistoryFloorAdvanced)
+            }
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HarnessContentRetentionReason {
+    Unspecified = 0,
+    TerminalMinimumExpired = 1,
+}
+impl HarnessContentRetentionReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "HARNESS_CONTENT_RETENTION_REASON_UNSPECIFIED",
+            Self::TerminalMinimumExpired => {
+                "HARNESS_CONTENT_RETENTION_REASON_TERMINAL_MINIMUM_EXPIRED"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HARNESS_CONTENT_RETENTION_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "HARNESS_CONTENT_RETENTION_REASON_TERMINAL_MINIMUM_EXPIRED" => {
+                Some(Self::TerminalMinimumExpired)
+            }
             _ => None,
         }
     }

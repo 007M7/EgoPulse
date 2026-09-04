@@ -2566,6 +2566,7 @@ fn build_dispatch_envelope(
         session_strategy: material.session_strategy as i32,
         native_session_ref: material.native_session_ref.clone(),
         checkpoint_ref: material.checkpoint_ref.clone(),
+        route_binding: None,
     }
 }
 

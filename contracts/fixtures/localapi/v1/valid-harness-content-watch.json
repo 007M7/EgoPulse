@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "v01-localapi-fixture/v0.1",
+  "fixtureId": "localapi-valid-harness-content-watch",
+  "category": "valid",
+  "requirementRefs": ["R9C-D01", "R9C-D06", "R9C-D07"],
+  "principal": { "kind": "LOCAL_USER", "principalId": "os-user:founder", "authenticated": true },
+  "transport": { "kind": "WINDOWS_NAMED_PIPE" },
+  "startingState": {
+    "grantedPermissionCodes": ["local.harness.content.read"],
+    "ownedTaskIds": ["task-001"],
+    "clientContentPosition": { "epoch": "content-epoch-01", "sequence": 12 },
+    "currentContentPosition": { "epoch": "content-epoch-01", "sequence": 13 }
+  },
+  "operation": {
+    "watchHarnessContent": {
+      "taskId": "task-001",
+      "attemptIds": ["attempt-001"],
+      "resumeAfter": { "epoch": "content-epoch-01", "sequence": 12 }
+    }
+  },
+  "expected": {
+    "outcome": "ok",
+    "businessWriteCount": 0,
+    "framePayloadBranch": "records",
+    "framePayload": { "records": { "recordCount": 1 } },
+    "firstDeliveredSequence": 13,
+    "operationRecords": true,
+    "completeSnapshot": false,
+    "orderedWithinContentEpoch": true,
+    "taskPositionCompared": false,
+    "approvalPositionCompared": false,
+    "maxFramesInFlight": 1,
+    "permissionRevalidatedAfterSendReservation": true,
+    "heartbeatFieldsCoPresent": false,
+    "resetRequiredFieldsCoPresent": false
+  }
+}

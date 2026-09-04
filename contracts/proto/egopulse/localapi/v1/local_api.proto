@@ -50,6 +50,16 @@ enum StreamFrameKind {
   STREAM_FRAME_KIND_RESET_REQUIRED = 3;
 }
 
+enum HarnessContentResetReason {
+  HARNESS_CONTENT_RESET_REASON_UNSPECIFIED = 0;
+  HARNESS_CONTENT_RESET_REASON_CURSOR_EXPIRED = 1;
+  HARNESS_CONTENT_RESET_REASON_EPOCH_CHANGED = 2;
+  HARNESS_CONTENT_RESET_REASON_PROFILE_CHANGED = 3;
+  HARNESS_CONTENT_RESET_REASON_RETENTION_COMPACTED = 4;
+  HARNESS_CONTENT_RESET_REASON_BASELINE_UNAVAILABLE = 5;
+  HARNESS_CONTENT_RESET_REASON_INTEGRITY_RECOVERY = 6;
+}
+
 enum AvailableActionKind {
   AVAILABLE_ACTION_KIND_UNSPECIFIED = 0;
   AVAILABLE_ACTION_KIND_CREATE_TASK = 1;
@@ -307,6 +317,138 @@ message HarnessApprovalView {
   HarnessApprovalDecisionView policy_decision = 17;
   repeated AvailableAction available_actions = 18;
   repeated RedactedField redactions = 19;
+}
+
+// Independent content-domain position. It must not be compared with the Task,
+// Approval or OpenSession projection position even when values happen to match.
+message HarnessContentPosition {
+  string epoch = 1;
+  uint64 sequence = 2;
+  google.protobuf.Timestamp projected_at = 3;
+}
+
+message HarnessAssistantTextView {
+  string safe_message_id = 1;
+  uint64 revision = 2;
+  uint64 previous_revision = 3;
+  egopulse.harness.v1.ContentMutationOperation operation = 4;
+  string safe_text_utf8 = 5;
+  string safe_cumulative_digest_sha256 = 6;
+  uint32 part_index = 7;
+  uint32 part_count = 8;
+  bool provisional = 9;
+}
+
+message HarnessLifecycleContentView {
+  egopulse.harness.v1.LifecycleKind kind = 1;
+  egopulse.harness.v1.SideEffectCertainty side_effect_certainty = 2;
+  optional bool native_will_retry = 3;
+}
+
+message HarnessUsageContentView {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  optional uint64 cached_input_tokens = 3;
+}
+
+// Request identity/details remain in the separately authorized Approval stream.
+message HarnessApprovalRequiredContentView {}
+
+message HarnessArtifactIdentityView {
+  string artifact_id = 1;
+  string artifact_digest_sha256 = 2;
+}
+
+message HarnessArtifactAvailableRedactedView {}
+
+message HarnessArtifactRelationView {
+  bool safe_content_differs_from_artifact = 1;
+  oneof visibility {
+    HarnessArtifactIdentityView available = 2;
+    HarnessArtifactAvailableRedactedView available_redacted = 3;
+  }
+}
+
+message HarnessContentMarkerView {
+  egopulse.harness.v1.HarnessContentMarkerKind kind = 1;
+}
+
+// Public, post-disclosure DTO. Raw/native identifiers, raw evidence, route
+// binding, raw cumulative digests and credential commitments are intentionally
+// absent.
+message HarnessContentRecordView {
+  string record_id = 1;
+  string record_digest_sha256 = 2;
+  uint64 content_sequence = 3;
+  string task_id = 4;
+  string attempt_id = 5;
+  string provider_family_alias = 6;
+  string model_alias = 7;
+  string collaboration_role = 8;
+  egopulse.common.v1.ContractReference disclosure_profile_ref = 9;
+  google.protobuf.Timestamp projected_at = 10;
+  repeated egopulse.harness.v1.HarnessContentSafetyFlag safety_flags = 11;
+  oneof payload {
+    HarnessAssistantTextView assistant_text = 20;
+    HarnessLifecycleContentView lifecycle = 21;
+    HarnessUsageContentView usage = 22;
+    HarnessApprovalRequiredContentView approval_required = 23;
+    HarnessArtifactRelationView artifact_relation = 24;
+    HarnessContentMarkerView marker = 25;
+  }
+}
+
+message ListHarnessContentRequest {
+  ClientRequestMetadata client = 1;
+  string task_id = 2;
+  repeated string attempt_ids = 3;
+  uint32 page_size = 4;
+  optional string page_cursor = 5;
+  // Required on every page after the first so pagination cannot drift to a
+  // newer content position.
+  HarnessContentPosition snapshot_position = 6;
+}
+
+message HarnessContentBaselinePage {
+  repeated HarnessContentRecordView records = 1;
+  optional string next_page_cursor = 2;
+  bool has_more = 3;
+  HarnessContentPosition snapshot_position = 4;
+  uint64 retained_from_sequence = 5;
+  egopulse.common.v1.ContractReference disclosure_profile_ref = 6;
+}
+
+message ListHarnessContentResponse {
+  oneof outcome {
+    HarnessContentBaselinePage page = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message WatchHarnessContentRequest {
+  ClientRequestMetadata client = 1;
+  string task_id = 2;
+  repeated string attempt_ids = 3;
+  HarnessContentPosition resume_after = 4;
+}
+
+message HarnessContentRecordsFrame {
+  repeated HarnessContentRecordView records = 1;
+}
+
+message HarnessContentHeartbeatFrame {}
+
+message HarnessContentResetRequiredFrame {
+  HarnessContentResetReason reason = 1;
+}
+
+message HarnessContentStreamFrame {
+  HarnessContentPosition position = 1;
+  oneof payload {
+    HarnessContentRecordsFrame records = 2;
+    HarnessContentHeartbeatFrame heartbeat = 3;
+    HarnessContentResetRequiredFrame reset_required = 4;
+  }
 }
 
 message LocalApiError {
@@ -647,6 +789,8 @@ service LocalReadModelService {
   rpc GetProjectionStatus(GetProjectionStatusRequest) returns (GetProjectionStatusResponse);
   rpc WatchTaskViews(WatchTaskViewsRequest) returns (stream TaskViewStreamFrame);
   rpc WatchHarnessApprovalViews(WatchHarnessApprovalViewsRequest) returns (stream HarnessApprovalViewStreamFrame);
+  rpc ListHarnessContent(ListHarnessContentRequest) returns (ListHarnessContentResponse);
+  rpc WatchHarnessContent(WatchHarnessContentRequest) returns (stream HarnessContentStreamFrame);
   rpc AwaitProjection(AwaitProjectionRequest) returns (AwaitProjectionResponse);
 }
 

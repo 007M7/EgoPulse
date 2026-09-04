@@ -1,0 +1,71 @@
+{
+  "schemaVersion": "v01-localapi-fixture/v0.1",
+  "fixtureId": "localapi-recovery-harness-content-retention-reset",
+  "category": "recovery",
+  "requirementRefs": ["R9C-D05", "R9C-D07", "R9C-D08"],
+  "principal": { "kind": "FOUNDER", "principalId": "os-user:founder", "authenticated": true },
+  "transport": { "kind": "WINDOWS_NAMED_PIPE" },
+  "startingState": {
+    "grantedPermissionCodes": ["local.harness.content.read"],
+    "ownedTaskIds": ["task-001"],
+    "clientContentPosition": { "epoch": "content-epoch-01", "sequence": 7 },
+    "currentContentPosition": { "epoch": "content-epoch-02", "sequence": 4 },
+    "retainedFromSequence": 2,
+    "taskProjectionStillLive": true,
+    "approvalProjectionStillLive": true
+  },
+  "ownerRetentionTombstone": {
+    "tombstoneId": "hrt_c3974d6b10d5934defe7cecf331300ecb3f7292676bf52d2abf170e27283bd8f",
+    "tombstoneDigestSha256": "9e66456fca02fc3c3603e6fa2988c5edcd6c813c4b56d61a4361f7e10aa8c642",
+    "taskId": "task-001",
+    "attemptId": "attempt-001",
+    "finalEpoch": "content-epoch-02",
+    "finalSequence": 4,
+    "finalSafeContentDigestSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "disclosureProfileRef": {
+      "contractId": "egopulse.harness-content-disclosure.v1",
+      "version": "0.1.0",
+      "sha256": "f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc"
+    },
+    "terminalCommittedAt": { "seconds": 1785888000, "nanos": 0 },
+    "compactedAt": { "seconds": 1788480000, "nanos": 0 },
+    "reason": "HARNESS_CONTENT_RETENTION_REASON_TERMINAL_MINIMUM_EXPIRED"
+  },
+  "canonicalVectors": {
+    "retentionTombstoneIdHex": "320000000000000065676f70756c73652f6861726e6573732d636f6e74656e742f726574656e74696f6e2d746f6d6273746f6e652d69642f763108000000000000007461736b2d3030310b00000000000000617474656d70742d3030311000000000000000636f6e74656e742d65706f63682d30320800000000000000040000000000000040000000000000006638656566323430666463323538643362373139343863663864393732346162343638343861356231393834366162393338326235303566663535363366646318000000000000005445524d494e414c5f4d494e494d554d5f45585049524544",
+    "retentionTombstoneIdSha256": "c3974d6b10d5934defe7cecf331300ecb3f7292676bf52d2abf170e27283bd8f",
+    "retentionTombstoneHex": "2f0000000000000065676f70756c73652f6861726e6573732d636f6e74656e742f726574656e74696f6e2d746f6d6273746f6e652f763144000000000000006872745f6333393734643662313064353933346465666537636563663333313330306563623366373239323637366266353264326162663137306532373238336264386608000000000000007461736b2d3030310b00000000000000617474656d70742d3030311000000000000000636f6e74656e742d65706f63682d303208000000000000000400000000000000400000000000000064646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464260000000000000065676f70756c73652e6861726e6573732d636f6e74656e742d646973636c6f737572652e76310500000000000000302e312e304000000000000000663865656632343066646332353864336237313934386366386439373234616234363834386135623139383436616239333832623530356666353536336664630800000000000000007d726a000000000400000000000000000000000800000000000000000a9a6a0000000004000000000000000000000018000000000000005445524d494e414c5f4d494e494d554d5f45585049524544",
+    "retentionTombstoneSha256": "9e66456fca02fc3c3603e6fa2988c5edcd6c813c4b56d61a4361f7e10aa8c642"
+  },
+  "retentionBoundary": {
+    "terminalCommittedAtSeconds": 1785888000,
+    "minimumRetentionSeconds": 2592000,
+    "oneSecondBeforeEligibleAtSeconds": 1788479999,
+    "firstEligibleAtSeconds": 1788480000,
+    "eligibleOneSecondBefore": false,
+    "eligibleAtBoundary": true,
+    "deletionTiming": "first_compactor_run_at_or_after_boundary"
+  },
+  "operation": {
+    "watchHarnessContent": {
+      "taskId": "task-001",
+      "resumeAfter": { "epoch": "content-epoch-01", "sequence": 7 }
+    }
+  },
+  "expected": {
+    "outcome": "reset_required",
+    "businessWriteCount": 0,
+    "framePayloadBranch": "reset_required",
+    "resetRequired": { "reason": "HARNESS_CONTENT_RESET_REASON_RETENTION_COMPACTED" },
+    "clientDiscardsIncompleteAssembly": true,
+    "newContentBaselineRequired": true,
+    "oldProfileTextCopied": false,
+    "redactionRerun": false,
+    "taskStreamTerminated": false,
+    "approvalStreamTerminated": false,
+    "ownerTombstoneTyped": true,
+    "ownerTombstoneContainsText": false,
+    "rawEvidenceRebuildAttempted": false,
+    "expiredContentResurrected": false
+  }
+}

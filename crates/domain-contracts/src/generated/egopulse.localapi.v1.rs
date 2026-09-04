@@ -393,6 +393,244 @@ pub struct HarnessApprovalView {
     #[prost(message, repeated, tag = "19")]
     pub redactions: ::prost::alloc::vec::Vec<RedactedField>,
 }
+/// Independent content-domain position. It must not be compared with the Task,
+/// Approval or OpenSession projection position even when values happen to match.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessContentPosition {
+    #[prost(string, tag = "1")]
+    pub epoch: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(message, optional, tag = "3")]
+    pub projected_at: ::core::option::Option<::prost_types::Timestamp>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessAssistantTextView {
+    #[prost(string, tag = "1")]
+    pub safe_message_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub revision: u64,
+    #[prost(uint64, tag = "3")]
+    pub previous_revision: u64,
+    #[prost(
+        enumeration = "super::super::harness::v1::ContentMutationOperation",
+        tag = "4"
+    )]
+    pub operation: i32,
+    #[prost(string, tag = "5")]
+    pub safe_text_utf8: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub safe_cumulative_digest_sha256: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "7")]
+    pub part_index: u32,
+    #[prost(uint32, tag = "8")]
+    pub part_count: u32,
+    #[prost(bool, tag = "9")]
+    pub provisional: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessLifecycleContentView {
+    #[prost(enumeration = "super::super::harness::v1::LifecycleKind", tag = "1")]
+    pub kind: i32,
+    #[prost(enumeration = "super::super::harness::v1::SideEffectCertainty", tag = "2")]
+    pub side_effect_certainty: i32,
+    #[prost(bool, optional, tag = "3")]
+    pub native_will_retry: ::core::option::Option<bool>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessUsageContentView {
+    #[prost(uint64, tag = "1")]
+    pub input_tokens: u64,
+    #[prost(uint64, tag = "2")]
+    pub output_tokens: u64,
+    #[prost(uint64, optional, tag = "3")]
+    pub cached_input_tokens: ::core::option::Option<u64>,
+}
+/// Request identity/details remain in the separately authorized Approval stream.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessApprovalRequiredContentView {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessArtifactIdentityView {
+    #[prost(string, tag = "1")]
+    pub artifact_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub artifact_digest_sha256: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessArtifactAvailableRedactedView {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessArtifactRelationView {
+    #[prost(bool, tag = "1")]
+    pub safe_content_differs_from_artifact: bool,
+    #[prost(oneof = "harness_artifact_relation_view::Visibility", tags = "2, 3")]
+    pub visibility: ::core::option::Option<harness_artifact_relation_view::Visibility>,
+}
+/// Nested message and enum types in `HarnessArtifactRelationView`.
+pub mod harness_artifact_relation_view {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Visibility {
+        #[prost(message, tag = "2")]
+        Available(super::HarnessArtifactIdentityView),
+        #[prost(message, tag = "3")]
+        AvailableRedacted(super::HarnessArtifactAvailableRedactedView),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessContentMarkerView {
+    #[prost(
+        enumeration = "super::super::harness::v1::HarnessContentMarkerKind",
+        tag = "1"
+    )]
+    pub kind: i32,
+}
+/// Public, post-disclosure DTO. Raw/native identifiers, raw evidence, route
+/// binding, raw cumulative digests and credential commitments are intentionally
+/// absent.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessContentRecordView {
+    #[prost(string, tag = "1")]
+    pub record_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub record_digest_sha256: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub content_sequence: u64,
+    #[prost(string, tag = "4")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub attempt_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub provider_family_alias: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub model_alias: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub collaboration_role: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "9")]
+    pub disclosure_profile_ref: ::core::option::Option<
+        super::super::common::v1::ContractReference,
+    >,
+    #[prost(message, optional, tag = "10")]
+    pub projected_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(
+        enumeration = "super::super::harness::v1::HarnessContentSafetyFlag",
+        repeated,
+        tag = "11"
+    )]
+    pub safety_flags: ::prost::alloc::vec::Vec<i32>,
+    #[prost(
+        oneof = "harness_content_record_view::Payload",
+        tags = "20, 21, 22, 23, 24, 25"
+    )]
+    pub payload: ::core::option::Option<harness_content_record_view::Payload>,
+}
+/// Nested message and enum types in `HarnessContentRecordView`.
+pub mod harness_content_record_view {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "20")]
+        AssistantText(super::HarnessAssistantTextView),
+        #[prost(message, tag = "21")]
+        Lifecycle(super::HarnessLifecycleContentView),
+        #[prost(message, tag = "22")]
+        Usage(super::HarnessUsageContentView),
+        #[prost(message, tag = "23")]
+        ApprovalRequired(super::HarnessApprovalRequiredContentView),
+        #[prost(message, tag = "24")]
+        ArtifactRelation(super::HarnessArtifactRelationView),
+        #[prost(message, tag = "25")]
+        Marker(super::HarnessContentMarkerView),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListHarnessContentRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub attempt_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(uint32, tag = "4")]
+    pub page_size: u32,
+    #[prost(string, optional, tag = "5")]
+    pub page_cursor: ::core::option::Option<::prost::alloc::string::String>,
+    /// Required on every page after the first so pagination cannot drift to a
+    /// newer content position.
+    #[prost(message, optional, tag = "6")]
+    pub snapshot_position: ::core::option::Option<HarnessContentPosition>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HarnessContentBaselinePage {
+    #[prost(message, repeated, tag = "1")]
+    pub records: ::prost::alloc::vec::Vec<HarnessContentRecordView>,
+    #[prost(string, optional, tag = "2")]
+    pub next_page_cursor: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "3")]
+    pub has_more: bool,
+    #[prost(message, optional, tag = "4")]
+    pub snapshot_position: ::core::option::Option<HarnessContentPosition>,
+    #[prost(uint64, tag = "5")]
+    pub retained_from_sequence: u64,
+    #[prost(message, optional, tag = "6")]
+    pub disclosure_profile_ref: ::core::option::Option<
+        super::super::common::v1::ContractReference,
+    >,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListHarnessContentResponse {
+    #[prost(oneof = "list_harness_content_response::Outcome", tags = "1, 2")]
+    pub outcome: ::core::option::Option<list_harness_content_response::Outcome>,
+}
+/// Nested message and enum types in `ListHarnessContentResponse`.
+pub mod list_harness_content_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Outcome {
+        #[prost(message, tag = "1")]
+        Page(super::HarnessContentBaselinePage),
+        #[prost(message, tag = "2")]
+        Error(super::LocalApiError),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchHarnessContentRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub attempt_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "4")]
+    pub resume_after: ::core::option::Option<HarnessContentPosition>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HarnessContentRecordsFrame {
+    #[prost(message, repeated, tag = "1")]
+    pub records: ::prost::alloc::vec::Vec<HarnessContentRecordView>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessContentHeartbeatFrame {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct HarnessContentResetRequiredFrame {
+    #[prost(enumeration = "HarnessContentResetReason", tag = "1")]
+    pub reason: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HarnessContentStreamFrame {
+    #[prost(message, optional, tag = "1")]
+    pub position: ::core::option::Option<HarnessContentPosition>,
+    #[prost(oneof = "harness_content_stream_frame::Payload", tags = "2, 3, 4")]
+    pub payload: ::core::option::Option<harness_content_stream_frame::Payload>,
+}
+/// Nested message and enum types in `HarnessContentStreamFrame`.
+pub mod harness_content_stream_frame {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "2")]
+        Records(super::HarnessContentRecordsFrame),
+        #[prost(message, tag = "3")]
+        Heartbeat(super::HarnessContentHeartbeatFrame),
+        #[prost(message, tag = "4")]
+        ResetRequired(super::HarnessContentResetRequiredFrame),
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LocalApiError {
     #[prost(enumeration = "LocalApiErrorCode", tag = "1")]
@@ -1109,6 +1347,57 @@ impl StreamFrameKind {
             "STREAM_FRAME_KIND_SNAPSHOT" => Some(Self::Snapshot),
             "STREAM_FRAME_KIND_HEARTBEAT" => Some(Self::Heartbeat),
             "STREAM_FRAME_KIND_RESET_REQUIRED" => Some(Self::ResetRequired),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HarnessContentResetReason {
+    Unspecified = 0,
+    CursorExpired = 1,
+    EpochChanged = 2,
+    ProfileChanged = 3,
+    RetentionCompacted = 4,
+    BaselineUnavailable = 5,
+    IntegrityRecovery = 6,
+}
+impl HarnessContentResetReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "HARNESS_CONTENT_RESET_REASON_UNSPECIFIED",
+            Self::CursorExpired => "HARNESS_CONTENT_RESET_REASON_CURSOR_EXPIRED",
+            Self::EpochChanged => "HARNESS_CONTENT_RESET_REASON_EPOCH_CHANGED",
+            Self::ProfileChanged => "HARNESS_CONTENT_RESET_REASON_PROFILE_CHANGED",
+            Self::RetentionCompacted => {
+                "HARNESS_CONTENT_RESET_REASON_RETENTION_COMPACTED"
+            }
+            Self::BaselineUnavailable => {
+                "HARNESS_CONTENT_RESET_REASON_BASELINE_UNAVAILABLE"
+            }
+            Self::IntegrityRecovery => "HARNESS_CONTENT_RESET_REASON_INTEGRITY_RECOVERY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HARNESS_CONTENT_RESET_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "HARNESS_CONTENT_RESET_REASON_CURSOR_EXPIRED" => Some(Self::CursorExpired),
+            "HARNESS_CONTENT_RESET_REASON_EPOCH_CHANGED" => Some(Self::EpochChanged),
+            "HARNESS_CONTENT_RESET_REASON_PROFILE_CHANGED" => Some(Self::ProfileChanged),
+            "HARNESS_CONTENT_RESET_REASON_RETENTION_COMPACTED" => {
+                Some(Self::RetentionCompacted)
+            }
+            "HARNESS_CONTENT_RESET_REASON_BASELINE_UNAVAILABLE" => {
+                Some(Self::BaselineUnavailable)
+            }
+            "HARNESS_CONTENT_RESET_REASON_INTEGRITY_RECOVERY" => {
+                Some(Self::IntegrityRecovery)
+            }
             _ => None,
         }
     }
@@ -1929,6 +2218,64 @@ pub mod local_read_model_service_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        pub async fn list_harness_content(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListHarnessContentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListHarnessContentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalReadModelService/ListHarnessContent",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalReadModelService",
+                        "ListHarnessContent",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn watch_harness_content(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WatchHarnessContentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::HarnessContentStreamFrame>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalReadModelService/WatchHarnessContent",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalReadModelService",
+                        "WatchHarnessContent",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
         pub async fn await_projection(
             &mut self,
             request: impl tonic::IntoRequest<super::AwaitProjectionRequest>,
@@ -2042,6 +2389,29 @@ pub mod local_read_model_service_server {
             request: tonic::Request<super::WatchHarnessApprovalViewsRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::WatchHarnessApprovalViewsStream>,
+            tonic::Status,
+        >;
+        async fn list_harness_content(
+            &self,
+            request: tonic::Request<super::ListHarnessContentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListHarnessContentResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the WatchHarnessContent method.
+        type WatchHarnessContentStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<
+                    super::HarnessContentStreamFrame,
+                    tonic::Status,
+                >,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn watch_harness_content(
+            &self,
+            request: tonic::Request<super::WatchHarnessContentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::WatchHarnessContentStream>,
             tonic::Status,
         >;
         async fn await_projection(
@@ -2516,6 +2886,106 @@ pub mod local_read_model_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = WatchHarnessApprovalViewsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/egopulse.localapi.v1.LocalReadModelService/ListHarnessContent" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListHarnessContentSvc<T: LocalReadModelService>(pub Arc<T>);
+                    impl<
+                        T: LocalReadModelService,
+                    > tonic::server::UnaryService<super::ListHarnessContentRequest>
+                    for ListHarnessContentSvc<T> {
+                        type Response = super::ListHarnessContentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListHarnessContentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalReadModelService>::list_harness_content(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListHarnessContentSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/egopulse.localapi.v1.LocalReadModelService/WatchHarnessContent" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchHarnessContentSvc<T: LocalReadModelService>(pub Arc<T>);
+                    impl<
+                        T: LocalReadModelService,
+                    > tonic::server::ServerStreamingService<
+                        super::WatchHarnessContentRequest,
+                    > for WatchHarnessContentSvc<T> {
+                        type Response = super::HarnessContentStreamFrame;
+                        type ResponseStream = T::WatchHarnessContentStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WatchHarnessContentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalReadModelService>::watch_harness_content(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchHarnessContentSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

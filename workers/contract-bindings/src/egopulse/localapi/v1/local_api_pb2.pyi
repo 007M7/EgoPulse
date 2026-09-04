@@ -53,6 +53,16 @@ class StreamFrameKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     STREAM_FRAME_KIND_HEARTBEAT: _ClassVar[StreamFrameKind]
     STREAM_FRAME_KIND_RESET_REQUIRED: _ClassVar[StreamFrameKind]
 
+class HarnessContentResetReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    HARNESS_CONTENT_RESET_REASON_UNSPECIFIED: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_CURSOR_EXPIRED: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_EPOCH_CHANGED: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_PROFILE_CHANGED: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_RETENTION_COMPACTED: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_BASELINE_UNAVAILABLE: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_INTEGRITY_RECOVERY: _ClassVar[HarnessContentResetReason]
+
 class AvailableActionKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     AVAILABLE_ACTION_KIND_UNSPECIFIED: _ClassVar[AvailableActionKind]
@@ -115,6 +125,13 @@ STREAM_FRAME_KIND_UNSPECIFIED: StreamFrameKind
 STREAM_FRAME_KIND_SNAPSHOT: StreamFrameKind
 STREAM_FRAME_KIND_HEARTBEAT: StreamFrameKind
 STREAM_FRAME_KIND_RESET_REQUIRED: StreamFrameKind
+HARNESS_CONTENT_RESET_REASON_UNSPECIFIED: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_CURSOR_EXPIRED: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_EPOCH_CHANGED: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_PROFILE_CHANGED: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_RETENTION_COMPACTED: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_BASELINE_UNAVAILABLE: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_INTEGRITY_RECOVERY: HarnessContentResetReason
 AVAILABLE_ACTION_KIND_UNSPECIFIED: AvailableActionKind
 AVAILABLE_ACTION_KIND_CREATE_TASK: AvailableActionKind
 AVAILABLE_ACTION_KIND_REQUEST_CANCELLATION: AvailableActionKind
@@ -495,6 +512,208 @@ class HarnessApprovalView(_message.Message):
     available_actions: _containers.RepeatedCompositeFieldContainer[AvailableAction]
     redactions: _containers.RepeatedCompositeFieldContainer[RedactedField]
     def __init__(self, metadata: _Optional[_Union[ProjectionMetadata, _Mapping]] = ..., approval_request_id: _Optional[str] = ..., task_id: _Optional[str] = ..., run_id: _Optional[str] = ..., step_id: _Optional[str] = ..., attempt_id: _Optional[str] = ..., dispatch_id: _Optional[str] = ..., fencing_token: _Optional[int] = ..., kind: _Optional[_Union[_harness_pb2.ApprovalKind, str]] = ..., action_digest_sha256: _Optional[str] = ..., requested_scope_ref: _Optional[str] = ..., display_summary_ref: _Optional[str] = ..., request_observation_id: _Optional[str] = ..., request_observation_sequence: _Optional[int] = ..., request_lifecycle: _Optional[_Union[_harness_pb2.ApprovalRequestLifecycleKind, str]] = ..., request_revision: _Optional[int] = ..., policy_decision: _Optional[_Union[HarnessApprovalDecisionView, _Mapping]] = ..., available_actions: _Optional[_Iterable[_Union[AvailableAction, _Mapping]]] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ...) -> None: ...
+
+class HarnessContentPosition(_message.Message):
+    __slots__ = ("epoch", "sequence", "projected_at")
+    EPOCH_FIELD_NUMBER: _ClassVar[int]
+    SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    PROJECTED_AT_FIELD_NUMBER: _ClassVar[int]
+    epoch: str
+    sequence: int
+    projected_at: _timestamp_pb2.Timestamp
+    def __init__(self, epoch: _Optional[str] = ..., sequence: _Optional[int] = ..., projected_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class HarnessAssistantTextView(_message.Message):
+    __slots__ = ("safe_message_id", "revision", "previous_revision", "operation", "safe_text_utf8", "safe_cumulative_digest_sha256", "part_index", "part_count", "provisional")
+    SAFE_MESSAGE_ID_FIELD_NUMBER: _ClassVar[int]
+    REVISION_FIELD_NUMBER: _ClassVar[int]
+    PREVIOUS_REVISION_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_FIELD_NUMBER: _ClassVar[int]
+    SAFE_TEXT_UTF8_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CUMULATIVE_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    PART_INDEX_FIELD_NUMBER: _ClassVar[int]
+    PART_COUNT_FIELD_NUMBER: _ClassVar[int]
+    PROVISIONAL_FIELD_NUMBER: _ClassVar[int]
+    safe_message_id: str
+    revision: int
+    previous_revision: int
+    operation: _harness_pb2.ContentMutationOperation
+    safe_text_utf8: str
+    safe_cumulative_digest_sha256: str
+    part_index: int
+    part_count: int
+    provisional: bool
+    def __init__(self, safe_message_id: _Optional[str] = ..., revision: _Optional[int] = ..., previous_revision: _Optional[int] = ..., operation: _Optional[_Union[_harness_pb2.ContentMutationOperation, str]] = ..., safe_text_utf8: _Optional[str] = ..., safe_cumulative_digest_sha256: _Optional[str] = ..., part_index: _Optional[int] = ..., part_count: _Optional[int] = ..., provisional: _Optional[bool] = ...) -> None: ...
+
+class HarnessLifecycleContentView(_message.Message):
+    __slots__ = ("kind", "side_effect_certainty", "native_will_retry")
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    SIDE_EFFECT_CERTAINTY_FIELD_NUMBER: _ClassVar[int]
+    NATIVE_WILL_RETRY_FIELD_NUMBER: _ClassVar[int]
+    kind: _harness_pb2.LifecycleKind
+    side_effect_certainty: _harness_pb2.SideEffectCertainty
+    native_will_retry: bool
+    def __init__(self, kind: _Optional[_Union[_harness_pb2.LifecycleKind, str]] = ..., side_effect_certainty: _Optional[_Union[_harness_pb2.SideEffectCertainty, str]] = ..., native_will_retry: _Optional[bool] = ...) -> None: ...
+
+class HarnessUsageContentView(_message.Message):
+    __slots__ = ("input_tokens", "output_tokens", "cached_input_tokens")
+    INPUT_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    CACHED_INPUT_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    def __init__(self, input_tokens: _Optional[int] = ..., output_tokens: _Optional[int] = ..., cached_input_tokens: _Optional[int] = ...) -> None: ...
+
+class HarnessApprovalRequiredContentView(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class HarnessArtifactIdentityView(_message.Message):
+    __slots__ = ("artifact_id", "artifact_digest_sha256")
+    ARTIFACT_ID_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    artifact_id: str
+    artifact_digest_sha256: str
+    def __init__(self, artifact_id: _Optional[str] = ..., artifact_digest_sha256: _Optional[str] = ...) -> None: ...
+
+class HarnessArtifactAvailableRedactedView(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class HarnessArtifactRelationView(_message.Message):
+    __slots__ = ("safe_content_differs_from_artifact", "available", "available_redacted")
+    SAFE_CONTENT_DIFFERS_FROM_ARTIFACT_FIELD_NUMBER: _ClassVar[int]
+    AVAILABLE_FIELD_NUMBER: _ClassVar[int]
+    AVAILABLE_REDACTED_FIELD_NUMBER: _ClassVar[int]
+    safe_content_differs_from_artifact: bool
+    available: HarnessArtifactIdentityView
+    available_redacted: HarnessArtifactAvailableRedactedView
+    def __init__(self, safe_content_differs_from_artifact: _Optional[bool] = ..., available: _Optional[_Union[HarnessArtifactIdentityView, _Mapping]] = ..., available_redacted: _Optional[_Union[HarnessArtifactAvailableRedactedView, _Mapping]] = ...) -> None: ...
+
+class HarnessContentMarkerView(_message.Message):
+    __slots__ = ("kind",)
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    kind: _harness_pb2.HarnessContentMarkerKind
+    def __init__(self, kind: _Optional[_Union[_harness_pb2.HarnessContentMarkerKind, str]] = ...) -> None: ...
+
+class HarnessContentRecordView(_message.Message):
+    __slots__ = ("record_id", "record_digest_sha256", "content_sequence", "task_id", "attempt_id", "provider_family_alias", "model_alias", "collaboration_role", "disclosure_profile_ref", "projected_at", "safety_flags", "assistant_text", "lifecycle", "usage", "approval_required", "artifact_relation", "marker")
+    RECORD_ID_FIELD_NUMBER: _ClassVar[int]
+    RECORD_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    PROVIDER_FAMILY_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    MODEL_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    COLLABORATION_ROLE_FIELD_NUMBER: _ClassVar[int]
+    DISCLOSURE_PROFILE_REF_FIELD_NUMBER: _ClassVar[int]
+    PROJECTED_AT_FIELD_NUMBER: _ClassVar[int]
+    SAFETY_FLAGS_FIELD_NUMBER: _ClassVar[int]
+    ASSISTANT_TEXT_FIELD_NUMBER: _ClassVar[int]
+    LIFECYCLE_FIELD_NUMBER: _ClassVar[int]
+    USAGE_FIELD_NUMBER: _ClassVar[int]
+    APPROVAL_REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_RELATION_FIELD_NUMBER: _ClassVar[int]
+    MARKER_FIELD_NUMBER: _ClassVar[int]
+    record_id: str
+    record_digest_sha256: str
+    content_sequence: int
+    task_id: str
+    attempt_id: str
+    provider_family_alias: str
+    model_alias: str
+    collaboration_role: str
+    disclosure_profile_ref: _common_pb2.ContractReference
+    projected_at: _timestamp_pb2.Timestamp
+    safety_flags: _containers.RepeatedScalarFieldContainer[_harness_pb2.HarnessContentSafetyFlag]
+    assistant_text: HarnessAssistantTextView
+    lifecycle: HarnessLifecycleContentView
+    usage: HarnessUsageContentView
+    approval_required: HarnessApprovalRequiredContentView
+    artifact_relation: HarnessArtifactRelationView
+    marker: HarnessContentMarkerView
+    def __init__(self, record_id: _Optional[str] = ..., record_digest_sha256: _Optional[str] = ..., content_sequence: _Optional[int] = ..., task_id: _Optional[str] = ..., attempt_id: _Optional[str] = ..., provider_family_alias: _Optional[str] = ..., model_alias: _Optional[str] = ..., collaboration_role: _Optional[str] = ..., disclosure_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., projected_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., safety_flags: _Optional[_Iterable[_Union[_harness_pb2.HarnessContentSafetyFlag, str]]] = ..., assistant_text: _Optional[_Union[HarnessAssistantTextView, _Mapping]] = ..., lifecycle: _Optional[_Union[HarnessLifecycleContentView, _Mapping]] = ..., usage: _Optional[_Union[HarnessUsageContentView, _Mapping]] = ..., approval_required: _Optional[_Union[HarnessApprovalRequiredContentView, _Mapping]] = ..., artifact_relation: _Optional[_Union[HarnessArtifactRelationView, _Mapping]] = ..., marker: _Optional[_Union[HarnessContentMarkerView, _Mapping]] = ...) -> None: ...
+
+class ListHarnessContentRequest(_message.Message):
+    __slots__ = ("client", "task_id", "attempt_ids", "page_size", "page_cursor", "snapshot_position")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_IDS_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    PAGE_CURSOR_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_POSITION_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    task_id: str
+    attempt_ids: _containers.RepeatedScalarFieldContainer[str]
+    page_size: int
+    page_cursor: str
+    snapshot_position: HarnessContentPosition
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., task_id: _Optional[str] = ..., attempt_ids: _Optional[_Iterable[str]] = ..., page_size: _Optional[int] = ..., page_cursor: _Optional[str] = ..., snapshot_position: _Optional[_Union[HarnessContentPosition, _Mapping]] = ...) -> None: ...
+
+class HarnessContentBaselinePage(_message.Message):
+    __slots__ = ("records", "next_page_cursor", "has_more", "snapshot_position", "retained_from_sequence", "disclosure_profile_ref")
+    RECORDS_FIELD_NUMBER: _ClassVar[int]
+    NEXT_PAGE_CURSOR_FIELD_NUMBER: _ClassVar[int]
+    HAS_MORE_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_POSITION_FIELD_NUMBER: _ClassVar[int]
+    RETAINED_FROM_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    DISCLOSURE_PROFILE_REF_FIELD_NUMBER: _ClassVar[int]
+    records: _containers.RepeatedCompositeFieldContainer[HarnessContentRecordView]
+    next_page_cursor: str
+    has_more: bool
+    snapshot_position: HarnessContentPosition
+    retained_from_sequence: int
+    disclosure_profile_ref: _common_pb2.ContractReference
+    def __init__(self, records: _Optional[_Iterable[_Union[HarnessContentRecordView, _Mapping]]] = ..., next_page_cursor: _Optional[str] = ..., has_more: _Optional[bool] = ..., snapshot_position: _Optional[_Union[HarnessContentPosition, _Mapping]] = ..., retained_from_sequence: _Optional[int] = ..., disclosure_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ...) -> None: ...
+
+class ListHarnessContentResponse(_message.Message):
+    __slots__ = ("page", "error")
+    PAGE_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    page: HarnessContentBaselinePage
+    error: LocalApiError
+    def __init__(self, page: _Optional[_Union[HarnessContentBaselinePage, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class WatchHarnessContentRequest(_message.Message):
+    __slots__ = ("client", "task_id", "attempt_ids", "resume_after")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_IDS_FIELD_NUMBER: _ClassVar[int]
+    RESUME_AFTER_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    task_id: str
+    attempt_ids: _containers.RepeatedScalarFieldContainer[str]
+    resume_after: HarnessContentPosition
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., task_id: _Optional[str] = ..., attempt_ids: _Optional[_Iterable[str]] = ..., resume_after: _Optional[_Union[HarnessContentPosition, _Mapping]] = ...) -> None: ...
+
+class HarnessContentRecordsFrame(_message.Message):
+    __slots__ = ("records",)
+    RECORDS_FIELD_NUMBER: _ClassVar[int]
+    records: _containers.RepeatedCompositeFieldContainer[HarnessContentRecordView]
+    def __init__(self, records: _Optional[_Iterable[_Union[HarnessContentRecordView, _Mapping]]] = ...) -> None: ...
+
+class HarnessContentHeartbeatFrame(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class HarnessContentResetRequiredFrame(_message.Message):
+    __slots__ = ("reason",)
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    reason: HarnessContentResetReason
+    def __init__(self, reason: _Optional[_Union[HarnessContentResetReason, str]] = ...) -> None: ...
+
+class HarnessContentStreamFrame(_message.Message):
+    __slots__ = ("position", "records", "heartbeat", "reset_required")
+    POSITION_FIELD_NUMBER: _ClassVar[int]
+    RECORDS_FIELD_NUMBER: _ClassVar[int]
+    HEARTBEAT_FIELD_NUMBER: _ClassVar[int]
+    RESET_REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    position: HarnessContentPosition
+    records: HarnessContentRecordsFrame
+    heartbeat: HarnessContentHeartbeatFrame
+    reset_required: HarnessContentResetRequiredFrame
+    def __init__(self, position: _Optional[_Union[HarnessContentPosition, _Mapping]] = ..., records: _Optional[_Union[HarnessContentRecordsFrame, _Mapping]] = ..., heartbeat: _Optional[_Union[HarnessContentHeartbeatFrame, _Mapping]] = ..., reset_required: _Optional[_Union[HarnessContentResetRequiredFrame, _Mapping]] = ...) -> None: ...
 
 class LocalApiError(_message.Message):
     __slots__ = ("code", "safe_fingerprint", "retryable", "required_action_code", "current_position", "correlation_id")

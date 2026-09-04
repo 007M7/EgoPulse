@@ -4,9 +4,10 @@ use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
     AwaitProjectionRequest, AwaitProjectionResponse, GetEvidenceGraphRequest,
     GetEvidenceGraphResponse, GetHarnessApprovalViewRequest, GetHarnessApprovalViewResponse,
     GetProjectionStatusRequest, GetProjectionStatusResponse, GetTaskViewRequest,
-    GetTaskViewResponse, HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest,
-    ListHarnessApprovalViewsResponse, ListTaskViewsRequest, ListTaskViewsResponse,
-    TaskViewStreamFrame, WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest,
+    GetTaskViewResponse, HarnessApprovalViewStreamFrame, HarnessContentStreamFrame,
+    ListHarnessApprovalViewsRequest, ListHarnessApprovalViewsResponse, ListHarnessContentRequest,
+    ListHarnessContentResponse, ListTaskViewsRequest, ListTaskViewsResponse, TaskViewStreamFrame,
+    WatchHarnessApprovalViewsRequest, WatchHarnessContentRequest, WatchTaskViewsRequest,
     local_read_model_service_server::LocalReadModelService,
 };
 use egopulse_local_ipc_platform::PeerConnectionInfo;
@@ -35,6 +36,8 @@ impl LocalReadModelEndpoint {
 type TaskWatchStream = Pin<Box<dyn Stream<Item = Result<TaskViewStreamFrame, Status>> + Send>>;
 type ApprovalWatchStream =
     Pin<Box<dyn Stream<Item = Result<HarnessApprovalViewStreamFrame, Status>> + Send>>;
+type HarnessContentWatchStream =
+    Pin<Box<dyn Stream<Item = Result<HarnessContentStreamFrame, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl LocalReadModelService for LocalReadModelEndpoint {
@@ -96,6 +99,13 @@ impl LocalReadModelService for LocalReadModelEndpoint {
                 .list_harness_approval_views(peer.as_ref(), request.into_inner())
                 .await,
         ))
+    }
+
+    async fn list_harness_content(
+        &self,
+        _request: Request<ListHarnessContentRequest>,
+    ) -> Result<Response<ListHarnessContentResponse>, Status> {
+        Err(Status::unimplemented("r9c_contract_only"))
     }
 
     async fn get_projection_status(
@@ -160,6 +170,15 @@ impl LocalReadModelService for LocalReadModelEndpoint {
                 }
             },
         ))))
+    }
+
+    type WatchHarnessContentStream = HarnessContentWatchStream;
+
+    async fn watch_harness_content(
+        &self,
+        _request: Request<WatchHarnessContentRequest>,
+    ) -> Result<Response<Self::WatchHarnessContentStream>, Status> {
+        Err(Status::unimplemented("r9c_contract_only"))
     }
 
     async fn await_projection(

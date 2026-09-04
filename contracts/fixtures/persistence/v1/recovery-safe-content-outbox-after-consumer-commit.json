@@ -1,0 +1,85 @@
+{
+  "schemaVersion": "v01-persistence-fixture/v0.1",
+  "fixtureId": "persistence-recovery-safe-content-outbox-after-consumer-commit",
+  "category": "recovery",
+  "requirementRefs": ["R9C-D02", "R9C-D07", "R9C-D12-PROJECTION", "C08-OUTBOX-04"],
+  "principal": { "kind": "RECOVERY_COORDINATOR", "principalId": "recovery-coordinator:harness-content", "authenticated": true },
+  "startingState": {
+    "sourceDomain": "PERSISTENCE_DOMAIN_HARNESS_ADAPTER",
+    "safeLedgerRecordId": "hcr_461422ff77f6fbc2dfde772af0415b46fd5dd5a2957c0b9533e7d55a5c570c9d",
+    "safeLedgerRecordDigestSha256": "de7d51fb8cdcffb028a7ac8d505f7615a53c03009d52ef15fb9bfb6843b8c397",
+    "safeLedgerRecordCount": 1,
+    "outboxMessageId": "outbox-safe-content-001",
+    "outboxPayloadDigestSha256": "9292929292929292929292929292929292929292929292929292929292929292",
+    "outboxMessageCount": 1,
+    "consumerId": "local-read-model:harness-content",
+    "consumerInboxReceiptId": "inbox-safe-content-001",
+    "consumerCommitDurable": true,
+    "consumerInboxReceiptDurable": true,
+    "consumerContentRecordCount": 1,
+    "sourceAckLost": true
+  },
+  "operation": {
+    "replayOutbox": {
+      "sourceDomain": "PERSISTENCE_DOMAIN_HARNESS_ADAPTER",
+      "outboxMessageId": "outbox-safe-content-001",
+      "outboxPayloadDigestSha256": "9292929292929292929292929292929292929292929292929292929292929292",
+      "safeLedgerRecordId": "hcr_461422ff77f6fbc2dfde772af0415b46fd5dd5a2957c0b9533e7d55a5c570c9d",
+      "safeLedgerRecordDigestSha256": "de7d51fb8cdcffb028a7ac8d505f7615a53c03009d52ef15fb9bfb6843b8c397",
+      "consumerId": "local-read-model:harness-content"
+    }
+  },
+  "typedHistoryCompaction": {
+    "compactionRecordId": "hcc_7650d9dc119bb7d9b1e101279fd7174e9fceabb316d2a76b0693f03f9babdb20",
+    "compactionRecordDigestSha256": "9774b8410cd8e52e0e0855a200b32331d5f69a81b82da841600872e95fc694ca",
+    "taskId": "task-001",
+    "attemptId": "attempt-001",
+    "finalEpoch": "content-epoch-01",
+    "finalSequence": 13,
+    "finalSafeContentDigestSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "ownerSnapshotDigestSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "disclosureProfileRef": {
+      "contractId": "egopulse.harness-content-disclosure.v1",
+      "version": "0.1.0",
+      "sha256": "f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc"
+    },
+    "compactedAt": { "seconds": 1788480000, "nanos": 0 },
+    "reason": "HARNESS_CONTENT_COMPACTION_REASON_OWNER_HISTORY_FLOOR_ADVANCED"
+  },
+  "canonicalVectors": {
+    "historyCompactionRecordIdHex": "310000000000000065676f70756c73652f6861726e6573732d636f6e74656e742f686973746f72792d636f6d70616374696f6e2d69642f763108000000000000007461736b2d3030310b00000000000000617474656d70742d3030311000000000000000636f6e74656e742d65706f63682d303108000000000000000d000000000000004000000000000000663865656632343066646332353864336237313934386366386439373234616234363834386135623139383436616239333832623530356666353536336664631c000000000000004f574e45525f484953544f52595f464c4f4f525f414456414e434544",
+    "historyCompactionRecordIdSha256": "7650d9dc119bb7d9b1e101279fd7174e9fceabb316d2a76b0693f03f9babdb20",
+    "historyCompactionRecordHex": "2e0000000000000065676f70756c73652f6861726e6573732d636f6e74656e742f686973746f72792d636f6d70616374696f6e2f763144000000000000006863635f3736353064396463313139626237643962316531303132373966643731373465396663656162623331366432613736623036393366303366396261626462323008000000000000007461736b2d3030310b00000000000000617474656d70742d3030311000000000000000636f6e74656e742d65706f63682d303108000000000000000d00000000000000400000000000000066666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666400000000000000065656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565260000000000000065676f70756c73652e6861726e6573732d636f6e74656e742d646973636c6f737572652e76310500000000000000302e312e304000000000000000663865656632343066646332353864336237313934386366386439373234616234363834386135623139383436616239333832623530356666353536336664630800000000000000000a9a6a000000000400000000000000000000001c000000000000004f574e45525f484953544f52595f464c4f4f525f414456414e434544",
+    "historyCompactionRecordSha256": "9774b8410cd8e52e0e0855a200b32331d5f69a81b82da841600872e95fc694ca"
+  },
+  "expected": {
+    "outcome": "replayed",
+    "businessWriteCount": 0,
+    "replayed": true,
+    "sameSafeLedgerRecordId": true,
+    "sameSafeLedgerRecordDigest": true,
+    "sameSafeRecordReplayed": true,
+    "sameOutboxMessageIdReplayed": true,
+    "sameOutboxPayloadDigestReplayed": true,
+    "sameConsumptionReceiptReturned": true,
+    "typedHistoryCompactionRecord": true,
+    "projectorInboxDeduplicated": true,
+    "duplicateSafeLedgerRowCreated": false,
+    "duplicateOutboxMessageCreated": false,
+    "consumerBusinessWriteRepeated": false,
+    "safeLedgerWriteCount": 0,
+    "outboxWriteCount": 0,
+    "consumerWriteCount": 0,
+    "rawCandidateReadByConsumer": false,
+    "authorityBusinessWriteCount": 0,
+    "taskAuthorityWriteCount": 0,
+    "collaborationAuthorityWriteCount": 0,
+    "policyAuthorityWriteCount": 0,
+    "artifactAuthorityWriteCount": 0,
+    "verificationAuthorityWriteCount": 0,
+    "founderVerdictAuthorityWriteCount": 0,
+    "contextAuthorityWriteCount": 0,
+    "memoryAuthorityWriteCount": 0,
+    "authorityStateAdvanced": false
+  }
+}

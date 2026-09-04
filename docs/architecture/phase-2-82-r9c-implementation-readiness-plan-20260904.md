@@ -534,6 +534,14 @@ exist exactly once; the authoritative Rust Gate may then run the complete C5
 binary once in its established serial order instead of rerunning the same six
 tests as a second suite.
 
+The existing restart test is also the container for the two isolated migration
+sub-scenarios required by section 7: before any post-migration product write it
+must restore the verified coordinated backup and old binary as one operation;
+after a post-migration product write it must reject old-binary restore and use
+structured-only forward-disable without losing native evidence, safe records or
+tombstones. These are required sub-scenarios, not two additional test names, so
+the frozen C5 inventory remains exactly six.
+
 ### 8.5 Provider isolation and local CI
 
 Codex closes R-9C core. DSH, Kimi and the existing OpenCode/GLM candidate each

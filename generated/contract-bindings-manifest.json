@@ -1,6 +1,6 @@
 {
     "schemaVersion":  "egopulse-generated-contract-bindings/v0.1",
-    "sourceManifestSha256":  "d64dd4fa35a1fc5f3409d20cfdc192ac7aad9997b73d1c7394b5df5a0a91e5a0",
+    "sourceManifestSha256":  "fda010018357bc5f5677e0ca731bb0b468a442ad19b52f9ece4f80b9190ee3da",
     "generators":  {
                        "buf":  "1.72.0",
                        "protocGenEs":  "2.14.0",
@@ -24,11 +24,11 @@
                   },
                   {
                       "path":  "crates/domain-contracts/src/generated/egopulse.harness.v1.rs",
-                      "sha256":  "088890fc5212e073c180f6b9c30375b79b8ea6255bc3771082629b40c5b45442"
+                      "sha256":  "ebeb768306a0d7d6efaf0edd94c8751822539f1d3741a84d0458201d2ad91b39"
                   },
                   {
                       "path":  "crates/domain-contracts/src/generated/egopulse.localapi.v1.rs",
-                      "sha256":  "49154881717db7d5fbb44133e47c105c19e5c7dff5243893b9c98c0a535362e2"
+                      "sha256":  "3aeb13733c06be5f1e6263fabee38a214af892d5df275552414702241e0c3024"
                   },
                   {
                       "path":  "crates/domain-contracts/src/generated/egopulse.memory.v1.rs",
@@ -68,11 +68,11 @@
                   },
                   {
                       "path":  "packages/generated-client/src/generated/egopulse/harness/v1/harness_pb.ts",
-                      "sha256":  "9ac92650d784754fa11b37948672500e2169ff60ccba7eb65599b9392c6024e2"
+                      "sha256":  "ceb816a140034caa406025ab43a62766c5e38e7b25d89842981194c064e2e8b9"
                   },
                   {
                       "path":  "packages/generated-client/src/generated/egopulse/localapi/v1/local_api_pb.ts",
-                      "sha256":  "a76645f40eb7990d3b995fe5d85116dcd8231065ecd00bfad940bed52910de9a"
+                      "sha256":  "40a006fdeebb61a2776b204ba1fc9e41f4d623278f720b0a15b406e2dfec7d04"
                   },
                   {
                       "path":  "packages/generated-client/src/generated/egopulse/memory/v1/memory_pb.ts",
@@ -124,19 +124,19 @@
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/harness/v1/harness_pb2.py",
-                      "sha256":  "4a4805d895bcd957ed2d25835f6434eb4caf3a167b486fc3fa6eadce727f7dd2"
+                      "sha256":  "c8a23dbd7711be712bd2b9ee37744d7f67f33c4ce51dd53d7d962f8cedf9c7f6"
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/harness/v1/harness_pb2.pyi",
-                      "sha256":  "f87414529e0736a9caab4118e3bbfdab7a78f4dcf3f3f9e14d3e2a6625d0ebdc"
+                      "sha256":  "6c35041f2ad23394dbf829b699a2cd7c06b9c5d11c3f357be9539e32f7d732c5"
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/localapi/v1/local_api_pb2.py",
-                      "sha256":  "6c7e2c87f270c1da2188ae1d365c32a807a39566421b7a373b92d19b79202b79"
+                      "sha256":  "ca8489b414295e73e2d684c03a78e412ca55667f812d5c746eea1df0fc49855e"
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/localapi/v1/local_api_pb2.pyi",
-                      "sha256":  "0e018e8b2e6ee2682f380447176db65f2d9e6d9bc37000a0013b6cdd46611495"
+                      "sha256":  "34f60e824c5476addfc0182fd29994e3d9939d58d72001fbc5f775e29fc42400"
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/memory/v1/memory_pb2.py",

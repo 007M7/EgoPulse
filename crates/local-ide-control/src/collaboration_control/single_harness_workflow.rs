@@ -346,6 +346,7 @@ fn dispatch_intent_command(
         session_strategy: config.material.session_strategy as i32,
         native_session_ref: config.material.native_session_ref.clone(),
         checkpoint_ref: config.material.checkpoint_ref.clone(),
+        route_binding: None,
     };
     let fingerprint = canonical_dispatch_fingerprint(&envelope);
     envelope.dispatch_fingerprint = fingerprint.clone();

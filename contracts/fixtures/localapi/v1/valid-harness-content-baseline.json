@@ -1,0 +1,63 @@
+{
+  "schemaVersion": "v01-localapi-fixture/v0.1",
+  "fixtureId": "localapi-valid-harness-content-baseline",
+  "category": "valid",
+  "requirementRefs": ["R9C-D06", "R9C-D07", "R9C-D08"],
+  "principal": { "kind": "FOUNDER", "principalId": "os-user:founder", "authenticated": true },
+  "transport": { "kind": "WINDOWS_NAMED_PIPE", "peerCredentialVerified": true },
+  "startingState": {
+    "grantedPermissionCodes": ["local.harness.content.read"],
+    "ownedTaskIds": ["task-001"],
+    "contentPosition": { "epoch": "content-epoch-01", "sequence": 12 },
+    "retainedFromSequence": 3
+  },
+  "operation": {
+    "listHarnessContent": {
+      "taskId": "task-001",
+      "attemptIds": ["attempt-001"],
+      "pageSize": 2
+    }
+  },
+  "boundaryCases": {
+    "pageRecordLimit": {
+      "exact": 256,
+      "plusOne": 257,
+      "recordsReturnedAtExact": 256,
+      "recordsReturnedAtPlusOne": 256,
+      "hasMoreAtPlusOne": true
+    },
+    "pageTextByteLimit": {
+      "exact": 1048576,
+      "plusOne": 1048577,
+      "wholeRecordsOnly": true,
+      "partialRecordReturned": false
+    },
+    "tamperedCursor": {
+      "mutation": "attempt_filter_changed_after_cursor_issue",
+      "outcome": "error",
+      "recordsReturned": 0,
+      "readModelRowsConsumed": 0,
+      "failsClosedBeforeRecordRead": true
+    }
+  },
+  "expected": {
+    "outcome": "ok",
+    "businessWriteCount": 0,
+    "snapshotPosition": { "epoch": "content-epoch-01", "sequence": 12 },
+    "recordsReturned": 2,
+    "wholeRecordsOnly": true,
+    "hasMore": true,
+    "nextPageCursorBoundToSnapshotAndFilters": true,
+    "operationRecordStream": true,
+    "completeSnapshotFrame": false,
+    "profileRef": {
+      "contractId": "egopulse.harness-content-disclosure.v1",
+      "version": "0.1.0",
+      "sha256": "f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc"
+    },
+    "rawNativeIdentifiersReturned": false,
+    "rawEvidenceReturned": false,
+    "rawCumulativeDigestReturned": false,
+    "credentialCommitmentReturned": false
+  }
+}

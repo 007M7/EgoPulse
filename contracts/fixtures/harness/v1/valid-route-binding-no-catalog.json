@@ -1,0 +1,52 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1",
+  "fixtureId": "harness-valid-route-binding-no-catalog",
+  "category": "valid",
+  "requirementRefs": ["R9C-D03", "R9C-D10", "R9C-CONTRACT-GATE"],
+  "principal": { "kind": "COLLABORATION_CONTROL", "principalId": "collaboration-control:test", "authenticated": true },
+  "startingState": {
+    "attemptStatus": "ATTEMPT_STATUS_DISPATCH_PENDING",
+    "fencingToken": 9,
+    "nativeDispatchCount": 0
+  },
+  "command": {
+    "dispatch": {
+      "runId": "run-no-catalog-001",
+      "stepId": "step-no-catalog-001",
+      "attemptId": "attempt-no-catalog-001",
+      "dispatchId": "dispatch-no-catalog-001",
+      "fencingToken": 9,
+      "capabilityProfileRef": { "sha256": "1111111111111111111111111111111111111111111111111111111111111111" },
+      "budgetProfileRef": { "sha256": "2222222222222222222222222222222222222222222222222222222222222222" },
+      "sandboxProfileRef": { "sha256": "3333333333333333333333333333333333333333333333333333333333333333" },
+      "toolPolicyRef": { "sha256": "4444444444444444444444444444444444444444444444444444444444444444" },
+      "dataEgressPolicyRef": { "sha256": "5555555555555555555555555555555555555555555555555555555555555555" },
+      "approvalPolicyRef": { "sha256": "6666666666666666666666666666666666666666666666666666666666666666" },
+      "routeBinding": {
+        "providerBootstrapProfileId": "glm-default",
+        "selectedHarnessId": "glm_cli",
+        "providerModelId": "glm-5",
+        "noCatalogSnapshot": {},
+        "capabilityProfileId": "glm-cli-v1",
+        "routeBindingSha256": "587d3a6f20042c32eec5f2e0a6152f1aef494dd2d3ea0c7bf5d452c5aaf5d442"
+      }
+    }
+  },
+  "canonicalVector": {
+    "routeBindingHex": "290000000000000065676f70756c73652f6861726e6573732d636f6e74656e742f726f7574652d62696e64696e672f76310b00000000000000676c6d2d64656661756c740700000000000000676c6d5f636c690500000000000000676c6d2d350a000000000000004e4f5f434154414c4f4700000000000000000a00000000000000676c6d2d636c692d7631",
+    "routeBindingSha256": "587d3a6f20042c32eec5f2e0a6152f1aef494dd2d3ea0c7bf5d452c5aaf5d442"
+  },
+  "expected": {
+    "outcome": "committed",
+    "businessWriteCount": 1,
+    "deliveryDisposition": "DELIVERY_DISPOSITION_DELIVERED",
+    "nativeDispatchCount": 1,
+    "harnessAccepted": false,
+    "catalogSnapshotKind": "NO_CATALOG",
+    "catalogSnapshotValue": "",
+    "routeBindingPersistedBeforeNativeSend": true,
+    "historicRouteBindingRecomputed": false,
+    "providerAliasUsedAsIdentity": false,
+    "modelAliasUsedAsIdentity": false
+  }
+}

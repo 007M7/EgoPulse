@@ -21,6 +21,9 @@ const authorizationProfileRelative = 'profiles/authorization/v1/v01-default.json
 const authorizationSchemaRelative = 'authorization-capability-profile.schema.json';
 const contextRevokeProfileRelative = 'profiles/context-revoke/v1/v01-default.json';
 const contextRevokeSchemaRelative = 'context-revoke-semantic-profile.schema.json';
+const harnessContentProfileRelative = 'profiles/harness-content-disclosure/v1/v01-default.json';
+const harnessContentSchemaRelative = 'harness-content-disclosure-profile.schema.json';
+const r9cAuthorityRef = 'conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7';
 const requiredCategories = new Set(['valid', 'invalid', 'duplicate', 'stale', 'unauthorized', 'recovery']);
 const taskCommandNames = new Set([
   'createTask', 'activateTask', 'submitTaskEvidence', 'recordTaskVerification',
@@ -133,7 +136,7 @@ const localApiOperationNames = new Set([
   'watchTaskViews', 'watchHarnessApprovalViews', 'executeTaskCommand',
   'decideHarnessApproval', 'executeFounderVerdict', 'executeMemoryMutation',
   'prepareWork', 'confirmWork', 'executeContextMutation', 'retrieveMemory',
-  'awaitProjection',
+  'listHarnessContent', 'watchHarnessContent', 'awaitProjection',
 ]);
 const persistenceOperationNames = new Set([
   'commitAuthorityMutation', 'consumeOutboxMessage', 'sealArtifactMetadata',
@@ -155,6 +158,40 @@ function readJson(file) {
 
 function sha256(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+function isSha256(value) {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+}
+
+function managedCredentialVariants(value) {
+  const bytes = Buffer.from(value, 'ascii');
+  const standardPadded = bytes.toString('base64');
+  const standardUnpadded = standardPadded.replace(/=+$/, '');
+  const urlPadded = standardPadded.replaceAll('+', '-').replaceAll('/', '_');
+  const urlUnpadded = urlPadded.replace(/=+$/, '');
+  const percent = [...bytes].map((byte) => {
+    const unreserved = (byte >= 0x41 && byte <= 0x5a)
+      || (byte >= 0x61 && byte <= 0x7a)
+      || (byte >= 0x30 && byte <= 0x39)
+      || [0x2d, 0x2e, 0x5f, 0x7e].includes(byte);
+    return unreserved ? String.fromCharCode(byte) : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }).join('');
+  return {
+    rawAscii: value,
+    canonicalJsonContentEscape: value.replace(/["\\]/g, (match) => `\\${match}`),
+    canonicalPercentUppercase: percent,
+    base64StandardPadded: standardPadded,
+    base64StandardUnpadded: standardUnpadded,
+    base64urlPadded: urlPadded,
+    base64urlUnpadded: urlUnpadded,
+  };
+}
+
+function requireExactSet(actualValues, expectedValues, message) {
+  const actual = new Set(actualValues);
+  const expected = new Set(expectedValues);
+  if (actualValues.length !== actual.size || actual.size !== expected.size || [...expected].some((value) => !actual.has(value))) fail(message);
 }
 
 function contextRevokeSemanticDigest(authenticatedPrincipalId, semanticInput) {
@@ -271,11 +308,17 @@ function validateHarnessFixture(file) {
     const declaration = command.declaration;
     if (!declaration || declaration.nativeProtocol.schemaSha256 !== 'b4e8157096dd054c008a4f1b538fb6cd8f1f2cb9577a97a4afef59c2296ed608') fail(prefix + 'Codex candidate must pin audited v2 schema digest');
     if (declaration.semantics.resume.includes('RESUME_SEMANTICS_PARTIAL_EXECUTION_RESUME') || expected.partialExecutionResumeClaimed !== false) fail(prefix + 'Codex thread resume cannot claim partial execution resume');
+    if (value.fixtureId === 'harness-valid-attest-codex-profile' && declaration.semantics.governedUserVisibleContent !== 'SUPPORT_LEVEL_ADAPTER_EMULATED') fail(prefix + 'Codex content mapping must be independently capability-attested');
   }
   if (commandName === 'dispatch' && expected.outcome === 'committed') {
     if (expected.deliveryDisposition !== 'DELIVERY_DISPOSITION_DELIVERED' || expected.nativeDispatchCount !== 1) fail(prefix + 'dispatch must produce exactly one delivery');
     if (expected.harnessAccepted !== false) fail(prefix + 'delivery cannot imply harness ACK');
     for (const ref of ['capabilityProfileRef', 'budgetProfileRef', 'sandboxProfileRef', 'toolPolicyRef', 'dataEgressPolicyRef', 'approvalPolicyRef']) if (!command[ref] || !command[ref].sha256) fail(prefix + 'dispatch governed reference required: ' + ref);
+    const route = command.routeBinding;
+    if (!route || !route.providerBootstrapProfileId || !route.selectedHarnessId || !route.providerModelId || !route.capabilityProfileId || !isSha256(route.routeBindingSha256)) fail(prefix + 'new dispatch must persist a complete immutable route binding before native send');
+    const catalogBranches = ['catalogSnapshotSha256', 'noCatalogSnapshot'].filter((field) => Object.prototype.hasOwnProperty.call(route, field));
+    if (catalogBranches.length !== 1 || (route.catalogSnapshotSha256 && !isSha256(route.catalogSnapshotSha256))) fail(prefix + 'route binding must carry exactly one catalog snapshot branch');
+    if (value.fixtureId === 'harness-valid-dispatch-delivery' && (route.routeBindingSha256 !== '5fc3d40c5d3ecdc61ccac5826e0e2d0b10131133adcd8a5ca8438188c01c39a8' || expected.routeBindingPersistedBeforeNativeSend !== true || expected.historicRouteBindingRecomputed !== false)) fail(prefix + 'dispatch route binding order/history rule drifted');
   }
   if (commandName === 'ingestObservation' && expected.outcome === 'committed') {
     if (start && Number.isInteger(start.lastObservationSequence) && expected.resultingObservationSequence !== start.lastObservationSequence + 1) fail(prefix + 'observation sequence must advance exactly once');
@@ -299,6 +342,92 @@ function validateHarnessFixture(file) {
     }
     if (expected.automaticApproval !== false) fail(prefix + 'Harness approval cannot be automatic');
   }
+  if (commandName === 'ingestObservation' && command.contentSignal) {
+    const signal = command.contentSignal;
+    if (!isSha256(signal.contentEventId) || !signal.deliveredReceiptId || !isSha256(signal.deliveredReceiptDigestSha256) || !isSha256(signal.dispatchRouteBindingSha256)) fail(prefix + 'content signal source identity/digests are incomplete');
+    if (!command.nativeEventId || !Number.isInteger(command.nativeSequence) || !isSha256(command.nativeEventDigestSha256)) fail(prefix + 'content signal requires the complete native event tuple');
+    const proof = signal.contextConsumptionProof || {};
+    const proofBranches = ['notContextBound', 'authorizedContext'].filter((field) => Object.prototype.hasOwnProperty.call(proof, field));
+    if (proofBranches.length !== 1) fail(prefix + 'content signal requires exactly one closed Context proof branch');
+    if (proof.authorizedContext && (!proof.authorizedContext.authorizationId || !isSha256(proof.authorizedContext.committedRequestDigestSha256))) fail(prefix + 'authorized Context proof must bind the existing authorization identity and committed request digest');
+    const candidate = signal.candidate || {};
+    const candidateBranches = ['assistantText', 'lifecycle', 'usage', 'approvalRequired', 'blockedSource'].filter((field) => Object.prototype.hasOwnProperty.call(candidate, field));
+    if (candidateBranches.length !== 1 || !isSha256(candidate.candidateDigestSha256)) fail(prefix + 'content candidate requires one closed payload and canonical digest');
+    for (const forbidden of ['taskId', 'runId', 'stepId', 'attemptId', 'dispatchId', 'providerId', 'providerModelId', 'routeBinding']) {
+      if (Object.prototype.hasOwnProperty.call(candidate, forbidden)) fail(prefix + 'content candidate self-reports trusted identity: ' + forbidden);
+    }
+    if (candidate.assistantText) {
+      const text = candidate.assistantText;
+      if (!text.messageId || !Number.isInteger(text.revision) || !Number.isInteger(text.previousRevision) || !['CONTENT_MUTATION_OPERATION_APPEND', 'CONTENT_MUTATION_OPERATION_REPLACE', 'CONTENT_MUTATION_OPERATION_FINALIZE'].includes(text.operation)) fail(prefix + 'assistant text identity/revision/operation is invalid');
+      for (const digest of ['deltaOrSnapshotDigestSha256', 'previousRawCumulativeDigestSha256', 'rawCumulativeDigestSha256']) if (!isSha256(text[digest])) fail(prefix + 'assistant text digest is invalid: ' + digest);
+      if (text.operation === 'CONTENT_MUTATION_OPERATION_FINALIZE' ? text.textUtf8Hex !== '' : !/^(?:[0-9a-f]{2})*$/.test(text.textUtf8Hex || '')) fail(prefix + 'assistant text bytes do not match operation semantics');
+    }
+    if (candidate.blockedSource && !['HARNESS_CONTENT_MARKER_KIND_FORBIDDEN_CATEGORY', 'HARNESS_CONTENT_MARKER_KIND_UNKNOWN_CATEGORY'].includes(candidate.blockedSource.reason)) fail(prefix + 'blocked source must use a closed source-classification marker');
+  }
+  if (value.fixtureId === 'harness-valid-content-append-not-context-bound') {
+    const vectors = value.canonicalVectors || {};
+    const exactVectors = {
+      routeBindingHex: '290000000000000065676f70756c73652f6861726e6573732d636f6e74656e742f726f7574652d62696e64696e672f763111000000000000006770742d636f6465782d64656661756c741000000000000000636f6465785f6170705f7365727665720b000000000000006770742d352e362d736f6c06000000000000004449474553544000000000000000616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612400000000000000636f6465782d6170702d7365727665722d76322d302e3134382e302d616c7068612e3135',
+      routeBindingSha256: '5fc3d40c5d3ecdc61ccac5826e0e2d0b10131133adcd8a5ca8438188c01c39a8',
+      textPayloadHex: '280000000000000065676f70756c73652f6861726e6573732d636f6e74656e742f746578742d7061796c6f61642f76310f0000000000000048656c6c6f2c0d0a776f726c642109',
+      textPayloadSha256: '7fc849816061c35cc7d05023a41064e6df98009688072686b66916e7ea6f36af',
+      previousRawCumulativeHex: '2a0000000000000065676f70756c73652f6861726e6573732d636f6e74656e742f7261772d63756d756c61746976652f76310000000000000000',
+      previousRawCumulativeSha256: '87daed9be3cf1353adde646397681802b85f5dff8321d313e339229c92bdba28',
+      rawCumulativeHex: '2a0000000000000065676f70756c73652f6861726e6573732d636f6e74656e742f7261772d63756d756c61746976652f76310f0000000000000048656c6c6f2c0d0a776f726c642109',
+      rawCumulativeSha256: '3f5278a253c9e81ad98f135a3d0262abbfa5f551a222d5060b83dc5d1f5330df',
+      candidateSha256: '97de32300fc9f29a2482e2e46917a1caa2ffd14218ca795847ebb682ea81843f',
+      contentEventSha256: '8bf9b6392731854455807e7a35791f39e99e1c119bc0d43c0bcdf813fdc768c3',
+      safeCumulativeSha256: '51b7cf9b02c27b407880e537b5bfa722bcd3e82e284c8d9152ab613894568e77',
+      safeMessageIdSha256: 'b060407711409ba70a1affd38e053f313e27c549d9bfb6c2312415adf28f229a',
+      safeAssistantPayloadSha256: '3fa3a43ce8a169fdf2082ea69d45ac3fd9c8e66fb88eb9edfebe161cda100d40',
+      safeRecordIdSha256: '461422ff77f6fbc2dfde772af0415b46fd5dd5a2957c0b9533e7d55a5c570c9d',
+      safeRecordSha256: 'de7d51fb8cdcffb028a7ac8d505f7615a53c03009d52ef15fb9bfb6843b8c397',
+    };
+    for (const [field, expectedValue] of Object.entries(exactVectors)) if (vectors[field] !== expectedValue) fail(prefix + 'R9C independent canonical vector drifted: ' + field);
+    for (const [hexField, digestField] of [['routeBindingHex', 'routeBindingSha256'], ['textPayloadHex', 'textPayloadSha256'], ['previousRawCumulativeHex', 'previousRawCumulativeSha256'], ['rawCumulativeHex', 'rawCumulativeSha256'], ['safeCumulativeHex', 'safeCumulativeSha256'], ['safeMessageIdHex', 'safeMessageIdSha256'], ['safeAssistantPayloadHex', 'safeAssistantPayloadSha256'], ['safeRecordIdHex', 'safeRecordIdSha256'], ['safeRecordHex', 'safeRecordSha256']]) {
+      if (crypto.createHash('sha256').update(Buffer.from(vectors[hexField], 'hex')).digest('hex') !== vectors[digestField]) fail(prefix + 'literal canonical bytes do not match digest: ' + digestField);
+    }
+    const safe = value.safeProjection || {};
+    if (safe.recordId !== 'hcr_' + vectors.safeRecordIdSha256 || safe.recordDigestSha256 !== vectors.safeRecordSha256 || safe.assistantText?.safeMessageId !== 'hcm_' + vectors.safeMessageIdSha256 || safe.assistantText?.safeCumulativeDigestSha256 !== vectors.safeCumulativeSha256 || safe.assistantText?.safeTextUtf8 !== 'Hello,\nworld!    ') fail(prefix + 'safe record identity/payload vector drifted');
+    if (safe.disclosureProfileRef?.sha256 !== 'f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc') fail(prefix + 'safe record must bind the exact disclosure profile');
+    const additional = value.additionalCandidateVectors || {};
+    const candidateVectors = [
+      [additional.usage, '352f85c3425505cb13a12321dde2cb6ab84e42b184d287165496fb1341a8e4a8'],
+      [additional.approvalRequired, 'f586c112652ea1dc727536c8a4e1358260ad89aec74ba7ecd35faca2e4f156b4'],
+      [additional.blockedSource, '75c5de4b4c15a51b95c3bf334850a978850abc4bec59c214baf445e2a89e03f0'],
+    ];
+    for (const [candidateVector, expectedDigest] of candidateVectors) {
+      if (!candidateVector || candidateVector.candidateDigestSha256 !== expectedDigest || crypto.createHash('sha256').update(Buffer.from(candidateVector.canonicalHex, 'hex')).digest('hex') !== expectedDigest) fail(prefix + 'non-text candidate canonical vector drifted');
+    }
+    const credentialVectors = value.credentialVariantVectors || [];
+    if (credentialVectors.length !== 2) fail(prefix + 'managed credential literal vector inventory drifted');
+    for (const vector of credentialVectors) {
+      if (JSON.stringify(managedCredentialVariants(vector.credentialUtf8)) !== JSON.stringify(vector.variants)) fail(prefix + 'managed credential transform vector drifted: ' + vector.case);
+    }
+    const split = value.streamingCredentialBoundaryContract || {};
+    if (split.everyInternalSplitOfEveryVariantMustMatch !== true || split.matchedFragmentEchoed !== false || split.maxCredentialBytes !== 1024 || split.maxPercentEncodedPatternBytes !== 3072 || split.maxProperPrefixWithheldBytes !== 3071 || split.replaceResetsMatcher !== true || split.finalizeFlushesNonSecretSuffix !== true) fail(prefix + 'managed credential streaming-boundary contract drifted');
+    if (expected.safeTextUtf8 !== 'Hello,\nworld!    ' || expected.forbiddenSourceBytesInSafeRecord !== false || expected.taskAuthorityWriteCount !== 0) fail(prefix + 'safe text/control normalization or Authority boundary drifted');
+  }
+  if (value.fixtureId === 'harness-valid-route-binding-no-catalog') {
+    const route = command.routeBinding || {};
+    const vector = value.canonicalVector || {};
+    if (!Object.prototype.hasOwnProperty.call(route, 'noCatalogSnapshot') || Object.prototype.hasOwnProperty.call(route, 'catalogSnapshotSha256') || vector.routeBindingSha256 !== '587d3a6f20042c32eec5f2e0a6152f1aef494dd2d3ea0c7bf5d452c5aaf5d442' || crypto.createHash('sha256').update(Buffer.from(vector.routeBindingHex, 'hex')).digest('hex') !== vector.routeBindingSha256) fail(prefix + 'no-catalog route binding vector drifted');
+    if (expected.catalogSnapshotKind !== 'NO_CATALOG' || expected.catalogSnapshotValue !== '' || expected.routeBindingPersistedBeforeNativeSend !== true || expected.historicRouteBindingRecomputed !== false || expected.providerAliasUsedAsIdentity !== false || expected.modelAliasUsedAsIdentity !== false) fail(prefix + 'no-catalog route identity semantics drifted');
+  }
+  if (value.fixtureId === 'harness-valid-content-authorized-context') {
+    const vectors = value.canonicalVectors || {};
+    for (const [hexField, digestField, expectedDigest] of [
+      ['lifecycleCandidateHex', 'lifecycleCandidateSha256', '3609d7b8e9b483160120f839a839eda159a8efab3364957b54809fa7d91d3d18'],
+      ['contentEventHex', 'contentEventSha256', '3551a421b7932d428930fcd7211cc91505acefb623e9a4419bc974ffe3d2b7d1'],
+    ]) {
+      if (vectors[digestField] !== expectedDigest || crypto.createHash('sha256').update(Buffer.from(vectors[hexField], 'hex')).digest('hex') !== expectedDigest) fail(prefix + 'AUTHORIZED_CONTEXT canonical vector drifted: ' + digestField);
+    }
+    if (expected.authorizedContextProofReused !== true || expected.newContextAuthorizationIssued !== false || expected.contextRevokeAppliedRetrospectively !== false || expected.taskAuthorityWriteCount !== 0) fail(prefix + 'AUTHORIZED_CONTEXT source-integrity semantics drifted');
+  }
+  if (value.fixtureId.includes('content-forbidden-category') && (expected.safeMarker !== 'HARNESS_CONTENT_MARKER_KIND_FORBIDDEN_CATEGORY' || expected.sourceBytesInSafeRecord !== false || expected.sourceBytesInLocalApi !== false || expected.taskAuthorityWriteCount !== 0)) fail(prefix + 'forbidden source must become one no-source-bytes marker without Authority writes');
+  if (value.fixtureId.includes('content-source-binding-drift') && (expected.errorCode !== 'HARNESS_ERROR_CODE_INTEGRITY_FAILURE' || expected.safeRecordWriteCount !== 0 || expected.historicBindingRecomputed !== false)) fail(prefix + 'route binding drift must fail closed without historical recomputation');
+  if (value.fixtureId.includes('content-revision-digest-drift') && (expected.errorCode !== 'HARNESS_ERROR_CODE_SEQUENCE_CONFLICT' || expected.quarantined !== true || expected.safeRecordWriteCount !== 0)) fail(prefix + 'revision/predecessor drift must quarantine without a safe record');
+  if (value.fixtureId.includes('content-exact-replay') && (expected.sameSafeRecordReturned !== true || expected.safeRecordWriteCount !== 0)) fail(prefix + 'exact content replay must be a no-op returning the same safe identity');
   if (commandName === 'decideApproval' && expected.outcome === 'committed') {
     const authority = value.resolvedReferences && value.resolvedReferences.authorityDecision;
     if (value.principal.kind !== 'POLICY_AUTHORITY' || !authority || authority.valid !== true) fail(prefix + 'approval decision requires a resolved trusted Policy Authority record');
@@ -628,6 +757,45 @@ function validateLocalApiFixture(file) {
   if (operationName === 'watchHarnessApprovalViews' && expected.outcome === 'ok' && value.fixtureId.includes('complete-snapshots')) {
     if (expected.completeSnapshot !== true || expected.fieldPatch !== false || expected.delivery !== 'at_least_once' || expected.orderedWithinEpoch !== true) fail(prefix + 'approval stream must use ordered complete snapshots with at-least-once delivery');
   }
+  if (operationName === 'listHarnessContent' && expected.outcome === 'ok') {
+    if (expected.operationRecordStream !== true || expected.completeSnapshotFrame !== false || expected.wholeRecordsOnly !== true || expected.nextPageCursorBoundToSnapshotAndFilters !== true) fail(prefix + 'content baseline must use fixed-position whole operation records');
+    if (expected.profileRef?.contractId !== 'egopulse.harness-content-disclosure.v1' || expected.profileRef?.version !== '0.1.0' || expected.profileRef?.sha256 !== sha256(path.join(root, harnessContentProfileRelative))) fail(prefix + 'content baseline profile reference must bind the exact disclosure profile');
+    for (const field of ['rawNativeIdentifiersReturned', 'rawEvidenceReturned', 'rawCumulativeDigestReturned', 'credentialCommitmentReturned']) if (expected[field] !== false) fail(prefix + 'content baseline exposes private Adapter field: ' + field);
+    if (value.fixtureId === 'localapi-valid-harness-content-baseline') {
+      const boundary = value.boundaryCases || {};
+      if (boundary.pageRecordLimit?.exact !== 256 || boundary.pageRecordLimit?.plusOne !== 257 || boundary.pageRecordLimit?.recordsReturnedAtExact !== 256 || boundary.pageRecordLimit?.recordsReturnedAtPlusOne !== 256 || boundary.pageRecordLimit?.hasMoreAtPlusOne !== true) fail(prefix + 'content page record exact/plus-one boundary drifted');
+      if (boundary.pageTextByteLimit?.exact !== 1048576 || boundary.pageTextByteLimit?.plusOne !== 1048577 || boundary.pageTextByteLimit?.wholeRecordsOnly !== true || boundary.pageTextByteLimit?.partialRecordReturned !== false) fail(prefix + 'content page text-byte exact/plus-one boundary drifted');
+      if (boundary.tamperedCursor?.mutation !== 'attempt_filter_changed_after_cursor_issue' || boundary.tamperedCursor?.outcome !== 'error' || boundary.tamperedCursor?.recordsReturned !== 0 || boundary.tamperedCursor?.readModelRowsConsumed !== 0 || boundary.tamperedCursor?.failsClosedBeforeRecordRead !== true) fail(prefix + 'content cursor tamper must fail closed before record read');
+    }
+  }
+  if (operationName === 'watchHarnessContent' && expected.outcome === 'ok') {
+    if (expected.framePayloadBranch !== 'records' || expected.framePayload?.records?.recordCount !== 1 || expected.operationRecords !== true || expected.completeSnapshot !== false || expected.orderedWithinContentEpoch !== true || expected.taskPositionCompared !== false || expected.approvalPositionCompared !== false) fail(prefix + 'content watch must preserve independent operation-record semantics');
+    if (expected.maxFramesInFlight !== 1 || expected.permissionRevalidatedAfterSendReservation !== true) fail(prefix + 'content watch send authorization/fencing semantics drifted');
+    if (expected.heartbeatFieldsCoPresent !== false || expected.resetRequiredFieldsCoPresent !== false) fail(prefix + 'content stream frame must use one closed payload branch');
+  }
+  if (value.fixtureId === 'localapi-recovery-harness-content-retention-reset') {
+    if (expected.outcome !== 'reset_required' || expected.framePayloadBranch !== 'reset_required' || expected.resetRequired?.reason !== 'HARNESS_CONTENT_RESET_REASON_RETENTION_COMPACTED' || expected.clientDiscardsIncompleteAssembly !== true || expected.newContentBaselineRequired !== true) fail(prefix + 'content retention gap must require a new content baseline');
+    if (expected.oldProfileTextCopied !== false || expected.redactionRerun !== false || expected.taskStreamTerminated !== false || expected.approvalStreamTerminated !== false) fail(prefix + 'content reset must not re-redact, copy history or terminate other projection domains');
+    if (expected.ownerTombstoneTyped !== true || expected.ownerTombstoneContainsText !== false || expected.rawEvidenceRebuildAttempted !== false || expected.expiredContentResurrected !== false) fail(prefix + 'retention tombstone must be typed, text-free and prevent raw-evidence resurrection');
+    const tombstone = value.ownerRetentionTombstone || {};
+    const vectors = value.canonicalVectors || {};
+    if (tombstone.tombstoneId !== 'hrt_' + vectors.retentionTombstoneIdSha256 || tombstone.tombstoneDigestSha256 !== vectors.retentionTombstoneSha256 || tombstone.disclosureProfileRef?.sha256 !== 'f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc' || tombstone.reason !== 'HARNESS_CONTENT_RETENTION_REASON_TERMINAL_MINIMUM_EXPIRED') fail(prefix + 'typed retention tombstone identity drifted');
+    for (const [hexField, digestField, expectedDigest] of [
+      ['retentionTombstoneIdHex', 'retentionTombstoneIdSha256', 'c3974d6b10d5934defe7cecf331300ecb3f7292676bf52d2abf170e27283bd8f'],
+      ['retentionTombstoneHex', 'retentionTombstoneSha256', '9e66456fca02fc3c3603e6fa2988c5edcd6c813c4b56d61a4361f7e10aa8c642'],
+    ]) {
+      if (vectors[digestField] !== expectedDigest || crypto.createHash('sha256').update(Buffer.from(vectors[hexField], 'hex')).digest('hex') !== expectedDigest) fail(prefix + 'retention tombstone canonical vector drifted: ' + digestField);
+    }
+    const boundary = value.retentionBoundary || {};
+    if (boundary.terminalCommittedAtSeconds !== 1785888000 || boundary.minimumRetentionSeconds !== 2592000 || boundary.oneSecondBeforeEligibleAtSeconds !== 1788479999 || boundary.firstEligibleAtSeconds !== 1788480000 || boundary.eligibleOneSecondBefore !== false || boundary.eligibleAtBoundary !== true || boundary.deletionTiming !== 'first_compactor_run_at_or_after_boundary') fail(prefix + 'retention exact-boundary contract drifted');
+  }
+  if (value.fixtureId === 'localapi-invalid-harness-content-frame-combination') {
+    const vectors = value.operation.watchHarnessContent?.typedFrameVectors || [];
+    if (JSON.stringify(vectors) !== JSON.stringify([{ case: 'missing-payload', wireHex: '' }, { case: 'unknown-payload', wireHex: '2a00' }]) || expected.outcome !== 'error' || expected.recordsDelivered !== 0 || expected.assemblyMutated !== false || expected.duplicateWireBranchRejectionClaimed !== false || expected.missingPayloadBranchFailsClosed !== true || expected.unknownPayloadBranchFailsClosed !== true) fail(prefix + 'typed missing and unknown content frame payloads must fail closed before delivery');
+  }
+  if (value.fixtureId === 'localapi-unauthorized-harness-content-read') {
+    if (expected.requiredPermissionCode !== 'local.harness.content.read' || expected.otherReadPermissionSubstituted !== false || expected.readModelCallCount !== 0 || expected.contentBytesReturned !== 0) fail(prefix + 'content permission must be independent and fail before read-model access');
+  }
   if (operationName === 'awaitProjection' && value.fixtureId.includes('policy-projection') && expected.outcome === 'ok') {
     if (expected.returnedViewKind !== 'HarnessApprovalView' || expected.minimumPolicyRevisionSatisfied !== true || expected.readYourWriteGuaranteed !== true) fail(prefix + 'policy await must return the approval projection at or after the required Authority revision');
   }
@@ -720,14 +888,37 @@ function validatePersistenceFixture(file) {
   if (value.fixtureId.includes('corrupt-authority-store-held') && (expected.commandGatewayEnabled !== false || expected.corruptStoreOverwritten !== false)) fail(prefix + 'corrupt authority store must fail closed without overwrite');
   if (value.fixtureId.includes('process-crash-after-ack-rpo-zero') && (expected.acknowledgedCommitLost !== false || expected.rpoSeconds !== 0 || expected.faultModel !== 'PROCESS_OR_OS_CRASH_DURABLE_MEDIA_INTACT')) fail(prefix + 'RPO 0 proof must bind the declared crash fault model');
   if (value.fixtureId.includes('partial-migration') && (expected.entireStoreSetRestored !== true || expected.mixedSchemaSetActivated !== false || expected.automaticDownMigration !== false)) fail(prefix + 'partial migration failure must restore the pre-upgrade set without automatic down-migration');
+  if (value.fixtureId === 'persistence-recovery-r9c-prewrite-migration-backup-restore') {
+    if (value.startingState?.coordinatedBackupVerified !== true || value.startingState?.writesFenced !== true || value.startingState?.postMigrationProductWriteCount !== 0 || expected.verifiedBackupAndOldBinaryRestoredAsOneOperation !== true || expected.entireCoordinatedStoreSetRestored !== true || expected.mixedSchemaSetActivated !== false || expected.automaticDownMigration !== false || expected.newBinaryProductWritesObserved !== false || expected.contentProjectionEnabled !== false || expected.factLoss !== false) fail(prefix + 'R9C pre-write migration failure must atomically restore the verified backup and old binary');
+  }
+  if (value.fixtureId === 'persistence-recovery-r9c-postwrite-forward-disable') {
+    if (!(value.startingState?.postMigrationProductWriteCount > 0) || expected.outcome !== 'held' || expected.verifiedBackupRestored !== false || expected.oldBinaryActivated !== false || expected.automaticDownMigration !== false || expected.structuredOnlyModeEnabled !== true || expected.newAttemptGovernedTextEligible !== false || expected.nativeEvidenceRetained !== true || expected.safeRecordsRetained !== true || expected.retentionTombstonesRetained !== true || expected.forwardRepairAllowed !== true || expected.factLoss !== false) fail(prefix + 'R9C post-write rollback must use structured-only forward-disable without fact loss');
+  }
+  if (value.fixtureId === 'persistence-recovery-safe-content-outbox-after-consumer-commit') {
+    const operation = value.operation.replayOutbox || {};
+    if (expected.outcome !== 'replayed' || expected.replayed !== true || !isSha256(operation.outboxPayloadDigestSha256) || !isSha256(operation.safeLedgerRecordDigestSha256)) fail(prefix + 'safe content recovery must replay the exact committed outbox/ledger digests');
+    for (const field of ['sameSafeLedgerRecordId', 'sameSafeLedgerRecordDigest', 'sameSafeRecordReplayed', 'sameOutboxMessageIdReplayed', 'sameOutboxPayloadDigestReplayed', 'sameConsumptionReceiptReturned', 'projectorInboxDeduplicated']) if (expected[field] !== true) fail(prefix + 'safe content replay identity/dedup drifted: ' + field);
+    for (const field of ['duplicateSafeLedgerRowCreated', 'duplicateOutboxMessageCreated', 'consumerBusinessWriteRepeated', 'rawCandidateReadByConsumer', 'authorityStateAdvanced']) if (expected[field] !== false) fail(prefix + 'safe content replay repeated or crossed a forbidden boundary: ' + field);
+    for (const field of ['safeLedgerWriteCount', 'outboxWriteCount', 'consumerWriteCount', 'authorityBusinessWriteCount', 'taskAuthorityWriteCount', 'collaborationAuthorityWriteCount', 'policyAuthorityWriteCount', 'artifactAuthorityWriteCount', 'verificationAuthorityWriteCount', 'founderVerdictAuthorityWriteCount', 'contextAuthorityWriteCount', 'memoryAuthorityWriteCount']) if (expected[field] !== 0) fail(prefix + 'safe content recovery must perform zero duplicate/Authority writes: ' + field);
+    const compaction = value.typedHistoryCompaction || {};
+    const vectors = value.canonicalVectors || {};
+    if (expected.typedHistoryCompactionRecord !== true || compaction.compactionRecordId !== 'hcc_' + vectors.historyCompactionRecordIdSha256 || compaction.compactionRecordDigestSha256 !== vectors.historyCompactionRecordSha256 || compaction.disclosureProfileRef?.sha256 !== 'f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc' || compaction.reason !== 'HARNESS_CONTENT_COMPACTION_REASON_OWNER_HISTORY_FLOOR_ADVANCED') fail(prefix + 'typed owner history compaction record drifted');
+    for (const [hexField, digestField, expectedDigest] of [
+      ['historyCompactionRecordIdHex', 'historyCompactionRecordIdSha256', '7650d9dc119bb7d9b1e101279fd7174e9fceabb316d2a76b0693f03f9babdb20'],
+      ['historyCompactionRecordHex', 'historyCompactionRecordSha256', '9774b8410cd8e52e0e0855a200b32331d5f69a81b82da841600872e95fc694ca'],
+    ]) {
+      if (vectors[digestField] !== expectedDigest || crypto.createHash('sha256').update(Buffer.from(vectors[hexField], 'hex')).digest('hex') !== expectedDigest) fail(prefix + 'history compaction canonical vector drifted: ' + digestField);
+    }
+  }
   return value.category;
 }
 
 function main() {
   const manifest = readJson(manifestPath);
   if (manifest.schemaVersion !== 'v01-gate3-contract-candidate-manifest/v0.1') fail('manifest schemaVersion');
-  if (manifest.candidateVersion !== '0.1.0-draft.19' || manifest.status !== 'targeted_revision_r9a_complete_locally_verified') fail('R-9A draft.19 candidate identity drifted');
+  if (manifest.candidateVersion !== '0.1.0-draft.20' || manifest.status !== 'targeted_revision_r9c_contract_founder_frozen_locally_verified') fail('R-9C draft.20 candidate identity drifted');
   if (manifest.contextRevokeSchemeCAuthorityRef !== 'conversation:2026-08-31:founder-r9a-gate11-scheme-c') fail('R-9A Scheme C authority drifted');
+  if (manifest.r9cHarnessContentAuthorityRef !== r9cAuthorityRef) fail('R-9C Founder freeze authority drifted');
   const manifestPaths = new Set(manifest.artifacts.map((artifact) => artifact.path.replace(/\\/g, '/')));
   const taskCategories = new Set();
   const taskFixtureFiles = fs.readdirSync(taskFixtureRoot).filter((name) => name.endsWith('.json')).sort();
@@ -805,9 +996,11 @@ function main() {
   for (const required of ['package egopulse.collaboration.v1', 'enum RunStatus', 'enum StepStatus', 'enum AttemptStatus', 'enum AttemptCancellationDisposition', 'message Lease', 'message CheckpointReference', 'string task_id = 14', 'uint64 work_revision = 15', 'message CollaborationSnapshot', 'message CollaborationCommand', 'message CollaborationEvent', 'service CollaborationControlService']) {
     if (!collaborationProto.includes(required)) fail('collaboration proto missing: ' + required);
   }
-  for (const required of ['package egopulse.harness.v1', 'enum SupportLevel', 'enum CancellationSemantics', 'enum ResumeSemantics', 'enum ApprovalRequestLifecycleKind', 'message CapabilityProfile', 'message DispatchEnvelope', 'message HarnessObservation', 'message ApprovalDecisionEnvelope', 'message CancelExecutionEnvelope', 'message ResumeExecutionEnvelope', 'message ArtifactReturnObservation', 'service HarnessAdapterService', 'service HarnessRegistryService']) {
+  for (const required of ['package egopulse.harness.v1', 'enum SupportLevel', 'enum CancellationSemantics', 'enum ResumeSemantics', 'enum ApprovalRequestLifecycleKind', 'enum ContentMutationOperation', 'enum HarnessContentSafetyFlag', 'enum HarnessContentMarkerKind', 'enum HarnessContentCompactionReason', 'enum HarnessContentRetentionReason', 'message CapabilityProfile', 'governed_user_visible_content = 11', 'message DispatchRouteBinding', 'DispatchRouteBinding route_binding = 23', 'message UserVisibleContentCandidate', 'message HarnessContentSignalObservation', 'message SafeHarnessContentRecord', 'message HarnessContentHistoryCompactionRecord', 'message HarnessContentRetentionTombstone', 'message SafeHarnessContentProjectionEvent', 'message DispatchContextConsumptionProof', 'HarnessContentSignalObservation content_signal = 27', 'message DispatchEnvelope', 'message HarnessObservation', 'message ApprovalDecisionEnvelope', 'message CancelExecutionEnvelope', 'message ResumeExecutionEnvelope', 'message ArtifactReturnObservation', 'service HarnessAdapterService', 'service HarnessRegistryService']) {
     if (!harnessProto.includes(required)) fail('harness proto missing: ' + required);
   }
+  const ownerArtifactRelation = harnessProto.slice(harnessProto.indexOf('message SafeArtifactRelationContent'), harnessProto.indexOf('message SafeContentMarker'));
+  if (!ownerArtifactRelation.includes('SafeArtifactIdentity artifact = 2') || ownerArtifactRelation.includes('available_redacted') || ownerArtifactRelation.includes('oneof visibility')) fail('Adapter owner record must persist immutable Artifact identity without per-principal visibility');
   for (const required of ['package egopulse.artifact.v1', 'message ContentAddress', 'message LineageBinding', 'message Provenance', 'message ArtifactDescriptor', 'message Claim', 'message Evidence', 'message ArtifactSet', 'message ReturnHandoff', 'message ReturnReceipt', 'bool verification_performed = 8', 'bool task_completion_decided = 9', 'service ArtifactAuthorityService']) {
     if (!artifactProto.includes(required)) fail('artifact proto missing: ' + required);
   }
@@ -824,15 +1017,20 @@ function main() {
   }
   const issuePolicyCommand = policyProto.slice(policyProto.indexOf('message IssueHarnessApprovalDecisionCommand'), policyProto.indexOf('message ConsumeHarnessApprovalDecisionCommand'));
   for (const forbidden of ['authority_decision_ref', 'native_routing_ref', 'authenticated_principal_id', 'authorization_policy_ref']) if (issuePolicyCommand.includes(forbidden)) fail('client policy issue command asserts trusted field: ' + forbidden);
-  for (const required of ['package egopulse.localapi.v1', 'SOURCE_DOMAIN_POLICY_DECISION', 'SOURCE_DOMAIN_HARNESS_ADAPTER', 'message ProjectionPosition', 'message SourceRevision', 'message ProjectionMetadata', 'message TaskView', 'message EvidenceGraphView', 'message HarnessApprovalAuthorityResult', 'message HarnessApprovalView', 'message GetHarnessApprovalViewRequest', 'message ListHarnessApprovalViewsRequest', 'message WatchHarnessApprovalViewsRequest', 'message ProjectionAwaitToken', 'message TaskViewStreamFrame', 'client_kernel_contract_ref', 'authorization_policy_ref', 'reserved 2', 'reserved "decision"', 'IssueHarnessApprovalDecisionCommand command = 3', 'reserved 1', 'reserved "authority_result"', 'PolicyDecisionCommandResult policy_authority_result = 4 [deprecated = true]', 'HarnessApprovalAuthorityResult sanitized_authority_result = 5', 'uint64 context_state_revision = 30', 'message RevokeContextSnapshotCommand', 'message ContextRevokeReceipt', 'message ExecuteContextMutationRequest', 'rpc ExecuteContextMutation', 'service LocalSessionService', 'service LocalReadModelService', 'service LocalCommandGatewayService']) {
+  for (const required of ['package egopulse.localapi.v1', 'SOURCE_DOMAIN_POLICY_DECISION', 'SOURCE_DOMAIN_HARNESS_ADAPTER', 'enum HarnessContentResetReason', 'message ProjectionPosition', 'message HarnessContentPosition', 'message SourceRevision', 'message ProjectionMetadata', 'message TaskView', 'message EvidenceGraphView', 'message HarnessApprovalAuthorityResult', 'message HarnessApprovalView', 'message HarnessContentRecordView', 'message ListHarnessContentRequest', 'message HarnessContentBaselinePage', 'message WatchHarnessContentRequest', 'message HarnessContentRecordsFrame', 'message HarnessContentHeartbeatFrame', 'message HarnessContentResetRequiredFrame', 'message HarnessContentStreamFrame', 'rpc ListHarnessContent', 'rpc WatchHarnessContent', 'message GetHarnessApprovalViewRequest', 'message ListHarnessApprovalViewsRequest', 'message WatchHarnessApprovalViewsRequest', 'message ProjectionAwaitToken', 'message TaskViewStreamFrame', 'client_kernel_contract_ref', 'authorization_policy_ref', 'reserved 2', 'reserved "decision"', 'IssueHarnessApprovalDecisionCommand command = 3', 'reserved 1', 'reserved "authority_result"', 'PolicyDecisionCommandResult policy_authority_result = 4 [deprecated = true]', 'HarnessApprovalAuthorityResult sanitized_authority_result = 5', 'uint64 context_state_revision = 30', 'message RevokeContextSnapshotCommand', 'message ContextRevokeReceipt', 'message ExecuteContextMutationRequest', 'rpc ExecuteContextMutation', 'service LocalSessionService', 'service LocalReadModelService', 'service LocalCommandGatewayService']) {
     if (!localApiProto.includes(required)) fail('localapi proto missing: ' + required);
   }
+  const contentFrame = localApiProto.slice(localApiProto.indexOf('message HarnessContentStreamFrame'), localApiProto.indexOf('message LocalApiError'));
+  for (const required of ['oneof payload', 'HarnessContentRecordsFrame records = 2', 'HarnessContentHeartbeatFrame heartbeat = 3', 'HarnessContentResetRequiredFrame reset_required = 4']) if (!contentFrame.includes(required)) fail('Harness content stream frame must be a closed payload oneof: ' + required);
+  if (contentFrame.includes('HarnessContentFrameKind') || contentFrame.includes('repeated HarnessContentRecordView records') || contentFrame.includes('HarnessContentResetReason reset_reason')) fail('Harness content stream frame retains an invalid combinable kind/fields shape');
   const contextMutationResponse = localApiProto.slice(localApiProto.indexOf('message ExecuteContextMutationResponse'), localApiProto.indexOf('message AwaitProjectionRequest'));
   for (const required of ['oneof outcome', 'ContextRevokeReceipt authority_result = 1', 'LocalApiError error = 2']) if (!contextMutationResponse.includes(required)) fail('Context mutation response must have mutually exclusive success/error: ' + required);
   if (contextMutationResponse.includes('gateway_error')) fail('Context mutation Authority failure cannot be mislabeled as gateway_error');
   for (const forbidden of ['enum UnifiedTaskStatus', 'message LocalTaskFact', 'string actor_id', 'json_patch', 'surface_permission', 'tui_read_only', 'service ArtifactAuthorityService', 'ApprovalDecisionEnvelope decision = 2', 'ApprovalDecisionResult authority_result = 1']) if (localApiProto.includes(forbidden)) fail('localapi proto crosses projection/authority boundary: ' + forbidden);
-  const approvalView = localApiProto.slice(localApiProto.indexOf('message HarnessApprovalView'), localApiProto.indexOf('message LocalApiError'));
+  const approvalView = localApiProto.slice(localApiProto.indexOf('message HarnessApprovalView'), localApiProto.indexOf('message HarnessContentPosition'));
   for (const forbidden of ['native_routing_ref', 'authority_proof', 'raw_command', 'credential', 'store_handle']) if (approvalView.includes(forbidden)) fail('approval read model exposes private Adapter/Authority field: ' + forbidden);
+  const contentView = localApiProto.slice(localApiProto.indexOf('message HarnessAssistantTextView'), localApiProto.indexOf('message LocalApiError'));
+  for (const forbidden of ['raw_evidence', 'native_event', 'native_routing', 'native_session', 'native_execution', 'route_binding', 'raw_cumulative', 'credential_commitment', 'provider_request', 'tool_arguments', 'tool_results', 'workspace_path']) if (contentView.includes(forbidden)) fail('Harness content read model exposes private Adapter field: ' + forbidden);
   for (const required of ['package egopulse.persistence.v1', 'enum PersistenceDomain', 'PERSISTENCE_DOMAIN_POLICY_DECISION = 10', 'enum StoreRole', 'enum StoreHealth', 'enum RecoveryPhase', 'message DomainWatermark', 'message DurableCommitReceipt', 'message OutboxEnvelope', 'message InboxConsumptionReceipt', 'message DomainSnapshotDescriptor', 'message BackupManifest', 'message RestoreVerificationReport', 'message RecoveryPlan', 'service PersistenceParticipantService', 'service BackupRecoveryCoordinatorService']) {
     if (!persistenceProto.includes(required)) fail('persistence proto missing: ' + required);
   }
@@ -858,33 +1056,41 @@ function main() {
   if (limit('QR-01', 'hardBytes') !== 536870912 || limit('QR-03', 'hardBytes') !== 2147483648 || limit('QR-09', 'minimumSecondsAfterTaskTerminal') !== 2592000) fail('resource budget values drifted');
   if (limit('QM-01', 'hardTokens') !== 500000 || limit('QM-02', 'hardTokens') !== 50000 || limit('QM-03', 'unknownMayRenderAsZero') !== false) fail('model usage budget values drifted');
   if (budgetProfile.measurementPolicy?.crashInjectionsPerBoundary !== 10 || budgetProfile.measurementPolicy?.crashBoundaryCount !== 8 || budgetProfile.measurementPolicy?.failedSamplesIncluded !== true) fail('measurement policy drifted');
-  for (const relative of [clientKernelProfileRelative, clientKernelSchemaRelative, authorizationProfileRelative, authorizationSchemaRelative, contextRevokeProfileRelative, contextRevokeSchemaRelative]) {
+  for (const relative of [clientKernelProfileRelative, clientKernelSchemaRelative, authorizationProfileRelative, authorizationSchemaRelative, contextRevokeProfileRelative, contextRevokeSchemaRelative, harnessContentProfileRelative, harnessContentSchemaRelative]) {
     if (!manifestPaths.has(relative)) fail('G4-08C support profile contract missing from manifest: ' + relative);
   }
   const clientKernelProfile = readJson(path.join(root, clientKernelProfileRelative));
   if (clientKernelProfile.schemaVersion !== 'egopulse.client-kernel-profile/v0.1' || clientKernelProfile.contractId !== 'egopulse.client-kernel.v1' || clientKernelProfile.contractVersion !== '0.1.0') fail('client-kernel profile identity drifted');
-  if (clientKernelProfile.authorityRef !== 'conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze') fail('client-kernel profile missing latest Founder authority');
-  if (clientKernelProfile.localApiCompatibility?.contractId !== 'egopulse.localapi.v1' || clientKernelProfile.localApiCompatibility?.runtimeReferenceRequired !== true) fail('client-kernel Local API compatibility binding invalid');
+  if (clientKernelProfile.authorityRef !== r9cAuthorityRef) fail('client-kernel profile missing latest Founder authority');
+  if (clientKernelProfile.localApiCompatibility?.contractId !== 'egopulse.localapi.v1' || clientKernelProfile.localApiCompatibility?.minimumVersion !== '0.1.0-draft.20' || clientKernelProfile.localApiCompatibility?.maximumVersionExclusive !== '0.2.0' || clientKernelProfile.localApiCompatibility?.runtimeReferenceRequired !== true) fail('client-kernel Local API compatibility binding invalid');
   const kernelBoundary = clientKernelProfile.implementationBoundary || {};
   const expectedSurfaces = new Set(['cli', 'tui', 'desktop_tauri_backend']);
   if (kernelBoundary.sharedKernelLanguage !== 'rust' || kernelBoundary.typescriptBusinessKernelAllowed !== false || kernelBoundary.transport !== 'tonic_grpc_http2_semantics_over_named_pipe_or_uds_no_tcp' || new Set(kernelBoundary.surfaces || []).size !== expectedSurfaces.size || [...expectedSurfaces].some((surface) => !(kernelBoundary.surfaces || []).includes(surface))) fail('client-kernel implementation boundary drifted');
-  const requiredKernelCapabilities = ['session_negotiation', 'query', 'list', 'watch_complete_snapshots', 'await_projection', 'memory_retrieval', 'context_revoke_full_digest_confirmation', 'typed_command', 'stable_cursor', 'reset_and_refetch', 'read_your_write', 'typed_error', 'frame_deduplication'];
-  if (requiredKernelCapabilities.some((capability) => !(clientKernelProfile.capabilities || []).includes(capability))) fail('client-kernel conformance capability missing');
+  const requiredKernelCapabilities = ['session_negotiation', 'query', 'list', 'watch_complete_snapshots', 'content_baseline_pagination', 'watch_operation_records', 'await_projection', 'memory_retrieval', 'context_revoke_full_digest_confirmation', 'typed_command', 'stable_cursor', 'reset_and_refetch', 'read_your_write', 'typed_error', 'frame_deduplication', 'content_generation_fencing'];
+  requireExactSet(clientKernelProfile.capabilities || [], requiredKernelCapabilities, 'client-kernel conformance capability catalog drifted');
+  const streamSemantics = clientKernelProfile.streamSemantics || {};
+  requireExactSet(streamSemantics.completeSnapshotDomains || [], ['task_views', 'harness_approval_views'], 'client-kernel complete-snapshot domain catalog drifted');
+  requireExactSet(streamSemantics.operationRecordDomains || [], ['harness_content'], 'client-kernel operation-record domain catalog drifted');
+  if (streamSemantics.independentDomainPositions !== true || streamSemantics.resetDiscardsIncompleteAssembly !== true || streamSemantics.crossDomainOrdering !== 'forbidden') fail('client-kernel stream semantics drifted');
   const kernelInvariants = clientKernelProfile.invariants || {};
-  for (const field of ['surfaceNeutral', 'completeSnapshotStreams', 'orderedWithinEpoch', 'atLeastOnceDelivery', 'unknownFrameFailClosed', 'gapRequiresReset', 'authorityResultPreserved', 'clientNeverBecomesAuthority']) if (kernelInvariants[field] !== true) fail('client-kernel invariant drifted: ' + field);
+  for (const field of ['surfaceNeutral', 'completeSnapshotStreams', 'orderedWithinEpoch', 'atLeastOnceDelivery', 'unknownFrameFailClosed', 'gapRequiresReset', 'authorityResultPreserved', 'clientNeverBecomesAuthority', 'operationRecordAssemblyInSharedKernel', 'crossDomainPositionComparisonForbidden', 'contentCannotAdvanceAuthorityState']) if (kernelInvariants[field] !== true) fail('client-kernel invariant drifted: ' + field);
 
   const authorizationProfile = readJson(path.join(root, authorizationProfileRelative));
   if (authorizationProfile.schemaVersion !== 'egopulse.authorization-capability-profile/v0.1' || authorizationProfile.contractId !== 'egopulse.authorization.v1' || authorizationProfile.contractVersion !== '0.1.0' || authorizationProfile.localApiContractId !== 'egopulse.localapi.v1') fail('authorization profile identity drifted');
-  if (authorizationProfile.authorityRef !== 'conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze') fail('authorization profile missing latest Founder authority');
+  if (authorizationProfile.authorityRef !== r9cAuthorityRef) fail('authorization profile missing latest Founder authority');
   const authorizationDefaults = authorizationProfile.defaults || {};
   if (authorizationDefaults.unknownPermission !== 'fail_closed' || authorizationDefaults.unknownRpc !== 'fail_closed' || authorizationDefaults.unknownCommandOneof !== 'fail_closed' || authorizationDefaults.surfaceNeutral !== true || authorizationDefaults.sessionGrantIsFinalAuthorization !== false || authorizationDefaults.owningAuthorityRevalidationRequired !== true) fail('authorization fail-closed defaults drifted');
-  const expectedPermissionCodes = new Set(['local.task.read', 'local.evidence.read', 'local.approval.read', 'local.projection.status.read', 'local.projection.await', 'local.memory.retrieve', 'local.memory.candidate.submit', 'local.memory.govern', 'local.context.revoke', 'local.task.create', 'local.work.prepare', 'local.work.confirm', 'local.task.cancellation.request', 'local.approval.decide', 'local.founder-verdict.issue', 'local.founder-verdict.revoke', 'local.founder-verdict.apply']);
+  const expectedPermissionCodes = new Set(['local.task.read', 'local.evidence.read', 'local.approval.read', 'local.harness.content.read', 'local.projection.status.read', 'local.projection.await', 'local.memory.retrieve', 'local.memory.candidate.submit', 'local.memory.govern', 'local.context.revoke', 'local.task.create', 'local.work.prepare', 'local.work.confirm', 'local.task.cancellation.request', 'local.approval.decide', 'local.founder-verdict.issue', 'local.founder-verdict.revoke', 'local.founder-verdict.apply']);
   const permissionCodes = new Set((authorizationProfile.permissions || []).map((permission) => permission.code));
   if (permissionCodes.size !== expectedPermissionCodes.size || [...expectedPermissionCodes].some((code) => !permissionCodes.has(code))) fail('authorization permission catalog must contain the exact V-01 code set');
-  const expectedRpcs = new Set(['LocalSessionService/OpenSession', 'LocalReadModelService/GetTaskView', 'LocalReadModelService/ListTaskViews', 'LocalReadModelService/GetEvidenceGraph', 'LocalReadModelService/GetHarnessApprovalView', 'LocalReadModelService/ListHarnessApprovalViews', 'LocalReadModelService/GetProjectionStatus', 'LocalReadModelService/WatchTaskViews', 'LocalReadModelService/WatchHarnessApprovalViews', 'LocalReadModelService/AwaitProjection', 'LocalCognitionService/RetrieveMemory', 'LocalCommandGatewayService/ExecuteTaskCommand', 'LocalCommandGatewayService/PrepareWork', 'LocalCommandGatewayService/ConfirmWork', 'LocalCommandGatewayService/DecideHarnessApproval', 'LocalCommandGatewayService/ExecuteFounderVerdict', 'LocalCommandGatewayService/ExecuteMemoryMutation', 'LocalCommandGatewayService/ExecuteContextMutation']);
+  const expectedRpcs = new Set(['LocalSessionService/OpenSession', 'LocalReadModelService/GetTaskView', 'LocalReadModelService/ListTaskViews', 'LocalReadModelService/GetEvidenceGraph', 'LocalReadModelService/GetHarnessApprovalView', 'LocalReadModelService/ListHarnessApprovalViews', 'LocalReadModelService/GetProjectionStatus', 'LocalReadModelService/WatchTaskViews', 'LocalReadModelService/WatchHarnessApprovalViews', 'LocalReadModelService/ListHarnessContent', 'LocalReadModelService/WatchHarnessContent', 'LocalReadModelService/AwaitProjection', 'LocalCognitionService/RetrieveMemory', 'LocalCommandGatewayService/ExecuteTaskCommand', 'LocalCommandGatewayService/PrepareWork', 'LocalCommandGatewayService/ConfirmWork', 'LocalCommandGatewayService/DecideHarnessApproval', 'LocalCommandGatewayService/ExecuteFounderVerdict', 'LocalCommandGatewayService/ExecuteMemoryMutation', 'LocalCommandGatewayService/ExecuteContextMutation']);
   const rpcRules = new Map((authorizationProfile.rpcRules || []).map((rule) => [rule.rpc, rule]));
   if (rpcRules.size !== expectedRpcs.size || [...expectedRpcs].some((rpc) => !rpcRules.has(rpc))) fail('authorization RPC catalog must cover the exact Local API service set');
   for (const rule of rpcRules.values()) for (const code of rule.requiredPermissionCodes || []) if (!permissionCodes.has(code)) fail('RPC rule references unknown permission: ' + code);
+  for (const rpc of ['LocalReadModelService/ListHarnessContent', 'LocalReadModelService/WatchHarnessContent']) {
+    const rule = rpcRules.get(rpc);
+    if (rule.access !== 'granted_permission' || JSON.stringify(rule.requiredPermissionCodes) !== JSON.stringify(['local.harness.content.read']) || Object.prototype.hasOwnProperty.call(rule, 'tokenScopeEnforced')) fail('Harness content RPC must have one independent read permission and no projection-token semantics: ' + rpc);
+  }
   const expectedCommandRules = new Map([
     ['LocalCommandGatewayService/ExecuteTaskCommand#create_task', ['user', 'local.task.create', 'TaskAuthority', ['TaskAuthority.Founder'], 'none']],
     ['LocalCommandGatewayService/ExecuteTaskCommand#request_task_cancellation', ['user', 'local.task.cancellation.request', 'TaskAuthority', ['TaskAuthority.Founder'], 'authority_contract']],
@@ -939,11 +1145,105 @@ function main() {
   if (JSON.stringify(contextRevokeProfile.fixtureRefs) !== JSON.stringify(expectedContextFixtureRefs)) fail('Context revoke fixture catalog drifted');
   const fixedContextRevoke = readJson(path.join(localApiFixtureRoot, 'valid-context-revoke-semantic-digest.json')).operation.executeContextMutation;
   if (fixedContextRevoke.requestDigestSha256 !== '08d5c9f548acdef1cf739b73205510084c6c3ecd010ece536881a155eff3befc' || fixedContextRevoke.canonicalBytesHex !== '1a0000000000000065676f70756c73652f636f6e746578742d7265766f6b652f76310f000000000000006f732d757365723a666f756e64657244000000000000006374783a30313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566080000000000000001000000000000001100000000000000666f756e6465722d77697468647261776e08000000000000000100000000000000120000000000000065766964656e63653a7265766965773a34321300000000000000636f6e6669726d6174696f6e3a636c693a3031') fail('Context revoke fixed digest/canonical bytes vector drifted');
+  const harnessContentProfile = readJson(path.join(root, harnessContentProfileRelative));
+  if (harnessContentProfile.schemaVersion !== 'egopulse.harness-content-disclosure-profile/v0.1' || harnessContentProfile.contractId !== 'egopulse.harness-content-disclosure.v1' || harnessContentProfile.contractVersion !== '0.1.0' || harnessContentProfile.profileId !== 'harness-content-disclosure-v01-default' || harnessContentProfile.authorityRef !== r9cAuthorityRef) fail('Harness content disclosure profile identity drifted');
+  if (JSON.stringify(harnessContentProfile.contractBindings) !== JSON.stringify({ harnessContractId: 'egopulse.harness.v1', localApiContractId: 'egopulse.localapi.v1', capabilityField: 'governed_user_visible_content', permissionCode: 'local.harness.content.read' })) fail('Harness content contract bindings drifted');
+  const sourceAdmission = harnessContentProfile.sourceAdmission || {};
+  requireExactSet(sourceAdmission.contextProofBranches || [], ['NOT_CONTEXT_BOUND', 'AUTHORIZED_CONTEXT'], 'Harness content Context proof branches drifted');
+  if (sourceAdmission.requiredDeliveryDisposition !== 'DELIVERY_DISPOSITION_DELIVERED' || sourceAdmission.candidateIdentitySource !== 'trusted_stores_only' || sourceAdmission.missingRouteBinding !== 'fail_closed_no_text_disclosure' || sourceAdmission.legacyDispatch !== 'never_backfill_from_current_configuration' || sourceAdmission.providerCapabilityRequired !== true || sourceAdmission.unknownOneof !== 'fail_closed') fail('Harness content source admission drifted');
+  const expectedAllowedContent = ['assistant_text', 'lifecycle_activity_code', 'usage_counters', 'approval_required_code', 'final_artifact_relation', 'redacted_marker', 'blocked_marker', 'truncated_marker', 'content_domain_status_marker'];
+  const expectedForbiddenContent = ['hidden_reasoning', 'chain_of_thought', 'system_prompt', 'developer_prompt', 'provider_request_payload', 'context_source_field', 'memory_source_field', 'rag_query', 'embedding', 'proof', 'source_reference', 'tool_arguments', 'tool_results', 'command_stdout', 'command_stderr', 'ansi_or_terminal_control', 'file_content', 'workspace_path', 'raw_native_event', 'raw_evidence_reference', 'native_routing_identifier', 'native_session_identifier', 'native_execution_identifier', 'credential_or_token', 'private_key', 'environment_value', 'secret_store_material', 'unknown_category'];
+  requireExactSet(harnessContentProfile.contentCategories?.allowed || [], expectedAllowedContent, 'Harness content allowlist drifted');
+  requireExactSet(harnessContentProfile.contentCategories?.forbidden || [], expectedForbiddenContent, 'Harness content denylist drifted');
+  if (harnessContentProfile.contentCategories?.unknownCategory !== 'blocked_marker_no_source_bytes') fail('unknown Harness content category must fail closed to a no-source-bytes marker');
+  const protocol = harnessContentProfile.messageProtocol || {};
+  if (JSON.stringify(protocol.operations) !== JSON.stringify(['APPEND', 'REPLACE', 'FINALIZE']) || protocol.revisionStartsAt !== 1 || protocol.sameRevisionSameDigest !== 'idempotent_no_op' || protocol.sameRevisionDifferentDigest !== 'quarantine_integrity_conflict' || protocol.revisionGap !== 'fail_closed' || protocol.invalidPredecessor !== 'fail_closed' || protocol.secondFinalize !== 'fail_closed' || protocol.updateAfterFinalize !== 'fail_closed' || protocol.replaceMatcherState !== 'reset_from_complete_replacement' || protocol.finalizeMatcherState !== 'flush_non_secret_suffix') fail('Harness content message protocol drifted');
+  const canonical = harnessContentProfile.canonicalEncoding || {};
+  if (canonical.digestAlgorithm !== 'SHA-256' || canonical.digestOutput !== 'lowercase_hex_64' || canonical.lengthPrefix !== 'u64_little_endian_byte_length' || canonical.integerEncoding !== 'u64_little_endian' || canonical.signedIntegerEncoding !== 'i64_little_endian' || canonical.uint32Encoding !== 'u32_little_endian' || canonical.booleanEncoding !== 'u64_little_endian_zero_or_one' || canonical.stringEncoding !== 'utf8_no_normalization' || canonical.enumEncoding !== 'canonical_short_name_utf8' || canonical.optionalEncoding !== 'presence_NONE_or_SOME_utf8_then_empty_or_encoded_value' || canonical.collectionEncoding !== 'count_u64_then_each_value_in_declared_order' || canonical.timestampEncoding !== 'seconds_i64_little_endian_then_nanos_u32_little_endian_each_framed') fail('Harness content canonical primitive encoding drifted');
+  if (JSON.stringify(canonical.catalogSnapshotKinds) !== JSON.stringify({ digest: 'DIGEST', noCatalog: 'NO_CATALOG', noCatalogValue: '' })) fail('Harness content catalog-snapshot canonical branches drifted');
+  if (JSON.stringify(canonical.contextProofCanonicalization) !== JSON.stringify({ notContextBoundBranch: 'NOT_CONTEXT_BOUND', notContextBoundAuthorizationId: '', notContextBoundRequestDigestSha256: '', authorizedContextBranch: 'AUTHORIZED_CONTEXT', authorizedContextRequiresAuthorizationId: true, authorizedContextRequiresRequestDigestSha256: true })) fail('Harness content Context-proof canonical branches drifted');
+  if (JSON.stringify(canonical.candidatePayloadDiscriminators) !== JSON.stringify({ assistantText: 'ASSISTANT_TEXT', lifecycle: 'LIFECYCLE', usage: 'USAGE', approvalRequired: 'APPROVAL_REQUIRED', blockedSource: 'BLOCKED_SOURCE' })) fail('Harness content candidate payload discriminator catalog drifted');
+  if (JSON.stringify(canonical.safePayloadDiscriminators) !== JSON.stringify({ assistantText: 'ASSISTANT_TEXT', lifecycle: 'LIFECYCLE', usage: 'USAGE', approvalRequired: 'APPROVAL_REQUIRED', artifactRelation: 'ARTIFACT_RELATION', marker: 'MARKER' })) fail('Harness content safe payload discriminator catalog drifted');
+  if (JSON.stringify(canonical.projectionEventDiscriminators) !== JSON.stringify({ contentRecord: 'CONTENT_RECORD', historyCompaction: 'HISTORY_COMPACTION', retentionTombstone: 'RETENTION_TOMBSTONE' })) fail('Harness content projection-event discriminator catalog drifted');
+  if (JSON.stringify(canonical.identifierFormats) !== JSON.stringify({ safeMessageId: 'hcm_<lowercase_hex_64>', safeRecordId: 'hcr_<lowercase_hex_64>', historyCompactionRecordId: 'hcc_<lowercase_hex_64>', retentionTombstoneId: 'hrt_<lowercase_hex_64>' })) fail('Harness content identifier formats drifted');
+  if (JSON.stringify(canonical.digestRules) !== JSON.stringify({ candidateDigest: 'sha256_of_selected_candidate_payload_canonical_bytes', safePayloadDigest: 'sha256_of_selected_safe_payload_canonical_bytes', safeRecordDigest: 'sha256_of_safe_record_canonical_bytes_excluding_record_digest_sha256', historyCompactionDigest: 'sha256_of_history_compaction_canonical_bytes_excluding_compaction_record_digest_sha256', retentionTombstoneDigest: 'sha256_of_retention_tombstone_canonical_bytes_excluding_tombstone_digest_sha256', safetyFlags: 'ascending_numeric_unique', nonTextPartIndexForRecordId: 0 })) fail('Harness content digest/self-exclusion rules drifted');
+  const expectedDomains = {
+    routeBinding: 'egopulse/harness-content/route-binding/v1',
+    textPayload: 'egopulse/harness-content/text-payload/v1',
+    rawCumulative: 'egopulse/harness-content/raw-cumulative/v1',
+    safeCumulative: 'egopulse/harness-content/safe-cumulative/v1',
+    safeMessageId: 'egopulse/harness-content/safe-message-id/v1',
+    textCandidate: 'egopulse/harness-content/text-candidate/v1',
+    lifecycleCandidate: 'egopulse/harness-content/lifecycle-candidate/v1',
+    usageCandidate: 'egopulse/harness-content/usage-candidate/v1',
+    approvalRequiredCandidate: 'egopulse/harness-content/approval-required-candidate/v1',
+    blockedSourceCandidate: 'egopulse/harness-content/blocked-source-candidate/v1',
+    contentEvent: 'egopulse/harness-content/event/v1',
+    safeRecordId: 'egopulse/harness-content/safe-record-id/v1',
+    safeRecord: 'egopulse/harness-content/safe-record/v1',
+    safeAssistantText: 'egopulse/harness-content/safe-assistant-text/v1',
+    safeLifecycle: 'egopulse/harness-content/safe-lifecycle/v1',
+    safeUsage: 'egopulse/harness-content/safe-usage/v1',
+    safeApprovalRequired: 'egopulse/harness-content/safe-approval-required/v1',
+    safeArtifactRelation: 'egopulse/harness-content/safe-artifact-relation/v1',
+    safeMarker: 'egopulse/harness-content/safe-marker/v1',
+    historyCompactionRecordId: 'egopulse/harness-content/history-compaction-id/v1',
+    historyCompactionRecord: 'egopulse/harness-content/history-compaction/v1',
+    retentionTombstoneId: 'egopulse/harness-content/retention-tombstone-id/v1',
+    retentionTombstone: 'egopulse/harness-content/retention-tombstone/v1',
+    credentialCommitment: 'egopulse/harness-content/credential-set/v1',
+  };
+  if (JSON.stringify(canonical.domainSeparators) !== JSON.stringify(expectedDomains)) fail('Harness content canonical domain separators drifted');
+  const expectedFieldOrders = {
+    routeBindingFieldOrder: ['domain_separator', 'provider_bootstrap_profile_id', 'selected_harness_id', 'provider_model_id', 'catalog_snapshot_kind', 'catalog_snapshot_value', 'capability_profile_id'],
+    textPayloadFieldOrder: ['domain_separator', 'text_utf8'],
+    rawCumulativeFieldOrder: ['domain_separator', 'raw_cumulative_text_utf8'],
+    safeCumulativeFieldOrder: ['domain_separator', 'safe_cumulative_text_utf8'],
+    safeMessageIdFieldOrder: ['domain_separator', 'attempt_id', 'dispatch_id', 'route_binding_sha256', 'candidate_message_id'],
+    textCandidateFieldOrder: ['domain_separator', 'message_id', 'revision', 'previous_revision', 'operation', 'text_utf8', 'delta_or_snapshot_digest_sha256', 'previous_raw_cumulative_digest_sha256', 'raw_cumulative_digest_sha256'],
+    lifecycleCandidateFieldOrder: ['domain_separator', 'lifecycle_kind', 'side_effect_certainty', 'native_will_retry_presence', 'native_will_retry_value'],
+    usageCandidateFieldOrder: ['domain_separator', 'input_tokens', 'output_tokens', 'cached_input_tokens_presence', 'cached_input_tokens_value'],
+    approvalRequiredCandidateFieldOrder: ['domain_separator'],
+    blockedSourceCandidateFieldOrder: ['domain_separator', 'marker_kind'],
+    contentEventIdFieldOrder: ['domain_separator', 'delivered_receipt_id', 'delivered_receipt_digest_sha256', 'context_proof_branch', 'context_authorization_id', 'context_authorization_request_digest_sha256', 'dispatch_route_binding_sha256', 'attempt_id', 'dispatch_id', 'fencing_token', 'capability_profile_id', 'native_event_id', 'native_event_digest_sha256', 'native_sequence', 'candidate_digest_sha256'],
+    safeRecordIdFieldOrder: ['domain_separator', 'content_event_id', 'disclosure_profile_contract_id', 'disclosure_profile_version', 'disclosure_profile_sha256', 'payload_discriminator', 'part_index'],
+    safeRecordFieldOrder: ['domain_separator', 'record_id', 'content_event_id', 'task_id', 'run_id', 'step_id', 'attempt_id', 'dispatch_id', 'fencing_token', 'route_binding_sha256', 'disclosure_profile_contract_id', 'disclosure_profile_version', 'disclosure_profile_sha256', 'provider_family_alias', 'model_alias', 'collaboration_role', 'safety_flags_count', 'safety_flags_ascending_numeric', 'payload_discriminator', 'payload_digest_sha256'],
+    safeAssistantTextFieldOrder: ['domain_separator', 'safe_message_id', 'revision', 'previous_revision', 'operation', 'safe_text_utf8', 'safe_cumulative_digest_sha256', 'part_index', 'part_count'],
+    safeLifecycleFieldOrder: ['domain_separator', 'lifecycle_kind', 'side_effect_certainty', 'native_will_retry_presence', 'native_will_retry_value'],
+    safeUsageFieldOrder: ['domain_separator', 'input_tokens', 'output_tokens', 'cached_input_tokens_presence', 'cached_input_tokens_value'],
+    safeApprovalRequiredFieldOrder: ['domain_separator'],
+    safeArtifactRelationFieldOrder: ['domain_separator', 'safe_content_differs_from_artifact', 'artifact_id', 'artifact_digest_sha256'],
+    safeMarkerFieldOrder: ['domain_separator', 'marker_kind'],
+    historyCompactionRecordIdFieldOrder: ['domain_separator', 'task_id', 'attempt_id', 'final_epoch', 'final_sequence', 'disclosure_profile_sha256', 'reason'],
+    historyCompactionRecordFieldOrder: ['domain_separator', 'compaction_record_id', 'task_id', 'attempt_id', 'final_epoch', 'final_sequence', 'final_safe_content_digest_sha256', 'owner_snapshot_digest_sha256', 'disclosure_profile_contract_id', 'disclosure_profile_version', 'disclosure_profile_sha256', 'compacted_at_seconds', 'compacted_at_nanos', 'reason'],
+    retentionTombstoneIdFieldOrder: ['domain_separator', 'task_id', 'attempt_id', 'final_epoch', 'final_sequence', 'disclosure_profile_sha256', 'reason'],
+    retentionTombstoneFieldOrder: ['domain_separator', 'tombstone_id', 'task_id', 'attempt_id', 'final_epoch', 'final_sequence', 'final_safe_content_digest_sha256', 'disclosure_profile_contract_id', 'disclosure_profile_version', 'disclosure_profile_sha256', 'terminal_committed_at_seconds', 'terminal_committed_at_nanos', 'compacted_at_seconds', 'compacted_at_nanos', 'reason'],
+    credentialCommitmentFieldOrder: ['domain_separator', 'variant_value_count', 'variant_values_sorted_unsigned_byte_lexicographic'],
+  };
+  for (const [field, expectedOrder] of Object.entries(expectedFieldOrders)) if (JSON.stringify(canonical[field]) !== JSON.stringify(expectedOrder)) fail('Harness content canonical field order drifted: ' + field);
+  const safety = harnessContentProfile.textSafety || {};
+  requireExactSet(safety.unicodeLineSeparatorsToLf || [], ['U+2028', 'U+2029'], 'Harness content Unicode line-separator set drifted');
+  requireExactSet(safety.c0Allowed || [], ['LF'], 'Harness content allowed C0 set drifted');
+  requireExactSet(safety.bidiControlScalars || [], ['U+061C', 'U+200E', 'U+200F', 'U+202A-U+202E', 'U+2066-U+2069'], 'Harness content bidi-control set drifted');
+  if (safety.invalidUtf8 !== 'INVALID_TEXT_marker_no_text' || safety.newlineNormalization !== 'crlf_and_cr_to_lf' || safety.tabReplacementSpaces !== 4 || safety.replacementScalar !== 'U+FFFD' || safety.replaceDel !== true || safety.replaceC1 !== true || safety.ansiInterpretation !== 'forbidden') fail('Harness content text safety transform drifted');
+  const secrets = harnessContentProfile.managedCredentialRedaction || {};
+  requireExactSet(secrets.variants || [], ['raw_ascii', 'canonical_json_content_escape', 'canonical_percent_uppercase', 'base64_standard_padded', 'base64_standard_unpadded', 'base64url_padded', 'base64url_unpadded'], 'Harness content credential variant set drifted');
+  if (secrets.credentialMode !== 'api_key_environment' || secrets.maxNonEmptyValues !== 32 || secrets.maxValueBytes !== 1024 || secrets.valueEncoding !== 'printable_ascii' || secrets.maxEncodedPatternBytes !== 3072 || secrets.maxWithheldSuffixBytes !== 3071 || secrets.matcher !== 'deterministic_streaming_multi_pattern_longest_match' || secrets.commitment !== 'domain_separated_hmac_sha256_from_adapter_store_key' || secrets.persistedSecretMaterial !== 'commitment_only' || secrets.oversizeBehavior !== 'structured_only_attempt_execution_continues' || secrets.restartMismatchBehavior !== 'REDACTION_INPUT_UNAVAILABLE_then_structured_only' || secrets.harnessAccountGuarantee !== 'forbidden_source_and_daemon_managed_secret_bytes_only') fail('Harness content managed-credential redaction contract drifted');
+  const limits = harnessContentProfile.resourceLimits || {};
+  if (limits.candidateTextBytes !== 65536 || limits.safePartBytes !== 65536 || limits.serializedFrameBytes !== 81920 || limits.attemptSafeTextBytes !== 16777216 || limits.attemptSafeRecords !== 16384 || limits.taskSafeTextBytes !== 67108864 || limits.taskSafeRecords !== 65536 || limits.baselinePageRecords !== 256 || limits.baselinePageTextBytes !== 1048576 || limits.reservedFinalRecordSlot !== 'LIMIT_REACHED' || limits.byteAccounting !== 'safe_normalized_redacted_utf8_before_proto' || limits.paginationWholeRecordsOnly !== true) fail('Harness content resource limits drifted');
+  const recovery = harnessContentProfile.recoveryAndRetention || {};
+  if (recovery.projectionDomain !== 'independent_harness_content' || recovery.delivery !== 'at_least_once_idempotent' || recovery.stableIdentity !== 'content_event_id_and_record_digest' || recovery.rebuildSource !== 'adapter_safe_ledger_or_owner_snapshot_only' || recovery.rerunRedactionOnReplay !== false || recovery.profileChange !== 'new_epoch_reset_old_text_excluded_history_unavailable_tombstone' || recovery.minimumSecondsAfterTaskTerminal !== 2592000 || recovery.compaction !== 'owner_snapshot_floor_delete_and_typed_record_atomic' || recovery.tombstonePreventsResurrection !== true || recovery.unknownGap !== 'ResetRequired') fail('Harness content recovery/retention contract drifted');
+  const contentAuthorization = harnessContentProfile.authorization || {};
+  if (contentAuthorization.permissionCode !== 'local.harness.content.read' || contentAuthorization.scopeSource !== 'trusted_task_and_attempt_lineage' || contentAuthorization.revalidateAfterSendReservation !== true || contentAuthorization.maxFramesInFlight !== 1 || contentAuthorization.postChangeExposureFrames !== 1 || contentAuthorization.artifactIdentityPermissionCode !== 'local.evidence.read' || contentAuthorization.failureIsolation !== 'content_domain_only') fail('Harness content authorization contract drifted');
+  const expectedHarnessContentFixtures = ['fixtures/harness/v1/valid-content-append-not-context-bound.json', 'fixtures/harness/v1/valid-content-authorized-context.json', 'fixtures/harness/v1/valid-route-binding-no-catalog.json', 'fixtures/harness/v1/invalid-content-forbidden-category.json', 'fixtures/harness/v1/invalid-content-source-binding-drift.json', 'fixtures/harness/v1/invalid-content-revision-digest-drift.json', 'fixtures/harness/v1/duplicate-content-exact-replay.json', 'fixtures/localapi/v1/valid-harness-content-baseline.json', 'fixtures/localapi/v1/valid-harness-content-watch.json', 'fixtures/localapi/v1/invalid-harness-content-frame-combination.json', 'fixtures/localapi/v1/unauthorized-harness-content-read.json', 'fixtures/localapi/v1/recovery-harness-content-retention-reset.json', 'fixtures/persistence/v1/recovery-safe-content-outbox-after-consumer-commit.json'];
+  if (JSON.stringify(harnessContentProfile.fixtureRefs) !== JSON.stringify(expectedHarnessContentFixtures)) fail('Harness content fixture catalog drifted');
+  for (const relative of expectedHarnessContentFixtures) if (!manifestPaths.has(relative)) fail('Harness content fixture missing from manifest: ' + relative);
   const openSessionFixture = readJson(path.join(localApiFixtureRoot, 'valid-open-desktop-session.json'));
-  const grantedCodes = openSessionFixture.expected?.grantedWriteCapabilities || [];
+  const grantedCodes = [...(openSessionFixture.expected?.grantedReadCapabilities || []), ...(openSessionFixture.expected?.grantedWriteCapabilities || [])];
   if (grantedCodes.some((code) => !permissionCodes.has(code))) fail('open-session fixture grants permission outside authorization profile');
+  if (!(openSessionFixture.expected?.grantedReadCapabilities || []).includes('local.harness.content.read')) fail('open-session fixture must negotiate the R-9C content permission');
   const validation = manifest.validation || {};
-  for (const field of ['bufLint', 'bufBuild', 'protocCompile', 'crossLanguageGeneration', 'faultConformance', 'qualityBudgetProfile', 'clientKernelProfile', 'authorizationCapabilityProfile', 'contextRevokeSemanticProfile']) {
+  for (const field of ['bufLint', 'bufBuild', 'protocCompile', 'crossLanguageGeneration', 'faultConformance', 'qualityBudgetProfile', 'clientKernelProfile', 'authorizationCapabilityProfile', 'contextRevokeSemanticProfile', 'harnessContentDisclosureProfile', 'r9cContractGate']) {
     if (typeof validation[field] !== 'string' || !validation[field].startsWith('passed_')) fail('toolchain evidence is not passed: ' + field);
   }
   if (typeof validation.bufBreaking !== 'string' || (!validation.bufBreaking.startsWith('passed_') && !validation.bufBreaking.startsWith('not_applicable_initial_contract_'))) {
@@ -959,11 +1259,13 @@ function main() {
   if (!g408cProfiles || g408cProfiles.status !== 'founder_confirmed_targeted_gate3_reverified') fail('G4-08C A1/A3 support profiles must carry Founder acceptance and targeted Gate 3 reverification');
   const r9a2 = manifest.groups.find((group) => group.id === 'R-9A.2');
   if (!r9a2 || r9a2.status !== 'founder_confirmed_locally_verified') fail('R-9A.2 must be locally verified under the Founder-confirmed contract');
+  const r9c1 = manifest.groups.find((group) => group.id === 'R-9C.1');
+  if (!r9c1 || r9c1.status !== 'founder_frozen_contract_locally_verified' || r9c1.founderDecisionRequired !== true) fail('R-9C.1 must carry the explicit Founder freeze and local Contract Gate evidence');
   const expectedR9aAcceptanceGates = 'passed_gate7_existing_adapter_receipt_and_task_run_step_attempt_unchanged_after_revoke;gate9_authorization_first_and_revoke_first_restart_paths_use_independent_external_side_effect_witness;gate10_context_paths_do_not_create_or_advance_founder_verdict;gate11_scheme_c_new_commit_validation_and_exact_historical_replay_zero_writes_with_changed_semantics_conflict';
   if (validation.r9aAcceptanceGates !== expectedR9aAcceptanceGates) fail('R-9A Gate 7/9/10/11 evidence drifted');
   console.log(`candidate validation passed: ${taskFixtureFiles.length} task fixtures, ${collaborationFixtureFiles.length} collaboration fixtures, ${harnessFixtureFiles.length} harness fixtures, ${artifactFixtureFiles.length} artifact fixtures, ${verificationFixtureFiles.length} verification fixtures, ${verdictFixtureFiles.length} verdict fixtures, ${policyFixtureFiles.length} policy fixtures, ${localApiFixtureFiles.length} localapi fixtures, ${persistenceFixtureFiles.length} persistence fixtures, ${manifest.artifacts.length} digests`);
-  console.log('proto_toolchain_status=passed; Buf/protoc, Rust/TypeScript/Python generation, and SQLCipher process-crash conformance are verified');
-  console.log('gate3_status=targeted_revision_reverified; G4-08C A1/A3 support profiles are closed and G4-08A2 is authorized for implementation');
+  console.log('proto_toolchain_status=passed; draft.20 Buf/protoc and Rust/TypeScript/Python generation are verified');
+  console.log('r9c_contract_status=founder_frozen_locally_verified; R9C-D01..D12 and phase-2-82 section 7 are pinned');
 }
 
 main();

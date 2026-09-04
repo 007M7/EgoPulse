@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "v01-persistence-fixture/v0.1",
+  "fixtureId": "persistence-recovery-r9c-prewrite-migration-backup-restore",
+  "category": "recovery",
+  "requirementRefs": ["R9C-MIGRATION-01", "R9C-ROLLBACK-01", "R9C-C5"],
+  "principal": { "kind": "RECOVERY_COORDINATOR", "principalId": "migration-coordinator", "authenticated": true },
+  "startingState": {
+    "coordinatedBackupId": "backup-r9c-preupgrade-001",
+    "coordinatedBackupVerified": true,
+    "writesFenced": true,
+    "adapterSchemaVersion": 3,
+    "localReadModelSchemaVersion": 3,
+    "adapterMigrationOutcome": "committed_not_activated",
+    "localReadModelMigrationOutcome": "failed",
+    "activeStoreSetCutover": false,
+    "postMigrationProductWriteCount": 0
+  },
+  "operation": {
+    "recoverFailedMigration": {
+      "preMigrationBackupId": "backup-r9c-preupgrade-001",
+      "requestedBinary": "pre-r9c-binary"
+    }
+  },
+  "expected": {
+    "outcome": "ok",
+    "businessWriteCount": 0,
+    "verifiedBackupAndOldBinaryRestoredAsOneOperation": true,
+    "entireCoordinatedStoreSetRestored": true,
+    "mixedSchemaSetActivated": false,
+    "automaticDownMigration": false,
+    "newBinaryProductWritesObserved": false,
+    "contentProjectionEnabled": false,
+    "factLoss": false
+  }
+}

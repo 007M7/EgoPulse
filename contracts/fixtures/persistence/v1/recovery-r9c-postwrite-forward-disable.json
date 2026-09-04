@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "v01-persistence-fixture/v0.1",
+  "fixtureId": "persistence-recovery-r9c-postwrite-forward-disable",
+  "category": "recovery",
+  "requirementRefs": ["R9C-MIGRATION-01", "R9C-ROLLBACK-02", "R9C-C5"],
+  "principal": { "kind": "RECOVERY_COORDINATOR", "principalId": "migration-coordinator", "authenticated": true },
+  "startingState": {
+    "coordinatedBackupId": "backup-r9c-preupgrade-001",
+    "coordinatedBackupVerified": true,
+    "adapterSchemaVersion": 4,
+    "localReadModelSchemaVersion": 4,
+    "postMigrationProductWriteCount": 3,
+    "nativeEvidenceRows": 1,
+    "safeRecordRows": 1,
+    "retentionTombstoneRows": 1
+  },
+  "operation": {
+    "recoverFailedMigration": {
+      "preMigrationBackupId": "backup-r9c-preupgrade-001",
+      "requestedBinary": "pre-r9c-binary"
+    }
+  },
+  "expected": {
+    "outcome": "held",
+    "businessWriteCount": 0,
+    "verifiedBackupRestored": false,
+    "oldBinaryActivated": false,
+    "automaticDownMigration": false,
+    "structuredOnlyModeEnabled": true,
+    "newAttemptGovernedTextEligible": false,
+    "nativeEvidenceRetained": true,
+    "safeRecordsRetained": true,
+    "retentionTombstonesRetained": true,
+    "forwardRepairAllowed": true,
+    "factLoss": false
+  }
+}

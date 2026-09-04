@@ -3478,6 +3478,7 @@ fn u03c_seed_collaboration(
         session_strategy: NativeSessionStrategy::CreateNew as i32,
         native_session_ref: None,
         checkpoint_ref: None,
+        route_binding: None,
     };
     envelope.dispatch_fingerprint = canonical_dispatch_fingerprint(&envelope);
     snapshot = u03c_collaboration_snapshot(

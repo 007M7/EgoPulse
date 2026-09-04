@@ -2,10 +2,10 @@
   "schemaVersion": "egopulse.client-kernel-profile/v0.1",
   "contractId": "egopulse.client-kernel.v1",
   "contractVersion": "0.1.0",
-  "authorityRef": "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze",
+  "authorityRef": "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7",
   "localApiCompatibility": {
     "contractId": "egopulse.localapi.v1",
-    "minimumVersion": "0.1.0-draft.13",
+    "minimumVersion": "0.1.0-draft.20",
     "maximumVersionExclusive": "0.2.0",
     "runtimeReferenceRequired": true
   },
@@ -20,6 +20,8 @@
     "query",
     "list",
     "watch_complete_snapshots",
+    "content_baseline_pagination",
+    "watch_operation_records",
     "await_projection",
     "memory_retrieval",
     "context_revoke_full_digest_confirmation",
@@ -28,8 +30,16 @@
     "reset_and_refetch",
     "read_your_write",
     "typed_error",
-    "frame_deduplication"
+    "frame_deduplication",
+    "content_generation_fencing"
   ],
+  "streamSemantics": {
+    "completeSnapshotDomains": ["task_views", "harness_approval_views"],
+    "operationRecordDomains": ["harness_content"],
+    "independentDomainPositions": true,
+    "resetDiscardsIncompleteAssembly": true,
+    "crossDomainOrdering": "forbidden"
+  },
   "invariants": {
     "surfaceNeutral": true,
     "completeSnapshotStreams": true,
@@ -38,6 +48,9 @@
     "unknownFrameFailClosed": true,
     "gapRequiresReset": true,
     "authorityResultPreserved": true,
-    "clientNeverBecomesAuthority": true
+    "clientNeverBecomesAuthority": true,
+    "operationRecordAssemblyInSharedKernel": true,
+    "crossDomainPositionComparisonForbidden": true,
+    "contentCannotAdvanceAuthorityState": true
   }
 }

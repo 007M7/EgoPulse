@@ -9,7 +9,7 @@
   "gate3AuthorityRef": "conversation:2026-08-23:founder-v01-gate3-pass",
   "gate4DriAuthorityRef": "conversation:2026-08-23:founder-v01-gate4-dri-confirmation",
   "implementationSsotAfterVerifiedImport": true,
-  "currentContractVersion": "0.1.0-draft.19",
+  "currentContractVersion": "0.1.0-draft.20",
   "targetedRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3",
   "approvalReadModelRevisionAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a",
   "g408cSupportProfilesAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
@@ -18,6 +18,7 @@
   "workPrepareConfirmAuthorityRef": "conversation:2026-08-28:founder-work-prepare-confirm-candidate",
   "contextRevokeLinearizationAuthorityRef": "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze",
   "contextRevokeSchemeCAuthorityRef": "conversation:2026-08-31:founder-r9a-gate11-scheme-c",
-  "targetedRevisionScope": ["C-03", "C-07", "C-08", "G4-07A", "G4-08A", "G4-08C-A1", "G4-08C-A3", "M-01..M-06", "M-07..M-10", "R-9A"],
-  "note": "Draft.11 remains the immutable accepted Gate 3 import. Draft.12 inserted Policy Decision Authority. Draft.13 added the independently rebuildable Harness Approval Read Model. Draft.14 added digest-addressed client and authorization profiles. Draft.15 froze the Memory/RAG Worker contract. Draft.16 froze the governed Memory retrieval daemon, authorization, CLI and TUI boundary. Draft.17 added the candidate PrepareWork/ConfirmWork surface. Draft.18 froze the additive Context revoke wire shape, server-derived Founder ownership, independent governance state revision, one shared semantic digest profile and a sanitized Authority receipt. Draft.19 closes complete R-9A with Scheme C new-commit validation, exact historical replay compatibility and durable Gate 1-12 evidence; it changes no Proto, SQL schema or semantic digest algorithm/vector."
+  "r9cHarnessContentAuthorityRef": "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7",
+  "targetedRevisionScope": ["C-03", "C-07", "C-08", "G4-07A", "G4-08A", "G4-08C-A1", "G4-08C-A3", "M-01..M-06", "M-07..M-10", "R-9A", "R-9C.1"],
+  "note": "Draft.11 remains the immutable accepted Gate 3 import. Draft.12 inserted Policy Decision Authority. Draft.13 added the independently rebuildable Harness Approval Read Model. Draft.14 added digest-addressed client and authorization profiles. Draft.15 froze the Memory/RAG Worker contract. Draft.16 froze governed Memory retrieval. Draft.17 added PrepareWork/ConfirmWork. Draft.18 froze additive Context revoke. Draft.19 closed complete R-9A with Scheme C validation and historical replay compatibility. Draft.20 freezes R9C-D01 through R9C-D12 plus phase-2-82 section 7: additive Harness content candidates and immutable route binding, deterministic disclosure profile, independent operation-record Local API, one read permission, bounded recovery/retention, and generated Rust/Python/TypeScript bindings. It authorizes no new Authority, send path, third database or retrospective content backfill."
 }

@@ -1,8 +1,8 @@
 {
   "schemaVersion": "v01-gate3-contract-candidate-manifest/v0.1",
   "candidateId": "v01-gate3-contracts",
-  "candidateVersion": "0.1.0-draft.19",
-  "status": "targeted_revision_r9a_complete_locally_verified",
+  "candidateVersion": "0.1.0-draft.20",
+  "status": "targeted_revision_r9c_contract_founder_frozen_locally_verified",
   "ssotRole": "implementation_contract_ssot",
   "featureId": "v01-governed-single-harness-work-loop",
   "architectureAuthorityRef": "conversation:2026-08-23:founder-v01-feature-adr-a01",
@@ -28,6 +28,7 @@
   "workPrepareConfirmAuthorityRef": "conversation:2026-08-28:founder-work-prepare-confirm-candidate",
   "contextRevokeLinearizationAuthorityRef": "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze",
   "contextRevokeSchemeCAuthorityRef": "conversation:2026-08-31:founder-r9a-gate11-scheme-c",
+  "r9cHarnessContentAuthorityRef": "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7",
   "implementationAuthorized": true,
   "handoffRule": {
     "gate": "Gate 4",
@@ -125,21 +126,29 @@
       "name": "Context Revoke Local API and Shared Semantic Confirmation",
       "status": "founder_confirmed_locally_verified",
       "founderDecisionRequired": true
+    },
+    {
+      "id": "R-9C.1",
+      "name": "Governed Harness Content Contract Truth",
+      "status": "founder_frozen_contract_locally_verified",
+      "founderDecisionRequired": true
     }
   ],
   "validation": {
     "localCandidateValidator": "scripts/validate-candidate.js",
-    "localCandidateStatus": "passed_184_domain_fixtures_plus_1_foundation_fixture",
-    "bufLint": "passed_buf_1.72.0_draft18_with_two_documented_rpc_naming_exceptions",
-    "bufBuild": "passed_draft18_proto_descriptor",
+    "localCandidateStatus": "passed_199_domain_fixtures_plus_1_foundation_fixture",
+    "bufLint": "passed_buf_1.72.0_draft20_with_documented_rpc_naming_exceptions",
+    "bufBuild": "passed_draft20_proto_descriptor",
     "bufBreaking": "passed_no_new_wire_breaks_against_draft13_and_exact_founder_authorized_two_field_breaks_against_draft11",
-    "protocCompile": "passed_libprotoc_35.1_draft18_eleven_v01_modules_plus_foundation",
-    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_draft18_eleven_v01_modules_plus_foundation",
+    "protocCompile": "passed_libprotoc_35.1_draft20_eleven_v01_modules_plus_foundation",
+    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_draft20_eleven_v01_modules_plus_foundation",
     "faultConformance": "passed_existing_real_process_and_sqlcipher_suite_plus_memory_retrieval_permission_scope_concurrency_crash_timeout_and_real_daemon_cli_tui_parity",
     "qualityBudgetProfile": "passed_33_d03_rules_exactly_once_with_gate3_design_gate6_verification_binding",
     "clientKernelProfile": "passed_versioned_surface_neutral_rust_shared_kernel_profile_with_context_revoke_confirmation",
     "authorizationCapabilityProfile": "passed_exact_permission_rpc_command_oneof_catalog_with_context_authority_binding",
     "contextRevokeSemanticProfile": "passed_exact_canonical_bytes_fixed_digest_scheme_c_and_historical_replay_fixture_matrix",
+    "harnessContentDisclosureProfile": "passed_exact_source_disclosure_limits_recovery_authorization_and_fixture_catalog",
+    "r9cContractGate": "passed_r9c_d01_d12_proto_profile_fixture_fixed_vectors_and_generated_bindings",
     "r9aAcceptanceGates": "passed_gate7_existing_adapter_receipt_and_task_run_step_attempt_unchanged_after_revoke;gate9_authorization_first_and_revoke_first_restart_paths_use_independent_external_side_effect_witness;gate10_context_paths_do_not_create_or_advance_founder_verdict;gate11_scheme_c_new_commit_validation_and_exact_historical_replay_zero_writes_with_changed_semantics_conflict"
   },
   "artifacts": [
@@ -181,7 +190,7 @@
     },
     {
       "path": "client-kernel-profile.schema.json",
-      "sha256": "80ae0d9aacc5d66c1d6202354e6f9952d4aa7acfc3d82613ca2b13359a1f6b5d"
+      "sha256": "307984c9a6a2f33e3e016ec8bdb7f4eef604b03026809ead43599b1562a3b0fe"
     },
     {
       "path": "collaboration-fixture-envelope.schema.json",
@@ -324,8 +333,24 @@
       "sha256": "c1caa64426a501f28cb724ed84993a71fa3717ecab25fbec0125abb5bc4f3985"
     },
     {
+      "path": "fixtures/harness/v1/duplicate-content-exact-replay.json",
+      "sha256": "181642073c126ea369b5053015d3738e6286b768c6716144bdf096cca43bafa6"
+    },
+    {
       "path": "fixtures/harness/v1/duplicate-observation-replay.json",
       "sha256": "8f2b9145239228045fdb3d92b3aee2ad99ef81711cfeae9e2e8128474f509247"
+    },
+    {
+      "path": "fixtures/harness/v1/invalid-content-forbidden-category.json",
+      "sha256": "5cbe3a3db88c178959b90f4758c6e4447b19440a036454dfa721d49c717e2012"
+    },
+    {
+      "path": "fixtures/harness/v1/invalid-content-revision-digest-drift.json",
+      "sha256": "6bb5cbaf1211ae00beebc87c217982441b669d16f737b4de004ea3a3ebab0061"
+    },
+    {
+      "path": "fixtures/harness/v1/invalid-content-source-binding-drift.json",
+      "sha256": "674d13f40c74597ec1a360c0037916aebf08bec3cda326614da26cf8ccfae5ce"
     },
     {
       "path": "fixtures/harness/v1/invalid-natural-language-completion.json",
@@ -377,15 +402,27 @@
     },
     {
       "path": "fixtures/harness/v1/valid-attest-codex-profile.json",
-      "sha256": "0e4424dcb4d33063cda86ac639756f6f9b377a5451c6d6a193bc6349ce3bb6e7"
+      "sha256": "5d42335b20b14330b8beb827c38e2903c051ddebfa6e3125a1a5486c7116559a"
+    },
+    {
+      "path": "fixtures/harness/v1/valid-content-append-not-context-bound.json",
+      "sha256": "7d06d253224a7ce663926ce2902adc345ce7c9965725ab46b07d397e6018a68c"
+    },
+    {
+      "path": "fixtures/harness/v1/valid-content-authorized-context.json",
+      "sha256": "cc4062cabd8667c7f7a7f1c246e5c35d31fa286a0d40227c97dfb1612d10f0fb"
     },
     {
       "path": "fixtures/harness/v1/valid-dispatch-delivery.json",
-      "sha256": "307c499c8147333edfed2783d6f5c716a03ead74f5e61285af109c899b48a520"
+      "sha256": "55b79f8e740bba9f62f88bb46fbe370f83c35985578a9bd547912316e3609656"
     },
     {
       "path": "fixtures/harness/v1/valid-governed-approval-decision.json",
       "sha256": "f58b9bdfd83841177f4076b1f5bb6f96af26ecfa92a944662faffc38da9557d4"
+    },
+    {
+      "path": "fixtures/harness/v1/valid-route-binding-no-catalog.json",
+      "sha256": "90f4fb063713d589a56afc6de0470403058e66e4c17c262098a854b1723b2f26"
     },
     {
       "path": "fixtures/harness/v1/valid-running-observation.json",
@@ -440,6 +477,10 @@
       "sha256": "c5a6fdf5004cb4ee0b8237752a0780735248bf8b930c81d06b59dd8c4632aaf2"
     },
     {
+      "path": "fixtures/localapi/v1/invalid-harness-content-frame-combination.json",
+      "sha256": "8e81b571b64c54e567762c97ab79c9357ec7d1aaf215f400c62120dab04f21e1"
+    },
+    {
       "path": "fixtures/localapi/v1/invalid-incoherent-source-vector.json",
       "sha256": "41f57384403e8fe37580e76652ddbfde73a3ac8cfbd72444ca0148a1dd8d9e41"
     },
@@ -472,6 +513,10 @@
       "sha256": "b89a0f9a2750197ce2f8283f64eb6ee90b04654fa269d4c5c3ad15cb0f202d62"
     },
     {
+      "path": "fixtures/localapi/v1/recovery-harness-content-retention-reset.json",
+      "sha256": "750c1b27e1a90188aa46edfe9c4f6e8d893c91f96cbaadfffb7283105feeaa8e"
+    },
+    {
       "path": "fixtures/localapi/v1/recovery-projector-rebuild-new-epoch.json",
       "sha256": "5483c4239b4737b747b5e5568114765d1e1bbd05ca69da22993d8b54e645e63e"
     },
@@ -486,6 +531,10 @@
     {
       "path": "fixtures/localapi/v1/stale-minimum-position-timeout.json",
       "sha256": "fff317041c5dafd8778803419510b0e051bede80920f5c8b57fb68dafe39361e"
+    },
+    {
+      "path": "fixtures/localapi/v1/unauthorized-harness-content-read.json",
+      "sha256": "08c8b1fe78cb920e57f33a22bb2101176b50c9047f503583d5ec395d37c7236b"
     },
     {
       "path": "fixtures/localapi/v1/unauthorized-model-founder-write.json",
@@ -544,6 +593,14 @@
       "sha256": "23a82d5c33aec4acc6c753ba42da6a3230206fc0870241dc667e80caa64f8bc7"
     },
     {
+      "path": "fixtures/localapi/v1/valid-harness-content-baseline.json",
+      "sha256": "bb1cc73b222e7a048e60d832555c278a822e3ad16ad8fc2d1f6dc3de669498b5"
+    },
+    {
+      "path": "fixtures/localapi/v1/valid-harness-content-watch.json",
+      "sha256": "9d730abbf2bfe5b7ef4184fabedaf35785785781bf378f5ef6e9ed3fa9579f45"
+    },
+    {
       "path": "fixtures/localapi/v1/valid-list-actionable-harness-approvals.json",
       "sha256": "75d9ecaaa8d04f4dcb2ef87f65fea3c7f1e25ae88ac850f6adc407d57ab7a364"
     },
@@ -553,7 +610,7 @@
     },
     {
       "path": "fixtures/localapi/v1/valid-open-desktop-session.json",
-      "sha256": "2eb5c6b2209c87a6fbb39bbf9b7eae49692ee56f3a7674990a21146f4239ee41"
+      "sha256": "e69d5908b58e18b67907647f515aacee2e29da256e255cd062758285ee23022a"
     },
     {
       "path": "fixtures/localapi/v1/valid-task-command-authority-result.json",
@@ -660,12 +717,24 @@
       "sha256": "6c31f60091d6182e7132dc27407d425f9ecbd0fd3b607b4b41e173866fa0b25d"
     },
     {
+      "path": "fixtures/persistence/v1/recovery-r9c-postwrite-forward-disable.json",
+      "sha256": "0978b545b37244aab5dd83d4c150ae277bad809a649249146bc805730cbd637a"
+    },
+    {
+      "path": "fixtures/persistence/v1/recovery-r9c-prewrite-migration-backup-restore.json",
+      "sha256": "0eeaff5165178e6385be84ce18b022e600c87346703734383307f38e633cecec"
+    },
+    {
       "path": "fixtures/persistence/v1/recovery-readmodel-checkpoint-gap-new-epoch.json",
       "sha256": "81ef10cdf9bc145a1847e68806a946e9ff9ffd7c2967314e7eb1a14951b8789c"
     },
     {
       "path": "fixtures/persistence/v1/recovery-restored-pending-outbox-delivered.json",
       "sha256": "13701050c0b8fcf9fb9d4a1a58ad8dbfc6e404c204e394949a58fa3a4fa2ea6c"
+    },
+    {
+      "path": "fixtures/persistence/v1/recovery-safe-content-outbox-after-consumer-commit.json",
+      "sha256": "3d6517da892f9d31f0d2cd4021d80e9bbbf68bd61f0a5680a30ed1a860eb8ed2"
     },
     {
       "path": "fixtures/persistence/v1/stale-backup-domain-watermark.json",
@@ -936,16 +1005,20 @@
       "sha256": "677d88b09c62f4ebeac20c182e63e4c379335b64c16504c62263dace18c2a8bc"
     },
     {
+      "path": "harness-content-disclosure-profile.schema.json",
+      "sha256": "8df2c25d19b57b622d7e8ab031c7600c09714ccd05937ff2d5cf68759fca7b9c"
+    },
+    {
       "path": "harness-fixture-envelope.schema.json",
       "sha256": "fd55cd3eefa3b2610473dfafc8a73d163a8fa12c3b6412fec552fa8e9829d6e0"
     },
     {
       "path": "IMPLEMENTATION-SSOT.json",
-      "sha256": "06aa6a2777245b72a2f3dc6c9783abc4ba4222326ff99243c02f982572c038de"
+      "sha256": "00c45d3284d165fba4f59c3f66f51764895127fda2cdb7c75d4ccdb536bb07db"
     },
     {
       "path": "IMPLEMENTATION-SSOT.md",
-      "sha256": "31ee6f406a7fa97b02e76e5ac9dae73780e38779f40d4dded8933f7eb077731c"
+      "sha256": "0096eb403acf6aa122924dda280dc5696ee824669803a0cbfd1458f5314200b6"
     },
     {
       "path": "json-schema/foundation-health.schema.json",
@@ -965,15 +1038,19 @@
     },
     {
       "path": "profiles/authorization/v1/v01-default.json",
-      "sha256": "e44e1cee143b35173372b75fa7ce4efb5732be58bb787d59e961450599d612ab"
+      "sha256": "948c2abb84cf7249dcff23213772cbc7aa136630a3b254aa592f8099223e58d2"
     },
     {
       "path": "profiles/client-kernel/v1/v01-default.json",
-      "sha256": "c729726c718a6f49c45e74a0f7435aa0974748661461f4be0e1315b838b17fa4"
+      "sha256": "10a0f4b05d2f799667c08af3514f855315076ac85785f59c81e1b9b60e2350e4"
     },
     {
       "path": "profiles/context-revoke/v1/v01-default.json",
       "sha256": "ee77f4894dfd64394f674d37634a29383bf453dc68494f3d75268e85df2590e4"
+    },
+    {
+      "path": "profiles/harness-content-disclosure/v1/v01-default.json",
+      "sha256": "f8eef240fdc258d3b71948cf8d9724ab46848a5b19846ab9382b505ff5563fdc"
     },
     {
       "path": "profiles/quality-budget/v1/v01-default.json",
@@ -997,11 +1074,11 @@
     },
     {
       "path": "proto/egopulse/harness/v1/harness.proto",
-      "sha256": "fc3d69093fd8e4eb93daa427ba217f5142d2c10f6c7938f9a4a2751b552462d8"
+      "sha256": "da7133aad7a981620e0c842b6d923bc30c2248997f55e0c53fd94aa377008a4c"
     },
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
-      "sha256": "d45d66f0f7d88e90630931204b57bd58c66e81271d3d87121790169fe29a49cc"
+      "sha256": "60bebde781107232f39bce625beaf4ecf86050c46dfbd70777d52a718dd85483"
     },
     {
       "path": "proto/egopulse/memory/v1/memory.proto",
@@ -1041,7 +1118,7 @@
     },
     {
       "path": "scripts/validate-candidate.js",
-      "sha256": "0cdab8a80f1f9dfb939c961230bcb53bbd70599bea4055f3468937f27cdb0376"
+      "sha256": "91a9406a13b98716533bac40079568703b025a54fda53943d354f22173a6ea95"
     },
     {
       "path": "scripts/verify-faults.ps1",

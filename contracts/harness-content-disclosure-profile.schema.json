@@ -1,0 +1,340 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://egopulse.local/contracts/harness-content-disclosure-profile/v0.1",
+  "title": "EgoPulse Harness Content Disclosure Profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "contractId",
+    "contractVersion",
+    "profileId",
+    "authorityRef",
+    "contractBindings",
+    "sourceAdmission",
+    "contentCategories",
+    "messageProtocol",
+    "canonicalEncoding",
+    "textSafety",
+    "managedCredentialRedaction",
+    "resourceLimits",
+    "recoveryAndRetention",
+    "authorization",
+    "fixtureRefs"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "egopulse.harness-content-disclosure-profile/v0.1" },
+    "contractId": { "const": "egopulse.harness-content-disclosure.v1" },
+    "contractVersion": { "const": "0.1.0" },
+    "profileId": { "type": "string", "minLength": 1 },
+    "authorityRef": { "type": "string", "minLength": 1 },
+    "contractBindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["harnessContractId", "localApiContractId", "capabilityField", "permissionCode"],
+      "properties": {
+        "harnessContractId": { "const": "egopulse.harness.v1" },
+        "localApiContractId": { "const": "egopulse.localapi.v1" },
+        "capabilityField": { "const": "governed_user_visible_content" },
+        "permissionCode": { "const": "local.harness.content.read" }
+      }
+    },
+    "sourceAdmission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requiredDeliveryDisposition", "candidateIdentitySource", "contextProofBranches", "missingRouteBinding", "legacyDispatch", "providerCapabilityRequired", "unknownOneof"],
+      "properties": {
+        "requiredDeliveryDisposition": { "const": "DELIVERY_DISPOSITION_DELIVERED" },
+        "candidateIdentitySource": { "const": "trusted_stores_only" },
+        "contextProofBranches": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "enum": ["NOT_CONTEXT_BOUND", "AUTHORIZED_CONTEXT"] }
+        },
+        "missingRouteBinding": { "const": "fail_closed_no_text_disclosure" },
+        "legacyDispatch": { "const": "never_backfill_from_current_configuration" },
+        "providerCapabilityRequired": { "const": true },
+        "unknownOneof": { "const": "fail_closed" }
+      }
+    },
+    "contentCategories": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "forbidden", "unknownCategory"],
+      "properties": {
+        "allowed": { "type": "array", "uniqueItems": true, "minItems": 9, "items": { "type": "string", "minLength": 1 } },
+        "forbidden": { "type": "array", "uniqueItems": true, "minItems": 20, "items": { "type": "string", "minLength": 1 } },
+        "unknownCategory": { "const": "blocked_marker_no_source_bytes" }
+      }
+    },
+    "messageProtocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operations", "revisionStartsAt", "sameRevisionSameDigest", "sameRevisionDifferentDigest", "revisionGap", "invalidPredecessor", "secondFinalize", "updateAfterFinalize", "replaceMatcherState", "finalizeMatcherState"],
+      "properties": {
+        "operations": { "type": "array", "uniqueItems": true, "minItems": 3, "maxItems": 3, "items": { "enum": ["APPEND", "REPLACE", "FINALIZE"] } },
+        "revisionStartsAt": { "const": 1 },
+        "sameRevisionSameDigest": { "const": "idempotent_no_op" },
+        "sameRevisionDifferentDigest": { "const": "quarantine_integrity_conflict" },
+        "revisionGap": { "const": "fail_closed" },
+        "invalidPredecessor": { "const": "fail_closed" },
+        "secondFinalize": { "const": "fail_closed" },
+        "updateAfterFinalize": { "const": "fail_closed" },
+        "replaceMatcherState": { "const": "reset_from_complete_replacement" },
+        "finalizeMatcherState": { "const": "flush_non_secret_suffix" }
+      }
+    },
+    "canonicalEncoding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digestAlgorithm", "digestOutput", "lengthPrefix", "integerEncoding", "signedIntegerEncoding", "uint32Encoding", "booleanEncoding", "stringEncoding", "enumEncoding", "optionalEncoding", "collectionEncoding", "timestampEncoding", "catalogSnapshotKinds", "contextProofCanonicalization", "candidatePayloadDiscriminators", "safePayloadDiscriminators", "projectionEventDiscriminators", "identifierFormats", "digestRules", "domainSeparators", "routeBindingFieldOrder", "textPayloadFieldOrder", "rawCumulativeFieldOrder", "safeCumulativeFieldOrder", "safeMessageIdFieldOrder", "textCandidateFieldOrder", "lifecycleCandidateFieldOrder", "usageCandidateFieldOrder", "approvalRequiredCandidateFieldOrder", "blockedSourceCandidateFieldOrder", "contentEventIdFieldOrder", "safeRecordIdFieldOrder", "safeRecordFieldOrder", "safeAssistantTextFieldOrder", "safeLifecycleFieldOrder", "safeUsageFieldOrder", "safeApprovalRequiredFieldOrder", "safeArtifactRelationFieldOrder", "safeMarkerFieldOrder", "historyCompactionRecordIdFieldOrder", "historyCompactionRecordFieldOrder", "retentionTombstoneIdFieldOrder", "retentionTombstoneFieldOrder", "credentialCommitmentFieldOrder"],
+      "properties": {
+        "digestAlgorithm": { "const": "SHA-256" },
+        "digestOutput": { "const": "lowercase_hex_64" },
+        "lengthPrefix": { "const": "u64_little_endian_byte_length" },
+        "integerEncoding": { "const": "u64_little_endian" },
+        "signedIntegerEncoding": { "const": "i64_little_endian" },
+        "uint32Encoding": { "const": "u32_little_endian" },
+        "booleanEncoding": { "const": "u64_little_endian_zero_or_one" },
+        "stringEncoding": { "const": "utf8_no_normalization" },
+        "enumEncoding": { "const": "canonical_short_name_utf8" },
+        "optionalEncoding": { "const": "presence_NONE_or_SOME_utf8_then_empty_or_encoded_value" },
+        "collectionEncoding": { "const": "count_u64_then_each_value_in_declared_order" },
+        "timestampEncoding": { "const": "seconds_i64_little_endian_then_nanos_u32_little_endian_each_framed" },
+        "catalogSnapshotKinds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["digest", "noCatalog", "noCatalogValue"],
+          "properties": {
+            "digest": { "const": "DIGEST" },
+            "noCatalog": { "const": "NO_CATALOG" },
+            "noCatalogValue": { "const": "" }
+          }
+        },
+        "contextProofCanonicalization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["notContextBoundBranch", "notContextBoundAuthorizationId", "notContextBoundRequestDigestSha256", "authorizedContextBranch", "authorizedContextRequiresAuthorizationId", "authorizedContextRequiresRequestDigestSha256"],
+          "properties": {
+            "notContextBoundBranch": { "const": "NOT_CONTEXT_BOUND" },
+            "notContextBoundAuthorizationId": { "const": "" },
+            "notContextBoundRequestDigestSha256": { "const": "" },
+            "authorizedContextBranch": { "const": "AUTHORIZED_CONTEXT" },
+            "authorizedContextRequiresAuthorizationId": { "const": true },
+            "authorizedContextRequiresRequestDigestSha256": { "const": true }
+          }
+        },
+        "candidatePayloadDiscriminators": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["assistantText", "lifecycle", "usage", "approvalRequired", "blockedSource"],
+          "properties": {
+            "assistantText": { "const": "ASSISTANT_TEXT" },
+            "lifecycle": { "const": "LIFECYCLE" },
+            "usage": { "const": "USAGE" },
+            "approvalRequired": { "const": "APPROVAL_REQUIRED" },
+            "blockedSource": { "const": "BLOCKED_SOURCE" }
+          }
+        },
+        "safePayloadDiscriminators": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["assistantText", "lifecycle", "usage", "approvalRequired", "artifactRelation", "marker"],
+          "properties": {
+            "assistantText": { "const": "ASSISTANT_TEXT" },
+            "lifecycle": { "const": "LIFECYCLE" },
+            "usage": { "const": "USAGE" },
+            "approvalRequired": { "const": "APPROVAL_REQUIRED" },
+            "artifactRelation": { "const": "ARTIFACT_RELATION" },
+            "marker": { "const": "MARKER" }
+          }
+        },
+        "projectionEventDiscriminators": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["contentRecord", "historyCompaction", "retentionTombstone"],
+          "properties": {
+            "contentRecord": { "const": "CONTENT_RECORD" },
+            "historyCompaction": { "const": "HISTORY_COMPACTION" },
+            "retentionTombstone": { "const": "RETENTION_TOMBSTONE" }
+          }
+        },
+        "identifierFormats": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["safeMessageId", "safeRecordId", "historyCompactionRecordId", "retentionTombstoneId"],
+          "properties": {
+            "safeMessageId": { "const": "hcm_<lowercase_hex_64>" },
+            "safeRecordId": { "const": "hcr_<lowercase_hex_64>" },
+            "historyCompactionRecordId": { "const": "hcc_<lowercase_hex_64>" },
+            "retentionTombstoneId": { "const": "hrt_<lowercase_hex_64>" }
+          }
+        },
+        "digestRules": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["candidateDigest", "safePayloadDigest", "safeRecordDigest", "historyCompactionDigest", "retentionTombstoneDigest", "safetyFlags", "nonTextPartIndexForRecordId"],
+          "properties": {
+            "candidateDigest": { "const": "sha256_of_selected_candidate_payload_canonical_bytes" },
+            "safePayloadDigest": { "const": "sha256_of_selected_safe_payload_canonical_bytes" },
+            "safeRecordDigest": { "const": "sha256_of_safe_record_canonical_bytes_excluding_record_digest_sha256" },
+            "historyCompactionDigest": { "const": "sha256_of_history_compaction_canonical_bytes_excluding_compaction_record_digest_sha256" },
+            "retentionTombstoneDigest": { "const": "sha256_of_retention_tombstone_canonical_bytes_excluding_tombstone_digest_sha256" },
+            "safetyFlags": { "const": "ascending_numeric_unique" },
+            "nonTextPartIndexForRecordId": { "const": 0 }
+          }
+        },
+        "domainSeparators": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["routeBinding", "textPayload", "rawCumulative", "safeCumulative", "safeMessageId", "textCandidate", "lifecycleCandidate", "usageCandidate", "approvalRequiredCandidate", "blockedSourceCandidate", "contentEvent", "safeRecordId", "safeRecord", "safeAssistantText", "safeLifecycle", "safeUsage", "safeApprovalRequired", "safeArtifactRelation", "safeMarker", "historyCompactionRecordId", "historyCompactionRecord", "retentionTombstoneId", "retentionTombstone", "credentialCommitment"],
+          "properties": {
+            "routeBinding": { "const": "egopulse/harness-content/route-binding/v1" },
+            "textPayload": { "const": "egopulse/harness-content/text-payload/v1" },
+            "rawCumulative": { "const": "egopulse/harness-content/raw-cumulative/v1" },
+            "safeCumulative": { "const": "egopulse/harness-content/safe-cumulative/v1" },
+            "safeMessageId": { "const": "egopulse/harness-content/safe-message-id/v1" },
+            "textCandidate": { "const": "egopulse/harness-content/text-candidate/v1" },
+            "lifecycleCandidate": { "const": "egopulse/harness-content/lifecycle-candidate/v1" },
+            "usageCandidate": { "const": "egopulse/harness-content/usage-candidate/v1" },
+            "approvalRequiredCandidate": { "const": "egopulse/harness-content/approval-required-candidate/v1" },
+            "blockedSourceCandidate": { "const": "egopulse/harness-content/blocked-source-candidate/v1" },
+            "contentEvent": { "const": "egopulse/harness-content/event/v1" },
+            "safeRecordId": { "const": "egopulse/harness-content/safe-record-id/v1" },
+            "safeRecord": { "const": "egopulse/harness-content/safe-record/v1" },
+            "safeAssistantText": { "const": "egopulse/harness-content/safe-assistant-text/v1" },
+            "safeLifecycle": { "const": "egopulse/harness-content/safe-lifecycle/v1" },
+            "safeUsage": { "const": "egopulse/harness-content/safe-usage/v1" },
+            "safeApprovalRequired": { "const": "egopulse/harness-content/safe-approval-required/v1" },
+            "safeArtifactRelation": { "const": "egopulse/harness-content/safe-artifact-relation/v1" },
+            "safeMarker": { "const": "egopulse/harness-content/safe-marker/v1" },
+            "historyCompactionRecordId": { "const": "egopulse/harness-content/history-compaction-id/v1" },
+            "historyCompactionRecord": { "const": "egopulse/harness-content/history-compaction/v1" },
+            "retentionTombstoneId": { "const": "egopulse/harness-content/retention-tombstone-id/v1" },
+            "retentionTombstone": { "const": "egopulse/harness-content/retention-tombstone/v1" },
+            "credentialCommitment": { "const": "egopulse/harness-content/credential-set/v1" }
+          }
+        },
+        "routeBindingFieldOrder": { "type": "array", "minItems": 7, "maxItems": 7, "uniqueItems": true, "items": { "type": "string" } },
+        "textPayloadFieldOrder": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "type": "string" } },
+        "rawCumulativeFieldOrder": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "type": "string" } },
+        "safeCumulativeFieldOrder": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "type": "string" } },
+        "safeMessageIdFieldOrder": { "type": "array", "minItems": 5, "maxItems": 5, "uniqueItems": true, "items": { "type": "string" } },
+        "textCandidateFieldOrder": { "type": "array", "minItems": 9, "maxItems": 9, "uniqueItems": true, "items": { "type": "string" } },
+        "lifecycleCandidateFieldOrder": { "type": "array", "minItems": 5, "maxItems": 5, "uniqueItems": true, "items": { "type": "string" } },
+        "usageCandidateFieldOrder": { "type": "array", "minItems": 5, "maxItems": 5, "uniqueItems": true, "items": { "type": "string" } },
+        "approvalRequiredCandidateFieldOrder": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+        "blockedSourceCandidateFieldOrder": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "type": "string" } },
+        "contentEventIdFieldOrder": { "type": "array", "minItems": 15, "maxItems": 15, "uniqueItems": true, "items": { "type": "string" } },
+        "safeRecordIdFieldOrder": { "type": "array", "minItems": 7, "maxItems": 7, "uniqueItems": true, "items": { "type": "string" } },
+        "safeRecordFieldOrder": { "type": "array", "minItems": 20, "maxItems": 20, "uniqueItems": true, "items": { "type": "string" } },
+        "safeAssistantTextFieldOrder": { "type": "array", "minItems": 9, "maxItems": 9, "uniqueItems": true, "items": { "type": "string" } },
+        "safeLifecycleFieldOrder": { "type": "array", "minItems": 5, "maxItems": 5, "uniqueItems": true, "items": { "type": "string" } },
+        "safeUsageFieldOrder": { "type": "array", "minItems": 5, "maxItems": 5, "uniqueItems": true, "items": { "type": "string" } },
+        "safeApprovalRequiredFieldOrder": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "type": "string" } },
+        "safeArtifactRelationFieldOrder": { "type": "array", "minItems": 4, "maxItems": 4, "uniqueItems": true, "items": { "type": "string" } },
+        "safeMarkerFieldOrder": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "type": "string" } },
+        "historyCompactionRecordIdFieldOrder": { "type": "array", "minItems": 7, "maxItems": 7, "uniqueItems": true, "items": { "type": "string" } },
+        "historyCompactionRecordFieldOrder": { "type": "array", "minItems": 14, "maxItems": 14, "uniqueItems": true, "items": { "type": "string" } },
+        "retentionTombstoneIdFieldOrder": { "type": "array", "minItems": 7, "maxItems": 7, "uniqueItems": true, "items": { "type": "string" } },
+        "retentionTombstoneFieldOrder": { "type": "array", "minItems": 15, "maxItems": 15, "uniqueItems": true, "items": { "type": "string" } },
+        "credentialCommitmentFieldOrder": { "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true, "items": { "type": "string" } }
+      }
+    },
+    "textSafety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["invalidUtf8", "newlineNormalization", "tabReplacementSpaces", "unicodeLineSeparatorsToLf", "replacementScalar", "c0Allowed", "replaceDel", "replaceC1", "bidiControlScalars", "ansiInterpretation"],
+      "properties": {
+        "invalidUtf8": { "const": "INVALID_TEXT_marker_no_text" },
+        "newlineNormalization": { "const": "crlf_and_cr_to_lf" },
+        "tabReplacementSpaces": { "const": 4 },
+        "unicodeLineSeparatorsToLf": { "type": "array", "uniqueItems": true, "minItems": 2, "maxItems": 2, "items": { "enum": ["U+2028", "U+2029"] } },
+        "replacementScalar": { "const": "U+FFFD" },
+        "c0Allowed": { "type": "array", "minItems": 1, "maxItems": 1, "items": { "const": "LF" } },
+        "replaceDel": { "const": true },
+        "replaceC1": { "const": true },
+        "bidiControlScalars": { "type": "array", "uniqueItems": true, "minItems": 4, "items": { "type": "string" } },
+        "ansiInterpretation": { "const": "forbidden" }
+      }
+    },
+    "managedCredentialRedaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credentialMode", "maxNonEmptyValues", "maxValueBytes", "valueEncoding", "variants", "maxEncodedPatternBytes", "maxWithheldSuffixBytes", "matcher", "commitment", "persistedSecretMaterial", "oversizeBehavior", "restartMismatchBehavior", "harnessAccountGuarantee"],
+      "properties": {
+        "credentialMode": { "const": "api_key_environment" },
+        "maxNonEmptyValues": { "const": 32 },
+        "maxValueBytes": { "const": 1024 },
+        "valueEncoding": { "const": "printable_ascii" },
+        "variants": { "type": "array", "uniqueItems": true, "minItems": 7, "items": { "type": "string", "minLength": 1 } },
+        "maxEncodedPatternBytes": { "const": 3072 },
+        "maxWithheldSuffixBytes": { "const": 3071 },
+        "matcher": { "const": "deterministic_streaming_multi_pattern_longest_match" },
+        "commitment": { "const": "domain_separated_hmac_sha256_from_adapter_store_key" },
+        "persistedSecretMaterial": { "const": "commitment_only" },
+        "oversizeBehavior": { "const": "structured_only_attempt_execution_continues" },
+        "restartMismatchBehavior": { "const": "REDACTION_INPUT_UNAVAILABLE_then_structured_only" },
+        "harnessAccountGuarantee": { "const": "forbidden_source_and_daemon_managed_secret_bytes_only" }
+      }
+    },
+    "resourceLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidateTextBytes", "safePartBytes", "serializedFrameBytes", "attemptSafeTextBytes", "attemptSafeRecords", "taskSafeTextBytes", "taskSafeRecords", "baselinePageRecords", "baselinePageTextBytes", "reservedFinalRecordSlot", "byteAccounting", "paginationWholeRecordsOnly"],
+      "properties": {
+        "candidateTextBytes": { "const": 65536 },
+        "safePartBytes": { "const": 65536 },
+        "serializedFrameBytes": { "const": 81920 },
+        "attemptSafeTextBytes": { "const": 16777216 },
+        "attemptSafeRecords": { "const": 16384 },
+        "taskSafeTextBytes": { "const": 67108864 },
+        "taskSafeRecords": { "const": 65536 },
+        "baselinePageRecords": { "const": 256 },
+        "baselinePageTextBytes": { "const": 1048576 },
+        "reservedFinalRecordSlot": { "const": "LIMIT_REACHED" },
+        "byteAccounting": { "const": "safe_normalized_redacted_utf8_before_proto" },
+        "paginationWholeRecordsOnly": { "const": true }
+      }
+    },
+    "recoveryAndRetention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projectionDomain", "delivery", "stableIdentity", "rebuildSource", "rerunRedactionOnReplay", "profileChange", "minimumSecondsAfterTaskTerminal", "compaction", "tombstonePreventsResurrection", "unknownGap"],
+      "properties": {
+        "projectionDomain": { "const": "independent_harness_content" },
+        "delivery": { "const": "at_least_once_idempotent" },
+        "stableIdentity": { "const": "content_event_id_and_record_digest" },
+        "rebuildSource": { "const": "adapter_safe_ledger_or_owner_snapshot_only" },
+        "rerunRedactionOnReplay": { "const": false },
+        "profileChange": { "const": "new_epoch_reset_old_text_excluded_history_unavailable_tombstone" },
+        "minimumSecondsAfterTaskTerminal": { "const": 2592000 },
+        "compaction": { "const": "owner_snapshot_floor_delete_and_typed_record_atomic" },
+        "tombstonePreventsResurrection": { "const": true },
+        "unknownGap": { "const": "ResetRequired" }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["permissionCode", "scopeSource", "revalidateAfterSendReservation", "maxFramesInFlight", "postChangeExposureFrames", "artifactIdentityPermissionCode", "failureIsolation"],
+      "properties": {
+        "permissionCode": { "const": "local.harness.content.read" },
+        "scopeSource": { "const": "trusted_task_and_attempt_lineage" },
+        "revalidateAfterSendReservation": { "const": true },
+        "maxFramesInFlight": { "const": 1 },
+        "postChangeExposureFrames": { "const": 1 },
+        "artifactIdentityPermissionCode": { "const": "local.evidence.read" },
+        "failureIsolation": { "const": "content_domain_only" }
+      }
+    },
+    "fixtureRefs": {
+      "type": "array",
+      "uniqueItems": true,
+      "minItems": 9,
+      "items": { "type": "string", "minLength": 1 }
+    }
+  }
+}
