@@ -214,11 +214,12 @@ CREATE TABLE harness_content_inbox (
 CREATE TABLE harness_content_records (
   content_sequence INTEGER PRIMARY KEY CHECK (content_sequence >= 1),
   record_id TEXT NOT NULL UNIQUE,
-  content_event_id TEXT NOT NULL UNIQUE,
+  content_event_id TEXT NOT NULL,
   record_digest_sha256 TEXT NOT NULL,
   delivery_payload_digest_sha256 TEXT NOT NULL,
   task_id TEXT NOT NULL,
   attempt_id TEXT NOT NULL,
+  limit_kind INTEGER NOT NULL CHECK (limit_kind >= 0 AND limit_kind <= 4),
   disclosure_contract_id TEXT NOT NULL,
   disclosure_contract_version TEXT NOT NULL,
   disclosure_profile_sha256 TEXT NOT NULL,
@@ -232,6 +233,8 @@ CREATE INDEX harness_content_records_task_sequence_idx
   ON harness_content_records(task_id, content_sequence);
 CREATE INDEX harness_content_records_attempt_sequence_idx
   ON harness_content_records(attempt_id, content_sequence);
+CREATE INDEX harness_content_records_event_sequence_idx
+  ON harness_content_records(content_event_id, content_sequence);
 CREATE TABLE harness_content_owner_baselines (
   owner_snapshot_digest_sha256 TEXT PRIMARY KEY,
   task_id TEXT NOT NULL,

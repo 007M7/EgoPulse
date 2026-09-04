@@ -8,6 +8,9 @@
 use std::collections::BTreeSet;
 
 use egopulse_domain_contracts::{
+    harness_content::{
+        canonical_safe_harness_content_record_digest, canonical_safe_harness_content_record_id,
+    },
     profiles::{
         ContractProfiles, HARNESS_CONTENT_DISCLOSURE_CONTRACT_ID,
         HARNESS_CONTENT_DISCLOSURE_CONTRACT_VERSION,
@@ -16,9 +19,9 @@ use egopulse_domain_contracts::{
     v01::egopulse::{
         common::v1::ContractReference,
         harness::v1::{
-            ContentMutationOperation, HarnessContentMarkerKind, HarnessContentSafetyFlag,
-            LifecycleKind, SafeHarnessContentProjectionEvent, SafeHarnessContentRecord,
-            SideEffectCertainty, safe_harness_content_projection_event,
+            ContentMutationOperation, HarnessContentLimitKind, HarnessContentMarkerKind,
+            HarnessContentSafetyFlag, LifecycleKind, SafeHarnessContentProjectionEvent,
+            SafeHarnessContentRecord, SideEffectCertainty, safe_harness_content_projection_event,
             safe_harness_content_record,
         },
         localapi::v1::{
@@ -212,7 +215,14 @@ impl LocalReadModel {
             ) => return Err(ProjectionFailure::ContentOwnerSnapshotRequired),
             None => return Err(ProjectionFailure::InvalidMessage),
         };
-        let safe_text_bytes = validate_safe_record(record)?;
+        let safe_text_bytes = match validate_safe_record(record) {
+            Ok(value) => value,
+            Err(ProjectionFailure::IntegrityFailure) => {
+                mark_content_integrity_failed(&self.connection)?;
+                return Err(ProjectionFailure::IntegrityFailure);
+            }
+            Err(error) => return Err(error),
+        };
 
         let result = {
             let transaction = self
@@ -601,16 +611,16 @@ fn apply_content_record_transaction(
         return replay_or_conflict(
             existing,
             CONTENT_EVENT_KIND_RECORD,
-            &record.content_event_id,
+            &record.record_id,
             &record.record_digest_sha256,
             &input.payload_digest_sha256,
         );
     }
-    if let Some(existing) = inbox_by_owner_event(transaction, &record.content_event_id)? {
+    if let Some(existing) = inbox_by_owner_event(transaction, &record.record_id)? {
         return replay_or_conflict(
             existing,
             CONTENT_EVENT_KIND_RECORD,
-            &record.content_event_id,
+            &record.record_id,
             &record.record_digest_sha256,
             &input.payload_digest_sha256,
         );
@@ -635,6 +645,8 @@ fn apply_content_record_transaction(
     if tombstoned {
         return Err(ProjectionFailure::IntegrityFailure);
     }
+    enforce_not_after_terminal_limit(transaction, record)?;
+    enforce_content_event_group(transaction, record)?;
     enforce_content_budget(transaction, record, safe_text_bytes)?;
     let sequence = next_content_sequence(transaction, &input.projected_at)?;
     let profile = record
@@ -644,11 +656,11 @@ fn apply_content_record_transaction(
     transaction.execute(
         "INSERT INTO harness_content_records(
            content_sequence,record_id,content_event_id,record_digest_sha256,
-           delivery_payload_digest_sha256,task_id,attempt_id,
+           delivery_payload_digest_sha256,task_id,attempt_id,limit_kind,
            disclosure_contract_id,disclosure_contract_version,
            disclosure_profile_sha256,safe_text_bytes,projected_at_seconds,
            projected_at_nanos,safe_record
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![
             sequence as i64,
             record.record_id,
@@ -657,6 +669,7 @@ fn apply_content_record_transaction(
             input.payload_digest_sha256,
             record.task_id,
             record.attempt_id,
+            content_limit_kind(record)? as i32,
             profile.contract_id,
             profile.version,
             profile.sha256,
@@ -675,7 +688,7 @@ fn apply_content_record_transaction(
         params![
             input.delivery_id,
             CONTENT_EVENT_KIND_RECORD,
-            record.content_event_id,
+            record.record_id,
             record.record_digest_sha256,
             input.payload_digest_sha256,
             sequence as i64,
@@ -688,6 +701,112 @@ fn apply_content_record_transaction(
         return Err(ProjectionFailure::IntegrityFailure);
     }
     Ok(ApplyTransaction::Committed { sequence })
+}
+
+fn enforce_content_event_group(
+    transaction: &Transaction<'_>,
+    record: &SafeHarnessContentRecord,
+) -> Result<(), ProjectionFailure> {
+    let existing_count: i64 = transaction.query_row(
+        "SELECT count(*) FROM harness_content_records WHERE content_event_id=?1",
+        [&record.content_event_id],
+        |row| row.get(0),
+    )?;
+    if existing_count < 0 {
+        return Err(ProjectionFailure::IntegrityFailure);
+    }
+    let incoming_text = match record.payload.as_ref() {
+        Some(safe_harness_content_record::Payload::AssistantText(value)) => Some(value),
+        _ => None,
+    };
+    let incoming_limit_marker = matches!(
+        record.payload.as_ref(),
+        Some(safe_harness_content_record::Payload::Marker(_))
+    ) && content_limit_kind(record)?
+        != HarnessContentLimitKind::Unspecified;
+    if existing_count == 0 {
+        if incoming_text.is_some_and(|value| value.part_index != 0) {
+            return Err(ProjectionFailure::IntegrityFailure);
+        }
+        return Ok(());
+    }
+    let previous_bytes: Vec<u8> = transaction.query_row(
+        "SELECT safe_record FROM harness_content_records
+         WHERE content_event_id=?1 ORDER BY content_sequence DESC LIMIT 1",
+        [&record.content_event_id],
+        |row| row.get(0),
+    )?;
+    let previous = SafeHarnessContentRecord::decode(previous_bytes.as_slice())
+        .map_err(|_| ProjectionFailure::IntegrityFailure)?;
+    validate_safe_record(&previous).map_err(|_| ProjectionFailure::IntegrityFailure)?;
+    let Some(safe_harness_content_record::Payload::AssistantText(previous_text)) =
+        previous.payload.as_ref()
+    else {
+        return Err(ProjectionFailure::IntegrityFailure);
+    };
+    if record.task_id != previous.task_id
+        || record.run_id != previous.run_id
+        || record.step_id != previous.step_id
+        || record.attempt_id != previous.attempt_id
+        || record.dispatch_id != previous.dispatch_id
+        || record.fencing_token != previous.fencing_token
+        || record.route_binding_sha256 != previous.route_binding_sha256
+        || record.disclosure_profile_ref != previous.disclosure_profile_ref
+        || record.provider_family_alias != previous.provider_family_alias
+        || record.model_alias != previous.model_alias
+        || record.collaboration_role != previous.collaboration_role
+    {
+        return Err(ProjectionFailure::IntegrityFailure);
+    }
+    if incoming_limit_marker {
+        return Ok(());
+    }
+    let Some(incoming_text) = incoming_text else {
+        return Err(ProjectionFailure::IntegrityFailure);
+    };
+    let expected_part_index =
+        u32::try_from(existing_count).map_err(|_| ProjectionFailure::IntegrityFailure)?;
+    if incoming_text.part_index != expected_part_index
+        || incoming_text.part_count != previous_text.part_count
+        || incoming_text.safe_message_id != previous_text.safe_message_id
+        || incoming_text.revision != previous_text.revision
+        || incoming_text.previous_revision != previous_text.previous_revision
+        || incoming_text.operation != previous_text.operation
+        || incoming_text.safe_cumulative_digest_sha256
+            != previous_text.safe_cumulative_digest_sha256
+        || record.safety_flags != previous.safety_flags
+    {
+        return Err(ProjectionFailure::IntegrityFailure);
+    }
+    Ok(())
+}
+
+fn enforce_not_after_terminal_limit(
+    transaction: &Transaction<'_>,
+    record: &SafeHarnessContentRecord,
+) -> Result<(), ProjectionFailure> {
+    let terminal_exists: bool = transaction.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM harness_content_records
+           WHERE task_id=?1 AND (
+             limit_kind IN (?3,?4)
+             OR (attempt_id=?2 AND limit_kind IN (?5,?6))
+           )
+         )",
+        params![
+            record.task_id,
+            record.attempt_id,
+            HarnessContentLimitKind::TaskRecords as i32,
+            HarnessContentLimitKind::TaskTextBytes as i32,
+            HarnessContentLimitKind::AttemptRecords as i32,
+            HarnessContentLimitKind::AttemptTextBytes as i32,
+        ],
+        |row| row.get(0),
+    )?;
+    if terminal_exists {
+        return Err(ProjectionFailure::IntegrityFailure);
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -805,18 +924,76 @@ fn enforce_content_budget(
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let safe_text_bytes = safe_text_bytes as u64;
+    let limit_marker = content_limit_kind(record)? != HarnessContentLimitKind::Unspecified;
     if attempt_records < 0
         || attempt_bytes < 0
         || task_records < 0
         || task_bytes < 0
-        || attempt_records as u64 + 1 > MAX_ATTEMPT_SAFE_RECORDS
-        || task_records as u64 + 1 > MAX_TASK_SAFE_RECORDS
-        || (attempt_bytes as u64).saturating_add(safe_text_bytes) > MAX_ATTEMPT_SAFE_TEXT_BYTES
-        || (task_bytes as u64).saturating_add(safe_text_bytes) > MAX_TASK_SAFE_TEXT_BYTES
+        || !content_budget_allows(
+            attempt_records as u64,
+            attempt_bytes as u64,
+            task_records as u64,
+            task_bytes as u64,
+            safe_text_bytes,
+            limit_marker,
+        )
     {
         return Err(ProjectionFailure::IntegrityFailure);
     }
     Ok(())
+}
+
+fn content_limit_kind(
+    record: &SafeHarnessContentRecord,
+) -> Result<HarnessContentLimitKind, ProjectionFailure> {
+    let Some(safe_harness_content_record::Payload::Marker(marker)) = record.payload.as_ref() else {
+        return Ok(HarnessContentLimitKind::Unspecified);
+    };
+    let marker_kind = HarnessContentMarkerKind::try_from(marker.kind)
+        .map_err(|_| ProjectionFailure::IntegrityFailure)?;
+    let limit_kind = HarnessContentLimitKind::try_from(marker.limit_kind)
+        .map_err(|_| ProjectionFailure::IntegrityFailure)?;
+    if (marker_kind == HarnessContentMarkerKind::LimitReached
+        && limit_kind == HarnessContentLimitKind::Unspecified)
+        || (marker_kind != HarnessContentMarkerKind::LimitReached
+            && limit_kind != HarnessContentLimitKind::Unspecified)
+    {
+        Err(ProjectionFailure::IntegrityFailure)
+    } else {
+        Ok(limit_kind)
+    }
+}
+
+fn content_budget_allows(
+    attempt_records: u64,
+    attempt_bytes: u64,
+    task_records: u64,
+    task_bytes: u64,
+    incoming_safe_text_bytes: u64,
+    limit_marker: bool,
+) -> bool {
+    let attempt_record_limit = if limit_marker {
+        MAX_ATTEMPT_SAFE_RECORDS
+    } else {
+        MAX_ATTEMPT_SAFE_RECORDS - 1
+    };
+    let task_record_limit = if limit_marker {
+        MAX_TASK_SAFE_RECORDS
+    } else {
+        MAX_TASK_SAFE_RECORDS - 1
+    };
+    attempt_records
+        .checked_add(1)
+        .is_some_and(|value| value <= attempt_record_limit)
+        && task_records
+            .checked_add(1)
+            .is_some_and(|value| value <= task_record_limit)
+        && attempt_bytes
+            .checked_add(incoming_safe_text_bytes)
+            .is_some_and(|value| value <= MAX_ATTEMPT_SAFE_TEXT_BYTES)
+        && task_bytes
+            .checked_add(incoming_safe_text_bytes)
+            .is_some_and(|value| value <= MAX_TASK_SAFE_TEXT_BYTES)
 }
 
 fn content_position_at_connection(
@@ -868,6 +1045,13 @@ fn validate_safe_record(record: &SafeHarnessContentRecord) -> Result<usize, Proj
         return Err(ProjectionFailure::InvalidMessage);
     }
     validate_profile_ref(record.disclosure_profile_ref.as_ref())?;
+    if canonical_safe_harness_content_record_id(record).as_deref()
+        != Some(record.record_id.as_str())
+        || canonical_safe_harness_content_record_digest(record).as_deref()
+            != Some(record.record_digest_sha256.as_str())
+    {
+        return Err(ProjectionFailure::IntegrityFailure);
+    }
     let mut previous = None;
     for value in &record.safety_flags {
         let flag = HarnessContentSafetyFlag::try_from(*value)
@@ -1111,6 +1295,7 @@ fn safe_record_to_view(
         Some(safe_harness_content_record::Payload::Marker(value)) => {
             harness_content_record_view::Payload::Marker(HarnessContentMarkerView {
                 kind: value.kind,
+                limit_kind: value.limit_kind,
             })
         }
         None => return Err(ProjectionFailure::IntegrityFailure),
@@ -1183,4 +1368,89 @@ fn is_sha256(value: &str) -> bool {
 
 fn is_prefixed_sha256(value: &str, prefix: &str) -> bool {
     value.strip_prefix(prefix).is_some_and(is_sha256)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limit_marker_owns_the_reserved_attempt_and_task_record_slots() {
+        assert!(content_budget_allows(
+            MAX_ATTEMPT_SAFE_RECORDS - 2,
+            MAX_ATTEMPT_SAFE_TEXT_BYTES,
+            MAX_TASK_SAFE_RECORDS - 2,
+            MAX_TASK_SAFE_TEXT_BYTES,
+            0,
+            false,
+        ));
+        assert!(!content_budget_allows(
+            MAX_ATTEMPT_SAFE_RECORDS - 1,
+            0,
+            0,
+            0,
+            0,
+            false,
+        ));
+        assert!(!content_budget_allows(
+            0,
+            0,
+            MAX_TASK_SAFE_RECORDS - 1,
+            0,
+            0,
+            false,
+        ));
+        assert!(content_budget_allows(
+            MAX_ATTEMPT_SAFE_RECORDS - 1,
+            MAX_ATTEMPT_SAFE_TEXT_BYTES,
+            MAX_TASK_SAFE_RECORDS - 1,
+            MAX_TASK_SAFE_TEXT_BYTES,
+            0,
+            true,
+        ));
+        assert!(!content_budget_allows(
+            MAX_ATTEMPT_SAFE_RECORDS,
+            0,
+            0,
+            0,
+            0,
+            true,
+        ));
+        assert!(!content_budget_allows(
+            0,
+            0,
+            MAX_TASK_SAFE_RECORDS,
+            0,
+            0,
+            true,
+        ));
+    }
+
+    #[test]
+    fn safe_text_byte_budgets_accept_exact_and_reject_plus_one() {
+        assert!(content_budget_allows(
+            0,
+            MAX_ATTEMPT_SAFE_TEXT_BYTES - 1,
+            0,
+            MAX_TASK_SAFE_TEXT_BYTES - 1,
+            1,
+            false,
+        ));
+        assert!(!content_budget_allows(
+            0,
+            MAX_ATTEMPT_SAFE_TEXT_BYTES,
+            0,
+            0,
+            1,
+            false,
+        ));
+        assert!(!content_budget_allows(
+            0,
+            0,
+            0,
+            MAX_TASK_SAFE_TEXT_BYTES,
+            1,
+            false,
+        ));
+    }
 }

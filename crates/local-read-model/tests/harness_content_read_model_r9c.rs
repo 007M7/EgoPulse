@@ -1,6 +1,9 @@
 use std::{fs, path::PathBuf};
 
 use egopulse_domain_contracts::{
+    harness_content::{
+        canonical_safe_harness_content_record_digest, canonical_safe_harness_content_record_id,
+    },
     profiles::{
         HARNESS_CONTENT_DISCLOSURE_CONTRACT_ID, HARNESS_CONTENT_DISCLOSURE_CONTRACT_VERSION,
         HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256,
@@ -14,8 +17,9 @@ use egopulse_domain_contracts::{
         harness::v1::{
             ApprovalKind, ApprovalRequestLifecycleKind, ApprovalRequestObservation,
             ContentMutationOperation, HarnessContentHistoryCompactionRecord,
-            HarnessContentRetentionTombstone, HarnessContentSafetyFlag, HarnessObservation,
-            SafeArtifactIdentity, SafeArtifactRelationContent, SafeAssistantTextContent,
+            HarnessContentLimitKind, HarnessContentMarkerKind, HarnessContentRetentionTombstone,
+            HarnessContentSafetyFlag, HarnessObservation, SafeArtifactIdentity,
+            SafeArtifactRelationContent, SafeAssistantTextContent, SafeContentMarker,
             SafeHarnessContentProjectionEvent, SafeHarnessContentRecord, SafeUsageContent,
             harness_observation, safe_harness_content_projection_event,
             safe_harness_content_record,
@@ -275,9 +279,9 @@ fn record(
     attempt_id: &str,
     payload: safe_harness_content_record::Payload,
 ) -> SafeHarnessContentRecord {
-    SafeHarnessContentRecord {
-        record_id: format!("hcr_{}", sha256(format!("record-id-{id}"))),
-        record_digest_sha256: sha256(format!("record-digest-{id}")),
+    let mut record = SafeHarnessContentRecord {
+        record_id: String::new(),
+        record_digest_sha256: String::new(),
         content_event_id: sha256(format!("content-event-{id}")),
         task_id: task_id.to_owned(),
         run_id: format!("run-canary-{id}"),
@@ -292,7 +296,18 @@ fn record(
         collaboration_role: "primary".to_owned(),
         safety_flags: vec![HarnessContentSafetyFlag::Provisional as i32],
         payload: Some(payload),
-    }
+    };
+    seal_record(&mut record);
+    record
+}
+
+fn seal_record(record: &mut SafeHarnessContentRecord) {
+    record.record_id.clear();
+    record.record_digest_sha256.clear();
+    record.record_id = canonical_safe_harness_content_record_id(record)
+        .expect("fixture has canonical safe-record identity");
+    record.record_digest_sha256 = canonical_safe_harness_content_record_digest(record)
+        .expect("fixture has canonical safe-record digest");
 }
 
 fn usage_record(id: usize, task_id: &str, attempt_id: &str) -> SafeHarnessContentRecord {
@@ -329,6 +344,42 @@ fn text_record(
             part_count: 1,
         }),
     )
+}
+
+fn limit_marker_record(
+    id: usize,
+    task_id: &str,
+    attempt_id: &str,
+    limit_kind: HarnessContentLimitKind,
+) -> SafeHarnessContentRecord {
+    let mut marker = record(
+        id,
+        task_id,
+        attempt_id,
+        safe_harness_content_record::Payload::Marker(SafeContentMarker {
+            kind: HarnessContentMarkerKind::LimitReached as i32,
+            limit_kind: limit_kind as i32,
+        }),
+    );
+    marker.safety_flags.clear();
+    seal_record(&mut marker);
+    marker
+}
+
+fn limit_marker_after(
+    prefix: &SafeHarnessContentRecord,
+    limit_kind: HarnessContentLimitKind,
+) -> SafeHarnessContentRecord {
+    let mut marker = prefix.clone();
+    marker.safety_flags.clear();
+    marker.payload = Some(safe_harness_content_record::Payload::Marker(
+        SafeContentMarker {
+            kind: HarnessContentMarkerKind::LimitReached as i32,
+            limit_kind: limit_kind as i32,
+        },
+    ));
+    seal_record(&mut marker);
+    marker
 }
 
 fn projection_input(
@@ -849,6 +900,282 @@ fn r9c_content_record_commit_replay_and_conflict_are_atomic() {
             .expect("health after conflict"),
         ProjectionHealth::IntegrityFailed
     );
+}
+
+#[test]
+fn r9c_forged_record_id_fails_closed_without_cross_domain_write() {
+    let root = TempRoot::new("forged-record-id");
+    let mut model = open(&root);
+    model.apply_task(&task_input()).expect("project Task");
+    model
+        .apply_collaboration(&collaboration_input())
+        .expect("project collaboration");
+    model
+        .apply_adapter_approval(&approval_input())
+        .expect("project approval");
+
+    let task = task_view_bytes(&model);
+    let task_counts = task_projection_counts(&root);
+    let approval = model
+        .get_harness_approval_view(
+            "approval-001",
+            ApprovalViewAccess {
+                can_read: true,
+                can_decide: false,
+            },
+        )
+        .expect("read approval")
+        .expect("approval exists")
+        .encode_to_vec();
+
+    let mut forged = projection_input(
+        "forged-record-id-delivery",
+        usage_record(77, "task-forged", "attempt-forged"),
+        1,
+    );
+    let Some(safe_harness_content_projection_event::Payload::ContentRecord(record)) =
+        forged.event.payload.as_mut()
+    else {
+        unreachable!()
+    };
+    record.record_id = format!("hcr_{}", "f".repeat(64));
+    forged.payload_digest_sha256 = sha256(forged.event.encode_to_vec());
+
+    assert!(matches!(
+        model.apply_harness_content(&forged),
+        Err(ProjectionFailure::IntegrityFailure)
+    ));
+    assert_eq!(content_counts(&root), (0, 0));
+    assert_eq!(task_view_bytes(&model), task);
+    assert_eq!(task_projection_counts(&root), task_counts);
+    assert_eq!(
+        model
+            .get_harness_approval_view(
+                "approval-001",
+                ApprovalViewAccess {
+                    can_read: true,
+                    can_decide: false,
+                },
+            )
+            .expect("read approval after forged record")
+            .expect("approval remains")
+            .encode_to_vec(),
+        approval
+    );
+    assert_eq!(
+        model
+            .harness_content_health()
+            .expect("content health after forged record"),
+        ProjectionHealth::IntegrityFailed
+    );
+}
+
+#[test]
+fn r9c_content_event_accepts_all_canonical_safe_parts_exactly_once() {
+    let root = TempRoot::new("multipart-owner-identity");
+    let mut model = open(&root);
+    let cumulative_digest = sha256("first-second");
+    let mut first = text_record(
+        501,
+        "task-multipart",
+        "attempt-multipart",
+        "first-".to_owned(),
+    );
+    let Some(safe_harness_content_record::Payload::AssistantText(text)) = first.payload.as_mut()
+    else {
+        unreachable!()
+    };
+    text.safe_cumulative_digest_sha256 = cumulative_digest.clone();
+    text.part_index = 0;
+    text.part_count = 2;
+    seal_record(&mut first);
+
+    let mut second = first.clone();
+    let Some(safe_harness_content_record::Payload::AssistantText(text)) = second.payload.as_mut()
+    else {
+        unreachable!()
+    };
+    text.safe_text_utf8 = "second".to_owned();
+    text.safe_cumulative_digest_sha256 = cumulative_digest;
+    text.part_index = 1;
+    text.part_count = 2;
+    seal_record(&mut second);
+
+    assert_ne!(first.record_id, second.record_id);
+    assert_eq!(first.content_event_id, second.content_event_id);
+    let first_input = projection_input("multipart-delivery-0", first, 1);
+    let second_input = projection_input("multipart-delivery-1", second, 2);
+    assert!(matches!(
+        model.apply_harness_content(&first_input),
+        Ok(HarnessContentApply::Committed { .. })
+    ));
+    assert!(matches!(
+        model.apply_harness_content(&second_input),
+        Ok(HarnessContentApply::Committed { .. })
+    ));
+    assert_eq!(content_counts(&root), (2, 2));
+    assert!(matches!(
+        model.apply_harness_content(&second_input),
+        Ok(HarnessContentApply::Replay { .. })
+    ));
+    assert_eq!(content_counts(&root), (2, 2));
+}
+
+#[test]
+fn r9c_content_event_rejects_out_of_order_parts_and_identity_drift() {
+    let out_of_order_root = TempRoot::new("multipart-out-of-order");
+    let mut out_of_order_model = open(&out_of_order_root);
+    let mut out_of_order = text_record(
+        601,
+        "task-multipart-order",
+        "attempt-multipart-order",
+        "second".to_owned(),
+    );
+    let Some(safe_harness_content_record::Payload::AssistantText(text)) =
+        out_of_order.payload.as_mut()
+    else {
+        unreachable!()
+    };
+    text.part_index = 1;
+    text.part_count = 2;
+    seal_record(&mut out_of_order);
+    assert!(matches!(
+        out_of_order_model.apply_harness_content(&projection_input(
+            "multipart-out-of-order-delivery",
+            out_of_order,
+            1,
+        )),
+        Err(ProjectionFailure::IntegrityFailure)
+    ));
+    assert_eq!(content_counts(&out_of_order_root), (0, 0));
+
+    let drift_root = TempRoot::new("multipart-identity-drift");
+    let mut drift_model = open(&drift_root);
+    let mut first = text_record(
+        602,
+        "task-multipart-drift",
+        "attempt-multipart-drift",
+        "first".to_owned(),
+    );
+    let Some(safe_harness_content_record::Payload::AssistantText(text)) = first.payload.as_mut()
+    else {
+        unreachable!()
+    };
+    text.part_count = 2;
+    seal_record(&mut first);
+    let mut drifted_second = first.clone();
+    drifted_second.model_alias = "different-model".to_owned();
+    let Some(safe_harness_content_record::Payload::AssistantText(text)) =
+        drifted_second.payload.as_mut()
+    else {
+        unreachable!()
+    };
+    text.part_index = 1;
+    text.safe_text_utf8 = "second".to_owned();
+    seal_record(&mut drifted_second);
+    drift_model
+        .apply_harness_content(&projection_input("multipart-drift-first", first, 1))
+        .expect("commit first canonical part");
+    assert!(matches!(
+        drift_model.apply_harness_content(&projection_input(
+            "multipart-drift-second",
+            drifted_second,
+            2,
+        )),
+        Err(ProjectionFailure::IntegrityFailure)
+    ));
+    assert_eq!(content_counts(&drift_root), (1, 1));
+}
+
+#[test]
+fn r9c_limit_marker_follows_prefix_is_publicly_typed_and_terminates_task() {
+    let root = TempRoot::new("typed-task-limit");
+    let mut model = open(&root);
+    let mut prefix = text_record(
+        701,
+        "task-typed-limit",
+        "attempt-typed-limit",
+        "final fitting prefix".to_owned(),
+    );
+    let Some(safe_harness_content_record::Payload::AssistantText(text)) = prefix.payload.as_mut()
+    else {
+        unreachable!()
+    };
+    text.part_count = 2;
+    seal_record(&mut prefix);
+    let marker = limit_marker_after(&prefix, HarnessContentLimitKind::TaskTextBytes);
+
+    model
+        .apply_harness_content(&projection_input("typed-limit-prefix", prefix, 1))
+        .expect("commit final fitting prefix");
+    model
+        .apply_harness_content(&projection_input("typed-limit-marker", marker, 2))
+        .expect("commit final typed marker");
+
+    let page = model
+        .list_harness_content(
+            &baseline_query("task-typed-limit", &["attempt-typed-limit"], 10),
+            read_access(),
+        )
+        .expect("read typed marker");
+    assert_eq!(page.records.len(), 2);
+    let Some(harness_content_record_view::Payload::Marker(public_marker)) =
+        page.records[1].payload.as_ref()
+    else {
+        panic!("second record must be the public limit marker")
+    };
+    assert_eq!(
+        HarnessContentMarkerKind::try_from(public_marker.kind),
+        Ok(HarnessContentMarkerKind::LimitReached)
+    );
+    assert_eq!(
+        HarnessContentLimitKind::try_from(public_marker.limit_kind),
+        Ok(HarnessContentLimitKind::TaskTextBytes)
+    );
+
+    assert!(matches!(
+        model.apply_harness_content(&projection_input(
+            "typed-limit-after-task",
+            usage_record(702, "task-typed-limit", "attempt-other"),
+            3,
+        )),
+        Err(ProjectionFailure::IntegrityFailure)
+    ));
+    assert_eq!(content_counts(&root), (2, 2));
+}
+
+#[test]
+fn r9c_attempt_limit_blocks_only_its_attempt() {
+    let root = TempRoot::new("typed-attempt-limit");
+    let mut model = open(&root);
+    model
+        .apply_harness_content(&projection_input(
+            "attempt-limit-marker",
+            limit_marker_record(
+                711,
+                "task-attempt-limit",
+                "attempt-limited",
+                HarnessContentLimitKind::AttemptRecords,
+            ),
+            1,
+        ))
+        .expect("commit attempt-scoped marker");
+    model
+        .apply_harness_content(&projection_input(
+            "attempt-limit-other-attempt",
+            usage_record(712, "task-attempt-limit", "attempt-open"),
+            2,
+        ))
+        .expect("another Attempt remains open");
+    assert!(matches!(
+        model.apply_harness_content(&projection_input(
+            "attempt-limit-after-attempt",
+            usage_record(713, "task-attempt-limit", "attempt-limited"),
+            3,
+        )),
+        Err(ProjectionFailure::IntegrityFailure)
+    ));
+    assert_eq!(content_counts(&root), (2, 2));
 }
 
 #[test]

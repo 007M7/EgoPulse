@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod context_revoke;
+pub mod harness_content;
 pub mod memory;
 pub mod profiles;
 
