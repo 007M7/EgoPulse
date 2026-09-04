@@ -67,6 +67,9 @@ pub struct HarnessDispatchCycleReport {
     /// Number of Artifact returns whose Verification-gated Step return was
     /// durably committed or replayed in this cycle.
     pub return_settlements: u64,
+    /// Number of Artifact Authority returns whose Task evidence intake was
+    /// durably committed or idempotently replayed in this cycle.
+    pub task_evidence_intakes: u64,
     pub activations_seen: u64,
     pub activations_started: u64,
     pub activations_acknowledged: u64,
@@ -94,6 +97,8 @@ pub enum HarnessDispatchCycleError {
     TaskActivationWorkflow(String),
     #[error("governed return collector failed: {0}")]
     ReturnCollector(String),
+    #[error("governed Task evidence intake failed: {0}")]
+    TaskEvidenceIntake(String),
     #[error("harness recovery failed: {0}")]
     Recovery(String),
 }
@@ -1475,6 +1480,11 @@ fn merge_report(target: &mut HarnessDispatchCycleReport, source: HarnessDispatch
     target.terminal_output_candidates_seen += source.terminal_output_candidates_seen;
     target.terminal_output_candidates_receipted += source.terminal_output_candidates_receipted;
     target.terminal_output_candidates_held += source.terminal_output_candidates_held;
+    target.return_settlements += source.return_settlements;
+    target.task_evidence_intakes += source.task_evidence_intakes;
+    target.activations_seen += source.activations_seen;
+    target.activations_started += source.activations_started;
+    target.activations_acknowledged += source.activations_acknowledged;
     for dispatch_id in source.terminal_dispatch_ids {
         if !target
             .terminal_dispatch_ids
@@ -1668,6 +1678,11 @@ mod tests {
                 report: HarnessDispatchCycleReport {
                     dispatches_seen: 1,
                     dispatches_delivered: 1,
+                    return_settlements: 1,
+                    task_evidence_intakes: 1,
+                    activations_seen: 1,
+                    activations_started: 1,
+                    activations_acknowledged: 1,
                     terminal_dispatch_ids: vec!["dispatch:one".to_owned()],
                     held_dispatch_ids: vec!["dispatch:held".to_owned()],
                     ..Default::default()
@@ -1677,6 +1692,11 @@ mod tests {
                 report: HarnessDispatchCycleReport {
                     dispatches_seen: 2,
                     dispatches_rejected: 1,
+                    return_settlements: 2,
+                    task_evidence_intakes: 2,
+                    activations_seen: 2,
+                    activations_started: 2,
+                    activations_acknowledged: 2,
                     terminal_dispatch_ids: vec![
                         "dispatch:one".to_owned(),
                         "dispatch:two".to_owned(),
@@ -1692,6 +1712,11 @@ mod tests {
         assert_eq!(report.dispatches_seen, 3);
         assert_eq!(report.dispatches_delivered, 1);
         assert_eq!(report.dispatches_rejected, 1);
+        assert_eq!(report.return_settlements, 3);
+        assert_eq!(report.task_evidence_intakes, 3);
+        assert_eq!(report.activations_seen, 3);
+        assert_eq!(report.activations_started, 3);
+        assert_eq!(report.activations_acknowledged, 3);
         assert_eq!(
             report.terminal_dispatch_ids,
             vec!["dispatch:one", "dispatch:two"]

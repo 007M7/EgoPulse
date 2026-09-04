@@ -19,12 +19,11 @@ use egopulse_cognition_runtime::task_authority::{
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::{CommandMetadata, ContractReference},
     task::v1::{
-        ActivateTaskCommand, CreateTaskCommand, SubmitTaskEvidenceCommand,
-        TaskCommand as DomainTaskCommand, TaskSnapshot, TaskStatus, task_command,
+        ActivateTaskCommand, CreateTaskCommand, TaskCommand as DomainTaskCommand, TaskSnapshot,
+        TaskStatus, task_command,
     },
     verification::v1::{CheckerAssuranceClass, CheckerProfile},
 };
-use egopulse_local_api::command_gateway::CommandPrincipal;
 use egopulse_verification_authority::canonical_checker_profile_digest;
 use prost_types::Timestamp;
 use serde_json::Value;
@@ -179,13 +178,6 @@ fn seal(mut command: DomainTaskCommand) -> DomainTaskCommand {
                 .meta
                 .as_mut()
                 .expect("activate metadata")
-                .request_digest_sha256 = digest;
-        }
-        Some(task_command::Command::SubmitTaskEvidence(value)) => {
-            value
-                .meta
-                .as_mut()
-                .expect("evidence metadata")
                 .request_digest_sha256 = digest;
         }
         _ => panic!("unexpected Task command in G4-04 fixture"),
@@ -562,7 +554,7 @@ async fn user_configured_production_runner_completes_real_codex_dispatch() {
     let input_digest = hex::encode(Sha256::digest(bundle));
     let config_path = user_config(&root, &input_digest, &codex_executable);
     eprintln!("g4-04: user config written");
-    let (task_id, task_revision, work_revision) = seed_activation(&root);
+    seed_activation(&root);
     eprintln!("g4-04: task activated");
 
     let mut providers = ProductionBootstrapConfig::from_user_file(&config_path)
@@ -595,6 +587,7 @@ async fn user_configured_production_runner_completes_real_codex_dispatch() {
             assert_eq!(report.terminal_output_candidates_seen, 1);
             assert_eq!(report.terminal_output_candidates_receipted, 1);
             assert_eq!(report.terminal_output_candidates_held, 0);
+            assert_eq!(report.task_evidence_intakes, 1);
             terminal_seen = true;
             break;
         }
@@ -605,41 +598,6 @@ async fn user_configured_production_runner_completes_real_codex_dispatch() {
         "Codex production dispatch did not reach a terminal observation"
     );
     eprintln!("g4-04: terminal dispatch observed");
-
-    let evidence = seal(DomainTaskCommand {
-        command: Some(task_command::Command::SubmitTaskEvidence(
-            SubmitTaskEvidenceCommand {
-                meta: Some(metadata(
-                    "g4-04-submit-evidence",
-                    "g4-04-submit-evidence",
-                    "g4-04",
-                )),
-                task_id: task_id.clone(),
-                expected_revision: task_revision,
-                work_revision,
-                return_handoff_id: format!("return-handoff:harness:{DISPATCH_ID}"),
-                artifact_set_id: format!("artifact-set:harness-return:{DISPATCH_ID}"),
-            },
-        )),
-    });
-    let task_result = providers
-        .task_port
-        .execute(
-            &evidence,
-            &CommandPrincipal {
-                principal_id: "local-user:g4-04-test".to_owned(),
-                required_authority_principal_kinds: vec![
-                    "TaskAuthority.CollaborationControl".to_owned(),
-                ],
-            },
-        )
-        .expect("submit production Task evidence");
-    assert!(
-        task_result.result.committed_event.is_some(),
-        "Task evidence result was not committed: {:?}",
-        task_result.result
-    );
-    eprintln!("g4-04: task evidence submitted");
 
     let verification = verification_worker
         .run_once()

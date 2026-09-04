@@ -63,13 +63,14 @@ use egopulse_local_api::{
     },
 };
 use egopulse_local_ide_control::collaboration_control::{
-    AuthenticatedCollaborationPrincipal, CollaborationControl, CollaborationControlConfig,
-    CollaborationControlError, CollaborationLineageReader, CollaborationLineageReaderConfig,
-    CollaborationPrincipalKind, CollaborationSqlCipherKey, CompositeHarnessDispatchRunner,
-    GovernedTaskActivationRunner, HarnessDispatchCycleError, HarnessDispatchRunner,
-    SingleHarnessWorkConfig, SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
-    SingleHarnessWorkflowResolverError, SystemAuthorityClock, TaskActivationGuardSet,
-    TaskActivationSource, TrustedDispatchRouteProfile, build_dispatch_route_binding,
+    ArtifactReturnSource, AuthenticatedCollaborationPrincipal, CollaborationControl,
+    CollaborationControlConfig, CollaborationControlError, CollaborationLineageReader,
+    CollaborationLineageReaderConfig, CollaborationPrincipalKind, CollaborationSqlCipherKey,
+    CompositeHarnessDispatchRunner, GovernedTaskActivationRunner, HarnessDispatchCycleError,
+    HarnessDispatchRunner, SingleHarnessWorkConfig, SingleHarnessWorkflowResolution,
+    SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError, SystemAuthorityClock,
+    TaskActivationGuardSet, TaskActivationSource, TrustedDispatchRouteProfile,
+    build_dispatch_route_binding,
 };
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
@@ -88,6 +89,7 @@ mod return_collector;
 mod return_projection;
 mod security;
 mod task;
+mod task_evidence;
 mod task_recovery;
 mod verdict;
 mod verdict_consumer;
@@ -1271,6 +1273,9 @@ impl DaemonProviders {
         let source = self.task_activation_source.take().ok_or(
             DaemonCompositionError::InvalidConfiguration("Task activation source"),
         )?;
+        let artifact_return_source: Arc<dyn ArtifactReturnSource> = Arc::new(
+            ArtifactAuthorityReturnSource::new(Arc::clone(&artifact_authority)),
+        );
         let mut runners = Vec::with_capacity(compositions.len());
         for composition in compositions {
             let ProfiledNativeHarnessComposition {
@@ -1424,11 +1429,6 @@ impl DaemonProviders {
                     .clone(),
                 authenticated: true,
             };
-            let artifact_return_source: Arc<
-                dyn egopulse_local_ide_control::collaboration_control::ArtifactReturnSource,
-            > = Arc::new(ArtifactAuthorityReturnSource::new(Arc::clone(
-                &artifact_authority,
-            )));
             let runner = GovernedTaskActivationRunner::new(
                 control,
                 adapter,
@@ -1439,7 +1439,10 @@ impl DaemonProviders {
                 config.lease_ttl_seconds,
             )
             .with_capability_profile_ref(capability_profile_ref)
-            .with_artifact_return_source(artifact_return_source, artifact_return_principal)
+            .with_artifact_return_source(
+                Arc::clone(&artifact_return_source),
+                artifact_return_principal,
+            )
             .with_step_return_principal(AuthenticatedCollaborationPrincipal {
                 kind: CollaborationPrincipalKind::CollaborationControl,
                 principal_id: "collaboration-control:return-settlement".to_owned(),
@@ -1457,7 +1460,12 @@ impl DaemonProviders {
         }
         let composite = CompositeHarnessDispatchRunner::new(runners)
             .map_err(DaemonCompositionError::InvalidConfiguration)?;
-        self.harness_dispatch_runner = Some(Arc::new(composite));
+        let evidence_intake = crate::task_evidence::GovernedTaskEvidenceIntakeRunner::new(
+            Arc::new(composite),
+            artifact_return_source,
+            Arc::clone(&self.task_port),
+        );
+        self.harness_dispatch_runner = Some(Arc::new(evidence_intake));
         Ok(self)
     }
 }

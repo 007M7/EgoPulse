@@ -88,6 +88,18 @@ pub trait TaskCommandPort: Send + Sync + 'static {
         let _ = command;
         Err(CommandPortFailure::Unavailable)
     }
+
+    /// Daemon-owned technical evidence intake for one Artifact Authority
+    /// ReturnReceipt. The implementing port owns the fixed Collaboration
+    /// principal; callers cannot supply or widen it. The default remains
+    /// fail-closed, and this boundary accepts only SubmitTaskEvidence.
+    fn execute_system_evidence_intake(
+        &self,
+        command: &TaskCommand,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        let _ = command;
+        Err(CommandPortFailure::Unavailable)
+    }
 }
 
 pub trait PolicyCommandPort: Send + Sync + 'static {
