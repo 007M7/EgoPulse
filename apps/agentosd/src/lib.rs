@@ -13,6 +13,7 @@ use egopulse_codex_adapter::{
 };
 use egopulse_cognition_runtime::{
     context_authority::ContextAuthority, memory_authority::MemoryAuthority,
+    task_authority::TaskAuthority,
 };
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::ContractReference,
@@ -48,7 +49,11 @@ use egopulse_local_api::{
     },
     read_gateway::{NoopReadGatewayAuditSink, ReadGatewayApplication},
     read_gateway_policy::ReadGatewayPolicy,
-    read_model_reader::{BlockingLocalReadModelReader, ProjectionCommitNotifier},
+    read_model_reader::{
+        BlockingLocalReadModelReader, FailClosedHarnessContentScopeReader,
+        HarnessContentCommitNotifier, HarnessContentScopeAccessError, HarnessContentScopeReader,
+        ProjectionCommitNotifier,
+    },
     read_service::LocalReadModelEndpoint,
     read_tokens::{ReadTokenCodec, TokenMacKey},
     session::{
@@ -59,12 +64,12 @@ use egopulse_local_api::{
 };
 use egopulse_local_ide_control::collaboration_control::{
     AuthenticatedCollaborationPrincipal, CollaborationControl, CollaborationControlConfig,
-    CollaborationControlError, CollaborationPrincipalKind, CollaborationSqlCipherKey,
-    CompositeHarnessDispatchRunner, GovernedTaskActivationRunner, HarnessDispatchCycleError,
-    HarnessDispatchRunner, SingleHarnessWorkConfig, SingleHarnessWorkflowResolution,
-    SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError, SystemAuthorityClock,
-    TaskActivationGuardSet, TaskActivationSource, TrustedDispatchRouteProfile,
-    build_dispatch_route_binding,
+    CollaborationControlError, CollaborationLineageReader, CollaborationLineageReaderConfig,
+    CollaborationPrincipalKind, CollaborationSqlCipherKey, CompositeHarnessDispatchRunner,
+    GovernedTaskActivationRunner, HarnessDispatchCycleError, HarnessDispatchRunner,
+    SingleHarnessWorkConfig, SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
+    SingleHarnessWorkflowResolverError, SystemAuthorityClock, TaskActivationGuardSet,
+    TaskActivationSource, TrustedDispatchRouteProfile, build_dispatch_route_binding,
 };
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
@@ -343,8 +348,63 @@ pub struct DaemonProviders {
     pub memory_candidate_producers: Arc<MemoryCandidateProducerRegistry>,
     pub work_preparation_port: Arc<dyn WorkPreparationPort>,
     context_authority: Option<Arc<Mutex<ContextAuthority>>>,
-    harness_content_projectors:
-        Vec<Arc<Mutex<GovernedHarnessContentProjector<SystemAdapterClock>>>>,
+    harness_content_workers: Vec<HarnessContentWorker>,
+    harness_content_task_authority: Option<Arc<Mutex<TaskAuthority>>>,
+    harness_content_lineage_readers: Vec<Arc<Mutex<CollaborationLineageReader>>>,
+}
+
+struct HarnessContentWorker {
+    projector: Arc<Mutex<GovernedHarnessContentProjector<SystemAdapterClock>>>,
+    projection_edge: Arc<Mutex<AdapterEdge>>,
+}
+
+struct AuthorityHarnessContentScopeReader {
+    task: Arc<Mutex<TaskAuthority>>,
+    lineage_readers: Vec<Arc<Mutex<CollaborationLineageReader>>>,
+}
+
+#[tonic::async_trait]
+impl HarnessContentScopeReader for AuthorityHarnessContentScopeReader {
+    async fn task_owner_principal_id(
+        &self,
+        task_id: String,
+    ) -> Result<Option<String>, HarnessContentScopeAccessError> {
+        let task = Arc::clone(&self.task);
+        tokio::task::spawn_blocking(move || {
+            task.lock()
+                .map_err(|_| HarnessContentScopeAccessError::Integrity)?
+                .task_owner_principal_id(&task_id)
+                .map_err(|_| HarnessContentScopeAccessError::Unavailable)
+        })
+        .await
+        .map_err(|_| HarnessContentScopeAccessError::Unavailable)?
+    }
+
+    async fn task_id_for_attempt(
+        &self,
+        attempt_id: String,
+    ) -> Result<Option<String>, HarnessContentScopeAccessError> {
+        let readers = self.lineage_readers.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut resolved = None;
+            for reader in readers {
+                let task_id = reader
+                    .lock()
+                    .map_err(|_| HarnessContentScopeAccessError::Integrity)?
+                    .task_id_for_attempt(&attempt_id)
+                    .map_err(|_| HarnessContentScopeAccessError::Unavailable)?;
+                if let Some(task_id) = task_id {
+                    if resolved.as_ref().is_some_and(|value| value != &task_id) {
+                        return Err(HarnessContentScopeAccessError::Integrity);
+                    }
+                    resolved = Some(task_id);
+                }
+            }
+            Ok(resolved)
+        })
+        .await
+        .map_err(|_| HarnessContentScopeAccessError::Unavailable)?
+    }
 }
 
 /// Explicit workflow configuration boundary for the first vertical. Reviewed
@@ -743,7 +803,9 @@ impl DaemonProviders {
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
             context_authority: None,
-            harness_content_projectors: Vec::new(),
+            harness_content_workers: Vec::new(),
+            harness_content_task_authority: None,
+            harness_content_lineage_readers: Vec::new(),
         }
     }
 
@@ -777,6 +839,7 @@ impl DaemonProviders {
     #[must_use]
     pub fn from_authority_inputs(inputs: AuthorityCompositionInputs) -> Self {
         let task = Arc::new(Mutex::new(inputs.task));
+        let harness_content_task_authority = Arc::clone(&task);
         let verdict = Arc::new(Mutex::new(Some(inputs.verdict)));
         let ports = Arc::new(AuthorityCommandPorts::new_shared_handles(
             Arc::clone(&task),
@@ -820,7 +883,9 @@ impl DaemonProviders {
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
             context_authority: None,
-            harness_content_projectors: Vec::new(),
+            harness_content_workers: Vec::new(),
+            harness_content_task_authority: Some(harness_content_task_authority),
+            harness_content_lineage_readers: Vec::new(),
         }
     }
 
@@ -829,6 +894,7 @@ impl DaemonProviders {
     /// command handling must observe the same owner instance.
     #[must_use]
     pub fn from_shared_authority_inputs(inputs: SharedAuthorityCompositionInputs) -> Self {
+        let harness_content_task_authority = Arc::clone(&inputs.task);
         let founder_verdict_consume_worker = Some(Arc::new(
             ConfiguredFounderVerdictConsumeWorker::new(
                 Arc::clone(&inputs.task),
@@ -871,7 +937,9 @@ impl DaemonProviders {
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
             context_authority: None,
-            harness_content_projectors: Vec::new(),
+            harness_content_workers: Vec::new(),
+            harness_content_task_authority: Some(harness_content_task_authority),
+            harness_content_lineage_readers: Vec::new(),
         }
     }
 
@@ -1193,6 +1261,13 @@ impl DaemonProviders {
                 key: AdapterEdgeKey::new(config.adapter_key),
             })
             .map_err(DaemonCompositionError::AdapterEdge)?;
+            let content_projection_edge = AdapterEdge::open(AdapterEdgeConfig {
+                database_path: config.adapter_database_path.clone(),
+                adapter_id: adapter_id.clone(),
+                store_epoch: config.adapter_store_epoch.clone(),
+                key: AdapterEdgeKey::new(config.adapter_key),
+            })
+            .map_err(DaemonCompositionError::AdapterEdge)?;
             let writer_edge = AdapterEdge::open(AdapterEdgeConfig {
                 database_path: config.adapter_database_path,
                 adapter_id: adapter_id.clone(),
@@ -1206,6 +1281,11 @@ impl DaemonProviders {
                 Arc::clone(&verification),
             );
             let (guard, reference) = TaskActivationGuardSet::new(evidence);
+            let lineage_reader_config = CollaborationLineageReaderConfig {
+                database_path: config.collaboration_database_path.clone(),
+                store_epoch: config.collaboration_store_epoch.clone(),
+                key: CollaborationSqlCipherKey::new(config.collaboration_key),
+            };
             let control = CollaborationControl::open(
                 CollaborationControlConfig {
                     database_path: config.collaboration_database_path,
@@ -1216,6 +1296,11 @@ impl DaemonProviders {
                 SystemAuthorityClock,
             )
             .map_err(DaemonCompositionError::Collaboration)?;
+            self.harness_content_lineage_readers
+                .push(Arc::new(Mutex::new(
+                    CollaborationLineageReader::open(lineage_reader_config)
+                        .map_err(DaemonCompositionError::Collaboration)?,
+                )));
             let file_material = match config.default_model.as_ref() {
                 Some(model) => FileDispatchMaterialResolver::new(
                     config.input_bundle_root,
@@ -1236,13 +1321,14 @@ impl DaemonProviders {
                 driver,
                 SystemAdapterClock,
             );
-            self.harness_content_projectors.push(Arc::new(Mutex::new(
-                GovernedHarnessContentProjector::new(
+            self.harness_content_workers.push(HarnessContentWorker {
+                projector: Arc::new(Mutex::new(GovernedHarnessContentProjector::new(
                     content_edge,
                     disclosure_credentials,
                     SystemAdapterClock,
-                ),
-            )));
+                ))),
+                projection_edge: Arc::new(Mutex::new(content_projection_edge)),
+            });
             if let Some(route_profile) = route_profile.as_ref() {
                 adapter = adapter.with_dispatch_route_binding(
                     build_dispatch_route_binding(route_profile).map_err(|_| {
@@ -1398,8 +1484,9 @@ pub struct DaemonComposition {
     verification_interval: Duration,
     founder_verdict_consume_worker: Option<Arc<dyn FounderVerdictConsumeWorker>>,
     verdict_consumption_interval: Duration,
-    harness_content_projectors:
-        Vec<Arc<Mutex<GovernedHarnessContentProjector<SystemAdapterClock>>>>,
+    harness_content_workers: Vec<HarnessContentWorker>,
+    harness_content_read_model: Arc<Mutex<LocalReadModel>>,
+    harness_content_notifier: HarnessContentCommitNotifier,
 }
 
 impl DaemonComposition {
@@ -1424,10 +1511,24 @@ impl DaemonComposition {
         let initial_position = model
             .position()
             .map_err(DaemonCompositionError::ReadModel)?;
+        let initial_content_position = model
+            .harness_content_position()
+            .map_err(DaemonCompositionError::ReadModel)?;
         let model = Arc::new(Mutex::new(model));
         let reader = Arc::new(BlockingLocalReadModelReader::new(Arc::clone(&model)));
         let notifier = ProjectionCommitNotifier::new(initial_position.clone());
+        let content_notifier = HarnessContentCommitNotifier::new(initial_content_position);
         let position_provider = Arc::new(SharedProjectionPosition::new(initial_position));
+        let content_scope_reader: Arc<dyn HarnessContentScopeReader> = match (
+            providers.harness_content_task_authority.as_ref(),
+            providers.harness_content_lineage_readers.is_empty(),
+        ) {
+            (Some(task), false) => Arc::new(AuthorityHarnessContentScopeReader {
+                task: Arc::clone(task),
+                lineage_readers: providers.harness_content_lineage_readers.clone(),
+            }),
+            _ => Arc::new(FailClosedHarnessContentScopeReader),
+        };
 
         let token_key =
             TokenMacKey::new(config.token_mac_key).map_err(|_| DaemonCompositionError::TokenKey)?;
@@ -1450,11 +1551,13 @@ impl DaemonComposition {
             providers.session_audit,
         );
         let registry = session.registry();
-        let read_application = Arc::new(ReadGatewayApplication::new(
+        let read_application = Arc::new(ReadGatewayApplication::new_with_harness_content(
             Arc::clone(&registry),
             profiles.clone(),
             reader,
             notifier.clone(),
+            content_scope_reader,
+            content_notifier.clone(),
             token_codec.clone(),
             Arc::new(NoopReadGatewayAuditSink),
         ));
@@ -1486,7 +1589,7 @@ impl DaemonComposition {
         let harness_dispatch_runner = providers.harness_dispatch_runner;
         let verification_worker = providers.verification_worker;
         let founder_verdict_consume_worker = providers.founder_verdict_consume_worker;
-        let harness_content_projectors = providers.harness_content_projectors;
+        let harness_content_workers = providers.harness_content_workers;
 
         Ok(Self {
             address,
@@ -1502,7 +1605,9 @@ impl DaemonComposition {
             verification_interval: config.verification_interval,
             founder_verdict_consume_worker,
             verdict_consumption_interval: config.verdict_consumption_interval,
-            harness_content_projectors,
+            harness_content_workers,
+            harness_content_read_model: model,
+            harness_content_notifier: content_notifier,
         })
     }
 
@@ -1528,7 +1633,9 @@ impl DaemonComposition {
             verification_interval,
             founder_verdict_consume_worker,
             verdict_consumption_interval,
-            harness_content_projectors,
+            harness_content_workers,
+            harness_content_read_model,
+            harness_content_notifier,
             ..
         } = self;
         let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
@@ -1555,7 +1662,9 @@ impl DaemonComposition {
             verification_interval,
             founder_verdict_consume_worker,
             verdict_consumption_interval,
-            harness_content_projectors,
+            harness_content_workers,
+            read_model: harness_content_read_model,
+            content_notifier: harness_content_notifier,
             stop: stop_receiver,
         }));
         tokio::select! {
@@ -1584,8 +1693,9 @@ struct BackgroundWorkerInputs {
     verification_interval: Duration,
     founder_verdict_consume_worker: Option<Arc<dyn FounderVerdictConsumeWorker>>,
     verdict_consumption_interval: Duration,
-    harness_content_projectors:
-        Vec<Arc<Mutex<GovernedHarnessContentProjector<SystemAdapterClock>>>>,
+    harness_content_workers: Vec<HarnessContentWorker>,
+    read_model: Arc<Mutex<LocalReadModel>>,
+    content_notifier: HarnessContentCommitNotifier,
     stop: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -1598,7 +1708,9 @@ async fn run_background_workers(inputs: BackgroundWorkerInputs) -> Result<(), Da
         verification_interval,
         founder_verdict_consume_worker,
         verdict_consumption_interval,
-        harness_content_projectors,
+        harness_content_workers,
+        read_model,
+        content_notifier,
         stop,
     } = inputs;
     let mut workers = tokio::task::JoinSet::new();
@@ -1639,10 +1751,12 @@ async fn run_background_workers(inputs: BackgroundWorkerInputs) -> Result<(), Da
             .map_err(DaemonServeError::FounderVerdictConsume)
         });
     }
-    for projector in harness_content_projectors {
+    for worker in harness_content_workers {
         let stop_for_worker = stop.clone();
+        let read_model = Arc::clone(&read_model);
+        let content_notifier = content_notifier.clone();
         workers.spawn(async move {
-            run_harness_content_worker(projector, stop_for_worker).await;
+            run_harness_content_worker(worker, read_model, content_notifier, stop_for_worker).await;
             Ok(())
         });
     }
@@ -1672,7 +1786,9 @@ const HARNESS_CONTENT_DRAIN_BATCH: usize = 32;
 const HARNESS_CONTENT_DRAIN_INTERVAL: Duration = Duration::from_millis(100);
 
 async fn run_harness_content_worker(
-    projector: Arc<Mutex<GovernedHarnessContentProjector<SystemAdapterClock>>>,
+    worker: HarnessContentWorker,
+    read_model: Arc<Mutex<LocalReadModel>>,
+    content_notifier: HarnessContentCommitNotifier,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(HARNESS_CONTENT_DRAIN_INTERVAL);
@@ -1683,7 +1799,7 @@ async fn run_harness_content_worker(
         }
         let mut fatal = false;
         for _ in 0..HARNESS_CONTENT_DRAIN_BATCH {
-            let result = match projector.lock() {
+            let projection_result = match worker.projector.lock() {
                 Ok(mut projector) => projector.drain_once(),
                 Err(_) => {
                     tracing::error!("Harness content projector lock failed closed");
@@ -1691,18 +1807,108 @@ async fn run_harness_content_worker(
                     break;
                 }
             };
-            match result {
-                Ok(HarnessContentDrain::Idle) => break,
+            let projector_idle = match projection_result {
+                Ok(HarnessContentDrain::Idle) => true,
                 Ok(
                     HarnessContentDrain::Committed(_)
                     | HarnessContentDrain::Replayed
                     | HarnessContentDrain::Quarantined { .. },
-                ) => {}
+                ) => false,
                 Err(_) => {
                     tracing::error!("Harness content projector stopped in its isolated domain");
                     fatal = true;
                     break;
                 }
+            };
+            let message = match worker.projection_edge.lock() {
+                Ok(edge) => match edge.pending_safe_content_projection() {
+                    Ok(messages) => messages.into_iter().next(),
+                    Err(_) => {
+                        tracing::error!(
+                            "Harness content safe outbox read stopped in its isolated domain"
+                        );
+                        fatal = true;
+                        break;
+                    }
+                },
+                Err(_) => {
+                    tracing::error!("Harness content projection Edge lock failed closed");
+                    fatal = true;
+                    break;
+                }
+            };
+            let Some(message) = message else {
+                if projector_idle {
+                    break;
+                }
+                continue;
+            };
+            let projected_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                Ok(value) => prost_types::Timestamp {
+                    seconds: match i64::try_from(value.as_secs()) {
+                        Ok(seconds) => seconds,
+                        Err(_) => {
+                            tracing::error!("Harness content projection clock failed closed");
+                            fatal = true;
+                            break;
+                        }
+                    },
+                    nanos: i32::try_from(value.subsec_nanos())
+                        .expect("subsecond nanoseconds always fit i32"),
+                },
+                Err(_) => {
+                    tracing::error!("Harness content projection clock failed closed");
+                    fatal = true;
+                    break;
+                }
+            };
+            let apply_result = match read_model.lock() {
+                Ok(mut model) => {
+                    let applied = model.apply_harness_content(
+                        &egopulse_local_read_model::HarnessContentProjectionInput {
+                            delivery_id: message.message_id.clone(),
+                            payload_digest_sha256: message.payload_digest_sha256.clone(),
+                            event: message.event,
+                            projected_at,
+                        },
+                    );
+                    match applied {
+                        Ok(_) => model.harness_content_position(),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(_) => {
+                    tracing::error!("Harness content Local Read Model lock failed closed");
+                    fatal = true;
+                    break;
+                }
+            };
+            let projected_position = match apply_result {
+                Ok(position) => position,
+                Err(_) => {
+                    tracing::error!(
+                        "Harness content Local Read Model projection stopped in its isolated domain"
+                    );
+                    fatal = true;
+                    break;
+                }
+            };
+            content_notifier.publish(projected_position);
+            let acknowledge_result = match worker.projection_edge.lock() {
+                Ok(mut edge) => edge.acknowledge_safe_content_projection(
+                    &message.message_id,
+                    &message.payload_digest_sha256,
+                ),
+                Err(_) => {
+                    tracing::error!("Harness content projection Edge lock failed closed");
+                    fatal = true;
+                    break;
+                }
+            };
+            if acknowledge_result.is_err() {
+                tracing::error!("Harness content safe outbox ACK stopped in its isolated domain");
+                fatal = true;
+                break;
             }
         }
         if fatal {
@@ -2998,6 +3204,24 @@ mod tests {
             ManagedDisclosureCredentials::harness_account(),
             SystemAdapterClock,
         )));
+        let projection_edge = Arc::new(Mutex::new(
+            open_edge().expect("open safe content projection consumer Edge"),
+        ));
+        let read_model = Arc::new(Mutex::new(
+            LocalReadModel::open(LocalReadModelConfig {
+                database_path: root.join("local-read-model.sqlcipher"),
+                epoch: "r9c-content-read-model-v1".to_owned(),
+                key: LocalReadModelKey::new([0x5d; 32]),
+            })
+            .expect("open content Local Read Model"),
+        ));
+        let content_notifier = HarnessContentCommitNotifier::new(
+            read_model
+                .lock()
+                .expect("read model lock")
+                .harness_content_position()
+                .expect("initial content position"),
+        );
         let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
         let background = tokio::spawn(run_background_workers(BackgroundWorkerInputs {
             projection_pump: None,
@@ -3007,7 +3231,12 @@ mod tests {
             verification_interval: Duration::from_millis(25),
             founder_verdict_consume_worker: None,
             verdict_consumption_interval: Duration::from_millis(25),
-            harness_content_projectors: vec![projector],
+            harness_content_workers: vec![HarnessContentWorker {
+                projector,
+                projection_edge,
+            }],
+            read_model: Arc::clone(&read_model),
+            content_notifier,
             stop: stop_receiver,
         }));
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -3016,9 +3245,19 @@ mod tests {
                     .expect("open observer Edge")
                     .inspect()
                     .expect("inspect content worker result");
-                if inspection.safe_content_ledger_count == 1 {
+                if inspection.safe_content_ledger_count == 1
+                    && inspection.pending_content_projection_count == 0
+                {
                     assert_eq!(inspection.pending_content_candidate_count, 0);
-                    assert_eq!(inspection.pending_content_projection_count, 1);
+                    assert_eq!(
+                        read_model
+                            .lock()
+                            .expect("read model lock")
+                            .harness_content_position()
+                            .expect("content position")
+                            .sequence,
+                        1
+                    );
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -3032,6 +3271,7 @@ mod tests {
             .expect("background worker bounded stop")
             .expect("background worker task")
             .expect("background worker result");
+        drop(read_model);
         fs::remove_dir_all(root).expect("remove content worker test root");
     }
 

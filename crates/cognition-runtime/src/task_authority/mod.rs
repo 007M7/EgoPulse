@@ -380,6 +380,18 @@ impl TaskAuthority {
         })
     }
 
+    /// Resolves the principal that durably created a Task. This read-only
+    /// owner fact is used by Local API scope enforcement; it does not grant a
+    /// caller access to the Task Authority store or permit any write.
+    pub fn task_owner_principal_id(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<String>, TaskAuthorityFailure> {
+        self.store
+            .task_owner_principal_id(task_id)
+            .map_err(TaskAuthorityFailure::from)
+    }
+
     pub fn inspect_store(&self) -> Result<TaskStoreInspection, TaskAuthorityFailure> {
         self.store.inspect().map_err(TaskAuthorityFailure::from)
     }

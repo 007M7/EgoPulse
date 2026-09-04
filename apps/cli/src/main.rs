@@ -23,15 +23,16 @@ use egopulse_client_operations::{
     ApprovalWatch, ApprovalWatchClassification, ApprovalWatchCursor, ApprovalWatchUpdate,
     AttachError, ClientApprovalWatchError, ClientAttachment, ClientContextRevokeError,
     ClientGovernedTaskError, ClientGuidedApprovalDecisionError, ClientGuidedWorkError,
-    ClientTaskResultReviewError, ClientWorkError, ContextRevokeInput, GovernedHoldReason,
-    GovernedProjectionPosition, GovernedProjectionReason, GovernedStateComposite,
-    GovernedStateDomain, GovernedStateDomainPhase, GovernedStateReason, GovernedStateSession,
-    GovernedTaskBaseline, GovernedTaskSession, GovernedTaskState, GovernedTaskUpdate,
-    GuidedApprovalDecision, GuidedApprovalDecisionInput, GuidedWorkConfirmationAttempt,
-    GuidedWorkInput, GuidedWorkPreparationAttempt, GuidedWorkPreview, GuidedWorkSource,
-    TaskResultReview, TaskResultReviewStage, TaskWatchClassification, attach as attach_client,
-    command_metadata, set_task_digest, set_verdict_digest, timestamp_after,
-    validate_guided_work_input,
+    ClientHarnessContentError, ClientTaskResultReviewError, ClientWorkError, ContextRevokeInput,
+    GovernedHoldReason, GovernedProjectionPosition, GovernedProjectionReason,
+    GovernedStateComposite, GovernedStateDomain, GovernedStateDomainPhase, GovernedStateReason,
+    GovernedStateSession, GovernedTaskBaseline, GovernedTaskSession, GovernedTaskState,
+    GovernedTaskUpdate, GuidedApprovalDecision, GuidedApprovalDecisionInput,
+    GuidedWorkConfirmationAttempt, GuidedWorkInput, GuidedWorkPreparationAttempt,
+    GuidedWorkPreview, GuidedWorkSource, HarnessContentFilter, HarnessContentSession,
+    HarnessContentUpdate, HarnessContentUpdateKind, TaskResultReview, TaskResultReviewStage,
+    TaskWatchClassification, attach as attach_client, command_metadata, set_task_digest,
+    set_verdict_digest, timestamp_after, validate_guided_work_input,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -44,16 +45,21 @@ use egopulse_domain_contracts::v01::egopulse::{
     },
     collaboration::v1::{RunStatus, StepStatus},
     common::v1::ContractReference,
+    harness::v1::{
+        ContentMutationOperation, HarnessContentLimitKind, HarnessContentMarkerKind,
+        HarnessContentSafetyFlag, LifecycleKind, SideEffectCertainty,
+    },
     localapi::v1::{
         AwaitProjectionRequest, ClientSurface, ContextGovernanceState,
         ExecuteFounderVerdictRequest, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
         GetEvidenceGraphRequest, GetHarnessApprovalViewRequest, GetProjectionStatusRequest,
-        GetTaskViewRequest, ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError,
-        LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken,
-        ProjectionHealth, ProjectionMetadata, RetrieveMemoryRequest, SourceDomain, SourceRevision,
-        TaskView, await_projection_response, get_evidence_graph_response,
-        get_harness_approval_view_response, get_task_view_response, memory_mutation_command,
-        retrieve_memory_response,
+        GetTaskViewRequest, HarnessContentPosition, HarnessContentRecordView,
+        ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError, LocalApiErrorCode,
+        MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth,
+        ProjectionMetadata, RetrieveMemoryRequest, SourceDomain, SourceRevision, TaskView,
+        await_projection_response, get_evidence_graph_response, get_harness_approval_view_response,
+        get_task_view_response, harness_artifact_relation_view, harness_content_record_view,
+        memory_mutation_command, retrieve_memory_response,
     },
     policy::v1::PolicyDecisionErrorCode,
     task::v1::{
@@ -139,6 +145,28 @@ enum Command {
     State {
         #[command(subcommand)]
         command: StateCommand,
+    },
+    /// Read the independent governed Harness-content stream for one Task.
+    Content {
+        #[command(subcommand)]
+        command: ContentCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ContentCommand {
+    /// Print the fixed baseline, then stream source-labelled safe records.
+    Watch {
+        task_id: String,
+        /// Restrict to an Attempt. Repeat to select multiple Attempts.
+        #[arg(long = "attempt-id")]
+        attempt_ids: Vec<String>,
+        /// Stop after this many live frames; omit to run until Ctrl+C.
+        #[arg(long)]
+        frames: Option<u32>,
+        /// Emit one stable JSON object per line (NDJSON).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -618,6 +646,35 @@ impl CliFailure {
         }
     }
 
+    fn content_reset_required() -> Self {
+        Self {
+            exit_code: 7,
+            reason_code: "CONTENT_RESET_REQUIRED",
+            message:
+                "Harness content exceeded the bounded reset recovery budget; rerun the command"
+                    .to_owned(),
+            category: "projection",
+            retryable: true,
+            required_action_code: Some("REFETCH_CONTENT_BASELINE".to_owned()),
+            safe_fingerprint: None,
+            operation: "content.watch",
+        }
+    }
+
+    fn content_session_changed() -> Self {
+        Self {
+            exit_code: 5,
+            reason_code: "SESSION_CHANGED",
+            message: "the authenticated Harness-content session expired; rerun the command"
+                .to_owned(),
+            category: "contract",
+            retryable: false,
+            required_action_code: Some("REATTACH_SESSION".to_owned()),
+            safe_fingerprint: None,
+            operation: "content.watch",
+        }
+    }
+
     fn permission(operation: &'static str, message: impl Into<String>) -> Self {
         Self {
             exit_code: 4,
@@ -856,22 +913,7 @@ impl CliFailure {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let json_output = command_json(&cli.command);
-    let result = match cli.command {
-        Command::Status { json } => status(json).await,
-        Command::Await {
-            token_json,
-            timeout_milliseconds,
-            json,
-        } => await_projection(token_json, timeout_milliseconds, json).await,
-        Command::Task { command } => task(command).await,
-        Command::Evidence { command } => evidence(command).await,
-        Command::Approval { command } => approval(command).await,
-        Command::Verdict { command } => verdict(command).await,
-        Command::Memory { command } => memory(command).await,
-        Command::Work { command } => work(command).await,
-        Command::Context { command } => context(command).await,
-        Command::State { command } => state(command).await,
-    };
+    let result = dispatch_command(cli.command).await;
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -882,6 +924,32 @@ async fn main() -> ExitCode {
             }
             ExitCode::from(error.exit_code)
         }
+    }
+}
+
+type CliCommandFuture = Pin<Box<dyn Future<Output = Result<(), CliFailure>>>>;
+
+/// Erase every selected command future before it enters Tokio's main future.
+/// This keeps the sum of unrelated CLI state machines from consuming the
+/// Windows main-thread stack and makes adding a long-lived stream independent
+/// of the stack needs of existing commands.
+fn dispatch_command(command: Command) -> CliCommandFuture {
+    match command {
+        Command::Status { json } => Box::pin(status(json)),
+        Command::Await {
+            token_json,
+            timeout_milliseconds,
+            json,
+        } => Box::pin(await_projection(token_json, timeout_milliseconds, json)),
+        Command::Task { command } => Box::pin(task(command)),
+        Command::Evidence { command } => Box::pin(evidence(command)),
+        Command::Approval { command } => Box::pin(approval(command)),
+        Command::Verdict { command } => Box::pin(verdict(command)),
+        Command::Memory { command } => Box::pin(memory(command)),
+        Command::Work { command } => Box::pin(work(command)),
+        Command::Context { command } => Box::pin(context(command)),
+        Command::State { command } => Box::pin(state(command)),
+        Command::Content { command } => Box::pin(content(command)),
     }
 }
 
@@ -931,6 +999,9 @@ fn command_json(command: &Command) -> bool {
         }
         | Command::State {
             command: StateCommand::Watch { json, .. },
+        }
+        | Command::Content {
+            command: ContentCommand::Watch { json, .. },
         } => *json,
     }
 }
@@ -2625,6 +2696,424 @@ fn write_governed_state_record<Writer: Write>(
     writeln!(writer, "{rendered}").map_err(|_| {
         CliFailure::protocol("governed state output failed").for_operation("state.watch")
     })
+}
+
+const MAX_CONTENT_WATCH_FRAMES: u32 = 1_000;
+const MAX_CONTENT_WATCH_REBASES: u32 = 3;
+
+async fn content(command: ContentCommand) -> Result<(), CliFailure> {
+    match command {
+        ContentCommand::Watch {
+            task_id,
+            attempt_ids,
+            frames,
+            json,
+        } => Box::pin(content_watch(task_id, attempt_ids, frames, json)).await,
+    }
+}
+
+async fn content_watch(
+    task_id: String,
+    attempt_ids: Vec<String>,
+    frames: Option<u32>,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    if frames.is_some_and(|value| value == 0 || value > MAX_CONTENT_WATCH_FRAMES) {
+        return Err(CliFailure::protocol("frames must be between 1 and 1000")
+            .for_operation("content.watch"));
+    }
+    let filter =
+        HarnessContentFilter::new(task_id, attempt_ids).map_err(harness_content_failure)?;
+    let attached = attach("content.watch").await?;
+    let stop = tokio::signal::ctrl_c();
+    tokio::pin!(stop);
+    let mut emitted = 0_u32;
+    let mut rebases = 0_u32;
+
+    loop {
+        let mut session = attached
+            .0
+            .open_harness_content_session(filter.clone())
+            .await
+            .map_err(harness_content_failure)?;
+        render_content_baseline(&session, rebases, json_output)?;
+
+        loop {
+            if frames.is_some_and(|limit| emitted >= limit) {
+                return Ok(());
+            }
+            let update = tokio::select! {
+                biased;
+                _ = &mut stop => return Ok(()),
+                result = session.next_update() => result.map_err(harness_content_failure)?,
+            };
+            render_content_update(&update, rebases, json_output)?;
+            emitted += 1;
+            if update.kind == HarnessContentUpdateKind::ResetRequired {
+                if frames.is_some_and(|limit| emitted >= limit) {
+                    return Ok(());
+                }
+                if rebases == MAX_CONTENT_WATCH_REBASES {
+                    return Err(CliFailure::content_reset_required());
+                }
+                rebases += 1;
+                break;
+            }
+        }
+    }
+}
+
+fn render_content_baseline(
+    session: &HarnessContentSession,
+    generation: u32,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    for record in session.records() {
+        write_content_record(
+            &mut writer,
+            "baseline_record",
+            generation,
+            session.position(),
+            record,
+            json_output,
+        )?;
+    }
+    write_content_control(
+        &mut writer,
+        "baseline_complete",
+        generation,
+        session.position(),
+        session.records().len(),
+        session.assistant_messages().len(),
+        None,
+        json_output,
+    )
+}
+
+fn render_content_update(
+    update: &HarnessContentUpdate,
+    generation: u32,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    if !update.records.is_empty() {
+        for record in &update.records {
+            write_content_record(
+                &mut writer,
+                "record",
+                generation,
+                &update.position,
+                record,
+                json_output,
+            )?;
+        }
+        return Ok(());
+    }
+    let event = match (update.kind, update.disposition) {
+        (HarnessContentUpdateKind::Heartbeat, _) => "heartbeat",
+        (HarnessContentUpdateKind::ResetRequired, _) => "reset_required",
+        (HarnessContentUpdateKind::Records, egopulse_client_kernel::StreamApply::Replay) => {
+            "replay"
+        }
+        _ => "record_applied",
+    };
+    write_content_control(
+        &mut writer,
+        event,
+        generation,
+        &update.position,
+        0,
+        update.changed_messages.len(),
+        update.reset_reason.map(|reason| reason.as_str_name()),
+        json_output,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_content_control<Writer: Write>(
+    writer: &mut Writer,
+    event: &'static str,
+    generation: u32,
+    position: &HarnessContentPosition,
+    record_count: usize,
+    message_count: usize,
+    reset_reason: Option<&'static str>,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    if json_output {
+        let value = json!({
+            "schemaVersion": "egopulse.cli.harness-content/v1",
+            "event": event,
+            "generation": generation,
+            "contentPosition": content_position_json(position),
+            "recordCount": record_count,
+            "assembledMessageCount": message_count,
+            "resetReason": reset_reason,
+        });
+        writeln!(writer, "{}", serde_json::to_string(&value).unwrap())
+    } else {
+        writeln!(
+            writer,
+            "Harness content {event}: generation={generation} position={}:{} records={record_count} messages={message_count}{}",
+            position.epoch,
+            position.sequence,
+            reset_reason.map_or_else(String::new, |reason| format!(" reason={reason}")),
+        )
+    }
+    .map_err(|_| {
+        CliFailure::protocol("Harness-content output failed").for_operation("content.watch")
+    })
+}
+
+fn write_content_record<Writer: Write>(
+    writer: &mut Writer,
+    event: &'static str,
+    generation: u32,
+    position: &HarnessContentPosition,
+    record: &HarnessContentRecordView,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    if json_output {
+        let value = json!({
+            "schemaVersion": "egopulse.cli.harness-content/v1",
+            "event": event,
+            "generation": generation,
+            "contentPosition": content_position_json(position),
+            "record": content_record_json(record),
+        });
+        writeln!(writer, "{}", serde_json::to_string(&value).unwrap())
+    } else {
+        writeln!(writer, "{}", content_record_text(event, record))
+    }
+    .map_err(|_| {
+        CliFailure::protocol("Harness-content output failed").for_operation("content.watch")
+    })
+}
+
+fn content_position_json(position: &HarnessContentPosition) -> serde_json::Value {
+    json!({
+        "epoch": position.epoch,
+        "sequence": position.sequence,
+        "projectedAt": position.projected_at.as_ref().map(|value| json!({
+            "seconds": value.seconds,
+            "nanos": value.nanos,
+        })),
+    })
+}
+
+fn content_record_json(record: &HarnessContentRecordView) -> serde_json::Value {
+    let payload = match record.payload.as_ref() {
+        Some(harness_content_record_view::Payload::AssistantText(value)) => json!({
+            "kind": "assistant_text",
+            "safeMessageId": value.safe_message_id,
+            "revision": value.revision,
+            "previousRevision": value.previous_revision,
+            "operation": ContentMutationOperation::try_from(value.operation)
+                .map(|item| item.as_str_name())
+                .unwrap_or("CONTENT_MUTATION_OPERATION_UNKNOWN"),
+            "safeText": value.safe_text_utf8,
+            "safeCumulativeDigestSha256": value.safe_cumulative_digest_sha256,
+            "partIndex": value.part_index,
+            "partCount": value.part_count,
+            "provisional": value.provisional,
+        }),
+        Some(harness_content_record_view::Payload::Lifecycle(value)) => json!({
+            "kind": "lifecycle",
+            "lifecycle": LifecycleKind::try_from(value.kind)
+                .map(|item| item.as_str_name())
+                .unwrap_or("LIFECYCLE_KIND_UNKNOWN"),
+            "sideEffectCertainty": SideEffectCertainty::try_from(value.side_effect_certainty)
+                .map(|item| item.as_str_name())
+                .unwrap_or("SIDE_EFFECT_CERTAINTY_UNKNOWN"),
+            "nativeWillRetry": value.native_will_retry,
+        }),
+        Some(harness_content_record_view::Payload::Usage(value)) => json!({
+            "kind": "usage",
+            "inputTokens": value.input_tokens,
+            "outputTokens": value.output_tokens,
+            "cachedInputTokens": value.cached_input_tokens,
+        }),
+        Some(harness_content_record_view::Payload::ApprovalRequired(_)) => json!({
+            "kind": "approval_required",
+        }),
+        Some(harness_content_record_view::Payload::ArtifactRelation(value)) => {
+            let visibility = match value.visibility.as_ref() {
+                Some(harness_artifact_relation_view::Visibility::Available(artifact)) => json!({
+                    "kind": "available",
+                    "artifactId": artifact.artifact_id,
+                    "artifactDigestSha256": artifact.artifact_digest_sha256,
+                }),
+                Some(harness_artifact_relation_view::Visibility::AvailableRedacted(_)) => json!({
+                    "kind": "available_redacted",
+                }),
+                None => serde_json::Value::Null,
+            };
+            json!({
+                "kind": "artifact_relation",
+                "safeContentDiffersFromArtifact": value.safe_content_differs_from_artifact,
+                "visibility": visibility,
+            })
+        }
+        Some(harness_content_record_view::Payload::Marker(value)) => json!({
+            "kind": "marker",
+            "marker": HarnessContentMarkerKind::try_from(value.kind)
+                .map(|item| item.as_str_name())
+                .unwrap_or("HARNESS_CONTENT_MARKER_KIND_UNKNOWN"),
+            "limitKind": HarnessContentLimitKind::try_from(value.limit_kind)
+                .map(|item| item.as_str_name())
+                .unwrap_or("HARNESS_CONTENT_LIMIT_KIND_UNKNOWN"),
+        }),
+        None => serde_json::Value::Null,
+    };
+    json!({
+        "recordId": record.record_id,
+        "recordDigestSha256": record.record_digest_sha256,
+        "contentSequence": record.content_sequence,
+        "taskId": record.task_id,
+        "attemptId": record.attempt_id,
+        "source": {
+            "providerFamily": record.provider_family_alias,
+            "model": record.model_alias,
+            "collaborationRole": record.collaboration_role,
+        },
+        "disclosureProfile": record.disclosure_profile_ref.as_ref().map(|value| json!({
+            "contractId": value.contract_id,
+            "version": value.version,
+            "sha256": value.sha256,
+        })),
+        "projectedAt": record.projected_at.as_ref().map(|value| json!({
+            "seconds": value.seconds,
+            "nanos": value.nanos,
+        })),
+        "safetyFlags": record.safety_flags.iter().map(|raw| {
+            HarnessContentSafetyFlag::try_from(*raw)
+                .map(|value| value.as_str_name())
+                .unwrap_or("HARNESS_CONTENT_SAFETY_FLAG_UNKNOWN")
+        }).collect::<Vec<_>>(),
+        "payload": payload,
+    })
+}
+
+fn content_record_text(event: &str, record: &HarnessContentRecordView) -> String {
+    let source = format!(
+        "{}/{} role={} attempt={}",
+        record.provider_family_alias,
+        record.model_alias,
+        record.collaboration_role,
+        record.attempt_id
+    );
+    match record.payload.as_ref() {
+        Some(harness_content_record_view::Payload::AssistantText(value)) => format!(
+            "[{source} provisional={}] {event} seq={} revision={} operation={} part={}/{}\n{}",
+            value.provisional,
+            record.content_sequence,
+            value.revision,
+            ContentMutationOperation::try_from(value.operation)
+                .map(|item| item.as_str_name())
+                .unwrap_or("CONTENT_MUTATION_OPERATION_UNKNOWN"),
+            value.part_index + 1,
+            value.part_count,
+            value.safe_text_utf8,
+        ),
+        Some(harness_content_record_view::Payload::Lifecycle(value)) => format!(
+            "[{source}] {event} seq={} lifecycle={} side_effect_certainty={} retry={}",
+            record.content_sequence,
+            LifecycleKind::try_from(value.kind)
+                .map(|item| item.as_str_name())
+                .unwrap_or("LIFECYCLE_KIND_UNKNOWN"),
+            SideEffectCertainty::try_from(value.side_effect_certainty)
+                .map(|item| item.as_str_name())
+                .unwrap_or("SIDE_EFFECT_CERTAINTY_UNKNOWN"),
+            value
+                .native_will_retry
+                .map_or_else(|| "unknown".to_owned(), |retry| retry.to_string()),
+        ),
+        Some(harness_content_record_view::Payload::Usage(value)) => format!(
+            "[{source}] {event} seq={} usage input={} output={} cached={}",
+            record.content_sequence,
+            value.input_tokens,
+            value.output_tokens,
+            value
+                .cached_input_tokens
+                .map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string()),
+        ),
+        Some(harness_content_record_view::Payload::ApprovalRequired(_)) => format!(
+            "[{source}] {event} seq={} approval_required",
+            record.content_sequence
+        ),
+        Some(harness_content_record_view::Payload::ArtifactRelation(value)) => format!(
+            "[{source}] {event} seq={} artifact_relation differs={} visibility={}",
+            record.content_sequence,
+            value.safe_content_differs_from_artifact,
+            match value.visibility.as_ref() {
+                Some(harness_artifact_relation_view::Visibility::Available(artifact)) => {
+                    format!("available:{}", artifact.artifact_id)
+                }
+                Some(harness_artifact_relation_view::Visibility::AvailableRedacted(_)) => {
+                    "available_redacted".to_owned()
+                }
+                None => "unknown".to_owned(),
+            },
+        ),
+        Some(harness_content_record_view::Payload::Marker(value)) => format!(
+            "[{source}] {event} seq={} marker={} limit={}",
+            record.content_sequence,
+            HarnessContentMarkerKind::try_from(value.kind)
+                .map(|item| item.as_str_name())
+                .unwrap_or("HARNESS_CONTENT_MARKER_KIND_UNKNOWN"),
+            HarnessContentLimitKind::try_from(value.limit_kind)
+                .map(|item| item.as_str_name())
+                .unwrap_or("HARNESS_CONTENT_LIMIT_KIND_UNKNOWN"),
+        ),
+        None => format!(
+            "[{source}] {event} seq={} invalid_payload",
+            record.content_sequence
+        ),
+    }
+}
+
+fn harness_content_failure(error: ClientHarnessContentError) -> CliFailure {
+    match error {
+        ClientHarnessContentError::Transport(_) => CliFailure::stream_recovery(
+            "content.watch",
+            "Harness-content transport ended; rerun the command",
+        ),
+        ClientHarnessContentError::Kernel(KernelError::PermissionDenied(permission)) => {
+            CliFailure::permission("content.watch", permission)
+        }
+        ClientHarnessContentError::Kernel(KernelError::SessionUnavailable) => {
+            CliFailure::daemon_unavailable(
+                "Harness-content session is unavailable; rerun the command",
+            )
+            .for_operation("content.watch")
+        }
+        ClientHarnessContentError::Kernel(KernelError::SessionExpired) => {
+            CliFailure::content_session_changed()
+        }
+        ClientHarnessContentError::Api(error) => {
+            CliFailure::from_local_api_error(*error).for_operation("content.watch")
+        }
+        ClientHarnessContentError::UnexpectedEof => CliFailure::stream_recovery(
+            "content.watch",
+            "Harness-content watch ended unexpectedly; rerun the command",
+        ),
+        ClientHarnessContentError::ResetBarrier => CliFailure::content_reset_required(),
+        ClientHarnessContentError::BaselineLimitExceeded => {
+            CliFailure::protocol("Harness-content baseline exceeded its bounded page limit")
+                .for_operation("content.watch")
+        }
+        ClientHarnessContentError::InvalidInput(detail) => {
+            CliFailure::protocol(format!("invalid Harness-content filter: {detail}"))
+                .for_operation("content.watch")
+        }
+        ClientHarnessContentError::Protocol(_) | ClientHarnessContentError::Kernel(_) => {
+            CliFailure::protocol("Harness-content integrity validation failed")
+                .for_operation("content.watch")
+        }
+    }
 }
 
 async fn task(command: TaskCommandCli) -> Result<(), CliFailure> {

@@ -50,9 +50,9 @@ use zeroize::Zeroize;
 
 pub use store::CollaborationStoreInspection;
 use store::{
-    AttemptWrite, CollaborationCommit, CollaborationStore, OutboxWrite, PendingDispatchRecord,
-    PendingProjectionRecord, ProjectionBootstrapCandidate, ProjectionBootstrapWrite, RunWrite,
-    StepWrite, StoreError,
+    AttemptWrite, CollaborationCommit, CollaborationLineageStore, CollaborationStore, OutboxWrite,
+    PendingDispatchRecord, PendingProjectionRecord, ProjectionBootstrapCandidate,
+    ProjectionBootstrapWrite, RunWrite, StepWrite, StoreError,
 };
 
 const AUTHORITY_REF: &str = "agentosd:collaboration-control/v1";
@@ -95,6 +95,48 @@ pub struct CollaborationControlConfig {
     pub database_path: PathBuf,
     pub store_epoch: String,
     pub key: CollaborationSqlCipherKey,
+}
+
+pub struct CollaborationLineageReaderConfig {
+    pub database_path: PathBuf,
+    pub store_epoch: String,
+    pub key: CollaborationSqlCipherKey,
+}
+
+/// Read-only owner-module port for resolving Attempt-to-Task lineage. The
+/// SQLCipher connection is query-only and exposes no Collaboration snapshots
+/// or mutation capability to callers.
+pub struct CollaborationLineageReader {
+    store: CollaborationLineageStore,
+}
+
+impl CollaborationLineageReader {
+    pub fn open(
+        config: CollaborationLineageReaderConfig,
+    ) -> Result<Self, CollaborationControlError> {
+        if config.store_epoch.trim().is_empty() {
+            return Err(CollaborationControlError::Persistence);
+        }
+        Ok(Self {
+            store: CollaborationLineageStore::open(
+                &config.database_path,
+                &config.key.0,
+                &config.store_epoch,
+            )?,
+        })
+    }
+
+    pub fn task_id_for_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<String>, CollaborationControlError> {
+        if attempt_id.trim().is_empty() {
+            return Err(CollaborationControlError::Persistence);
+        }
+        self.store
+            .task_id_for_attempt(attempt_id)
+            .map_err(CollaborationControlError::from)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

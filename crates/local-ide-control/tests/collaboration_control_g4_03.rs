@@ -31,14 +31,14 @@ use egopulse_harness_adapter::{
 use egopulse_local_ide_control::collaboration_control::{
     AdapterBackedHarnessEvidenceResolver, ArtifactReturnSource,
     AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
-    CollaborationControlConfig, CollaborationControlError, CollaborationPrincipalKind,
-    CollaborationReferenceGuard, CollaborationSqlCipherKey, CompositeCollaborationGuard,
-    DELIVERY_OUTCOME_UNKNOWN_REASON_CODE, DispatchMaterial, GovernedHarnessDispatchRunner,
-    GovernedTaskActivationRunner, HarnessDispatchRunner, HarnessEvidenceResolver,
-    HarnessFactIngestionDisposition, HeldDispatchRecoveryState, LeaseAuthorization,
-    PendingArtifactReturn, ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
-    ResolvedHarnessEvidence, ResolvedStepReturn, SingleHarnessWorkConfig,
-    SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
+    CollaborationControlConfig, CollaborationControlError, CollaborationLineageReader,
+    CollaborationLineageReaderConfig, CollaborationPrincipalKind, CollaborationReferenceGuard,
+    CollaborationSqlCipherKey, CompositeCollaborationGuard, DELIVERY_OUTCOME_UNKNOWN_REASON_CODE,
+    DispatchMaterial, GovernedHarnessDispatchRunner, GovernedTaskActivationRunner,
+    HarnessDispatchRunner, HarnessEvidenceResolver, HarnessFactIngestionDisposition,
+    HeldDispatchRecoveryState, LeaseAuthorization, PendingArtifactReturn, ReferenceAuthorization,
+    ReferenceGuardRejection, ResolvedArtifactReturn, ResolvedHarnessEvidence, ResolvedStepReturn,
+    SingleHarnessWorkConfig, SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
     SingleHarnessWorkflowResolverError, TaskActivationGuardSet, TaskActivationHandoff,
     TaskActivationReferenceGuard, TaskActivationSource, TaskActivationSourceError,
     canonical_dispatch_fingerprint, canonical_request_digest, dispatch_pending, pump_observations,
@@ -2443,6 +2443,25 @@ fn single_harness_workflow_builds_run_attempt_lease_and_dispatch_outbox() {
     assert_eq!(result.envelope.dispatch_id, config.dispatch_id);
     assert_eq!(result.envelope.input_bundle_ref, "input-001");
     assert_eq!(result.envelope.input_bundle_sha256, "5".repeat(64));
+    let lineage_reader = CollaborationLineageReader::open(CollaborationLineageReaderConfig {
+        database_path: collaboration_store.database_path(),
+        store_epoch: STORE_EPOCH.to_owned(),
+        key: CollaborationSqlCipherKey::new(TEST_KEY),
+    })
+    .expect("open query-only Collaboration lineage reader");
+    assert_eq!(
+        lineage_reader
+            .task_id_for_attempt(&config.attempt_id)
+            .expect("resolve trusted Attempt lineage")
+            .as_deref(),
+        Some(task.task_id.as_str())
+    );
+    assert_eq!(
+        lineage_reader
+            .task_id_for_attempt("attempt-missing")
+            .expect("missing Attempt lineage is not fabricated"),
+        None
+    );
     assert_eq!(
         control
             .pending_dispatches(&harness_adapter())

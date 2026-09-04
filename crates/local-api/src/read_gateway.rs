@@ -16,13 +16,15 @@ use egopulse_domain_contracts::{
             GetEvidenceGraphRequest, GetEvidenceGraphResponse, GetHarnessApprovalViewRequest,
             GetHarnessApprovalViewResponse, GetProjectionStatusRequest,
             GetProjectionStatusResponse, GetTaskViewRequest, GetTaskViewResponse,
-            HarnessApprovalView, HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest,
-            ListHarnessApprovalViewsResponse, ListTaskViewsRequest, ListTaskViewsResponse,
-            LocalApiError, LocalApiErrorCode, ProjectionHealth, ProjectionMetadata,
-            ProjectionPosition, StreamFrameKind, TaskView, TaskViewStreamFrame,
-            WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, await_projection_response,
+            HarnessApprovalView, HarnessApprovalViewStreamFrame, HarnessContentBaselinePage,
+            HarnessContentPosition, HarnessContentStreamFrame, ListHarnessApprovalViewsRequest,
+            ListHarnessApprovalViewsResponse, ListHarnessContentRequest,
+            ListHarnessContentResponse, ListTaskViewsRequest, ListTaskViewsResponse, LocalApiError,
+            LocalApiErrorCode, ProjectionHealth, ProjectionMetadata, ProjectionPosition,
+            StreamFrameKind, TaskView, TaskViewStreamFrame, WatchHarnessApprovalViewsRequest,
+            WatchHarnessContentRequest, WatchTaskViewsRequest, await_projection_response,
             get_evidence_graph_response, get_harness_approval_view_response,
-            get_task_view_response,
+            get_task_view_response, harness_content_stream_frame, list_harness_content_response,
         },
         policy::v1::HarnessApprovalDecisionStateKind,
         task::v1::TaskStatus,
@@ -30,7 +32,9 @@ use egopulse_domain_contracts::{
 };
 use egopulse_local_ipc_platform::PeerConnectionInfo;
 use egopulse_local_read_model::{
-    ApprovalListFilter, ApprovalViewAccess, EvidenceGraphAccess, TaskListFilter, TaskViewAccess,
+    ApprovalListFilter, ApprovalViewAccess, EvidenceGraphAccess, HarnessContentBaselineQuery,
+    HarnessContentPageCursor, HarnessContentReadAccess, HarnessContentWatchQuery, TaskListFilter,
+    TaskViewAccess,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -40,12 +44,14 @@ use uuid::Uuid;
 use crate::{
     read_gateway_policy::ReadGatewayPolicy,
     read_model_reader::{
-        ProjectionCommitNotifier, ProjectionStatusReader, ReadModelAccessError, ReadModelReader,
-        ReadModelStatus,
+        FailClosedHarnessContentScopeReader, HarnessContentCommitNotifier,
+        HarnessContentScopeAccessError, HarnessContentScopeReader, ProjectionCommitNotifier,
+        ProjectionStatusReader, ReadModelAccessError, ReadModelReader, ReadModelStatus,
     },
     read_tokens::{
-        AwaitTarget, CursorAnchor, CursorCollection, CursorExpectation, CursorIssue, CursorSort,
-        ReadTokenCodec, ReadTokenError, ReadTokenScope, VerifiedCursor,
+        AwaitTarget, ContentCursorExpectation, ContentCursorIssue, CursorAnchor, CursorCollection,
+        CursorExpectation, CursorIssue, CursorSort, ReadTokenCodec, ReadTokenError, ReadTokenScope,
+        VerifiedCursor,
     },
     session::{AuthenticatedSession, SessionAuthenticationFailure, SessionRegistry},
 };
@@ -62,6 +68,8 @@ const RPC_LIST_TASKS: &str = "LocalReadModelService/ListTaskViews";
 const RPC_LIST_APPROVALS: &str = "LocalReadModelService/ListHarnessApprovalViews";
 const RPC_WATCH_TASKS: &str = "LocalReadModelService/WatchTaskViews";
 const RPC_WATCH_APPROVALS: &str = "LocalReadModelService/WatchHarnessApprovalViews";
+const RPC_LIST_CONTENT: &str = "LocalReadModelService/ListHarnessContent";
+const RPC_WATCH_CONTENT: &str = "LocalReadModelService/WatchHarnessContent";
 const RPC_AWAIT: &str = "LocalReadModelService/AwaitProjection";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +97,8 @@ pub struct ReadGatewayApplication {
     registry: Arc<SessionRegistry>,
     profiles: Arc<ContractProfiles>,
     reader: Arc<dyn ReadModelReader>,
+    content_scope_reader: Arc<dyn HarnessContentScopeReader>,
+    content_notifier: HarnessContentCommitNotifier,
     minimum_gate: MinimumPositionGate,
     token_codec: Arc<ReadTokenCodec>,
     audit: Arc<dyn ReadGatewayAuditSink>,
@@ -130,11 +140,41 @@ impl ReadGatewayApplication {
         token_codec: Arc<ReadTokenCodec>,
         audit: Arc<dyn ReadGatewayAuditSink>,
     ) -> Self {
+        Self::new_with_harness_content(
+            registry,
+            profiles,
+            reader,
+            notifier,
+            Arc::new(FailClosedHarnessContentScopeReader),
+            HarnessContentCommitNotifier::new(HarnessContentPosition {
+                epoch: "unconfigured-content-domain".to_owned(),
+                sequence: 0,
+                projected_at: None,
+            }),
+            token_codec,
+            audit,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_harness_content(
+        registry: Arc<SessionRegistry>,
+        profiles: Arc<ContractProfiles>,
+        reader: Arc<dyn ReadModelReader>,
+        notifier: ProjectionCommitNotifier,
+        content_scope_reader: Arc<dyn HarnessContentScopeReader>,
+        content_notifier: HarnessContentCommitNotifier,
+        token_codec: Arc<ReadTokenCodec>,
+        audit: Arc<dyn ReadGatewayAuditSink>,
+    ) -> Self {
         let minimum_gate = MinimumPositionGate::new(notifier, token_codec.policy());
         Self {
             registry,
             profiles,
             reader,
+            content_scope_reader,
+            content_notifier,
             minimum_gate,
             token_codec,
             audit,
@@ -733,6 +773,225 @@ impl ReadGatewayApplication {
         }
     }
 
+    pub async fn list_harness_content(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: ListHarnessContentRequest,
+    ) -> ListHarnessContentResponse {
+        let metadata = request.client.clone();
+        let correlation_id = correlation_id(metadata.as_ref());
+        let context = match self.authorize(peer, metadata.as_ref(), RPC_LIST_CONTENT) {
+            Ok(value) => value,
+            Err(failure) => return content_list_error(failure.into_error(correlation_id)),
+        };
+        if validate_identifier(&request.task_id).is_err() {
+            return content_list_error(api_error(
+                LocalApiErrorCode::InvalidArgument,
+                "invalid_content_task_id",
+                false,
+                None,
+                None,
+                correlation_id,
+            ));
+        }
+        let attempt_ids = match normalize_identifiers(&request.attempt_ids) {
+            Ok(value) => value,
+            Err(()) => {
+                return content_list_error(api_error(
+                    LocalApiErrorCode::InvalidArgument,
+                    "invalid_content_attempt_filter",
+                    false,
+                    None,
+                    None,
+                    correlation_id,
+                ));
+            }
+        };
+        if let Err(error) = self
+            .enforce_content_scope(
+                &context.session,
+                &request.task_id,
+                &attempt_ids,
+                &correlation_id,
+            )
+            .await
+        {
+            return content_list_error(*error);
+        }
+        let page_size = self
+            .token_codec
+            .policy()
+            .effective_harness_content_page_size(request.page_size);
+        let filter_sha256 = match digest_filter(&HarnessContentFilterMaterial {
+            task_id: &request.task_id,
+            attempt_ids: &attempt_ids,
+        }) {
+            Ok(value) => value,
+            Err(_) => {
+                return content_list_error(api_error(
+                    LocalApiErrorCode::IntegrityFailure,
+                    "content_filter_digest_failure",
+                    false,
+                    Some("RESTART_DAEMON"),
+                    None,
+                    correlation_id,
+                ));
+            }
+        };
+        let scope = match ReadTokenScope::from_session(&context.session) {
+            Ok(value) => value,
+            Err(error) => return content_list_error(token_error(error, correlation_id)),
+        };
+        let (snapshot_position, cursor) = match request.page_cursor.as_deref() {
+            None => {
+                if request.snapshot_position.is_some() {
+                    return content_list_error(api_error(
+                        LocalApiErrorCode::InvalidArgument,
+                        "content_first_page_snapshot_forbidden",
+                        false,
+                        Some("RESET_AND_REFETCH"),
+                        None,
+                        correlation_id,
+                    ));
+                }
+                (None, None)
+            }
+            Some(token) => {
+                let Some(visible_snapshot) = request.snapshot_position.as_ref() else {
+                    return content_list_error(api_error(
+                        LocalApiErrorCode::InvalidArgument,
+                        "content_snapshot_required_with_cursor",
+                        false,
+                        Some("RESET_AND_REFETCH"),
+                        None,
+                        correlation_id,
+                    ));
+                };
+                if validate_harness_content_position(visible_snapshot).is_err() {
+                    return content_list_error(api_error(
+                        LocalApiErrorCode::InvalidArgument,
+                        "invalid_content_snapshot_position",
+                        false,
+                        Some("RESET_AND_REFETCH"),
+                        None,
+                        correlation_id,
+                    ));
+                }
+                let status = match self.reader.harness_content_status().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return content_list_error(content_read_error(error, correlation_id));
+                    }
+                };
+                let verified = match self.token_codec.verify_content_cursor(
+                    token,
+                    &scope,
+                    &ContentCursorExpectation {
+                        filter_sha256: filter_sha256.clone(),
+                        effective_page_size: page_size,
+                        current_epoch: status.position.epoch,
+                        retention_floor: status.retention_floor.sequence,
+                    },
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return content_list_error(token_error(error, correlation_id)),
+                };
+                if visible_snapshot.epoch != verified.snapshot_epoch
+                    || visible_snapshot.sequence != verified.snapshot_sequence
+                    || visible_snapshot.projected_at != verified.snapshot_projected_at
+                {
+                    return content_list_error(api_error(
+                        LocalApiErrorCode::CursorInvalid,
+                        "content_visible_snapshot_binding_mismatch",
+                        false,
+                        Some("RESET_AND_REFETCH"),
+                        None,
+                        correlation_id,
+                    ));
+                }
+                (
+                    Some(visible_snapshot.clone()),
+                    Some(HarnessContentPageCursor::from_verified_parts(
+                        verified.snapshot_epoch,
+                        verified.snapshot_sequence,
+                        request.task_id.clone(),
+                        attempt_ids.clone(),
+                        verified.last_sequence,
+                    )),
+                )
+            }
+        };
+        let result = match self
+            .reader
+            .list_harness_content(
+                HarnessContentBaselineQuery {
+                    task_id: request.task_id.clone(),
+                    attempt_ids: attempt_ids.clone(),
+                    page_size,
+                    snapshot_position,
+                    cursor,
+                },
+                content_access(&context.session.permission_codes),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => return content_list_error(content_read_error(error, correlation_id)),
+        };
+        if result.has_more != result.next_cursor.is_some() {
+            return content_list_error(api_error(
+                LocalApiErrorCode::IntegrityFailure,
+                "content_page_continuation_integrity_failure",
+                false,
+                Some("REBUILD_PROJECTION"),
+                None,
+                correlation_id,
+            ));
+        }
+        let next_page_cursor = match result.next_cursor.as_ref() {
+            Some(cursor) => match self.token_codec.issue_content_cursor(
+                &scope,
+                ContentCursorIssue {
+                    filter_sha256,
+                    effective_page_size: page_size,
+                    snapshot_position: result.snapshot_position.clone(),
+                    last_sequence: cursor.last_sequence(),
+                },
+            ) {
+                Ok(value) => Some(value),
+                Err(error) => return content_list_error(token_error(error, correlation_id)),
+            },
+            None => None,
+        };
+        let final_context = match self.authorize(peer, metadata.as_ref(), RPC_LIST_CONTENT) {
+            Ok(value) => value,
+            Err(failure) => return content_list_error(failure.into_error(correlation_id)),
+        };
+        if let Err(error) = self
+            .enforce_content_scope(
+                &final_context.session,
+                &request.task_id,
+                &attempt_ids,
+                &correlation_id,
+            )
+            .await
+        {
+            return content_list_error(*error);
+        }
+        ListHarnessContentResponse {
+            outcome: Some(list_harness_content_response::Outcome::Page(
+                HarnessContentBaselinePage {
+                    records: result.records,
+                    next_page_cursor,
+                    has_more: result.has_more,
+                    snapshot_position: Some(result.snapshot_position),
+                    retained_from_sequence: result.retained_from_sequence,
+                    disclosure_profile_ref: Some(result.disclosure_profile_ref),
+                },
+            )),
+        }
+    }
+
     pub async fn get_projection_status(
         &self,
         peer: Option<&PeerConnectionInfo>,
@@ -1091,6 +1350,147 @@ impl ReadGatewayApplication {
         })
     }
 
+    pub async fn open_content_watch(
+        self: &Arc<Self>,
+        peer: PeerConnectionInfo,
+        request: WatchHarnessContentRequest,
+    ) -> Result<HarnessContentWatchSubscription, Box<LocalApiError>> {
+        let correlation_id = correlation_id(request.client.as_ref());
+        let context = self
+            .authorize(Some(&peer), request.client.as_ref(), RPC_WATCH_CONTENT)
+            .map_err(|failure| Box::new(failure.into_error(correlation_id.clone())))?;
+        if validate_identifier(&request.task_id).is_err() {
+            return Err(Box::new(api_error(
+                LocalApiErrorCode::InvalidArgument,
+                "invalid_content_task_id",
+                false,
+                None,
+                None,
+                correlation_id,
+            )));
+        }
+        let attempt_ids = normalize_identifiers(&request.attempt_ids).map_err(|()| {
+            Box::new(api_error(
+                LocalApiErrorCode::InvalidArgument,
+                "invalid_content_attempt_filter",
+                false,
+                None,
+                None,
+                correlation_id.clone(),
+            ))
+        })?;
+        let resume_after = request.resume_after.ok_or_else(|| {
+            Box::new(api_error(
+                LocalApiErrorCode::InvalidArgument,
+                "content_resume_position_required",
+                false,
+                Some("FETCH_BASELINE"),
+                None,
+                correlation_id.clone(),
+            ))
+        })?;
+        validate_harness_content_position(&resume_after).map_err(|()| {
+            Box::new(api_error(
+                LocalApiErrorCode::InvalidArgument,
+                "invalid_content_resume_position",
+                false,
+                Some("FETCH_BASELINE"),
+                None,
+                correlation_id.clone(),
+            ))
+        })?;
+        self.enforce_content_scope(
+            &context.session,
+            &request.task_id,
+            &attempt_ids,
+            &correlation_id,
+        )
+        .await?;
+        Ok(HarnessContentWatchSubscription {
+            app: Arc::clone(self),
+            peer,
+            metadata: request.client.ok_or_else(|| {
+                Box::new(api_error(
+                    LocalApiErrorCode::InvalidArgument,
+                    "invalid_client_metadata",
+                    false,
+                    None,
+                    None,
+                    correlation_id.clone(),
+                ))
+            })?,
+            task_id: request.task_id,
+            attempt_ids,
+            position: resume_after,
+            notifier: self.content_notifier.subscribe(),
+            next_heartbeat: Instant::now() + self.token_codec.policy().watch_heartbeat_interval(),
+            heartbeat_interval: self.token_codec.policy().watch_heartbeat_interval(),
+            terminated: false,
+        })
+    }
+
+    async fn enforce_content_scope(
+        &self,
+        session: &AuthenticatedSession,
+        task_id: &str,
+        attempt_ids: &[String],
+        correlation_id: &str,
+    ) -> Result<(), Box<LocalApiError>> {
+        let owner = self
+            .content_scope_reader
+            .task_owner_principal_id(task_id.to_owned())
+            .await
+            .map_err(|error| Box::new(content_scope_error(error, correlation_id.to_owned())))?;
+        let Some(owner) = owner else {
+            return Err(Box::new(api_error(
+                LocalApiErrorCode::NotFound,
+                "content_task_not_found",
+                false,
+                None,
+                None,
+                correlation_id.to_owned(),
+            )));
+        };
+        if owner != session.authenticated_principal_id {
+            return Err(Box::new(api_error(
+                LocalApiErrorCode::OwnerMismatch,
+                "content_task_owner_mismatch",
+                false,
+                None,
+                None,
+                correlation_id.to_owned(),
+            )));
+        }
+        for attempt_id in attempt_ids {
+            let attempt_task_id = self
+                .content_scope_reader
+                .task_id_for_attempt(attempt_id.clone())
+                .await
+                .map_err(|error| Box::new(content_scope_error(error, correlation_id.to_owned())))?;
+            let Some(attempt_task_id) = attempt_task_id else {
+                return Err(Box::new(api_error(
+                    LocalApiErrorCode::NotFound,
+                    "content_attempt_not_found",
+                    false,
+                    None,
+                    None,
+                    correlation_id.to_owned(),
+                )));
+            };
+            if attempt_task_id != task_id {
+                return Err(Box::new(api_error(
+                    LocalApiErrorCode::OwnerMismatch,
+                    "content_attempt_task_mismatch",
+                    false,
+                    None,
+                    None,
+                    correlation_id.to_owned(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn authorize(
         &self,
         peer: Option<&PeerConnectionInfo>,
@@ -1404,6 +1804,136 @@ impl ApprovalWatchSubscription {
     }
 }
 
+pub struct HarnessContentWatchSubscription {
+    app: Arc<ReadGatewayApplication>,
+    peer: PeerConnectionInfo,
+    metadata: ClientRequestMetadata,
+    task_id: String,
+    attempt_ids: Vec<String>,
+    position: HarnessContentPosition,
+    notifier: watch::Receiver<HarnessContentPosition>,
+    next_heartbeat: Instant,
+    heartbeat_interval: Duration,
+    terminated: bool,
+}
+
+impl HarnessContentWatchSubscription {
+    /// Returns at most one bounded frame for each downstream reservation.
+    /// Authorization and trusted Task/Attempt scope are checked once before
+    /// the read and again immediately before the frame is yielded.
+    pub async fn next_frame(
+        &mut self,
+    ) -> Result<Option<HarnessContentStreamFrame>, Box<LocalApiError>> {
+        loop {
+            if self.terminated {
+                return Ok(None);
+            }
+            let correlation_id = correlation_id(Some(&self.metadata));
+            let context = self
+                .app
+                .authorize(Some(&self.peer), Some(&self.metadata), RPC_WATCH_CONTENT)
+                .map_err(|failure| Box::new(failure.into_error(correlation_id.clone())))?;
+            self.app
+                .enforce_content_scope(
+                    &context.session,
+                    &self.task_id,
+                    &self.attempt_ids,
+                    &correlation_id,
+                )
+                .await?;
+            let mut result = self
+                .app
+                .reader
+                .watch_harness_content(
+                    HarnessContentWatchQuery {
+                        task_id: self.task_id.clone(),
+                        attempt_ids: self.attempt_ids.clone(),
+                        resume_after: self.position.clone(),
+                        max_frames: 1,
+                    },
+                    content_access(&context.session.permission_codes),
+                )
+                .await
+                .map_err(|error| Box::new(content_read_error(error, correlation_id.clone())))?;
+            if result.frames.len() != 1 {
+                return Err(Box::new(api_error(
+                    LocalApiErrorCode::IntegrityFailure,
+                    "content_watch_frame_count_invalid",
+                    false,
+                    Some("REBUILD_PROJECTION"),
+                    None,
+                    correlation_id,
+                )));
+            }
+            let frame = result.frames.remove(0);
+            let frame_position = frame.position.as_ref().ok_or_else(|| {
+                Box::new(api_error(
+                    LocalApiErrorCode::IntegrityFailure,
+                    "content_watch_position_missing",
+                    false,
+                    Some("REBUILD_PROJECTION"),
+                    None,
+                    correlation_id.clone(),
+                ))
+            })?;
+            if validate_harness_content_position(frame_position).is_err()
+                || frame_position != &result.observed_position
+            {
+                return Err(Box::new(api_error(
+                    LocalApiErrorCode::IntegrityFailure,
+                    "content_watch_position_integrity_failure",
+                    false,
+                    Some("REBUILD_PROJECTION"),
+                    None,
+                    correlation_id,
+                )));
+            }
+            let heartbeat = matches!(
+                frame.payload.as_ref(),
+                Some(harness_content_stream_frame::Payload::Heartbeat(_))
+            );
+            if heartbeat && Instant::now() < self.next_heartbeat {
+                self.position = result.observed_position;
+                let mut sleep = Box::pin(tokio::time::sleep_until(self.next_heartbeat));
+                tokio::select! {
+                    changed = self.notifier.changed() => {
+                        if changed.is_err() {
+                            return Ok(None);
+                        }
+                    }
+                    _ = &mut sleep => {}
+                }
+                continue;
+            }
+
+            // This is the capacity-one send reservation boundary. A grant or
+            // ownership change after this check can expose no more than this
+            // single already-bounded frame.
+            let final_context = self
+                .app
+                .authorize(Some(&self.peer), Some(&self.metadata), RPC_WATCH_CONTENT)
+                .map_err(|failure| Box::new(failure.into_error(correlation_id.clone())))?;
+            self.app
+                .enforce_content_scope(
+                    &final_context.session,
+                    &self.task_id,
+                    &self.attempt_ids,
+                    &correlation_id,
+                )
+                .await?;
+            self.position = result.observed_position;
+            self.next_heartbeat = Instant::now() + self.heartbeat_interval;
+            if matches!(
+                frame.payload.as_ref(),
+                Some(harness_content_stream_frame::Payload::ResetRequired(_))
+            ) {
+                self.terminated = true;
+            }
+            return Ok(Some(frame));
+        }
+    }
+}
+
 struct DeferredApiError {
     code: LocalApiErrorCode,
     fingerprint: &'static str,
@@ -1616,6 +2146,20 @@ fn validate_minimum_position(minimum: &ProjectionPosition) -> Result<(), Project
     }
 }
 
+fn validate_harness_content_position(position: &HarnessContentPosition) -> Result<(), ()> {
+    if position.epoch.trim().is_empty()
+        || position.epoch.len() > MAX_EPOCH_BYTES
+        || position.epoch.chars().any(char::is_control)
+        || position
+            .projected_at
+            .is_some_and(|value| value.seconds < 0 || !(0..1_000_000_000).contains(&value.nanos))
+    {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
 fn evaluate_status(
     status: &ReadModelStatus,
     minimum: Option<&ProjectionPosition>,
@@ -1699,6 +2243,13 @@ fn approval_access(permissions: &BTreeSet<String>) -> ApprovalViewAccess {
     ApprovalViewAccess {
         can_read: permissions.contains("local.approval.read"),
         can_decide: permissions.contains("local.approval.decide"),
+    }
+}
+
+fn content_access(permissions: &BTreeSet<String>) -> HarnessContentReadAccess {
+    HarnessContentReadAccess {
+        can_read_content: permissions.contains("local.harness.content.read"),
+        can_read_artifact_identity: permissions.contains("local.evidence.read"),
     }
 }
 
@@ -1822,6 +2373,73 @@ fn read_error_is_reset(error: &ReadModelAccessError) -> bool {
     )
 }
 
+fn content_read_error(error: ReadModelAccessError, correlation_id: String) -> LocalApiError {
+    use egopulse_local_read_model::ProjectionFailure;
+
+    let (code, fingerprint, retryable, action) = match error {
+        ReadModelAccessError::Projection(ProjectionFailure::PermissionDenied) => (
+            LocalApiErrorCode::PermissionDenied,
+            "content_read_permission_denied",
+            false,
+            None,
+        ),
+        ReadModelAccessError::Projection(ProjectionFailure::ContentCursorMismatch) => (
+            LocalApiErrorCode::CursorInvalid,
+            "content_cursor_invalid",
+            false,
+            Some("RESET_AND_REFETCH"),
+        ),
+        ReadModelAccessError::Projection(
+            ProjectionFailure::SnapshotEpochMismatch
+            | ProjectionFailure::SnapshotAhead
+            | ProjectionFailure::SnapshotBeforeRetention { .. }
+            | ProjectionFailure::ContentBaselineUnavailable,
+        ) => (
+            LocalApiErrorCode::ProjectionResetRequired,
+            "content_baseline_reset_required",
+            true,
+            Some("RESET_AND_REFETCH"),
+        ),
+        ReadModelAccessError::Unavailable => (
+            LocalApiErrorCode::AuthorityUnavailable,
+            "content_projection_reader_unavailable",
+            true,
+            Some("RETRY"),
+        ),
+        ReadModelAccessError::Projection(_) | ReadModelAccessError::WorkerFailed => (
+            LocalApiErrorCode::IntegrityFailure,
+            "content_projection_integrity_failure",
+            false,
+            Some("REBUILD_PROJECTION"),
+        ),
+    };
+    api_error(code, fingerprint, retryable, action, None, correlation_id)
+}
+
+fn content_scope_error(
+    error: HarnessContentScopeAccessError,
+    correlation_id: String,
+) -> LocalApiError {
+    match error {
+        HarnessContentScopeAccessError::Unavailable => api_error(
+            LocalApiErrorCode::AuthorityUnavailable,
+            "content_scope_source_unavailable",
+            true,
+            Some("RETRY"),
+            None,
+            correlation_id,
+        ),
+        HarnessContentScopeAccessError::Integrity => api_error(
+            LocalApiErrorCode::IntegrityFailure,
+            "content_scope_integrity_failure",
+            false,
+            Some("REPAIR_AUTHORITY"),
+            None,
+            correlation_id,
+        ),
+    }
+}
+
 fn token_error(error: ReadTokenError, correlation_id: String) -> LocalApiError {
     DeferredApiError::from_token(error).with_correlation(correlation_id)
 }
@@ -1917,6 +2535,12 @@ struct ApprovalFilterMaterial<'a> {
     decision_states: &'a [i32],
     task_ids: &'a [String],
     actionable_only: bool,
+}
+
+#[derive(Serialize)]
+struct HarnessContentFilterMaterial<'a> {
+    task_id: &'a str,
+    attempt_ids: &'a [String],
 }
 
 fn digest_filter(value: &impl Serialize) -> Result<String, serde_json::Error> {
@@ -2044,6 +2668,12 @@ fn approval_list_error(error: LocalApiError) -> ListHarnessApprovalViewsResponse
         next_page_cursor: None,
         snapshot_position: None,
         error: Some(error),
+    }
+}
+
+fn content_list_error(error: LocalApiError) -> ListHarnessContentResponse {
+    ListHarnessContentResponse {
+        outcome: Some(list_harness_content_response::Outcome::Error(error)),
     }
 }
 

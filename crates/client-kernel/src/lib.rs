@@ -1,5 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod harness_content;
+
+pub use harness_content::{
+    HarnessAssistantMessage, HarnessContentFrameApply, HarnessContentStreamTracker,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Deref,
@@ -464,6 +470,8 @@ pub enum KernelError {
     RefetchRequired,
     #[error("stream refetch was not requested")]
     RefetchNotRequired,
+    #[error("Harness content protocol is invalid: {0}")]
+    HarnessContentProtocol(&'static str),
 }
 
 #[must_use]

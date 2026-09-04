@@ -18,9 +18,9 @@ use crossterm::{
 use egopulse_client_operations::{
     ClientAttachment, ClientContextRevokeError, ClientReadError, ClientWorkError,
     ContextRevokeInput, GovernedHoldReason, GovernedProjectionReason, GovernedTaskState,
-    GuidedApprovalDecision, GuidedApprovalDecisionInput, PreparedContextRevoke,
-    attach as attach_client, command_metadata, set_task_digest, set_verdict_digest,
-    timestamp_after,
+    GuidedApprovalDecision, GuidedApprovalDecisionInput, HarnessContentFilter,
+    PreparedContextRevoke, attach as attach_client, command_metadata, set_task_digest,
+    set_verdict_digest, timestamp_after,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -58,6 +58,7 @@ use egopulse_tui::governed_state::{
     GovernedStateClient, GovernedStateController, GovernedStateControllerStartError,
     GovernedStatePageModel, GovernedStateStream, domain_label,
 };
+use egopulse_tui::harness_content::{HarnessContentController, render_harness_content_page};
 use egopulse_tui::result_review::{
     RESULT_REVIEW_NOTICE, ResultReviewController, ResultReviewPageModel, TaskResultReviewClient,
     TaskResultReviewFuture,
@@ -851,6 +852,7 @@ enum InteractiveMode {
     GovernedState,
     WorkStart,
     TaskWatch,
+    HarnessContent,
     ResultReview,
     ApprovalQueue,
     ApprovalDecisionModal(ApprovalDecisionModal),
@@ -876,6 +878,9 @@ enum InteractiveAction {
     OpenTaskWatch,
     RefetchTaskWatch,
     CloseTaskWatch,
+    OpenHarnessContent,
+    RefetchHarnessContent,
+    CloseHarnessContent,
     OpenResultReview,
     RefreshResultReview,
     CloseResultReview,
@@ -2592,12 +2597,14 @@ struct App {
     instance: String,
     client: Option<Arc<dyn InteractiveClient>>,
     governed_state_client: Option<Arc<AttachedClient>>,
+    content_attachment: Option<Arc<ClientAttachment>>,
     snapshot: Option<Snapshot>,
     panel: Panel,
     message: String,
     refresh_interval: Duration,
     mode: InteractiveMode,
     task_watch: Option<TaskWatchController<dyn InteractiveClient>>,
+    harness_content: Option<HarnessContentController>,
     approval_queue: Option<ApprovalQueueController<dyn InteractiveClient>>,
     result_review: Option<ResultReviewController<dyn InteractiveClient>>,
     work_start: Option<WorkStartController>,
@@ -2611,12 +2618,14 @@ impl App {
             instance,
             client: None,
             governed_state_client: None,
+            content_attachment: None,
             snapshot: None,
             panel: Panel::Tasks,
             message: "Connecting to local daemon…".to_owned(),
             refresh_interval: Duration::from_secs(2),
             mode: InteractiveMode::Dashboard,
             task_watch: None,
+            harness_content: None,
             approval_queue: None,
             result_review: None,
             work_start: None,
@@ -2748,6 +2757,17 @@ impl App {
             InteractiveMode::TaskWatch => match key.code {
                 KeyCode::Esc => Ok(Some(InteractiveAction::CloseTaskWatch)),
                 KeyCode::Char('r') => Ok(Some(InteractiveAction::RefetchTaskWatch)),
+                KeyCode::Char('h')
+                    if self.pending_task_watch_selection.is_none()
+                        && self
+                            .task_watch
+                            .as_ref()
+                            .and_then(|controller| controller.model())
+                            .and_then(|model| model.selected_task_id.as_ref())
+                            .is_some() =>
+                {
+                    Ok(Some(InteractiveAction::OpenHarnessContent))
+                }
                 KeyCode::Char('q') => Ok(Some(InteractiveAction::Quit)),
                 KeyCode::Up => {
                     if let Some(controller) = &mut self.task_watch {
@@ -2787,6 +2807,36 @@ impl App {
                 KeyCode::Enter if self.pending_task_watch_selection.is_some() => {
                     self.message = "Authority confirmed the Task, but its exact projection has not arrived; result review remains blocked"
                         .to_owned();
+                    Ok(None)
+                }
+                _ => Ok(None),
+            },
+            InteractiveMode::HarnessContent => match key.code {
+                KeyCode::Esc => Ok(Some(InteractiveAction::CloseHarnessContent)),
+                KeyCode::Char('r') => Ok(Some(InteractiveAction::RefetchHarnessContent)),
+                KeyCode::Char('q') => Ok(Some(InteractiveAction::Quit)),
+                KeyCode::Up => {
+                    if let Some(controller) = self.harness_content.as_mut() {
+                        controller.model_mut().select_previous();
+                    }
+                    Ok(None)
+                }
+                KeyCode::Down => {
+                    if let Some(controller) = self.harness_content.as_mut() {
+                        controller.model_mut().select_next();
+                    }
+                    Ok(None)
+                }
+                KeyCode::PageUp => {
+                    if let Some(controller) = self.harness_content.as_mut() {
+                        controller.model_mut().scroll_up(10);
+                    }
+                    Ok(None)
+                }
+                KeyCode::PageDown => {
+                    if let Some(controller) = self.harness_content.as_mut() {
+                        controller.model_mut().scroll_down(10);
+                    }
                     Ok(None)
                 }
                 _ => Ok(None),
@@ -3101,6 +3151,7 @@ impl App {
                 self.stop_governed_state().await;
                 self.client = None;
                 self.governed_state_client = None;
+                self.content_attachment = None;
             }
         }
     }
@@ -3114,6 +3165,7 @@ impl App {
     }
 
     fn install_attached_client(&mut self, client: AttachedClient) {
+        self.content_attachment = Some(Arc::clone(&client.0));
         let (interactive, governed_state) = shared_attached_client_pair(client);
         self.client = Some(interactive);
         self.governed_state_client = Some(governed_state);
@@ -3382,6 +3434,77 @@ impl App {
         }
     }
 
+    async fn start_harness_content(&mut self) -> Result<(), String> {
+        if self.work_start.is_some() {
+            return Err(
+                "Work Start recovery must be settled before opening Harness content".to_owned(),
+            );
+        }
+        let task_id = self
+            .task_watch
+            .as_ref()
+            .and_then(|controller| controller.model())
+            .and_then(|model| model.selected_task_id.clone())
+            .ok_or_else(|| "Select a Task before opening Harness content".to_owned())?;
+        self.start_harness_content_for_task(task_id).await
+    }
+
+    async fn start_harness_content_for_task(&mut self, task_id: String) -> Result<(), String> {
+        self.stop_task_watch().await;
+        self.stop_harness_content().await;
+        self.stop_approval_queue().await;
+        self.stop_result_review().await;
+        self.stop_governed_state().await;
+        self.ensure_task_watch_client().await?;
+        let filter = HarnessContentFilter::new(task_id.clone(), Vec::new())
+            .map_err(|error| error.to_string())?;
+        let client = Arc::clone(
+            self.content_attachment
+                .as_ref()
+                .expect("Harness content attachment is installed with the shared client"),
+        );
+        let controller = HarnessContentController::start(client, filter).map_err(str::to_owned)?;
+        self.message = controller.model().message.clone();
+        self.pending_task_watch_selection = Some(task_id);
+        self.harness_content = Some(controller);
+        self.mode = InteractiveMode::HarnessContent;
+        Ok(())
+    }
+
+    async fn refetch_harness_content(&mut self) -> Result<(), String> {
+        let task_id = self
+            .harness_content
+            .as_ref()
+            .map(|controller| controller.task_id().to_owned())
+            .ok_or_else(|| "Harness content controller is unavailable".to_owned())?;
+        self.start_harness_content_for_task(task_id).await
+    }
+
+    async fn stop_harness_content(&mut self) {
+        if let Some(mut controller) = self.harness_content.take() {
+            controller.stop().await;
+        }
+    }
+
+    fn apply_harness_content_events(&mut self) {
+        let Some(controller) = self.harness_content.as_mut() else {
+            self.message = "Harness content controller is unavailable".to_owned();
+            return;
+        };
+        controller.pump();
+        self.message = controller.model().message.clone();
+    }
+
+    async fn close_harness_content_to_task_watch(&mut self) -> Result<(), String> {
+        let task_id = self
+            .harness_content
+            .as_ref()
+            .map(|controller| controller.task_id().to_owned());
+        self.stop_harness_content().await;
+        self.pending_task_watch_selection = task_id;
+        self.start_task_watch().await
+    }
+
     async fn start_approval_queue(&mut self) -> Result<(), String> {
         if self.work_start.is_some() {
             return Err(
@@ -3627,6 +3750,19 @@ impl App {
                     );
                 }
             }
+            InteractiveMode::HarnessContent => match self.harness_content.as_ref() {
+                Some(controller) => render_harness_content_page(frame, body[1], controller.model()),
+                None => frame.render_widget(
+                    Paragraph::new("Harness content session is unavailable.")
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title("Harness Content"),
+                        )
+                        .wrap(Wrap { trim: true }),
+                    body[1],
+                ),
+            },
             InteractiveMode::WorkStart => match self.work_start.as_ref() {
                 Some(controller) => render_work_start_page(frame, body[1], controller.model()),
                 None => frame.render_widget(
@@ -3699,10 +3835,14 @@ impl App {
             ),
             InteractiveMode::TaskWatch => {
                 format!(
-                    "{} - Up/Down select - Enter review - Esc dashboard - r refetch - q quit",
+                    "{} - Up/Down select - h live content - Enter review - Esc dashboard - r refetch - q quit",
                     self.message
                 )
             }
+            InteractiveMode::HarnessContent => format!(
+                "{} - Up/Down lane - PgUp/PgDn scroll - r refetch - Esc Task Watch - q quit",
+                self.message
+            ),
             InteractiveMode::WorkStart => format!(
                 "{} - Tab/BackTab field - Enter advance - Esc governed back - q bounded close",
                 self.message
@@ -4434,6 +4574,7 @@ async fn finish_interactive_session<T>(
         return Err(app.message.clone());
     }
     app.stop_task_watch().await;
+    app.stop_harness_content().await;
     app.stop_approval_queue().await;
     app.stop_result_review().await;
     app.stop_governed_state().await;
@@ -4563,6 +4704,24 @@ async fn execute_interactive_action(
             app.refresh().await;
             *next_refresh = tokio::time::Instant::now() + app.refresh_interval;
         }
+        InteractiveAction::OpenHarnessContent => {
+            if let Err(error) = app.start_harness_content().await {
+                app.mode = InteractiveMode::Dashboard;
+                app.message = format!("Harness content unavailable: {error}");
+            }
+        }
+        InteractiveAction::RefetchHarnessContent => {
+            if let Err(error) = app.refetch_harness_content().await {
+                app.mode = InteractiveMode::Dashboard;
+                app.message = format!("Harness content unavailable: {error}");
+            }
+        }
+        InteractiveAction::CloseHarnessContent => {
+            if let Err(error) = app.close_harness_content_to_task_watch().await {
+                app.mode = InteractiveMode::Dashboard;
+                app.message = format!("Task Watch unavailable after Harness content: {error}");
+            }
+        }
         InteractiveAction::OpenResultReview => {
             if let Err(error) = app.start_result_review().await {
                 app.message = format!("Result review unavailable: {error}");
@@ -4611,6 +4770,7 @@ async fn execute_interactive_action(
                 return Ok(InteractiveLoopControl::Continue);
             }
             app.stop_task_watch().await;
+            app.stop_harness_content().await;
             app.stop_approval_queue().await;
             app.stop_result_review().await;
             app.stop_governed_state().await;
@@ -4669,6 +4829,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
             && let Err(error) = app.apply_task_watch_events().await
         {
             app.handle_task_watch_failure(error).await;
+        }
+        if matches!(app.mode, InteractiveMode::HarnessContent) {
+            app.apply_harness_content_events();
         }
         if matches!(app.mode, InteractiveMode::ResultReview) {
             app.pump_result_review_fail_closed().await;

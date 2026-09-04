@@ -321,6 +321,23 @@ impl TaskStore {
             .map_err(StoreError::from)
     }
 
+    pub fn task_owner_principal_id(&self, task_id: &str) -> Result<Option<String>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT authenticated_principal_id
+             FROM task_idempotency_results
+             WHERE task_id = ?1 AND operation = 'create_task'
+             ORDER BY authenticated_principal_id",
+        )?;
+        let owners = statement
+            .query_map([task_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        match owners.as_slice() {
+            [] => Ok(None),
+            [owner] if !owner.trim().is_empty() => Ok(Some(owner.clone())),
+            _ => Err(StoreError::IntegrityFailure),
+        }
+    }
+
     pub fn current_revision(&self, task_id: &str) -> Result<Option<u64>, StoreError> {
         self.connection
             .query_row(

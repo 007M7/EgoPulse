@@ -15,7 +15,8 @@ use futures_util::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::read_gateway::{
-    ApprovalWatchSubscription, ReadGatewayApplication, TaskWatchSubscription,
+    ApprovalWatchSubscription, HarnessContentWatchSubscription, ReadGatewayApplication,
+    TaskWatchSubscription,
 };
 
 pub struct LocalReadModelEndpoint {
@@ -103,9 +104,14 @@ impl LocalReadModelService for LocalReadModelEndpoint {
 
     async fn list_harness_content(
         &self,
-        _request: Request<ListHarnessContentRequest>,
+        request: Request<ListHarnessContentRequest>,
     ) -> Result<Response<ListHarnessContentResponse>, Status> {
-        Err(Status::unimplemented("r9c_contract_only"))
+        let peer = Self::peer(&request);
+        Ok(Response::new(
+            self.application
+                .list_harness_content(peer.as_ref(), request.into_inner())
+                .await,
+        ))
     }
 
     async fn get_projection_status(
@@ -176,9 +182,26 @@ impl LocalReadModelService for LocalReadModelEndpoint {
 
     async fn watch_harness_content(
         &self,
-        _request: Request<WatchHarnessContentRequest>,
+        request: Request<WatchHarnessContentRequest>,
     ) -> Result<Response<Self::WatchHarnessContentStream>, Status> {
-        Err(Status::unimplemented("r9c_contract_only"))
+        let peer =
+            Self::peer(&request).ok_or_else(|| Status::unauthenticated("peer_identity_missing"))?;
+        let subscription = self
+            .application
+            .open_content_watch(peer, request.into_inner())
+            .await
+            .map_err(|error| local_error_status(*error))?;
+        Ok(Response::new(Box::pin(futures_util::stream::unfold(
+            Some(subscription),
+            |state: Option<HarnessContentWatchSubscription>| async move {
+                let mut subscription = state?;
+                match subscription.next_frame().await {
+                    Ok(Some(frame)) => Some((Ok(frame), Some(subscription))),
+                    Ok(None) => None,
+                    Err(error) => Some((Err(local_error_status(*error)), None)),
+                }
+            },
+        ))))
     }
 
     async fn await_projection(

@@ -213,6 +213,19 @@ fn valid_create_duplicate_and_conflict_preserve_one_atomic_commit() {
     assert_eq!(snapshot.status, TaskStatus::Ready as i32);
     assert_eq!(snapshot.revision, 1);
     assert_eq!(snapshot.work_revision, 1);
+    assert_eq!(
+        authority
+            .task_owner_principal_id(&snapshot.task_id)
+            .expect("resolve immutable Task owner")
+            .as_deref(),
+        Some("founder:test")
+    );
+    assert_eq!(
+        authority
+            .task_owner_principal_id("task-missing")
+            .expect("missing Task owner is not fabricated"),
+        None
+    );
 
     let committed_counts = authority.inspect_store().expect("inspect committed store");
     assert_eq!(committed_counts.task_count, 1);

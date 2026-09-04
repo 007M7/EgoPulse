@@ -27,6 +27,15 @@ const SAFE_USAGE_DOMAIN: &str = "egopulse/harness-content/safe-usage/v1";
 const SAFE_APPROVAL_DOMAIN: &str = "egopulse/harness-content/safe-approval-required/v1";
 const SAFE_ARTIFACT_DOMAIN: &str = "egopulse/harness-content/safe-artifact-relation/v1";
 const SAFE_MARKER_DOMAIN: &str = "egopulse/harness-content/safe-marker/v1";
+const SAFE_CUMULATIVE_DOMAIN: &str = "egopulse/harness-content/safe-cumulative/v1";
+
+/// Recompute the public cumulative-text digest used by governed assistant
+/// records. Keeping this oracle beside the other frozen content identities
+/// prevents clients from inventing a surface-specific assembly rule.
+#[must_use]
+pub fn canonical_safe_cumulative_digest(safe_text: &str) -> String {
+    framed_digest(SAFE_CUMULATIVE_DOMAIN, safe_text.as_bytes())
+}
 
 /// Recompute the stable safe-record identifier from the frozen source/profile
 /// tuple and payload discriminator. Assistant parts add their zero-based part

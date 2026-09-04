@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -274,6 +274,59 @@ pub(super) struct ProjectionBootstrapWrite {
 pub(super) struct CollaborationStore {
     connection: Connection,
     store_epoch: String,
+}
+
+pub(super) struct CollaborationLineageStore {
+    connection: Connection,
+}
+
+impl CollaborationLineageStore {
+    pub fn open(path: &Path, key: &[u8; 32], store_epoch: &str) -> Result<Self, StoreError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.pragma_update(None, "key", format!("x'{}'", hex::encode(key)))?;
+        let cipher_version: String = connection
+            .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+            .map_err(|_| StoreError::CipherUnavailable)?;
+        if cipher_version.trim().is_empty() {
+            return Err(StoreError::CipherUnavailable);
+        }
+        connection.pragma_update(None, "query_only", "ON")?;
+        let schema_digest = hex::encode(Sha256::digest(
+            format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes(),
+        ));
+        let metadata: (String, String, String) = connection.query_row(
+            "SELECT store_epoch, schema_profile_id, schema_profile_sha256
+             FROM collaboration_store_metadata WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if metadata.0 != store_epoch
+            || metadata.1 != SCHEMA_PROFILE_ID
+            || metadata.2 != schema_digest
+        {
+            return Err(StoreError::StoreGenerationMismatch);
+        }
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(StoreError::IntegrityFailure);
+        }
+        Ok(Self { connection })
+    }
+
+    pub fn task_id_for_attempt(&self, attempt_id: &str) -> Result<Option<String>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT r.task_id
+                 FROM collaboration_attempts a
+                 JOIN collaboration_runs r ON r.run_id = a.run_id
+                 WHERE a.attempt_id = ?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
 }
 
 impl CollaborationStore {

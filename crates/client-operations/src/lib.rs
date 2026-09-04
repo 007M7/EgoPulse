@@ -12,6 +12,8 @@ mod governed_state;
 )]
 mod governed_state_driver;
 
+mod harness_content_driver;
+
 pub use governed_state::{
     GovernedApprovalDomainPosition, GovernedApprovalDomainState, GovernedApprovalState,
     GovernedStateComposite, GovernedStateDomain, GovernedStateDomainPhase, GovernedStateReason,
@@ -20,6 +22,10 @@ pub use governed_state::{
 pub use governed_state_driver::{
     GovernedStateSession, GovernedStateSessionStartError, GovernedStateShutdown,
     GovernedStateUpdate,
+};
+pub use harness_content_driver::{
+    ClientHarnessContentError, HarnessContentDriver, HarnessContentFilter, HarnessContentSession,
+    HarnessContentUpdate, HarnessContentUpdateKind,
 };
 
 use std::{

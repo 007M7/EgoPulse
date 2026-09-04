@@ -94,6 +94,26 @@ pub struct HarnessContentPageCursor {
 }
 
 impl HarnessContentPageCursor {
+    /// Rehydrates cursor material only after the Local API has verified its
+    /// integrity-protected token. The read model still rechecks every binding
+    /// against the fixed query snapshot before reading records.
+    #[must_use]
+    pub fn from_verified_parts(
+        epoch: String,
+        snapshot_sequence: u64,
+        task_id: String,
+        attempt_ids: Vec<String>,
+        last_sequence: u64,
+    ) -> Self {
+        Self {
+            epoch,
+            snapshot_sequence,
+            task_id,
+            attempt_ids,
+            last_sequence,
+        }
+    }
+
     #[must_use]
     pub fn last_sequence(&self) -> u64 {
         self.last_sequence
