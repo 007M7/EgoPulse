@@ -312,15 +312,20 @@ impl ProviderBootstrapProfile {
 /// This function only inspects the filesystem/PATH; it never starts a child
 /// process and therefore cannot be mistaken for a Provider capability probe.
 fn provider_executable_available(executable: &Path) -> bool {
+    resolve_provider_executable(executable).is_some()
+}
+
+fn resolve_provider_executable(executable: &Path) -> Option<PathBuf> {
     // An extension does not make a command an explicit path: `codex.cmd` is
     // still a valid PATH lookup on Windows. Only a path-like value should be
     // checked relative to the current filesystem location.
     if executable.components().count() > 1 {
-        return executable.is_file();
+        return executable
+            .is_file()
+            .then(|| fs::canonicalize(executable).ok())
+            .flatten();
     }
-    let Some(path_value) = std::env::var_os("PATH") else {
-        return false;
-    };
+    let path_value = std::env::var_os("PATH")?;
     let candidates =
         std::env::split_paths(&path_value).flat_map(|directory| {
             let direct = directory.join(executable);
@@ -339,7 +344,12 @@ fn provider_executable_available(executable: &Path) -> bool {
                 directory.join(format!("{}{}", executable.display(), extension))
             }))
         });
-    candidates.into_iter().any(|candidate| candidate.is_file())
+    candidates.into_iter().find_map(|candidate| {
+        candidate
+            .is_file()
+            .then(|| fs::canonicalize(candidate).ok())
+            .flatten()
+    })
 }
 
 fn validate_refreshed_model_identity(
@@ -469,7 +479,43 @@ impl ProductionBootstrapConfig {
     /// Opens every Authority exactly once and composes the first production
     /// vertical. Missing or invalid references fail before a serving daemon is
     /// built; no test resolver is used as a production fallback.
-    pub fn build(self) -> Result<DaemonProviders, ProductionBootstrapError> {
+    pub fn build(mut self) -> Result<DaemonProviders, ProductionBootstrapError> {
+        // User configuration may name an executable through PATH for setup
+        // convenience, but the supervised process boundary accepts only an
+        // exact absolute file. Resolve both copies before opening any Authority
+        // store and reject drift between the Provider profile and runtime block.
+        let codex_profile_index = self
+            .provider_profiles
+            .iter()
+            .position(|profile| {
+                profile.provider == ProviderId::Gpt
+                    && profile.harness == ProviderHarnessKind::CodexAppServer
+                    && profile.admission == ProviderAdmission::Production
+            })
+            .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_codex_route_binding",
+            ))?;
+        let profile_executable =
+            resolve_provider_executable(&self.provider_profiles[codex_profile_index].executable)
+                .ok_or_else(|| {
+                    ProductionBootstrapError::ProviderExecutableUnavailable(
+                        self.provider_profiles[codex_profile_index]
+                            .profile_id
+                            .clone(),
+                    )
+                })?;
+        let runtime_executable = resolve_provider_executable(&self.codex.codex_executable)
+            .ok_or_else(|| {
+                ProductionBootstrapError::ProviderExecutableUnavailable("codex.runtime".to_owned())
+            })?;
+        if profile_executable != runtime_executable {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_codex_binding",
+            ));
+        }
+        self.provider_profiles[codex_profile_index].executable = profile_executable;
+        self.codex.codex_executable = runtime_executable;
+
         let context_database_path = self
             .memory
             .database_path
@@ -2332,6 +2378,8 @@ pub enum ProductionBootstrapError {
     InvalidConfiguration(&'static str),
     #[error("required bootstrap secret is missing: {0}")]
     MissingSecret(String),
+    #[error("production Provider executable is unavailable: {0}")]
+    ProviderExecutableUnavailable(String),
     #[error("bootstrap secret is not a non-zero 32-byte hex value: {0}")]
     InvalidSecret(String),
     #[error("Task creation guard configuration is invalid")]
@@ -2380,6 +2428,20 @@ mod tests {
     use egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationBinding;
     use std::fs;
     use uuid::Uuid;
+
+    #[test]
+    fn provider_executable_resolution_produces_an_absolute_file_boundary() {
+        let current = std::env::current_exe().expect("current test executable");
+        let resolved = resolve_provider_executable(&current).expect("resolve current executable");
+        assert!(resolved.is_absolute());
+        assert!(resolved.is_file());
+
+        let missing = std::env::temp_dir().join(format!(
+            "egopulse-missing-provider-executable-{}",
+            Uuid::now_v7()
+        ));
+        assert_eq!(resolve_provider_executable(&missing), None);
+    }
 
     #[test]
     fn production_verification_boundary_denies_all_unreviewed_references() {

@@ -35,8 +35,12 @@ or Harness-owned delegated login. These are local readiness hints, not
 authenticated lifecycle or production-admission evidence.
 
 The installer requires Windows x64, Python/uv-compatible Memory Worker setup,
-and an installed `uv` command. If `uv` is absent, install it from
-`https://docs.astral.sh/uv/` first.
+an installed `uv` command, and the configured production Harness. The current
+production profile uses Codex app-server, so `codex` must resolve to a local
+application before installation can complete. If `uv` is absent, install it
+from `https://docs.astral.sh/uv/` first. A configured command is resolved to an
+absolute executable before daemon process supervision; an unavailable
+production Harness fails installation instead of surfacing on the first Task.
 
 After installation, open a new PowerShell window so the user environment is
 loaded and run:

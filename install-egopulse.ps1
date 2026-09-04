@@ -210,6 +210,15 @@ foreach ($profile in @($providerReport.provider_profiles)) {
         $profile.admission
     )
 }
+$productionProfiles = @($providerReport.provider_profiles | Where-Object { $_.admission -eq 'production' })
+if ($productionProfiles.Count -ne 1) {
+    throw "Expected exactly one production Provider profile, found $($productionProfiles.Count)."
+}
+$productionProfile = $productionProfiles[0]
+if (-not [bool]$productionProfile.executable_available) {
+    throw "Production Harness executable is unavailable for profile '$($productionProfile.profile_id)'. Install the configured Harness or update its executable before rerunning the installer."
+}
+Write-Output "production_provider_preflight=ready profile:$($productionProfile.profile_id)"
 
 if ($Launch) {
     $daemonProcess = Start-Process -FilePath $daemon -WorkingDirectory $root -WindowStyle Hidden -PassThru

@@ -137,6 +137,7 @@ try {
     Set-Item -Path 'Env:EGOPULSE_INSTALLER_TEST_KEY_SENTINEL' -Value $keySentinel
     $null = New-Item -ItemType Directory -Force -Path (Join-Path $packageRoot 'bin')
     $null = New-Item -ItemType Directory -Force -Path (Join-Path $packageRoot 'config')
+    $harnessBin = (New-Item -ItemType Directory -Force -Path (Join-Path $sandbox 'harness-bin')).FullName
     foreach ($binary in $requiredBinaries) {
         Copy-Item -LiteralPath (Join-Path $debugRoot $binary) -Destination (Join-Path $packageRoot "bin/$binary")
     }
@@ -148,12 +149,15 @@ try {
     Assert-Condition ($invalid.ExitCode -ne 0) 'invalid IpcInstance unexpectedly succeeded'
     Assert-Condition (-not (Test-Path -LiteralPath $invalidDataRoot)) 'invalid IpcInstance wrote DataRoot before validation failed'
 
+    Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32/where.exe') -Destination (Join-Path $harnessBin 'codex.exe')
+    $env:PATH = "$harnessBin;$env:PATH"
     $result = Invoke-HermeticInstaller -InstallerPath $installerPath -PackageRoot $packageRoot -DataRoot $dataRoot -IpcInstance $ipcInstance
     Assert-Condition ($result.ExitCode -eq 0) "installer failed: stdout=$($result.Stdout) stderr=$($result.Stderr)"
     Assert-Condition ($result.Stdout.Contains('agentosd configuration=passed stores_opened=false')) 'daemon configuration check success was not observed'
     Assert-Condition ($result.Stdout.Contains('uv=unavailable')) 'hermetic child did not prove uv was unavailable'
     Assert-Condition ($result.Stdout.Contains('process_authority_keys=preserved')) 'NoPersistEnvironment did not preserve inherited process-only Authority keys'
     Assert-Condition ($result.Stdout.Contains('egopulse_installation=passed')) 'installer success marker is missing'
+    Assert-Condition ($result.Stdout.Contains('production_provider_preflight=ready')) 'production Harness readiness was not enforced'
     Assert-Condition ($result.Stdout.Contains('environment=process-only')) 'process-only environment mode was not reported'
     Assert-Condition ($result.Stdout.Contains("ipc_instance=$ipcInstance")) 'requested IPC instance was not reported'
     Assert-Condition (-not $result.Stdout.Contains($keySentinel)) 'installer stdout leaked an authority key sentinel'

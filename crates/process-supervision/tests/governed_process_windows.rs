@@ -55,6 +55,17 @@ fn unique_pid_file(test_name: &str) -> PathBuf {
     ))
 }
 
+fn unique_command_file(test_name: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "egopulse-process-supervision-{test_name}-{}-{nonce}.cmd",
+        std::process::id()
+    ))
+}
+
 fn pid_writer_script(pid_file: &std::path::Path) -> String {
     let escaped = pid_file.to_string_lossy().replace('\'', "''");
     format!("Set-Content -NoNewline -LiteralPath '{escaped}' -Value $PID; Start-Sleep -Seconds 30")
@@ -112,6 +123,28 @@ async fn framed_process_accepts_one_real_response_frame() {
     .await
     .expect("framed worker succeeds");
     assert_eq!(receipt.stdout, b"ok");
+}
+
+#[tokio::test]
+async fn governed_process_starts_an_absolute_cmd_shim_with_minimal_environment() {
+    let command_file = unique_command_file("cmd-shim");
+    std::fs::write(&command_file, "@echo off\r\necho cmd-boundary-ok\r\n")
+        .expect("write command shim");
+    let executable = std::fs::canonicalize(&command_file).expect("canonical command shim");
+    let spec = SupervisedProcessSpec::new(
+        executable,
+        std::env::current_dir().expect("test working directory"),
+    )
+    .with_minimal_user_environment();
+
+    let result = run_governed_process(&spec, b"", budget(Duration::from_secs(5), 64)).await;
+    let _ = std::fs::remove_file(command_file);
+
+    let receipt = result.expect("absolute command shim succeeds");
+    assert_eq!(
+        String::from_utf8_lossy(&receipt.stdout).trim(),
+        "cmd-boundary-ok"
+    );
 }
 
 #[tokio::test]
