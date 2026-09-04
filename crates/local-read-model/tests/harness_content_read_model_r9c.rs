@@ -1179,6 +1179,111 @@ fn r9c_attempt_limit_blocks_only_its_attempt() {
 }
 
 #[test]
+fn r9c_limit_kind_index_drift_fails_closed_before_read_or_terminal_bypass() {
+    let read_root = TempRoot::new("limit-kind-index-drift-read");
+    let mut model = open(&read_root);
+    model
+        .apply_harness_content(&projection_input(
+            "limit-kind-index-drift-read-marker",
+            limit_marker_record(
+                721,
+                "task-limit-kind-index-drift-read",
+                "attempt-limit-kind-index-drift-read",
+                HarnessContentLimitKind::TaskRecords,
+            ),
+            1,
+        ))
+        .expect("commit canonical terminal marker");
+    drop(model);
+
+    let connection = mutable_fixture_connection(&read_root);
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE harness_content_records SET limit_kind=?1 WHERE task_id=?2",
+                params![
+                    HarnessContentLimitKind::Unspecified as i32,
+                    "task-limit-kind-index-drift-read"
+                ],
+            )
+            .expect("tamper derived limit-kind index"),
+        1
+    );
+    drop(connection);
+
+    let model = open(&read_root);
+    assert!(matches!(
+        model.list_harness_content(
+            &baseline_query(
+                "task-limit-kind-index-drift-read",
+                &["attempt-limit-kind-index-drift-read"],
+                10,
+            ),
+            read_access(),
+        ),
+        Err(ProjectionFailure::IntegrityFailure)
+    ));
+    assert_eq!(
+        model
+            .harness_content_health()
+            .expect("read fail-closed health"),
+        ProjectionHealth::IntegrityFailed
+    );
+
+    let append_root = TempRoot::new("limit-kind-index-drift-append");
+    let mut model = open(&append_root);
+    model
+        .apply_harness_content(&projection_input(
+            "limit-kind-index-drift-append-marker",
+            limit_marker_record(
+                722,
+                "task-limit-kind-index-drift-append",
+                "attempt-limit-kind-index-drift-append",
+                HarnessContentLimitKind::TaskRecords,
+            ),
+            1,
+        ))
+        .expect("commit second canonical terminal marker");
+    drop(model);
+
+    let connection = mutable_fixture_connection(&append_root);
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE harness_content_records SET limit_kind=?1 WHERE task_id=?2",
+                params![
+                    HarnessContentLimitKind::Unspecified as i32,
+                    "task-limit-kind-index-drift-append"
+                ],
+            )
+            .expect("tamper second derived limit-kind index"),
+        1
+    );
+    drop(connection);
+
+    let mut model = open(&append_root);
+    assert!(matches!(
+        model.apply_harness_content(&projection_input(
+            "limit-kind-index-drift-bypass",
+            usage_record(
+                723,
+                "task-limit-kind-index-drift-append",
+                "attempt-after-terminal",
+            ),
+            2,
+        )),
+        Err(ProjectionFailure::IntegrityFailure)
+    ));
+    assert_eq!(content_counts(&append_root), (1, 1));
+    assert_eq!(
+        model
+            .harness_content_health()
+            .expect("append fail-closed health"),
+        ProjectionHealth::IntegrityFailed
+    );
+}
+
+#[test]
 fn r9c_content_baseline_pagination_is_fixed_and_cursor_bound() {
     let root = TempRoot::new("fixed-pagination");
     let mut model = open(&root);

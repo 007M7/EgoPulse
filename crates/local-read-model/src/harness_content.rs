@@ -379,7 +379,7 @@ impl LocalReadModel {
         let allowed_attempts = attempt_ids.iter().cloned().collect::<BTreeSet<_>>();
         let mut statement = self.connection.prepare(
             "SELECT content_sequence,record_id,content_event_id,record_digest_sha256,
-                    task_id,attempt_id,disclosure_contract_id,
+                    task_id,attempt_id,limit_kind,disclosure_contract_id,
                     disclosure_contract_version,disclosure_profile_sha256,
                     safe_text_bytes,projected_at_seconds,projected_at_nanos,safe_record
              FROM harness_content_records
@@ -501,7 +501,7 @@ impl LocalReadModel {
         };
         let mut statement = self.connection.prepare(
             "SELECT content_sequence,record_id,content_event_id,record_digest_sha256,
-                    task_id,attempt_id,disclosure_contract_id,
+                    task_id,attempt_id,limit_kind,disclosure_contract_id,
                     disclosure_contract_version,disclosure_profile_sha256,
                     safe_text_bytes,projected_at_seconds,projected_at_nanos,safe_record
              FROM harness_content_records
@@ -785,26 +785,41 @@ fn enforce_not_after_terminal_limit(
     transaction: &Transaction<'_>,
     record: &SafeHarnessContentRecord,
 ) -> Result<(), ProjectionFailure> {
-    let terminal_exists: bool = transaction.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM harness_content_records
-           WHERE task_id=?1 AND (
-             limit_kind IN (?3,?4)
-             OR (attempt_id=?2 AND limit_kind IN (?5,?6))
-           )
-         )",
-        params![
-            record.task_id,
-            record.attempt_id,
-            HarnessContentLimitKind::TaskRecords as i32,
-            HarnessContentLimitKind::TaskTextBytes as i32,
-            HarnessContentLimitKind::AttemptRecords as i32,
-            HarnessContentLimitKind::AttemptTextBytes as i32,
-        ],
-        |row| row.get(0),
+    // `limit_kind` is a derived query index, never an authority fact. Scan the
+    // bounded Task history and compare it with the canonical record blob before
+    // using it to make the terminal-scope decision. This also detects a drift to
+    // UNSPECIFIED, which a predicate on the index column alone would miss.
+    let mut statement = transaction.prepare(
+        "SELECT attempt_id,limit_kind,safe_record
+         FROM harness_content_records WHERE task_id=?1",
     )?;
-    if terminal_exists {
-        return Err(ProjectionFailure::IntegrityFailure);
+    let mut rows = statement.query([&record.task_id])?;
+    while let Some(row) = rows.next()? {
+        let stored_attempt_id: String = row.get(0)?;
+        let stored_limit_kind: i32 = row.get(1)?;
+        let bytes: Vec<u8> = row.get(2)?;
+        let persisted = SafeHarnessContentRecord::decode(bytes.as_slice())
+            .map_err(|_| ProjectionFailure::IntegrityFailure)?;
+        validate_safe_record(&persisted).map_err(|_| ProjectionFailure::IntegrityFailure)?;
+        let canonical_limit_kind = content_limit_kind(&persisted)?;
+        if persisted.task_id != record.task_id
+            || persisted.attempt_id != stored_attempt_id
+            || canonical_limit_kind as i32 != stored_limit_kind
+        {
+            return Err(ProjectionFailure::IntegrityFailure);
+        }
+        let task_terminal = matches!(
+            canonical_limit_kind,
+            HarnessContentLimitKind::TaskRecords | HarnessContentLimitKind::TaskTextBytes
+        );
+        let attempt_terminal = persisted.attempt_id == record.attempt_id
+            && matches!(
+                canonical_limit_kind,
+                HarnessContentLimitKind::AttemptRecords | HarnessContentLimitKind::AttemptTextBytes
+            );
+        if task_terminal || attempt_terminal {
+            return Err(ProjectionFailure::IntegrityFailure);
+        }
     }
     Ok(())
 }
@@ -1168,6 +1183,7 @@ struct PersistedRecord {
     record_digest_sha256: String,
     task_id: String,
     attempt_id: String,
+    limit_kind: i32,
     contract_id: String,
     contract_version: String,
     profile_sha256: String,
@@ -1179,7 +1195,7 @@ struct PersistedRecord {
 impl PersistedRecord {
     fn from_row(row: &rusqlite::Row<'_>) -> Result<Self, ProjectionFailure> {
         let sequence = row.get::<_, i64>(0)?;
-        let safe_text_bytes = row.get::<_, i64>(9)?;
+        let safe_text_bytes = row.get::<_, i64>(10)?;
         if sequence < 1 || safe_text_bytes < 0 {
             return Err(ProjectionFailure::IntegrityFailure);
         }
@@ -1193,15 +1209,16 @@ impl PersistedRecord {
             record_digest_sha256: row.get(3)?,
             task_id: row.get(4)?,
             attempt_id: row.get(5)?,
-            contract_id: row.get(6)?,
-            contract_version: row.get(7)?,
-            profile_sha256: row.get(8)?,
+            limit_kind: row.get(6)?,
+            contract_id: row.get(7)?,
+            contract_version: row.get(8)?,
+            profile_sha256: row.get(9)?,
             safe_text_bytes: safe_text_bytes as usize,
             projected_at: Timestamp {
-                seconds: row.get(10)?,
-                nanos: row.get(11)?,
+                seconds: row.get(11)?,
+                nanos: row.get(12)?,
             },
-            bytes: row.get(12)?,
+            bytes: row.get(13)?,
         })
     }
 
@@ -1222,6 +1239,7 @@ impl PersistedRecord {
             || record.record_digest_sha256 != self.record_digest_sha256
             || record.task_id != self.task_id
             || record.attempt_id != self.attempt_id
+            || content_limit_kind(&record)? as i32 != self.limit_kind
             || profile.contract_id != self.contract_id
             || profile.version != self.contract_version
             || profile.sha256 != self.profile_sha256
