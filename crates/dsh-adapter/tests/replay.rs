@@ -91,6 +91,19 @@ async fn dsh_replay_driver_emits_terminal_lifecycle() {
         harness_observation::Payload::Lifecycle(value)
             if value.kind == LifecycleKind::ExecutionCompleted as i32
     ));
+    let output = driver
+        .take_terminal_output_candidate(&envelope)
+        .await
+        .expect("terminal output candidate")
+        .expect("completed replay must expose committed output");
+    assert!(!output.content.is_empty());
+    assert!(
+        driver
+            .take_terminal_output_candidate(&envelope)
+            .await
+            .expect("terminal output candidate replay")
+            .is_none()
+    );
     assert!(
         driver
             .next_event(&envelope)
@@ -145,6 +158,21 @@ async fn dsh_replay_driver_sends_native_cancel_and_observes_interruption() {
         harness_observation::Payload::Lifecycle(value)
             if value.kind == LifecycleKind::ExecutionInterrupted as i32
     ));
+    assert!(
+        driver
+            .next_event(&envelope)
+            .await
+            .expect("cancelled dispatch must remain drained")
+            .is_none()
+    );
+    assert!(
+        driver
+            .take_terminal_output_candidate(&envelope)
+            .await
+            .expect("cancelled output eligibility check")
+            .is_none(),
+        "cancelled partial output must never become an Artifact candidate"
+    );
     let _ = std::fs::remove_dir_all(home);
 }
 

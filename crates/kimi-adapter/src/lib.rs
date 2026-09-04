@@ -136,6 +136,10 @@ pub struct KimiAcpDriver {
     config: KimiAcpConfig,
     session: Option<KimiSession>,
     active: Option<ActiveDispatch>,
+    /// Any native terminal response closes event polling for this dispatch.
+    /// Successful completion is tracked separately so cancellation and
+    /// failure cannot expose partial text as a terminal Artifact candidate.
+    terminal_dispatch_id: Option<String>,
     completed_dispatch_id: Option<String>,
     pending_approvals: HashMap<String, PendingApproval>,
 }
@@ -147,9 +151,16 @@ impl KimiAcpDriver {
             config,
             session: None,
             active: None,
+            terminal_dispatch_id: None,
             completed_dispatch_id: None,
             pending_approvals: HashMap::new(),
         }
+    }
+
+    fn record_terminal_dispatch(&mut self, dispatch_id: &str, kind: LifecycleKind) {
+        self.terminal_dispatch_id = Some(dispatch_id.to_owned());
+        self.completed_dispatch_id =
+            (kind == LifecycleKind::ExecutionCompleted).then(|| dispatch_id.to_owned());
     }
 
     /// Performs the ACP initialize plus empty-session setup probe. It does not
@@ -265,7 +276,7 @@ impl NativeHarnessDriver for KimiAcpDriver {
     ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
         Box::pin(async move {
             if self.active.is_some()
-                && self.completed_dispatch_id.as_deref()
+                && self.terminal_dispatch_id.as_deref()
                     != self.active.as_ref().map(|value| value.dispatch_id.as_str())
             {
                 return Err(dependency_error("KIMI_ACP_ACTIVE_DISPATCH_EXISTS"));
@@ -298,6 +309,7 @@ impl NativeHarnessDriver for KimiAcpDriver {
                 output_text: String::new(),
                 output_candidate_taken: false,
             });
+            self.terminal_dispatch_id = None;
             self.completed_dispatch_id = None;
             Ok(DriverDelivery {
                 native_request_ref: format!("kimi-acp-jsonrpc:{request_id}"),
@@ -313,7 +325,7 @@ impl NativeHarnessDriver for KimiAcpDriver {
         envelope: &'a DispatchEnvelope,
     ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
         Box::pin(async move {
-            if self.completed_dispatch_id.as_deref() == Some(envelope.dispatch_id.as_str()) {
+            if self.terminal_dispatch_id.as_deref() == Some(envelope.dispatch_id.as_str()) {
                 return Ok(None);
             }
             if !self.pending_approvals.is_empty() {
@@ -379,13 +391,17 @@ impl NativeHarnessDriver for KimiAcpDriver {
                                 (LifecycleKind::ExecutionInterrupted, "cancelled")
                             }
                             _ => {
+                                self.record_terminal_dispatch(
+                                    &dispatch_id,
+                                    LifecycleKind::ExecutionFailed,
+                                );
                                 return Err(driver_error(
                                     "KIMI_ACP_TERMINAL_STATUS_UNKNOWN",
                                     line.as_bytes(),
                                 ));
                             }
                         };
-                        self.completed_dispatch_id = Some(dispatch_id);
+                        self.record_terminal_dispatch(&dispatch_id, kind);
                         return Ok(Some(lifecycle_event(
                             "session/prompt",
                             kind,
@@ -396,7 +412,7 @@ impl NativeHarnessDriver for KimiAcpDriver {
                     acp::KimiAcpMessage::Response(acp::KimiAcpResponse::Error { id, .. })
                         if id.as_ref().and_then(Value::as_u64) == Some(prompt_request_id) =>
                     {
-                        self.completed_dispatch_id = Some(dispatch_id);
+                        self.record_terminal_dispatch(&dispatch_id, LifecycleKind::ExecutionFailed);
                         return Ok(Some(lifecycle_event(
                             "session/prompt",
                             LifecycleKind::ExecutionFailed,
@@ -1461,5 +1477,77 @@ mod tests {
             ReconciliationFinding::OutcomeUnknown { evidence_ref }
                 if evidence_ref == KIMI_NATIVE_RECOVERY_NO_SESSION_REF
         ));
+    }
+
+    #[tokio::test]
+    async fn successful_output_is_one_shot_but_non_success_output_is_ineligible() {
+        let dispatch_id = "dispatch:kimi-success";
+        let mut successful = KimiAcpDriver::new(KimiAcpConfig::new(
+            r"C:\kimi.exe",
+            std::env::current_dir().expect("cwd"),
+        ));
+        successful.active = Some(ActiveDispatch {
+            dispatch_id: dispatch_id.to_owned(),
+            native_session_ref: "kimi-session-success".to_owned(),
+            prompt_request_id: 43,
+            output_text: "committed answer".to_owned(),
+            output_candidate_taken: false,
+        });
+        successful.record_terminal_dispatch(dispatch_id, LifecycleKind::ExecutionCompleted);
+        let envelope = DispatchEnvelope {
+            dispatch_id: dispatch_id.to_owned(),
+            ..DispatchEnvelope::default()
+        };
+        let candidate = successful
+            .take_terminal_output_candidate(&envelope)
+            .await
+            .expect("successful candidate extraction")
+            .expect("successful output must be collectable");
+        assert_eq!(candidate.content, b"committed answer");
+        assert!(
+            successful
+                .take_terminal_output_candidate(&envelope)
+                .await
+                .expect("successful candidate replay")
+                .is_none()
+        );
+
+        for kind in [
+            LifecycleKind::ExecutionInterrupted,
+            LifecycleKind::ExecutionFailed,
+        ] {
+            let dispatch_id = format!("dispatch:kimi-non-success-{kind:?}");
+            let mut driver = KimiAcpDriver::new(KimiAcpConfig::new(
+                r"C:\kimi.exe",
+                std::env::current_dir().expect("cwd"),
+            ));
+            driver.active = Some(ActiveDispatch {
+                dispatch_id: dispatch_id.clone(),
+                native_session_ref: "kimi-session-non-success".to_owned(),
+                prompt_request_id: 44,
+                output_text: "partial output must not become an Artifact".to_owned(),
+                output_candidate_taken: false,
+            });
+            driver.record_terminal_dispatch(&dispatch_id, kind);
+            let envelope = DispatchEnvelope {
+                dispatch_id,
+                ..DispatchEnvelope::default()
+            };
+
+            assert!(
+                driver
+                    .next_event(&envelope)
+                    .await
+                    .expect("terminal dispatch must drain without another native read")
+                    .is_none()
+            );
+            assert!(
+                driver
+                    .take_terminal_output_candidate(&envelope)
+                    .await
+                    .expect("non-success candidate check")
+                    .is_none()
+            );
+        }
     }
 }
