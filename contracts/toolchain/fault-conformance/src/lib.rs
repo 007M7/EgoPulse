@@ -4,6 +4,7 @@ pub mod memory_restart_oracle;
 pub mod r8b2c;
 pub mod r9a3;
 pub mod r9a3_context;
+pub mod r9b_governed_state;
 pub mod u03c_result_review;
 pub mod u04c_work_start;
 

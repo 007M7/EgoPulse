@@ -107,6 +107,8 @@ pub struct TaskDurabilitySnapshot {
     pub idempotency_count: u64,
     pub outbox_count: u64,
     pub cross_authority_outbox_count: u64,
+    pub pending_local_read_model_outbox_count: u64,
+    pub pending_founder_verdict_cross_outbox_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,6 +120,7 @@ pub struct CollaborationDurabilitySnapshot {
     pub event_count: u64,
     pub idempotency_count: u64,
     pub outbox_count: u64,
+    pub pending_local_read_model_outbox_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +134,7 @@ pub struct ArtifactDurabilitySnapshot {
     pub event_count: u64,
     pub idempotency_count: u64,
     pub outbox_count: u64,
+    pub pending_local_read_model_outbox_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,6 +147,7 @@ pub struct VerificationDurabilitySnapshot {
     pub event_count: u64,
     pub idempotency_count: u64,
     pub outbox_count: u64,
+    pub pending_local_read_model_outbox_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,6 +159,7 @@ pub struct VerdictDurabilitySnapshot {
     pub idempotency_count: u64,
     pub outbox_count: u64,
     pub consumption_receipt_count: u64,
+    pub pending_projection_outbox_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -408,6 +414,11 @@ fn count(tx: &Transaction<'_>, table: &str) -> FaultConformanceResult<u64> {
     u64::try_from(value).map_err(|_| FaultConformanceError::invariant("negative U-03c row count"))
 }
 
+fn count_query(tx: &Transaction<'_>, sql: &str) -> FaultConformanceResult<u64> {
+    let value: i64 = tx.query_row(sql, [], |row| row.get(0))?;
+    u64::try_from(value).map_err(|_| FaultConformanceError::invariant("negative pending row count"))
+}
+
 fn require_sequence(
     metadata: &OwnerMetadata,
     tx: &Transaction<'_>,
@@ -450,6 +461,14 @@ fn read_task(
         idempotency_count: count(&tx, "task_idempotency_results")?,
         outbox_count: count(&tx, "task_outbox")?,
         cross_authority_outbox_count: count(&tx, "task_cross_authority_outbox")?,
+        pending_local_read_model_outbox_count: count_query(
+            &tx,
+            "SELECT count(*) FROM task_outbox WHERE destination_domain='local-read-model' AND delivery_state='pending'",
+        )?,
+        pending_founder_verdict_cross_outbox_count: count_query(
+            &tx,
+            "SELECT count(*) FROM task_cross_authority_outbox WHERE destination_domain='founder-verdict-authority' AND delivery_state='pending'",
+        )?,
         metadata,
     };
     tx.commit()?;
@@ -489,6 +508,10 @@ fn read_collaboration(
         event_count: count(&tx, "collaboration_events")?,
         idempotency_count: count(&tx, "collaboration_idempotency_results")?,
         outbox_count: count(&tx, "collaboration_outbox")?,
+        pending_local_read_model_outbox_count: count_query(
+            &tx,
+            "SELECT count(*) FROM collaboration_outbox WHERE destination_domain='local-read-model' AND payload_kind='collaboration-snapshot-v1' AND delivery_state='pending'",
+        )?,
         metadata,
     };
     tx.commit()?;
@@ -539,6 +562,10 @@ fn read_artifact(
         event_count: count(&tx, "artifact_events")?,
         idempotency_count: count(&tx, "artifact_idempotency_results")?,
         outbox_count: count(&tx, "artifact_outbox")?,
+        pending_local_read_model_outbox_count: count_query(
+            &tx,
+            "SELECT count(*) FROM artifact_outbox WHERE destination_domain='local-read-model' AND delivery_state='pending'",
+        )?,
         metadata,
     };
     tx.commit()?;
@@ -586,6 +613,10 @@ fn read_verification(
         event_count: count(&tx, "verification_events")?,
         idempotency_count: count(&tx, "verification_idempotency_results")?,
         outbox_count: count(&tx, "verification_outbox")?,
+        pending_local_read_model_outbox_count: count_query(
+            &tx,
+            "SELECT count(*) FROM verification_outbox WHERE destination_domain='local-read-model' AND delivery_state='pending'",
+        )?,
         metadata,
     };
     tx.commit()?;
@@ -623,6 +654,10 @@ fn read_verdict(
         idempotency_count: count(&tx, "verdict_idempotency_results")?,
         outbox_count: count(&tx, "verdict_outbox")?,
         consumption_receipt_count: count(&tx, "verdict_consumption_receipts")?,
+        pending_projection_outbox_count: count_query(
+            &tx,
+            "SELECT count(*) FROM verdict_projection_outbox WHERE delivery_state='pending'",
+        )?,
         metadata,
     };
     tx.commit()?;

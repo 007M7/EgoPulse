@@ -1061,7 +1061,7 @@
     },
     {
       "path": "toolchain/fault-conformance/src/lib.rs",
-      "sha256": "21341931cc0c4d198c159ebdea4edca40e89db90beb5be1dae7b06ea42fe9600"
+      "sha256": "c81fc41df1bca834b14aaca49487c27583fa09b834816095af3779f0dd0957e4"
     },
     {
       "path": "toolchain/fault-conformance/src/main.rs",
@@ -1084,8 +1084,12 @@
       "sha256": "c5405236b55f44a33978ad04ac5d41ab20d3ff93680244a74373b4469a481ffa"
     },
     {
+      "path": "toolchain/fault-conformance/src/r9b_governed_state.rs",
+      "sha256": "2b258d20f922de2c74b0e2dffc76c66cd279a613617d55d8fe60899fe5f78193"
+    },
+    {
       "path": "toolchain/fault-conformance/src/u03c_result_review.rs",
-      "sha256": "ab5fff1b7f0d316f3f5979f4baed33325e1ca8a39710266f4a4f157a655e29f9"
+      "sha256": "27f07a4d8b055abbeb9c90d1744b04ff69e6f234de73040d1c95ad00d714c913"
     },
     {
       "path": "toolchain/fault-conformance/src/u04c_work_start.rs",

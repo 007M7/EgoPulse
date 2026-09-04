@@ -12,7 +12,7 @@ use std::{
     process::{Command as StdCommand, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -26,8 +26,8 @@ use egopulse_agentosd::{
     ConfiguredWorkPreparationPort, ContextMutationPortAdapter, DaemonComposition, DaemonConfig,
     DaemonProviders, DenyVerificationReferences, GovernedReturnCollectorConfig,
     MemoryRetrievalCompositionConfig, NativeHarnessCompositionConfig, OwnerProjectionSource,
-    PendingOwnerProjection, ProjectionSourceFailure, SharedAuthorityCompositionInputs,
-    VerificationProjectionSource,
+    PendingOwnerProjection, ProjectionPump, ProjectionSourceFailure,
+    SharedAuthorityCompositionInputs, VerificationProjectionSource,
 };
 use egopulse_artifact_authority::{
     ArtifactAuthority, ArtifactAuthorityConfig, ArtifactPrincipalKind, ArtifactSqlCipherKey,
@@ -38,8 +38,8 @@ use egopulse_client_kernel::{
     ClientKernel, KernelError, api_contract_ref, authorization_contract_ref,
 };
 use egopulse_client_operations::{
-    ClientTaskResultReviewError, GuidedApprovalDecision, TaskResultReviewStage,
-    attach as attach_client_operation,
+    ClientTaskResultReviewError, GovernedStateDomain, GuidedApprovalDecision,
+    TaskResultReviewStage, attach as attach_client_operation,
 };
 use egopulse_codex_adapter::{CODEX_ADAPTER_ID, CODEX_CAPABILITY_PROFILE_ID, FakeCodexDriver};
 use egopulse_cognition_runtime::{
@@ -82,10 +82,13 @@ use egopulse_domain_contracts::v01::egopulse::{
         ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
     },
     localapi::v1::{
-        ClientSurface, ConfirmWorkRequest, ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest,
-        LocalApiErrorCode, MemoryMutationCommand, OpenSessionRequest, PrepareWorkRequest,
-        RetrieveMemoryRequest, WorkPreparationPreview,
-        local_session_service_client::LocalSessionServiceClient, memory_mutation_command,
+        ClientSurface, ConfirmWorkRequest, EvidenceGraphView, ExecuteMemoryMutationRequest,
+        ExecuteTaskCommandRequest, HarnessApprovalView, LocalApiErrorCode, MemoryMutationCommand,
+        OpenSessionRequest, PrepareWorkRequest, ProjectionPosition, RetrieveMemoryRequest,
+        SourceRevision, StreamFrameKind, TaskView, WorkPreparationPreview,
+        local_read_model_service_server::LocalReadModelServiceServer,
+        local_session_service_client::LocalSessionServiceClient,
+        local_session_service_server::LocalSessionServiceServer, memory_mutation_command,
         retrieve_memory_response,
     },
     policy::v1::{
@@ -123,13 +126,22 @@ use egopulse_harness_adapter::{
     ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
 };
 use egopulse_local_api::session::{
-    NoopSessionAuditSink, PrincipalGrant, PrincipalResolutionFailure, TrustedPrincipalResolver,
+    FixedProjectionPosition, LocalSessionEndpoint, NoopSessionAuditSink, PrincipalGrant,
+    PrincipalResolutionFailure, SessionConfig, TrustedPrincipalResolver,
 };
 use egopulse_local_api::{
     LocalApiClient,
     command_gateway::{
         CommandPortFailure, CommandPortResult, CommandPrincipal, WorkPreparationPort,
     },
+    read_gateway::{NoopReadGatewayAuditSink, ReadGatewayApplication},
+    read_gateway_policy::ReadGatewayPolicy,
+    read_model_reader::{
+        BlockingLocalReadModelReader, ProjectionCommitNotifier, ProjectionStatusReader,
+        ReadModelAccessError, ReadModelReader, ReadModelStatus,
+    },
+    read_service::LocalReadModelEndpoint,
+    read_tokens::{ReadTokenCodec, TokenMacKey},
 };
 use egopulse_local_ide_control::collaboration_control::{
     AuthenticatedCollaborationPrincipal, AuthorityClock, CollaborationControl,
@@ -140,7 +152,11 @@ use egopulse_local_ide_control::collaboration_control::{
     ResolvedHarnessEvidence, ResolvedStepReturn, SingleHarnessWorkConfig,
     canonical_dispatch_fingerprint,
 };
-use egopulse_local_ipc_platform::LocalIpcAddress;
+use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
+use egopulse_local_read_model::{
+    ApprovalListFilter, ApprovalViewAccess, EvidenceGraphAccess, HistoricalPage, LocalReadModel,
+    LocalReadModelConfig, LocalReadModelKey, StreamBatch, TaskListFilter, TaskViewAccess,
+};
 use egopulse_policy_decision_authority::{
     AuthenticatedPolicyPrincipal, PolicyAuthorityConfig, PolicyDecisionAuthority,
     PolicyPrincipalKind, PolicyReferenceRejection, PolicySqlCipherKey,
@@ -148,6 +164,7 @@ use egopulse_policy_decision_authority::{
 };
 use egopulse_tui::{
     approval_queue::ApprovalQueueController,
+    governed_state::{DomainView, GovernedStateController, GovernedStatePageModel},
     result_review::ResultReviewController,
     task_watch::{TaskWatchController, TaskWatchPhase},
     work_start::{WorkStartController, WorkStartStage},
@@ -169,6 +186,7 @@ use egopulse_v01_fault_conformance::r9a3_context::{
     R9a3ContextGovernanceState, R9a3VerdictAuthorityCounts, read_r9a3_context_authority_store,
     read_r9a3_verdict_authority_counts,
 };
+use egopulse_v01_fault_conformance::r9b_governed_state::read_r9b_governed_state_authorities;
 use egopulse_v01_fault_conformance::u03c_result_review::{
     ExpectedStoreProfile, GovernedResultDurabilitySnapshot, GovernedResultOracleRequest,
     discover_single_task_id, read_governed_result_durability,
@@ -191,6 +209,7 @@ use tokio::{
     process::{Child, Command},
     time::{sleep, timeout},
 };
+use tonic::transport::Server;
 use uuid::Uuid;
 
 const FIXTURE_ROOT_ENV: &str = "EGOPULSE_C5_FIXTURE_ROOT";
@@ -209,6 +228,23 @@ const R9A3E_REVOKED_READY_MODE: &str = "dynamic-r9a3e-revoked-ready";
 const U03C_RESULT_REVIEW_MODE: &str = "u03c-result-review";
 const U03C_RESULT_REVIEW_DENY_MODE: &str = "u03c-result-review-deny";
 const U03C_RESULT_REVIEW_STALE_MODE: &str = "u03c-result-review-stale";
+const R9B_GOVERNED_STATE_MODE: &str = "r9b-governed-state";
+const R9B_DENY_TASK_READ_MODE: &str = "r9b-deny-task-read";
+const R9B_DENY_APPROVAL_READ_MODE: &str = "r9b-deny-approval-read";
+const R9B_TASK_SINGLE_DISCONNECT_MODE: &str = "r9b-task-single-disconnect";
+const R9B_RETENTION_RESET_MODE: &str = "r9b-retention-reset";
+const R9B_TASK_READER_CALLS_FILE: &str = "r9b-task-reader-calls.log";
+const R9B_TASK_DISCONNECT_ARM_FILE: &str = "r9b-task-disconnect-arm";
+const R9B_APPROVAL_ADVANCE_FILE: &str = "r9b-approval-advance";
+const R9B_TASK_REBASELINE_RELEASE_FILE: &str = "r9b-task-rebaseline-release";
+const R9B_ADVANCED_APPROVAL_ID: &str = "approval-r9b-task-disconnect";
+const R9B_RETENTION_WITNESS_FILE: &str = "r9b-retention-witness.log";
+const R9B_RETENTION_TASK_HOLD_ARM_FILE: &str = "r9b-retention-task-hold-arm";
+const R9B_RETENTION_TASK_LIVE_RELEASE_FILE: &str = "r9b-retention-task-live-release";
+const R9B_RETENTION_APPROVAL_OBSERVED_FILE: &str = "r9b-retention-approval-observed";
+const R9B_RETENTION_COMPACT_REQUEST_FILE: &str = "r9b-retention-compact-request";
+const R9B_RETENTION_COMPACTED_FILE: &str = "r9b-retention-compacted";
+const R9B_RETENTION_REBASELINE_RELEASE_FILE: &str = "r9b-retention-rebaseline-release";
 const U03C_RUN_ID: &str = "run-u03c-result";
 const U03C_STEP_ID: &str = "step-u03c-result";
 const U03C_ATTEMPT_ID: &str = "attempt-u03c-result";
@@ -2136,6 +2172,524 @@ impl OwnerProjectionSource for StaticApprovalProjectionSource {
     }
 }
 
+struct R9bTaskDisconnectProjectionSource {
+    initial: StaticApprovalProjectionSource,
+    trigger_path: PathBuf,
+    advanced_acknowledged: Mutex<bool>,
+}
+
+impl R9bTaskDisconnectProjectionSource {
+    fn new(root: &Path) -> Self {
+        Self {
+            initial: StaticApprovalProjectionSource::new(),
+            trigger_path: root.join(R9B_APPROVAL_ADVANCE_FILE),
+            advanced_acknowledged: Mutex::new(false),
+        }
+    }
+
+    fn advanced_projection() -> PendingOwnerProjection {
+        let observation = HarnessObservation {
+            observation_id: "observation-r9b-task-disconnect".to_owned(),
+            adapter_id: "c5-adapter".to_owned(),
+            attempt_id: "c5-attempt".to_owned(),
+            dispatch_id: "c5-dispatch".to_owned(),
+            fencing_token: 7,
+            observation_sequence: 2,
+            payload: Some(harness_observation::Payload::ApprovalRequest(
+                ApprovalRequestObservation {
+                    approval_request_id: R9B_ADVANCED_APPROVAL_ID.to_owned(),
+                    kind: ApprovalKind::Command as i32,
+                    action_digest_sha256: "44".repeat(32),
+                    requested_scope_ref: "scope-r9b-task-disconnect".to_owned(),
+                    display_summary_ref: "summary-r9b-task-disconnect".to_owned(),
+                    native_routing_ref: String::new(),
+                    lifecycle: ApprovalRequestLifecycleKind::Open as i32,
+                    request_revision: 1,
+                },
+            )),
+            ..Default::default()
+        };
+        PendingOwnerProjection::AdapterApproval(Box::new(
+            egopulse_harness_adapter::PendingAdapterApprovalProjection {
+                message_id: "projection-r9b-task-disconnect".to_owned(),
+                source_observation_id: observation.observation_id.clone(),
+                source_revision: observation.observation_sequence,
+                payload_digest_sha256: hex::encode(Sha256::digest(observation.encode_to_vec())),
+                run_id: "c5-run".to_owned(),
+                step_id: "c5-step".to_owned(),
+                attempt_id: observation.attempt_id.clone(),
+                dispatch_id: observation.dispatch_id.clone(),
+                fencing_token: observation.fencing_token,
+                observation,
+            },
+        ))
+    }
+}
+
+impl OwnerProjectionSource for R9bTaskDisconnectProjectionSource {
+    fn pending(&self) -> Result<Vec<PendingOwnerProjection>, ProjectionSourceFailure> {
+        let mut pending = self.initial.pending()?;
+        let advanced_acknowledged = *self
+            .advanced_acknowledged
+            .lock()
+            .map_err(|_| ProjectionSourceFailure::Acknowledgement)?;
+        if self.trigger_path.is_file() && !advanced_acknowledged {
+            pending.push(Self::advanced_projection());
+        }
+        Ok(pending)
+    }
+
+    fn acknowledge(
+        &self,
+        message: &PendingOwnerProjection,
+    ) -> Result<bool, ProjectionSourceFailure> {
+        let is_advanced = matches!(
+            message,
+            PendingOwnerProjection::AdapterApproval(value)
+                if value.message_id == "projection-r9b-task-disconnect"
+        );
+        if is_advanced {
+            let mut acknowledged = self
+                .advanced_acknowledged
+                .lock()
+                .map_err(|_| ProjectionSourceFailure::Acknowledgement)?;
+            if *acknowledged {
+                return Ok(false);
+            }
+            *acknowledged = true;
+            return Ok(true);
+        }
+        self.initial.acknowledge(message)
+    }
+}
+
+struct R9bTaskFramesReader {
+    inner: Arc<dyn ReadModelReader>,
+    task_frame_calls: AtomicU64,
+    task_operation_calls: AtomicU64,
+    injected: AtomicBool,
+    baseline_hold_recorded: AtomicBool,
+    arm_path: PathBuf,
+    calls_path: PathBuf,
+    release_path: PathBuf,
+}
+
+impl R9bTaskFramesReader {
+    fn new(inner: Arc<dyn ReadModelReader>, root: &Path) -> Self {
+        Self {
+            inner,
+            task_frame_calls: AtomicU64::new(0),
+            task_operation_calls: AtomicU64::new(0),
+            injected: AtomicBool::new(false),
+            baseline_hold_recorded: AtomicBool::new(false),
+            arm_path: root.join(R9B_TASK_DISCONNECT_ARM_FILE),
+            calls_path: root.join(R9B_TASK_READER_CALLS_FILE),
+            release_path: root.join(R9B_TASK_REBASELINE_RELEASE_FILE),
+        }
+    }
+
+    fn record_task_operation(
+        &self,
+        operation: &str,
+        outcome: &str,
+    ) -> Result<(), ReadModelAccessError> {
+        let call = self.task_operation_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.calls_path)
+            .map_err(|_| ReadModelAccessError::WorkerFailed)?;
+        writeln!(file, "{call} {operation} {outcome}")
+            .and_then(|()| file.sync_all())
+            .map_err(|_| ReadModelAccessError::WorkerFailed)
+    }
+
+    async fn wait_for_rebaseline_release(&self) -> Result<(), ReadModelAccessError> {
+        if !self.injected.load(Ordering::SeqCst) || self.release_path.is_file() {
+            return Ok(());
+        }
+        if self
+            .baseline_hold_recorded
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.record_task_operation("task_baseline", "held")?;
+        }
+        timeout(Duration::from_secs(8), async {
+            while !self.release_path.is_file() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| ReadModelAccessError::Unavailable)
+    }
+}
+
+#[tonic::async_trait]
+impl ProjectionStatusReader for R9bTaskFramesReader {
+    async fn status(&self) -> Result<ReadModelStatus, ReadModelAccessError> {
+        self.wait_for_rebaseline_release().await?;
+        self.inner.status().await
+    }
+}
+
+#[tonic::async_trait]
+impl ReadModelReader for R9bTaskFramesReader {
+    async fn task_frames_after(
+        &self,
+        after: ProjectionPosition,
+        filter: TaskListFilter,
+        task_ids: Vec<String>,
+        access: TaskViewAccess,
+    ) -> Result<
+        StreamBatch<egopulse_domain_contracts::v01::egopulse::localapi::v1::TaskViewStreamFrame>,
+        ReadModelAccessError,
+    > {
+        let frame_call = self.task_frame_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.arm_path.is_file()
+            && self
+                .injected
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.record_task_operation("task_frames_after", "unavailable")?;
+            return Err(ReadModelAccessError::Unavailable);
+        }
+        self.record_task_operation("task_frames_after", &format!("delegated-{frame_call}"))?;
+        self.inner
+            .task_frames_after(after, filter, task_ids, access)
+            .await
+    }
+
+    async fn approval_frames_after(
+        &self,
+        after: ProjectionPosition,
+        filter: ApprovalListFilter,
+        approval_request_ids: Vec<String>,
+        access: ApprovalViewAccess,
+    ) -> Result<
+        StreamBatch<
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::HarnessApprovalViewStreamFrame,
+        >,
+        ReadModelAccessError,
+    > {
+        self.inner
+            .approval_frames_after(after, filter, approval_request_ids, access)
+            .await
+    }
+
+    async fn has_projected_source(
+        &self,
+        required: SourceRevision,
+    ) -> Result<bool, ReadModelAccessError> {
+        self.inner.has_projected_source(required).await
+    }
+
+    async fn get_task_view(
+        &self,
+        task_id: String,
+        access: TaskViewAccess,
+    ) -> Result<Option<TaskView>, ReadModelAccessError> {
+        self.record_task_operation("get_task_view", "delegated")?;
+        self.inner.get_task_view(task_id, access).await
+    }
+
+    async fn list_task_views_at(
+        &self,
+        snapshot: ProjectionPosition,
+        filter: TaskListFilter,
+        access: TaskViewAccess,
+    ) -> Result<HistoricalPage<TaskView>, ReadModelAccessError> {
+        self.record_task_operation("list_task_views_at", "delegated")?;
+        self.inner
+            .list_task_views_at(snapshot, filter, access)
+            .await
+    }
+
+    async fn get_evidence_graph(
+        &self,
+        task_id: String,
+        artifact_set_id: String,
+        access: EvidenceGraphAccess,
+    ) -> Result<Option<EvidenceGraphView>, ReadModelAccessError> {
+        self.inner
+            .get_evidence_graph(task_id, artifact_set_id, access)
+            .await
+    }
+
+    async fn get_harness_approval_view(
+        &self,
+        approval_request_id: String,
+        access: ApprovalViewAccess,
+    ) -> Result<Option<HarnessApprovalView>, ReadModelAccessError> {
+        self.inner
+            .get_harness_approval_view(approval_request_id, access)
+            .await
+    }
+
+    async fn list_harness_approval_views_at(
+        &self,
+        snapshot: ProjectionPosition,
+        filter: ApprovalListFilter,
+        access: ApprovalViewAccess,
+    ) -> Result<HistoricalPage<HarnessApprovalView>, ReadModelAccessError> {
+        self.inner
+            .list_harness_approval_views_at(snapshot, filter, access)
+            .await
+    }
+}
+
+struct R9bRetentionWitness {
+    path: PathBuf,
+    sequence: AtomicU64,
+}
+
+impl R9bRetentionWitness {
+    fn new(root: &Path) -> Self {
+        Self {
+            path: root.join(R9B_RETENTION_WITNESS_FILE),
+            sequence: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, event: &str) -> std::io::Result<()> {
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        writeln!(file, "{sequence} {event}")?;
+        file.sync_all()
+    }
+}
+
+struct R9bRetentionReader {
+    inner: Arc<dyn ReadModelReader>,
+    witness: Arc<R9bRetentionWitness>,
+    task_hold_arm_path: PathBuf,
+    task_live_release_path: PathBuf,
+    task_rebaseline_release_path: PathBuf,
+    task_live_held: AtomicBool,
+    task_reset_observed: AtomicBool,
+    task_rebaseline_held: AtomicBool,
+    task_rebaseline_released: AtomicBool,
+}
+
+impl R9bRetentionReader {
+    fn new(
+        inner: Arc<dyn ReadModelReader>,
+        witness: Arc<R9bRetentionWitness>,
+        root: &Path,
+    ) -> Self {
+        Self {
+            inner,
+            witness,
+            task_hold_arm_path: root.join(R9B_RETENTION_TASK_HOLD_ARM_FILE),
+            task_live_release_path: root.join(R9B_RETENTION_TASK_LIVE_RELEASE_FILE),
+            task_rebaseline_release_path: root.join(R9B_RETENTION_REBASELINE_RELEASE_FILE),
+            task_live_held: AtomicBool::new(false),
+            task_reset_observed: AtomicBool::new(false),
+            task_rebaseline_held: AtomicBool::new(false),
+            task_rebaseline_released: AtomicBool::new(false),
+        }
+    }
+
+    async fn wait_for_control(&self, path: &Path) -> Result<(), ReadModelAccessError> {
+        timeout(Duration::from_secs(8), async {
+            while !path.is_file() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| ReadModelAccessError::Unavailable)
+    }
+
+    async fn hold_task_live_read(
+        &self,
+        after: &ProjectionPosition,
+    ) -> Result<(), ReadModelAccessError> {
+        if !self.task_hold_arm_path.is_file()
+            || self
+                .task_live_held
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Ok(());
+        }
+        self.witness
+            .record(&format!(
+                "task-live-read-held epoch={} sequence={}",
+                after.epoch, after.sequence
+            ))
+            .map_err(|_| ReadModelAccessError::WorkerFailed)?;
+        self.wait_for_control(&self.task_live_release_path).await?;
+        self.witness
+            .record("task-live-read-released")
+            .map_err(|_| ReadModelAccessError::WorkerFailed)
+    }
+
+    async fn hold_task_rebaseline(&self) -> Result<(), ReadModelAccessError> {
+        if !self.task_reset_observed.load(Ordering::SeqCst)
+            || self.task_rebaseline_release_path.is_file()
+        {
+            return Ok(());
+        }
+        if self
+            .task_rebaseline_held
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.witness
+                .record("task-rebaseline-held")
+                .map_err(|_| ReadModelAccessError::WorkerFailed)?;
+        }
+        self.wait_for_control(&self.task_rebaseline_release_path)
+            .await?;
+        if self
+            .task_rebaseline_released
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.witness
+                .record("task-rebaseline-released")
+                .map_err(|_| ReadModelAccessError::WorkerFailed)?;
+        }
+        Ok(())
+    }
+}
+
+#[tonic::async_trait]
+impl ProjectionStatusReader for R9bRetentionReader {
+    async fn status(&self) -> Result<ReadModelStatus, ReadModelAccessError> {
+        self.hold_task_rebaseline().await?;
+        self.inner.status().await
+    }
+}
+
+#[tonic::async_trait]
+impl ReadModelReader for R9bRetentionReader {
+    async fn task_frames_after(
+        &self,
+        after: ProjectionPosition,
+        filter: TaskListFilter,
+        task_ids: Vec<String>,
+        access: TaskViewAccess,
+    ) -> Result<
+        StreamBatch<egopulse_domain_contracts::v01::egopulse::localapi::v1::TaskViewStreamFrame>,
+        ReadModelAccessError,
+    > {
+        self.hold_task_live_read(&after).await?;
+        let batch = self
+            .inner
+            .task_frames_after(after, filter, task_ids, access)
+            .await?;
+        let reset_frames = batch
+            .frames
+            .iter()
+            .filter(|frame| frame.kind == StreamFrameKind::ResetRequired as i32)
+            .collect::<Vec<_>>();
+        if !reset_frames.is_empty() {
+            self.witness
+                .record(&format!("task-raw-reset count={}", reset_frames.len()))
+                .map_err(|_| ReadModelAccessError::WorkerFailed)?;
+            if reset_frames.len() != 1
+                || reset_frames[0].reset_reason_code.as_deref() != Some("PROJECTION_RETENTION_GAP")
+                || self.task_reset_observed.swap(true, Ordering::SeqCst)
+            {
+                return Err(ReadModelAccessError::WorkerFailed);
+            }
+        }
+        Ok(batch)
+    }
+
+    async fn approval_frames_after(
+        &self,
+        after: ProjectionPosition,
+        filter: ApprovalListFilter,
+        approval_request_ids: Vec<String>,
+        access: ApprovalViewAccess,
+    ) -> Result<
+        StreamBatch<
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::HarnessApprovalViewStreamFrame,
+        >,
+        ReadModelAccessError,
+    > {
+        let batch = self
+            .inner
+            .approval_frames_after(after, filter, approval_request_ids, access)
+            .await?;
+        let reset_count = batch
+            .frames
+            .iter()
+            .filter(|frame| frame.kind == StreamFrameKind::ResetRequired as i32)
+            .count();
+        if reset_count > 0 {
+            self.witness
+                .record(&format!("approval-raw-reset count={reset_count}"))
+                .map_err(|_| ReadModelAccessError::WorkerFailed)?;
+        }
+        Ok(batch)
+    }
+
+    async fn has_projected_source(
+        &self,
+        required: SourceRevision,
+    ) -> Result<bool, ReadModelAccessError> {
+        self.inner.has_projected_source(required).await
+    }
+
+    async fn get_task_view(
+        &self,
+        task_id: String,
+        access: TaskViewAccess,
+    ) -> Result<Option<TaskView>, ReadModelAccessError> {
+        self.inner.get_task_view(task_id, access).await
+    }
+
+    async fn list_task_views_at(
+        &self,
+        snapshot: ProjectionPosition,
+        filter: TaskListFilter,
+        access: TaskViewAccess,
+    ) -> Result<HistoricalPage<TaskView>, ReadModelAccessError> {
+        self.inner
+            .list_task_views_at(snapshot, filter, access)
+            .await
+    }
+
+    async fn get_evidence_graph(
+        &self,
+        task_id: String,
+        artifact_set_id: String,
+        access: EvidenceGraphAccess,
+    ) -> Result<Option<EvidenceGraphView>, ReadModelAccessError> {
+        self.inner
+            .get_evidence_graph(task_id, artifact_set_id, access)
+            .await
+    }
+
+    async fn get_harness_approval_view(
+        &self,
+        approval_request_id: String,
+        access: ApprovalViewAccess,
+    ) -> Result<Option<HarnessApprovalView>, ReadModelAccessError> {
+        self.inner
+            .get_harness_approval_view(approval_request_id, access)
+            .await
+    }
+
+    async fn list_harness_approval_views_at(
+        &self,
+        snapshot: ProjectionPosition,
+        filter: ApprovalListFilter,
+        access: ApprovalViewAccess,
+    ) -> Result<HistoricalPage<HarnessApprovalView>, ReadModelAccessError> {
+        self.inner
+            .list_harness_approval_views_at(snapshot, filter, access)
+            .await
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct FixtureAuthorityPrincipalResolver;
 
@@ -2191,6 +2745,48 @@ impl TrustedPrincipalResolver for FixtureSessionResolver {
             permission_codes: profiles.permission_codes().clone(),
             authorization_policy_ref: authorization_contract_ref(),
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct R9bDenyPermissionSessionResolver {
+    denied_permission: &'static str,
+}
+
+impl TrustedPrincipalResolver for R9bDenyPermissionSessionResolver {
+    fn resolve(
+        &self,
+        _principal: &egopulse_local_ipc_platform::OsPrincipal,
+    ) -> Result<PrincipalGrant, PrincipalResolutionFailure> {
+        let profiles = egopulse_client_kernel::ContractProfiles::embedded()
+            .map_err(|_| PrincipalResolutionFailure::PolicyUnavailable)?;
+        let mut permissions = profiles.permission_codes().clone();
+        let retained_permission = match self.denied_permission {
+            "local.task.read" => "local.approval.read",
+            "local.approval.read" => "local.task.read",
+            _ => return Err(PrincipalResolutionFailure::PolicyUnavailable),
+        };
+        if !permissions.remove(self.denied_permission) || !permissions.contains(retained_permission)
+        {
+            return Err(PrincipalResolutionFailure::PolicyUnavailable);
+        }
+        Ok(PrincipalGrant {
+            authenticated_principal_id: "os-user:c5-fixture".to_owned(),
+            permission_codes: permissions,
+            authorization_policy_ref: authorization_contract_ref(),
+        })
+    }
+}
+
+fn fixture_session_principal_resolver() -> Arc<dyn TrustedPrincipalResolver> {
+    match fixture_mode().as_str() {
+        R9B_DENY_TASK_READ_MODE => Arc::new(R9bDenyPermissionSessionResolver {
+            denied_permission: "local.task.read",
+        }),
+        R9B_DENY_APPROVAL_READ_MODE => Arc::new(R9bDenyPermissionSessionResolver {
+            denied_permission: "local.approval.read",
+        }),
+        _ => Arc::new(FixtureSessionResolver),
     }
 }
 
@@ -3905,7 +4501,22 @@ fn open_fixture_providers(root: &Path) -> DaemonProviders {
     }
     if matches!(
         fixture_mode().as_str(),
+        R9B_TASK_SINGLE_DISCONNECT_MODE | R9B_RETENTION_RESET_MODE
+    ) {
+        return open_fixture_providers_with_guards(
+            root,
+            AllowTaskReferences,
+            AllowPolicyReferences,
+            AllowVerdictReferences,
+            vec![Arc::new(R9bTaskDisconnectProjectionSource::new(root))],
+        );
+    }
+    if matches!(
+        fixture_mode().as_str(),
         "allow"
+            | R9B_GOVERNED_STATE_MODE
+            | R9B_DENY_TASK_READ_MODE
+            | R9B_DENY_APPROVAL_READ_MODE
             | R8A_FIXTURE_MODE
             | R8B_PAUSE_BEFORE_RUNNER_MODE
             | R8B2C_BEGIN_DELIVERY_MODE
@@ -3995,7 +4606,7 @@ where
                 policy,
                 verdict,
                 principal_resolver: Arc::new(FixtureAuthorityPrincipalResolver),
-                session_principal_resolver: Arc::new(FixtureSessionResolver),
+                session_principal_resolver: fixture_session_principal_resolver(),
                 session_clock: Arc::new(egopulse_local_api::session::SystemSessionClock),
                 session_audit: Arc::new(NoopSessionAuditSink),
                 additional_projection_sources,
@@ -4009,7 +4620,7 @@ where
                 policy,
                 verdict,
                 principal_resolver: Arc::new(FixtureAuthorityPrincipalResolver),
-                session_principal_resolver: Arc::new(FixtureSessionResolver),
+                session_principal_resolver: fixture_session_principal_resolver(),
                 session_clock: Arc::new(egopulse_local_api::session::SystemSessionClock),
                 session_audit: Arc::new(NoopSessionAuditSink),
                 additional_projection_sources,
@@ -5707,6 +6318,1227 @@ async fn u03c_real_daemon_cli_and_tui_review_complete_governed_result_without_au
     fs::remove_dir_all(&root).expect("remove U-03c fixture root");
 }
 
+async fn start_r9b_governed_state_controller(
+    instance: &str,
+) -> (
+    Arc<egopulse_client_operations::ClientAttachment>,
+    GovernedStateController,
+) {
+    timeout(Duration::from_secs(5), async {
+        let attachment = Arc::new(
+            attach_client_operation(
+                instance,
+                ClientSurface::Tui,
+                format!("egopulse-tui-r9b-{}", Uuid::now_v7()),
+            )
+            .await
+            .expect("attach production R-9B TUI client"),
+        );
+        let controller = GovernedStateController::start(Arc::clone(&attachment))
+            .expect("start production R-9B governed-state controller");
+        (attachment, controller)
+    })
+    .await
+    .expect("R-9B attachment and controller start timed out")
+}
+
+async fn wait_for_r9b_governed_state(
+    controller: &mut GovernedStateController,
+    child: &mut Child,
+    label: &str,
+    predicate: impl Fn(&GovernedStatePageModel) -> bool,
+) -> GovernedStatePageModel {
+    timeout(Duration::from_secs(8), async {
+        loop {
+            controller.pump();
+            if predicate(controller.model()) {
+                break controller.model().clone();
+            }
+            if let Some(status) = child
+                .try_wait()
+                .unwrap_or_else(|error| panic!("inspect {label} daemon: {error}"))
+            {
+                panic!("{label} daemon exited before governed state settled: {status}");
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label} governed state did not settle before its deadline"))
+}
+
+async fn collect_r9b_governed_state_initial_trace(
+    controller: &mut GovernedStateController,
+    child: &mut Child,
+    label: &str,
+) -> Vec<GovernedStatePageModel> {
+    timeout(Duration::from_secs(8), async {
+        let mut trace = vec![controller.model().clone()];
+        while trace.len() < 3 {
+            controller.pump();
+            let current = controller.model();
+            let previous = trace.last().expect("R-9B TUI trace has initial model");
+            if current.update_index != previous.update_index {
+                assert_eq!(current.update_index, previous.update_index + 1);
+                trace.push(current.clone());
+                continue;
+            }
+            assert!(!current.stopped, "{label} TUI controller stopped early");
+            if let Some(status) = child
+                .try_wait()
+                .unwrap_or_else(|error| panic!("inspect {label} daemon: {error}"))
+            {
+                panic!("{label} daemon exited before its two domain updates: {status}");
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            r9b_model_is_dual_live(trace.last().expect("R-9B TUI final trace model")),
+            "{label} did not publish exactly one live update per domain"
+        );
+        trace
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label} TUI trace did not settle before its deadline"))
+}
+
+fn r9b_model_is_dual_live(model: &GovernedStatePageModel) -> bool {
+    model.task.view.phase == "live"
+        && model.approval.view.phase == "live"
+        && !model.task.facts.is_empty()
+        && !model.approval.facts.is_empty()
+}
+
+fn assert_r9b_tui_local_trace(trace: &[GovernedStatePageModel]) {
+    assert_eq!(trace.len(), 3);
+    let initial = &trace[0];
+    assert_eq!(initial.kind.label(), "initial");
+    assert_eq!(initial.update_index, 0);
+    assert_eq!(initial.changed_domain, None);
+    assert_eq!(initial.task.view.phase, "connecting");
+    assert_eq!(initial.approval.view.phase, "connecting");
+    assert!(initial.task.view.epoch.is_none());
+    assert!(initial.task.view.sequence.is_none());
+    assert!(initial.approval.view.epoch.is_none());
+    assert!(initial.approval.view.sequence.is_none());
+    assert!(initial.task.facts.is_empty());
+    assert!(initial.approval.facts.is_empty());
+
+    let mut task_seen = false;
+    let mut approval_seen = false;
+    for (index, pair) in trace.windows(2).enumerate() {
+        let previous = &pair[0];
+        let current = &pair[1];
+        assert_eq!(current.kind.label(), "update");
+        assert_eq!(current.update_index, u64::try_from(index + 1).unwrap());
+        match current
+            .changed_domain
+            .expect("R-9B TUI update declares one changed domain")
+        {
+            GovernedStateDomain::Task => {
+                assert!(!task_seen, "R-9B TUI repeated Task initial update");
+                task_seen = true;
+                assert_ne!(current.task, previous.task);
+                assert_eq!(current.approval, previous.approval);
+            }
+            GovernedStateDomain::Approval => {
+                assert!(!approval_seen, "R-9B TUI repeated Approval initial update");
+                approval_seen = true;
+                assert_ne!(current.approval, previous.approval);
+                assert_eq!(current.task, previous.task);
+            }
+        }
+    }
+    assert!(task_seen && approval_seen);
+}
+
+fn assert_r9b_json_keys(value: &serde_json::Value, expected: &[&str], label: &str) {
+    let actual = value
+        .as_object()
+        .unwrap_or_else(|| panic!("{label} must be a JSON object"))
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected, "unexpected keys in {label}");
+}
+
+fn assert_r9b_cli_record_shape(record: &serde_json::Value) {
+    assert_r9b_json_keys(
+        record,
+        &[
+            "approval",
+            "changedDomain",
+            "indexSemantics",
+            "kind",
+            "schemaVersion",
+            "task",
+            "updateIndex",
+        ],
+        "R-9B CLI record",
+    );
+    for (domain, facts_key) in [("task", "tasks"), ("approval", "approvals")] {
+        assert_r9b_json_keys(
+            &record[domain],
+            &[
+                "generation",
+                "phase",
+                "position",
+                "reason",
+                "recovery",
+                facts_key,
+            ],
+            &format!("R-9B CLI {domain} domain"),
+        );
+        assert_r9b_json_keys(
+            &record[domain]["recovery"],
+            &["limit", "remaining"],
+            &format!("R-9B CLI {domain} recovery"),
+        );
+        if !record[domain]["position"].is_null() {
+            assert_r9b_json_keys(
+                &record[domain]["position"],
+                &["epoch", "sequence"],
+                &format!("R-9B CLI {domain} position"),
+            );
+        }
+    }
+}
+
+fn assert_r9b_cli_local_trace(records: &[serde_json::Value]) {
+    assert_eq!(records.len(), 3);
+    for record in records {
+        assert_r9b_cli_record_shape(record);
+    }
+    assert_eq!(records[0]["kind"], "initial");
+    assert_eq!(records[0]["updateIndex"], 0);
+    assert!(records[0]["changedDomain"].is_null());
+
+    let mut task_seen = false;
+    let mut approval_seen = false;
+    for index in 1..=2 {
+        let previous = &records[index - 1];
+        let current = &records[index];
+        assert_eq!(current["kind"], "update");
+        assert_eq!(current["updateIndex"].as_u64(), Some(index as u64));
+        match current["changedDomain"]
+            .as_str()
+            .expect("R-9B CLI update declares one changed domain")
+        {
+            "task" => {
+                assert!(!task_seen, "R-9B CLI repeated Task initial update");
+                task_seen = true;
+                assert_ne!(current["task"], previous["task"]);
+                assert_eq!(current["approval"], previous["approval"]);
+            }
+            "approval" => {
+                assert!(!approval_seen, "R-9B CLI repeated Approval initial update");
+                approval_seen = true;
+                assert_ne!(current["approval"], previous["approval"]);
+                assert_eq!(current["task"], previous["task"]);
+            }
+            domain => panic!("unexpected R-9B CLI changed domain: {domain}"),
+        }
+    }
+    assert!(task_seen && approval_seen);
+}
+
+fn assert_r9b_cli_domain_matches_tui(cli: &serde_json::Value, tui: &DomainView) {
+    assert_eq!(cli["phase"].as_str(), Some(tui.phase.as_str()));
+    assert_eq!(cli["reason"].as_str(), tui.reason.as_deref());
+    assert_eq!(cli["generation"].as_u64(), Some(tui.generation));
+    assert_eq!(
+        cli["recovery"]["remaining"].as_u64(),
+        Some(u64::from(tui.recovery_remaining))
+    );
+    assert_eq!(
+        cli["recovery"]["limit"].as_u64(),
+        Some(u64::from(tui.recovery_limit))
+    );
+    match (tui.epoch.as_deref(), tui.sequence) {
+        (Some(epoch), Some(sequence)) => {
+            assert_eq!(cli["position"]["epoch"].as_str(), Some(epoch));
+            assert_eq!(cli["position"]["sequence"].as_u64(), Some(sequence));
+        }
+        (None, None) => assert!(cli["position"].is_null()),
+        _ => panic!("TUI R-9B position must be either complete or absent"),
+    }
+}
+
+fn assert_r9b_cli_domains_match_tui(record: &serde_json::Value, model: &GovernedStatePageModel) {
+    assert_eq!(record["schemaVersion"], "egopulse.governed-state.v1");
+    assert_eq!(record["indexSemantics"], "client-local");
+    assert!(record.get("cursor").is_none());
+    assert!(record.get("combinedCursor").is_none());
+    assert!(record.get("globalCursor").is_none());
+
+    assert_r9b_cli_domain_matches_tui(&record["task"], &model.task.view);
+    assert_r9b_cli_domain_matches_tui(&record["approval"], &model.approval.view);
+
+    let cli_tasks = record["task"]["tasks"]
+        .as_array()
+        .expect("R-9B CLI Task facts");
+    assert_eq!(cli_tasks.len(), model.task.facts.len());
+    for (cli, tui) in cli_tasks.iter().zip(&model.task.facts) {
+        assert_eq!(cli["taskId"].as_str(), Some(tui.task_id.as_str()));
+        assert_eq!(cli["revision"].as_u64(), Some(tui.revision));
+        assert_eq!(cli["status"].as_str(), Some(tui.status.as_str()));
+    }
+    assert!(cli_tasks.windows(2).all(|pair| {
+        pair[0]["taskId"]
+            .as_str()
+            .zip(pair[1]["taskId"].as_str())
+            .is_some_and(|(left, right)| left < right)
+    }));
+
+    let cli_approvals = record["approval"]["approvals"]
+        .as_array()
+        .expect("R-9B CLI Approval facts");
+    assert_eq!(cli_approvals.len(), model.approval.facts.len());
+    for (cli, tui) in cli_approvals.iter().zip(&model.approval.facts) {
+        assert_eq!(
+            cli["approvalRequestId"].as_str(),
+            Some(tui.approval_request_id.as_str())
+        );
+        assert_eq!(cli["taskId"].as_str(), Some(tui.task_id.as_str()));
+    }
+    assert!(cli_approvals.windows(2).all(|pair| {
+        pair[0]["approvalRequestId"]
+            .as_str()
+            .zip(pair[1]["approvalRequestId"].as_str())
+            .is_some_and(|(left, right)| left < right)
+    }));
+}
+
+fn assert_r9b_cli_initial_matches_tui(record: &serde_json::Value, model: &GovernedStatePageModel) {
+    assert_eq!(record["kind"].as_str(), Some(model.kind.label()));
+    assert_eq!(record["updateIndex"].as_u64(), Some(model.update_index));
+    assert!(record["changedDomain"].is_null());
+    assert_r9b_cli_domains_match_tui(record, model);
+}
+
+fn assert_r9b_cli_live_domains_match_tui(
+    record: &serde_json::Value,
+    model: &GovernedStatePageModel,
+) {
+    assert_eq!(record["task"]["phase"], "live");
+    assert_eq!(record["approval"]["phase"], "live");
+    assert_eq!(model.task.view.phase, "live");
+    assert_eq!(model.approval.view.phase, "live");
+    assert_r9b_cli_domains_match_tui(record, model);
+}
+
+fn assert_r9b_safe_facts_equal(expected: &GovernedStatePageModel, actual: &GovernedStatePageModel) {
+    assert_eq!(actual.task.view.phase, "live");
+    assert_eq!(actual.approval.view.phase, "live");
+    assert_eq!(actual.task.view.reason, expected.task.view.reason);
+    assert_eq!(actual.approval.view.reason, expected.approval.view.reason);
+    assert_eq!(actual.task.view.generation, expected.task.view.generation);
+    assert_eq!(
+        actual.approval.view.generation,
+        expected.approval.view.generation
+    );
+    assert_eq!(actual.task.view.epoch, expected.task.view.epoch);
+    assert_eq!(actual.task.view.sequence, expected.task.view.sequence);
+    assert_eq!(actual.approval.view.epoch, expected.approval.view.epoch);
+    assert_eq!(
+        actual.approval.view.sequence,
+        expected.approval.view.sequence
+    );
+    assert_eq!(actual.task.facts, expected.task.facts);
+    assert_eq!(actual.approval.facts, expected.approval.facts);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r9b_real_windows_dual_state_cli_tui_and_same_root_restart_are_consistent() {
+    let root = std::env::temp_dir().join(format!("egopulse-r9b-dual-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create R-9B dual-state fixture root");
+    let instance = format!("r9b-dual-{}", Uuid::now_v7());
+
+    let mut d1 = spawn_fixture_with_mode(&root, &instance, R9B_GOVERNED_STATE_MODE).await;
+    let d1_pid = d1.id().expect("R-9B D1 PID");
+    assert_ne!(d1_pid, std::process::id());
+    wait_for_m12_daemon(&instance, &mut d1, "R-9B D1 readiness").await;
+    let before = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B authority snapshot before D1 observations");
+    let (d1_attachment, mut d1_controller) = start_r9b_governed_state_controller(&instance).await;
+    let d1_trace =
+        collect_r9b_governed_state_initial_trace(&mut d1_controller, &mut d1, "R-9B D1").await;
+    assert_r9b_tui_local_trace(&d1_trace);
+    let d1_initial_model = d1_trace[0].clone();
+    let d1_model = d1_trace[2].clone();
+    let cli = run_bounded_fixture_command_with_timeout(
+        cli_executable(),
+        &instance,
+        &["state", "watch", "--updates", "2", "--json"],
+        "R-9B governed-state CLI",
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        cli.status.success(),
+        "R-9B governed-state CLI failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&cli.stdout),
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_stdout = String::from_utf8(cli.stdout).expect("R-9B CLI stdout UTF-8");
+    let records: Vec<serde_json::Value> = cli_stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("R-9B CLI NDJSON record"))
+        .collect();
+    assert_eq!(records.len(), 3, "R-9B CLI output: {cli_stdout}");
+    assert_r9b_cli_local_trace(&records);
+    assert_r9b_cli_initial_matches_tui(&records[0], &d1_initial_model);
+    assert_r9b_cli_live_domains_match_tui(
+        records.last().expect("R-9B final CLI record"),
+        &d1_model,
+    );
+
+    assert_u04c_conpty_host_available(&instance).await;
+    let mut conpty = U04cConptySession::spawn(&instance);
+    assert_ne!(conpty.process_id(), std::process::id());
+    assert_ne!(conpty.process_id(), d1_pid);
+    conpty.wait_for_checkpoint("g governed state").await;
+    conpty.send_keys(b"g");
+    conpty
+        .wait_for_checkpoint("Task and Approval positions are independent")
+        .await;
+    conpty
+        .wait_for_checkpoint("this page is observation-only")
+        .await;
+    conpty.wait_for_checkpoint("Task domain: phase=live").await;
+    conpty
+        .wait_for_checkpoint("Approval domain: phase=live")
+        .await;
+    let governed_screen = conpty.screen_text();
+    assert!(
+        governed_screen.contains("no atomic snapshot or global cursor"),
+        "R-9B Governed State screen:\n{governed_screen}"
+    );
+    assert!(
+        governed_screen.contains("Task domain: phase=live"),
+        "R-9B Governed State screen:\n{governed_screen}"
+    );
+    assert!(
+        governed_screen.contains("Approval domain: phase=live"),
+        "R-9B Governed State screen:\n{governed_screen}"
+    );
+    conpty.finish_successfully().await;
+
+    timeout(Duration::from_secs(5), d1_controller.stop())
+        .await
+        .expect("stop R-9B D1 controller before deadline");
+    let after_d1 = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B authority snapshot after D1 observations");
+    assert_eq!(after_d1, before);
+    drop(d1_controller);
+    drop(d1_attachment);
+    let d1_status = shutdown_fixture_child(&mut d1, "R-9B D1").await;
+    assert!(d1_status.success(), "R-9B D1 shutdown failed: {d1_status}");
+    let after_d1_reap = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B authority snapshot after D1 process reap");
+    assert_eq!(after_d1_reap, before);
+
+    let mut d2 = spawn_fixture_with_mode(&root, &instance, R9B_GOVERNED_STATE_MODE).await;
+    let d2_pid = d2.id().expect("R-9B D2 PID");
+    assert_ne!(d2_pid, std::process::id());
+    assert_ne!(d2_pid, d1_pid);
+    wait_for_m12_daemon(&instance, &mut d2, "R-9B D2 readiness").await;
+    let before_d2 = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B authority snapshot before D2 observations");
+    assert_eq!(before_d2, before);
+    let (d2_attachment, mut d2_controller) = start_r9b_governed_state_controller(&instance).await;
+    let d2_model = wait_for_r9b_governed_state(
+        &mut d2_controller,
+        &mut d2,
+        "R-9B D2",
+        r9b_model_is_dual_live,
+    )
+    .await;
+    assert_r9b_safe_facts_equal(&d1_model, &d2_model);
+
+    timeout(Duration::from_secs(5), d2_controller.stop())
+        .await
+        .expect("stop R-9B D2 controller before deadline");
+    let after_d2 = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B authority snapshot after D2 observations");
+    assert_eq!(after_d2, before);
+    drop(d2_controller);
+    drop(d2_attachment);
+    let d2_status = shutdown_fixture_child(&mut d2, "R-9B D2").await;
+    assert!(d2_status.success(), "R-9B D2 shutdown failed: {d2_status}");
+    let after_d2_reap = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B authority snapshot after D2 process reap");
+    assert_eq!(after_d2_reap, before);
+    fs::remove_dir_all(&root).expect("remove R-9B dual-state fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r9b_read_permission_rejection_is_isolated_to_one_domain() {
+    for (case, mode, denied_domain) in [
+        ("task", R9B_DENY_TASK_READ_MODE, GovernedStateDomain::Task),
+        (
+            "approval",
+            R9B_DENY_APPROVAL_READ_MODE,
+            GovernedStateDomain::Approval,
+        ),
+    ] {
+        let root =
+            std::env::temp_dir().join(format!("egopulse-r9b-deny-{case}-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create R-9B permission fixture root");
+        let instance = format!("r9b-deny-{case}-{}", Uuid::now_v7());
+        let mut child = spawn_fixture_with_mode(&root, &instance, mode).await;
+        assert_ne!(child.id(), Some(std::process::id()));
+        wait_for_m12_daemon(&instance, &mut child, "R-9B permission readiness").await;
+        let before = read_r9b_governed_state_authorities(&root)
+            .unwrap_or_else(|error| panic!("read R-9B {case} authority snapshot before: {error}"));
+        let (attachment, mut controller) = start_r9b_governed_state_controller(&instance).await;
+        let model = wait_for_r9b_governed_state(
+            &mut controller,
+            &mut child,
+            "R-9B permission isolation",
+            |model| match denied_domain {
+                GovernedStateDomain::Task => {
+                    model.task.view.phase == "fatal"
+                        && model.task.view.reason.as_deref() == Some("permission_denied")
+                        && model.approval.view.phase == "live"
+                        && !model.approval.facts.is_empty()
+                }
+                GovernedStateDomain::Approval => {
+                    model.approval.view.phase == "fatal"
+                        && model.approval.view.reason.as_deref() == Some("permission_denied")
+                        && model.task.view.phase == "live"
+                        && !model.task.facts.is_empty()
+                }
+            },
+        )
+        .await;
+        match denied_domain {
+            GovernedStateDomain::Task => {
+                assert!(model.task.facts.is_empty());
+                assert!(model.task.view.epoch.is_none());
+                assert!(model.task.view.sequence.is_none());
+                assert_eq!(model.approval.view.reason, None);
+            }
+            GovernedStateDomain::Approval => {
+                assert!(model.approval.facts.is_empty());
+                assert!(model.approval.view.epoch.is_none());
+                assert!(model.approval.view.sequence.is_none());
+                assert_eq!(model.task.view.reason, None);
+            }
+        }
+
+        timeout(Duration::from_secs(5), controller.stop())
+            .await
+            .unwrap_or_else(|_| panic!("stop R-9B {case} permission controller before deadline"));
+        let after = read_r9b_governed_state_authorities(&root)
+            .unwrap_or_else(|error| panic!("read R-9B {case} authority snapshot after: {error}"));
+        assert_eq!(after, before, "R-9B {case} observation mutated Authority");
+        drop(controller);
+        drop(attachment);
+        let status = shutdown_fixture_child(&mut child, "R-9B permission daemon").await;
+        assert!(
+            status.success(),
+            "R-9B {case} daemon shutdown failed: {status}"
+        );
+        let after_reap = read_r9b_governed_state_authorities(&root).unwrap_or_else(|error| {
+            panic!("read R-9B {case} authority snapshot after process reap: {error}")
+        });
+        assert_eq!(
+            after_reap, before,
+            "R-9B {case} process shutdown mutated Authority"
+        );
+        fs::remove_dir_all(&root).expect("remove R-9B permission fixture root");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r9b_task_stream_single_disconnect_keeps_approval_live_and_recovers_bounded() {
+    let root =
+        std::env::temp_dir().join(format!("egopulse-r9b-task-disconnect-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create R-9B C5-C fixture root");
+    let instance = format!("r9b-task-disconnect-{}", Uuid::now_v7());
+    let mut child =
+        spawn_fixture_with_mode(&root, &instance, R9B_TASK_SINGLE_DISCONNECT_MODE).await;
+    assert_ne!(child.id(), Some(std::process::id()));
+    wait_for_m12_daemon(&instance, &mut child, "R-9B C5-C readiness").await;
+    let authority_before = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B C5-C Authority snapshot before attachment");
+
+    let attachment = Arc::new(
+        timeout(
+            Duration::from_secs(5),
+            attach_client_operation(
+                &instance,
+                ClientSurface::Tui,
+                format!("egopulse-tui-r9b-c5c-{}", Uuid::now_v7()),
+            ),
+        )
+        .await
+        .expect("R-9B C5-C attachment deadline")
+        .expect("attach R-9B C5-C production client"),
+    );
+    let controller_attachment = Arc::clone(&attachment);
+    assert!(Arc::ptr_eq(&attachment, &controller_attachment));
+    let mut controller = GovernedStateController::start(controller_attachment)
+        .expect("start R-9B C5-C production controller");
+    assert!(
+        Arc::strong_count(&attachment) > 1,
+        "R-9B C5-C controller must retain the same attachment"
+    );
+    let baseline = wait_for_r9b_governed_state(
+        &mut controller,
+        &mut child,
+        "R-9B C5-C pre-fault",
+        r9b_model_is_dual_live,
+    )
+    .await;
+    assert_eq!(baseline.task.view.reason, None);
+    assert_eq!(baseline.approval.view.reason, None);
+    assert!(!baseline.task.facts.is_empty());
+    assert!(!baseline.approval.facts.is_empty());
+    let baseline_task_generation = baseline.task.view.generation;
+    let baseline_approval = baseline.approval.clone();
+    let calls_path = root.join(R9B_TASK_READER_CALLS_FILE);
+    let append_parent_stage = |stage: &str| {
+        let mut witness = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&calls_path)
+            .expect("open R-9B C5-C ordered witness");
+        writeln!(witness, "parent {stage}")
+            .and_then(|()| witness.sync_all())
+            .expect("persist R-9B C5-C ordered witness");
+    };
+    let approval_advance_path = root.join(R9B_APPROVAL_ADVANCE_FILE);
+    let release_path = root.join(R9B_TASK_REBASELINE_RELEASE_FILE);
+    assert!(!approval_advance_path.exists());
+    assert!(!release_path.exists());
+
+    let arm_path = root.join(R9B_TASK_DISCONNECT_ARM_FILE);
+    let mut arm = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&arm_path)
+        .expect("create R-9B C5-C atomic arm command");
+    arm.write_all(b"arm-task-disconnect\n")
+        .and_then(|()| arm.sync_all())
+        .expect("persist R-9B C5-C arm command");
+    drop(arm);
+
+    let degraded = wait_for_r9b_governed_state(
+        &mut controller,
+        &mut child,
+        "R-9B C5-C isolated Task failure",
+        |model| {
+            model.task.view.phase == "stale"
+                && model.approval.view.phase == "live"
+                && fs::read_to_string(&calls_path).is_ok_and(|calls| {
+                    let lines = calls.lines().collect::<Vec<_>>();
+                    lines
+                        .iter()
+                        .any(|line| line.ends_with("task_frames_after unavailable"))
+                        && lines
+                            .iter()
+                            .any(|line| line.ends_with("task_baseline held"))
+                })
+        },
+    )
+    .await;
+    assert_eq!(
+        degraded.task.view.reason.as_deref(),
+        Some("transport_unavailable")
+    );
+    assert_eq!(degraded.task.view.generation, baseline_task_generation + 1);
+    assert_eq!(degraded.task.view.epoch, baseline.task.view.epoch);
+    assert_eq!(degraded.task.view.sequence, baseline.task.view.sequence);
+    assert_eq!(degraded.task.facts, baseline.task.facts);
+    assert_eq!(
+        degraded.task.view.recovery_remaining,
+        baseline
+            .task
+            .view
+            .recovery_remaining
+            .checked_sub(1)
+            .expect("R-9B C5-C Task recovery budget")
+    );
+    assert_eq!(
+        degraded.task.view.recovery_limit,
+        baseline.task.view.recovery_limit
+    );
+    assert_eq!(degraded.approval, baseline_approval);
+    assert!(!approval_advance_path.exists());
+    assert!(!release_path.exists());
+
+    let mut approval_advance = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&approval_advance_path)
+        .expect("create R-9B C5-C Approval advance command");
+    approval_advance
+        .write_all(b"advance-approval-through-projection-pump\n")
+        .and_then(|()| approval_advance.sync_all())
+        .expect("persist R-9B C5-C Approval advance command");
+    drop(approval_advance);
+
+    let advanced = wait_for_r9b_governed_state(
+        &mut controller,
+        &mut child,
+        "R-9B C5-C Approval advancement during Task hold",
+        |model| {
+            model.task == degraded.task
+                && model.approval.view.phase == "live"
+                && model
+                    .approval
+                    .facts
+                    .iter()
+                    .any(|approval| approval.approval_request_id == R9B_ADVANCED_APPROVAL_ID)
+        },
+    )
+    .await;
+    assert_eq!(advanced.task, degraded.task);
+    assert_eq!(
+        advanced.approval.view.generation,
+        baseline_approval.view.generation
+    );
+    assert_eq!(
+        advanced.approval.view.recovery_remaining,
+        baseline_approval.view.recovery_remaining
+    );
+    assert_eq!(
+        advanced.approval.view.recovery_limit,
+        baseline_approval.view.recovery_limit
+    );
+    assert_eq!(advanced.approval.view.epoch, baseline_approval.view.epoch);
+    assert!(
+        advanced.approval.view.sequence > baseline_approval.view.sequence,
+        "R-9B C5-C Approval position must advance within its own domain"
+    );
+    assert_eq!(
+        advanced.approval.facts.len(),
+        baseline_approval.facts.len() + 1
+    );
+    assert!(!release_path.exists());
+    append_parent_stage("approval-advance-observed");
+
+    let mut release = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&release_path)
+        .expect("create R-9B C5-C Task rebaseline release command");
+    release
+        .write_all(b"release-task-rebaseline\n")
+        .and_then(|()| release.sync_all())
+        .expect("persist R-9B C5-C Task rebaseline release command");
+    drop(release);
+    append_parent_stage("release-command-created");
+
+    let recovered = wait_for_r9b_governed_state(
+        &mut controller,
+        &mut child,
+        "R-9B C5-C Task recovery",
+        |model| {
+            model.task.view.phase == "live"
+                && model.task.view.generation == degraded.task.view.generation
+                && model.task.view.epoch == baseline.task.view.epoch
+                && model.task.view.sequence > baseline.task.view.sequence
+                && model.approval.facts == advanced.approval.facts
+        },
+    )
+    .await;
+    assert_eq!(recovered.task.view.phase, "live");
+    assert_eq!(recovered.task.view.reason, None);
+    assert_eq!(recovered.task.view.epoch, baseline.task.view.epoch);
+    assert!(
+        recovered.task.view.sequence > baseline.task.view.sequence,
+        "R-9B C5-C Task rebaseline then live catch-up must advance within the Task domain"
+    );
+    assert_eq!(
+        recovered.task.view.generation,
+        degraded.task.view.generation
+    );
+    assert_eq!(recovered.task.facts, baseline.task.facts);
+    assert_eq!(
+        recovered.task.view.recovery_remaining,
+        degraded.task.view.recovery_remaining
+    );
+    assert_eq!(
+        recovered.task.view.recovery_limit,
+        degraded.task.view.recovery_limit
+    );
+    assert_eq!(
+        recovered.task.view.recovery_limit,
+        baseline.task.view.recovery_limit
+    );
+    assert_eq!(recovered.approval, advanced.approval);
+
+    timeout(Duration::from_secs(5), controller.stop())
+        .await
+        .expect("stop R-9B C5-C controller before deadline");
+    drop(controller);
+    drop(attachment);
+    let status = shutdown_fixture_child(&mut child, "R-9B C5-C daemon").await;
+    assert!(status.success(), "R-9B C5-C daemon failed: {status}");
+
+    let calls = fs::read_to_string(root.join(R9B_TASK_READER_CALLS_FILE))
+        .expect("read R-9B C5-C Task reader call witness");
+    let call_lines = calls.lines().collect::<Vec<_>>();
+    assert_eq!(
+        call_lines
+            .iter()
+            .filter(|line| line.ends_with("task_frames_after unavailable"))
+            .count(),
+        1,
+        "R-9B C5-C must inject exactly one Task stream failure: {calls}"
+    );
+    assert_eq!(
+        call_lines
+            .iter()
+            .filter(|line| line.ends_with("task_baseline held"))
+            .count(),
+        1,
+        "R-9B C5-C must hold exactly one Task rebaseline: {calls}"
+    );
+    let witness_index = |suffix: &str| {
+        call_lines
+            .iter()
+            .position(|line| line.ends_with(suffix))
+            .unwrap_or_else(|| panic!("R-9B C5-C witness omitted {suffix}: {calls}"))
+    };
+    let unavailable_index = witness_index("task_frames_after unavailable");
+    let held_index = witness_index("task_baseline held");
+    let approval_observed_index = witness_index("parent approval-advance-observed");
+    let release_index = witness_index("parent release-command-created");
+    assert!(
+        unavailable_index < held_index
+            && held_index < approval_observed_index
+            && approval_observed_index < release_index,
+        "R-9B C5-C witness order must be unavailable < held < approval observed < release: {calls}"
+    );
+    let task_operation_count = call_lines
+        .iter()
+        .filter(|line| {
+            line.split_once(' ')
+                .and_then(|(sequence, _)| sequence.parse::<u64>().ok())
+                .is_some()
+        })
+        .count();
+    assert!(
+        task_operation_count <= 12,
+        "R-9B C5-C Task operations must remain finite: {calls}"
+    );
+    assert!(
+        call_lines
+            .iter()
+            .filter(|line| line.contains("task_frames_after delegated"))
+            .count()
+            >= 2,
+        "R-9B C5-C must delegate before and after its one failure: {calls}"
+    );
+    let authority_after = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B C5-C Authority snapshot after process reap");
+    assert_eq!(authority_after, authority_before);
+    fs::remove_dir_all(&root).expect("remove R-9B C5-C fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r9b_retention_gap_resets_only_task_and_rebaselines_bounded() {
+    let root = std::env::temp_dir().join(format!("egopulse-r9b-retention-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create R-9B C5-D fixture root");
+    let instance = format!("r9b-retention-{}", Uuid::now_v7());
+    let mut child = spawn_fixture_with_mode(&root, &instance, R9B_RETENTION_RESET_MODE).await;
+    assert_ne!(child.id(), Some(std::process::id()));
+    wait_for_m12_daemon(&instance, &mut child, "R-9B C5-D readiness").await;
+    let authority_o0 = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B C5-D Authority O0 before attachment");
+
+    let attachment = Arc::new(
+        timeout(
+            Duration::from_secs(5),
+            attach_client_operation(
+                &instance,
+                ClientSurface::Tui,
+                format!("egopulse-tui-r9b-c5d-{}", Uuid::now_v7()),
+            ),
+        )
+        .await
+        .expect("R-9B C5-D attachment deadline")
+        .expect("attach R-9B C5-D production client"),
+    );
+    let controller_attachment = Arc::clone(&attachment);
+    assert!(Arc::ptr_eq(&attachment, &controller_attachment));
+    let mut controller = GovernedStateController::start(controller_attachment)
+        .expect("start R-9B C5-D production controller");
+    let baseline = wait_for_r9b_governed_state(
+        &mut controller,
+        &mut child,
+        "R-9B C5-D dual-Live baseline",
+        r9b_model_is_dual_live,
+    )
+    .await;
+    assert_eq!(baseline.task.view.reason, None);
+    assert_eq!(baseline.approval.view.reason, None);
+    assert!(!baseline.task.facts.is_empty());
+    assert!(!baseline.approval.facts.is_empty());
+    let task_t0_epoch = baseline
+        .task
+        .view
+        .epoch
+        .clone()
+        .expect("R-9B C5-D Task T0 epoch");
+    let task_t0_sequence = baseline
+        .task
+        .view
+        .sequence
+        .expect("R-9B C5-D Task T0 sequence");
+    let baseline_task_generation = baseline.task.view.generation;
+    let witness_path = root.join(R9B_RETENTION_WITNESS_FILE);
+    let create_control = |path: &Path, content: &str, label: &str| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .unwrap_or_else(|error| panic!("create {label}: {error}"));
+        file.write_all(content.as_bytes())
+            .and_then(|()| file.sync_all())
+            .unwrap_or_else(|error| panic!("persist {label}: {error}"));
+    };
+    let append_parent_witness = |event: &str| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&witness_path)
+            .expect("open R-9B C5-D parent witness");
+        writeln!(file, "parent {event}")
+            .and_then(|()| file.sync_all())
+            .expect("persist R-9B C5-D parent witness");
+    };
+
+    let task_hold_arm_path = root.join(R9B_RETENTION_TASK_HOLD_ARM_FILE);
+    create_control(
+        &task_hold_arm_path,
+        "hold-task-live-read\n",
+        "R-9B C5-D Task hold arm",
+    );
+    let held = wait_for_r9b_governed_state(
+        &mut controller,
+        &mut child,
+        "R-9B C5-D Task live-read hold",
+        |model| {
+            model.task == baseline.task
+                && model.approval == baseline.approval
+                && fs::read_to_string(&witness_path)
+                    .is_ok_and(|witness| witness.contains("task-live-read-held"))
+        },
+    )
+    .await;
+    assert_eq!(held.task, baseline.task);
+    assert_eq!(held.approval, baseline.approval);
+    let held_witness = fs::read_to_string(&witness_path).expect("read R-9B C5-D held Task witness");
+    let expected_held_task =
+        format!("task-live-read-held epoch={task_t0_epoch} sequence={task_t0_sequence}");
+    assert_eq!(
+        held_witness
+            .lines()
+            .filter(|line| line.ends_with(&expected_held_task))
+            .count(),
+        1,
+        "R-9B C5-D held Task witness must bind exactly to T0: {held_witness}"
+    );
+
+    let approval_advance_path = root.join(R9B_APPROVAL_ADVANCE_FILE);
+    create_control(
+        &approval_advance_path,
+        "advance-approval-through-production-projection-pump\n",
+        "R-9B C5-D Approval advance",
+    );
+    let approval_a1 = wait_for_r9b_governed_state(
+        &mut controller,
+        &mut child,
+        "R-9B C5-D Approval A1",
+        |model| {
+            model.task == baseline.task
+                && model.approval.view.phase == "live"
+                && model
+                    .approval
+                    .facts
+                    .iter()
+                    .any(|approval| approval.approval_request_id == R9B_ADVANCED_APPROVAL_ID)
+        },
+    )
+    .await;
+    assert_eq!(approval_a1.task, baseline.task);
+    assert_eq!(
+        approval_a1.approval.view.generation,
+        baseline.approval.view.generation
+    );
+    assert_eq!(
+        approval_a1.approval.view.recovery_limit,
+        baseline.approval.view.recovery_limit
+    );
+    assert_eq!(
+        approval_a1.approval.view.recovery_remaining,
+        baseline.approval.view.recovery_remaining
+    );
+    let approval_a1_sequence = approval_a1
+        .approval
+        .view
+        .sequence
+        .expect("R-9B C5-D Approval A1 sequence");
+    assert!(
+        approval_a1_sequence
+            > baseline
+                .approval
+                .view
+                .sequence
+                .expect("R-9B C5-D Approval A0 sequence"),
+        "R-9B C5-D Approval must advance within its own domain"
+    );
+
+    let approval_observed_path = root.join(R9B_RETENTION_APPROVAL_OBSERVED_FILE);
+    create_control(
+        &approval_observed_path,
+        "approval-a1-observed\n",
+        "R-9B C5-D Approval observation",
+    );
+    append_parent_witness("approval-a1-observed");
+    let compact_request_path = root.join(R9B_RETENTION_COMPACT_REQUEST_FILE);
+    append_parent_witness("compact-request-created");
+    create_control(
+        &compact_request_path,
+        "compact-at-current\n",
+        "R-9B C5-D compact request",
+    );
+    let compacted_path = root.join(R9B_RETENTION_COMPACTED_FILE);
+    let compacted_model = wait_for_r9b_governed_state(
+        &mut controller,
+        &mut child,
+        "R-9B C5-D retention compaction",
+        |model| {
+            compacted_path.is_file()
+                && model.task == baseline.task
+                && model.approval == approval_a1.approval
+        },
+    )
+    .await;
+    assert_eq!(compacted_model.task, baseline.task);
+    assert_eq!(compacted_model.approval, approval_a1.approval);
+    let compacted =
+        fs::read_to_string(&compacted_path).expect("read R-9B C5-D persisted compaction fact");
+    let compact_fields = compacted
+        .split_whitespace()
+        .map(|field| {
+            field
+                .split_once('=')
+                .unwrap_or_else(|| panic!("invalid R-9B C5-D compact field: {field}"))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let retention_floor_epoch = *compact_fields
+        .get("floor_epoch")
+        .expect("R-9B C5-D neutral retention floor epoch");
+    let retention_floor_sequence = compact_fields
+        .get("floor_sequence")
+        .expect("R-9B C5-D neutral retention floor sequence")
+        .parse::<u64>()
+        .expect("parse R-9B C5-D neutral retention floor sequence");
+    assert_eq!(
+        compact_fields.get("current_epoch"),
+        Some(&retention_floor_epoch),
+        "R-9B C5-D current epoch must still equal the child-fixed neutral floor"
+    );
+    assert_eq!(
+        compact_fields
+            .get("current_sequence")
+            .expect("R-9B C5-D compact current sequence")
+            .parse::<u64>()
+            .expect("parse R-9B C5-D compact current sequence"),
+        retention_floor_sequence
+    );
+    assert_eq!(
+        compact_fields.get("old_floor_epoch"),
+        Some(&retention_floor_epoch),
+        "R-9B C5-D old floor epoch must equal the neutral floor epoch"
+    );
+    assert_eq!(
+        compact_fields.get("returned_floor_epoch"),
+        Some(&retention_floor_epoch),
+        "R-9B C5-D returned floor epoch must equal the neutral floor epoch"
+    );
+    assert_eq!(
+        compact_fields
+            .get("returned_floor_sequence")
+            .expect("R-9B C5-D returned floor sequence")
+            .parse::<u64>()
+            .expect("parse R-9B C5-D returned floor sequence"),
+        retention_floor_sequence
+    );
+    assert!(
+        compact_fields
+            .get("old_floor_sequence")
+            .expect("R-9B C5-D old floor sequence")
+            .parse::<u64>()
+            .expect("parse R-9B C5-D old floor sequence")
+            < retention_floor_sequence
+    );
+    assert_eq!(task_t0_epoch, retention_floor_epoch);
+    assert!(
+        task_t0_sequence < retention_floor_sequence,
+        "R-9B C5-D Task T0 must precede the independently fixed neutral floor"
+    );
+    let authority_after_compaction = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B C5-D Authority snapshot immediately after compaction");
+    assert_eq!(authority_after_compaction, authority_o0);
+
+    append_parent_witness("task-live-read-release-created");
+    let task_live_release_path = root.join(R9B_RETENTION_TASK_LIVE_RELEASE_FILE);
+    create_control(
+        &task_live_release_path,
+        "release-old-task-live-read\n",
+        "R-9B C5-D Task live-read release",
+    );
+    let reset = wait_for_r9b_governed_state(
+        &mut controller,
+        &mut child,
+        "R-9B C5-D Task retention reset",
+        |model| {
+            model.task.view.phase == "reset_required"
+                && model.task.view.reason.as_deref() == Some("projection_reset_required")
+                && model.approval == approval_a1.approval
+                && fs::read_to_string(&witness_path).is_ok_and(|witness| {
+                    witness.contains("task-raw-reset count=1")
+                        && witness.contains("task-rebaseline-held")
+                })
+        },
+    )
+    .await;
+    assert_eq!(reset.task.view.phase, "reset_required");
+    assert_eq!(
+        reset.task.view.reason.as_deref(),
+        Some("projection_reset_required")
+    );
+    assert_eq!(reset.task.view.generation, baseline_task_generation + 1);
+    assert_eq!(
+        reset.task.view.epoch.as_deref(),
+        Some(task_t0_epoch.as_str())
+    );
+    assert_eq!(reset.task.view.sequence, Some(task_t0_sequence));
+    assert_eq!(reset.task.facts, baseline.task.facts);
+    assert_eq!(
+        reset.task.view.recovery_remaining, baseline.task.view.recovery_remaining,
+        "R-9B C5-D retention reset must not consume transport recovery budget"
+    );
+    assert_eq!(
+        reset.task.view.recovery_limit,
+        baseline.task.view.recovery_limit
+    );
+    assert_eq!(reset.approval, approval_a1.approval);
+    let authority_at_reset = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B C5-D Authority snapshot at ResetRequired");
+    assert_eq!(authority_at_reset, authority_o0);
+
+    append_parent_witness("task-rebaseline-release-created");
+    let rebaseline_release_path = root.join(R9B_RETENTION_REBASELINE_RELEASE_FILE);
+    create_control(
+        &rebaseline_release_path,
+        "release-task-rebaseline\n",
+        "R-9B C5-D Task rebaseline release",
+    );
+    let recovered = wait_for_r9b_governed_state(
+        &mut controller,
+        &mut child,
+        "R-9B C5-D Task retention recovery",
+        |model| {
+            model.task.view.phase == "live"
+                && model.task.view.reason.is_none()
+                && model.task.view.generation == reset.task.view.generation
+                && model.task.view.epoch.as_deref() == Some(task_t0_epoch.as_str())
+                && model.task.view.sequence.is_some_and(|sequence| {
+                    sequence > task_t0_sequence && sequence >= retention_floor_sequence
+                })
+                && model.approval == approval_a1.approval
+        },
+    )
+    .await;
+    assert_eq!(recovered.task.view.phase, "live");
+    assert_eq!(recovered.task.view.reason, None);
+    assert_eq!(recovered.task.view.generation, reset.task.view.generation);
+    assert_eq!(
+        recovered.task.view.epoch.as_deref(),
+        Some(task_t0_epoch.as_str())
+    );
+    assert!(recovered.task.view.sequence.is_some_and(|sequence| {
+        sequence > task_t0_sequence && sequence >= retention_floor_sequence
+    }));
+    assert_eq!(recovered.task.facts, baseline.task.facts);
+    assert_eq!(
+        recovered.task.view.recovery_remaining,
+        baseline.task.view.recovery_remaining
+    );
+    assert_eq!(
+        recovered.task.view.recovery_limit,
+        baseline.task.view.recovery_limit
+    );
+    assert_eq!(recovered.approval, approval_a1.approval);
+
+    let authority_at_recovery = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B C5-D Authority snapshot at recovered Live");
+    assert_eq!(authority_at_recovery, authority_o0);
+    timeout(Duration::from_secs(5), controller.stop())
+        .await
+        .expect("stop R-9B C5-D controller before deadline");
+    drop(controller);
+    drop(attachment);
+    let authority_after_stop = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B C5-D Authority snapshot after controller stop");
+    assert_eq!(authority_after_stop, authority_o0);
+    let status = shutdown_fixture_child(&mut child, "R-9B C5-D daemon").await;
+    assert!(status.success(), "R-9B C5-D daemon failed: {status}");
+    let authority_after_reap = read_r9b_governed_state_authorities(&root)
+        .expect("read R-9B C5-D Authority snapshot after process reap");
+    assert_eq!(authority_after_reap, authority_o0);
+
+    let witness = fs::read_to_string(&witness_path).expect("read R-9B C5-D witness");
+    let witness_lines = witness.lines().collect::<Vec<_>>();
+    let count = |needle: &str| {
+        witness_lines
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
+    };
+    assert_eq!(count("retention-compacted"), 1, "{witness}");
+    assert_eq!(count("task-raw-reset count=1"), 1, "{witness}");
+    assert_eq!(count("approval-raw-reset"), 0, "{witness}");
+    assert_eq!(count("task-live-read-held"), 1, "{witness}");
+    assert_eq!(count("task-rebaseline-held"), 1, "{witness}");
+    assert_eq!(count("task-rebaseline-released"), 1, "{witness}");
+    let witness_index = |needle: &str| {
+        witness_lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("R-9B C5-D witness omitted {needle}: {witness}"))
+    };
+    let held_index = witness_index("task-live-read-held");
+    let approval_observed_index = witness_index("parent approval-a1-observed");
+    let compact_index = witness_index("retention-compacted");
+    let live_release_index = witness_index("parent task-live-read-release-created");
+    let reset_index = witness_index("task-raw-reset count=1");
+    let rebaseline_held_index = witness_index("task-rebaseline-held");
+    let rebaseline_release_index = witness_index("parent task-rebaseline-release-created");
+    let rebaseline_released_index = witness_index("task-rebaseline-released");
+    assert!(
+        held_index < approval_observed_index
+            && approval_observed_index < compact_index
+            && compact_index < live_release_index
+            && live_release_index < reset_index
+            && reset_index < rebaseline_held_index
+            && rebaseline_held_index < rebaseline_release_index
+            && rebaseline_release_index < rebaseline_released_index,
+        "R-9B C5-D witness order must be hold < Approval observed < compact < old-read release < reset < rebaseline hold < rebaseline release: {witness}"
+    );
+    fs::remove_dir_all(&root).expect("remove R-9B C5-D fixture root");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn u05d_real_daemon_tui_baseline_is_read_only() {
     let root = std::env::temp_dir().join(format!("egopulse-u05d-tui-{}", Uuid::now_v7()));
@@ -5717,6 +7549,36 @@ async fn u05d_real_daemon_tui_baseline_is_read_only() {
     wait_for_u03c_ready(&instance, &mut child).await;
 
     let task_id = u03c_discover_single_task_id(&root);
+    let quiescence_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect U-05d daemon while awaiting worker quiescence")
+                .is_none(),
+            "U-05d daemon exited before its durable workers became quiescent"
+        );
+        let durable = read_governed_result_durability(&u03c_oracle_request(&root, &task_id))
+            .expect("read U-05d durable worker delivery state");
+        let pending = [
+            durable.task.pending_local_read_model_outbox_count,
+            durable.task.pending_founder_verdict_cross_outbox_count,
+            durable.collaboration.pending_local_read_model_outbox_count,
+            durable.artifact.pending_local_read_model_outbox_count,
+            durable.verification.pending_local_read_model_outbox_count,
+            durable.verdict.pending_projection_outbox_count,
+        ];
+        if durable.verdict.consumption_receipt_count == 1 && pending.iter().all(|count| *count == 0)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < quiescence_deadline,
+            "U-05d durable workers did not quiesce: consumption_receipts={} pending={pending:?}",
+            durable.verdict.consumption_receipt_count
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
     let before = u03c_durability_oracle(&root, &task_id);
 
     let (attachment, mut controller, selected_task_id) =
@@ -6127,6 +7989,358 @@ async fn u03c_real_clients_fail_closed_for_missing_permission_and_stale_review()
     }
 }
 
+async fn serve_r9b_task_disconnect_fixture(
+    root: &Path,
+    instance: &str,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
+    let config = fixture_config(root, instance);
+    let providers = open_fixture_providers(root);
+    let address = LocalIpcAddress::for_instance(&config.instance).expect("R-9B C5-C IPC address");
+    let listener = LocalIpcListener::bind(address).expect("R-9B C5-C IPC listener");
+    let model = LocalReadModel::open(LocalReadModelConfig {
+        database_path: config.read_model_database_path,
+        epoch: config.read_model_epoch,
+        key: LocalReadModelKey::new(config.read_model_key),
+    })
+    .expect("R-9B C5-C read model");
+    let initial_position = model.position().expect("R-9B C5-C initial position");
+    let model = Arc::new(Mutex::new(model));
+    let inner: Arc<dyn ReadModelReader> =
+        Arc::new(BlockingLocalReadModelReader::new(Arc::clone(&model)));
+    let reader: Arc<dyn ReadModelReader> = Arc::new(R9bTaskFramesReader::new(inner, root));
+    let notifier = ProjectionCommitNotifier::new(initial_position.clone());
+    let position_provider = Arc::new(FixedProjectionPosition(initial_position));
+    let profiles = Arc::new(
+        egopulse_domain_contracts::profiles::ContractProfiles::embedded()
+            .expect("R-9B C5-C profiles"),
+    );
+    let token_key = TokenMacKey::new(config.token_mac_key).expect("R-9B C5-C token key");
+    let token_codec = Arc::new(ReadTokenCodec::new(
+        token_key,
+        ReadGatewayPolicy::v01(),
+        Arc::clone(&providers.session_clock),
+    ));
+    let session_config = SessionConfig::new(
+        vec![api_contract_ref()],
+        egopulse_client_kernel::client_kernel_contract_ref(),
+        config.session_ttl,
+    )
+    .expect("R-9B C5-C session config");
+    let session = LocalSessionEndpoint::new(
+        session_config,
+        Arc::clone(&providers.principal_resolver),
+        Arc::clone(&providers.session_clock),
+        position_provider,
+        Arc::clone(&providers.session_audit),
+    );
+    let registry = session.registry();
+    let read_application = Arc::new(ReadGatewayApplication::new(
+        registry,
+        profiles,
+        reader,
+        notifier.clone(),
+        token_codec,
+        Arc::new(NoopReadGatewayAuditSink),
+    ));
+    let read_model = LocalReadModelEndpoint::new(read_application);
+    let projection_source = providers
+        .projection_source
+        .clone()
+        .expect("R-9B C5-C projection source");
+    let arm_notifier = notifier.clone();
+    let projection_pump = ProjectionPump::new(model, notifier, projection_source);
+    let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
+    let mut server_stop = stop_receiver.clone();
+    let mut arm_stop = stop_receiver.clone();
+    let arm_path = root.join(R9B_TASK_DISCONNECT_ARM_FILE);
+    let mut arm_wake = Box::pin(async move {
+        let arm_position = arm_notifier.subscribe();
+        loop {
+            if arm_path.is_file() {
+                let current_position = arm_position.borrow().clone();
+                arm_notifier.publish(current_position);
+                break;
+            }
+            tokio::select! {
+                changed = arm_stop.changed() => {
+                    if changed.is_err() || *arm_stop.borrow() {
+                        return;
+                    }
+                }
+                _ = sleep(Duration::from_millis(5)) => {}
+            }
+        }
+        while !*arm_stop.borrow() {
+            if arm_stop.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+    let server_shutdown = async move {
+        tokio::select! {
+            _ = shutdown => {}
+            _ = server_stop.changed() => {}
+        }
+    };
+    let mut server = Box::pin(
+        Server::builder()
+            .add_service(LocalSessionServiceServer::new(session))
+            .add_service(LocalReadModelServiceServer::new(read_model))
+            .serve_with_incoming_shutdown(listener.into_incoming(), server_shutdown),
+    );
+    let mut projection = Box::pin(projection_pump.run(stop_receiver));
+    tokio::select! {
+        result = &mut server => {
+            let _ = stop_sender.send(true);
+            projection.await.expect("R-9B C5-C projection shutdown");
+            arm_wake.await;
+            result.expect("R-9B C5-C server");
+        }
+        result = &mut projection => {
+            result.expect("R-9B C5-C projection pump");
+            let _ = stop_sender.send(true);
+            arm_wake.await;
+            server.await.expect("R-9B C5-C server shutdown");
+            panic!("R-9B C5-C projection pump stopped before fixture shutdown");
+        }
+        () = &mut arm_wake => {
+            let _ = stop_sender.send(true);
+            projection.await.expect("R-9B C5-C projection shutdown after arm wake");
+            server.await.expect("R-9B C5-C server shutdown after arm wake");
+            panic!("R-9B C5-C arm notifier stopped before fixture shutdown");
+        }
+    }
+}
+
+async fn serve_r9b_retention_reset_fixture(
+    root: &Path,
+    instance: &str,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
+    let config = fixture_config(root, instance);
+    let providers = open_fixture_providers(root);
+    let address = LocalIpcAddress::for_instance(&config.instance).expect("R-9B C5-D IPC address");
+    let listener = LocalIpcListener::bind(address).expect("R-9B C5-D IPC listener");
+    let model = LocalReadModel::open(LocalReadModelConfig {
+        database_path: config.read_model_database_path,
+        epoch: config.read_model_epoch,
+        key: LocalReadModelKey::new(config.read_model_key),
+    })
+    .expect("R-9B C5-D read model");
+    let initial_position = model.position().expect("R-9B C5-D initial position");
+    let model = Arc::new(Mutex::new(model));
+    let witness = Arc::new(R9bRetentionWitness::new(root));
+    let inner: Arc<dyn ReadModelReader> =
+        Arc::new(BlockingLocalReadModelReader::new(Arc::clone(&model)));
+    let reader: Arc<dyn ReadModelReader> =
+        Arc::new(R9bRetentionReader::new(inner, Arc::clone(&witness), root));
+    let notifier = ProjectionCommitNotifier::new(initial_position.clone());
+    let position_provider = Arc::new(FixedProjectionPosition(initial_position));
+    let profiles = Arc::new(
+        egopulse_domain_contracts::profiles::ContractProfiles::embedded()
+            .expect("R-9B C5-D profiles"),
+    );
+    let token_key = TokenMacKey::new(config.token_mac_key).expect("R-9B C5-D token key");
+    let token_codec = Arc::new(ReadTokenCodec::new(
+        token_key,
+        ReadGatewayPolicy::v01(),
+        Arc::clone(&providers.session_clock),
+    ));
+    let session_config = SessionConfig::new(
+        vec![api_contract_ref()],
+        egopulse_client_kernel::client_kernel_contract_ref(),
+        config.session_ttl,
+    )
+    .expect("R-9B C5-D session config");
+    let session = LocalSessionEndpoint::new(
+        session_config,
+        Arc::clone(&providers.principal_resolver),
+        Arc::clone(&providers.session_clock),
+        position_provider,
+        Arc::clone(&providers.session_audit),
+    );
+    let registry = session.registry();
+    let read_application = Arc::new(ReadGatewayApplication::new(
+        registry,
+        profiles,
+        reader,
+        notifier.clone(),
+        token_codec,
+        Arc::new(NoopReadGatewayAuditSink),
+    ));
+    let read_model = LocalReadModelEndpoint::new(read_application);
+    let projection_source = providers
+        .projection_source
+        .clone()
+        .expect("R-9B C5-D projection source");
+    let projection_pump =
+        ProjectionPump::new(Arc::clone(&model), notifier.clone(), projection_source);
+    let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
+    let mut server_stop = stop_receiver.clone();
+
+    let mut arm_stop = stop_receiver.clone();
+    let arm_path = root.join(R9B_RETENTION_TASK_HOLD_ARM_FILE);
+    let arm_witness = Arc::clone(&witness);
+    let arm_notifier = notifier.clone();
+    let arm_wake = async move {
+        let arm_position = arm_notifier.subscribe();
+        let arm_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if arm_path.is_file() {
+                let current_position = arm_position.borrow().clone();
+                arm_witness
+                    .record(&format!(
+                        "task-hold-wake epoch={} sequence={}",
+                        current_position.epoch, current_position.sequence
+                    ))
+                    .expect("persist R-9B C5-D Task hold wake");
+                arm_notifier.publish(current_position);
+                break;
+            }
+            assert!(
+                Instant::now() < arm_deadline,
+                "R-9B C5-D Task hold arm exceeded its deadline"
+            );
+            tokio::select! {
+                changed = arm_stop.changed() => {
+                    if changed.is_err() || *arm_stop.borrow() {
+                        return;
+                    }
+                }
+                _ = sleep(Duration::from_millis(5)) => {}
+            }
+        }
+        while !*arm_stop.borrow() {
+            if arm_stop.changed().await.is_err() {
+                break;
+            }
+        }
+    };
+
+    let mut compact_stop = stop_receiver.clone();
+    let compact_model = Arc::clone(&model);
+    let compact_witness = Arc::clone(&witness);
+    let compact_request_path = root.join(R9B_RETENTION_COMPACT_REQUEST_FILE);
+    let compacted_path = root.join(R9B_RETENTION_COMPACTED_FILE);
+    let approval_observed_path = root.join(R9B_RETENTION_APPROVAL_OBSERVED_FILE);
+    let compactor = async move {
+        let compact_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if compact_request_path.is_file() {
+                assert!(
+                    approval_observed_path.is_file(),
+                    "R-9B C5-D compaction requires persisted Approval observation"
+                );
+                let request = fs::read_to_string(&compact_request_path)
+                    .expect("read R-9B C5-D compaction request");
+                assert_eq!(
+                    request, "compact-at-current\n",
+                    "R-9B C5-D compact request must carry no domain position"
+                );
+                let (old_floor, fixed_floor, current, returned_floor) = {
+                    let mut model = compact_model
+                        .lock()
+                        .expect("lock R-9B C5-D read model for compaction");
+                    let old_floor = model
+                        .retention_floor()
+                        .expect("read R-9B C5-D old retention floor");
+                    let fixed_floor = model
+                        .position()
+                        .expect("fix R-9B C5-D neutral current retention floor");
+                    let current = model.position().expect("read R-9B C5-D current position");
+                    assert_eq!(current, fixed_floor);
+                    assert_eq!(old_floor.epoch, fixed_floor.epoch);
+                    let returned_floor = model
+                        .compact_history(fixed_floor.sequence)
+                        .expect("compact R-9B C5-D projection history");
+                    assert_eq!(returned_floor.epoch, fixed_floor.epoch);
+                    (old_floor, fixed_floor, current, returned_floor)
+                };
+                let compact_fact = format!(
+                    "floor_epoch={} floor_sequence={} old_floor_epoch={} old_floor_sequence={} current_epoch={} current_sequence={} returned_floor_epoch={} returned_floor_sequence={}",
+                    fixed_floor.epoch,
+                    fixed_floor.sequence,
+                    old_floor.epoch,
+                    old_floor.sequence,
+                    current.epoch,
+                    current.sequence,
+                    returned_floor.epoch,
+                    returned_floor.sequence
+                );
+                compact_witness
+                    .record(&format!("retention-compacted {compact_fact}"))
+                    .expect("persist R-9B C5-D compaction witness");
+                let mut compacted = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&compacted_path)
+                    .expect("create R-9B C5-D compacted fact");
+                writeln!(compacted, "{compact_fact}")
+                    .and_then(|()| compacted.sync_all())
+                    .expect("persist R-9B C5-D compacted fact");
+                drop(compacted);
+                break;
+            }
+            assert!(
+                Instant::now() < compact_deadline,
+                "R-9B C5-D compaction request exceeded its deadline"
+            );
+            tokio::select! {
+                changed = compact_stop.changed() => {
+                    if changed.is_err() || *compact_stop.borrow() {
+                        return;
+                    }
+                }
+                _ = sleep(Duration::from_millis(5)) => {}
+            }
+        }
+        while !*compact_stop.borrow() {
+            if compact_stop.changed().await.is_err() {
+                break;
+            }
+        }
+    };
+
+    let mut control = Box::pin(async move {
+        tokio::join!(arm_wake, compactor);
+    });
+    let server_shutdown = async move {
+        tokio::select! {
+            _ = shutdown => {}
+            _ = server_stop.changed() => {}
+        }
+    };
+    let mut server = Box::pin(
+        Server::builder()
+            .add_service(LocalSessionServiceServer::new(session))
+            .add_service(LocalReadModelServiceServer::new(read_model))
+            .serve_with_incoming_shutdown(listener.into_incoming(), server_shutdown),
+    );
+    let mut projection = Box::pin(projection_pump.run(stop_receiver));
+    tokio::select! {
+        result = &mut server => {
+            let _ = stop_sender.send(true);
+            projection.await.expect("R-9B C5-D projection shutdown");
+            control.await;
+            result.expect("R-9B C5-D server");
+        }
+        result = &mut projection => {
+            result.expect("R-9B C5-D projection pump");
+            let _ = stop_sender.send(true);
+            control.await;
+            server.await.expect("R-9B C5-D server shutdown");
+            panic!("R-9B C5-D projection pump stopped before fixture shutdown");
+        }
+        () = &mut control => {
+            let _ = stop_sender.send(true);
+            projection.await.expect("R-9B C5-D projection shutdown after control plane");
+            server.await.expect("R-9B C5-D server shutdown after control plane");
+            panic!("R-9B C5-D control plane stopped before fixture shutdown");
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c5_00_daemon_fixture_child() {
     if std::env::var_os(FIXTURE_ROOT_ENV).is_none() {
@@ -6135,11 +8349,6 @@ async fn c5_00_daemon_fixture_child() {
 
     let root = fixture_root();
     let instance = fixture_instance();
-    let composition = DaemonComposition::build(
-        fixture_config(&root, &instance),
-        open_fixture_providers(&root),
-    )
-    .expect("real fixture daemon composition");
     let shutdown = async {
         let _ = tokio::task::spawn_blocking(|| {
             let mut stdin = std::io::stdin();
@@ -6148,6 +8357,19 @@ async fn c5_00_daemon_fixture_child() {
         })
         .await;
     };
+    if fixture_mode() == R9B_TASK_SINGLE_DISCONNECT_MODE {
+        serve_r9b_task_disconnect_fixture(&root, &instance, shutdown).await;
+        return;
+    }
+    if fixture_mode() == R9B_RETENTION_RESET_MODE {
+        serve_r9b_retention_reset_fixture(&root, &instance, shutdown).await;
+        return;
+    }
+    let composition = DaemonComposition::build(
+        fixture_config(&root, &instance),
+        open_fixture_providers(&root),
+    )
+    .expect("real fixture daemon composition");
     composition
         .serve(shutdown)
         .await
@@ -10704,22 +12926,31 @@ impl Drop for U04cConptySession {
 }
 
 fn selected_u04c_task_id(screen: &str) -> Option<String> {
-    screen.lines().find_map(|line| {
-        let selected = line.split_once('>')?.1.trim_start();
-        let task_id = selected.split_ascii_whitespace().next()?;
-        (task_id.starts_with("task")
-            && task_id.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, ':' | '-' | '_' | '.')
-            }))
-        .then(|| task_id.to_owned())
-    })
-}
-
-fn u04c_projection_task_count(screen: &str) -> Option<u64> {
-    let marker = "Connected · ";
-    let start = screen.find(marker)? + marker.len();
-    let count = screen[start..].split_ascii_whitespace().next()?;
-    count.parse().ok()
+    let valid_identity_character = |character: char| {
+        character.is_ascii_alphanumeric() || matches!(character, ':' | '-' | '_' | '.')
+    };
+    let visible_task_id = screen.split('>').skip(1).find_map(|selected| {
+        let selected = selected.trim_start();
+        let visible_task_id = selected.split_ascii_whitespace().next()?;
+        (!visible_task_id.is_empty()
+            && visible_task_id.starts_with("task")
+            && visible_task_id.chars().all(valid_identity_character))
+        .then_some(visible_task_id)
+    })?;
+    let governed_detail = screen.split_once("Execution / Recovery Facts")?.1;
+    let full_task_id = governed_detail
+        .split_once("Task task")?
+        .1
+        .chars()
+        .take_while(|character| valid_identity_character(*character))
+        .fold(String::from("task"), |mut task_id, character| {
+            task_id.push(character);
+            task_id
+        });
+    (full_task_id.starts_with(visible_task_id)
+        && !visible_task_id.is_empty()
+        && !full_task_id.is_empty())
+    .then_some(full_task_id)
 }
 
 async fn stop_u04c_fixture(child: &mut Child, label: &str) {
@@ -11071,8 +13302,6 @@ async fn u04c_real_windows_conpty_drives_normal_tui_from_dashboard_to_exact_task
     assert_ne!(terminal.process_id(), std::process::id());
     assert_ne!(terminal.process_id(), daemon_pid);
     terminal.wait_for_checkpoint("n new work").await;
-    let projection_task_count_before = u04c_projection_task_count(&terminal.screen_text())
-        .expect("Dashboard must expose its current projected Task count");
     terminal.send_keys(b"n");
     terminal.wait_for_checkpoint("Stage: Editing").await;
     terminal.send_keys(
@@ -11083,17 +13312,23 @@ async fn u04c_real_windows_conpty_drives_normal_tui_from_dashboard_to_exact_task
         .await;
     terminal.send_keys(b"\r");
     terminal.wait_for_checkpoint("Task Watch").await;
-    terminal
-        .wait_for_checkpoint(format!("{} tasks", projection_task_count_before + 1).as_str())
-        .await;
+    let task_id = timeout(Duration::from_secs(8), async {
+        loop {
+            let task_watch_screen = terminal.screen_text();
+            if let Some(task_id) = selected_u04c_task_id(&task_watch_screen) {
+                break task_id;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Task Watch selected Task identity deadline");
     let rendered = terminal.output_text();
     let task_watch_screen = terminal.screen_text();
     assert!(
         task_watch_screen.contains("Task Watch"),
         "the current ConPTY screen must be the post-confirmation Task Watch"
     );
-    let task_id = selected_u04c_task_id(&task_watch_screen)
-        .expect("Task Watch must select the exact governed Task after confirmation");
     assert!(
         !rendered.contains(DAEMON_ONLY_CANARY),
         "the TUI must not render daemon-only Context contents"
