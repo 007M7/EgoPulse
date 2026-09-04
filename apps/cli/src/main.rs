@@ -9,6 +9,7 @@ use std::{
     io::{self, IsTerminal, Write},
     pin::Pin,
     process::ExitCode,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -23,12 +24,14 @@ use egopulse_client_operations::{
     AttachError, ClientApprovalWatchError, ClientAttachment, ClientContextRevokeError,
     ClientGovernedTaskError, ClientGuidedApprovalDecisionError, ClientGuidedWorkError,
     ClientTaskResultReviewError, ClientWorkError, ContextRevokeInput, GovernedHoldReason,
-    GovernedProjectionPosition, GovernedProjectionReason, GovernedTaskBaseline,
-    GovernedTaskSession, GovernedTaskState, GovernedTaskUpdate, GuidedApprovalDecision,
-    GuidedApprovalDecisionInput, GuidedWorkConfirmationAttempt, GuidedWorkInput,
-    GuidedWorkPreparationAttempt, GuidedWorkPreview, GuidedWorkSource, TaskResultReview,
-    TaskResultReviewStage, TaskWatchClassification, attach as attach_client, command_metadata,
-    set_task_digest, set_verdict_digest, timestamp_after, validate_guided_work_input,
+    GovernedProjectionPosition, GovernedProjectionReason, GovernedStateComposite,
+    GovernedStateDomain, GovernedStateDomainPhase, GovernedStateReason, GovernedStateSession,
+    GovernedTaskBaseline, GovernedTaskSession, GovernedTaskState, GovernedTaskUpdate,
+    GuidedApprovalDecision, GuidedApprovalDecisionInput, GuidedWorkConfirmationAttempt,
+    GuidedWorkInput, GuidedWorkPreparationAttempt, GuidedWorkPreview, GuidedWorkSource,
+    TaskResultReview, TaskResultReviewStage, TaskWatchClassification, attach as attach_client,
+    command_metadata, set_task_digest, set_verdict_digest, timestamp_after,
+    validate_guided_work_input,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -131,6 +134,22 @@ enum Command {
     Context {
         #[command(subcommand)]
         command: ContextCommand,
+    },
+    /// Watch the independent governed Task and Approval state domains.
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum StateCommand {
+    /// Emit an initial safe composite and a bounded number of domain updates.
+    Watch {
+        #[arg(long)]
+        updates: u32,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -851,6 +870,7 @@ async fn main() -> ExitCode {
         Command::Memory { command } => memory(command).await,
         Command::Work { command } => work(command).await,
         Command::Context { command } => context(command).await,
+        Command::State { command } => state(command).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -908,6 +928,9 @@ fn command_json(command: &Command) -> bool {
         }
         | Command::Context {
             command: ContextCommand::Revoke { json, .. },
+        }
+        | Command::State {
+            command: StateCommand::Watch { json, .. },
         } => *json,
     }
 }
@@ -2218,6 +2241,390 @@ async fn await_projection(
         }
         None => Err(CliFailure::protocol("await outcome missing").for_operation("await")),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CliGovernedStatePosition {
+    epoch: String,
+    sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CliGovernedStateTask {
+    task_id: String,
+    revision: u64,
+    status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CliGovernedStateApproval {
+    approval_request_id: String,
+    task_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CliGovernedTaskDomain {
+    phase: GovernedStateDomainPhase,
+    reason: Option<GovernedStateReason>,
+    position: Option<CliGovernedStatePosition>,
+    recovery_remaining: u32,
+    recovery_limit: u32,
+    generation: u64,
+    tasks: Vec<CliGovernedStateTask>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CliGovernedApprovalDomain {
+    phase: GovernedStateDomainPhase,
+    reason: Option<GovernedStateReason>,
+    position: Option<CliGovernedStatePosition>,
+    recovery_remaining: u32,
+    recovery_limit: u32,
+    generation: u64,
+    approvals: Vec<CliGovernedStateApproval>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CliGovernedStateView {
+    task: CliGovernedTaskDomain,
+    approval: CliGovernedApprovalDomain,
+}
+
+impl CliGovernedStateView {
+    fn from_composite(state: &GovernedStateComposite) -> Self {
+        let task = state.task();
+        let approval = state.approval();
+        Self {
+            task: CliGovernedTaskDomain {
+                phase: task.phase(),
+                reason: task.reason(),
+                position: task.position().map(|position| CliGovernedStatePosition {
+                    epoch: position.epoch().to_owned(),
+                    sequence: position.sequence(),
+                }),
+                recovery_remaining: task.recovery_remaining(),
+                recovery_limit: task.recovery_limit(),
+                generation: task.generation(),
+                tasks: task
+                    .tasks()
+                    .into_iter()
+                    .map(|task| CliGovernedStateTask {
+                        task_id: task.task_id.clone(),
+                        revision: task.revision,
+                        status: task.status.as_str_name().to_ascii_lowercase(),
+                    })
+                    .collect(),
+            },
+            approval: CliGovernedApprovalDomain {
+                phase: approval.phase(),
+                reason: approval.reason(),
+                position: approval
+                    .position()
+                    .map(|position| CliGovernedStatePosition {
+                        epoch: position.epoch().to_owned(),
+                        sequence: position.sequence(),
+                    }),
+                recovery_remaining: approval.recovery_remaining(),
+                recovery_limit: approval.recovery_limit(),
+                generation: approval.generation(),
+                approvals: approval
+                    .approvals()
+                    .into_iter()
+                    .map(|approval| CliGovernedStateApproval {
+                        approval_request_id: approval.approval_request_id().to_owned(),
+                        task_id: approval.task_id().to_owned(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+}
+
+trait CliGovernedStateSession {
+    fn safe_state(&self) -> CliGovernedStateView;
+
+    fn next_domain_update(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Option<GovernedStateDomain>> + '_>>;
+
+    fn shutdown(self) -> Pin<Box<dyn Future<Output = ()>>>
+    where
+        Self: Sized;
+}
+
+impl CliGovernedStateSession for GovernedStateSession {
+    fn safe_state(&self) -> CliGovernedStateView {
+        CliGovernedStateView::from_composite(self.state())
+    }
+
+    fn next_domain_update(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Option<GovernedStateDomain>> + '_>> {
+        Box::pin(async move {
+            GovernedStateSession::next_update(self)
+                .await
+                .map(|update| update.domain())
+        })
+    }
+
+    fn shutdown(self) -> Pin<Box<dyn Future<Output = ()>>> {
+        Box::pin(async move {
+            let _ = GovernedStateSession::shutdown(self).await;
+        })
+    }
+}
+
+async fn consume_governed_state_watch<Session, Stop, Render>(
+    mut session: Session,
+    updates: u32,
+    stop: Stop,
+    mut render: Render,
+) -> Result<(), CliFailure>
+where
+    Session: CliGovernedStateSession,
+    Stop: Future<Output = ()>,
+    Render:
+        FnMut(u32, Option<GovernedStateDomain>, &CliGovernedStateView) -> Result<(), CliFailure>,
+{
+    if let Err(error) = render(0, None, &session.safe_state()) {
+        session.shutdown().await;
+        return Err(error);
+    }
+    tokio::pin!(stop);
+    let mut emitted = 0_u32;
+    while emitted < updates {
+        let update = tokio::select! {
+            biased;
+            () = &mut stop => None,
+            update = session.next_domain_update() => update,
+        };
+        let Some(update) = update else {
+            break;
+        };
+        emitted += 1;
+        if let Err(error) = render(emitted, Some(update), &session.safe_state()) {
+            session.shutdown().await;
+            return Err(error);
+        }
+    }
+    session.shutdown().await;
+    Ok(())
+}
+
+fn validate_governed_state_watch_updates(updates: u32) -> Result<(), CliFailure> {
+    if !(1..=1000).contains(&updates) {
+        return Err(
+            CliFailure::protocol("updates must be between 1 and 1000").for_operation("state.watch")
+        );
+    }
+    Ok(())
+}
+
+async fn state(command: StateCommand) -> Result<(), CliFailure> {
+    match command {
+        StateCommand::Watch { updates, json } => state_watch(updates, json).await,
+    }
+}
+
+async fn state_watch(updates: u32, json_output: bool) -> Result<(), CliFailure> {
+    validate_governed_state_watch_updates(updates)?;
+    let attached = attach("state.watch").await?;
+    let attachment = Arc::new(attached.0);
+    let session = attachment.start_governed_state_session().map_err(|_| {
+        CliFailure::daemon_unavailable("governed state runtime is unavailable")
+            .for_operation("state.watch")
+    })?;
+    consume_governed_state_watch(
+        session,
+        updates,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+        |index, changed_domain, state| {
+            render_governed_state_record(index, changed_domain, state, json_output)
+        },
+    )
+    .await
+}
+
+fn governed_state_domain_name(domain: GovernedStateDomain) -> &'static str {
+    match domain {
+        GovernedStateDomain::Task => "task",
+        GovernedStateDomain::Approval => "approval",
+    }
+}
+
+fn governed_state_phase_name(phase: GovernedStateDomainPhase) -> &'static str {
+    match phase {
+        GovernedStateDomainPhase::Connecting => "connecting",
+        GovernedStateDomainPhase::Live => "live",
+        GovernedStateDomainPhase::Stale => "stale",
+        GovernedStateDomainPhase::ResetRequired => "reset_required",
+        GovernedStateDomainPhase::Fatal => "fatal",
+    }
+}
+
+fn governed_state_reason_name(reason: GovernedStateReason) -> &'static str {
+    match reason {
+        GovernedStateReason::SessionUnavailable => "session_unavailable",
+        GovernedStateReason::PermissionDenied => "permission_denied",
+        GovernedStateReason::ApiRejected => "api_rejected",
+        GovernedStateReason::TransportUnavailable => "transport_unavailable",
+        GovernedStateReason::UnexpectedEof => "unexpected_eof",
+        GovernedStateReason::ProjectionResetRequired => "projection_reset_required",
+        GovernedStateReason::ProjectionIntegrityFailure => "projection_integrity_failure",
+        GovernedStateReason::BaselineLimitExceeded => "baseline_limit_exceeded",
+        GovernedStateReason::RecoveryExhausted => "recovery_exhausted",
+    }
+}
+
+fn governed_state_position_json(position: Option<&CliGovernedStatePosition>) -> serde_json::Value {
+    position.map_or(
+        serde_json::Value::Null,
+        |position| json!({"epoch": position.epoch, "sequence": position.sequence}),
+    )
+}
+
+fn governed_state_record_json(
+    index: u32,
+    changed_domain: Option<GovernedStateDomain>,
+    state: &CliGovernedStateView,
+) -> serde_json::Value {
+    let kind = if index == 0 && changed_domain.is_none() {
+        "initial"
+    } else {
+        "update"
+    };
+    json!({
+        "schemaVersion": "egopulse.governed-state.v1",
+        "kind": kind,
+        "updateIndex": index,
+        "indexSemantics": "client-local",
+        "changedDomain": changed_domain.map(governed_state_domain_name),
+        "task": {
+            "phase": governed_state_phase_name(state.task.phase),
+            "reason": state.task.reason.map(governed_state_reason_name),
+            "position": governed_state_position_json(state.task.position.as_ref()),
+            "recovery": {
+                "remaining": state.task.recovery_remaining,
+                "limit": state.task.recovery_limit,
+            },
+            "generation": state.task.generation,
+            "tasks": state.task.tasks.iter().map(|task| json!({
+                "taskId": task.task_id,
+                "revision": task.revision,
+                "status": task.status,
+            })).collect::<Vec<_>>(),
+        },
+        "approval": {
+            "phase": governed_state_phase_name(state.approval.phase),
+            "reason": state.approval.reason.map(governed_state_reason_name),
+            "position": governed_state_position_json(state.approval.position.as_ref()),
+            "recovery": {
+                "remaining": state.approval.recovery_remaining,
+                "limit": state.approval.recovery_limit,
+            },
+            "generation": state.approval.generation,
+            "approvals": state.approval.approvals.iter().map(|approval| json!({
+                "approvalRequestId": approval.approval_request_id,
+                "taskId": approval.task_id,
+            })).collect::<Vec<_>>(),
+        },
+    })
+}
+
+fn governed_state_record_text(
+    index: u32,
+    changed_domain: Option<GovernedStateDomain>,
+    state: &CliGovernedStateView,
+) -> String {
+    fn position_text(position: Option<&CliGovernedStatePosition>) -> String {
+        position.map_or_else(
+            || "none".to_owned(),
+            |position| format!("{}:{}", position.epoch, position.sequence),
+        )
+    }
+
+    let kind = if index == 0 && changed_domain.is_none() {
+        "initial"
+    } else {
+        "update"
+    };
+    let mut output = format!(
+        "Governed state kind={kind} update_index={index} changed_domain={}\nIndependent domain positions; this is not an atomic or global cursor.\nTask domain: phase={} reason={} position={} generation={} recovery={}/{}\n",
+        changed_domain
+            .map(governed_state_domain_name)
+            .unwrap_or("none"),
+        governed_state_phase_name(state.task.phase),
+        state
+            .task
+            .reason
+            .map(governed_state_reason_name)
+            .unwrap_or("none"),
+        position_text(state.task.position.as_ref()),
+        state.task.generation,
+        state.task.recovery_remaining,
+        state.task.recovery_limit,
+    );
+    for task in &state.task.tasks {
+        output.push_str(&format!(
+            "  Task {} revision={} status={}\n",
+            task.task_id, task.revision, task.status
+        ));
+    }
+    output.push_str(&format!(
+        "Approval domain: phase={} reason={} position={} generation={} recovery={}/{}\n",
+        governed_state_phase_name(state.approval.phase),
+        state
+            .approval
+            .reason
+            .map(governed_state_reason_name)
+            .unwrap_or("none"),
+        position_text(state.approval.position.as_ref()),
+        state.approval.generation,
+        state.approval.recovery_remaining,
+        state.approval.recovery_limit,
+    ));
+    for approval in &state.approval.approvals {
+        output.push_str(&format!(
+            "  Approval {} task={}\n",
+            approval.approval_request_id, approval.task_id
+        ));
+    }
+    output.trim_end().to_owned()
+}
+
+fn render_governed_state_record(
+    index: u32,
+    changed_domain: Option<GovernedStateDomain>,
+    state: &CliGovernedStateView,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    write_governed_state_record(&mut writer, index, changed_domain, state, json_output)
+}
+
+fn write_governed_state_record<Writer: Write>(
+    writer: &mut Writer,
+    index: u32,
+    changed_domain: Option<GovernedStateDomain>,
+    state: &CliGovernedStateView,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    let rendered = if json_output {
+        serde_json::to_string(&governed_state_record_json(index, changed_domain, state)).map_err(
+            |_| {
+                CliFailure::protocol("governed state record serialization failed")
+                    .for_operation("state.watch")
+            },
+        )?
+    } else {
+        governed_state_record_text(index, changed_domain, state)
+    };
+    writeln!(writer, "{rendered}").map_err(|_| {
+        CliFailure::protocol("governed state output failed").for_operation("state.watch")
+    })
 }
 
 async fn task(command: TaskCommandCli) -> Result<(), CliFailure> {
@@ -6371,5 +6778,372 @@ mod tests {
             assert!(payload["data"][field].is_null(), "{field}");
         }
         assert_eq!(payload["data"]["taskStatus"], "TASK_STATUS_ACTIVE");
+    }
+
+    struct ScriptedCliGovernedStateSession {
+        state: CliGovernedStateView,
+        updates: VecDeque<(GovernedStateDomain, CliGovernedStateView)>,
+        polls: Rc<Cell<u32>>,
+        shutdowns: Rc<Cell<u32>>,
+    }
+
+    struct FailingGovernedStateWriter;
+
+    impl std::io::Write for FailingGovernedStateWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test broken pipe",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CliGovernedStateSession for ScriptedCliGovernedStateSession {
+        fn safe_state(&self) -> CliGovernedStateView {
+            self.state.clone()
+        }
+
+        fn next_domain_update(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = Option<GovernedStateDomain>> + '_>> {
+            Box::pin(async move {
+                self.polls.set(self.polls.get() + 1);
+                let update = self.updates.pop_front();
+                if let Some((_, state)) = &update {
+                    self.state = state.clone();
+                }
+                update.map(|(domain, _)| domain)
+            })
+        }
+
+        fn shutdown(self) -> Pin<Box<dyn Future<Output = ()>>> {
+            self.shutdowns.set(self.shutdowns.get() + 1);
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    fn cli_governed_state_view(task_sequence: u64, approval_sequence: u64) -> CliGovernedStateView {
+        CliGovernedStateView {
+            task: CliGovernedTaskDomain {
+                phase: GovernedStateDomainPhase::Live,
+                reason: None,
+                position: Some(CliGovernedStatePosition {
+                    epoch: "task-epoch:test".to_owned(),
+                    sequence: task_sequence,
+                }),
+                recovery_remaining: 3,
+                recovery_limit: 3,
+                generation: task_sequence,
+                tasks: vec![CliGovernedStateTask {
+                    task_id: format!("task:{task_sequence}"),
+                    revision: task_sequence,
+                    status: "task_status_active".to_owned(),
+                }],
+            },
+            approval: CliGovernedApprovalDomain {
+                phase: GovernedStateDomainPhase::Live,
+                reason: None,
+                position: Some(CliGovernedStatePosition {
+                    epoch: "approval-epoch:test".to_owned(),
+                    sequence: approval_sequence,
+                }),
+                recovery_remaining: 3,
+                recovery_limit: 3,
+                generation: approval_sequence,
+                approvals: vec![CliGovernedStateApproval {
+                    approval_request_id: format!("approval:{approval_sequence}"),
+                    task_id: format!("task:{task_sequence}"),
+                }],
+            },
+        }
+    }
+
+    fn cli_connecting_governed_state_view() -> CliGovernedStateView {
+        CliGovernedStateView {
+            task: CliGovernedTaskDomain {
+                phase: GovernedStateDomainPhase::Connecting,
+                reason: None,
+                position: None,
+                recovery_remaining: 3,
+                recovery_limit: 3,
+                generation: 1,
+                tasks: Vec::new(),
+            },
+            approval: CliGovernedApprovalDomain {
+                phase: GovernedStateDomainPhase::Connecting,
+                reason: None,
+                position: None,
+                recovery_remaining: 3,
+                recovery_limit: 3,
+                generation: 1,
+                approvals: Vec::new(),
+            },
+        }
+    }
+
+    fn scripted_governed_state_session(
+        initial: CliGovernedStateView,
+        updates: Vec<(GovernedStateDomain, CliGovernedStateView)>,
+    ) -> (
+        ScriptedCliGovernedStateSession,
+        Rc<Cell<u32>>,
+        Rc<Cell<u32>>,
+    ) {
+        let polls = Rc::new(Cell::new(0));
+        let shutdowns = Rc::new(Cell::new(0));
+        (
+            ScriptedCliGovernedStateSession {
+                state: initial,
+                updates: updates.into(),
+                polls: Rc::clone(&polls),
+                shutdowns: Rc::clone(&shutdowns),
+            },
+            polls,
+            shutdowns,
+        )
+    }
+
+    #[test]
+    fn governed_state_watch_requires_a_bounded_update_count() {
+        assert!(validate_governed_state_watch_updates(0).is_err());
+        assert!(validate_governed_state_watch_updates(1).is_ok());
+        assert!(validate_governed_state_watch_updates(1000).is_ok());
+        assert!(validate_governed_state_watch_updates(1001).is_err());
+        assert!(Cli::try_parse_from(["egopulse", "state", "watch"]).is_err());
+
+        let parsed =
+            Cli::try_parse_from(["egopulse", "state", "watch", "--updates", "2", "--json"])
+                .expect("state watch arguments should parse");
+        assert!(matches!(
+            parsed.command,
+            Command::State {
+                command: StateCommand::Watch {
+                    updates: 2,
+                    json: true
+                }
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn governed_state_watch_emits_initial_then_independent_domain_updates() {
+        let initial = cli_connecting_governed_state_view();
+        let after_task = cli_governed_state_view(2, 1);
+        let after_approval = cli_governed_state_view(2, 2);
+        let (session, polls, shutdowns) = scripted_governed_state_session(
+            initial,
+            vec![
+                (GovernedStateDomain::Task, after_task),
+                (GovernedStateDomain::Approval, after_approval),
+            ],
+        );
+        let records = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&records);
+
+        consume_governed_state_watch(
+            session,
+            3,
+            std::future::pending::<()>(),
+            move |index, domain, state| {
+                captured.borrow_mut().push((index, domain, state.clone()));
+                Ok(())
+            },
+        )
+        .await
+        .expect("early EOF should close the bounded watch cleanly");
+
+        let records = records.borrow();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].0, 0);
+        assert_eq!(records[0].1, None);
+        assert_eq!(records[1].0, 1);
+        assert_eq!(records[1].1, Some(GovernedStateDomain::Task));
+        assert_eq!(records[2].0, 2);
+        assert_eq!(records[2].1, Some(GovernedStateDomain::Approval));
+        assert_eq!(polls.get(), 3, "initial output must not count as an update");
+        assert_eq!(shutdowns.get(), 1);
+
+        let initial_json = governed_state_record_json(0, None, &records[0].2);
+        assert_eq!(initial_json["schemaVersion"], "egopulse.governed-state.v1");
+        assert_eq!(initial_json["kind"], "initial");
+        assert_eq!(initial_json["updateIndex"], 0);
+        assert_eq!(initial_json["indexSemantics"], "client-local");
+        assert!(initial_json["changedDomain"].is_null());
+        assert_eq!(initial_json["task"]["generation"], 1);
+        assert_eq!(initial_json["approval"]["generation"], 1);
+        assert_eq!(initial_json["task"]["phase"], "connecting");
+        assert_eq!(initial_json["approval"]["phase"], "connecting");
+        assert!(initial_json["task"]["reason"].is_null());
+        assert!(initial_json["approval"]["reason"].is_null());
+        assert!(initial_json["task"]["position"].is_null());
+        assert!(initial_json["approval"]["position"].is_null());
+        assert_eq!(initial_json["task"]["tasks"], json!([]));
+        assert_eq!(initial_json["approval"]["approvals"], json!([]));
+        for forbidden in [
+            "index",
+            "cursor",
+            "globalCursor",
+            "combinedCursor",
+            "atomicPosition",
+        ] {
+            assert!(initial_json.get(forbidden).is_none(), "{forbidden}");
+        }
+        let update_json =
+            governed_state_record_json(1, Some(GovernedStateDomain::Task), &records[1].2);
+        assert_eq!(update_json["kind"], "update");
+        assert_eq!(update_json["updateIndex"], 1);
+        assert_eq!(update_json["changedDomain"], "task");
+        assert_eq!(
+            update_json["task"]["tasks"][0]["status"],
+            "task_status_active"
+        );
+
+        let initial_text = governed_state_record_text(0, None, &records[0].2);
+        assert!(
+            initial_text
+                .starts_with("Governed state kind=initial update_index=0 changed_domain=none\n")
+        );
+        assert!(initial_text.contains("not an atomic or global cursor"));
+        assert!(initial_text.contains("generation=1"));
+        let update_text =
+            governed_state_record_text(1, Some(GovernedStateDomain::Task), &records[1].2);
+        assert!(
+            update_text
+                .starts_with("Governed state kind=update update_index=1 changed_domain=task\n")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn governed_state_watch_keeps_a_fatal_task_domain_while_approval_advances() {
+        let mut task_fatal = cli_governed_state_view(2, 1);
+        task_fatal.task.phase = GovernedStateDomainPhase::Fatal;
+        task_fatal.task.reason = Some(GovernedStateReason::ProjectionIntegrityFailure);
+        let mut approval_advanced = task_fatal.clone();
+        approval_advanced.approval = cli_governed_state_view(2, 2).approval;
+        let (session, polls, shutdowns) = scripted_governed_state_session(
+            cli_connecting_governed_state_view(),
+            vec![
+                (GovernedStateDomain::Task, task_fatal.clone()),
+                (GovernedStateDomain::Approval, approval_advanced.clone()),
+            ],
+        );
+        let records = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&records);
+
+        consume_governed_state_watch(
+            session,
+            2,
+            std::future::pending::<()>(),
+            move |index, domain, state| {
+                captured.borrow_mut().push((index, domain, state.clone()));
+                Ok(())
+            },
+        )
+        .await
+        .expect("a fatal Task domain must not stop Approval observation");
+
+        let records = records.borrow();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].1, Some(GovernedStateDomain::Task));
+        assert_eq!(records[1].2.task, task_fatal.task);
+        assert_eq!(records[2].1, Some(GovernedStateDomain::Approval));
+        assert_eq!(records[2].2.task, task_fatal.task);
+        assert_eq!(records[2].2.approval, approval_advanced.approval);
+        assert_ne!(records[1].2.approval, records[2].2.approval);
+        assert_eq!(polls.get(), 2);
+        assert_eq!(shutdowns.get(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn governed_state_watch_update_budget_stops_before_an_extra_poll() {
+        let initial = cli_governed_state_view(1, 1);
+        let (session, polls, shutdowns) = scripted_governed_state_session(
+            initial,
+            vec![
+                (GovernedStateDomain::Task, cli_governed_state_view(2, 1)),
+                (GovernedStateDomain::Approval, cli_governed_state_view(2, 2)),
+                (GovernedStateDomain::Task, cli_governed_state_view(3, 2)),
+            ],
+        );
+        let rendered = Rc::new(Cell::new(0_u32));
+        let captured = Rc::clone(&rendered);
+
+        consume_governed_state_watch(session, 2, std::future::pending::<()>(), move |_, _, _| {
+            captured.set(captured.get() + 1);
+            Ok(())
+        })
+        .await
+        .expect("bounded watch should finish");
+
+        assert_eq!(rendered.get(), 3, "initial plus exactly two updates");
+        assert_eq!(polls.get(), 2);
+        assert_eq!(shutdowns.get(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn governed_state_watch_stop_and_render_failures_shutdown_exactly_once() {
+        let (session, polls, shutdowns) = scripted_governed_state_session(
+            cli_governed_state_view(1, 1),
+            vec![(GovernedStateDomain::Task, cli_governed_state_view(2, 1))],
+        );
+        consume_governed_state_watch(session, 1, std::future::ready(()), |_, _, _| Ok(()))
+            .await
+            .expect("stop should close cleanly");
+        assert_eq!(polls.get(), 0);
+        assert_eq!(shutdowns.get(), 1);
+
+        let (session, polls, shutdowns) = scripted_governed_state_session(
+            cli_governed_state_view(1, 1),
+            vec![(GovernedStateDomain::Task, cli_governed_state_view(2, 1))],
+        );
+        let result = consume_governed_state_watch(
+            session,
+            1,
+            std::future::pending::<()>(),
+            |index, domain, state| {
+                write_governed_state_record(
+                    &mut FailingGovernedStateWriter,
+                    index,
+                    domain,
+                    state,
+                    true,
+                )
+            },
+        )
+        .await
+        .expect_err("broken stdout must be a typed presentation failure");
+        assert_eq!(result.operation, "state.watch");
+        assert_eq!(result.reason_code, "LOCAL_API_PROTOCOL_ERROR");
+        assert_eq!(polls.get(), 0);
+        assert_eq!(shutdowns.get(), 1);
+
+        let (session, polls, shutdowns) = scripted_governed_state_session(
+            cli_governed_state_view(1, 1),
+            vec![(GovernedStateDomain::Task, cli_governed_state_view(2, 1))],
+        );
+        let render_calls = Rc::new(Cell::new(0_u32));
+        let captured = Rc::clone(&render_calls);
+        let result = consume_governed_state_watch(
+            session,
+            1,
+            std::future::pending::<()>(),
+            move |_, _, _| {
+                captured.set(captured.get() + 1);
+                if captured.get() == 2 {
+                    Err(CliFailure::protocol("update render rejected"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(render_calls.get(), 2);
+        assert_eq!(polls.get(), 1);
+        assert_eq!(shutdowns.get(), 1);
     }
 }
