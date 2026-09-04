@@ -4,7 +4,14 @@
 //! This crate owns derived state only. It accepts typed, owner-produced
 //! projection messages and never receives an Authority database handle.
 
+mod harness_content;
 mod task_evidence;
+
+pub use harness_content::{
+    HarnessContentApply, HarnessContentBaselineQuery, HarnessContentBaselineResult,
+    HarnessContentPageCursor, HarnessContentProjectionInput, HarnessContentReadAccess,
+    HarnessContentWatchQuery, HarnessContentWatchResult,
+};
 
 pub use task_evidence::{
     ArtifactProjectionInput, EvidenceGraphAccess, TaskListFilter, TaskProjectionApply,
@@ -172,6 +179,124 @@ CREATE INDEX approval_view_frames_entity_sequence_idx
   ON harness_approval_frames(approval_request_id,sequence);
 "#;
 
+// R9C content is an independent read domain inside the existing SQLCipher
+// store. These tables deliberately do not reuse `projection_metadata` or
+// `projection_inbox`: content failure/reset must not advance or clear the
+// Task/Approval domains.
+const SCHEMA_V4: &str = r#"
+CREATE TABLE harness_content_metadata (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  epoch TEXT NOT NULL,
+  current_sequence INTEGER NOT NULL DEFAULT 0 CHECK (current_sequence >= 0),
+  retention_floor_sequence INTEGER NOT NULL DEFAULT 0
+    CHECK (retention_floor_sequence >= 0 AND retention_floor_sequence <= current_sequence),
+  health INTEGER NOT NULL,
+  reset_reason INTEGER NOT NULL DEFAULT 0,
+  current_projected_at_seconds INTEGER NOT NULL DEFAULT 0,
+  current_projected_at_nanos INTEGER NOT NULL DEFAULT 0
+    CHECK (current_projected_at_nanos >= 0 AND current_projected_at_nanos < 1000000000),
+  disclosure_contract_id TEXT NOT NULL,
+  disclosure_contract_version TEXT NOT NULL,
+  disclosure_profile_id TEXT NOT NULL,
+  disclosure_profile_sha256 TEXT NOT NULL
+) STRICT;
+CREATE TABLE harness_content_inbox (
+  delivery_id TEXT PRIMARY KEY,
+  event_kind INTEGER NOT NULL CHECK (event_kind IN (1, 2, 3)),
+  owner_event_id TEXT NOT NULL UNIQUE,
+  owner_event_digest_sha256 TEXT NOT NULL,
+  payload_digest_sha256 TEXT NOT NULL,
+  committed_sequence INTEGER NOT NULL CHECK (committed_sequence >= 1),
+  projected_at_seconds INTEGER NOT NULL,
+  projected_at_nanos INTEGER NOT NULL
+    CHECK (projected_at_nanos >= 0 AND projected_at_nanos < 1000000000)
+) STRICT;
+CREATE TABLE harness_content_records (
+  content_sequence INTEGER PRIMARY KEY CHECK (content_sequence >= 1),
+  record_id TEXT NOT NULL UNIQUE,
+  content_event_id TEXT NOT NULL UNIQUE,
+  record_digest_sha256 TEXT NOT NULL,
+  delivery_payload_digest_sha256 TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  disclosure_contract_id TEXT NOT NULL,
+  disclosure_contract_version TEXT NOT NULL,
+  disclosure_profile_sha256 TEXT NOT NULL,
+  safe_text_bytes INTEGER NOT NULL CHECK (safe_text_bytes >= 0),
+  projected_at_seconds INTEGER NOT NULL,
+  projected_at_nanos INTEGER NOT NULL
+    CHECK (projected_at_nanos >= 0 AND projected_at_nanos < 1000000000),
+  safe_record BLOB NOT NULL
+) STRICT;
+CREATE INDEX harness_content_records_task_sequence_idx
+  ON harness_content_records(task_id, content_sequence);
+CREATE INDEX harness_content_records_attempt_sequence_idx
+  ON harness_content_records(attempt_id, content_sequence);
+CREATE TABLE harness_content_owner_baselines (
+  owner_snapshot_digest_sha256 TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  owner_epoch TEXT NOT NULL,
+  owner_sequence INTEGER NOT NULL CHECK (owner_sequence >= 0),
+  owner_floor_sequence INTEGER NOT NULL
+    CHECK (owner_floor_sequence >= 0 AND owner_floor_sequence <= owner_sequence),
+  disclosure_contract_id TEXT NOT NULL,
+  disclosure_contract_version TEXT NOT NULL,
+  disclosure_profile_sha256 TEXT NOT NULL,
+  installed_content_sequence INTEGER NOT NULL CHECK (installed_content_sequence >= 1)
+) STRICT;
+CREATE TABLE harness_content_owner_baseline_records (
+  owner_snapshot_digest_sha256 TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  record_id TEXT NOT NULL,
+  safe_record BLOB NOT NULL,
+  PRIMARY KEY(owner_snapshot_digest_sha256, ordinal),
+  FOREIGN KEY(owner_snapshot_digest_sha256)
+    REFERENCES harness_content_owner_baselines(owner_snapshot_digest_sha256) ON DELETE CASCADE
+) STRICT;
+CREATE TABLE harness_content_compactions (
+  compaction_record_id TEXT PRIMARY KEY,
+  compaction_record_digest_sha256 TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  final_epoch TEXT NOT NULL,
+  final_sequence INTEGER NOT NULL CHECK (final_sequence >= 0),
+  final_safe_content_digest_sha256 TEXT NOT NULL,
+  owner_snapshot_digest_sha256 TEXT NOT NULL,
+  disclosure_contract_id TEXT NOT NULL,
+  disclosure_contract_version TEXT NOT NULL,
+  disclosure_profile_sha256 TEXT NOT NULL,
+  compacted_at_seconds INTEGER NOT NULL,
+  compacted_at_nanos INTEGER NOT NULL
+    CHECK (compacted_at_nanos >= 0 AND compacted_at_nanos < 1000000000),
+  reason INTEGER NOT NULL,
+  committed_content_sequence INTEGER NOT NULL CHECK (committed_content_sequence >= 1),
+  compaction_record BLOB NOT NULL
+) STRICT;
+CREATE TABLE harness_content_tombstones (
+  tombstone_id TEXT PRIMARY KEY,
+  tombstone_digest_sha256 TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  final_epoch TEXT NOT NULL,
+  final_sequence INTEGER NOT NULL CHECK (final_sequence >= 0),
+  final_safe_content_digest_sha256 TEXT NOT NULL,
+  disclosure_contract_id TEXT NOT NULL,
+  disclosure_contract_version TEXT NOT NULL,
+  disclosure_profile_sha256 TEXT NOT NULL,
+  terminal_committed_at_seconds INTEGER NOT NULL,
+  terminal_committed_at_nanos INTEGER NOT NULL
+    CHECK (terminal_committed_at_nanos >= 0 AND terminal_committed_at_nanos < 1000000000),
+  compacted_at_seconds INTEGER NOT NULL,
+  compacted_at_nanos INTEGER NOT NULL
+    CHECK (compacted_at_nanos >= 0 AND compacted_at_nanos < 1000000000),
+  reason INTEGER NOT NULL,
+  committed_content_sequence INTEGER NOT NULL CHECK (committed_content_sequence >= 1),
+  tombstone BLOB NOT NULL,
+  UNIQUE(task_id, attempt_id)
+) STRICT;
+"#;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ProjectionMessageMode {
     #[default]
@@ -301,6 +426,12 @@ pub enum ProjectionFailure {
     SnapshotBeforeRetention { requested: u64, floor: u64 },
     #[error("projection retention floor is invalid or would move backwards")]
     InvalidRetentionFloor,
+    #[error("Harness content cursor does not match its fixed query snapshot")]
+    ContentCursorMismatch,
+    #[error("Harness content baseline is unavailable until the content domain is ready")]
+    ContentBaselineUnavailable,
+    #[error("Harness content compaction or retention requires an owner snapshot bundle")]
+    ContentOwnerSnapshotRequired,
 }
 
 pub struct LocalReadModel {
@@ -331,11 +462,18 @@ impl LocalReadModel {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "secure_delete", "ON")?;
-        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2), M::up(SCHEMA_V3)])
-            .to_latest(&mut connection)?;
+        Migrations::new(vec![
+            M::up(SCHEMA_V1),
+            M::up(SCHEMA_V2),
+            M::up(SCHEMA_V3),
+            M::up(SCHEMA_V4),
+        ])
+        .to_latest(&mut connection)?;
         let legacy_v1_digest = sha256(SCHEMA_V1.as_bytes());
         let legacy_v2_digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes());
-        let digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}\n{SCHEMA_V3}").as_bytes());
+        let legacy_v3_digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}\n{SCHEMA_V3}").as_bytes());
+        let digest =
+            sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}\n{SCHEMA_V3}\n{SCHEMA_V4}").as_bytes());
         connection.execute(
             "INSERT OR IGNORE INTO projection_metadata(
                singleton,epoch,schema_profile_id,schema_profile_sha256,current_sequence,health
@@ -356,15 +494,19 @@ impl LocalReadModel {
         if actual.0 != config.epoch || actual.1 != SCHEMA_PROFILE_ID {
             return Err(ProjectionFailure::StoreGenerationMismatch);
         }
-        if actual.2 == legacy_v1_digest || actual.2 == legacy_v2_digest {
+        if actual.2 == legacy_v1_digest
+            || actual.2 == legacy_v2_digest
+            || actual.2 == legacy_v3_digest
+        {
             connection.execute(
                 "UPDATE projection_metadata SET schema_profile_sha256=?1
-                 WHERE singleton=1 AND schema_profile_sha256 IN (?2,?3)",
-                params![digest, legacy_v1_digest, legacy_v2_digest],
+                 WHERE singleton=1 AND schema_profile_sha256 IN (?2,?3,?4)",
+                params![digest, legacy_v1_digest, legacy_v2_digest, legacy_v3_digest],
             )?;
         } else if actual.2 != digest {
             return Err(ProjectionFailure::StoreGenerationMismatch);
         }
+        harness_content::initialize_content_domain(&connection, &config.epoch)?;
         let integrity: String =
             connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         if integrity != "ok" {
