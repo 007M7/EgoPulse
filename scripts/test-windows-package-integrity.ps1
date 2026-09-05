@@ -269,17 +269,17 @@ try {
     $exclusiveZip = Join-Path $testRoot 'exclusive.zip'
     $exclusiveZipStream = Open-EgoPulseExclusiveFile -LiteralPath $exclusiveZip
     $exclusiveZipStream.Dispose()
-    Assert-Throws { Open-EgoPulseExclusiveFile -LiteralPath $exclusiveZip } 'exist' 'pre-existing candidate ZIP'
+    Assert-Throws { Open-EgoPulseExclusiveFile -LiteralPath $exclusiveZip } '\AExclusive file creation failed:' 'pre-existing candidate ZIP'
     $exclusiveHash = Join-Path $testRoot 'exclusive.zip.sha256'
     $exclusiveHashStream = Open-EgoPulseExclusiveFile -LiteralPath $exclusiveHash
     $exclusiveHashStream.Dispose()
-    Assert-Throws { Open-EgoPulseExclusiveFile -LiteralPath $exclusiveHash } 'exist' 'pre-existing candidate hash'
+    Assert-Throws { Open-EgoPulseExclusiveFile -LiteralPath $exclusiveHash } '\AExclusive file creation failed:' 'pre-existing candidate hash'
     $exclusiveArchive = Join-Path $testRoot 'exclusive-package.zip'
     $null = New-EgoPulsePackageArchiveExclusively -PackageRoot $happy -ArchivePath $exclusiveArchive
     Assert-Condition (Test-Path -LiteralPath $exclusiveArchive -PathType Leaf) 'exclusive package archive was not created'
     Assert-Throws {
         New-EgoPulsePackageArchiveExclusively -PackageRoot $happy -ArchivePath $exclusiveArchive
-    } 'exist' 'exclusive package archive overwrite'
+    } '\AExclusive file creation failed:' 'exclusive package archive overwrite'
 
     $publicSource = Join-Path $testRoot 'public-source'
     $null = New-Item -ItemType Directory -Path (Join-Path $publicSource 'nested') -Force
@@ -296,7 +296,7 @@ try {
         Copy-EgoPulseFileExclusively `
             -SourcePath (Join-Path $publicSource 'nested/payload.txt') `
             -DestinationPath $preExistingTarget
-    } 'exist' 'pre-existing packager target file pollution'
+    } '\AExclusive file creation failed:' 'pre-existing packager target file pollution'
     Assert-Condition ((Get-Content -Raw -LiteralPath $preExistingTarget) -ceq 'attacker-content') 'exclusive packager file copy overwrote a pre-existing target'
     Assert-ConcurrentPublicTreeCopyIsExclusive `
         -SourceRoot $publicSource `

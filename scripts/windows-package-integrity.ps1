@@ -215,12 +215,18 @@ function New-EgoPulseExclusiveDirectory {
 function Open-EgoPulseExclusiveFile {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
-    return [IO.File]::Open(
-        $LiteralPath,
-        [IO.FileMode]::CreateNew,
-        [IO.FileAccess]::Write,
-        [IO.FileShare]::None
-    )
+    $fullPath = [IO.Path]::GetFullPath($LiteralPath)
+    try {
+        return [IO.File]::Open(
+            $fullPath,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+    }
+    catch {
+        throw "Exclusive file creation failed: ${fullPath}: $($_.Exception.Message)"
+    }
 }
 
 function Copy-EgoPulseFileExclusively {
