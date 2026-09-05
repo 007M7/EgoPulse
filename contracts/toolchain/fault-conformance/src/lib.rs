@@ -1,10 +1,54 @@
 #![forbid(unsafe_code)]
 
+pub mod memory_restart_oracle;
+pub mod r8b2c;
+pub mod r9a3;
+pub mod r9a3_context;
+pub mod r9b_governed_state;
+pub mod u03c_result_review;
+pub mod u04c_work_start;
+
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FaultConformanceError {
+    message: String,
+}
+
+impl FaultConformanceError {
+    pub(crate) fn invariant(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for FaultConformanceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FaultConformanceError {}
+
+impl From<rusqlite::Error> for FaultConformanceError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::invariant(format!("SQLite conformance failure: {error}"))
+    }
+}
+
+impl From<std::io::Error> for FaultConformanceError {
+    fn from(error: std::io::Error) -> Self {
+        Self::invariant(format!("filesystem conformance failure: {error}"))
+    }
+}
+
+pub type FaultConformanceResult<T> = Result<T, FaultConformanceError>;
 
 pub const BOUNDARIES: [&str; 8] = [
     "command_commit",
@@ -83,6 +127,9 @@ fn open_database(root: &Path) -> rusqlite::Result<Connection> {
     Ok(connection)
 }
 
+// This fixture helper keeps the persisted fact, event, and outbox fields explicit so crash
+// boundary cases cannot accidentally share or omit identifiers while being assembled.
+#[allow(clippy::too_many_arguments)]
 fn commit_fact_event_outbox(
     tx: &Transaction<'_>,
     authority: &str,
@@ -148,7 +195,7 @@ fn consume_once(
     Ok(true)
 }
 
-pub fn inject_and_abort(boundary: &str, root: &Path) -> rusqlite::Result<()> {
+pub fn inject_and_abort(boundary: &str, root: &Path) -> FaultConformanceResult<()> {
     let mut connection = open_database(root)?;
     match boundary {
         "command_commit" => {
@@ -309,7 +356,7 @@ pub fn inject_and_abort(boundary: &str, root: &Path) -> rusqlite::Result<()> {
             )?;
             tx.commit()?;
         }
-        _ => return Err(rusqlite::Error::InvalidQuery),
+        _ => return Err(rusqlite::Error::InvalidQuery.into()),
     }
     std::process::abort();
 }
@@ -322,7 +369,7 @@ fn scalar_string(connection: &Connection, sql: &str) -> rusqlite::Result<String>
     connection.query_row(sql, [], |row| row.get(0))
 }
 
-pub fn recover_and_verify(boundary: &str, root: &Path) -> rusqlite::Result<()> {
+pub fn recover_and_verify(boundary: &str, root: &Path) -> FaultConformanceResult<()> {
     let encrypted_bytes = fs::read(database_path(root))
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     assert!(
@@ -563,7 +610,7 @@ pub fn recover_and_verify(boundary: &str, root: &Path) -> rusqlite::Result<()> {
                 1
             );
         }
-        _ => return Err(rusqlite::Error::InvalidQuery),
+        _ => return Err(rusqlite::Error::InvalidQuery.into()),
     }
     let integrity = scalar_string(&connection, "PRAGMA integrity_check")?;
     assert_eq!(

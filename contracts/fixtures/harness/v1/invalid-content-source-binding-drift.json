@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1",
+  "fixtureId": "harness-invalid-content-source-binding-drift",
+  "category": "invalid",
+  "requirementRefs": ["R9C-D03", "R9C-D12-SOURCE-INTEGRITY"],
+  "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": {
+    "fencingToken": 3,
+    "lastObservationSequence": 7,
+    "persistedDispatchRouteBindingSha256": "5fc3d40c5d3ecdc61ccac5826e0e2d0b10131133adcd8a5ca8438188c01c39a8"
+  },
+  "resolvedReferences": { "deliveredReceiptValid": true, "contextProofValid": true },
+  "command": {
+    "ingestObservation": {
+      "observationId": "obs-content-binding-drift-001",
+      "adapterId": "codex-adapter",
+      "attemptId": "attempt-001",
+      "dispatchId": "dispatch-001",
+      "fencingToken": 3,
+      "observationSequence": 8,
+      "nativeEventId": "native-binding-drift-001",
+      "nativeSequence": 8,
+      "nativeEventDigestSha256": "acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac",
+      "capabilityProfileId": "codex-app-server-v2-0.148.0-alpha.15",
+      "criticality": "OBSERVATION_CRITICALITY_SECURITY",
+      "rawEvidenceRef": "raw-binding-drift-001",
+      "contentSignal": {
+        "contentEventId": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        "deliveredReceiptId": "receipt-001",
+        "deliveredReceiptDigestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dispatchRouteBindingSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "contextConsumptionProof": { "notContextBound": {} },
+        "candidate": { "assistantText": { "messageId": "msg-safe-001", "revision": 1, "previousRevision": 0, "operation": "CONTENT_MUTATION_OPERATION_APPEND", "textUtf8Hex": "6869", "deltaOrSnapshotDigestSha256": "cececececececececececececececececececececececececececececececece", "previousRawCumulativeDigestSha256": "cfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcf", "rawCumulativeDigestSha256": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0" }, "candidateDigestSha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd" }
+      }
+    }
+  },
+  "expected": {
+    "outcome": "error",
+    "businessWriteCount": 0,
+    "errorCode": "HARNESS_ERROR_CODE_INTEGRITY_FAILURE",
+    "safeRecordWriteCount": 0,
+    "nativeEvidencePreserved": true,
+    "historicBindingRecomputed": false
+  }
+}

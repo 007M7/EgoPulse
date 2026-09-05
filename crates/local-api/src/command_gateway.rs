@@ -1,16 +1,26 @@
 use std::sync::Arc;
 
 use egopulse_domain_contracts::{
+    context_revoke::ContextRevokeSemanticRequest,
     profiles::{AuthorizedCommand, ContractProfileError, ContractProfiles},
     v01::egopulse::{
         common::v1::CommandMetadata,
         localapi::v1::{
-            ClientRequestMetadata, DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
+            ClientRequestMetadata, ConfirmWorkRequest, ConfirmWorkResponse, ContextMutationCommand,
+            ContextRevokeReceipt, DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
+            ExecuteContextMutationRequest, ExecuteContextMutationResponse,
             ExecuteFounderVerdictRequest, ExecuteFounderVerdictResponse,
             ExecuteMemoryMutationRequest, ExecuteMemoryMutationResponse, ExecuteTaskCommandRequest,
-            ExecuteTaskCommandResponse, HarnessApprovalAuthorityResult, LocalApiError,
-            LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken,
-            SourceRevision, local_command_gateway_service_server::LocalCommandGatewayService,
+            ExecuteTaskCommandResponse, HarnessApprovalAuthorityResult,
+            ListWorkCapabilitiesRequest, ListWorkCapabilitiesResponse, ListWorkCapabilitiesResult,
+            LocalApiError, LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt,
+            PrepareWorkRequest, PrepareWorkResponse, ProjectionAwaitToken,
+            SetDefaultWorkCapabilityRequest, SetDefaultWorkCapabilityResponse, SourceRevision,
+            WorkCapabilityPreferenceReceipt, WorkPreparationPreview, confirm_work_response,
+            context_mutation_command, execute_context_mutation_response,
+            list_work_capabilities_response,
+            local_command_gateway_service_server::LocalCommandGatewayService,
+            prepare_work_response, set_default_work_capability_response,
         },
         policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
         task::v1::{TaskCommand, TaskCommandResult, task_command},
@@ -30,6 +40,11 @@ const RPC_EXECUTE_TASK: &str = "LocalCommandGatewayService/ExecuteTaskCommand";
 const RPC_DECIDE_APPROVAL: &str = "LocalCommandGatewayService/DecideHarnessApproval";
 const RPC_EXECUTE_VERDICT: &str = "LocalCommandGatewayService/ExecuteFounderVerdict";
 const RPC_EXECUTE_MEMORY: &str = "LocalCommandGatewayService/ExecuteMemoryMutation";
+const RPC_EXECUTE_CONTEXT: &str = "LocalCommandGatewayService/ExecuteContextMutation";
+const RPC_LIST_WORK_CAPABILITIES: &str = "LocalCommandGatewayService/ListWorkCapabilities";
+const RPC_SET_DEFAULT_WORK_CAPABILITY: &str = "LocalCommandGatewayService/SetDefaultWorkCapability";
+const RPC_PREPARE_WORK: &str = "LocalCommandGatewayService/PrepareWork";
+const RPC_CONFIRM_WORK: &str = "LocalCommandGatewayService/ConfirmWork";
 
 /// The principal boundary passed from the governed Local API session into an
 /// owning Authority adapter. The gateway never constructs an Authority
@@ -54,6 +69,9 @@ pub struct CommandPortResult<R> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandPortFailure {
+    InvalidArgument,
+    CapabilityNotAdmitted,
+    ConfigurationMigrationRequired,
     Unavailable,
     /// The owner may have committed an external side effect, but the result
     /// of delivery is not known. Callers must reconcile before retrying.
@@ -67,6 +85,30 @@ pub trait TaskCommandPort: Send + Sync + 'static {
         command: &TaskCommand,
         principal: &CommandPrincipal,
     ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure>;
+
+    /// Daemon-owned system activation over one reviewed ActivateTask command.
+    /// The principal is owned by the implementing port, never by the caller.
+    /// The default is fail-closed: a port that does not explicitly admit
+    /// system activation must reject it.
+    fn execute_system_activation(
+        &self,
+        command: &TaskCommand,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        let _ = command;
+        Err(CommandPortFailure::Unavailable)
+    }
+
+    /// Daemon-owned technical evidence intake for one Artifact Authority
+    /// ReturnReceipt. The implementing port owns the fixed Collaboration
+    /// principal; callers cannot supply or widen it. The default remains
+    /// fail-closed, and this boundary accepts only SubmitTaskEvidence.
+    fn execute_system_evidence_intake(
+        &self,
+        command: &TaskCommand,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        let _ = command;
+        Err(CommandPortFailure::Unavailable)
+    }
 }
 
 pub trait PolicyCommandPort: Send + Sync + 'static {
@@ -95,6 +137,114 @@ pub trait MemoryMutationPort: Send + Sync + 'static {
     ) -> Result<MemoryMutationReceipt, CommandPortFailure>;
 }
 
+/// A Context revoke command that crossed the authenticated Local API boundary,
+/// matched the frozen authorization profile and passed the full semantic
+/// digest check. Its fields are intentionally private: external adapters can
+/// consume but cannot construct this proof-carrying type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedContextRevokeCommand {
+    command_id: String,
+    snapshot_id: String,
+    expected_state_revision: u64,
+    reason_code: String,
+    evidence_refs: Vec<String>,
+    confirmation_proof_ref: String,
+    idempotency_key: String,
+    correlation_id: String,
+    causation_id: Option<String>,
+    request_digest_sha256: String,
+}
+
+impl VerifiedContextRevokeCommand {
+    #[must_use]
+    pub fn command_id(&self) -> &str {
+        &self.command_id
+    }
+
+    #[must_use]
+    pub fn snapshot_id(&self) -> &str {
+        &self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn expected_state_revision(&self) -> u64 {
+        self.expected_state_revision
+    }
+
+    #[must_use]
+    pub fn reason_code(&self) -> &str {
+        &self.reason_code
+    }
+
+    #[must_use]
+    pub fn evidence_refs(&self) -> &[String] {
+        &self.evidence_refs
+    }
+
+    #[must_use]
+    pub fn confirmation_proof_ref(&self) -> &str {
+        &self.confirmation_proof_ref
+    }
+
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    #[must_use]
+    pub fn correlation_id(&self) -> &str {
+        &self.correlation_id
+    }
+
+    #[must_use]
+    pub fn causation_id(&self) -> Option<&str> {
+        self.causation_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn request_digest_sha256(&self) -> &str {
+        &self.request_digest_sha256
+    }
+}
+
+/// Context has business failures that must remain distinguishable at the
+/// public boundary. Reusing the generic three-state command failure would
+/// erase owner, CAS, revoke and idempotency semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextMutationPortFailure {
+    InvalidArgument,
+    PermissionDenied,
+    OwnerMismatch,
+    NotFound,
+    ContextRevoked,
+    StateRevisionConflict,
+    IdempotencyConflict,
+    IntegrityFailure,
+    AuthorityUnavailable,
+    UnknownCriticalSemantics,
+}
+
+pub trait ContextMutationPort: Send + Sync + 'static {
+    fn revoke(
+        &self,
+        command: &VerifiedContextRevokeCommand,
+        principal: &CommandPrincipal,
+    ) -> Result<ContextRevokeReceipt, ContextMutationPortFailure>;
+}
+
+#[derive(Default)]
+pub struct FailClosedContextMutationPort;
+
+impl ContextMutationPort for FailClosedContextMutationPort {
+    fn revoke(
+        &self,
+        _command: &VerifiedContextRevokeCommand,
+        _principal: &CommandPrincipal,
+    ) -> Result<ContextRevokeReceipt, ContextMutationPortFailure> {
+        Err(ContextMutationPortFailure::AuthorityUnavailable)
+    }
+}
+
 #[derive(Default)]
 pub struct FailClosedMemoryMutationPort;
 
@@ -108,6 +258,93 @@ impl MemoryMutationPort for FailClosedMemoryMutationPort {
     }
 }
 
+/// Preparation and confirmation are routed to the owning daemon composition.
+/// The Local API deliberately has no Context/Task store and cannot compile a
+/// client-authored snapshot. Implementations must prove the snapshot and then
+/// delegate confirmation to the Task Authority.
+#[tonic::async_trait]
+pub trait WorkPreparationPort: Send + Sync + 'static {
+    async fn prepare(
+        &self,
+        request: &PrepareWorkRequest,
+        principal: &CommandPrincipal,
+    ) -> Result<WorkPreparationPreview, CommandPortFailure>;
+
+    fn confirm(
+        &self,
+        request: &ConfirmWorkRequest,
+        principal: &CommandPrincipal,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure>;
+}
+
+#[derive(Default)]
+pub struct FailClosedWorkPreparationPort;
+
+#[tonic::async_trait]
+impl WorkPreparationPort for FailClosedWorkPreparationPort {
+    async fn prepare(
+        &self,
+        _request: &PrepareWorkRequest,
+        _principal: &CommandPrincipal,
+    ) -> Result<WorkPreparationPreview, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
+
+    fn confirm(
+        &self,
+        _request: &ConfirmWorkRequest,
+        _principal: &CommandPrincipal,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkCapabilityPortFailure {
+    InvalidArgument,
+    CapabilityNotAdmitted,
+    StateRevisionConflict,
+    ConfigurationMigrationRequired,
+    IntegrityFailure,
+    Unavailable,
+}
+
+/// Narrow daemon-owned configuration boundary. It owns neither Task facts nor
+/// dispatch: it exposes safe route choices and mutates only the revisioned
+/// default used by future work preparations.
+pub trait WorkCapabilityPort: Send + Sync + 'static {
+    fn list(
+        &self,
+        principal: &CommandPrincipal,
+    ) -> Result<ListWorkCapabilitiesResult, WorkCapabilityPortFailure>;
+
+    fn set_default(
+        &self,
+        request: &SetDefaultWorkCapabilityRequest,
+        principal: &CommandPrincipal,
+    ) -> Result<WorkCapabilityPreferenceReceipt, WorkCapabilityPortFailure>;
+}
+
+#[derive(Default)]
+pub struct FailClosedWorkCapabilityPort;
+
+impl WorkCapabilityPort for FailClosedWorkCapabilityPort {
+    fn list(
+        &self,
+        _principal: &CommandPrincipal,
+    ) -> Result<ListWorkCapabilitiesResult, WorkCapabilityPortFailure> {
+        Err(WorkCapabilityPortFailure::Unavailable)
+    }
+
+    fn set_default(
+        &self,
+        _request: &SetDefaultWorkCapabilityRequest,
+        _principal: &CommandPrincipal,
+    ) -> Result<WorkCapabilityPreferenceReceipt, WorkCapabilityPortFailure> {
+        Err(WorkCapabilityPortFailure::Unavailable)
+    }
+}
+
 pub struct CommandGatewayApplication {
     registry: Arc<SessionRegistry>,
     profiles: Arc<ContractProfiles>,
@@ -116,6 +353,40 @@ pub struct CommandGatewayApplication {
     policy_port: Arc<dyn PolicyCommandPort>,
     verdict_port: Arc<dyn VerdictCommandPort>,
     memory_port: Arc<dyn MemoryMutationPort>,
+    context_port: Arc<dyn ContextMutationPort>,
+    work_capability_port: Arc<dyn WorkCapabilityPort>,
+    work_port: Arc<dyn WorkPreparationPort>,
+}
+
+pub struct CommandExtensionPorts {
+    memory: Arc<dyn MemoryMutationPort>,
+    context: Arc<dyn ContextMutationPort>,
+    work_capability: Arc<dyn WorkCapabilityPort>,
+    work: Arc<dyn WorkPreparationPort>,
+}
+
+impl CommandExtensionPorts {
+    #[must_use]
+    pub fn new(memory: Arc<dyn MemoryMutationPort>, work: Arc<dyn WorkPreparationPort>) -> Self {
+        Self {
+            memory,
+            context: Arc::new(FailClosedContextMutationPort),
+            work_capability: Arc::new(FailClosedWorkCapabilityPort),
+            work,
+        }
+    }
+
+    #[must_use]
+    pub fn with_context(mut self, context: Arc<dyn ContextMutationPort>) -> Self {
+        self.context = context;
+        self
+    }
+
+    #[must_use]
+    pub fn with_work_capability(mut self, work_capability: Arc<dyn WorkCapabilityPort>) -> Self {
+        self.work_capability = work_capability;
+        self
+    }
 }
 
 impl CommandGatewayApplication {
@@ -149,6 +420,27 @@ impl CommandGatewayApplication {
         verdict_port: Arc<dyn VerdictCommandPort>,
         memory_port: Arc<dyn MemoryMutationPort>,
     ) -> Self {
+        Self::new_with_memory_and_work(
+            registry,
+            profiles,
+            token_codec,
+            task_port,
+            policy_port,
+            verdict_port,
+            CommandExtensionPorts::new(memory_port, Arc::new(FailClosedWorkPreparationPort)),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_memory_and_work(
+        registry: Arc<SessionRegistry>,
+        profiles: Arc<ContractProfiles>,
+        token_codec: Arc<ReadTokenCodec>,
+        task_port: Arc<dyn TaskCommandPort>,
+        policy_port: Arc<dyn PolicyCommandPort>,
+        verdict_port: Arc<dyn VerdictCommandPort>,
+        extensions: CommandExtensionPorts,
+    ) -> Self {
         Self {
             registry,
             profiles,
@@ -156,7 +448,150 @@ impl CommandGatewayApplication {
             task_port,
             policy_port,
             verdict_port,
-            memory_port,
+            memory_port: extensions.memory,
+            context_port: extensions.context,
+            work_capability_port: extensions.work_capability,
+            work_port: extensions.work,
+        }
+    }
+
+    pub fn list_work_capabilities(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: ListWorkCapabilitiesRequest,
+    ) -> ListWorkCapabilitiesResponse {
+        let correlation_id = client_correlation_id(request.client.as_ref());
+        let context =
+            match self.authorize_rpc(peer, request.client.as_ref(), RPC_LIST_WORK_CAPABILITIES) {
+                Ok(context) => context,
+                Err(error) => {
+                    return ListWorkCapabilitiesResponse {
+                        outcome: Some(list_work_capabilities_response::Outcome::Error(
+                            (*error).with_correlation(correlation_id),
+                        )),
+                    };
+                }
+            };
+        match self.work_capability_port.list(&context.principal) {
+            Ok(result) => ListWorkCapabilitiesResponse {
+                outcome: Some(list_work_capabilities_response::Outcome::Result(result)),
+            },
+            Err(error) => ListWorkCapabilitiesResponse {
+                outcome: Some(list_work_capabilities_response::Outcome::Error(
+                    work_capability_port_error(error, correlation_id),
+                )),
+            },
+        }
+    }
+
+    pub fn set_default_work_capability(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: SetDefaultWorkCapabilityRequest,
+    ) -> SetDefaultWorkCapabilityResponse {
+        let correlation_id = client_correlation_id(request.client.as_ref());
+        let context = match self.authorize_rpc(
+            peer,
+            request.client.as_ref(),
+            RPC_SET_DEFAULT_WORK_CAPABILITY,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return SetDefaultWorkCapabilityResponse {
+                    outcome: Some(set_default_work_capability_response::Outcome::Error(
+                        (*error).with_correlation(correlation_id),
+                    )),
+                };
+            }
+        };
+        match self
+            .work_capability_port
+            .set_default(&request, &context.principal)
+        {
+            Ok(receipt) => SetDefaultWorkCapabilityResponse {
+                outcome: Some(set_default_work_capability_response::Outcome::Receipt(
+                    receipt,
+                )),
+            },
+            Err(error) => SetDefaultWorkCapabilityResponse {
+                outcome: Some(set_default_work_capability_response::Outcome::Error(
+                    work_capability_port_error(error, correlation_id),
+                )),
+            },
+        }
+    }
+
+    pub async fn prepare_work(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: PrepareWorkRequest,
+    ) -> PrepareWorkResponse {
+        let correlation_id = client_correlation_id(request.client.as_ref());
+        let context = match self.authorize_rpc(peer, request.client.as_ref(), RPC_PREPARE_WORK) {
+            Ok(context) => context,
+            Err(error) => {
+                return PrepareWorkResponse {
+                    outcome: Some(prepare_work_response::Outcome::Error(
+                        (*error).with_correlation(correlation_id),
+                    )),
+                };
+            }
+        };
+        match self.work_port.prepare(&request, &context.principal).await {
+            Ok(preview) => PrepareWorkResponse {
+                outcome: Some(prepare_work_response::Outcome::Preview(preview)),
+            },
+            Err(error) => PrepareWorkResponse {
+                outcome: Some(prepare_work_response::Outcome::Error(port_error(
+                    error,
+                    correlation_id,
+                ))),
+            },
+        }
+    }
+
+    pub fn confirm_work(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: ConfirmWorkRequest,
+    ) -> ConfirmWorkResponse {
+        let correlation_id = client_correlation_id(request.client.as_ref());
+        let context = match self.authorize_rpc(peer, request.client.as_ref(), RPC_CONFIRM_WORK) {
+            Ok(context) => context,
+            Err(error) => {
+                return ConfirmWorkResponse {
+                    outcome: Some(confirm_work_response::Outcome::Error(
+                        (*error).with_correlation(correlation_id),
+                    )),
+                };
+            }
+        };
+        match self.work_port.confirm(&request, &context.principal) {
+            Ok(port_result) => {
+                let (await_token, gateway_error) = self.issue_await_token(
+                    &context.session,
+                    port_result.source_revision,
+                    port_result.await_target,
+                    correlation_id,
+                );
+                ConfirmWorkResponse {
+                    outcome: Some(match gateway_error {
+                        Some(error) => confirm_work_response::Outcome::Error(error),
+                        None => confirm_work_response::Outcome::Accepted(
+                            egopulse_domain_contracts::v01::egopulse::localapi::v1::ConfirmWorkAccepted {
+                                authority_result: Some(port_result.result),
+                                await_token,
+                            },
+                        ),
+                    }),
+                }
+            }
+            Err(error) => ConfirmWorkResponse {
+                outcome: Some(confirm_work_response::Outcome::Error(port_error(
+                    error,
+                    correlation_id,
+                ))),
+            },
         }
     }
 
@@ -374,6 +809,85 @@ impl CommandGatewayApplication {
         }
     }
 
+    pub fn execute_context_mutation(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: ExecuteContextMutationRequest,
+    ) -> ExecuteContextMutationResponse {
+        let ExecuteContextMutationRequest { client, command } = request;
+        let correlation_id = context_command_correlation_id(client.as_ref(), command.as_ref());
+        if peer.is_none() {
+            return context_response_error(peer_identity_error(correlation_id));
+        }
+        let context = match self.authorize(
+            peer,
+            client.as_ref(),
+            RPC_EXECUTE_CONTEXT,
+            context_oneof(command.as_ref()),
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return context_response_error((*error).with_correlation(correlation_id));
+            }
+        };
+        let Some(context_mutation_command::Command::RevokeContextSnapshot(command)) =
+            command.and_then(|value| value.command)
+        else {
+            return context_response_error(invalid_error("command_missing", correlation_id));
+        };
+        let metadata =
+            match validate_context_command_metadata(client.as_ref(), command.metadata.as_ref()) {
+                Ok(()) => command.metadata.as_ref().expect("metadata was validated"),
+                Err(error) => {
+                    return context_response_error((*error).with_correlation(correlation_id));
+                }
+            };
+        if !is_canonical_sha256(&metadata.request_digest_sha256) {
+            return context_response_error(invalid_error(
+                "context_revoke_digest_malformed",
+                correlation_id,
+            ));
+        }
+        let computed_digest = ContextRevokeSemanticRequest {
+            founder_principal_id: &context.principal.principal_id,
+            snapshot_id: &command.snapshot_id,
+            expected_state_revision: command.expected_state_revision,
+            reason_code: &command.reason_code,
+            evidence_refs: &command.evidence_refs,
+            confirmation_proof_ref: &command.confirmation_proof_ref,
+        }
+        .digest_sha256();
+        if computed_digest != metadata.request_digest_sha256 {
+            return context_response_error(api_error(
+                LocalApiErrorCode::IntegrityFailure,
+                "context_revoke_digest_mismatch",
+                false,
+                None,
+                correlation_id,
+            ));
+        }
+        let verified = VerifiedContextRevokeCommand {
+            command_id: metadata.command_id.clone(),
+            snapshot_id: command.snapshot_id,
+            expected_state_revision: command.expected_state_revision,
+            reason_code: command.reason_code,
+            evidence_refs: command.evidence_refs,
+            confirmation_proof_ref: command.confirmation_proof_ref,
+            idempotency_key: metadata.idempotency_key.clone(),
+            correlation_id: metadata.correlation_id.clone(),
+            causation_id: metadata.causation_id.clone(),
+            request_digest_sha256: metadata.request_digest_sha256.clone(),
+        };
+        match self.context_port.revoke(&verified, &context.principal) {
+            Ok(receipt) => ExecuteContextMutationResponse {
+                outcome: Some(execute_context_mutation_response::Outcome::AuthorityResult(
+                    receipt,
+                )),
+            },
+            Err(error) => context_response_error(context_port_error(error, correlation_id)),
+        }
+    }
+
     fn authorize(
         &self,
         peer: Option<&PeerConnectionInfo>,
@@ -425,6 +939,54 @@ impl CommandGatewayApplication {
             },
             session,
             _authorized: authorized,
+        })
+    }
+
+    fn authorize_rpc(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        metadata: Option<&ClientRequestMetadata>,
+        rpc: &str,
+    ) -> Result<WorkContext, Box<LocalApiError>> {
+        let correlation_id = client_correlation_id(metadata);
+        let peer = peer.ok_or_else(|| {
+            Box::new(invalid_error(
+                "peer_identity_missing",
+                correlation_id.clone(),
+            ))
+        })?;
+        let metadata = metadata.ok_or_else(|| {
+            Box::new(invalid_error(
+                "invalid_client_metadata",
+                correlation_id.clone(),
+            ))
+        })?;
+        validate_client_metadata(metadata).map_err(|_| {
+            Box::new(invalid_error(
+                "invalid_client_metadata",
+                correlation_id.clone(),
+            ))
+        })?;
+        let session = self
+            .registry
+            .authenticate(Some(metadata), peer)
+            .map_err(|failure| Box::new(session_error(failure, correlation_id.clone())))?;
+        self.profiles
+            .authorize_rpc(rpc, &session.permission_codes)
+            .map_err(|failure| Box::new(profile_error(failure, correlation_id.clone())))?;
+        Ok(WorkContext {
+            principal: CommandPrincipal {
+                principal_id: session.authenticated_principal_id.clone(),
+                // Preparation is compiler-only, while confirmation has one
+                // fixed downstream write owner. The constraint is derived by
+                // this gateway and cannot be supplied or widened by a client.
+                required_authority_principal_kinds: if rpc == RPC_CONFIRM_WORK {
+                    vec!["TaskAuthority.Founder".to_owned()]
+                } else {
+                    Vec::new()
+                },
+            },
+            session,
         })
     }
 
@@ -491,6 +1053,11 @@ struct CommandContext {
     _authorized: AuthorizedCommand,
 }
 
+struct WorkContext {
+    principal: CommandPrincipal,
+    session: AuthenticatedSession,
+}
+
 pub struct LocalCommandGatewayEndpoint {
     application: Arc<CommandGatewayApplication>,
 }
@@ -508,6 +1075,51 @@ impl LocalCommandGatewayEndpoint {
 
 #[tonic::async_trait]
 impl LocalCommandGatewayService for LocalCommandGatewayEndpoint {
+    async fn list_work_capabilities(
+        &self,
+        request: Request<ListWorkCapabilitiesRequest>,
+    ) -> Result<Response<ListWorkCapabilitiesResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(self.application.list_work_capabilities(
+            peer.as_ref(),
+            request.into_inner(),
+        )))
+    }
+
+    async fn set_default_work_capability(
+        &self,
+        request: Request<SetDefaultWorkCapabilityRequest>,
+    ) -> Result<Response<SetDefaultWorkCapabilityResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(self.application.set_default_work_capability(
+            peer.as_ref(),
+            request.into_inner(),
+        )))
+    }
+
+    async fn prepare_work(
+        &self,
+        request: Request<PrepareWorkRequest>,
+    ) -> Result<Response<PrepareWorkResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(
+            self.application
+                .prepare_work(peer.as_ref(), request.into_inner())
+                .await,
+        ))
+    }
+
+    async fn confirm_work(
+        &self,
+        request: Request<ConfirmWorkRequest>,
+    ) -> Result<Response<ConfirmWorkResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(
+            self.application
+                .confirm_work(peer.as_ref(), request.into_inner()),
+        ))
+    }
+
     async fn execute_task_command(
         &self,
         request: Request<ExecuteTaskCommandRequest>,
@@ -547,6 +1159,17 @@ impl LocalCommandGatewayService for LocalCommandGatewayEndpoint {
     ) -> Result<Response<ExecuteMemoryMutationResponse>, Status> {
         let peer = Self::peer(&request);
         Ok(Response::new(self.application.execute_memory_mutation(
+            peer.as_ref(),
+            request.into_inner(),
+        )))
+    }
+
+    async fn execute_context_mutation(
+        &self,
+        request: Request<ExecuteContextMutationRequest>,
+    ) -> Result<Response<ExecuteContextMutationResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(self.application.execute_context_mutation(
             peer.as_ref(),
             request.into_inner(),
         )))
@@ -598,6 +1221,49 @@ fn validate_command_metadata(
         )));
     }
     Ok(())
+}
+
+fn validate_context_command_metadata(
+    client: Option<&ClientRequestMetadata>,
+    metadata: Option<&CommandMetadata>,
+) -> Result<(), Box<LocalApiError>> {
+    validate_command_metadata(client, metadata)?;
+    let Some(metadata) = metadata else {
+        return Err(Box::new(invalid_error(
+            "command_metadata_missing",
+            String::new(),
+        )));
+    };
+    if !is_bounded_metadata_value(&metadata.command_id)
+        || !is_bounded_metadata_value(&metadata.idempotency_key)
+        || !is_bounded_metadata_value(&metadata.idempotency_scope)
+        || !is_bounded_metadata_value(&metadata.request_digest_sha256)
+        || !is_bounded_metadata_value(&metadata.correlation_id)
+        || metadata
+            .causation_id
+            .as_deref()
+            .is_some_and(|value| !is_bounded_metadata_value(value))
+    {
+        return Err(Box::new(invalid_error(
+            "context_command_metadata_invalid",
+            String::new(),
+        )));
+    }
+    Ok(())
+}
+
+fn is_bounded_metadata_value(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 256
+        && value == value.trim()
+        && !value.chars().any(char::is_control)
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn command_correlation_id<T>(client: Option<&ClientRequestMetadata>, command: Option<&T>) -> String
@@ -729,6 +1395,33 @@ fn memory_command_correlation_id(
         .unwrap_or_else(|| Uuid::now_v7().to_string())
 }
 
+fn context_oneof(command: Option<&ContextMutationCommand>) -> Option<&'static str> {
+    Some(match command?.command.as_ref()? {
+        context_mutation_command::Command::RevokeContextSnapshot(_) => "revoke_context_snapshot",
+    })
+}
+
+fn context_metadata(command: &ContextMutationCommand) -> Option<&CommandMetadata> {
+    match command.command.as_ref()? {
+        context_mutation_command::Command::RevokeContextSnapshot(value) => value.metadata.as_ref(),
+    }
+}
+
+fn context_command_correlation_id(
+    client: Option<&ClientRequestMetadata>,
+    command: Option<&ContextMutationCommand>,
+) -> String {
+    client
+        .and_then(|value| value.correlation_id.clone())
+        .or_else(|| {
+            command
+                .and_then(context_metadata)
+                .map(|value| value.correlation_id.clone())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Uuid::now_v7().to_string())
+}
+
 fn sanitize_policy_result(result: &PolicyDecisionCommandResult) -> HarnessApprovalAuthorityResult {
     let record = result.decision_record.as_ref();
     let state = result.state.as_ref();
@@ -809,6 +1502,27 @@ fn profile_error(failure: ContractProfileError, correlation_id: String) -> Local
 
 fn port_error(failure: CommandPortFailure, correlation_id: String) -> LocalApiError {
     match failure {
+        CommandPortFailure::InvalidArgument => api_error(
+            LocalApiErrorCode::InvalidArgument,
+            "work_preparation_invalid_argument",
+            false,
+            None,
+            correlation_id,
+        ),
+        CommandPortFailure::CapabilityNotAdmitted => api_error(
+            LocalApiErrorCode::CapabilityNotAdmitted,
+            "work_capability_not_admitted",
+            false,
+            Some("SELECT_ADMITTED_CAPABILITY"),
+            correlation_id,
+        ),
+        CommandPortFailure::ConfigurationMigrationRequired => api_error(
+            LocalApiErrorCode::ConfigurationMigrationRequired,
+            "work_capability_configuration_migration_required",
+            false,
+            Some("MIGRATE_CONFIGURATION"),
+            correlation_id,
+        ),
         CommandPortFailure::Unavailable => api_error(
             LocalApiErrorCode::AuthorityUnavailable,
             "authority_unavailable",
@@ -831,6 +1545,146 @@ fn port_error(failure: CommandPortFailure, correlation_id: String) -> LocalApiEr
             correlation_id,
         ),
     }
+}
+
+fn work_capability_port_error(
+    failure: WorkCapabilityPortFailure,
+    correlation_id: String,
+) -> LocalApiError {
+    match failure {
+        WorkCapabilityPortFailure::InvalidArgument => api_error(
+            LocalApiErrorCode::InvalidArgument,
+            "work_capability_invalid_argument",
+            false,
+            None,
+            correlation_id,
+        ),
+        WorkCapabilityPortFailure::CapabilityNotAdmitted => api_error(
+            LocalApiErrorCode::CapabilityNotAdmitted,
+            "work_capability_not_admitted",
+            false,
+            Some("SELECT_ADMITTED_CAPABILITY"),
+            correlation_id,
+        ),
+        WorkCapabilityPortFailure::StateRevisionConflict => api_error(
+            LocalApiErrorCode::StateRevisionConflict,
+            "work_capability_preference_revision_conflict",
+            false,
+            Some("REFRESH_WORK_CAPABILITIES"),
+            correlation_id,
+        ),
+        WorkCapabilityPortFailure::ConfigurationMigrationRequired => api_error(
+            LocalApiErrorCode::ConfigurationMigrationRequired,
+            "work_capability_configuration_migration_required",
+            false,
+            Some("MIGRATE_CONFIGURATION"),
+            correlation_id,
+        ),
+        WorkCapabilityPortFailure::IntegrityFailure => api_error(
+            LocalApiErrorCode::IntegrityFailure,
+            "work_capability_integrity_failure",
+            false,
+            Some("RESTART_DAEMON"),
+            correlation_id,
+        ),
+        WorkCapabilityPortFailure::Unavailable => api_error(
+            LocalApiErrorCode::AuthorityUnavailable,
+            "work_capability_configuration_unavailable",
+            true,
+            Some("RETRY"),
+            correlation_id,
+        ),
+    }
+}
+
+fn context_port_error(
+    failure: ContextMutationPortFailure,
+    correlation_id: String,
+) -> LocalApiError {
+    match failure {
+        ContextMutationPortFailure::InvalidArgument => api_error(
+            LocalApiErrorCode::InvalidArgument,
+            "context_authority_invalid_argument",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::PermissionDenied => api_error(
+            LocalApiErrorCode::PermissionDenied,
+            "context_authority_permission_denied",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::OwnerMismatch => api_error(
+            LocalApiErrorCode::OwnerMismatch,
+            "context_owner_mismatch",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::NotFound => api_error(
+            LocalApiErrorCode::NotFound,
+            "context_snapshot_not_found",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::ContextRevoked => api_error(
+            LocalApiErrorCode::ContextRevoked,
+            "context_snapshot_revoked",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::StateRevisionConflict => api_error(
+            LocalApiErrorCode::StateRevisionConflict,
+            "context_state_revision_conflict",
+            false,
+            Some("REFRESH_CONTEXT"),
+            correlation_id,
+        ),
+        ContextMutationPortFailure::IdempotencyConflict => api_error(
+            LocalApiErrorCode::IdempotencyConflict,
+            "context_idempotency_conflict",
+            false,
+            None,
+            correlation_id,
+        ),
+        ContextMutationPortFailure::IntegrityFailure => api_error(
+            LocalApiErrorCode::IntegrityFailure,
+            "context_authority_integrity_failure",
+            false,
+            Some("RESTART_DAEMON"),
+            correlation_id,
+        ),
+        ContextMutationPortFailure::AuthorityUnavailable => api_error(
+            LocalApiErrorCode::AuthorityUnavailable,
+            "context_authority_unavailable",
+            true,
+            Some("RETRY"),
+            correlation_id,
+        ),
+        ContextMutationPortFailure::UnknownCriticalSemantics => {
+            critical_error("context_authority_semantics_unknown", correlation_id)
+        }
+    }
+}
+
+fn context_response_error(error: LocalApiError) -> ExecuteContextMutationResponse {
+    ExecuteContextMutationResponse {
+        outcome: Some(execute_context_mutation_response::Outcome::Error(error)),
+    }
+}
+
+fn peer_identity_error(correlation_id: String) -> LocalApiError {
+    api_error(
+        LocalApiErrorCode::Unauthenticated,
+        "peer_identity_missing",
+        false,
+        Some("REOPEN_SESSION"),
+        correlation_id,
+    )
 }
 
 fn invalid_error(fingerprint: &'static str, correlation_id: String) -> LocalApiError {

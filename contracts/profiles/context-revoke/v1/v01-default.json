@@ -1,0 +1,87 @@
+{
+  "schemaVersion": "egopulse.context-revoke-semantic-profile/v0.1",
+  "contractId": "egopulse.context-revoke-confirmation.v1",
+  "contractVersion": "0.1.0",
+  "authorityRef": "conversation:2026-08-31:founder-r9a-gate11-scheme-c",
+  "domainSeparator": "egopulse/context-revoke/v1",
+  "digest": {
+    "algorithm": "SHA-256",
+    "outputEncoding": "lowercase_hex",
+    "outputCharacters": 64
+  },
+  "canonicalEncoding": {
+    "fieldEnvelope": "u64_le_byte_length_then_raw_value",
+    "stringEncoding": "utf8",
+    "unsignedIntegerEncoding": "u64_le_value_wrapped_as_field",
+    "listEncoding": "u64_le_item_count_wrapped_as_field_then_each_item_as_field",
+    "normalization": "none",
+    "evidenceOrder": "preserve_request_order"
+  },
+  "semanticFieldOrder": [
+    "domain_separator",
+    "founder_principal_id",
+    "snapshot_id",
+    "expected_state_revision",
+    "reason_code",
+    "evidence_refs_count",
+    "evidence_refs_each",
+    "confirmation_proof_ref"
+  ],
+  "excludedFields": [
+    "command_id",
+    "idempotency_key",
+    "idempotency_scope",
+    "issued_at",
+    "correlation_id",
+    "causation_id",
+    "request_id",
+    "client_instance_id",
+    "client_surface",
+    "presentation_text"
+  ],
+  "confirmation": {
+    "requestField": "RevokeContextSnapshotCommand.metadata.request_digest_sha256",
+    "principalSource": "authenticated_local_session",
+    "gatewayRule": "recompute_exact_match_before_context_authority",
+    "missingOrInvalidRule": "reject_before_context_authority_zero_calls"
+  },
+  "newCommitValidation": {
+    "reasonCode": {
+      "syntax": "lowercase_ascii_slug",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+      "minBytes": 1,
+      "maxBytes": 128
+    },
+    "evidenceRefs": {
+      "syntax": "lowercase_ascii_namespaced_ref",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*(?::[a-z0-9]+(?:-[a-z0-9]+)*)+$",
+      "minItems": 1,
+      "maxItems": 16,
+      "maxItemBytes": 512,
+      "maxTotalBytes": 4096,
+      "preserveRequestOrder": true
+    },
+    "confirmationProofRef": {
+      "syntax": "lowercase_ascii_namespaced_ref",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*(?::[a-z0-9]+(?:-[a-z0-9]+)*)+$",
+      "minBytes": 1,
+      "maxBytes": 512
+    },
+    "normalization": "reject_not_normalize",
+    "rawOrEncodedContextProviderContent": "forbidden"
+  },
+  "historicalReplay": {
+    "matchFields": [
+      "authenticated_principal_id",
+      "idempotency_key",
+      "full_semantic_request_digest_sha256"
+    ],
+    "exactMatchResult": "return_original_receipt_with_replayed_true_zero_writes",
+    "changedSemanticsResult": "idempotency_conflict_before_new_commit_validation"
+  },
+  "fixtureRefs": [
+    "fixtures/localapi/v1/valid-context-revoke-semantic-digest.json",
+    "fixtures/localapi/v1/invalid-context-revoke-confirmation-digests.json",
+    "fixtures/localapi/v1/context-revoke-scheme-c-boundaries-and-history.json"
+  ]
+}

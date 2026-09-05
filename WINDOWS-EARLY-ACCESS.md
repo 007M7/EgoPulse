@@ -1,8 +1,10 @@
 # Windows x64 early access
 
-This package is the first CLI/TUI release of EgoPulse. The CLI, TUI and
-`agentosd.exe` use the same Rust control kernel and local IPC transport. The
-Desktop/Tauri surface is not part of phase one.
+This package is the Windows x64 CLI/TUI early-access candidate of EgoPulse.
+CLI, TUI and `agentosd.exe` use the same Rust Client Kernel and local IPC
+transport. Desktop is implemented as a separate shared-kernel candidate, but
+is intentionally excluded from this first CLI/TUI package until native GUI
+automation and the remaining Desktop workflows are accepted.
 
 The package is intentionally **unsigned**. Windows SmartScreen may show an
 unknown-publisher warning. Verify the downloaded archive with the adjacent
@@ -26,17 +28,52 @@ Provider API keys to the package or configuration. A pre-existing
 configuration is preserved unless `-Force` is explicitly supplied; forced
 replacement creates a timestamped backup.
 
+After configuration validation, the installer prints one redacted preflight
+line per configured Provider. `executable_available` checks only the configured
+path/PATH entry, while `credential_status` reports API-key environment presence
+or Harness-owned delegated login. These are local readiness hints, not
+authenticated lifecycle or production-admission evidence.
+
 The installer requires Windows x64, Python/uv-compatible Memory Worker setup,
-and an installed `uv` command. If `uv` is absent, install it from
-`https://docs.astral.sh/uv/` first.
+an installed `uv` command, and the configured production Harness. The current
+production profile uses Codex app-server, so `codex` must resolve to a local
+application before installation can complete. If `uv` is absent, install it
+from `https://docs.astral.sh/uv/` first. A configured command is resolved to an
+absolute executable before daemon process supervision; an unavailable
+production Harness fails installation instead of surfacing on the first Task.
+EgoPulse repeats executable-file validation immediately before every child
+process spawn and assigns the process tree to a Windows Job Object so timeout,
+cancellation, and daemon loss also terminate Harness descendants. The
+early-access local threat model still trusts software under the signed-in
+Windows user's own Harness installation path; it does not claim binary pinning
+or protection from that same user replacing the Harness file.
 
 After installation, open a new PowerShell window so the user environment is
 loaded and run:
 
 ```powershell
 .\bin\egopulse.exe status
+.\bin\egopulse.exe work capabilities
 .\bin\egopulse-tui.exe
 ```
+
+The capability list shows Provider, Harness, Harness-model and provider-model
+identities separately. Only entries marked `admitted` have a public choice ID
+and can start work. Candidate and held entries are diagnostics, not selectable
+routes. To start a natural-language work request with the governed default and
+Memory retrieval, use:
+
+```powershell
+.\bin\egopulse.exe work start --intent 'Summarize this project and propose the next safe change' --scope 'scope:founder' --work-type 'general' --confirm
+```
+
+The TUI exposes the same kernel operation: press `n` to open Work Start, review
+the resolved capability and Memory-bound preview, then confirm. Provider output
+is projected as a governed stream; CLI and TUI do not call a Harness directly.
+
+The current CLI/TUI package does not contain `egopulse-desktop.exe`. A Desktop
+candidate must be built with the explicit `-IncludeDesktop` packaging option
+after its native GUI acceptance gate is closed.
 
 ## Manual first-run setup
 
@@ -92,4 +129,7 @@ The retrieval path is read-only, deterministic lexical retrieval in this
 early-access release. Agent writes remain candidates and require the frozen
 Memory governance path for promotion or revocation. Semantic/vector retrieval,
 reranking, a second production Harness, cloud telemetry and enterprise
-identity are outside this package.
+identity are outside this package. DeepSeek, Kimi and GLM profiles may be
+configured for evaluation, but their real authentication is deliberately not
+a blocker for this Codex-backed release and does not grant production
+admission.

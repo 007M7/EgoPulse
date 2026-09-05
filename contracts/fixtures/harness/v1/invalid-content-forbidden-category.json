@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1",
+  "fixtureId": "harness-invalid-content-forbidden-category",
+  "category": "invalid",
+  "requirementRefs": ["R9C-D04", "R9C-D05", "R9C-D12-DISCLOSURE"],
+  "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": { "fencingToken": 3, "lastObservationSequence": 7, "deliveredReceiptDisposition": "DELIVERY_DISPOSITION_DELIVERED" },
+  "resolvedReferences": {
+    "sourceCategory": "tool_results",
+    "rawEvidenceCanary": "R9C_FORBIDDEN_TOOL_RESULT_CANARY",
+    "routeBindingValid": true,
+    "contextProofValid": true
+  },
+  "command": {
+    "ingestObservation": {
+      "observationId": "obs-content-forbidden-001",
+      "adapterId": "codex-adapter",
+      "attemptId": "attempt-001",
+      "dispatchId": "dispatch-001",
+      "fencingToken": 3,
+      "observationSequence": 8,
+      "nativeEventId": "native-tool-result-001",
+      "nativeSequence": 8,
+      "nativeEventDigestSha256": "abababababababababababababababababababababababababababababababab",
+      "capabilityProfileId": "codex-app-server-v2-0.148.0-alpha.15",
+      "criticality": "OBSERVATION_CRITICALITY_INFORMATIONAL",
+      "rawEvidenceRef": "raw-tool-result-001",
+      "contentSignal": {
+        "contentEventId": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+        "deliveredReceiptId": "receipt-001",
+        "deliveredReceiptDigestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dispatchRouteBindingSha256": "5fc3d40c5d3ecdc61ccac5826e0e2d0b10131133adcd8a5ca8438188c01c39a8",
+        "contextConsumptionProof": { "notContextBound": {} },
+        "candidate": {
+          "blockedSource": { "reason": "HARNESS_CONTENT_MARKER_KIND_FORBIDDEN_CATEGORY" },
+          "candidateDigestSha256": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+        }
+      }
+    }
+  },
+  "expected": {
+    "outcome": "committed",
+    "businessWriteCount": 1,
+    "resultingObservationSequence": 8,
+    "safeRecordWriteCount": 1,
+    "safeMarker": "HARNESS_CONTENT_MARKER_KIND_FORBIDDEN_CATEGORY",
+    "sourceBytesInSafeRecord": false,
+    "sourceBytesInLocalApi": false,
+    "taskAuthorityWriteCount": 0
+  }
+}

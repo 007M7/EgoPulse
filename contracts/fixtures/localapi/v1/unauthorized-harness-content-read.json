@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "v01-localapi-fixture/v0.1",
+  "fixtureId": "localapi-unauthorized-harness-content-read",
+  "category": "unauthorized",
+  "requirementRefs": ["R9C-D06", "R9C-D12-AUTHORIZATION"],
+  "principal": { "kind": "LOCAL_USER", "principalId": "os-user:other", "authenticated": true },
+  "transport": { "kind": "WINDOWS_NAMED_PIPE" },
+  "startingState": {
+    "grantedPermissionCodes": ["local.task.read", "local.approval.read", "local.evidence.read"],
+    "ownedTaskIds": []
+  },
+  "operation": {
+    "listHarnessContent": { "taskId": "task-001", "pageSize": 32 }
+  },
+  "expected": {
+    "outcome": "error",
+    "businessWriteCount": 0,
+    "errorCode": "LOCAL_API_ERROR_CODE_PERMISSION_DENIED",
+    "requiredPermissionCode": "local.harness.content.read",
+    "otherReadPermissionSubstituted": false,
+    "readModelCallCount": 0,
+    "contentBytesReturned": 0
+  }
+}

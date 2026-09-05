@@ -1,11 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
-    EvidenceGraphView, HarnessApprovalView, ProjectionHealth, ProjectionPosition, TaskView,
+    EvidenceGraphView, HarnessApprovalView, HarnessContentPosition, ProjectionHealth,
+    ProjectionPosition, TaskView,
 };
 use egopulse_local_read_model::{
-    ApprovalListFilter, ApprovalViewAccess, EvidenceGraphAccess, HistoricalPage, LocalReadModel,
-    ProjectionFailure, StreamBatch, TaskListFilter, TaskViewAccess,
+    ApprovalListFilter, ApprovalViewAccess, EvidenceGraphAccess, HarnessContentBaselineQuery,
+    HarnessContentBaselineResult, HarnessContentReadAccess, HarnessContentWatchQuery,
+    HarnessContentWatchResult, HistoricalPage, LocalReadModel, ProjectionFailure, StreamBatch,
+    TaskListFilter, TaskViewAccess,
 };
 use thiserror::Error;
 use tokio::sync::{Semaphore, watch};
@@ -14,6 +17,13 @@ use tokio::sync::{Semaphore, watch};
 pub struct ReadModelStatus {
     pub position: ProjectionPosition,
     pub retention_floor: ProjectionPosition,
+    pub health: ProjectionHealth,
+}
+
+#[derive(Clone, Debug)]
+pub struct HarnessContentStatus {
+    pub position: HarnessContentPosition,
+    pub retention_floor: HarnessContentPosition,
     pub health: ProjectionHealth,
 }
 
@@ -34,6 +44,28 @@ pub trait ProjectionStatusReader: Send + Sync + 'static {
 
 #[tonic::async_trait]
 pub trait ReadModelReader: ProjectionStatusReader {
+    async fn harness_content_status(&self) -> Result<HarnessContentStatus, ReadModelAccessError> {
+        Err(ReadModelAccessError::Unavailable)
+    }
+
+    async fn list_harness_content(
+        &self,
+        query: HarnessContentBaselineQuery,
+        access: HarnessContentReadAccess,
+    ) -> Result<HarnessContentBaselineResult, ReadModelAccessError> {
+        let _ = (query, access);
+        Err(ReadModelAccessError::Unavailable)
+    }
+
+    async fn watch_harness_content(
+        &self,
+        query: HarnessContentWatchQuery,
+        access: HarnessContentReadAccess,
+    ) -> Result<HarnessContentWatchResult, ReadModelAccessError> {
+        let _ = (query, access);
+        Err(ReadModelAccessError::Unavailable)
+    }
+
     async fn task_frames_after(
         &self,
         after: ProjectionPosition,
@@ -162,6 +194,35 @@ impl ProjectionStatusReader for BlockingLocalReadModelReader {
 
 #[tonic::async_trait]
 impl ReadModelReader for BlockingLocalReadModelReader {
+    async fn harness_content_status(&self) -> Result<HarnessContentStatus, ReadModelAccessError> {
+        self.run(|model| {
+            Ok(HarnessContentStatus {
+                position: model.harness_content_position()?,
+                retention_floor: model.harness_content_retention_floor()?,
+                health: model.harness_content_health()?,
+            })
+        })
+        .await
+    }
+
+    async fn list_harness_content(
+        &self,
+        query: HarnessContentBaselineQuery,
+        access: HarnessContentReadAccess,
+    ) -> Result<HarnessContentBaselineResult, ReadModelAccessError> {
+        self.run(move |model| model.list_harness_content(&query, access))
+            .await
+    }
+
+    async fn watch_harness_content(
+        &self,
+        query: HarnessContentWatchQuery,
+        access: HarnessContentReadAccess,
+    ) -> Result<HarnessContentWatchResult, ReadModelAccessError> {
+        self.run(move |model| model.watch_harness_content(&query, access))
+            .await
+    }
+
     async fn task_frames_after(
         &self,
         after: ProjectionPosition,
@@ -256,6 +317,69 @@ pub struct ProjectionCommitNotifier {
     sender: watch::Sender<ProjectionPosition>,
 }
 
+#[derive(Clone)]
+pub struct HarnessContentCommitNotifier {
+    sender: watch::Sender<HarnessContentPosition>,
+}
+
+impl HarnessContentCommitNotifier {
+    #[must_use]
+    pub fn new(initial_position: HarnessContentPosition) -> Self {
+        let (sender, _) = watch::channel(initial_position);
+        Self { sender }
+    }
+
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<HarnessContentPosition> {
+        self.sender.subscribe()
+    }
+
+    pub fn publish(&self, committed_position: HarnessContentPosition) {
+        self.sender.send_replace(committed_position);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum HarnessContentScopeAccessError {
+    #[error("trusted Harness content scope source is unavailable")]
+    Unavailable,
+    #[error("trusted Harness content scope source failed integrity validation")]
+    Integrity,
+}
+
+#[tonic::async_trait]
+pub trait HarnessContentScopeReader: Send + Sync + 'static {
+    async fn task_owner_principal_id(
+        &self,
+        task_id: String,
+    ) -> Result<Option<String>, HarnessContentScopeAccessError>;
+
+    async fn task_id_for_attempt(
+        &self,
+        attempt_id: String,
+    ) -> Result<Option<String>, HarnessContentScopeAccessError>;
+}
+
+#[derive(Default)]
+pub struct FailClosedHarnessContentScopeReader;
+
+#[tonic::async_trait]
+impl HarnessContentScopeReader for FailClosedHarnessContentScopeReader {
+    async fn task_owner_principal_id(
+        &self,
+        _task_id: String,
+    ) -> Result<Option<String>, HarnessContentScopeAccessError> {
+        Err(HarnessContentScopeAccessError::Unavailable)
+    }
+
+    async fn task_id_for_attempt(
+        &self,
+        _attempt_id: String,
+    ) -> Result<Option<String>, HarnessContentScopeAccessError> {
+        Err(HarnessContentScopeAccessError::Unavailable)
+    }
+}
+
 impl ProjectionCommitNotifier {
     #[must_use]
     pub fn new(initial_position: ProjectionPosition) -> Self {
@@ -297,5 +421,22 @@ mod tests {
 
         let late_subscriber = notifier.subscribe();
         assert_eq!(late_subscriber.borrow().sequence, 4);
+    }
+
+    #[tokio::test]
+    async fn content_notifier_is_independent_from_the_task_projection_domain() {
+        let notifier = HarnessContentCommitNotifier::new(HarnessContentPosition {
+            epoch: "content-a".to_owned(),
+            sequence: 3,
+            projected_at: None,
+        });
+        let mut subscriber = notifier.subscribe();
+        notifier.publish(HarnessContentPosition {
+            epoch: "content-a".to_owned(),
+            sequence: 4,
+            projected_at: None,
+        });
+        subscriber.changed().await.expect("sender remains live");
+        assert_eq!(subscriber.borrow().sequence, 4);
     }
 }

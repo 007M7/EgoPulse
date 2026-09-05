@@ -26,6 +26,26 @@ class ClientSurface(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CLIENT_SURFACE_CLI: _ClassVar[ClientSurface]
     CLIENT_SURFACE_TUI: _ClassVar[ClientSurface]
 
+class WorkMemoryMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    WORK_MEMORY_MODE_UNSPECIFIED: _ClassVar[WorkMemoryMode]
+    WORK_MEMORY_MODE_DISABLED: _ClassVar[WorkMemoryMode]
+    WORK_MEMORY_MODE_GOVERNED_RETRIEVAL: _ClassVar[WorkMemoryMode]
+
+class WorkCapabilityAvailability(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    WORK_CAPABILITY_AVAILABILITY_UNSPECIFIED: _ClassVar[WorkCapabilityAvailability]
+    WORK_CAPABILITY_AVAILABILITY_ADMITTED: _ClassVar[WorkCapabilityAvailability]
+    WORK_CAPABILITY_AVAILABILITY_CANDIDATE: _ClassVar[WorkCapabilityAvailability]
+    WORK_CAPABILITY_AVAILABILITY_HELD: _ClassVar[WorkCapabilityAvailability]
+
+class WorkCapabilitySelectionSource(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    WORK_CAPABILITY_SELECTION_SOURCE_UNSPECIFIED: _ClassVar[WorkCapabilitySelectionSource]
+    WORK_CAPABILITY_SELECTION_SOURCE_FUTURE_WORK_DEFAULT: _ClassVar[WorkCapabilitySelectionSource]
+    WORK_CAPABILITY_SELECTION_SOURCE_EXPLICIT_CHOICE: _ClassVar[WorkCapabilitySelectionSource]
+    WORK_CAPABILITY_SELECTION_SOURCE_LEGACY_OMITTED_DEFAULT: _ClassVar[WorkCapabilitySelectionSource]
+
 class ProjectionHealth(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     PROJECTION_HEALTH_UNSPECIFIED: _ClassVar[ProjectionHealth]
@@ -53,6 +73,16 @@ class StreamFrameKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     STREAM_FRAME_KIND_HEARTBEAT: _ClassVar[StreamFrameKind]
     STREAM_FRAME_KIND_RESET_REQUIRED: _ClassVar[StreamFrameKind]
 
+class HarnessContentResetReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    HARNESS_CONTENT_RESET_REASON_UNSPECIFIED: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_CURSOR_EXPIRED: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_EPOCH_CHANGED: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_PROFILE_CHANGED: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_RETENTION_COMPACTED: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_BASELINE_UNAVAILABLE: _ClassVar[HarnessContentResetReason]
+    HARNESS_CONTENT_RESET_REASON_INTEGRITY_RECOVERY: _ClassVar[HarnessContentResetReason]
+
 class AvailableActionKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     AVAILABLE_ACTION_KIND_UNSPECIFIED: _ClassVar[AvailableActionKind]
@@ -62,6 +92,12 @@ class AvailableActionKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     AVAILABLE_ACTION_KIND_REVISE_TASK: _ClassVar[AvailableActionKind]
     AVAILABLE_ACTION_KIND_DECIDE_HARNESS_APPROVAL: _ClassVar[AvailableActionKind]
     AVAILABLE_ACTION_KIND_SUBMIT_FOUNDER_VERDICT: _ClassVar[AvailableActionKind]
+
+class ContextGovernanceState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    CONTEXT_GOVERNANCE_STATE_UNSPECIFIED: _ClassVar[ContextGovernanceState]
+    CONTEXT_GOVERNANCE_STATE_ISSUED: _ClassVar[ContextGovernanceState]
+    CONTEXT_GOVERNANCE_STATE_REVOKED: _ClassVar[ContextGovernanceState]
 
 class LocalApiErrorCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -83,10 +119,27 @@ class LocalApiErrorCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS: _ClassVar[LocalApiErrorCode]
     LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED: _ClassVar[LocalApiErrorCode]
     LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_OWNER_MISMATCH: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_CONTEXT_REVOKED: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_CAPABILITY_NOT_ADMITTED: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_CONFIGURATION_MIGRATION_REQUIRED: _ClassVar[LocalApiErrorCode]
 CLIENT_SURFACE_UNSPECIFIED: ClientSurface
 CLIENT_SURFACE_DESKTOP: ClientSurface
 CLIENT_SURFACE_CLI: ClientSurface
 CLIENT_SURFACE_TUI: ClientSurface
+WORK_MEMORY_MODE_UNSPECIFIED: WorkMemoryMode
+WORK_MEMORY_MODE_DISABLED: WorkMemoryMode
+WORK_MEMORY_MODE_GOVERNED_RETRIEVAL: WorkMemoryMode
+WORK_CAPABILITY_AVAILABILITY_UNSPECIFIED: WorkCapabilityAvailability
+WORK_CAPABILITY_AVAILABILITY_ADMITTED: WorkCapabilityAvailability
+WORK_CAPABILITY_AVAILABILITY_CANDIDATE: WorkCapabilityAvailability
+WORK_CAPABILITY_AVAILABILITY_HELD: WorkCapabilityAvailability
+WORK_CAPABILITY_SELECTION_SOURCE_UNSPECIFIED: WorkCapabilitySelectionSource
+WORK_CAPABILITY_SELECTION_SOURCE_FUTURE_WORK_DEFAULT: WorkCapabilitySelectionSource
+WORK_CAPABILITY_SELECTION_SOURCE_EXPLICIT_CHOICE: WorkCapabilitySelectionSource
+WORK_CAPABILITY_SELECTION_SOURCE_LEGACY_OMITTED_DEFAULT: WorkCapabilitySelectionSource
 PROJECTION_HEALTH_UNSPECIFIED: ProjectionHealth
 PROJECTION_HEALTH_READY: ProjectionHealth
 PROJECTION_HEALTH_CATCHING_UP: ProjectionHealth
@@ -105,6 +158,13 @@ STREAM_FRAME_KIND_UNSPECIFIED: StreamFrameKind
 STREAM_FRAME_KIND_SNAPSHOT: StreamFrameKind
 STREAM_FRAME_KIND_HEARTBEAT: StreamFrameKind
 STREAM_FRAME_KIND_RESET_REQUIRED: StreamFrameKind
+HARNESS_CONTENT_RESET_REASON_UNSPECIFIED: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_CURSOR_EXPIRED: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_EPOCH_CHANGED: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_PROFILE_CHANGED: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_RETENTION_COMPACTED: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_BASELINE_UNAVAILABLE: HarnessContentResetReason
+HARNESS_CONTENT_RESET_REASON_INTEGRITY_RECOVERY: HarnessContentResetReason
 AVAILABLE_ACTION_KIND_UNSPECIFIED: AvailableActionKind
 AVAILABLE_ACTION_KIND_CREATE_TASK: AvailableActionKind
 AVAILABLE_ACTION_KIND_REQUEST_CANCELLATION: AvailableActionKind
@@ -112,6 +172,9 @@ AVAILABLE_ACTION_KIND_RESUME_TASK: AvailableActionKind
 AVAILABLE_ACTION_KIND_REVISE_TASK: AvailableActionKind
 AVAILABLE_ACTION_KIND_DECIDE_HARNESS_APPROVAL: AvailableActionKind
 AVAILABLE_ACTION_KIND_SUBMIT_FOUNDER_VERDICT: AvailableActionKind
+CONTEXT_GOVERNANCE_STATE_UNSPECIFIED: ContextGovernanceState
+CONTEXT_GOVERNANCE_STATE_ISSUED: ContextGovernanceState
+CONTEXT_GOVERNANCE_STATE_REVOKED: ContextGovernanceState
 LOCAL_API_ERROR_CODE_UNSPECIFIED: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_INVALID_ARGUMENT: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_UNAUTHENTICATED: LocalApiErrorCode
@@ -130,6 +193,12 @@ LOCAL_API_ERROR_CODE_AUTHORITY_UNAVAILABLE: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_OWNER_MISMATCH: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_CONTEXT_REVOKED: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_CAPABILITY_NOT_ADMITTED: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_CONFIGURATION_MIGRATION_REQUIRED: LocalApiErrorCode
 
 class ClientRequestMetadata(_message.Message):
     __slots__ = ("request_id", "client_instance_id", "surface", "session_id", "api_contract_ref", "correlation_id")
@@ -247,6 +316,260 @@ class EvidenceGraphView(_message.Message):
     redactions: _containers.RepeatedCompositeFieldContainer[RedactedField]
     def __init__(self, metadata: _Optional[_Union[ProjectionMetadata, _Mapping]] = ..., task_id: _Optional[str] = ..., artifact_set_id: _Optional[str] = ..., artifacts: _Optional[_Iterable[_Union[_artifact_pb2.ArtifactDescriptor, _Mapping]]] = ..., claims: _Optional[_Iterable[_Union[_artifact_pb2.Claim, _Mapping]]] = ..., evidence: _Optional[_Iterable[_Union[_artifact_pb2.Evidence, _Mapping]]] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ...) -> None: ...
 
+class WorkSourceRequest(_message.Message):
+    __slots__ = ("source_ref", "label")
+    SOURCE_REF_FIELD_NUMBER: _ClassVar[int]
+    LABEL_FIELD_NUMBER: _ClassVar[int]
+    source_ref: str
+    label: str
+    def __init__(self, source_ref: _Optional[str] = ..., label: _Optional[str] = ...) -> None: ...
+
+class WorkSourceFact(_message.Message):
+    __slots__ = ("source_ref", "label", "authority", "content_sha256", "included")
+    SOURCE_REF_FIELD_NUMBER: _ClassVar[int]
+    LABEL_FIELD_NUMBER: _ClassVar[int]
+    AUTHORITY_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_SHA256_FIELD_NUMBER: _ClassVar[int]
+    INCLUDED_FIELD_NUMBER: _ClassVar[int]
+    source_ref: str
+    label: str
+    authority: str
+    content_sha256: str
+    included: bool
+    def __init__(self, source_ref: _Optional[str] = ..., label: _Optional[str] = ..., authority: _Optional[str] = ..., content_sha256: _Optional[str] = ..., included: _Optional[bool] = ...) -> None: ...
+
+class WorkGateNotice(_message.Message):
+    __slots__ = ("code", "detail", "source_ref")
+    CODE_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_REF_FIELD_NUMBER: _ClassVar[int]
+    code: str
+    detail: str
+    source_ref: str
+    def __init__(self, code: _Optional[str] = ..., detail: _Optional[str] = ..., source_ref: _Optional[str] = ...) -> None: ...
+
+class WorkCapabilityView(_message.Message):
+    __slots__ = ("provider_profile_id", "provider_alias", "harness_alias", "harness_model_alias", "provider_model_alias", "availability", "selectable", "safe_reason_code", "choice_id", "admitted_route", "current_future_work_default")
+    PROVIDER_PROFILE_ID_FIELD_NUMBER: _ClassVar[int]
+    PROVIDER_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    HARNESS_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    HARNESS_MODEL_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    PROVIDER_MODEL_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    AVAILABILITY_FIELD_NUMBER: _ClassVar[int]
+    SELECTABLE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_REASON_CODE_FIELD_NUMBER: _ClassVar[int]
+    CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    ADMITTED_ROUTE_FIELD_NUMBER: _ClassVar[int]
+    CURRENT_FUTURE_WORK_DEFAULT_FIELD_NUMBER: _ClassVar[int]
+    provider_profile_id: str
+    provider_alias: str
+    harness_alias: str
+    harness_model_alias: str
+    provider_model_alias: str
+    availability: WorkCapabilityAvailability
+    selectable: bool
+    safe_reason_code: str
+    choice_id: str
+    admitted_route: _task_pb2.WorkCapabilityRouteBinding
+    current_future_work_default: bool
+    def __init__(self, provider_profile_id: _Optional[str] = ..., provider_alias: _Optional[str] = ..., harness_alias: _Optional[str] = ..., harness_model_alias: _Optional[str] = ..., provider_model_alias: _Optional[str] = ..., availability: _Optional[_Union[WorkCapabilityAvailability, str]] = ..., selectable: _Optional[bool] = ..., safe_reason_code: _Optional[str] = ..., choice_id: _Optional[str] = ..., admitted_route: _Optional[_Union[_task_pb2.WorkCapabilityRouteBinding, _Mapping]] = ..., current_future_work_default: _Optional[bool] = ...) -> None: ...
+
+class WorkCapabilityPreferenceView(_message.Message):
+    __slots__ = ("default_choice_id", "preference_revision", "configuration_migration_required")
+    DEFAULT_CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    PREFERENCE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    CONFIGURATION_MIGRATION_REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    default_choice_id: str
+    preference_revision: int
+    configuration_migration_required: bool
+    def __init__(self, default_choice_id: _Optional[str] = ..., preference_revision: _Optional[int] = ..., configuration_migration_required: _Optional[bool] = ...) -> None: ...
+
+class ListWorkCapabilitiesRequest(_message.Message):
+    __slots__ = ("client",)
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ...) -> None: ...
+
+class ListWorkCapabilitiesResult(_message.Message):
+    __slots__ = ("capabilities", "preference")
+    CAPABILITIES_FIELD_NUMBER: _ClassVar[int]
+    PREFERENCE_FIELD_NUMBER: _ClassVar[int]
+    capabilities: _containers.RepeatedCompositeFieldContainer[WorkCapabilityView]
+    preference: WorkCapabilityPreferenceView
+    def __init__(self, capabilities: _Optional[_Iterable[_Union[WorkCapabilityView, _Mapping]]] = ..., preference: _Optional[_Union[WorkCapabilityPreferenceView, _Mapping]] = ...) -> None: ...
+
+class ListWorkCapabilitiesResponse(_message.Message):
+    __slots__ = ("result", "error")
+    RESULT_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    result: ListWorkCapabilitiesResult
+    error: LocalApiError
+    def __init__(self, result: _Optional[_Union[ListWorkCapabilitiesResult, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class SetDefaultWorkCapabilityRequest(_message.Message):
+    __slots__ = ("client", "choice_id", "expected_preference_revision")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_PREFERENCE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    choice_id: str
+    expected_preference_revision: int
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., choice_id: _Optional[str] = ..., expected_preference_revision: _Optional[int] = ...) -> None: ...
+
+class WorkCapabilityPreferenceReceipt(_message.Message):
+    __slots__ = ("previous_default_choice_id", "default_choice_id", "previous_preference_revision", "preference_revision", "changed")
+    PREVIOUS_DEFAULT_CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    DEFAULT_CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    PREVIOUS_PREFERENCE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    PREFERENCE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    CHANGED_FIELD_NUMBER: _ClassVar[int]
+    previous_default_choice_id: str
+    default_choice_id: str
+    previous_preference_revision: int
+    preference_revision: int
+    changed: bool
+    def __init__(self, previous_default_choice_id: _Optional[str] = ..., default_choice_id: _Optional[str] = ..., previous_preference_revision: _Optional[int] = ..., preference_revision: _Optional[int] = ..., changed: _Optional[bool] = ...) -> None: ...
+
+class SetDefaultWorkCapabilityResponse(_message.Message):
+    __slots__ = ("receipt", "error")
+    RECEIPT_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    receipt: WorkCapabilityPreferenceReceipt
+    error: LocalApiError
+    def __init__(self, receipt: _Optional[_Union[WorkCapabilityPreferenceReceipt, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class UseDefaultWorkCapability(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class WorkPreparationPreview(_message.Message):
+    __slots__ = ("snapshot_id", "snapshot_revision", "normalized_intent", "work_type", "target_scope_ref", "compiled_context_sha256", "included_sources", "excluded_sources", "non_goals", "allowed_read_paths", "allowed_write_paths", "allowed_tools", "external_resources", "acceptance_contract_ref", "budget_profile_ref", "memory_authority_revision", "memory_pack_snapshot_sha256", "recovery_entry", "visibility", "redactions", "expires_at", "confirmation_binding_sha256", "gate_ready", "blockers", "warnings", "required_confirmations", "evidence_required", "ready_for_founder_confirmation", "deadline", "context_state_revision", "work_capability", "work_capability_selection_source", "preference_revision_at_resolution")
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_REVISION_FIELD_NUMBER: _ClassVar[int]
+    NORMALIZED_INTENT_FIELD_NUMBER: _ClassVar[int]
+    WORK_TYPE_FIELD_NUMBER: _ClassVar[int]
+    TARGET_SCOPE_REF_FIELD_NUMBER: _ClassVar[int]
+    COMPILED_CONTEXT_SHA256_FIELD_NUMBER: _ClassVar[int]
+    INCLUDED_SOURCES_FIELD_NUMBER: _ClassVar[int]
+    EXCLUDED_SOURCES_FIELD_NUMBER: _ClassVar[int]
+    NON_GOALS_FIELD_NUMBER: _ClassVar[int]
+    ALLOWED_READ_PATHS_FIELD_NUMBER: _ClassVar[int]
+    ALLOWED_WRITE_PATHS_FIELD_NUMBER: _ClassVar[int]
+    ALLOWED_TOOLS_FIELD_NUMBER: _ClassVar[int]
+    EXTERNAL_RESOURCES_FIELD_NUMBER: _ClassVar[int]
+    ACCEPTANCE_CONTRACT_REF_FIELD_NUMBER: _ClassVar[int]
+    BUDGET_PROFILE_REF_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_AUTHORITY_REVISION_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_PACK_SNAPSHOT_SHA256_FIELD_NUMBER: _ClassVar[int]
+    RECOVERY_ENTRY_FIELD_NUMBER: _ClassVar[int]
+    VISIBILITY_FIELD_NUMBER: _ClassVar[int]
+    REDACTIONS_FIELD_NUMBER: _ClassVar[int]
+    EXPIRES_AT_FIELD_NUMBER: _ClassVar[int]
+    CONFIRMATION_BINDING_SHA256_FIELD_NUMBER: _ClassVar[int]
+    GATE_READY_FIELD_NUMBER: _ClassVar[int]
+    BLOCKERS_FIELD_NUMBER: _ClassVar[int]
+    WARNINGS_FIELD_NUMBER: _ClassVar[int]
+    REQUIRED_CONFIRMATIONS_FIELD_NUMBER: _ClassVar[int]
+    EVIDENCE_REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    READY_FOR_FOUNDER_CONFIRMATION_FIELD_NUMBER: _ClassVar[int]
+    DEADLINE_FIELD_NUMBER: _ClassVar[int]
+    CONTEXT_STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    WORK_CAPABILITY_FIELD_NUMBER: _ClassVar[int]
+    WORK_CAPABILITY_SELECTION_SOURCE_FIELD_NUMBER: _ClassVar[int]
+    PREFERENCE_REVISION_AT_RESOLUTION_FIELD_NUMBER: _ClassVar[int]
+    snapshot_id: str
+    snapshot_revision: int
+    normalized_intent: str
+    work_type: str
+    target_scope_ref: str
+    compiled_context_sha256: str
+    included_sources: _containers.RepeatedCompositeFieldContainer[WorkSourceFact]
+    excluded_sources: _containers.RepeatedCompositeFieldContainer[WorkGateNotice]
+    non_goals: _containers.RepeatedScalarFieldContainer[str]
+    allowed_read_paths: _containers.RepeatedScalarFieldContainer[str]
+    allowed_write_paths: _containers.RepeatedScalarFieldContainer[str]
+    allowed_tools: _containers.RepeatedScalarFieldContainer[str]
+    external_resources: _containers.RepeatedScalarFieldContainer[str]
+    acceptance_contract_ref: _common_pb2.ContractReference
+    budget_profile_ref: _common_pb2.ContractReference
+    memory_authority_revision: int
+    memory_pack_snapshot_sha256: str
+    recovery_entry: str
+    visibility: str
+    redactions: _containers.RepeatedCompositeFieldContainer[RedactedField]
+    expires_at: _timestamp_pb2.Timestamp
+    confirmation_binding_sha256: str
+    gate_ready: bool
+    blockers: _containers.RepeatedCompositeFieldContainer[WorkGateNotice]
+    warnings: _containers.RepeatedCompositeFieldContainer[WorkGateNotice]
+    required_confirmations: _containers.RepeatedScalarFieldContainer[str]
+    evidence_required: _containers.RepeatedScalarFieldContainer[str]
+    ready_for_founder_confirmation: bool
+    deadline: _timestamp_pb2.Timestamp
+    context_state_revision: int
+    work_capability: WorkCapabilityView
+    work_capability_selection_source: WorkCapabilitySelectionSource
+    preference_revision_at_resolution: int
+    def __init__(self, snapshot_id: _Optional[str] = ..., snapshot_revision: _Optional[int] = ..., normalized_intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., compiled_context_sha256: _Optional[str] = ..., included_sources: _Optional[_Iterable[_Union[WorkSourceFact, _Mapping]]] = ..., excluded_sources: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., non_goals: _Optional[_Iterable[str]] = ..., allowed_read_paths: _Optional[_Iterable[str]] = ..., allowed_write_paths: _Optional[_Iterable[str]] = ..., allowed_tools: _Optional[_Iterable[str]] = ..., external_resources: _Optional[_Iterable[str]] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., memory_authority_revision: _Optional[int] = ..., memory_pack_snapshot_sha256: _Optional[str] = ..., recovery_entry: _Optional[str] = ..., visibility: _Optional[str] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., confirmation_binding_sha256: _Optional[str] = ..., gate_ready: _Optional[bool] = ..., blockers: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., warnings: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., required_confirmations: _Optional[_Iterable[str]] = ..., evidence_required: _Optional[_Iterable[str]] = ..., ready_for_founder_confirmation: _Optional[bool] = ..., deadline: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., context_state_revision: _Optional[int] = ..., work_capability: _Optional[_Union[WorkCapabilityView, _Mapping]] = ..., work_capability_selection_source: _Optional[_Union[WorkCapabilitySelectionSource, str]] = ..., preference_revision_at_resolution: _Optional[int] = ...) -> None: ...
+
+class PrepareWorkRequest(_message.Message):
+    __slots__ = ("client", "intent", "work_type", "target_scope_ref", "sources", "idempotency_key", "memory_mode", "use_default_work_capability", "explicit_work_capability_choice_id")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    INTENT_FIELD_NUMBER: _ClassVar[int]
+    WORK_TYPE_FIELD_NUMBER: _ClassVar[int]
+    TARGET_SCOPE_REF_FIELD_NUMBER: _ClassVar[int]
+    SOURCES_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_MODE_FIELD_NUMBER: _ClassVar[int]
+    USE_DEFAULT_WORK_CAPABILITY_FIELD_NUMBER: _ClassVar[int]
+    EXPLICIT_WORK_CAPABILITY_CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    intent: str
+    work_type: str
+    target_scope_ref: str
+    sources: _containers.RepeatedCompositeFieldContainer[WorkSourceRequest]
+    idempotency_key: str
+    memory_mode: WorkMemoryMode
+    use_default_work_capability: UseDefaultWorkCapability
+    explicit_work_capability_choice_id: str
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., sources: _Optional[_Iterable[_Union[WorkSourceRequest, _Mapping]]] = ..., idempotency_key: _Optional[str] = ..., memory_mode: _Optional[_Union[WorkMemoryMode, str]] = ..., use_default_work_capability: _Optional[_Union[UseDefaultWorkCapability, _Mapping]] = ..., explicit_work_capability_choice_id: _Optional[str] = ...) -> None: ...
+
+class PrepareWorkResponse(_message.Message):
+    __slots__ = ("preview", "error")
+    PREVIEW_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    preview: WorkPreparationPreview
+    error: LocalApiError
+    def __init__(self, preview: _Optional[_Union[WorkPreparationPreview, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class ConfirmWorkRequest(_message.Message):
+    __slots__ = ("client", "snapshot_id", "confirmation_binding_sha256", "idempotency_key")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    CONFIRMATION_BINDING_SHA256_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    snapshot_id: str
+    confirmation_binding_sha256: str
+    idempotency_key: str
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., snapshot_id: _Optional[str] = ..., confirmation_binding_sha256: _Optional[str] = ..., idempotency_key: _Optional[str] = ...) -> None: ...
+
+class ConfirmWorkAccepted(_message.Message):
+    __slots__ = ("authority_result", "await_token")
+    AUTHORITY_RESULT_FIELD_NUMBER: _ClassVar[int]
+    AWAIT_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    authority_result: _task_pb2.TaskCommandResult
+    await_token: ProjectionAwaitToken
+    def __init__(self, authority_result: _Optional[_Union[_task_pb2.TaskCommandResult, _Mapping]] = ..., await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ...) -> None: ...
+
+class ConfirmWorkResponse(_message.Message):
+    __slots__ = ("accepted", "error")
+    ACCEPTED_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    accepted: ConfirmWorkAccepted
+    error: LocalApiError
+    def __init__(self, accepted: _Optional[_Union[ConfirmWorkAccepted, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
 class HarnessApprovalAuthorityResult(_message.Message):
     __slots__ = ("committed", "replayed", "authority_decision_ref", "decision", "state", "state_revision", "expires_at", "error_code", "safe_error_fingerprint")
     COMMITTED_FIELD_NUMBER: _ClassVar[int]
@@ -330,6 +653,210 @@ class HarnessApprovalView(_message.Message):
     available_actions: _containers.RepeatedCompositeFieldContainer[AvailableAction]
     redactions: _containers.RepeatedCompositeFieldContainer[RedactedField]
     def __init__(self, metadata: _Optional[_Union[ProjectionMetadata, _Mapping]] = ..., approval_request_id: _Optional[str] = ..., task_id: _Optional[str] = ..., run_id: _Optional[str] = ..., step_id: _Optional[str] = ..., attempt_id: _Optional[str] = ..., dispatch_id: _Optional[str] = ..., fencing_token: _Optional[int] = ..., kind: _Optional[_Union[_harness_pb2.ApprovalKind, str]] = ..., action_digest_sha256: _Optional[str] = ..., requested_scope_ref: _Optional[str] = ..., display_summary_ref: _Optional[str] = ..., request_observation_id: _Optional[str] = ..., request_observation_sequence: _Optional[int] = ..., request_lifecycle: _Optional[_Union[_harness_pb2.ApprovalRequestLifecycleKind, str]] = ..., request_revision: _Optional[int] = ..., policy_decision: _Optional[_Union[HarnessApprovalDecisionView, _Mapping]] = ..., available_actions: _Optional[_Iterable[_Union[AvailableAction, _Mapping]]] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ...) -> None: ...
+
+class HarnessContentPosition(_message.Message):
+    __slots__ = ("epoch", "sequence", "projected_at")
+    EPOCH_FIELD_NUMBER: _ClassVar[int]
+    SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    PROJECTED_AT_FIELD_NUMBER: _ClassVar[int]
+    epoch: str
+    sequence: int
+    projected_at: _timestamp_pb2.Timestamp
+    def __init__(self, epoch: _Optional[str] = ..., sequence: _Optional[int] = ..., projected_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class HarnessAssistantTextView(_message.Message):
+    __slots__ = ("safe_message_id", "revision", "previous_revision", "operation", "safe_text_utf8", "safe_cumulative_digest_sha256", "part_index", "part_count", "provisional")
+    SAFE_MESSAGE_ID_FIELD_NUMBER: _ClassVar[int]
+    REVISION_FIELD_NUMBER: _ClassVar[int]
+    PREVIOUS_REVISION_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_FIELD_NUMBER: _ClassVar[int]
+    SAFE_TEXT_UTF8_FIELD_NUMBER: _ClassVar[int]
+    SAFE_CUMULATIVE_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    PART_INDEX_FIELD_NUMBER: _ClassVar[int]
+    PART_COUNT_FIELD_NUMBER: _ClassVar[int]
+    PROVISIONAL_FIELD_NUMBER: _ClassVar[int]
+    safe_message_id: str
+    revision: int
+    previous_revision: int
+    operation: _harness_pb2.ContentMutationOperation
+    safe_text_utf8: str
+    safe_cumulative_digest_sha256: str
+    part_index: int
+    part_count: int
+    provisional: bool
+    def __init__(self, safe_message_id: _Optional[str] = ..., revision: _Optional[int] = ..., previous_revision: _Optional[int] = ..., operation: _Optional[_Union[_harness_pb2.ContentMutationOperation, str]] = ..., safe_text_utf8: _Optional[str] = ..., safe_cumulative_digest_sha256: _Optional[str] = ..., part_index: _Optional[int] = ..., part_count: _Optional[int] = ..., provisional: _Optional[bool] = ...) -> None: ...
+
+class HarnessLifecycleContentView(_message.Message):
+    __slots__ = ("kind", "side_effect_certainty", "native_will_retry")
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    SIDE_EFFECT_CERTAINTY_FIELD_NUMBER: _ClassVar[int]
+    NATIVE_WILL_RETRY_FIELD_NUMBER: _ClassVar[int]
+    kind: _harness_pb2.LifecycleKind
+    side_effect_certainty: _harness_pb2.SideEffectCertainty
+    native_will_retry: bool
+    def __init__(self, kind: _Optional[_Union[_harness_pb2.LifecycleKind, str]] = ..., side_effect_certainty: _Optional[_Union[_harness_pb2.SideEffectCertainty, str]] = ..., native_will_retry: _Optional[bool] = ...) -> None: ...
+
+class HarnessUsageContentView(_message.Message):
+    __slots__ = ("input_tokens", "output_tokens", "cached_input_tokens")
+    INPUT_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    CACHED_INPUT_TOKENS_FIELD_NUMBER: _ClassVar[int]
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    def __init__(self, input_tokens: _Optional[int] = ..., output_tokens: _Optional[int] = ..., cached_input_tokens: _Optional[int] = ...) -> None: ...
+
+class HarnessApprovalRequiredContentView(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class HarnessArtifactIdentityView(_message.Message):
+    __slots__ = ("artifact_id", "artifact_digest_sha256")
+    ARTIFACT_ID_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    artifact_id: str
+    artifact_digest_sha256: str
+    def __init__(self, artifact_id: _Optional[str] = ..., artifact_digest_sha256: _Optional[str] = ...) -> None: ...
+
+class HarnessArtifactAvailableRedactedView(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class HarnessArtifactRelationView(_message.Message):
+    __slots__ = ("safe_content_differs_from_artifact", "available", "available_redacted")
+    SAFE_CONTENT_DIFFERS_FROM_ARTIFACT_FIELD_NUMBER: _ClassVar[int]
+    AVAILABLE_FIELD_NUMBER: _ClassVar[int]
+    AVAILABLE_REDACTED_FIELD_NUMBER: _ClassVar[int]
+    safe_content_differs_from_artifact: bool
+    available: HarnessArtifactIdentityView
+    available_redacted: HarnessArtifactAvailableRedactedView
+    def __init__(self, safe_content_differs_from_artifact: _Optional[bool] = ..., available: _Optional[_Union[HarnessArtifactIdentityView, _Mapping]] = ..., available_redacted: _Optional[_Union[HarnessArtifactAvailableRedactedView, _Mapping]] = ...) -> None: ...
+
+class HarnessContentMarkerView(_message.Message):
+    __slots__ = ("kind", "limit_kind")
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    LIMIT_KIND_FIELD_NUMBER: _ClassVar[int]
+    kind: _harness_pb2.HarnessContentMarkerKind
+    limit_kind: _harness_pb2.HarnessContentLimitKind
+    def __init__(self, kind: _Optional[_Union[_harness_pb2.HarnessContentMarkerKind, str]] = ..., limit_kind: _Optional[_Union[_harness_pb2.HarnessContentLimitKind, str]] = ...) -> None: ...
+
+class HarnessContentRecordView(_message.Message):
+    __slots__ = ("record_id", "record_digest_sha256", "content_sequence", "task_id", "attempt_id", "provider_family_alias", "model_alias", "collaboration_role", "disclosure_profile_ref", "projected_at", "safety_flags", "assistant_text", "lifecycle", "usage", "approval_required", "artifact_relation", "marker")
+    RECORD_ID_FIELD_NUMBER: _ClassVar[int]
+    RECORD_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_ID_FIELD_NUMBER: _ClassVar[int]
+    PROVIDER_FAMILY_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    MODEL_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    COLLABORATION_ROLE_FIELD_NUMBER: _ClassVar[int]
+    DISCLOSURE_PROFILE_REF_FIELD_NUMBER: _ClassVar[int]
+    PROJECTED_AT_FIELD_NUMBER: _ClassVar[int]
+    SAFETY_FLAGS_FIELD_NUMBER: _ClassVar[int]
+    ASSISTANT_TEXT_FIELD_NUMBER: _ClassVar[int]
+    LIFECYCLE_FIELD_NUMBER: _ClassVar[int]
+    USAGE_FIELD_NUMBER: _ClassVar[int]
+    APPROVAL_REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_RELATION_FIELD_NUMBER: _ClassVar[int]
+    MARKER_FIELD_NUMBER: _ClassVar[int]
+    record_id: str
+    record_digest_sha256: str
+    content_sequence: int
+    task_id: str
+    attempt_id: str
+    provider_family_alias: str
+    model_alias: str
+    collaboration_role: str
+    disclosure_profile_ref: _common_pb2.ContractReference
+    projected_at: _timestamp_pb2.Timestamp
+    safety_flags: _containers.RepeatedScalarFieldContainer[_harness_pb2.HarnessContentSafetyFlag]
+    assistant_text: HarnessAssistantTextView
+    lifecycle: HarnessLifecycleContentView
+    usage: HarnessUsageContentView
+    approval_required: HarnessApprovalRequiredContentView
+    artifact_relation: HarnessArtifactRelationView
+    marker: HarnessContentMarkerView
+    def __init__(self, record_id: _Optional[str] = ..., record_digest_sha256: _Optional[str] = ..., content_sequence: _Optional[int] = ..., task_id: _Optional[str] = ..., attempt_id: _Optional[str] = ..., provider_family_alias: _Optional[str] = ..., model_alias: _Optional[str] = ..., collaboration_role: _Optional[str] = ..., disclosure_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., projected_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., safety_flags: _Optional[_Iterable[_Union[_harness_pb2.HarnessContentSafetyFlag, str]]] = ..., assistant_text: _Optional[_Union[HarnessAssistantTextView, _Mapping]] = ..., lifecycle: _Optional[_Union[HarnessLifecycleContentView, _Mapping]] = ..., usage: _Optional[_Union[HarnessUsageContentView, _Mapping]] = ..., approval_required: _Optional[_Union[HarnessApprovalRequiredContentView, _Mapping]] = ..., artifact_relation: _Optional[_Union[HarnessArtifactRelationView, _Mapping]] = ..., marker: _Optional[_Union[HarnessContentMarkerView, _Mapping]] = ...) -> None: ...
+
+class ListHarnessContentRequest(_message.Message):
+    __slots__ = ("client", "task_id", "attempt_ids", "page_size", "page_cursor", "snapshot_position")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_IDS_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    PAGE_CURSOR_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_POSITION_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    task_id: str
+    attempt_ids: _containers.RepeatedScalarFieldContainer[str]
+    page_size: int
+    page_cursor: str
+    snapshot_position: HarnessContentPosition
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., task_id: _Optional[str] = ..., attempt_ids: _Optional[_Iterable[str]] = ..., page_size: _Optional[int] = ..., page_cursor: _Optional[str] = ..., snapshot_position: _Optional[_Union[HarnessContentPosition, _Mapping]] = ...) -> None: ...
+
+class HarnessContentBaselinePage(_message.Message):
+    __slots__ = ("records", "next_page_cursor", "has_more", "snapshot_position", "retained_from_sequence", "disclosure_profile_ref")
+    RECORDS_FIELD_NUMBER: _ClassVar[int]
+    NEXT_PAGE_CURSOR_FIELD_NUMBER: _ClassVar[int]
+    HAS_MORE_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_POSITION_FIELD_NUMBER: _ClassVar[int]
+    RETAINED_FROM_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    DISCLOSURE_PROFILE_REF_FIELD_NUMBER: _ClassVar[int]
+    records: _containers.RepeatedCompositeFieldContainer[HarnessContentRecordView]
+    next_page_cursor: str
+    has_more: bool
+    snapshot_position: HarnessContentPosition
+    retained_from_sequence: int
+    disclosure_profile_ref: _common_pb2.ContractReference
+    def __init__(self, records: _Optional[_Iterable[_Union[HarnessContentRecordView, _Mapping]]] = ..., next_page_cursor: _Optional[str] = ..., has_more: _Optional[bool] = ..., snapshot_position: _Optional[_Union[HarnessContentPosition, _Mapping]] = ..., retained_from_sequence: _Optional[int] = ..., disclosure_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ...) -> None: ...
+
+class ListHarnessContentResponse(_message.Message):
+    __slots__ = ("page", "error")
+    PAGE_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    page: HarnessContentBaselinePage
+    error: LocalApiError
+    def __init__(self, page: _Optional[_Union[HarnessContentBaselinePage, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class WatchHarnessContentRequest(_message.Message):
+    __slots__ = ("client", "task_id", "attempt_ids", "resume_after")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_IDS_FIELD_NUMBER: _ClassVar[int]
+    RESUME_AFTER_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    task_id: str
+    attempt_ids: _containers.RepeatedScalarFieldContainer[str]
+    resume_after: HarnessContentPosition
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., task_id: _Optional[str] = ..., attempt_ids: _Optional[_Iterable[str]] = ..., resume_after: _Optional[_Union[HarnessContentPosition, _Mapping]] = ...) -> None: ...
+
+class HarnessContentRecordsFrame(_message.Message):
+    __slots__ = ("records",)
+    RECORDS_FIELD_NUMBER: _ClassVar[int]
+    records: _containers.RepeatedCompositeFieldContainer[HarnessContentRecordView]
+    def __init__(self, records: _Optional[_Iterable[_Union[HarnessContentRecordView, _Mapping]]] = ...) -> None: ...
+
+class HarnessContentHeartbeatFrame(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class HarnessContentResetRequiredFrame(_message.Message):
+    __slots__ = ("reason",)
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    reason: HarnessContentResetReason
+    def __init__(self, reason: _Optional[_Union[HarnessContentResetReason, str]] = ...) -> None: ...
+
+class HarnessContentStreamFrame(_message.Message):
+    __slots__ = ("position", "records", "heartbeat", "reset_required")
+    POSITION_FIELD_NUMBER: _ClassVar[int]
+    RECORDS_FIELD_NUMBER: _ClassVar[int]
+    HEARTBEAT_FIELD_NUMBER: _ClassVar[int]
+    RESET_REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    position: HarnessContentPosition
+    records: HarnessContentRecordsFrame
+    heartbeat: HarnessContentHeartbeatFrame
+    reset_required: HarnessContentResetRequiredFrame
+    def __init__(self, position: _Optional[_Union[HarnessContentPosition, _Mapping]] = ..., records: _Optional[_Union[HarnessContentRecordsFrame, _Mapping]] = ..., heartbeat: _Optional[_Union[HarnessContentHeartbeatFrame, _Mapping]] = ..., reset_required: _Optional[_Union[HarnessContentResetRequiredFrame, _Mapping]] = ...) -> None: ...
 
 class LocalApiError(_message.Message):
     __slots__ = ("code", "safe_fingerprint", "retryable", "required_action_code", "current_position", "correlation_id")
@@ -714,6 +1241,72 @@ class ExecuteMemoryMutationResponse(_message.Message):
     authority_result: MemoryMutationReceipt
     gateway_error: LocalApiError
     def __init__(self, authority_result: _Optional[_Union[MemoryMutationReceipt, _Mapping]] = ..., gateway_error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class RevokeContextSnapshotCommand(_message.Message):
+    __slots__ = ("metadata", "snapshot_id", "expected_state_revision", "reason_code", "evidence_refs", "confirmation_proof_ref")
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    REASON_CODE_FIELD_NUMBER: _ClassVar[int]
+    EVIDENCE_REFS_FIELD_NUMBER: _ClassVar[int]
+    CONFIRMATION_PROOF_REF_FIELD_NUMBER: _ClassVar[int]
+    metadata: _common_pb2.CommandMetadata
+    snapshot_id: str
+    expected_state_revision: int
+    reason_code: str
+    evidence_refs: _containers.RepeatedScalarFieldContainer[str]
+    confirmation_proof_ref: str
+    def __init__(self, metadata: _Optional[_Union[_common_pb2.CommandMetadata, _Mapping]] = ..., snapshot_id: _Optional[str] = ..., expected_state_revision: _Optional[int] = ..., reason_code: _Optional[str] = ..., evidence_refs: _Optional[_Iterable[str]] = ..., confirmation_proof_ref: _Optional[str] = ...) -> None: ...
+
+class ContextMutationCommand(_message.Message):
+    __slots__ = ("revoke_context_snapshot",)
+    REVOKE_CONTEXT_SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
+    revoke_context_snapshot: RevokeContextSnapshotCommand
+    def __init__(self, revoke_context_snapshot: _Optional[_Union[RevokeContextSnapshotCommand, _Mapping]] = ...) -> None: ...
+
+class ContextRevokeReceipt(_message.Message):
+    __slots__ = ("snapshot_id", "snapshot_revision", "content_digest_sha256", "previous_state_revision", "result_state_revision", "previous_state", "result_state", "request_digest_sha256", "event_id", "committed_at", "replayed", "acknowledged_after_durability_barrier")
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_REVISION_FIELD_NUMBER: _ClassVar[int]
+    CONTENT_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    PREVIOUS_STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    RESULT_STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    PREVIOUS_STATE_FIELD_NUMBER: _ClassVar[int]
+    RESULT_STATE_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    EVENT_ID_FIELD_NUMBER: _ClassVar[int]
+    COMMITTED_AT_FIELD_NUMBER: _ClassVar[int]
+    REPLAYED_FIELD_NUMBER: _ClassVar[int]
+    ACKNOWLEDGED_AFTER_DURABILITY_BARRIER_FIELD_NUMBER: _ClassVar[int]
+    snapshot_id: str
+    snapshot_revision: int
+    content_digest_sha256: str
+    previous_state_revision: int
+    result_state_revision: int
+    previous_state: ContextGovernanceState
+    result_state: ContextGovernanceState
+    request_digest_sha256: str
+    event_id: str
+    committed_at: _timestamp_pb2.Timestamp
+    replayed: bool
+    acknowledged_after_durability_barrier: bool
+    def __init__(self, snapshot_id: _Optional[str] = ..., snapshot_revision: _Optional[int] = ..., content_digest_sha256: _Optional[str] = ..., previous_state_revision: _Optional[int] = ..., result_state_revision: _Optional[int] = ..., previous_state: _Optional[_Union[ContextGovernanceState, str]] = ..., result_state: _Optional[_Union[ContextGovernanceState, str]] = ..., request_digest_sha256: _Optional[str] = ..., event_id: _Optional[str] = ..., committed_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., replayed: _Optional[bool] = ..., acknowledged_after_durability_barrier: _Optional[bool] = ...) -> None: ...
+
+class ExecuteContextMutationRequest(_message.Message):
+    __slots__ = ("client", "command")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    command: ContextMutationCommand
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., command: _Optional[_Union[ContextMutationCommand, _Mapping]] = ...) -> None: ...
+
+class ExecuteContextMutationResponse(_message.Message):
+    __slots__ = ("authority_result", "error")
+    AUTHORITY_RESULT_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    authority_result: ContextRevokeReceipt
+    error: LocalApiError
+    def __init__(self, authority_result: _Optional[_Union[ContextRevokeReceipt, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
 
 class AwaitProjectionRequest(_message.Message):
     __slots__ = ("client", "await_token", "timeout_milliseconds")

@@ -21,6 +21,31 @@ enum ClientSurface {
   CLIENT_SURFACE_TUI = 3;
 }
 
+// Per-work user intent. UNSPECIFIED deliberately preserves the pre-draft.22
+// no-Memory behavior for older clients; only GOVERNED_RETRIEVAL invokes the
+// daemon-owned accepted-snapshot retrieval path.
+enum WorkMemoryMode {
+  WORK_MEMORY_MODE_UNSPECIFIED = 0;
+  WORK_MEMORY_MODE_DISABLED = 1;
+  WORK_MEMORY_MODE_GOVERNED_RETRIEVAL = 2;
+}
+
+enum WorkCapabilityAvailability {
+  WORK_CAPABILITY_AVAILABILITY_UNSPECIFIED = 0;
+  WORK_CAPABILITY_AVAILABILITY_ADMITTED = 1;
+  WORK_CAPABILITY_AVAILABILITY_CANDIDATE = 2;
+  WORK_CAPABILITY_AVAILABILITY_HELD = 3;
+}
+
+enum WorkCapabilitySelectionSource {
+  WORK_CAPABILITY_SELECTION_SOURCE_UNSPECIFIED = 0;
+  WORK_CAPABILITY_SELECTION_SOURCE_FUTURE_WORK_DEFAULT = 1;
+  WORK_CAPABILITY_SELECTION_SOURCE_EXPLICIT_CHOICE = 2;
+  // Compatibility decoding only: an older request omitted the additive
+  // preference oneof and was resolved through the same governed default.
+  WORK_CAPABILITY_SELECTION_SOURCE_LEGACY_OMITTED_DEFAULT = 3;
+}
+
 enum ProjectionHealth {
   PROJECTION_HEALTH_UNSPECIFIED = 0;
   PROJECTION_HEALTH_READY = 1;
@@ -50,6 +75,16 @@ enum StreamFrameKind {
   STREAM_FRAME_KIND_RESET_REQUIRED = 3;
 }
 
+enum HarnessContentResetReason {
+  HARNESS_CONTENT_RESET_REASON_UNSPECIFIED = 0;
+  HARNESS_CONTENT_RESET_REASON_CURSOR_EXPIRED = 1;
+  HARNESS_CONTENT_RESET_REASON_EPOCH_CHANGED = 2;
+  HARNESS_CONTENT_RESET_REASON_PROFILE_CHANGED = 3;
+  HARNESS_CONTENT_RESET_REASON_RETENTION_COMPACTED = 4;
+  HARNESS_CONTENT_RESET_REASON_BASELINE_UNAVAILABLE = 5;
+  HARNESS_CONTENT_RESET_REASON_INTEGRITY_RECOVERY = 6;
+}
+
 enum AvailableActionKind {
   AVAILABLE_ACTION_KIND_UNSPECIFIED = 0;
   AVAILABLE_ACTION_KIND_CREATE_TASK = 1;
@@ -58,6 +93,14 @@ enum AvailableActionKind {
   AVAILABLE_ACTION_KIND_REVISE_TASK = 4;
   AVAILABLE_ACTION_KIND_DECIDE_HARNESS_APPROVAL = 5;
   AVAILABLE_ACTION_KIND_SUBMIT_FOUNDER_VERDICT = 6;
+}
+
+// Public governance projection only. Context bytes, private descriptor fields,
+// owner identity, evidence and confirmation proof never cross this boundary.
+enum ContextGovernanceState {
+  CONTEXT_GOVERNANCE_STATE_UNSPECIFIED = 0;
+  CONTEXT_GOVERNANCE_STATE_ISSUED = 1;
+  CONTEXT_GOVERNANCE_STATE_REVOKED = 2;
 }
 
 enum LocalApiErrorCode {
@@ -79,6 +122,12 @@ enum LocalApiErrorCode {
   LOCAL_API_ERROR_CODE_UNKNOWN_CRITICAL_SEMANTICS = 15;
   LOCAL_API_ERROR_CODE_RESOURCE_EXHAUSTED = 16;
   LOCAL_API_ERROR_CODE_COGNITION_WORKER_UNAVAILABLE = 17;
+  LOCAL_API_ERROR_CODE_OWNER_MISMATCH = 18;
+  LOCAL_API_ERROR_CODE_CONTEXT_REVOKED = 19;
+  LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT = 20;
+  LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT = 21;
+  LOCAL_API_ERROR_CODE_CAPABILITY_NOT_ADMITTED = 22;
+  LOCAL_API_ERROR_CODE_CONFIGURATION_MIGRATION_REQUIRED = 23;
 }
 
 message ClientRequestMetadata {
@@ -147,6 +196,177 @@ message EvidenceGraphView {
   repeated RedactedField redactions = 7;
 }
 
+// User-facing preparation input. The client supplies only natural-language
+// intent, reviewed work classification, scope and explicit source references;
+// the daemon compiles and verifies the authoritative context envelope.
+message WorkSourceRequest {
+  string source_ref = 1;
+  string label = 2;
+}
+
+// Authority-owned source fact returned in a preparation preview. The client
+// may request a source, but cannot author its authority or content digest.
+message WorkSourceFact {
+  string source_ref = 1;
+  string label = 2;
+  string authority = 3;
+  string content_sha256 = 4;
+  bool included = 5;
+}
+
+message WorkGateNotice {
+  string code = 1;
+  string detail = 2;
+  string source_ref = 3;
+}
+
+// Safe setup/work projection. A public choice_id is only a daemon lookup key;
+// admitted_route is the immutable fact that confirmation binds. Candidate or
+// held entries never carry an admitted route and are never selectable.
+message WorkCapabilityView {
+  string provider_profile_id = 1;
+  string provider_alias = 2;
+  string harness_alias = 3;
+  string harness_model_alias = 4;
+  string provider_model_alias = 5;
+  WorkCapabilityAvailability availability = 6;
+  bool selectable = 7;
+  optional string safe_reason_code = 8;
+  optional string choice_id = 9;
+  egopulse.task.v1.WorkCapabilityRouteBinding admitted_route = 10;
+  bool current_future_work_default = 11;
+}
+
+message WorkCapabilityPreferenceView {
+  string default_choice_id = 1;
+  uint64 preference_revision = 2;
+  // v2 is read-compatible and yields one in-memory Codex compatibility route,
+  // but mutation remains closed until explicit v3 migration.
+  bool configuration_migration_required = 3;
+}
+
+message ListWorkCapabilitiesRequest {
+  ClientRequestMetadata client = 1;
+}
+
+message ListWorkCapabilitiesResult {
+  repeated WorkCapabilityView capabilities = 1;
+  WorkCapabilityPreferenceView preference = 2;
+}
+
+message ListWorkCapabilitiesResponse {
+  oneof outcome {
+    ListWorkCapabilitiesResult result = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message SetDefaultWorkCapabilityRequest {
+  ClientRequestMetadata client = 1;
+  string choice_id = 2;
+  uint64 expected_preference_revision = 3;
+}
+
+message WorkCapabilityPreferenceReceipt {
+  string previous_default_choice_id = 1;
+  string default_choice_id = 2;
+  uint64 previous_preference_revision = 3;
+  uint64 preference_revision = 4;
+  bool changed = 5;
+}
+
+message SetDefaultWorkCapabilityResponse {
+  oneof outcome {
+    WorkCapabilityPreferenceReceipt receipt = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message UseDefaultWorkCapability {}
+
+// Sanitized, Authority-owned preparation result. Raw compiled context,
+// credentials, process configuration and client-selected authority fields are
+// never returned here.
+message WorkPreparationPreview {
+  string snapshot_id = 1;
+  uint64 snapshot_revision = 2;
+  string normalized_intent = 3;
+  string work_type = 4;
+  string target_scope_ref = 5;
+  string compiled_context_sha256 = 6;
+  repeated WorkSourceFact included_sources = 7;
+  repeated WorkGateNotice excluded_sources = 8;
+  repeated string non_goals = 9;
+  repeated string allowed_read_paths = 10;
+  repeated string allowed_write_paths = 11;
+  repeated string allowed_tools = 12;
+  repeated string external_resources = 13;
+  egopulse.common.v1.ContractReference acceptance_contract_ref = 14;
+  egopulse.common.v1.ContractReference budget_profile_ref = 15;
+  optional uint64 memory_authority_revision = 16;
+  optional string memory_pack_snapshot_sha256 = 17;
+  string recovery_entry = 18;
+  string visibility = 19;
+  repeated RedactedField redactions = 20;
+  google.protobuf.Timestamp expires_at = 21;
+  string confirmation_binding_sha256 = 22;
+  // Both fields are true only when the Authority-owned preparation gate is
+  // clear; neither means that a Task has been created or dispatched.
+  bool gate_ready = 23;
+  repeated WorkGateNotice blockers = 24;
+  repeated WorkGateNotice warnings = 25;
+  repeated string required_confirmations = 26;
+  repeated string evidence_required = 27;
+  bool ready_for_founder_confirmation = 28;
+  google.protobuf.Timestamp deadline = 29;
+  // Independent governance CAS read from Context Authority. It is not the
+  // immutable snapshot revision and MUST NOT be reconstructed by a client.
+  uint64 context_state_revision = 30;
+  WorkCapabilityView work_capability = 31;
+  WorkCapabilitySelectionSource work_capability_selection_source = 32;
+  optional uint64 preference_revision_at_resolution = 33;
+}
+
+message PrepareWorkRequest {
+  ClientRequestMetadata client = 1;
+  string intent = 2;
+  string work_type = 3;
+  string target_scope_ref = 4;
+  repeated WorkSourceRequest sources = 5;
+  string idempotency_key = 6;
+  WorkMemoryMode memory_mode = 7;
+  oneof work_capability_preference {
+    UseDefaultWorkCapability use_default_work_capability = 8;
+    string explicit_work_capability_choice_id = 9;
+  }
+}
+
+message PrepareWorkResponse {
+  oneof outcome {
+    WorkPreparationPreview preview = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message ConfirmWorkRequest {
+  ClientRequestMetadata client = 1;
+  string snapshot_id = 2;
+  string confirmation_binding_sha256 = 3;
+  string idempotency_key = 4;
+}
+
+message ConfirmWorkAccepted {
+  egopulse.task.v1.TaskCommandResult authority_result = 1;
+  ProjectionAwaitToken await_token = 2;
+}
+
+message ConfirmWorkResponse {
+  oneof outcome {
+    ConfirmWorkAccepted accepted = 1;
+    LocalApiError error = 2;
+  }
+}
+
 // Sanitized Authority result safe for Local API clients. The owning Policy
 // Authority remains the source of this result; native routing and proof
 // internals are deliberately absent.
@@ -196,6 +416,142 @@ message HarnessApprovalView {
   HarnessApprovalDecisionView policy_decision = 17;
   repeated AvailableAction available_actions = 18;
   repeated RedactedField redactions = 19;
+}
+
+// Independent content-domain position. It must not be compared with the Task,
+// Approval or OpenSession projection position even when values happen to match.
+message HarnessContentPosition {
+  string epoch = 1;
+  uint64 sequence = 2;
+  google.protobuf.Timestamp projected_at = 3;
+}
+
+message HarnessAssistantTextView {
+  string safe_message_id = 1;
+  uint64 revision = 2;
+  uint64 previous_revision = 3;
+  egopulse.harness.v1.ContentMutationOperation operation = 4;
+  string safe_text_utf8 = 5;
+  string safe_cumulative_digest_sha256 = 6;
+  uint32 part_index = 7;
+  uint32 part_count = 8;
+  bool provisional = 9;
+}
+
+message HarnessLifecycleContentView {
+  egopulse.harness.v1.LifecycleKind kind = 1;
+  egopulse.harness.v1.SideEffectCertainty side_effect_certainty = 2;
+  optional bool native_will_retry = 3;
+}
+
+message HarnessUsageContentView {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  optional uint64 cached_input_tokens = 3;
+}
+
+// Request identity/details remain in the separately authorized Approval stream.
+message HarnessApprovalRequiredContentView {}
+
+message HarnessArtifactIdentityView {
+  string artifact_id = 1;
+  string artifact_digest_sha256 = 2;
+}
+
+message HarnessArtifactAvailableRedactedView {}
+
+message HarnessArtifactRelationView {
+  bool safe_content_differs_from_artifact = 1;
+  oneof visibility {
+    HarnessArtifactIdentityView available = 2;
+    HarnessArtifactAvailableRedactedView available_redacted = 3;
+  }
+}
+
+message HarnessContentMarkerView {
+  egopulse.harness.v1.HarnessContentMarkerKind kind = 1;
+  // LIMIT_REACHED exposes the deterministic winning bound; every other
+  // marker carries UNSPECIFIED. The Local API must not force clients to infer
+  // this Authority-owned disclosure fact from counters or record position.
+  egopulse.harness.v1.HarnessContentLimitKind limit_kind = 2;
+}
+
+// Public, post-disclosure DTO. Raw/native identifiers, raw evidence, route
+// binding, raw cumulative digests and credential commitments are intentionally
+// absent.
+message HarnessContentRecordView {
+  string record_id = 1;
+  string record_digest_sha256 = 2;
+  uint64 content_sequence = 3;
+  string task_id = 4;
+  string attempt_id = 5;
+  string provider_family_alias = 6;
+  string model_alias = 7;
+  string collaboration_role = 8;
+  egopulse.common.v1.ContractReference disclosure_profile_ref = 9;
+  google.protobuf.Timestamp projected_at = 10;
+  repeated egopulse.harness.v1.HarnessContentSafetyFlag safety_flags = 11;
+  oneof payload {
+    HarnessAssistantTextView assistant_text = 20;
+    HarnessLifecycleContentView lifecycle = 21;
+    HarnessUsageContentView usage = 22;
+    HarnessApprovalRequiredContentView approval_required = 23;
+    HarnessArtifactRelationView artifact_relation = 24;
+    HarnessContentMarkerView marker = 25;
+  }
+}
+
+message ListHarnessContentRequest {
+  ClientRequestMetadata client = 1;
+  string task_id = 2;
+  repeated string attempt_ids = 3;
+  uint32 page_size = 4;
+  optional string page_cursor = 5;
+  // Required on every page after the first so pagination cannot drift to a
+  // newer content position.
+  HarnessContentPosition snapshot_position = 6;
+}
+
+message HarnessContentBaselinePage {
+  repeated HarnessContentRecordView records = 1;
+  optional string next_page_cursor = 2;
+  bool has_more = 3;
+  HarnessContentPosition snapshot_position = 4;
+  uint64 retained_from_sequence = 5;
+  egopulse.common.v1.ContractReference disclosure_profile_ref = 6;
+}
+
+message ListHarnessContentResponse {
+  oneof outcome {
+    HarnessContentBaselinePage page = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message WatchHarnessContentRequest {
+  ClientRequestMetadata client = 1;
+  string task_id = 2;
+  repeated string attempt_ids = 3;
+  HarnessContentPosition resume_after = 4;
+}
+
+message HarnessContentRecordsFrame {
+  repeated HarnessContentRecordView records = 1;
+}
+
+message HarnessContentHeartbeatFrame {}
+
+message HarnessContentResetRequiredFrame {
+  HarnessContentResetReason reason = 1;
+}
+
+message HarnessContentStreamFrame {
+  HarnessContentPosition position = 1;
+  oneof payload {
+    HarnessContentRecordsFrame records = 2;
+    HarnessContentHeartbeatFrame heartbeat = 3;
+    HarnessContentResetRequiredFrame reset_required = 4;
+  }
 }
 
 message LocalApiError {
@@ -440,6 +796,57 @@ message ExecuteMemoryMutationResponse {
   LocalApiError gateway_error = 2;
 }
 
+// The authenticated Founder owner is deliberately absent. The gateway derives
+// it from the validated local session and Context Authority revalidates it.
+message RevokeContextSnapshotCommand {
+  // request_digest_sha256 is the required full lower-case 64-hex confirmation
+  // digest. The semantic profile excludes all other CommandMetadata fields.
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string snapshot_id = 2;
+  uint64 expected_state_revision = 3;
+  string reason_code = 4;
+  repeated string evidence_refs = 5;
+  string confirmation_proof_ref = 6;
+}
+
+message ContextMutationCommand {
+  oneof command {
+    RevokeContextSnapshotCommand revoke_context_snapshot = 1;
+  }
+}
+
+// Sanitized Context Authority receipt. Raw Context bytes, descriptor content,
+// owner principal, reason, evidence and confirmation proof are forbidden.
+message ContextRevokeReceipt {
+  string snapshot_id = 1;
+  uint64 snapshot_revision = 2;
+  string content_digest_sha256 = 3;
+  uint64 previous_state_revision = 4;
+  uint64 result_state_revision = 5;
+  ContextGovernanceState previous_state = 6;
+  ContextGovernanceState result_state = 7;
+  string request_digest_sha256 = 8;
+  string event_id = 9;
+  google.protobuf.Timestamp committed_at = 10;
+  bool replayed = 11;
+  bool acknowledged_after_durability_barrier = 12;
+}
+
+message ExecuteContextMutationRequest {
+  ClientRequestMetadata client = 1;
+  ContextMutationCommand command = 2;
+}
+
+message ExecuteContextMutationResponse {
+  // Success and failure are wire-level mutually exclusive. The neutral error
+  // branch carries gateway or Context Authority failures without fabricating a
+  // partial success receipt.
+  oneof outcome {
+    ContextRevokeReceipt authority_result = 1;
+    LocalApiError error = 2;
+  }
+}
+
 message AwaitProjectionRequest {
   ClientRequestMetadata client = 1;
   ProjectionAwaitToken await_token = 2;
@@ -485,14 +892,21 @@ service LocalReadModelService {
   rpc GetProjectionStatus(GetProjectionStatusRequest) returns (GetProjectionStatusResponse);
   rpc WatchTaskViews(WatchTaskViewsRequest) returns (stream TaskViewStreamFrame);
   rpc WatchHarnessApprovalViews(WatchHarnessApprovalViewsRequest) returns (stream HarnessApprovalViewStreamFrame);
+  rpc ListHarnessContent(ListHarnessContentRequest) returns (ListHarnessContentResponse);
+  rpc WatchHarnessContent(WatchHarnessContentRequest) returns (stream HarnessContentStreamFrame);
   rpc AwaitProjection(AwaitProjectionRequest) returns (AwaitProjectionResponse);
 }
 
 service LocalCommandGatewayService {
+  rpc ListWorkCapabilities(ListWorkCapabilitiesRequest) returns (ListWorkCapabilitiesResponse);
+  rpc SetDefaultWorkCapability(SetDefaultWorkCapabilityRequest) returns (SetDefaultWorkCapabilityResponse);
+  rpc PrepareWork(PrepareWorkRequest) returns (PrepareWorkResponse);
+  rpc ConfirmWork(ConfirmWorkRequest) returns (ConfirmWorkResponse);
   rpc ExecuteTaskCommand(ExecuteTaskCommandRequest) returns (ExecuteTaskCommandResponse);
   rpc DecideHarnessApproval(DecideHarnessApprovalRequest) returns (DecideHarnessApprovalResponse);
   rpc ExecuteFounderVerdict(ExecuteFounderVerdictRequest) returns (ExecuteFounderVerdictResponse);
   rpc ExecuteMemoryMutation(ExecuteMemoryMutationRequest) returns (ExecuteMemoryMutationResponse);
+  rpc ExecuteContextMutation(ExecuteContextMutationRequest) returns (ExecuteContextMutationResponse);
 }
 
 service LocalCognitionService {

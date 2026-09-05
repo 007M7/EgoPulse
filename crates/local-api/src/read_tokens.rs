@@ -7,7 +7,10 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::ContractReference,
-    localapi::v1::{ProjectionAwaitToken, ProjectionPosition, SourceDomain, SourceRevision},
+    localapi::v1::{
+        HarnessContentPosition, ProjectionAwaitToken, ProjectionPosition, SourceDomain,
+        SourceRevision,
+    },
 };
 use hmac::{Hmac, Mac};
 use prost_types::Timestamp;
@@ -24,11 +27,14 @@ use crate::{
 type HmacSha256 = Hmac<Sha256>;
 
 const CURSOR_TOKEN_PREFIX: &str = "c1";
+const CONTENT_CURSOR_TOKEN_PREFIX: &str = "hc1";
 const AWAIT_TOKEN_PREFIX: &str = "a1";
 const CURSOR_SCHEMA: &str = "egopulse.read-cursor/v1";
+const CONTENT_CURSOR_SCHEMA: &str = "egopulse.harness-content-cursor/v1";
 const AWAIT_SCHEMA: &str = "egopulse.projection-await/v1";
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_PERMISSION_CODE_BYTES: usize = 128;
+const MAX_CONTENT_PAGE_SIZE: u32 = 256;
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ReadTokenError {
@@ -215,6 +221,49 @@ struct CursorPayload {
     expires_at: SignedInstant,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContentCursorIssue {
+    pub filter_sha256: String,
+    pub effective_page_size: u32,
+    pub snapshot_position: HarnessContentPosition,
+    pub last_sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentCursorExpectation {
+    pub filter_sha256: String,
+    pub effective_page_size: u32,
+    pub current_epoch: String,
+    pub retention_floor: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedContentCursor {
+    pub filter_sha256: String,
+    pub effective_page_size: u32,
+    pub snapshot_epoch: String,
+    pub snapshot_sequence: u64,
+    pub snapshot_projected_at: Option<Timestamp>,
+    pub last_sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ContentCursorPayload {
+    schema: String,
+    policy_version: String,
+    principal_id: String,
+    scope_sha256: String,
+    filter_sha256: String,
+    effective_page_size: u32,
+    snapshot_epoch: String,
+    snapshot_sequence: u64,
+    snapshot_projected_at: Option<SignedInstant>,
+    last_sequence: u64,
+    issued_at: SignedInstant,
+    expires_at: SignedInstant,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AwaitTarget {
@@ -310,6 +359,16 @@ impl SignedInstant {
             seconds: self.seconds,
             nanos: self.nanos,
         }
+    }
+
+    fn from_timestamp(value: &Timestamp) -> Result<Self, ReadTokenError> {
+        if value.seconds < 0 || !(0..1_000_000_000).contains(&value.nanos) {
+            return Err(ReadTokenError::InvalidInput);
+        }
+        Ok(Self {
+            seconds: value.seconds,
+            nanos: value.nanos,
+        })
     }
 }
 
@@ -421,6 +480,109 @@ impl ReadTokenCodec {
             snapshot_epoch: payload.snapshot_epoch,
             snapshot_sequence: payload.snapshot_sequence,
             anchor: payload.anchor,
+        })
+    }
+
+    pub fn issue_content_cursor(
+        &self,
+        scope: &ReadTokenScope,
+        issue: ContentCursorIssue,
+    ) -> Result<String, ReadTokenError> {
+        validate_scope(scope)?;
+        validate_content_cursor_binding(
+            &issue.filter_sha256,
+            issue.effective_page_size,
+            &issue.snapshot_position.epoch,
+            issue.snapshot_position.sequence,
+            issue.snapshot_position.projected_at.as_ref(),
+            issue.last_sequence,
+        )?;
+        let issued_at_time = self.clock.now();
+        let expires_at_time = issued_at_time
+            .checked_add(self.policy.cursor_ttl())
+            .ok_or(ReadTokenError::InvalidConfiguration)?;
+        self.sign_payload(
+            CONTENT_CURSOR_TOKEN_PREFIX,
+            &ContentCursorPayload {
+                schema: CONTENT_CURSOR_SCHEMA.to_owned(),
+                policy_version: self.policy.version().to_owned(),
+                principal_id: scope.principal_id.clone(),
+                scope_sha256: scope.scope_sha256.clone(),
+                filter_sha256: issue.filter_sha256,
+                effective_page_size: issue.effective_page_size,
+                snapshot_epoch: issue.snapshot_position.epoch,
+                snapshot_sequence: issue.snapshot_position.sequence,
+                snapshot_projected_at: issue
+                    .snapshot_position
+                    .projected_at
+                    .as_ref()
+                    .map(SignedInstant::from_timestamp)
+                    .transpose()?,
+                last_sequence: issue.last_sequence,
+                issued_at: SignedInstant::from_system_time(issued_at_time)?,
+                expires_at: SignedInstant::from_system_time(expires_at_time)?,
+            },
+        )
+    }
+
+    pub fn verify_content_cursor(
+        &self,
+        token: &str,
+        scope: &ReadTokenScope,
+        expected: &ContentCursorExpectation,
+    ) -> Result<VerifiedContentCursor, ReadTokenError> {
+        validate_scope(scope)?;
+        validate_content_cursor_expectation(expected)?;
+        let bytes = self.verify_signed(CONTENT_CURSOR_TOKEN_PREFIX, token)?;
+        let payload: ContentCursorPayload =
+            serde_json::from_slice(&bytes).map_err(|_| ReadTokenError::InvalidToken)?;
+        if payload.schema != CONTENT_CURSOR_SCHEMA
+            || payload.policy_version != self.policy.version()
+        {
+            return Err(ReadTokenError::BindingMismatch);
+        }
+        validate_content_cursor_binding(
+            &payload.filter_sha256,
+            payload.effective_page_size,
+            &payload.snapshot_epoch,
+            payload.snapshot_sequence,
+            payload
+                .snapshot_projected_at
+                .map(SignedInstant::to_timestamp)
+                .as_ref(),
+            payload.last_sequence,
+        )
+        .map_err(|_| ReadTokenError::InvalidToken)?;
+        validate_lifetime(
+            payload.issued_at,
+            payload.expires_at,
+            self.policy.cursor_ttl(),
+            self.clock.now(),
+        )?;
+        if payload.principal_id != scope.principal_id || payload.scope_sha256 != scope.scope_sha256
+        {
+            return Err(ReadTokenError::ScopeMismatch);
+        }
+        if payload.filter_sha256 != expected.filter_sha256
+            || payload.effective_page_size != expected.effective_page_size
+        {
+            return Err(ReadTokenError::BindingMismatch);
+        }
+        if payload.snapshot_epoch != expected.current_epoch
+            || payload.snapshot_sequence < expected.retention_floor
+            || payload.last_sequence < expected.retention_floor
+        {
+            return Err(ReadTokenError::ResetRequired);
+        }
+        Ok(VerifiedContentCursor {
+            filter_sha256: payload.filter_sha256,
+            effective_page_size: payload.effective_page_size,
+            snapshot_epoch: payload.snapshot_epoch,
+            snapshot_sequence: payload.snapshot_sequence,
+            snapshot_projected_at: payload
+                .snapshot_projected_at
+                .map(SignedInstant::to_timestamp),
+            last_sequence: payload.last_sequence,
         })
     }
 
@@ -620,6 +782,38 @@ fn validate_cursor_binding(
         ) => validate_identifier(approval_request_id),
         _ => Err(ReadTokenError::InvalidInput),
     }
+}
+
+fn validate_content_cursor_expectation(
+    expected: &ContentCursorExpectation,
+) -> Result<(), ReadTokenError> {
+    if !is_sha256(&expected.filter_sha256)
+        || expected.effective_page_size == 0
+        || expected.effective_page_size > MAX_CONTENT_PAGE_SIZE
+    {
+        return Err(ReadTokenError::InvalidInput);
+    }
+    validate_identifier(&expected.current_epoch)
+}
+
+fn validate_content_cursor_binding(
+    filter_sha256: &str,
+    effective_page_size: u32,
+    snapshot_epoch: &str,
+    snapshot_sequence: u64,
+    snapshot_projected_at: Option<&Timestamp>,
+    last_sequence: u64,
+) -> Result<(), ReadTokenError> {
+    if !is_sha256(filter_sha256)
+        || effective_page_size == 0
+        || effective_page_size > MAX_CONTENT_PAGE_SIZE
+        || last_sequence > snapshot_sequence
+        || snapshot_projected_at
+            .is_some_and(|value| value.seconds < 0 || !(0..1_000_000_000).contains(&value.nanos))
+    {
+        return Err(ReadTokenError::InvalidInput);
+    }
+    validate_identifier(snapshot_epoch)
 }
 
 fn validate_collection_sort(

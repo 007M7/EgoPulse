@@ -2,6 +2,7 @@
 
 use egopulse_domain_contracts::FoundationHealth;
 
+pub mod context_authority;
 pub mod memory_authority;
 pub mod memory_rag;
 pub mod task_authority;

@@ -2,6 +2,8 @@
 
 mod identity;
 
+#[cfg(windows)]
+mod process_tree;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -9,6 +11,8 @@ mod windows;
 
 pub use identity::{LocalTransport, OsPrincipal, PeerConnectionInfo};
 
+#[cfg(windows)]
+pub use process_tree::WindowsProcessTree;
 #[cfg(unix)]
 pub use unix::{
     LocalIpcAddress, LocalIpcClient, LocalIpcConnection, LocalIpcIncoming, LocalIpcListener,

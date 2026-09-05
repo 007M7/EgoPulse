@@ -83,3 +83,95 @@ fn check_config_accepts_the_packaged_example_without_opening_any_store() {
     );
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn check_config_json_emits_redacted_provider_catalog_without_secret_values() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config/agentos-config.example.json")
+        .canonicalize()
+        .expect("packaged example config exists");
+    let key = "66".repeat(32);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agentosd"))
+        .args(["--check-config", "--json"])
+        .env("EGOPULSE_USER_CONFIG", config_path)
+        .env("EGOPULSE_READ_MODEL_KEY_HEX", &key)
+        .env("EGOPULSE_TOKEN_MAC_KEY_HEX", &key)
+        .env("EGOPULSE_TASK_KEY_HEX", &key)
+        .env("EGOPULSE_MEMORY_KEY_HEX", &key)
+        .env("EGOPULSE_ARTIFACT_KEY_HEX", &key)
+        .env("EGOPULSE_VERIFICATION_KEY_HEX", &key)
+        .env("EGOPULSE_POLICY_KEY_HEX", &key)
+        .env("EGOPULSE_VERDICT_KEY_HEX", &key)
+        .env("EGOPULSE_ADAPTER_KEY_HEX", &key)
+        .env("EGOPULSE_COLLABORATION_KEY_HEX", &key)
+        .output()
+        .expect("run agentosd JSON config check");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("JSON provider report");
+    assert_eq!(report["configuration"], "passed");
+    assert_eq!(report["stores_opened"], false);
+    assert_eq!(report["provider_profiles"].as_array().unwrap().len(), 4);
+    assert_eq!(report["provider_profiles"][1]["provider"], "deepseek");
+    assert_eq!(
+        report["provider_profiles"][1]["credential_source_env"],
+        "DEEPSEEK_API_KEY"
+    );
+    assert_eq!(report["provider_profiles"][1]["admission"], "held");
+    assert_eq!(
+        report["provider_profiles"][1]["catalog_snapshot"]["source"],
+        "offline-fallback:egopulse-config-example"
+    );
+    assert_eq!(
+        report["provider_profiles"][1]["catalog_snapshot"]["harness_version"],
+        "not-probed"
+    );
+    assert!(report["provider_profiles"][1]["executable_available"].is_boolean());
+    assert_eq!(
+        report["provider_profiles"][1]["credential_status"],
+        "missing"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(&key),
+        "authority key must never appear in provider report"
+    );
+}
+
+#[test]
+fn packaged_example_grants_every_advertised_user_operation() {
+    let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config/agentos-config.example.json")
+        .canonicalize()
+        .expect("packaged example config exists");
+    let source: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).expect("read packaged example config"))
+            .expect("parse packaged example config");
+    let permissions = source["identity"]["permission_codes"]
+        .as_array()
+        .expect("permission catalog array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<std::collections::HashSet<_>>();
+
+    for permission in [
+        "local.task.cancellation.request",
+        "local.founder-verdict.issue",
+        "local.founder-verdict.revoke",
+        "local.founder-verdict.apply",
+        "local.memory.retrieve",
+        "local.memory.candidate.submit",
+        "local.memory.govern",
+        "local.work-capability.read",
+        "local.work-capability.default.set",
+        "local.work.prepare",
+        "local.work.confirm",
+    ] {
+        assert!(
+            permissions.contains(permission),
+            "packaged example must grant advertised operation {permission}"
+        );
+    }
+}

@@ -1,13 +1,15 @@
 use super::{
-    HarnessEvidenceResolver, ReferenceAuthorization, ReferenceGuardRejection,
-    ResolvedHarnessEvidence,
+    DELIVERY_OUTCOME_UNKNOWN_REASON_CODE, HarnessEvidenceResolver, ReferenceAuthorization,
+    ReferenceGuardRejection, ResolvedHarnessEvidence,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
-    CollaborationSnapshot, ReconciliationDisposition, RecordAttemptCancellationOutcomeCommand,
-    RecordAttemptReconciliationCommand, RecordDeliveryReceiptCommand, RecordHarnessAckCommand,
-    RecordRunningObservationCommand,
+    CollaborationSnapshot, MarkAttemptOutcomeUnknownCommand, ReconciliationDisposition,
+    RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
+    RecordDeliveryReceiptCommand, RecordHarnessAckCommand, RecordRunningObservationCommand,
 };
-use egopulse_domain_contracts::v01::egopulse::harness::v1::{LifecycleKind, harness_observation};
+use egopulse_domain_contracts::v01::egopulse::harness::v1::{
+    DeliveryDisposition, LifecycleKind, harness_observation,
+};
 use egopulse_harness_adapter::AdapterEdge;
 
 /// Provider-neutral read port backed by the Adapter's durable edge.
@@ -32,6 +34,83 @@ impl AdapterBackedHarnessEvidenceResolver {
 }
 
 impl HarnessEvidenceResolver for AdapterBackedHarnessEvidenceResolver {
+    fn validate_delivery_unknown(
+        &self,
+        command: &MarkAttemptOutcomeUnknownCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        if command.reason_code != DELIVERY_OUTCOME_UNKNOWN_REASON_CODE {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        let base = command
+            .base
+            .as_ref()
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let run = snapshot
+            .run
+            .as_ref()
+            .filter(|run| run.run_id == base.run_id)
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let attempt = snapshot
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == base.attempt_id)
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let dispatch_id = attempt
+            .dispatch_id
+            .as_deref()
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let receipt = self
+            .edge
+            .dispatch_receipt(dispatch_id)
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let envelope = self
+            .edge
+            .dispatch_envelope(dispatch_id)
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let lineage = self
+            .edge
+            .dispatch_task_lineage(dispatch_id)
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let capability = attempt
+            .capability_profile_ref
+            .as_ref()
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let fencing_token = attempt
+            .lease
+            .as_ref()
+            .map(|lease| lease.fencing_token)
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        if DeliveryDisposition::try_from(receipt.disposition) != Ok(DeliveryDisposition::Unknown)
+            || receipt.receipt_id != command.uncertainty_evidence_id
+            || receipt.adapter_id != self.edge.adapter_id()
+            || receipt.dispatch_id != dispatch_id
+            || receipt.attempt_id != attempt.attempt_id
+            || receipt.fencing_token != fencing_token
+            || receipt.fencing_token != envelope.fencing_token
+            || receipt.capability_profile_id != capability.contract_id
+            || envelope.dispatch_id != dispatch_id
+            || envelope.run_id != run.run_id
+            || envelope.step_id != attempt.step_id
+            || envelope.attempt_id != attempt.attempt_id
+            || envelope.capability_profile_ref.as_ref() != Some(capability)
+            || lineage.task_id != run.task_id
+            || lineage.task_revision != run.task_revision_at_creation
+            || lineage.work_revision != run.work_revision
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ReferenceAuthorization {
+            evidence_refs: vec![format!(
+                "adapter-delivery-unknown:{}:{}@durable",
+                receipt.receipt_id, receipt.receipt_digest_sha256
+            )],
+        })
+    }
+
     fn resolve_delivery_receipt(
         &self,
         command: &RecordDeliveryReceiptCommand,
@@ -158,7 +237,7 @@ impl HarnessEvidenceResolver for AdapterBackedHarnessEvidenceResolver {
     fn validate_reconciliation(
         &self,
         command: &RecordAttemptReconciliationCommand,
-        _snapshot: &CollaborationSnapshot,
+        snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
         let evidence = self
             .edge
@@ -171,13 +250,44 @@ impl HarnessEvidenceResolver for AdapterBackedHarnessEvidenceResolver {
         };
         let disposition = ReconciliationDisposition::try_from(command.disposition)
             .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?;
+        let attempt = snapshot
+            .attempts
+            .iter()
+            .find(|attempt| {
+                command
+                    .base
+                    .as_ref()
+                    .is_some_and(|base| base.attempt_id == attempt.attempt_id)
+            })
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let dispatch_id = attempt
+            .dispatch_id
+            .as_deref()
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let fencing_token = attempt
+            .lease
+            .as_ref()
+            .map(|lease| lease.fencing_token)
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
         if evidence.observation.native_event_id.as_deref()
             != Some(command.reconciliation_id.as_str())
+            || evidence.observation.dispatch_id != dispatch_id
+            || evidence.observation.attempt_id != attempt.attempt_id
+            || evidence.observation.fencing_token != fencing_token
             || !matches!(
                 (diagnostic.safe_diagnostic_code.as_str(), disposition),
                 (
                     "ADAPTER_RECONCILIATION_NO_EFFECT_PROVEN",
                     ReconciliationDisposition::NoEffectProven
+                ) | (
+                    "ADAPTER_RECONCILIATION_NATIVE_EXECUTION_ACTIVE",
+                    ReconciliationDisposition::ManualOnly
+                ) | (
+                    "ADAPTER_RECONCILIATION_TERMINAL_OBSERVATION_RECOVERED",
+                    ReconciliationDisposition::ManualOnly
+                ) | (
+                    "ADAPTER_RECONCILIATION_OUTCOME_UNKNOWN",
+                    ReconciliationDisposition::ManualOnly
                 )
             )
         {

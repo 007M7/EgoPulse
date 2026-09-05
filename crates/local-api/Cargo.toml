@@ -25,5 +25,8 @@ tower.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+prost.workspace = true
+
 [lib]
 path = "src/lib.rs"

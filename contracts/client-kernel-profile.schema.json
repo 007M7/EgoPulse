@@ -4,7 +4,7 @@
   "title": "EgoPulse Client Kernel Conformance Profile",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "contractId", "contractVersion", "authorityRef", "localApiCompatibility", "implementationBoundary", "capabilities", "invariants"],
+  "required": ["schemaVersion", "contractId", "contractVersion", "authorityRef", "localApiCompatibility", "implementationBoundary", "capabilities", "streamSemantics", "invariants"],
   "properties": {
     "schemaVersion": { "const": "egopulse.client-kernel-profile/v0.1" },
     "contractId": { "const": "egopulse.client-kernel.v1" },
@@ -36,12 +36,24 @@
       "type": "array",
       "uniqueItems": true,
       "minItems": 10,
-      "items": { "enum": ["session_negotiation", "query", "list", "watch_complete_snapshots", "await_projection", "typed_command", "stable_cursor", "reset_and_refetch", "read_your_write", "typed_error", "frame_deduplication"] }
+      "items": { "enum": ["session_negotiation", "query", "list", "watch_complete_snapshots", "content_baseline_pagination", "watch_operation_records", "await_projection", "memory_retrieval", "governed_memory_work_preparation", "governed_work_capability_routing", "context_revoke_full_digest_confirmation", "typed_command", "stable_cursor", "reset_and_refetch", "read_your_write", "typed_error", "frame_deduplication", "content_generation_fencing"] }
+    },
+    "streamSemantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["completeSnapshotDomains", "operationRecordDomains", "independentDomainPositions", "resetDiscardsIncompleteAssembly", "crossDomainOrdering"],
+      "properties": {
+        "completeSnapshotDomains": { "type": "array", "uniqueItems": true, "minItems": 2, "maxItems": 2, "items": { "enum": ["task_views", "harness_approval_views"] } },
+        "operationRecordDomains": { "type": "array", "uniqueItems": true, "minItems": 1, "maxItems": 1, "items": { "const": "harness_content" } },
+        "independentDomainPositions": { "const": true },
+        "resetDiscardsIncompleteAssembly": { "const": true },
+        "crossDomainOrdering": { "const": "forbidden" }
+      }
     },
     "invariants": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["surfaceNeutral", "completeSnapshotStreams", "orderedWithinEpoch", "atLeastOnceDelivery", "unknownFrameFailClosed", "gapRequiresReset", "authorityResultPreserved", "clientNeverBecomesAuthority"],
+      "required": ["surfaceNeutral", "completeSnapshotStreams", "orderedWithinEpoch", "atLeastOnceDelivery", "unknownFrameFailClosed", "gapRequiresReset", "authorityResultPreserved", "clientNeverBecomesAuthority", "operationRecordAssemblyInSharedKernel", "crossDomainPositionComparisonForbidden", "contentCannotAdvanceAuthorityState"],
       "properties": {
         "surfaceNeutral": { "const": true },
         "completeSnapshotStreams": { "const": true },
@@ -50,7 +62,10 @@
         "unknownFrameFailClosed": { "const": true },
         "gapRequiresReset": { "const": true },
         "authorityResultPreserved": { "const": true },
-        "clientNeverBecomesAuthority": { "const": true }
+        "clientNeverBecomesAuthority": { "const": true },
+        "operationRecordAssemblyInSharedKernel": { "const": true },
+        "crossDomainPositionComparisonForbidden": { "const": true },
+        "contentCannotAdvanceAuthorityState": { "const": true }
       }
     }
   }

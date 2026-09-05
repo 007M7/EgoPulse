@@ -3,6 +3,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub const READ_GATEWAY_POLICY_V01: &str = "egopulse.read-gateway-policy/v1";
+const MAX_HARNESS_CONTENT_PAGE_SIZE: u32 = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadGatewayPolicy {
@@ -161,6 +162,17 @@ impl ReadGatewayPolicy {
     }
 
     #[must_use]
+    pub const fn effective_harness_content_page_size(&self, requested: u32) -> u32 {
+        if requested == 0 {
+            self.default_page_size
+        } else if requested > MAX_HARNESS_CONTENT_PAGE_SIZE {
+            MAX_HARNESS_CONTENT_PAGE_SIZE
+        } else {
+            requested
+        }
+    }
+
+    #[must_use]
     pub const fn cursor_ttl(&self) -> Duration {
         self.cursor_ttl
     }
@@ -235,6 +247,9 @@ mod tests {
         assert_eq!(policy.effective_page_size(1), 1);
         assert_eq!(policy.effective_page_size(200), 200);
         assert_eq!(policy.effective_page_size(201), 200);
+        assert_eq!(policy.effective_harness_content_page_size(0), 50);
+        assert_eq!(policy.effective_harness_content_page_size(256), 256);
+        assert_eq!(policy.effective_harness_content_page_size(257), 256);
         assert_eq!(
             policy.minimum_position_wait_timeout(),
             Duration::from_secs(5)

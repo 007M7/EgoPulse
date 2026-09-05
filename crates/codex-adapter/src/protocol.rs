@@ -1,14 +1,15 @@
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     AckDisposition, ApprovalDecision, ApprovalDecisionEnvelope, ApprovalKind,
     ApprovalRequestLifecycleKind, ApprovalRequestObservation, CancelExecutionEnvelope,
-    DispatchEnvelope, HarnessAckObservation, HarnessErrorCode, HarnessReadiness, LifecycleKind,
+    ContentMutationOperation, DispatchEnvelope, HarnessAckObservation,
+    HarnessContentSignalObservation, HarnessErrorCode, HarnessReadiness, LifecycleKind,
     LifecycleObservation, NativeProtocolFingerprint, ObservationCriticality, ProbeHarnessRequest,
     ProbeHarnessResult, SideEffectCertainty, UsageObservation, harness_observation,
 };
 use egopulse_harness_adapter::{
     DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, NativeHarnessDriver,
     NativeHarnessFuture, ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
-    TerminalOutputCandidate,
+    TerminalOutputCandidate, assistant_text_content_candidate, assistant_text_mutation_candidate,
 };
 use egopulse_process_supervision::{SupervisedProcess, SupervisedProcessSpec};
 use prost_types::Timestamp;
@@ -41,6 +42,94 @@ pub fn codex_protocol_fingerprint() -> NativeProtocolFingerprint {
     }
 }
 
+/// Maps only the Codex App Server channel explicitly documented as a
+/// user-visible assistant message. Hidden reasoning, tool, terminal and raw
+/// result categories return no candidate and never cross this boundary.
+#[must_use]
+pub fn codex_user_visible_content_candidate(
+    item_type: &str,
+    message_id: &str,
+    text: &[u8],
+) -> Option<egopulse_domain_contracts::v01::egopulse::harness::v1::UserVisibleContentCandidate> {
+    (item_type == "agentMessage")
+        .then(|| assistant_text_content_candidate(message_id, text.to_vec()))
+        .flatten()
+}
+
+const CODEX_CONTENT_CANDIDATE_BYTES: usize = 65_536;
+
+#[must_use]
+pub fn codex_user_visible_content_mutations(
+    item_type: &str,
+    message_id: &str,
+    previous_revision: u64,
+    previous_raw_cumulative: &[u8],
+    operation: ContentMutationOperation,
+    text: &str,
+) -> Option<Vec<egopulse_domain_contracts::v01::egopulse::harness::v1::UserVisibleContentCandidate>>
+{
+    if item_type != "agentMessage" || message_id.trim().is_empty() {
+        return None;
+    }
+    if operation == ContentMutationOperation::Finalize {
+        return assistant_text_mutation_candidate(
+            message_id,
+            previous_revision.checked_add(1)?,
+            previous_revision,
+            operation,
+            Vec::new(),
+            previous_raw_cumulative,
+        )
+        .map(|candidate| vec![candidate]);
+    }
+    let chunks = utf8_candidate_chunks(text, CODEX_CONTENT_CANDIDATE_BYTES);
+    let mut cumulative = previous_raw_cumulative.to_vec();
+    let mut revision = previous_revision;
+    let mut candidates = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let chunk_operation = if index == 0 {
+            operation
+        } else {
+            ContentMutationOperation::Append
+        };
+        let candidate = assistant_text_mutation_candidate(
+            message_id,
+            revision.checked_add(1)?,
+            revision,
+            chunk_operation,
+            chunk.as_bytes().to_vec(),
+            &cumulative,
+        )?;
+        match chunk_operation {
+            ContentMutationOperation::Append => cumulative.extend_from_slice(chunk.as_bytes()),
+            ContentMutationOperation::Replace => cumulative = chunk.as_bytes().to_vec(),
+            ContentMutationOperation::Finalize | ContentMutationOperation::Unspecified => {
+                return None;
+            }
+        }
+        revision = revision.checked_add(1)?;
+        candidates.push(candidate);
+    }
+    Some(candidates)
+}
+
+fn utf8_candidate_chunks(value: &str, max_bytes: usize) -> Vec<&str> {
+    if value.is_empty() {
+        return vec![value];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < value.len() {
+        let mut end = value.len().min(start + max_bytes);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&value[start..end]);
+        start = end;
+    }
+    chunks
+}
+
 #[derive(Clone, Debug)]
 pub struct CodexAppServerConfig {
     pub executable: PathBuf,
@@ -70,9 +159,12 @@ impl CodexAppServerConfig {
 }
 
 fn apply_environment_overrides(
-    mut spec: SupervisedProcessSpec,
+    spec: SupervisedProcessSpec,
     overrides: &[(String, String)],
 ) -> SupervisedProcessSpec {
+    let mut spec = spec
+        .with_minimal_user_environment()
+        .with_inherited_environment("CODEX_HOME");
     for (name, value) in overrides {
         spec = spec.with_environment_override(name.clone(), value.clone());
     }
@@ -93,6 +185,13 @@ struct PendingApproval {
     observation: ApprovalRequestObservation,
 }
 
+#[derive(Default)]
+struct AgentMessageAssembly {
+    message_id: String,
+    revision: u64,
+    raw_cumulative: Vec<u8>,
+}
+
 struct CodexSession {
     process: SupervisedProcess,
     next_request_id: u64,
@@ -104,7 +203,7 @@ pub struct CodexAppServerDriver {
     session: Option<CodexSession>,
     active: Option<ActiveDispatch>,
     completed_dispatch_id: Option<String>,
-    pending_agent_message_text: String,
+    pending_agent_message: Option<AgentMessageAssembly>,
     terminal_output_candidate: Option<TerminalOutputCandidate>,
     pending_approvals: HashMap<String, PendingApproval>,
     responded_approvals: HashMap<String, ApprovalRequestObservation>,
@@ -121,7 +220,7 @@ impl CodexAppServerDriver {
             session: None,
             active: None,
             completed_dispatch_id: None,
-            pending_agent_message_text: String::new(),
+            pending_agent_message: None,
             terminal_output_candidate: None,
             pending_approvals: HashMap::new(),
             responded_approvals: HashMap::new(),
@@ -134,6 +233,49 @@ impl CodexAppServerDriver {
     #[must_use]
     pub fn last_protocol_diagnostic(&self) -> Option<&str> {
         self.last_protocol_diagnostic.as_deref()
+    }
+
+    fn queue_agent_message_candidates(
+        &mut self,
+        message_id: &str,
+        candidates: Vec<
+            egopulse_domain_contracts::v01::egopulse::harness::v1::UserVisibleContentCandidate,
+        >,
+        raw: &[u8],
+    ) -> Option<DriverEvent> {
+        let mut events = candidates.into_iter().map(|candidate| {
+            let revision = candidate
+                .payload
+                .as_ref()
+                .and_then(|payload| match payload {
+                    egopulse_domain_contracts::v01::egopulse::harness::v1::user_visible_content_candidate::Payload::AssistantText(text) => {
+                        Some(text.revision)
+                    }
+                    _ => None,
+                })
+                .expect("Codex agent-message mapper only queues assistant text");
+            DriverEvent {
+                native_key: format!("item/agentMessage/content:{message_id}:{revision}"),
+                native_event_id: Some(message_id.to_owned()),
+                native_sequence: Some(revision),
+                native_observed_at: now(),
+                criticality: ObservationCriticality::Informational,
+                payload: harness_observation::Payload::ContentSignal(
+                    HarnessContentSignalObservation {
+                        content_event_id: String::new(),
+                        delivered_receipt_id: String::new(),
+                        delivered_receipt_digest_sha256: String::new(),
+                        dispatch_route_binding_sha256: String::new(),
+                        context_consumption_proof: None,
+                        candidate: Some(candidate),
+                    },
+                ),
+                raw_event: raw.to_vec(),
+            }
+        });
+        let first = events.next();
+        self.queued_events.extend(events);
+        first
     }
 
     async fn ensure_session(&mut self, working_directory: &PathBuf) -> Result<(), DriverError> {
@@ -561,17 +703,71 @@ impl CodexAppServerDriver {
             ),
             "item/completed" => {
                 if params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") {
-                    let text = params
+                    let final_text = params
                         .pointer("/item/text")
                         .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| std::mem::take(&mut self.pending_agent_message_text));
+                        .map(str::to_owned);
                     let native_completion_ref = params
                         .pointer("/item/id")
                         .and_then(Value::as_str)
                         .map(str::to_owned)
                         .or_else(|| self.active.as_ref().and_then(|value| value.turn_id.clone()))
                         .unwrap_or_else(|| format!("codex-dispatch:{}", envelope.dispatch_id));
+                    let mut assembly =
+                        self.pending_agent_message
+                            .take()
+                            .unwrap_or_else(|| AgentMessageAssembly {
+                                message_id: native_completion_ref.clone(),
+                                ..AgentMessageAssembly::default()
+                            });
+                    if assembly.message_id != native_completion_ref {
+                        return Err(dependency_error("CODEX_AGENT_MESSAGE_ID_DRIFT"));
+                    }
+                    let text = final_text.unwrap_or_else(|| {
+                        String::from_utf8_lossy(&assembly.raw_cumulative).into_owned()
+                    });
+                    let mut queued_candidates = Vec::new();
+                    if text.as_bytes() != assembly.raw_cumulative {
+                        let operation = if assembly.revision == 0 {
+                            ContentMutationOperation::Append
+                        } else {
+                            ContentMutationOperation::Replace
+                        };
+                        let candidates = codex_user_visible_content_mutations(
+                            "agentMessage",
+                            &assembly.message_id,
+                            assembly.revision,
+                            &assembly.raw_cumulative,
+                            operation,
+                            &text,
+                        )
+                        .ok_or_else(|| dependency_error("CODEX_AGENT_MESSAGE_REPLACE_INVALID"))?;
+                        assembly.revision = assembly
+                            .revision
+                            .checked_add(candidates.len() as u64)
+                            .ok_or_else(|| {
+                                dependency_error("CODEX_AGENT_MESSAGE_REVISION_OVERFLOW")
+                            })?;
+                        assembly.raw_cumulative = text.as_bytes().to_vec();
+                        queued_candidates.extend(candidates);
+                    }
+                    let finalize = codex_user_visible_content_mutations(
+                        "agentMessage",
+                        &assembly.message_id,
+                        assembly.revision,
+                        &assembly.raw_cumulative,
+                        ContentMutationOperation::Finalize,
+                        "",
+                    )
+                    .ok_or_else(|| dependency_error("CODEX_AGENT_MESSAGE_FINALIZE_INVALID"))?;
+                    queued_candidates.extend(finalize);
+                    if let Some(first) = self.queue_agent_message_candidates(
+                        &native_completion_ref,
+                        queued_candidates,
+                        &raw,
+                    ) {
+                        self.queued_events.push_front(first);
+                    }
                     self.terminal_output_candidate = Some(TerminalOutputCandidate {
                         dispatch_id: envelope.dispatch_id.clone(),
                         native_completion_ref,
@@ -810,10 +1006,46 @@ impl CodexAppServerDriver {
                 }
             }
             "item/agentMessage/delta" => {
-                if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                    self.pending_agent_message_text.push_str(delta);
+                let delta = params
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| dependency_error("CODEX_AGENT_MESSAGE_DELTA_INVALID"))?;
+                let message_id = params
+                    .get("itemId")
+                    .or_else(|| params.pointer("/item/id"))
+                    .or_else(|| params.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        self.pending_agent_message
+                            .as_ref()
+                            .map(|assembly| assembly.message_id.clone())
+                    })
+                    .ok_or_else(|| dependency_error("CODEX_AGENT_MESSAGE_ID_MISSING"))?;
+                let assembly =
+                    self.pending_agent_message
+                        .get_or_insert_with(|| AgentMessageAssembly {
+                            message_id: message_id.clone(),
+                            ..AgentMessageAssembly::default()
+                        });
+                if assembly.message_id != message_id {
+                    return Err(dependency_error("CODEX_AGENT_MESSAGE_ID_DRIFT"));
                 }
-                return Ok(None);
+                let candidates = codex_user_visible_content_mutations(
+                    "agentMessage",
+                    &message_id,
+                    assembly.revision,
+                    &assembly.raw_cumulative,
+                    ContentMutationOperation::Append,
+                    delta,
+                )
+                .ok_or_else(|| dependency_error("CODEX_AGENT_MESSAGE_DELTA_INVALID"))?;
+                assembly.revision = assembly
+                    .revision
+                    .checked_add(candidates.len() as u64)
+                    .ok_or_else(|| dependency_error("CODEX_AGENT_MESSAGE_REVISION_OVERFLOW"))?;
+                assembly.raw_cumulative.extend_from_slice(delta.as_bytes());
+                return Ok(self.queue_agent_message_candidates(&message_id, candidates, &raw));
             }
             "turn/diff/updated"
             | "turn/plan/updated"
@@ -992,7 +1224,7 @@ impl NativeHarnessDriver for CodexAppServerDriver {
                 turn_request_id: request_id,
             });
             self.completed_dispatch_id = None;
-            self.pending_agent_message_text.clear();
+            self.pending_agent_message = None;
             self.terminal_output_candidate = None;
             Ok(DriverDelivery {
                 native_request_ref: format!("codex-jsonrpc:{request_id}"),
@@ -1439,6 +1671,28 @@ fn sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn process_environment_is_isolated_and_credentials_are_explicit() {
+        let spec = apply_environment_overrides(
+            SupervisedProcessSpec::new(r"C:\codex.exe", r"C:\workspace"),
+            &[("OPENAI_API_KEY".to_owned(), "managed-secret".to_owned())],
+        );
+
+        assert!(spec.clear_environment);
+        assert!(
+            spec.inherited_environment
+                .iter()
+                .all(|name| !name.starts_with("EGOPULSE_") && !name.ends_with("_API_KEY"))
+        );
+        assert_eq!(
+            spec.environment_overrides,
+            vec![("OPENAI_API_KEY".to_owned(), "managed-secret".to_owned())]
+        );
+    }
+    use egopulse_domain_contracts::v01::egopulse::harness::v1::{
+        AssistantTextContentCandidate, user_visible_content_candidate,
+    };
+
     fn approval_request(id: u64) -> Value {
         json!({
             "id": id,
@@ -1624,6 +1878,176 @@ mod tests {
                 .expect("candidate replay")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn agent_message_delta_and_complete_emit_append_replace_finalize_without_loss() {
+        fn content(event: DriverEvent) -> AssistantTextContentCandidate {
+            let harness_observation::Payload::ContentSignal(signal) = event.payload else {
+                panic!("content signal")
+            };
+            let Some(user_visible_content_candidate::Payload::AssistantText(candidate)) =
+                signal.candidate.and_then(|candidate| candidate.payload)
+            else {
+                panic!("assistant candidate")
+            };
+            candidate
+        }
+
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch-stream".to_owned(),
+            ..Default::default()
+        };
+        let delta = json!({
+            "method": "item/agentMessage/delta",
+            "params": { "itemId": "message-stream", "delta": "hello" }
+        });
+        let appended = content(
+            driver
+                .map_notification(
+                    &envelope,
+                    "item/agentMessage/delta",
+                    delta.clone(),
+                    serde_json::to_vec(&delta).expect("delta bytes"),
+                )
+                .expect("map delta")
+                .expect("delta candidate"),
+        );
+        assert_eq!(appended.operation, ContentMutationOperation::Append as i32);
+        assert_eq!(appended.revision, 1);
+        assert_eq!(appended.text_utf8, b"hello");
+
+        let completed = json!({
+            "method": "item/completed",
+            "params": { "item": {
+                "id": "message-stream", "type": "agentMessage", "text": "hello world"
+            }}
+        });
+        driver
+            .map_notification(
+                &envelope,
+                "item/completed",
+                completed.clone(),
+                serde_json::to_vec(&completed).expect("complete bytes"),
+            )
+            .expect("map complete")
+            .expect("lifecycle event");
+        let replaced = content(driver.queued_events.pop_front().expect("replace candidate"));
+        let finalized = content(
+            driver
+                .queued_events
+                .pop_front()
+                .expect("finalize candidate"),
+        );
+        assert_eq!(replaced.operation, ContentMutationOperation::Replace as i32);
+        assert_eq!(replaced.revision, 2);
+        assert_eq!(replaced.previous_revision, 1);
+        assert_eq!(replaced.text_utf8, b"hello world");
+        assert_eq!(
+            finalized.operation,
+            ContentMutationOperation::Finalize as i32
+        );
+        assert_eq!(finalized.revision, 3);
+        assert_eq!(finalized.previous_revision, 2);
+        assert!(finalized.text_utf8.is_empty());
+        assert!(driver.queued_events.is_empty());
+    }
+
+    #[test]
+    fn agent_message_large_utf8_delta_and_complete_use_the_real_mapper_without_loss() {
+        fn content(event: DriverEvent) -> AssistantTextContentCandidate {
+            let harness_observation::Payload::ContentSignal(signal) = event.payload else {
+                panic!("content signal")
+            };
+            let Some(user_visible_content_candidate::Payload::AssistantText(candidate)) =
+                signal.candidate.and_then(|candidate| candidate.payload)
+            else {
+                panic!("assistant candidate")
+            };
+            candidate
+        }
+
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch-large-stream".to_owned(),
+            ..Default::default()
+        };
+        let delta_text = format!("{}界{}", "a".repeat(65_535), "b".repeat(8_000));
+        let delta = json!({
+            "method": "item/agentMessage/delta",
+            "params": { "itemId": "message-large-stream", "delta": delta_text }
+        });
+        let first = driver
+            .map_notification(
+                &envelope,
+                "item/agentMessage/delta",
+                delta.clone(),
+                serde_json::to_vec(&delta).expect("delta bytes"),
+            )
+            .expect("map large delta")
+            .expect("first large delta candidate");
+        let mut delta_candidates = vec![content(first)];
+        while let Some(event) = driver.queued_events.pop_front() {
+            delta_candidates.push(content(event));
+        }
+        assert!(delta_candidates.len() > 1);
+        let mut rebuilt_delta = Vec::new();
+        for (index, candidate) in delta_candidates.iter().enumerate() {
+            assert_eq!(candidate.operation, ContentMutationOperation::Append as i32);
+            assert_eq!(candidate.previous_revision, index as u64);
+            assert_eq!(candidate.revision, index as u64 + 1);
+            assert!(candidate.text_utf8.len() <= CODEX_CONTENT_CANDIDATE_BYTES);
+            std::str::from_utf8(&candidate.text_utf8).expect("UTF-8 candidate boundary");
+            rebuilt_delta.extend_from_slice(&candidate.text_utf8);
+        }
+        assert_eq!(rebuilt_delta, delta_text.as_bytes());
+
+        let final_text = format!("{}界{}", "z".repeat(70_000), "q".repeat(7_000));
+        let completed = json!({
+            "method": "item/completed",
+            "params": { "item": {
+                "id": "message-large-stream", "type": "agentMessage", "text": final_text
+            }}
+        });
+        driver
+            .map_notification(
+                &envelope,
+                "item/completed",
+                completed.clone(),
+                serde_json::to_vec(&completed).expect("complete bytes"),
+            )
+            .expect("map large completion")
+            .expect("completion lifecycle");
+        let mut completion_candidates = Vec::new();
+        while let Some(event) = driver.queued_events.pop_front() {
+            completion_candidates.push(content(event));
+        }
+        assert!(completion_candidates.len() > 2);
+        assert_eq!(
+            completion_candidates[0].operation,
+            ContentMutationOperation::Replace as i32
+        );
+        assert_eq!(
+            completion_candidates.last().expect("finalize").operation,
+            ContentMutationOperation::Finalize as i32
+        );
+        let mut rebuilt_final = Vec::new();
+        for candidate in completion_candidates
+            .iter()
+            .take(completion_candidates.len() - 1)
+        {
+            assert!(candidate.text_utf8.len() <= CODEX_CONTENT_CANDIDATE_BYTES);
+            std::str::from_utf8(&candidate.text_utf8).expect("UTF-8 completion boundary");
+            match ContentMutationOperation::try_from(candidate.operation).expect("operation") {
+                ContentMutationOperation::Replace => rebuilt_final = candidate.text_utf8.clone(),
+                ContentMutationOperation::Append => {
+                    rebuilt_final.extend_from_slice(&candidate.text_utf8);
+                }
+                other => panic!("unexpected completion mutation {other:?}"),
+            }
+        }
+        assert_eq!(rebuilt_final, final_text.as_bytes());
     }
 
     #[tokio::test]

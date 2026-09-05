@@ -8,19 +8,22 @@ use std::{
 
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::ContractReference,
-    localapi::v1::{ClientSurface, ProjectionPosition, SourceDomain, SourceRevision},
+    localapi::v1::{
+        ClientSurface, HarnessContentPosition, ProjectionPosition, SourceDomain, SourceRevision,
+    },
 };
 use egopulse_local_api::{
     read_gateway_policy::ReadGatewayPolicy,
     read_tokens::{
-        AwaitTarget, CursorAnchor, CursorCollection, CursorExpectation, CursorIssue, CursorSort,
-        ReadTokenCodec, ReadTokenError, ReadTokenScope, TokenMacKey,
+        AwaitTarget, ContentCursorExpectation, ContentCursorIssue, CursorAnchor, CursorCollection,
+        CursorExpectation, CursorIssue, CursorSort, ReadTokenCodec, ReadTokenError, ReadTokenScope,
+        TokenMacKey,
     },
     session::{AuthenticatedSession, SessionClock},
 };
 
 const API_DIGEST: &str = "28d05e2533ea7650d8fedbc44abfa21d33c2845f8d105650e3287676e789e7bb";
-const KERNEL_DIGEST: &str = "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9";
+const KERNEL_DIGEST: &str = "500d1421381ea3929e6cd92c0ce7bc0e849a93f32d941366ff35037915aaea3d";
 const POLICY_DIGEST: &str = "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1";
 
 #[derive(Clone)]
@@ -192,6 +195,49 @@ fn cursor_round_trips_across_surfaces_and_binds_snapshot_policy_and_scope() {
     assert_eq!(
         codec.verify_cursor(&token, &changed_scope, &task_cursor_expectation()),
         Err(ReadTokenError::ScopeMismatch)
+    );
+}
+
+#[test]
+fn harness_content_cursor_uses_an_independent_position_and_binds_the_exact_filter() {
+    let clock = MutableClock::new(UNIX_EPOCH + Duration::from_secs(1_000));
+    let codec = build_codec(&clock, 17);
+    let scope = ReadTokenScope::from_session(&session(ClientSurface::Cli)).unwrap();
+    let issue = ContentCursorIssue {
+        filter_sha256: "c".repeat(64),
+        effective_page_size: 256,
+        snapshot_position: HarnessContentPosition {
+            epoch: "content-epoch-v1".to_owned(),
+            sequence: 400,
+            projected_at: None,
+        },
+        last_sequence: 256,
+    };
+    let token = codec.issue_content_cursor(&scope, issue).unwrap();
+    let expected = ContentCursorExpectation {
+        filter_sha256: "c".repeat(64),
+        effective_page_size: 256,
+        current_epoch: "content-epoch-v1".to_owned(),
+        retention_floor: 100,
+    };
+    let verified = codec
+        .verify_content_cursor(&token, &scope, &expected)
+        .unwrap();
+    assert_eq!(verified.snapshot_sequence, 400);
+    assert_eq!(verified.last_sequence, 256);
+
+    let mut changed_filter = expected.clone();
+    changed_filter.filter_sha256 = "d".repeat(64);
+    assert_eq!(
+        codec.verify_content_cursor(&token, &scope, &changed_filter),
+        Err(ReadTokenError::BindingMismatch)
+    );
+
+    let mut compacted = expected;
+    compacted.retention_floor = 257;
+    assert_eq!(
+        codec.verify_content_cursor(&token, &scope, &compacted),
+        Err(ReadTokenError::ResetRequired)
     );
 }
 

@@ -4,6 +4,9 @@ use egopulse_cognition_runtime::memory_authority::{
     SubmitMemoryCandidate,
 };
 use egopulse_cognition_runtime::task_authority::SqlCipherKey;
+use egopulse_domain_contracts::memory::{
+    MEMORY_MAX_ROUTING_FIELD_BYTES, MEMORY_MAX_TOTAL_CONTENT_BYTES,
+};
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -79,6 +82,17 @@ fn agent_write_is_candidate_only_and_founder_acceptance_exposes_snapshot() {
     assert_eq!(submitted.state, MemoryState::Candidate);
     assert_eq!(submitted.revision, 1);
 
+    let candidates = authority
+        .candidate_records("scope:founder")
+        .expect("read candidate records");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].memory_id, "memory-1");
+    assert_eq!(candidates[0].state, MemoryState::Candidate);
+    assert_eq!(
+        candidates[0].content,
+        "Founder prefers deterministic local execution."
+    );
+
     let snapshot = authority
         .accepted_snapshot("scope:founder")
         .expect("read empty accepted snapshot");
@@ -99,6 +113,12 @@ fn agent_write_is_candidate_only_and_founder_acceptance_exposes_snapshot() {
     assert_eq!(
         records[0].content,
         "Founder prefers deterministic local execution."
+    );
+    assert!(
+        authority
+            .candidate_records("scope:founder")
+            .expect("read empty candidate projection")
+            .is_empty()
     );
     assert!(authority.integrity_is_ok().expect("check memory integrity"));
 }
@@ -230,5 +250,32 @@ fn unauthenticated_principal_cannot_write() {
     assert_eq!(
         authority.submit_candidate(&candidate("submit-1"), &unauthenticated),
         Err(MemoryAuthorityFailure::Unauthorized)
+    );
+}
+
+#[test]
+fn candidate_rejects_content_and_routing_fields_above_worker_limits() {
+    let root = TempRoot::new("bounds");
+    let mut authority = authority(&root);
+    let agent = principal(MemoryPrincipalKind::Agent, "agent:local");
+
+    let oversized_content = SubmitMemoryCandidate {
+        content: "x".repeat(MEMORY_MAX_TOTAL_CONTENT_BYTES + 1),
+        idempotency_key: "oversized-content".to_owned(),
+        ..candidate("oversized-content")
+    };
+    assert_eq!(
+        authority.submit_candidate(&oversized_content, &agent),
+        Err(MemoryAuthorityFailure::InvalidArgument("content"))
+    );
+
+    let oversized_scope = SubmitMemoryCandidate {
+        scope_ref: "s".repeat(MEMORY_MAX_ROUTING_FIELD_BYTES + 1),
+        idempotency_key: "oversized-scope".to_owned(),
+        ..candidate("oversized-scope")
+    };
+    assert_eq!(
+        authority.submit_candidate(&oversized_scope, &agent),
+        Err(MemoryAuthorityFailure::InvalidArgument("scope_ref"))
     );
 }

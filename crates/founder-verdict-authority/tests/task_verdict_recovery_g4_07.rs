@@ -427,6 +427,7 @@ fn create_command() -> TaskCommand {
             target_scope_ref: "scope-01".to_owned(),
             acceptance_contract_ref: Some(contract_ref("acceptance", SHA_A)),
             budget_profile_ref: Some(contract_ref("budget", SHA_B)),
+            work_capability_route: None,
         })),
     }
 }

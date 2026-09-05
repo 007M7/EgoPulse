@@ -9,6 +9,9 @@ use std::{
 use egopulse_artifact_authority::{
     ArtifactAuthority, ArtifactAuthorityConfig, ArtifactAuthorityFailure, ArtifactSqlCipherKey,
 };
+use egopulse_cognition_runtime::context_authority::{
+    ContextAuthority, ContextAuthorityConfig, ContextPrincipalKind,
+};
 use egopulse_cognition_runtime::memory_authority::{
     MemoryAuthority, MemoryAuthorityConfig, MemoryAuthorityFailure, MemoryPrincipalKind,
 };
@@ -21,8 +24,10 @@ use egopulse_domain_contracts::v01::egopulse::{
     collaboration::v1::{RunPlan, StepPlan},
     common::v1::ContractReference,
     harness::v1::NativeSessionStrategy,
+    task::v1::WorkCapabilityRouteBinding,
     verification::v1::{CheckerProfile, VerificationBinding, VerificationRequest},
 };
+use egopulse_domain_contracts::work_capability::seal_work_capability_route_binding;
 use egopulse_founder_verdict_authority::{FounderVerdictAuthority, VerdictAuthorityConfig};
 use egopulse_founder_verdict_authority::{VerdictPrincipalKind, VerdictSqlCipherKey};
 use egopulse_harness_adapter::{AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeKey};
@@ -34,6 +39,7 @@ use egopulse_policy_decision_authority::{
     PolicyAuthorityConfig, PolicyAuthorityFailure, PolicyDecisionAuthority, PolicyPrincipalKind,
     PolicySqlCipherKey,
 };
+use egopulse_process_supervision::is_supported_executable_file;
 use egopulse_verification_authority::{
     ArtifactBackedReferenceResolver, ReferenceRejection, ResolvedVerificationInput,
     SegoFindingEvidenceBinding, SegoMapperPolicy, VerificationAuthority,
@@ -41,9 +47,13 @@ use egopulse_verification_authority::{
     VerificationSqlCipherKey,
 };
 use prost_types::Timestamp;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::ConfiguredWorkPreparationPort;
+use crate::work_capability::{
+    WorkCapabilityRegistry, WorkCapabilityRegistryError, persist_explicit_config_transition,
+};
 use crate::{AllowlistedPrincipal, AllowlistedPrincipalResolver, PrincipalPolicyError};
 use crate::{
     ArtifactAuthorityReferenceSource, ArtifactProjectionSource, AuthorityPrincipalBinding,
@@ -51,13 +61,19 @@ use crate::{
     ConfiguredArtifactAdmissionGuardConfig, ConfiguredAuthorityPrincipalResolver,
     ConfiguredFounderVerdictResolver, ConfiguredFounderVerdictResolverConfig,
     ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ConfiguredTaskTransitionGuard,
-    ConfiguredVerificationWorker, DaemonCompositionError, DaemonProviders,
-    FounderVerdictConfigurationError, GovernedReturnCollectorConfig, LocalUserPolicyResolver,
-    LocalUserPolicyResolverConfig, MemoryCandidateProducerBinding,
+    ConfiguredVerificationWorker, ContextMutationPortAdapter, DaemonCompositionError,
+    DaemonProviders, FounderVerdictConfigurationError, GovernedReturnCollectorConfig,
+    LocalUserPolicyResolver, LocalUserPolicyResolverConfig, MemoryCandidateProducerBinding,
     MemoryRetrievalCompositionConfig, NativeHarnessCompositionConfig,
     SharedAuthorityCompositionInputs, TaskAuthorityCommitReceiptSource,
     VerificationAuthorityArtifactSource, VerificationProjectionSource, VerificationWorkerConfig,
 };
+
+const PRODUCTION_BOOTSTRAP_V2: &str = "egopulse.production-bootstrap/v2";
+const PRODUCTION_BOOTSTRAP_V3: &str = "egopulse.production-bootstrap/v3";
+const V2_MIGRATION_BACKUP_SUFFIX: &str = ".v2.bak";
+const V3_ROLLBACK_BACKUP_SUFFIX: &str = ".v3-rollback.bak";
+const MAX_MIGRATION_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 
 /// Explicit scalar configuration for the local-user Policy resolver. The
 /// Adapter edge is opened by the composition root so the resolver reads the
@@ -121,6 +137,17 @@ pub struct ProviderModelBinding {
     pub provider_model_id: String,
 }
 
+/// Provenance for a local model-catalog snapshot. This describes where the
+/// editable catalog came from; it is not evidence that the Harness is
+/// reachable or that any model is production-admitted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderCatalogSnapshot {
+    pub source: String,
+    pub fetched_at: String,
+    pub harness_version: String,
+    pub evidence_digest_sha256: String,
+}
+
 /// Redaction-safe provider bootstrap profile shared by daemon startup and the
 /// future CLI/TUI provider status projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,12 +159,275 @@ pub struct ProviderBootstrapProfile {
     /// User/provider supplied model catalog. It is configuration data, not a
     /// claim that every model is currently reachable.
     pub models: Vec<ProviderModelBinding>,
+    pub catalog_snapshot: Option<ProviderCatalogSnapshot>,
     /// The exact Harness model identifier sent when a work input does not
     /// override the profile.
     pub exact_model: String,
     pub executable: PathBuf,
     pub credential: ProviderCredentialReference,
     pub hold_reason: Option<String>,
+}
+
+/// Redacted configuration projection for setup and diagnostics. It contains
+/// provider/model identities and environment-variable names only; it never
+/// resolves or serializes credential values.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderCatalogProfileView {
+    pub profile_id: String,
+    pub provider: String,
+    pub harness: String,
+    pub admission: String,
+    pub models: Vec<ProviderCatalogModelView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_snapshot: Option<ProviderCatalogSnapshot>,
+    pub selected_model: String,
+    pub executable: String,
+    /// Read-only local discovery result. This is not a protocol or
+    /// authentication attestation and never executes the Harness.
+    pub executable_available: bool,
+    pub credential_mode: String,
+    /// `present`/`missing` applies only to API-key environment references;
+    /// `harness_account_delegated` means the Harness owns authentication.
+    pub credential_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_source_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderCatalogModelView {
+    pub harness_model_id: String,
+    pub provider_model_id: String,
+}
+
+/// Redaction-safe report for the explicit v2/v3 work-capability config
+/// transition. It contains only public route identities and file locations;
+/// authority keys and Provider credential values are never decoded here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkCapabilityConfigTransitionReport {
+    pub transition: String,
+    pub applied: bool,
+    pub from_schema_version: String,
+    pub to_schema_version: String,
+    pub config_path: String,
+    pub retained_backup_path: String,
+    pub choice_id: String,
+    pub provider_profile_id: String,
+    pub provider_id: String,
+    pub harness_id: String,
+    pub harness_model_id: String,
+    pub provider_model_id: String,
+    pub route_binding_sha256: String,
+    pub preference_revision: u64,
+}
+
+/// A provider-neutral preview of a refreshed Harness catalog.
+///
+/// This is intentionally a pure value and does not mutate user configuration.
+/// A refresh can make the currently selected model unavailable, but it can
+/// never select a replacement implicitly.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderCatalogRefreshPreview {
+    pub profile_id: String,
+    pub models: Vec<ProviderCatalogModelView>,
+    pub selected_model: String,
+    pub selected_model_available: bool,
+    pub selection_changed: bool,
+    pub requires_user_action: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum ProviderCatalogRefreshError {
+    #[error("refreshed provider catalog must contain at least one model")]
+    EmptyCatalog,
+    #[error("refreshed provider catalog contains an invalid {0}")]
+    InvalidModelIdentity(&'static str),
+    #[error("refreshed provider catalog contains a duplicate Harness model id")]
+    DuplicateHarnessModelId,
+}
+
+impl ProviderBootstrapProfile {
+    #[must_use]
+    pub fn redacted_catalog_view(&self) -> ProviderCatalogProfileView {
+        let (credential_mode, credential_status, credential_source_env) = match &self.credential {
+            ProviderCredentialReference::HarnessAccount => {
+                ("harness_account", "harness_account_delegated", None)
+            }
+            ProviderCredentialReference::ApiKeyEnvironment { source_env, .. } => {
+                let status = match std::env::var(source_env) {
+                    Ok(value) if !value.trim().is_empty() => "present",
+                    _ => "missing",
+                };
+                ("api_key_environment", status, Some(source_env.clone()))
+            }
+        };
+        ProviderCatalogProfileView {
+            profile_id: self.profile_id.clone(),
+            provider: self.provider.as_str().to_owned(),
+            harness: self.harness.as_str().to_owned(),
+            admission: self.admission.as_str().to_owned(),
+            models: self
+                .models
+                .iter()
+                .map(|model| ProviderCatalogModelView {
+                    harness_model_id: model.harness_model_id.clone(),
+                    provider_model_id: model.provider_model_id.clone(),
+                })
+                .collect(),
+            catalog_snapshot: self.catalog_snapshot.clone(),
+            selected_model: self.exact_model.clone(),
+            executable: self.executable.display().to_string(),
+            executable_available: provider_executable_available(&self.executable),
+            credential_mode: credential_mode.to_owned(),
+            credential_status: credential_status.to_owned(),
+            credential_source_env,
+            hold_reason: self.hold_reason.clone(),
+        }
+    }
+
+    /// Previews a Harness-native catalog refresh without changing selection.
+    ///
+    /// The returned preview is suitable for a future read/selection surface.
+    /// It deliberately has no persistence side effect: selecting a model is a
+    /// separate, Founder-visible operation that must later be bound to the
+    /// frozen Local API contract and an exact dispatch receipt.
+    pub fn preview_catalog_refresh(
+        &self,
+        refreshed_models: &[ProviderModelBinding],
+    ) -> Result<ProviderCatalogRefreshPreview, ProviderCatalogRefreshError> {
+        if refreshed_models.is_empty() {
+            return Err(ProviderCatalogRefreshError::EmptyCatalog);
+        }
+        let mut models = refreshed_models.to_vec();
+        for model in &models {
+            validate_refreshed_model_identity(model)?;
+        }
+        models.sort_by(|left, right| {
+            left.harness_model_id
+                .cmp(&right.harness_model_id)
+                .then_with(|| left.provider_model_id.cmp(&right.provider_model_id))
+        });
+        if models
+            .windows(2)
+            .any(|pair| pair[0].harness_model_id == pair[1].harness_model_id)
+        {
+            return Err(ProviderCatalogRefreshError::DuplicateHarnessModelId);
+        }
+        let selected_model_available = models
+            .iter()
+            .any(|model| model.harness_model_id == self.exact_model);
+        Ok(ProviderCatalogRefreshPreview {
+            profile_id: self.profile_id.clone(),
+            models: models
+                .into_iter()
+                .map(|model| ProviderCatalogModelView {
+                    harness_model_id: model.harness_model_id,
+                    provider_model_id: model.provider_model_id,
+                })
+                .collect(),
+            selected_model: self.exact_model.clone(),
+            selected_model_available,
+            selection_changed: false,
+            requires_user_action: !selected_model_available,
+            reason_code: (!selected_model_available)
+                .then_some("selected_model_missing_from_refresh".to_owned()),
+        })
+    }
+}
+
+/// Performs non-invasive executable discovery for setup diagnostics.
+///
+/// A configured command can be a path or a bare command name. On Windows,
+/// `PATHEXT` is honored so `.cmd` Harness launchers are reported correctly.
+/// This function only inspects the filesystem/PATH; it never starts a child
+/// process and therefore cannot be mistaken for a Provider capability probe.
+fn provider_executable_available(executable: &Path) -> bool {
+    resolve_provider_executable(executable).is_some()
+}
+
+fn provider_command_extensions(executable: &Path) -> Vec<String> {
+    if !cfg!(windows) || executable.extension().is_some() {
+        return Vec::new();
+    }
+    std::env::var_os("PATHEXT")
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
+        .to_string_lossy()
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn resolve_provider_executable(executable: &Path) -> Option<PathBuf> {
+    // An extension does not make a command an explicit path: `codex.cmd` is
+    // still a valid PATH lookup on Windows. Only a path-like value should be
+    // checked relative to the current filesystem location.
+    if executable.components().count() > 1 {
+        let candidate = fs::canonicalize(executable).ok()?;
+        return is_supported_executable_file(&candidate).then_some(candidate);
+    }
+    let path_value = std::env::var_os("PATH")?;
+    let candidates =
+        std::env::split_paths(&path_value).flat_map(|directory| {
+            let direct = directory.join(executable);
+            let extensions = provider_command_extensions(executable);
+            std::iter::once(direct).chain(extensions.into_iter().map(move |extension| {
+                directory.join(format!("{}{}", executable.display(), extension))
+            }))
+        });
+    candidates.into_iter().find_map(|candidate| {
+        let candidate = fs::canonicalize(candidate).ok()?;
+        is_supported_executable_file(&candidate).then_some(candidate)
+    })
+}
+
+fn validate_refreshed_model_identity(
+    model: &ProviderModelBinding,
+) -> Result<(), ProviderCatalogRefreshError> {
+    for (value, field) in [
+        (&model.harness_model_id, "harness model identity"),
+        (&model.provider_model_id, "provider model identity"),
+    ] {
+        if value.is_empty() || value.trim() != value || value.len() > 4 * 1024 {
+            return Err(ProviderCatalogRefreshError::InvalidModelIdentity(field));
+        }
+    }
+    Ok(())
+}
+
+impl ProviderId {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Gpt => "gpt",
+            Self::DeepSeek => "deepseek",
+            Self::Kimi => "kimi",
+            Self::Glm => "glm",
+        }
+    }
+}
+
+impl ProviderHarnessKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "codex_app_server",
+            Self::DshAcp => "dsh_acp",
+            Self::KimiCliAcp => "kimi_cli_acp",
+            Self::OpenCodeAcp => "opencode_acp",
+        }
+    }
+}
+
+impl ProviderAdmission {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Candidate => "candidate",
+            Self::Held => "held",
+        }
+    }
 }
 
 /// Inputs owned by the local installation, not inferred from a client request.
@@ -170,6 +460,7 @@ pub struct ProductionBootstrapConfig {
     pub os_principal: AllowlistedPrincipal,
     pub authority_binding: AuthorityPrincipalBinding,
     pub provider_profiles: Vec<ProviderBootstrapProfile>,
+    pub work_capability_registry: Arc<WorkCapabilityRegistry>,
     pub codex: CodexHarnessCompositionConfig,
 }
 
@@ -198,7 +489,7 @@ impl ProductionBootstrapConfig {
                 source,
             }
         })?;
-        file.into_typed()
+        file.into_typed(path.to_path_buf())
     }
 
     /// Returns the redaction-safe Provider catalog. It intentionally does not
@@ -208,18 +499,81 @@ impl ProductionBootstrapConfig {
         &self.provider_profiles
     }
 
+    /// Returns the provider/model catalog for setup and diagnostics without
+    /// exposing credential values or authority state.
+    #[must_use]
+    pub fn provider_catalog_views(&self) -> Vec<ProviderCatalogProfileView> {
+        self.provider_profiles
+            .iter()
+            .map(ProviderBootstrapProfile::redacted_catalog_view)
+            .collect()
+    }
+
     /// Opens every Authority exactly once and composes the first production
     /// vertical. Missing or invalid references fail before a serving daemon is
     /// built; no test resolver is used as a production fallback.
-    pub fn build(self) -> Result<DaemonProviders, ProductionBootstrapError> {
-        let task_guard = ConfiguredTaskCreationGuard::new(self.task_guard)?;
+    pub fn build(mut self) -> Result<DaemonProviders, ProductionBootstrapError> {
+        // User configuration may name an executable through PATH for setup
+        // convenience, but the supervised process boundary accepts only an
+        // exact absolute file. Resolve both copies before opening any Authority
+        // store and reject drift between the Provider profile and runtime block.
+        let codex_profile_index = self
+            .provider_profiles
+            .iter()
+            .position(|profile| {
+                profile.provider == ProviderId::Gpt
+                    && profile.harness == ProviderHarnessKind::CodexAppServer
+                    && profile.admission == ProviderAdmission::Production
+            })
+            .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_codex_route_binding",
+            ))?;
+        let profile_executable =
+            resolve_provider_executable(&self.provider_profiles[codex_profile_index].executable)
+                .ok_or_else(|| {
+                    ProductionBootstrapError::ProviderExecutableUnavailable(
+                        self.provider_profiles[codex_profile_index]
+                            .profile_id
+                            .clone(),
+                    )
+                })?;
+        let runtime_executable = resolve_provider_executable(&self.codex.codex_executable)
+            .ok_or_else(|| {
+                ProductionBootstrapError::ProviderExecutableUnavailable("codex.runtime".to_owned())
+            })?;
+        if profile_executable != runtime_executable {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_codex_binding",
+            ));
+        }
+        self.provider_profiles[codex_profile_index].executable = profile_executable;
+        self.codex.codex_executable = runtime_executable;
+
+        let context_database_path = self
+            .memory
+            .database_path
+            .parent()
+            .map(|parent| parent.join("context-authority.sqlite3"))
+            .unwrap_or_else(|| PathBuf::from("context-authority.sqlite3"));
+        let context = Arc::new(Mutex::new(
+            ContextAuthority::open(ContextAuthorityConfig {
+                database_path: context_database_path,
+                store_epoch: format!("{}-context", self.memory.store_epoch),
+                key: self.memory.key.duplicate_for_related_store(),
+            })
+            .map_err(|_| ProductionBootstrapError::ContextAuthority)?,
+        ));
+        let task_guard_config = self.task_guard;
+        let task_guard = ConfiguredTaskCreationGuard::new(task_guard_config.clone())?
+            .with_context_authority(Arc::clone(&context));
         let founder_verdict_handle = Arc::new(Mutex::new(None));
         let task = Arc::new(Mutex::new(TaskAuthority::open_with_transition_guard(
             self.task,
             task_guard,
             ConfiguredTaskTransitionGuard::with_founder_verdict(Arc::clone(
                 &founder_verdict_handle,
-            )),
+            ))
+            .with_context_authority(Arc::clone(&context)),
         )?));
         let memory = Arc::new(Mutex::new(MemoryAuthority::open(self.memory)?));
 
@@ -290,6 +644,7 @@ impl ProductionBootstrapConfig {
             self.authority_binding
         ])?);
         let memory_principal_resolver = Arc::clone(&principal_resolver);
+        let context_principal_resolver = Arc::clone(&principal_resolver);
         let session_principal_resolver =
             Arc::new(AllowlistedPrincipalResolver::new([self.os_principal])?);
         let mut providers =
@@ -307,10 +662,16 @@ impl ProductionBootstrapConfig {
                         &verification,
                     ))),
                 ],
-            });
+            })
+            .with_context_authority(Arc::clone(&context))
+            .with_context_mutation(Arc::new(ContextMutationPortAdapter::new(
+                Arc::clone(&context),
+                context_principal_resolver,
+            )))
+            .with_work_capability_port(self.work_capability_registry.clone());
         if let Some(worker_config) = self.verification_worker {
             let worker = ConfiguredVerificationWorker::new(
-                task,
+                Arc::clone(&task),
                 Box::new(ArtifactAuthorityReferenceSource::new_shared(Arc::clone(
                     &artifact,
                 ))),
@@ -324,13 +685,48 @@ impl ProductionBootstrapConfig {
             providers = providers.with_memory_retrieval(Arc::clone(&memory), memory_retrieval)?;
         }
         providers = providers.with_memory_mutation(Arc::clone(&memory), memory_principal_resolver);
+        let work_port = ConfiguredWorkPreparationPort::new(
+            Arc::clone(&context),
+            Arc::clone(&providers.task_port),
+            Arc::clone(&providers.work_memory_retrieval_port),
+            self.codex.native.workspace_root.clone(),
+            task_guard_config.allowed_work_types,
+            task_guard_config.acceptance_contract_ref,
+            task_guard_config.budget_profile_ref,
+        )
+        .and_then(|port| port.with_input_bundle_root(self.codex.native.input_bundle_root.clone()))
+        .and_then(|port| port.with_activation_run_id(self.codex.native.workflow.run_id.clone()))
+        .map(|port| port.with_work_capability_registry(Arc::clone(&self.work_capability_registry)))
+        .map_err(|_| ProductionBootstrapError::WorkPreparation)?;
+        providers = providers.with_work_preparation_port(Arc::new(work_port));
         if !self.memory_candidate_producers.is_empty() {
             providers = providers.with_memory_candidate_producers(
                 Arc::clone(&memory),
                 self.memory_candidate_producers,
             )?;
         }
-        providers = providers.with_codex_harness(self.codex, artifact, verification)?;
+        let codex_provider_profile = self
+            .provider_profiles
+            .iter()
+            .find(|profile| {
+                profile.provider == ProviderId::Gpt
+                    && profile.harness == ProviderHarnessKind::CodexAppServer
+                    && profile.admission == ProviderAdmission::Production
+            })
+            .cloned()
+            .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_codex_route_binding",
+            ))?;
+        providers = providers.with_codex_harness(
+            self.codex,
+            codex_provider_profile,
+            artifact,
+            verification,
+        )?;
+        // The production dispatch cycle settles committed collaboration
+        // recovery facts (run cancelled / harness outcome unknown) into the
+        // Task Authority through the existing single-writer path.
+        providers = providers.with_task_recovery_settlement(Arc::clone(&task))?;
         Ok(providers)
     }
 }
@@ -355,7 +751,35 @@ struct UserOwnedBootstrapFile {
     founder: FounderFile,
     #[serde(default)]
     provider_profiles: Vec<ProviderProfileFile>,
+    #[serde(default)]
+    work_capabilities: Option<WorkCapabilitiesFile>,
     codex: CodexFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkCapabilitiesFile {
+    preference_revision: u64,
+    default_choice_id: String,
+    routes: Vec<WorkCapabilityRouteFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkCapabilityRouteFile {
+    choice_id: String,
+    route_id: String,
+    route_generation: u64,
+    provider_profile_id: String,
+    provider_id: String,
+    harness_id: String,
+    harness_model_id: String,
+    provider_model_id: String,
+    capability_profile_ref: ReferenceFile,
+    #[serde(default)]
+    catalog_snapshot_sha256: Option<String>,
+    native_composition_generation: String,
+    route_binding_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,6 +796,8 @@ struct ProviderProfileFile {
     #[serde(default)]
     models: Vec<ProviderModelFile>,
     #[serde(default)]
+    catalog_snapshot: Option<ProviderCatalogSnapshotFile>,
+    #[serde(default)]
     selected_model: Option<String>,
     executable: String,
     credential: ProviderCredentialFile,
@@ -384,6 +810,15 @@ struct ProviderProfileFile {
 struct ProviderModelFile {
     harness_model_id: String,
     provider_model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderCatalogSnapshotFile {
+    source: String,
+    fetched_at: String,
+    harness_version: String,
+    evidence_digest_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,6 +873,8 @@ struct IdentityFile {
     verdict_kind: String,
     #[serde(default)]
     memory_kind: Option<String>,
+    #[serde(default)]
+    context_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -700,6 +1137,439 @@ struct ReferenceFile {
     sha256: String,
 }
 
+impl WorkCapabilitiesFile {
+    fn into_typed(
+        self,
+        production_profile: &ProviderBootstrapProfile,
+        codex: &CodexHarnessCompositionConfig,
+    ) -> Result<(WorkCapabilityRouteBinding, String, u64), ProductionBootstrapError> {
+        if self.preference_revision == 0 || self.routes.len() != 1 {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "work_capabilities initial single-route state",
+            ));
+        }
+        let default_choice_id = required(
+            self.default_choice_id,
+            "work_capabilities.default_choice_id",
+        )?;
+        let route_file = self.routes.into_iter().next().ok_or(
+            ProductionBootstrapError::InvalidConfiguration("work_capabilities.routes"),
+        )?;
+        let (choice_id, route) = route_file.into_typed()?;
+        if choice_id != default_choice_id {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "work_capabilities.default_choice_id",
+            ));
+        }
+        validate_codex_route_runtime_binding(&route, production_profile, codex)?;
+        Ok((route, default_choice_id, self.preference_revision))
+    }
+}
+
+impl WorkCapabilityRouteFile {
+    fn into_typed(self) -> Result<(String, WorkCapabilityRouteBinding), ProductionBootstrapError> {
+        let choice_id = required(self.choice_id, "work_capabilities.routes.choice_id")?;
+        let route = WorkCapabilityRouteBinding {
+            route_id: required(self.route_id, "work_capabilities.routes.route_id")?,
+            route_generation: self.route_generation,
+            provider_profile_id: required(
+                self.provider_profile_id,
+                "work_capabilities.routes.provider_profile_id",
+            )?,
+            provider_id: required(self.provider_id, "work_capabilities.routes.provider_id")?,
+            harness_id: required(self.harness_id, "work_capabilities.routes.harness_id")?,
+            harness_model_id: required(
+                self.harness_model_id,
+                "work_capabilities.routes.harness_model_id",
+            )?,
+            provider_model_id: required(
+                self.provider_model_id,
+                "work_capabilities.routes.provider_model_id",
+            )?,
+            capability_profile_ref: Some(self.capability_profile_ref.into_typed()),
+            catalog_snapshot_sha256: self.catalog_snapshot_sha256,
+            native_composition_generation: required(
+                self.native_composition_generation,
+                "work_capabilities.routes.native_composition_generation",
+            )?,
+            route_binding_sha256: required(
+                self.route_binding_sha256,
+                "work_capabilities.routes.route_binding_sha256",
+            )?,
+        };
+        let route = seal_work_capability_route_binding(route).map_err(|_| {
+            ProductionBootstrapError::InvalidConfiguration("work_capabilities.routes.route_binding")
+        })?;
+        Ok((choice_id, route))
+    }
+}
+
+fn compatibility_codex_route(
+    profile: &ProviderBootstrapProfile,
+    codex: &CodexHarnessCompositionConfig,
+) -> Result<WorkCapabilityRouteBinding, ProductionBootstrapError> {
+    let route = compatibility_codex_route_from_parts(
+        profile,
+        codex.native.workflow.capability_profile_ref.clone(),
+        codex.native.workflow.run_id.clone(),
+    )?;
+    validate_codex_route_runtime_binding(&route, profile, codex)?;
+    Ok(route)
+}
+
+fn compatibility_codex_route_from_parts(
+    profile: &ProviderBootstrapProfile,
+    capability_profile_ref: ContractReference,
+    native_composition_generation: String,
+) -> Result<WorkCapabilityRouteBinding, ProductionBootstrapError> {
+    let model = profile
+        .models
+        .iter()
+        .find(|model| model.harness_model_id == profile.exact_model)
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.production_codex_model",
+        ))?;
+    let route = seal_work_capability_route_binding(WorkCapabilityRouteBinding {
+        route_id: "route:compat-codex:v1".to_owned(),
+        route_generation: 1,
+        provider_profile_id: profile.profile_id.clone(),
+        provider_id: "gpt".to_owned(),
+        harness_id: "codex_app_server".to_owned(),
+        harness_model_id: model.harness_model_id.clone(),
+        provider_model_id: model.provider_model_id.clone(),
+        capability_profile_ref: Some(capability_profile_ref),
+        catalog_snapshot_sha256: profile
+            .catalog_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.evidence_digest_sha256.clone()),
+        native_composition_generation,
+        route_binding_sha256: String::new(),
+    })
+    .map_err(|_| {
+        ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.production_codex_route_binding",
+        )
+    })?;
+    Ok(route)
+}
+
+fn validate_codex_route_runtime_binding(
+    route: &WorkCapabilityRouteBinding,
+    profile: &ProviderBootstrapProfile,
+    codex: &CodexHarnessCompositionConfig,
+) -> Result<(), ProductionBootstrapError> {
+    let model = profile
+        .models
+        .iter()
+        .find(|model| model.harness_model_id == profile.exact_model)
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.production_codex_model",
+        ))?;
+    let catalog_snapshot_sha256 = profile
+        .catalog_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.evidence_digest_sha256.as_str());
+    if route.provider_profile_id != profile.profile_id
+        || route.provider_id != "gpt"
+        || route.harness_id != "codex_app_server"
+        || route.harness_model_id != model.harness_model_id
+        || route.provider_model_id != model.provider_model_id
+        || route.capability_profile_ref.as_ref()
+            != Some(&codex.native.workflow.capability_profile_ref)
+        || route.catalog_snapshot_sha256.as_deref() != catalog_snapshot_sha256
+        || route.native_composition_generation != codex.native.workflow.run_id
+    {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "work_capabilities.routes.runtime_binding",
+        ));
+    }
+    Ok(())
+}
+
+/// Previews the additive v2 -> v3 work-capability configuration transition.
+/// No file is opened for writing and no secret environment variable is read.
+pub fn preview_work_capability_config_migration(
+    path: impl AsRef<Path>,
+) -> Result<WorkCapabilityConfigTransitionReport, ProductionBootstrapError> {
+    let path = path.as_ref();
+    let original = read_transition_config(path)?;
+    render_v3_migration(path, &original).map(|(report, _)| report)
+}
+
+/// Applies exactly the previously previewable v2 -> v3 transition under the
+/// daemon configuration lock. Startup never calls this function.
+pub fn apply_work_capability_config_migration(
+    path: impl AsRef<Path>,
+) -> Result<WorkCapabilityConfigTransitionReport, ProductionBootstrapError> {
+    let path = path.as_ref();
+    let original = read_transition_config(path)?;
+    let (mut report, replacement) = render_v3_migration(path, &original)?;
+    persist_explicit_config_transition(path, &original, &replacement, V2_MIGRATION_BACKUP_SUFFIX)
+        .map_err(transition_persistence_error)?;
+    report.applied = true;
+    Ok(report)
+}
+
+/// Previews a rollback only when the current v3 file is the exact semantic
+/// result of migrating its retained v2 backup. Any later route/default/config
+/// edit makes rollback fail closed.
+pub fn preview_work_capability_config_rollback(
+    path: impl AsRef<Path>,
+) -> Result<WorkCapabilityConfigTransitionReport, ProductionBootstrapError> {
+    let path = path.as_ref();
+    let current = read_transition_config(path)?;
+    render_v2_rollback(path, &current).map(|(report, _)| report)
+}
+
+/// Restores the retained complete v2 file and preserves the current v3 file
+/// as a separate rollback backup. Authority stores are not touched.
+pub fn rollback_work_capability_config_to_v2(
+    path: impl AsRef<Path>,
+) -> Result<WorkCapabilityConfigTransitionReport, ProductionBootstrapError> {
+    let path = path.as_ref();
+    let current = read_transition_config(path)?;
+    let (mut report, replacement) = render_v2_rollback(path, &current)?;
+    persist_explicit_config_transition(path, &current, &replacement, V3_ROLLBACK_BACKUP_SUFFIX)
+        .map_err(transition_persistence_error)?;
+    report.applied = true;
+    Ok(report)
+}
+
+fn render_v3_migration(
+    path: &Path,
+    original: &[u8],
+) -> Result<(WorkCapabilityConfigTransitionReport, Vec<u8>), ProductionBootstrapError> {
+    let file: UserOwnedBootstrapFile = serde_json::from_slice(original).map_err(|source| {
+        ProductionBootstrapError::ConfigurationFormat {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    let UserOwnedBootstrapFile {
+        schema_version,
+        provider_profiles,
+        work_capabilities,
+        codex,
+        ..
+    } = file;
+    if schema_version != PRODUCTION_BOOTSTRAP_V2 || work_capabilities.is_some() {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "configuration migration requires an unmigrated v2 file",
+        ));
+    }
+
+    let provider_profiles = provider_profiles
+        .into_iter()
+        .map(ProviderProfileFile::into_typed)
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_provider_profiles(&provider_profiles)?;
+    let production_profiles = provider_profiles
+        .iter()
+        .filter(|profile| {
+            profile.provider == ProviderId::Gpt
+                && profile.harness == ProviderHarnessKind::CodexAppServer
+                && profile.admission == ProviderAdmission::Production
+        })
+        .collect::<Vec<_>>();
+    let [production_profile] = production_profiles.as_slice() else {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "configuration migration requires exactly one production Codex profile",
+        ));
+    };
+
+    let CodexFile {
+        codex_executable,
+        default_model,
+        workflow,
+        ..
+    } = codex;
+    let default_model = required(default_model.unwrap_or_default(), "codex.default_model")?;
+    let codex_executable = required(codex_executable, "codex.codex_executable")?;
+    if default_model != production_profile.exact_model
+        || Path::new(&codex_executable) != production_profile.executable.as_path()
+    {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.production_codex_binding",
+        ));
+    }
+    let WorkflowFile {
+        run_id,
+        capability_profile_ref,
+        ..
+    } = workflow;
+    let route = compatibility_codex_route_from_parts(
+        production_profile,
+        capability_profile_ref.into_typed(),
+        required(run_id, "codex.workflow.run_id")?,
+    )?;
+    let choice_id = format!("compat-codex:{}", &route.route_binding_sha256[..16]);
+
+    let mut document: serde_json::Value = serde_json::from_slice(original).map_err(|source| {
+        ProductionBootstrapError::ConfigurationFormat {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    let root = document
+        .as_object_mut()
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "configuration document root",
+        ))?;
+    root.insert(
+        "schema_version".to_owned(),
+        serde_json::Value::String(PRODUCTION_BOOTSTRAP_V3.to_owned()),
+    );
+    let profile_ref = route.capability_profile_ref.as_ref().ok_or(
+        ProductionBootstrapError::InvalidConfiguration("work-capability route capability profile"),
+    )?;
+    root.insert(
+        "work_capabilities".to_owned(),
+        serde_json::json!({
+            "preference_revision": 1,
+            "default_choice_id": choice_id,
+            "routes": [{
+                "choice_id": choice_id,
+                "route_id": route.route_id,
+                "route_generation": route.route_generation,
+                "provider_profile_id": route.provider_profile_id,
+                "provider_id": route.provider_id,
+                "harness_id": route.harness_id,
+                "harness_model_id": route.harness_model_id,
+                "provider_model_id": route.provider_model_id,
+                "capability_profile_ref": {
+                    "contract_id": profile_ref.contract_id,
+                    "version": profile_ref.version,
+                    "sha256": profile_ref.sha256,
+                },
+                "catalog_snapshot_sha256": route.catalog_snapshot_sha256,
+                "native_composition_generation": route.native_composition_generation,
+                "route_binding_sha256": route.route_binding_sha256,
+            }]
+        }),
+    );
+    let mut replacement = serde_json::to_vec_pretty(&document).map_err(|_| {
+        ProductionBootstrapError::InvalidConfiguration("configuration migration serialization")
+    })?;
+    replacement.push(b'\n');
+    if replacement.len() > MAX_MIGRATION_CONFIG_BYTES {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "configuration file exceeds migration size limit",
+        ));
+    }
+
+    let route = document["work_capabilities"]["routes"][0]
+        .as_object()
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "work-capability migration route",
+        ))?;
+    let string_field = |name: &str| {
+        route
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                "work-capability migration route field",
+            ))
+    };
+    Ok((
+        WorkCapabilityConfigTransitionReport {
+            transition: "migrate_v2_to_v3".to_owned(),
+            applied: false,
+            from_schema_version: PRODUCTION_BOOTSTRAP_V2.to_owned(),
+            to_schema_version: PRODUCTION_BOOTSTRAP_V3.to_owned(),
+            config_path: path.display().to_string(),
+            retained_backup_path: transition_backup_path(path, V2_MIGRATION_BACKUP_SUFFIX)?
+                .display()
+                .to_string(),
+            choice_id,
+            provider_profile_id: string_field("provider_profile_id")?,
+            provider_id: string_field("provider_id")?,
+            harness_id: string_field("harness_id")?,
+            harness_model_id: string_field("harness_model_id")?,
+            provider_model_id: string_field("provider_model_id")?,
+            route_binding_sha256: string_field("route_binding_sha256")?,
+            preference_revision: 1,
+        },
+        replacement,
+    ))
+}
+
+fn render_v2_rollback(
+    path: &Path,
+    current: &[u8],
+) -> Result<(WorkCapabilityConfigTransitionReport, Vec<u8>), ProductionBootstrapError> {
+    let v2_backup_path = transition_backup_path(path, V2_MIGRATION_BACKUP_SUFFIX)?;
+    let v2_backup = read_transition_config(&v2_backup_path)?;
+    let (migrated_report, expected_v3) = render_v3_migration(path, &v2_backup)?;
+    let current_value: serde_json::Value = serde_json::from_slice(current).map_err(|source| {
+        ProductionBootstrapError::ConfigurationFormat {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    let expected_value: serde_json::Value =
+        serde_json::from_slice(&expected_v3).map_err(|source| {
+            ProductionBootstrapError::ConfigurationFormat {
+                path: path.display().to_string(),
+                source,
+            }
+        })?;
+    if current_value != expected_value {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "rollback requires the unchanged initial v3 migration state",
+        ));
+    }
+
+    Ok((
+        WorkCapabilityConfigTransitionReport {
+            transition: "rollback_v3_to_v2".to_owned(),
+            applied: false,
+            from_schema_version: PRODUCTION_BOOTSTRAP_V3.to_owned(),
+            to_schema_version: PRODUCTION_BOOTSTRAP_V2.to_owned(),
+            retained_backup_path: transition_backup_path(path, V3_ROLLBACK_BACKUP_SUFFIX)?
+                .display()
+                .to_string(),
+            ..migrated_report
+        },
+        v2_backup,
+    ))
+}
+
+fn read_transition_config(path: &Path) -> Result<Vec<u8>, ProductionBootstrapError> {
+    let bytes = fs::read(path).map_err(|source| ProductionBootstrapError::ConfigurationFile {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if bytes.len() > MAX_MIGRATION_CONFIG_BYTES {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "configuration file exceeds migration size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn transition_backup_path(path: &Path, suffix: &str) -> Result<PathBuf, ProductionBootstrapError> {
+    let mut file_name = path
+        .file_name()
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "configuration file path",
+        ))?
+        .to_os_string();
+    file_name.push(suffix);
+    Ok(path.with_file_name(file_name))
+}
+
+fn transition_persistence_error(
+    failure: egopulse_local_api::command_gateway::WorkCapabilityPortFailure,
+) -> ProductionBootstrapError {
+    match failure {
+        egopulse_local_api::command_gateway::WorkCapabilityPortFailure::StateRevisionConflict => {
+            ProductionBootstrapError::ConfigurationTransitionConflict
+        }
+        _ => ProductionBootstrapError::ConfigurationTransition,
+    }
+}
+
 impl ProviderProfileFile {
     fn into_typed(self) -> Result<ProviderBootstrapProfile, ProductionBootstrapError> {
         let profile_id = required(self.profile_id, "provider_profiles.profile_id")?;
@@ -714,6 +1584,9 @@ impl ProviderProfileFile {
                 ));
             }
         };
+        // Provider and Harness are independent route identities. Parsing a
+        // known pair proves only that configuration can represent it;
+        // production eligibility is enforced separately by admission.
         let harness = match self.harness.as_str() {
             "codex_app_server" => ProviderHarnessKind::CodexAppServer,
             "dsh_acp" => ProviderHarnessKind::DshAcp,
@@ -812,6 +1685,10 @@ impl ProviderProfileFile {
             ));
         }
         let executable = PathBuf::from(required(self.executable, "provider_profiles.executable")?);
+        let catalog_snapshot = self
+            .catalog_snapshot
+            .map(ProviderCatalogSnapshotFile::into_typed)
+            .transpose()?;
         let credential = match self.credential {
             ProviderCredentialFile::HarnessAccount => ProviderCredentialReference::HarnessAccount,
             ProviderCredentialFile::ApiKeyEnvironment {
@@ -838,13 +1715,13 @@ impl ProviderProfileFile {
                 "provider_profiles.hold_reason",
             ));
         }
-        validate_provider_harness(provider, harness)?;
         Ok(ProviderBootstrapProfile {
             profile_id,
             provider,
             harness,
             admission,
             models,
+            catalog_snapshot,
             exact_model,
             executable,
             credential,
@@ -853,23 +1730,32 @@ impl ProviderProfileFile {
     }
 }
 
-fn validate_provider_harness(
-    provider: ProviderId,
-    harness: ProviderHarnessKind,
-) -> Result<(), ProductionBootstrapError> {
-    let valid = matches!(
-        (provider, harness),
-        (ProviderId::Gpt, ProviderHarnessKind::CodexAppServer)
-            | (ProviderId::DeepSeek, ProviderHarnessKind::DshAcp)
-            | (ProviderId::Kimi, ProviderHarnessKind::KimiCliAcp)
-            | (ProviderId::Glm, ProviderHarnessKind::OpenCodeAcp)
-    );
-    if valid {
-        Ok(())
-    } else {
-        Err(ProductionBootstrapError::InvalidConfiguration(
-            "provider_profiles.provider_harness_mapping",
-        ))
+impl ProviderCatalogSnapshotFile {
+    fn into_typed(self) -> Result<ProviderCatalogSnapshot, ProductionBootstrapError> {
+        let source = bounded_text(self.source, "provider_profiles.catalog_snapshot.source")?;
+        let fetched_at = bounded_text(
+            self.fetched_at,
+            "provider_profiles.catalog_snapshot.fetched_at",
+        )?;
+        let harness_version = bounded_text(
+            self.harness_version,
+            "provider_profiles.catalog_snapshot.harness_version",
+        )?;
+        let evidence_digest_sha256 = required(
+            self.evidence_digest_sha256,
+            "provider_profiles.catalog_snapshot.evidence_digest_sha256",
+        )?;
+        if !is_lowercase_sha256(&evidence_digest_sha256) {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.catalog_snapshot.evidence_digest_sha256",
+            ));
+        }
+        Ok(ProviderCatalogSnapshot {
+            source,
+            fetched_at,
+            harness_version,
+            evidence_digest_sha256,
+        })
     }
 }
 
@@ -949,12 +1835,30 @@ fn validate_provider_profiles(
 }
 
 impl UserOwnedBootstrapFile {
-    fn into_typed(self) -> Result<ProductionBootstrapConfig, ProductionBootstrapError> {
-        if self.schema_version != "egopulse.production-bootstrap/v2" {
-            return Err(ProductionBootstrapError::InvalidConfiguration(
-                "schema_version",
-            ));
-        }
+    fn into_typed(
+        self,
+        config_path: PathBuf,
+    ) -> Result<ProductionBootstrapConfig, ProductionBootstrapError> {
+        let migration_required = match self.schema_version.as_str() {
+            "egopulse.production-bootstrap/v2" if self.work_capabilities.is_none() => true,
+            "egopulse.production-bootstrap/v3" if self.work_capabilities.is_some() => false,
+            "egopulse.production-bootstrap/v2" => {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "work_capabilities are not valid in v2",
+                ));
+            }
+            "egopulse.production-bootstrap/v3" => {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "work_capabilities are required in v3",
+                ));
+            }
+            _ => {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "schema_version",
+                ));
+            }
+        };
+        let work_capabilities_file = self.work_capabilities;
         let provider_profiles = self
             .provider_profiles
             .into_iter()
@@ -988,12 +1892,17 @@ impl UserOwnedBootstrapFile {
             ));
         }
         let principal_id = required(identity.principal_id, "identity.principal_id")?;
+        let permission_codes =
+            non_empty_set(identity.permission_codes, "identity.permission_codes")?;
+        let context_kind = identity
+            .context_kind
+            .as_deref()
+            .map(parse_context_principal)
+            .transpose()?;
+        validate_context_permission_binding(&permission_codes, context_kind)?;
         let grant = egopulse_local_api::session::PrincipalGrant {
             authenticated_principal_id: principal_id.clone(),
-            permission_codes: non_empty_set(
-                identity.permission_codes,
-                "identity.permission_codes",
-            )?,
+            permission_codes,
             authorization_policy_ref: identity_policy_ref,
         };
         let authority_binding = AuthorityPrincipalBinding {
@@ -1006,6 +1915,7 @@ impl UserOwnedBootstrapFile {
                 .as_deref()
                 .map(parse_memory_principal)
                 .transpose()?,
+            context: context_kind,
         };
 
         let task_guard = ConfiguredTaskCreationGuardConfig {
@@ -1147,7 +2057,7 @@ impl UserOwnedBootstrapFile {
             collector_principal_id: "collector:terminal-output".to_owned(),
             artifact_authority_principal_id: "authority:artifact".to_owned(),
         };
-        let codex = CodexHarnessCompositionConfig {
+        let mut codex = CodexHarnessCompositionConfig {
             native: NativeHarnessCompositionConfig {
                 collaboration_database_path: collaboration_store.database_path,
                 collaboration_store_epoch: collaboration_store.store_epoch,
@@ -1177,6 +2087,7 @@ impl UserOwnedBootstrapFile {
                 "codex.codex_executable",
             )?),
             environment_overrides: gpt_environment_overrides,
+            work_capability_route: None,
         };
         if let Some(profile) = provider_profiles.iter().find(|profile| {
             profile.provider == ProviderId::Gpt
@@ -1188,6 +2099,36 @@ impl UserOwnedBootstrapFile {
                 "provider_profiles.production_codex_binding",
             ));
         }
+        let production_codex_profile = provider_profiles
+            .iter()
+            .find(|profile| {
+                profile.provider == ProviderId::Gpt
+                    && profile.harness == ProviderHarnessKind::CodexAppServer
+                    && profile.admission == ProviderAdmission::Production
+            })
+            .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_codex_route_binding",
+            ))?;
+        let (admitted_route, default_choice_id, preference_revision) = if migration_required {
+            let route = compatibility_codex_route(production_codex_profile, &codex)?;
+            let choice_id = format!("compat-codex:{}", &route.route_binding_sha256[..16]);
+            (route, choice_id, 1)
+        } else {
+            let file =
+                work_capabilities_file.ok_or(ProductionBootstrapError::InvalidConfiguration(
+                    "work_capabilities are required in v3",
+                ))?;
+            file.into_typed(production_codex_profile, &codex)?
+        };
+        codex.work_capability_route = Some(admitted_route.clone());
+        let work_capability_registry = Arc::new(WorkCapabilityRegistry::new(
+            config_path,
+            &provider_profiles,
+            admitted_route,
+            default_choice_id,
+            preference_revision,
+            migration_required,
+        )?);
 
         Ok(ProductionBootstrapConfig {
             task: TaskAuthorityConfig {
@@ -1272,6 +2213,7 @@ impl UserOwnedBootstrapFile {
             },
             authority_binding,
             provider_profiles,
+            work_capability_registry,
             codex,
         })
     }
@@ -1323,6 +2265,21 @@ fn required(value: String, field: &'static str) -> Result<String, ProductionBoot
         return Err(ProductionBootstrapError::InvalidConfiguration(field));
     }
     Ok(value)
+}
+
+fn bounded_text(value: String, field: &'static str) -> Result<String, ProductionBootstrapError> {
+    let value = required(value, field)?;
+    if value.len() > 4 * 1024 {
+        return Err(ProductionBootstrapError::InvalidConfiguration(field));
+    }
+    Ok(value)
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn set(values: Vec<String>) -> BTreeSet<String> {
@@ -1733,6 +2690,7 @@ impl MaterialFile {
             session_strategy,
             native_session_ref: self.native_session_ref,
             checkpoint_ref: self.checkpoint_ref,
+            route_binding: None,
             evidence_refs: self.evidence_refs,
         })
     }
@@ -1814,6 +2772,29 @@ fn parse_memory_principal(value: &str) -> Result<MemoryPrincipalKind, Production
             "identity.memory_kind",
         )),
     }
+}
+
+fn parse_context_principal(value: &str) -> Result<ContextPrincipalKind, ProductionBootstrapError> {
+    match value {
+        "Founder" => Ok(ContextPrincipalKind::Founder),
+        _ => Err(ProductionBootstrapError::InvalidConfiguration(
+            "identity.context_kind",
+        )),
+    }
+}
+
+fn validate_context_permission_binding(
+    permission_codes: &BTreeSet<String>,
+    context_kind: Option<ContextPrincipalKind>,
+) -> Result<(), ProductionBootstrapError> {
+    if permission_codes.contains("local.context.revoke")
+        && context_kind != Some(ContextPrincipalKind::Founder)
+    {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "identity.context_kind",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_memory_producer_principal(
@@ -1924,8 +2905,14 @@ pub enum ProductionBootstrapError {
     },
     #[error("user-owned production configuration is invalid: {0}")]
     InvalidConfiguration(&'static str),
+    #[error("user-owned configuration changed while the explicit transition was in progress")]
+    ConfigurationTransitionConflict,
+    #[error("user-owned configuration transition could not be persisted atomically")]
+    ConfigurationTransition,
     #[error("required bootstrap secret is missing: {0}")]
     MissingSecret(String),
+    #[error("production Provider executable is unavailable: {0}")]
+    ProviderExecutableUnavailable(String),
     #[error("bootstrap secret is not a non-zero 32-byte hex value: {0}")]
     InvalidSecret(String),
     #[error("Task creation guard configuration is invalid")]
@@ -1934,6 +2921,12 @@ pub enum ProductionBootstrapError {
     TaskAuthority(#[from] TaskAuthorityFailure),
     #[error("Memory Authority could not be opened")]
     MemoryAuthority(#[from] MemoryAuthorityFailure),
+    #[error("Context Authority could not be opened")]
+    ContextAuthority,
+    #[error("Work preparation composition is invalid")]
+    WorkPreparation,
+    #[error("work-capability registry configuration is invalid")]
+    WorkCapability(#[from] WorkCapabilityRegistryError),
     #[error("Artifact admission guard configuration is invalid")]
     ArtifactGuard(#[from] crate::ArtifactAdmissionGuardConfigurationError),
     #[error("Artifact Authority could not be opened")]
@@ -1971,6 +2964,46 @@ mod tests {
     use std::fs;
     use uuid::Uuid;
 
+    fn packaged_v2_config_bytes() -> Vec<u8> {
+        let mut value: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../config/agentos-config.example.json"
+        ))
+        .expect("packaged configuration JSON");
+        value["schema_version"] = serde_json::json!(PRODUCTION_BOOTSTRAP_V2);
+        value
+            .as_object_mut()
+            .expect("packaged configuration object")
+            .remove("work_capabilities");
+        let mut bytes = serde_json::to_vec_pretty(&value).expect("render packaged v2 fixture");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn provider_executable_resolution_produces_an_absolute_file_boundary() {
+        let current = std::env::current_exe().expect("current test executable");
+        let resolved = resolve_provider_executable(&current).expect("resolve current executable");
+        assert!(resolved.is_absolute());
+        assert!(resolved.is_file());
+
+        let missing = std::env::temp_dir().join(format!(
+            "egopulse-missing-provider-executable-{}",
+            Uuid::now_v7()
+        ));
+        assert_eq!(resolve_provider_executable(&missing), None);
+
+        let ordinary_file = std::env::temp_dir().join(format!(
+            "egopulse-non-executable-provider-{}.txt",
+            Uuid::now_v7()
+        ));
+        fs::write(&ordinary_file, b"not an executable").expect("write ordinary file");
+        assert_eq!(resolve_provider_executable(&ordinary_file), None);
+        fs::remove_file(ordinary_file).expect("remove ordinary file");
+
+        assert!(provider_command_extensions(Path::new("codex.exe")).is_empty());
+        assert!(provider_command_extensions(Path::new("codex.cmd")).is_empty());
+    }
+
     #[test]
     fn production_verification_boundary_denies_all_unreviewed_references() {
         let resolver = DenyVerificationReferences;
@@ -2005,6 +3038,103 @@ mod tests {
             Err(ProductionBootstrapError::ConfigurationFormat { .. })
         ));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn work_capability_config_migration_is_explicit_complete_and_reversible() {
+        let directory = tempfile::tempdir().expect("migration tempdir");
+        let path = directory.path().join("agentos-config.json");
+        let original = packaged_v2_config_bytes();
+        fs::write(&path, &original).expect("write v2 config");
+
+        let preview =
+            preview_work_capability_config_migration(&path).expect("preview v2 migration");
+        assert!(!preview.applied);
+        assert_eq!(preview.from_schema_version, PRODUCTION_BOOTSTRAP_V2);
+        assert_eq!(preview.to_schema_version, PRODUCTION_BOOTSTRAP_V3);
+        assert_eq!(preview.preference_revision, 1);
+        assert_eq!(preview.harness_model_id, "gpt-5.6-sol");
+        assert_eq!(fs::read(&path).expect("read after preview"), original);
+        assert!(!Path::new(&preview.retained_backup_path).exists());
+
+        let applied = apply_work_capability_config_migration(&path).expect("apply v2 migration");
+        assert!(applied.applied);
+        assert_eq!(applied.route_binding_sha256.len(), 64);
+        assert_eq!(
+            fs::read(&applied.retained_backup_path).expect("retained v2 backup"),
+            original
+        );
+        let migrated = fs::read(&path).expect("read migrated v3");
+        let migrated_value: serde_json::Value =
+            serde_json::from_slice(&migrated).expect("parse migrated v3");
+        assert_eq!(migrated_value["schema_version"], PRODUCTION_BOOTSTRAP_V3);
+        assert_eq!(
+            migrated_value["work_capabilities"]["default_choice_id"],
+            applied.choice_id
+        );
+        assert_eq!(
+            migrated_value["work_capabilities"]["routes"][0]["route_binding_sha256"],
+            applied.route_binding_sha256
+        );
+
+        let rollback_preview =
+            preview_work_capability_config_rollback(&path).expect("preview v2 rollback");
+        assert!(!rollback_preview.applied);
+        assert_eq!(
+            rollback_preview.from_schema_version,
+            PRODUCTION_BOOTSTRAP_V3
+        );
+        assert_eq!(rollback_preview.to_schema_version, PRODUCTION_BOOTSTRAP_V2);
+        assert_eq!(
+            fs::read(&path).expect("rollback preview is read-only"),
+            migrated
+        );
+
+        let rolled_back = rollback_work_capability_config_to_v2(&path).expect("apply v2 rollback");
+        assert!(rolled_back.applied);
+        assert_eq!(fs::read(&path).expect("restored v2"), original);
+        assert_eq!(
+            fs::read(&rolled_back.retained_backup_path).expect("retained v3 rollback backup"),
+            migrated
+        );
+    }
+
+    #[test]
+    fn work_capability_config_rollback_rejects_any_post_migration_drift() {
+        let directory = tempfile::tempdir().expect("migration tempdir");
+        let path = directory.path().join("agentos-config.json");
+        let original = packaged_v2_config_bytes();
+        fs::write(&path, original).expect("write v2 config");
+        apply_work_capability_config_migration(&path).expect("apply v2 migration");
+
+        let mut current: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read v3")).expect("parse v3");
+        current["work_capabilities"]["preference_revision"] = serde_json::json!(2);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&current).expect("render drifted v3"),
+        )
+        .expect("write drifted v3");
+        let before = fs::read(&path).expect("read drifted bytes");
+
+        assert!(matches!(
+            preview_work_capability_config_rollback(&path),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "rollback requires the unchanged initial v3 migration state"
+            ))
+        ));
+        assert!(matches!(
+            rollback_work_capability_config_to_v2(&path),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "rollback requires the unchanged initial v3 migration state"
+            ))
+        ));
+        assert_eq!(fs::read(&path).expect("drift remains untouched"), before);
+        assert!(
+            !transition_backup_path(&path, V3_ROLLBACK_BACKUP_SUFFIX)
+                .expect("rollback backup path")
+                .exists()
+        );
     }
 
     #[test]
@@ -2075,6 +3205,12 @@ mod tests {
                 harness_model_id: "zai/glm-5.3".to_owned(),
                 provider_model_id: "glm-5.3".to_owned(),
             }],
+            catalog_snapshot: Some(ProviderCatalogSnapshotFile {
+                source: "offline-fallback:provider-docs".to_owned(),
+                fetched_at: "2026-08-27T00:00:00Z".to_owned(),
+                harness_version: "opencode-unverified".to_owned(),
+                evidence_digest_sha256: "a".repeat(64),
+            }),
             selected_model: Some("zai/glm-5.3".to_owned()),
             executable: "opencode".to_owned(),
             credential: ProviderCredentialFile::HarnessAccount,
@@ -2095,6 +3231,205 @@ mod tests {
             profile.credential,
             ProviderCredentialReference::HarnessAccount
         ));
+        assert_eq!(
+            profile.catalog_snapshot,
+            Some(ProviderCatalogSnapshot {
+                source: "offline-fallback:provider-docs".to_owned(),
+                fetched_at: "2026-08-27T00:00:00Z".to_owned(),
+                harness_version: "opencode-unverified".to_owned(),
+                evidence_digest_sha256: "a".repeat(64),
+            })
+        );
+    }
+
+    #[test]
+    fn gpt_candidate_profiles_can_bind_each_known_harness_without_production_admission() {
+        let harnesses = [
+            ("codex_app_server", ProviderHarnessKind::CodexAppServer),
+            ("dsh_acp", ProviderHarnessKind::DshAcp),
+            ("kimi_cli_acp", ProviderHarnessKind::KimiCliAcp),
+            ("opencode_acp", ProviderHarnessKind::OpenCodeAcp),
+        ];
+        let mut profiles = Vec::new();
+
+        for (harness_name, expected_harness) in harnesses {
+            let profile = ProviderProfileFile {
+                profile_id: format!("gpt-{harness_name}"),
+                provider: "gpt".to_owned(),
+                harness: harness_name.to_owned(),
+                admission: "held".to_owned(),
+                exact_model: None,
+                model_ids: Vec::new(),
+                models: vec![ProviderModelFile {
+                    harness_model_id: "gpt-cross-harness-test".to_owned(),
+                    provider_model_id: "gpt-cross-harness-test".to_owned(),
+                }],
+                catalog_snapshot: None,
+                selected_model: Some("gpt-cross-harness-test".to_owned()),
+                executable: harness_name.to_owned(),
+                credential: ProviderCredentialFile::HarnessAccount,
+                hold_reason: Some("real authentication is outside this release gate".to_owned()),
+            }
+            .into_typed()
+            .expect("known Provider and Harness identities should compose as held data");
+
+            assert_eq!(profile.provider, ProviderId::Gpt);
+            assert_eq!(profile.harness, expected_harness);
+            assert_eq!(profile.admission, ProviderAdmission::Held);
+            profiles.push(profile);
+        }
+
+        validate_provider_profiles(&profiles)
+            .expect("held cross-Harness profiles must remain valid configuration");
+
+        let mut unproven_production_profile = profiles[1].clone();
+        unproven_production_profile.admission = ProviderAdmission::Production;
+        assert!(matches!(
+            validate_provider_profiles(&[unproven_production_profile]),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_admission_pending"
+            ))
+        ));
+    }
+
+    #[test]
+    fn provider_catalog_snapshot_rejects_noncanonical_evidence_digest() {
+        let result = ProviderCatalogSnapshotFile {
+            source: "harness".to_owned(),
+            fetched_at: "2026-08-27T00:00:00Z".to_owned(),
+            harness_version: "1.0.0".to_owned(),
+            evidence_digest_sha256: "A".repeat(64),
+        }
+        .into_typed();
+
+        assert!(matches!(
+            result,
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.catalog_snapshot.evidence_digest_sha256"
+            ))
+        ));
+    }
+
+    #[test]
+    fn provider_catalog_refresh_preserves_an_available_exact_selection() {
+        let profile = ProviderBootstrapProfile {
+            profile_id: "deepseek".to_owned(),
+            provider: ProviderId::DeepSeek,
+            harness: ProviderHarnessKind::DshAcp,
+            admission: ProviderAdmission::Candidate,
+            models: vec![ProviderModelBinding {
+                harness_model_id: "deepseek-chat".to_owned(),
+                provider_model_id: "deepseek-chat".to_owned(),
+            }],
+            catalog_snapshot: None,
+            exact_model: "deepseek-chat".to_owned(),
+            executable: "dsh".into(),
+            credential: ProviderCredentialReference::ApiKeyEnvironment {
+                source_env: "DEEPSEEK_API_KEY".to_owned(),
+                target_env: "DEEPSEEK_API_KEY".to_owned(),
+            },
+            hold_reason: Some("candidate".to_owned()),
+        };
+
+        let preview = profile
+            .preview_catalog_refresh(&[
+                ProviderModelBinding {
+                    harness_model_id: "deepseek-reasoner".to_owned(),
+                    provider_model_id: "deepseek-reasoner".to_owned(),
+                },
+                ProviderModelBinding {
+                    harness_model_id: "deepseek-chat".to_owned(),
+                    provider_model_id: "deepseek-chat".to_owned(),
+                },
+            ])
+            .expect("valid refreshed catalog");
+
+        assert!(preview.selected_model_available);
+        assert!(!preview.selection_changed);
+        assert!(!preview.requires_user_action);
+        assert_eq!(preview.selected_model, "deepseek-chat");
+        assert_eq!(preview.models[0].harness_model_id, "deepseek-chat");
+    }
+
+    #[test]
+    fn provider_catalog_refresh_never_falls_back_when_selection_disappears() {
+        let profile = ProviderBootstrapProfile {
+            profile_id: "kimi".to_owned(),
+            provider: ProviderId::Kimi,
+            harness: ProviderHarnessKind::KimiCliAcp,
+            admission: ProviderAdmission::Held,
+            models: vec![ProviderModelBinding {
+                harness_model_id: "kimi-k2.5".to_owned(),
+                provider_model_id: "kimi-k2.5".to_owned(),
+            }],
+            catalog_snapshot: None,
+            exact_model: "kimi-k2.5".to_owned(),
+            executable: "kimi".into(),
+            credential: ProviderCredentialReference::HarnessAccount,
+            hold_reason: Some("pending".to_owned()),
+        };
+
+        let preview = profile
+            .preview_catalog_refresh(&[ProviderModelBinding {
+                harness_model_id: "kimi-k2.6".to_owned(),
+                provider_model_id: "kimi-k2.6".to_owned(),
+            }])
+            .expect("valid refreshed catalog");
+
+        assert!(!preview.selected_model_available);
+        assert!(!preview.selection_changed);
+        assert!(preview.requires_user_action);
+        assert_eq!(preview.selected_model, "kimi-k2.5");
+        assert_eq!(
+            preview.reason_code.as_deref(),
+            Some("selected_model_missing_from_refresh")
+        );
+    }
+
+    #[test]
+    fn provider_catalog_refresh_rejects_empty_invalid_and_duplicate_models() {
+        let profile = ProviderBootstrapProfile {
+            profile_id: "glm".to_owned(),
+            provider: ProviderId::Glm,
+            harness: ProviderHarnessKind::OpenCodeAcp,
+            admission: ProviderAdmission::Held,
+            models: vec![ProviderModelBinding {
+                harness_model_id: "zai/glm-5.3".to_owned(),
+                provider_model_id: "glm-5.3".to_owned(),
+            }],
+            catalog_snapshot: None,
+            exact_model: "zai/glm-5.3".to_owned(),
+            executable: "opencode".into(),
+            credential: ProviderCredentialReference::HarnessAccount,
+            hold_reason: Some("pending".to_owned()),
+        };
+
+        assert_eq!(
+            profile.preview_catalog_refresh(&[]),
+            Err(ProviderCatalogRefreshError::EmptyCatalog)
+        );
+        assert_eq!(
+            profile.preview_catalog_refresh(&[ProviderModelBinding {
+                harness_model_id: " ".to_owned(),
+                provider_model_id: "glm-5.3".to_owned(),
+            }]),
+            Err(ProviderCatalogRefreshError::InvalidModelIdentity(
+                "harness model identity"
+            ))
+        );
+        assert_eq!(
+            profile.preview_catalog_refresh(&[
+                ProviderModelBinding {
+                    harness_model_id: "zai/glm-5.3".to_owned(),
+                    provider_model_id: "glm-5.3".to_owned(),
+                },
+                ProviderModelBinding {
+                    harness_model_id: "zai/glm-5.3".to_owned(),
+                    provider_model_id: "glm-5.3-alias".to_owned(),
+                },
+            ]),
+            Err(ProviderCatalogRefreshError::DuplicateHarnessModelId)
+        );
     }
 
     #[test]
@@ -2107,6 +3442,7 @@ mod tests {
             exact_model: None,
             model_ids: vec!["deepseek-chat".to_owned()],
             models: Vec::new(),
+            catalog_snapshot: None,
             selected_model: Some("deepseek-reasoner".to_owned()),
             executable: "dsh".to_owned(),
             credential: ProviderCredentialFile::ApiKeyEnvironment {
@@ -2288,5 +3624,46 @@ mod tests {
                 "verification_worker.mapper.raw_output_address.algorithm"
             ))
         ));
+    }
+
+    #[test]
+    fn context_revoke_permission_requires_explicit_founder_binding() {
+        let revoke_permission = BTreeSet::from(["local.context.revoke".to_owned()]);
+        assert!(matches!(
+            validate_context_permission_binding(&revoke_permission, None),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "identity.context_kind"
+            ))
+        ));
+        assert!(
+            validate_context_permission_binding(
+                &revoke_permission,
+                Some(ContextPrincipalKind::Founder)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_context_permission_binding(
+                &BTreeSet::from(["local.task.read".to_owned()]),
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn context_identity_binding_accepts_only_founder() {
+        assert_eq!(
+            parse_context_principal("Founder").expect("Founder Context binding"),
+            ContextPrincipalKind::Founder
+        );
+        for invalid in ["GovernanceKernel", "ContextCompiler", "none", "founder"] {
+            assert!(matches!(
+                parse_context_principal(invalid),
+                Err(ProductionBootstrapError::InvalidConfiguration(
+                    "identity.context_kind"
+                ))
+            ));
+        }
     }
 }

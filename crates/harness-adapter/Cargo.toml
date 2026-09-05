@@ -6,8 +6,10 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 egopulse-domain-contracts.workspace = true
 hex.workspace = true
+hmac.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 rusqlite.workspace = true

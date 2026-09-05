@@ -77,6 +77,7 @@ def evaluate_model(
     return {
         "dataset_id": dataset_id,
         "dataset_sha256": dataset_sha256,
+        "deterministic_replay": True,
         "k": k,
         "fusion": {
             "lexical_weight": lexical_weight,

@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "v01-localapi-fixture/v0.1",
+  "fixtureId": "localapi-invalid-harness-content-frame-combination",
+  "category": "invalid",
+  "requirementRefs": ["R9C-D07", "R9C-D12-CONTRACT"],
+  "principal": { "kind": "LOCAL_USER", "principalId": "os-user:founder", "authenticated": true },
+  "transport": { "kind": "WINDOWS_NAMED_PIPE" },
+  "operation": {
+    "watchHarnessContent": {
+      "taskId": "task-001",
+      "resumeAfter": { "epoch": "content-epoch-01", "sequence": 13 },
+      "typedFrameVectors": [
+        { "case": "missing-payload", "wireHex": "" },
+        { "case": "unknown-payload", "wireHex": "2a00" }
+      ]
+    }
+  },
+  "expected": {
+    "outcome": "error",
+    "businessWriteCount": 0,
+    "recordsDelivered": 0,
+    "assemblyMutated": false,
+    "duplicateWireBranchRejectionClaimed": false,
+    "missingPayloadBranchFailsClosed": true,
+    "unknownPayloadBranchFailsClosed": true
+  }
+}

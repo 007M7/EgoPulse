@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use egopulse_process_supervision::{
-    GovernedProcessBudget, GovernedProcessError, SupervisedProcessSpec,
+    GovernedProcessBudget, GovernedProcessError, SupervisedProcess, SupervisedProcessSpec,
     run_governed_framed_process, run_governed_process,
 };
 use std::path::PathBuf;
@@ -55,6 +55,17 @@ fn unique_pid_file(test_name: &str) -> PathBuf {
     ))
 }
 
+fn unique_command_root(test_name: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "egopulse process supervision & {test_name}-{}-{nonce}",
+        std::process::id()
+    ))
+}
+
 fn pid_writer_script(pid_file: &std::path::Path) -> String {
     let escaped = pid_file.to_string_lossy().replace('\'', "''");
     format!("Set-Content -NoNewline -LiteralPath '{escaped}' -Value $PID; Start-Sleep -Seconds 30")
@@ -101,6 +112,21 @@ async fn wait_until_process_stops(pid: u32) -> bool {
     false
 }
 
+async fn force_stop_process(pid: u32) {
+    let _ = Command::new(powershell_executable())
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
 #[tokio::test]
 async fn framed_process_accepts_one_real_response_frame() {
     let script = r#"$bytes = [byte[]](0,0,0,2,111,107); [Console]::OpenStandardOutput().Write($bytes,0,$bytes.Length)"#;
@@ -112,6 +138,67 @@ async fn framed_process_accepts_one_real_response_frame() {
     .await
     .expect("framed worker succeeds");
     assert_eq!(receipt.stdout, b"ok");
+}
+
+#[tokio::test]
+async fn governed_process_closes_stdin_for_an_eof_driven_worker() {
+    let script = r#"$stream = [Console]::OpenStandardInput(); $buffer = New-Object byte[] 16; $total = 0; while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) { $total += $read }; [Console]::Write($total)"#;
+    let receipt = run_governed_process(
+        &powershell_spec(script),
+        b"request",
+        budget(Duration::from_secs(5), 64),
+    )
+    .await
+    .expect("EOF-driven worker succeeds");
+
+    assert_eq!(receipt.stdout, b"7");
+}
+
+#[tokio::test]
+async fn governed_process_starts_an_absolute_cmd_shim_with_minimal_environment() {
+    let command_root = unique_command_root("cmd-shim");
+    std::fs::create_dir(&command_root).expect("create command shim directory");
+    let command_file = command_root.join("provider shim.cmd");
+    std::fs::write(&command_file, "@echo off\r\necho cmd-boundary-ok\r\n")
+        .expect("write command shim");
+    let executable = std::fs::canonicalize(&command_file).expect("canonical command shim");
+    let spec = SupervisedProcessSpec::new(
+        executable,
+        std::env::current_dir().expect("test working directory"),
+    )
+    .with_minimal_user_environment();
+
+    let result = run_governed_process(&spec, b"", budget(Duration::from_secs(5), 64)).await;
+    let _ = std::fs::remove_file(command_file);
+    let _ = std::fs::remove_dir(command_root);
+
+    let receipt = result.expect("absolute command shim succeeds");
+    assert_eq!(
+        String::from_utf8_lossy(&receipt.stdout).trim(),
+        "cmd-boundary-ok"
+    );
+}
+
+#[tokio::test]
+async fn supervised_process_rejects_an_absolute_ordinary_file() {
+    let ordinary_file = unique_command_root("ordinary-file").with_extension("txt");
+    std::fs::write(&ordinary_file, b"not executable").expect("write ordinary file");
+    let executable = std::fs::canonicalize(&ordinary_file).expect("canonical ordinary file");
+    let spec = SupervisedProcessSpec::new(
+        executable,
+        std::env::current_dir().expect("test working directory"),
+    );
+
+    let error = match SupervisedProcess::spawn(&spec).await {
+        Ok(_) => panic!("ordinary file must fail before process creation"),
+        Err(error) => error,
+    };
+    let _ = std::fs::remove_file(ordinary_file);
+
+    assert!(matches!(
+        error,
+        egopulse_process_supervision::ProcessSupervisionError::InvalidExecutable
+    ));
 }
 
 #[tokio::test]
@@ -179,6 +266,52 @@ async fn dropping_a_governed_exchange_kills_the_real_child() {
         "cancelled child process remained alive: {pid}"
     );
     let _ = std::fs::remove_file(pid_file);
+}
+
+#[tokio::test]
+async fn dropping_a_governed_cmd_exchange_kills_its_descendant_tree() {
+    let command_root = unique_command_root("cmd-descendant");
+    std::fs::create_dir(&command_root).expect("create command tree directory");
+    let command_file = command_root.join("provider tree.cmd");
+    let pid_file = command_root.join("descendant.pid");
+    let command_body = format!(
+        "@echo off\r\n\"{}\" -NoProfile -NonInteractive -Command \"{}\"\r\n",
+        powershell_executable().display(),
+        pid_writer_script(&pid_file)
+    );
+    std::fs::write(&command_file, command_body).expect("write command tree shim");
+    let executable = std::fs::canonicalize(&command_file).expect("canonical command tree shim");
+    let spec = SupervisedProcessSpec::new(
+        executable,
+        std::env::current_dir().expect("test working directory"),
+    )
+    .with_minimal_user_environment();
+    let exchange = tokio::spawn(async move {
+        run_governed_process(&spec, b"", budget(Duration::from_secs(60), 64)).await
+    });
+    let descendant_pid = wait_for_pid(&pid_file).await;
+    assert!(
+        process_is_running(descendant_pid).await,
+        "command descendant never became observable"
+    );
+
+    let cancellation_started = std::time::Instant::now();
+    exchange.abort();
+    let join_error = exchange.await.expect_err("exchange must be cancelled");
+    assert!(join_error.is_cancelled());
+    let stopped = wait_until_process_stops(descendant_pid).await;
+    let cancellation_duration = cancellation_started.elapsed();
+    if !stopped {
+        force_stop_process(descendant_pid).await;
+    }
+    let _ = std::fs::remove_file(command_file);
+    let _ = std::fs::remove_file(pid_file);
+    let _ = std::fs::remove_dir(command_root);
+    assert!(stopped, "cancelled command descendant remained alive");
+    assert!(
+        cancellation_duration < Duration::from_secs(5),
+        "command process tree cancellation exceeded five seconds: {cancellation_duration:?}"
+    );
 }
 
 #[tokio::test]

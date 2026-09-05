@@ -1,11 +1,25 @@
+use crate::disclosure::{
+    ContentAssemblyCheckpoint, SafeContentProjection, canonical_credential_variants,
+    canonical_safe_record_digest, canonical_safe_record_id,
+};
 use crate::runtime::TerminalOutputCandidate;
+use egopulse_domain_contracts::profiles::{
+    HARNESS_CONTENT_DISCLOSURE_CONTRACT_ID, HARNESS_CONTENT_DISCLOSURE_CONTRACT_VERSION,
+    HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256,
+};
+use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ApprovalDecisionReceipt, CancelExecutionReceipt, DeliveryDisposition, DispatchEnvelope,
-    DispatchReceipt, HarnessObservation, LifecycleKind, ObservationCriticality,
-    harness_observation,
+    DispatchReceipt, DispatchRouteBinding, HarnessContentCompactionReason,
+    HarnessContentHistoryCompactionRecord, HarnessContentLimitKind, HarnessContentMarkerKind,
+    HarnessContentRetentionReason, HarnessContentRetentionTombstone,
+    HarnessContentSignalObservation, HarnessObservation, LifecycleKind, ObservationCriticality,
+    SafeContentMarker, SafeHarnessContentProjectionEvent, SafeHarnessContentRecord,
+    harness_observation, safe_harness_content_projection_event, safe_harness_content_record,
 };
+use hmac::{Hmac, Mac};
 use prost::Message;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -138,11 +152,140 @@ CREATE TABLE adapter_terminal_output_outbox (
 ) STRICT;
 "#;
 
+const SCHEMA_V4: &str = r#"
+ALTER TABLE adapter_edge_metadata ADD COLUMN next_content_sequence INTEGER NOT NULL DEFAULT 1
+  CHECK (next_content_sequence >= 1);
+
+CREATE TABLE adapter_dispatch_route_bindings (
+  dispatch_id TEXT PRIMARY KEY,
+  route_binding_digest_sha256 TEXT NOT NULL,
+  route_binding BLOB NOT NULL,
+  created_at_seconds INTEGER NOT NULL,
+  FOREIGN KEY (dispatch_id) REFERENCES adapter_dispatches(dispatch_id)
+) STRICT;
+
+CREATE TABLE adapter_content_candidates (
+  content_event_id TEXT PRIMARY KEY,
+  source_observation_id TEXT NOT NULL UNIQUE,
+  dispatch_id TEXT NOT NULL,
+  candidate_digest_sha256 TEXT NOT NULL,
+  content_signal BLOB NOT NULL,
+  projection_state TEXT NOT NULL CHECK (projection_state IN ('pending', 'projected', 'quarantined')),
+  safe_projection_digest_sha256 TEXT,
+  committed_records_digest_sha256 TEXT,
+  limit_kind TEXT,
+  quarantine_reason_code TEXT,
+  created_at_seconds INTEGER NOT NULL,
+  projected_at_seconds INTEGER,
+  FOREIGN KEY (source_observation_id) REFERENCES adapter_observations(observation_id),
+  FOREIGN KEY (dispatch_id) REFERENCES adapter_dispatches(dispatch_id)
+) STRICT;
+
+CREATE TABLE adapter_content_assemblies (
+  dispatch_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  current_revision INTEGER NOT NULL CHECK (current_revision >= 1),
+  finalized INTEGER NOT NULL CHECK (finalized IN (0, 1)),
+  raw_cumulative_digest_sha256 TEXT NOT NULL,
+  safe_cumulative_digest_sha256 TEXT NOT NULL,
+  credential_commitment_hmac_sha256 TEXT,
+  assembly_state BLOB NOT NULL,
+  updated_at_seconds INTEGER NOT NULL,
+  PRIMARY KEY(dispatch_id, message_id),
+  FOREIGN KEY (dispatch_id) REFERENCES adapter_dispatches(dispatch_id)
+) STRICT;
+
+CREATE TABLE adapter_safe_content_ledger (
+  record_id TEXT PRIMARY KEY,
+  content_event_id TEXT NOT NULL,
+  part_index INTEGER NOT NULL CHECK (part_index >= 0),
+  task_id TEXT NOT NULL,
+  record_digest_sha256 TEXT NOT NULL,
+  content_sequence INTEGER NOT NULL UNIQUE CHECK (content_sequence >= 1),
+  safe_record BLOB NOT NULL,
+  created_at_seconds INTEGER NOT NULL,
+  FOREIGN KEY (content_event_id) REFERENCES adapter_content_candidates(content_event_id),
+  UNIQUE(content_event_id, part_index)
+) STRICT;
+
+CREATE INDEX adapter_safe_content_ledger_task_sequence
+  ON adapter_safe_content_ledger(task_id, content_sequence);
+
+CREATE TABLE adapter_content_owner_snapshots (
+  task_id TEXT PRIMARY KEY,
+  owner_sequence INTEGER NOT NULL CHECK (owner_sequence >= 0),
+  floor_sequence INTEGER NOT NULL CHECK (floor_sequence >= 0),
+  disclosure_profile_digest_sha256 TEXT NOT NULL,
+  baseline_state BLOB NOT NULL,
+  baseline_digest_sha256 TEXT NOT NULL,
+  snapshot_digest_sha256 TEXT NOT NULL,
+  updated_at_seconds INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE adapter_content_history_floors (
+  task_id TEXT PRIMARY KEY,
+  floor_sequence INTEGER NOT NULL CHECK (floor_sequence >= 0),
+  floor_digest_sha256 TEXT NOT NULL,
+  updated_at_seconds INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE adapter_content_retention_tombstones (
+  tombstone_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  tombstone_digest_sha256 TEXT NOT NULL,
+  tombstone BLOB NOT NULL,
+  created_at_seconds INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE adapter_content_redaction_bindings (
+  dispatch_id TEXT PRIMARY KEY,
+  disclosure_profile_digest_sha256 TEXT NOT NULL,
+  credential_commitment_hmac_sha256 TEXT,
+  structured_only INTEGER NOT NULL CHECK (structured_only IN (0, 1)),
+  created_at_seconds INTEGER NOT NULL,
+  updated_at_seconds INTEGER NOT NULL,
+  FOREIGN KEY (dispatch_id) REFERENCES adapter_dispatches(dispatch_id)
+) STRICT;
+
+CREATE TABLE adapter_content_budgets (
+  scope_kind TEXT NOT NULL CHECK (scope_kind IN ('attempt', 'task')),
+  scope_id TEXT NOT NULL,
+  safe_text_bytes INTEGER NOT NULL CHECK (safe_text_bytes >= 0),
+  safe_record_count INTEGER NOT NULL CHECK (safe_record_count >= 0),
+  limit_reached INTEGER NOT NULL CHECK (limit_reached IN (0, 1)),
+  limit_kind TEXT CHECK (limit_kind IN (
+    'ATTEMPT_TEXT_BYTES', 'ATTEMPT_RECORDS', 'TASK_TEXT_BYTES', 'TASK_RECORDS'
+  )),
+  updated_at_seconds INTEGER NOT NULL,
+  CHECK ((limit_reached = 0 AND limit_kind IS NULL)
+      OR (limit_reached = 1 AND limit_kind IS NOT NULL)),
+  PRIMARY KEY(scope_kind, scope_id)
+) STRICT;
+
+CREATE TABLE adapter_content_projection_outbox (
+  message_id TEXT PRIMARY KEY,
+  source_record_id TEXT NOT NULL UNIQUE,
+  source_revision INTEGER NOT NULL CHECK (source_revision >= 1),
+  payload_digest_sha256 TEXT NOT NULL,
+  payload BLOB NOT NULL,
+  delivery_state TEXT NOT NULL CHECK (delivery_state IN ('pending', 'consumed', 'held')),
+  created_at_seconds INTEGER NOT NULL
+) STRICT;
+"#;
+
 /// QR-04 durable attempt-output budget. Oversized output keeps a bounded
 /// preview plus the digest and original byte count; it is never presented as
 /// a complete Artifact candidate.
 const TERMINAL_OUTPUT_FULL_BYTES: usize = 16 * 1024 * 1024;
 const TERMINAL_OUTPUT_PREVIEW_BYTES: usize = 64 * 1024;
+const CONTENT_SAFE_PART_BYTES: usize = 65_536;
+const ATTEMPT_SAFE_TEXT_BYTES: u64 = 16 * 1024 * 1024;
+const ATTEMPT_SAFE_RECORDS: u64 = 16_384;
+const TASK_SAFE_TEXT_BYTES: u64 = 64 * 1024 * 1024;
+const TASK_SAFE_RECORDS: u64 = 65_536;
+const CONTENT_MINIMUM_RETENTION_SECONDS: i64 = 2_592_000;
+
+type StoredContentCandidateState = (String, Option<String>, Option<String>, Option<String>);
 
 pub struct AdapterEdgeKey([u8; 32]);
 
@@ -213,6 +356,107 @@ pub enum ObservationAppend {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingContentCandidate {
+    pub observation: HarnessObservation,
+    pub signal: HarnessContentSignalObservation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SafeContentCommit {
+    Committed {
+        records: Vec<SafeHarnessContentRecord>,
+        first_sequence: u64,
+        last_sequence: u64,
+    },
+    Replay {
+        records: Vec<SafeHarnessContentRecord>,
+        first_sequence: u64,
+        last_sequence: u64,
+    },
+    Suppressed {
+        content_event_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SafeContentBudgetUsage {
+    pub safe_text_bytes: u64,
+    pub safe_record_count: u64,
+    pub limit_reached: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SafeContentBudgetSnapshot {
+    pub attempt: SafeContentBudgetUsage,
+    pub task: SafeContentBudgetUsage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentRetentionCompactionRequest {
+    pub task_id: String,
+    pub attempt_id: String,
+    pub final_epoch: String,
+    pub expected_owner_sequence: u64,
+    pub terminal_committed_at: prost_types::Timestamp,
+    pub compacted_at: prost_types::Timestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentRetentionCompactionReceipt {
+    pub owner_snapshot: SafeContentOwnerSnapshot,
+    pub compaction: HarnessContentHistoryCompactionRecord,
+    pub tombstone: HarnessContentRetentionTombstone,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafeContentProjectionMessage {
+    pub message_id: String,
+    pub source_revision: u64,
+    pub payload_digest_sha256: String,
+    pub event: SafeHarnessContentProjectionEvent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentDisclosureMode {
+    Full,
+    StructuredOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafeContentAssemblyCheckpoint {
+    pub dispatch_id: String,
+    pub message_id: String,
+    pub current_revision: u64,
+    pub finalized: bool,
+    pub raw_cumulative_digest_sha256: String,
+    pub safe_cumulative_digest_sha256: String,
+    pub safe_records: Vec<SafeHarnessContentRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafeContentOwnerRecord {
+    pub sequence: u64,
+    pub record: SafeHarnessContentRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafeContentOwnerSnapshot {
+    pub task_id: String,
+    pub owner_sequence: u64,
+    pub floor_sequence: u64,
+    pub disclosure_profile_digest_sha256: String,
+    pub snapshot_digest_sha256: String,
+    pub records: Vec<SafeContentOwnerRecord>,
+    pub tombstones: Vec<HarnessContentRetentionTombstone>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RetainedSafeContent {
+    Records(SafeContentOwnerSnapshot),
+    ResetRequired(SafeContentOwnerSnapshot),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeExecutionBinding {
     pub attempt_id: String,
     pub dispatch_id: String,
@@ -225,6 +469,31 @@ pub struct NativeExecutionBinding {
 pub struct AdapterObservationEvidence {
     pub observation: HarnessObservation,
     pub raw_event: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalObservationRecoveryView {
+    pub pending: Vec<HarnessObservation>,
+    pub durable_terminal_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredDeliveredDispatchEvidence {
+    pub dispatch_id: String,
+    pub attempt_id: String,
+    pub fencing_token: u64,
+    pub dispatch_fingerprint: String,
+    pub envelope_digest_sha256: String,
+    pub envelope: Vec<u8>,
+    pub delivery_state: String,
+    pub receipt: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DispatchTaskLineage {
+    pub task_id: String,
+    pub task_revision: u64,
+    pub work_revision: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -279,12 +548,27 @@ pub struct AdapterEdgeInspection {
     pub pending_projection_count: u64,
     pub terminal_output_outbox_count: u64,
     pub pending_terminal_output_count: u64,
+    pub dispatch_route_binding_count: u64,
+    pub content_candidate_count: u64,
+    pub pending_content_candidate_count: u64,
+    pub quarantined_content_candidate_count: u64,
+    pub safe_content_ledger_count: u64,
+    pub content_projection_outbox_count: u64,
+    pub pending_content_projection_count: u64,
     pub next_observation_sequence: u64,
+    pub next_content_sequence: u64,
 }
 
 pub struct AdapterEdge {
     connection: Connection,
     adapter_id: String,
+    content_commitment_key: [u8; 32],
+}
+
+impl Drop for AdapterEdge {
+    fn drop(&mut self) {
+        self.content_commitment_key.zeroize();
+    }
 }
 
 impl AdapterEdge {
@@ -295,6 +579,10 @@ impl AdapterEdge {
         if let Some(parent) = config.database_path.parent() {
             fs::create_dir_all(parent).map_err(AdapterEdgeError::Directory)?;
         }
+        let content_commitment_key = hmac_sha256_bytes(
+            &config.key.0,
+            b"egopulse/harness-content/credential-commitment-key/v1",
+        )?;
         let mut connection = Connection::open(&config.database_path)?;
         connection.pragma_update(None, "key", format!("x'{}'", hex::encode(config.key.0)))?;
         let cipher_version: String = connection
@@ -307,20 +595,29 @@ impl AdapterEdge {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "secure_delete", "ON")?;
-        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2), M::up(SCHEMA_V3)])
-            .to_latest(&mut connection)?;
+        Migrations::new(vec![
+            M::up(SCHEMA_V1),
+            M::up(SCHEMA_V2),
+            M::up(SCHEMA_V3),
+            M::up(SCHEMA_V4),
+        ])
+        .to_latest(&mut connection)?;
 
         backfill_approval_projection_outbox(&mut connection)?;
-        let schema_digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}\n{SCHEMA_V3}").as_bytes());
+        let schema_digest =
+            sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}\n{SCHEMA_V3}\n{SCHEMA_V4}").as_bytes());
+        let prior_v3_schema_digest =
+            sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}\n{SCHEMA_V3}").as_bytes());
         let prior_v2_schema_digest = sha256(format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes());
         let prior_v1_schema_digest = sha256(SCHEMA_V1.as_bytes());
         connection.execute(
             "UPDATE adapter_edge_metadata SET schema_profile_sha256 = ?1
              WHERE singleton = 1 AND schema_profile_id = ?2
-               AND schema_profile_sha256 IN (?3, ?4)",
+               AND schema_profile_sha256 IN (?3, ?4, ?5)",
             params![
                 schema_digest,
                 SCHEMA_PROFILE_ID,
+                prior_v3_schema_digest,
                 prior_v2_schema_digest,
                 prior_v1_schema_digest
             ],
@@ -358,7 +655,13 @@ impl AdapterEdge {
         Ok(Self {
             connection,
             adapter_id: config.adapter_id,
+            content_commitment_key,
         })
+    }
+
+    #[must_use]
+    pub fn adapter_id(&self) -> &str {
+        &self.adapter_id
     }
 
     pub fn prepare_dispatch(
@@ -392,7 +695,10 @@ impl AdapterEdge {
                 DispatchPreparation::DeliveryUnknown
             });
         }
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "INSERT INTO adapter_dispatches(
                dispatch_id, attempt_id, fencing_token, dispatch_fingerprint,
                envelope_digest_sha256, envelope, delivery_state,
@@ -408,7 +714,56 @@ impl AdapterEdge {
                 now_seconds
             ],
         )?;
+        if let Some(binding) = envelope.route_binding.as_ref() {
+            transaction.execute(
+                "INSERT INTO adapter_dispatch_route_bindings(
+                   dispatch_id, route_binding_digest_sha256, route_binding, created_at_seconds
+                 ) VALUES(?1, ?2, ?3, ?4)",
+                params![
+                    envelope.dispatch_id,
+                    binding.route_binding_sha256,
+                    binding.encode_to_vec(),
+                    now_seconds
+                ],
+            )?;
+        }
+        transaction.commit()?;
         Ok(DispatchPreparation::Ready)
+    }
+
+    pub fn dispatch_route_binding(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<DispatchRouteBinding>, AdapterEdgeError> {
+        let encoded: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT route_binding FROM adapter_dispatch_route_bindings WHERE dispatch_id = ?1",
+                [dispatch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        encoded
+            .map(|value| DispatchRouteBinding::decode(value.as_slice()).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn delivered_dispatch_receipt(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<DispatchReceipt>, AdapterEdgeError> {
+        let encoded: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT receipt FROM adapter_dispatches
+                 WHERE dispatch_id = ?1 AND delivery_state = 'delivered' AND receipt IS NOT NULL",
+                [dispatch_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        encoded
+            .map(|value| DispatchReceipt::decode(value.as_slice()).map_err(Into::into))
+            .transpose()
     }
 
     pub fn begin_delivery(
@@ -533,6 +888,37 @@ impl AdapterEdge {
         }
     }
 
+    pub fn dispatch_task_lineage(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<DispatchTaskLineage>, AdapterEdgeError> {
+        let value: Option<(String, i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT task_id, task_revision, work_revision
+                 FROM adapter_dispatch_task_lineage WHERE dispatch_id = ?1",
+                [dispatch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        value
+            .map(|(task_id, task_revision, work_revision)| {
+                let task_revision =
+                    u64::try_from(task_revision).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+                let work_revision =
+                    u64::try_from(work_revision).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+                if task_id.trim().is_empty() || task_revision == 0 || work_revision == 0 {
+                    return Err(AdapterEdgeError::IntegrityFailure);
+                }
+                Ok(DispatchTaskLineage {
+                    task_id,
+                    task_revision,
+                    work_revision,
+                })
+            })
+            .transpose()
+    }
+
     pub fn append_observation_with_terminal_output(
         &mut self,
         dispatch_id: &str,
@@ -543,6 +929,24 @@ impl AdapterEdge {
         now_seconds: i64,
     ) -> Result<ObservationAppend, AdapterEdgeError> {
         let digest = sha256(raw_event);
+        let content_signal = match observation.payload.as_ref() {
+            Some(harness_observation::Payload::ContentSignal(signal)) => {
+                let candidate = signal
+                    .candidate
+                    .as_ref()
+                    .ok_or(AdapterEdgeError::IntegrityFailure)?;
+                if signal.content_event_id.trim().is_empty()
+                    || !is_sha256(&signal.delivered_receipt_digest_sha256)
+                    || !is_sha256(&signal.dispatch_route_binding_sha256)
+                    || !is_sha256(&candidate.candidate_digest_sha256)
+                    || signal.context_consumption_proof.is_none()
+                {
+                    return Err(AdapterEdgeError::IntegrityFailure);
+                }
+                Some(signal.clone())
+            }
+            _ => None,
+        };
         if terminal_output.is_some_and(|candidate| {
             candidate.dispatch_id != dispatch_id
                 || candidate.native_completion_ref.trim().is_empty()
@@ -572,6 +976,14 @@ impl AdapterEdge {
             .optional()?;
         if let Some((prior_digest, prior_observation)) = existing {
             if prior_digest == digest {
+                if let Some(signal) = content_signal.as_ref() {
+                    let prior = HarnessObservation::decode(prior_observation.as_slice())?;
+                    if prior.payload.as_ref()
+                        != Some(&harness_observation::Payload::ContentSignal(signal.clone()))
+                    {
+                        return Err(AdapterEdgeError::SequenceConflict);
+                    }
+                }
                 if let Some(candidate) = terminal_output {
                     let prior_candidate_digest: Option<String> = transaction
                         .query_row(
@@ -666,6 +1078,27 @@ impl AdapterEdge {
                 now_seconds
             ],
         )?;
+        if let Some(signal) = content_signal.as_ref() {
+            let candidate = signal
+                .candidate
+                .as_ref()
+                .expect("validated content signal has candidate");
+            transaction.execute(
+                "INSERT INTO adapter_content_candidates(
+                   content_event_id, source_observation_id, dispatch_id,
+                   candidate_digest_sha256, content_signal, projection_state,
+                   created_at_seconds
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+                params![
+                    signal.content_event_id,
+                    observation_id,
+                    dispatch_id,
+                    candidate.candidate_digest_sha256,
+                    signal.encode_to_vec(),
+                    now_seconds
+                ],
+            )?;
+        }
         if is_approval {
             let projection_payload = approval_projection
                 .as_ref()
@@ -723,6 +1156,1109 @@ impl AdapterEdge {
         Ok(ObservationAppend::Committed(observation))
     }
 
+    pub fn pending_content_candidates(
+        &self,
+    ) -> Result<Vec<PendingContentCandidate>, AdapterEdgeError> {
+        let mut statement = self.connection.prepare(
+            "SELECT o.observation, c.content_signal
+             FROM adapter_content_candidates c
+             JOIN adapter_observations o ON o.observation_id = c.source_observation_id
+             WHERE c.projection_state = 'pending'
+             ORDER BY o.observation_sequence",
+        )?;
+        let encoded = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        encoded
+            .into_iter()
+            .map(|(observation, signal)| {
+                Ok(PendingContentCandidate {
+                    observation: HarnessObservation::decode(observation.as_slice())?,
+                    signal: HarnessContentSignalObservation::decode(signal.as_slice())?,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn settle_replayed_content_candidate(
+        &mut self,
+        content_event_id: &str,
+        now_seconds: i64,
+    ) -> Result<(), AdapterEdgeError> {
+        if self.connection.execute(
+            "UPDATE adapter_content_candidates
+             SET projection_state = 'projected', projected_at_seconds = ?1
+             WHERE content_event_id = ?2 AND projection_state = 'pending'",
+            params![now_seconds, content_event_id],
+        )? == 1
+        {
+            Ok(())
+        } else {
+            Err(AdapterEdgeError::SequenceConflict)
+        }
+    }
+
+    pub(crate) fn content_scope_limit_kind(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<HarnessContentLimitKind>, AdapterEdgeError> {
+        if task_id.trim().is_empty() || attempt_id.trim().is_empty() {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let (attempt, task) =
+            verified_content_budgets_from_owner_history(&transaction, task_id, attempt_id)?;
+        transaction.commit()?;
+        Ok(winning_limit_kind([
+            task.terminal_kind,
+            attempt.terminal_kind,
+        ]))
+    }
+
+    pub(crate) fn settle_limited_content_candidate(
+        &mut self,
+        content_event_id: &str,
+        candidate_digest_sha256: &str,
+        limit_kind: HarnessContentLimitKind,
+        now_seconds: i64,
+    ) -> Result<(), AdapterEdgeError> {
+        if content_event_id.trim().is_empty()
+            || !is_sha256(candidate_digest_sha256)
+            || limit_kind == HarnessContentLimitKind::Unspecified
+        {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        let mut bytes = Vec::new();
+        frame_bytes(
+            &mut bytes,
+            b"egopulse/harness-content/suppressed-candidate/v1",
+        );
+        frame_bytes(&mut bytes, content_event_id.as_bytes());
+        frame_bytes(&mut bytes, candidate_digest_sha256.as_bytes());
+        let projection_digest = sha256(&bytes);
+        let empty_digest = committed_records_digest(&[]);
+        let changed = self.connection.execute(
+            "UPDATE adapter_content_candidates
+             SET projection_state = 'projected', safe_projection_digest_sha256 = ?1,
+                 committed_records_digest_sha256 = ?2, limit_kind = ?3,
+                 projected_at_seconds = ?4
+             WHERE content_event_id = ?5 AND candidate_digest_sha256 = ?6
+               AND projection_state = 'pending'",
+            params![
+                projection_digest,
+                empty_digest,
+                limit_kind_name(limit_kind),
+                now_seconds,
+                content_event_id,
+                candidate_digest_sha256,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(AdapterEdgeError::SequenceConflict);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn quarantine_content_candidate(
+        &mut self,
+        content_event_id: &str,
+        reason_code: &'static str,
+        now_seconds: i64,
+    ) -> Result<(), AdapterEdgeError> {
+        if self.connection.execute(
+            "UPDATE adapter_content_candidates
+             SET projection_state = 'quarantined', quarantine_reason_code = ?1,
+                 projected_at_seconds = ?2
+             WHERE content_event_id = ?3 AND projection_state = 'pending'",
+            params![reason_code, now_seconds, content_event_id],
+        )? == 1
+        {
+            Ok(())
+        } else {
+            Err(AdapterEdgeError::SequenceConflict)
+        }
+    }
+
+    /// Binds the ephemeral managed-credential variant set to the first safe
+    /// projection for a dispatch. Only the keyed commitment is persisted.
+    /// A later profile/credential mismatch permanently narrows the remaining
+    /// dispatch projection to structured-only without rewriting safe records.
+    pub fn verify_or_bind_content_disclosure(
+        &mut self,
+        dispatch_id: &str,
+        managed_credentials: Option<&[String]>,
+        now_seconds: i64,
+    ) -> Result<ContentDisclosureMode, AdapterEdgeError> {
+        if dispatch_id.trim().is_empty() {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        let variants =
+            managed_credentials.and_then(|values| canonical_credential_variants(values).ok());
+        let commitment = variants
+            .as_ref()
+            .map(|variants| {
+                let mut input = Vec::new();
+                frame_bytes(&mut input, b"egopulse/harness-content/credential-set/v1");
+                frame_bytes(&mut input, &(variants.len() as u64).to_le_bytes());
+                for variant in variants {
+                    frame_bytes(&mut input, variant.as_bytes());
+                }
+                hmac_sha256_bytes(&self.content_commitment_key, &input).map(hex::encode)
+            })
+            .transpose()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let dispatch_exists: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM adapter_dispatches d
+               JOIN adapter_dispatch_route_bindings r ON r.dispatch_id = d.dispatch_id
+               WHERE d.dispatch_id = ?1
+             )",
+            [dispatch_id],
+            |row| row.get(0),
+        )?;
+        if !dispatch_exists {
+            return Err(AdapterEdgeError::DispatchNotFound(dispatch_id.to_owned()));
+        }
+        let existing: Option<(String, Option<String>, bool)> = transaction
+            .query_row(
+                "SELECT disclosure_profile_digest_sha256,
+                        credential_commitment_hmac_sha256, structured_only
+                 FROM adapter_content_redaction_bindings WHERE dispatch_id = ?1",
+                [dispatch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let mode = match existing {
+            None => {
+                let structured_only = commitment.is_none();
+                transaction.execute(
+                    "INSERT INTO adapter_content_redaction_bindings(
+                       dispatch_id, disclosure_profile_digest_sha256,
+                       credential_commitment_hmac_sha256, structured_only,
+                       created_at_seconds, updated_at_seconds
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?5)",
+                    params![
+                        dispatch_id,
+                        HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256,
+                        commitment,
+                        structured_only,
+                        now_seconds
+                    ],
+                )?;
+                if structured_only {
+                    ContentDisclosureMode::StructuredOnly
+                } else {
+                    ContentDisclosureMode::Full
+                }
+            }
+            Some((profile, stored_commitment, already_structured_only)) => {
+                let exact = profile == HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256
+                    && stored_commitment == commitment
+                    && commitment.is_some();
+                if already_structured_only || !exact {
+                    transaction.execute(
+                        "UPDATE adapter_content_redaction_bindings
+                         SET structured_only = 1, updated_at_seconds = ?1
+                         WHERE dispatch_id = ?2",
+                        params![now_seconds, dispatch_id],
+                    )?;
+                    ContentDisclosureMode::StructuredOnly
+                } else {
+                    ContentDisclosureMode::Full
+                }
+            }
+        };
+        transaction.commit()?;
+        Ok(mode)
+    }
+
+    pub fn commit_safe_content_projection(
+        &mut self,
+        projection: &SafeContentProjection,
+        now_seconds: i64,
+    ) -> Result<SafeContentCommit, AdapterEdgeError> {
+        let source_records = projection.records();
+        let Some(first_record) = source_records.first() else {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        };
+        for (expected_part, record) in source_records.iter().enumerate() {
+            if record.record_id.trim().is_empty()
+                || record.content_event_id.trim().is_empty()
+                || record.task_id.trim().is_empty()
+                || record.attempt_id.trim().is_empty()
+                || record.content_event_id != first_record.content_event_id
+                || record.task_id != first_record.task_id
+                || record.attempt_id != first_record.attempt_id
+                || record.dispatch_id != first_record.dispatch_id
+                || !projection_record_position_is_valid(record, expected_part, source_records.len())
+                || safe_record_text_bytes(record) > CONTENT_SAFE_PART_BYTES as u64
+                || !is_sha256(&record.record_digest_sha256)
+                || canonical_safe_record_digest(record).as_deref()
+                    != Some(record.record_digest_sha256.as_str())
+                || record
+                    .disclosure_profile_ref
+                    .as_ref()
+                    .is_none_or(|profile| {
+                        profile.sha256 != HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256
+                    })
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+        }
+        let input_digest = safe_projection_input_digest(projection);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidate_state: Option<StoredContentCandidateState> = transaction
+            .query_row(
+                "SELECT projection_state, safe_projection_digest_sha256,
+                            committed_records_digest_sha256, limit_kind
+                     FROM adapter_content_candidates WHERE content_event_id = ?1",
+                [&first_record.content_event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((candidate_state, stored_input_digest, stored_records_digest, stored_limit_kind)) =
+            candidate_state
+        else {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        };
+        if candidate_state == "projected" {
+            if stored_input_digest.as_deref() != Some(input_digest.as_str())
+                || stored_records_digest
+                    .as_deref()
+                    .is_none_or(|digest| !is_sha256(digest))
+            {
+                return Err(AdapterEdgeError::SequenceConflict);
+            }
+            let existing = {
+                let mut statement = transaction.prepare(
+                    "SELECT part_index, safe_record, content_sequence
+                     FROM adapter_safe_content_ledger WHERE content_event_id = ?1
+                     ORDER BY part_index",
+                )?;
+                statement
+                    .query_map([&first_record.content_event_id], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let mut replay_records = Vec::with_capacity(existing.len());
+            for (expected_part, (part_index, bytes, _)) in existing.iter().enumerate() {
+                let record = SafeHarnessContentRecord::decode(bytes.as_slice())?;
+                if *part_index != expected_part as i64
+                    || !projection_record_position_is_valid(&record, expected_part, existing.len())
+                    || canonical_safe_record_digest(&record).as_deref()
+                        != Some(record.record_digest_sha256.as_str())
+                {
+                    return Err(AdapterEdgeError::IntegrityFailure);
+                }
+                replay_records.push(record);
+            }
+            let stored_limit_kind = decode_stored_limit_kind(stored_limit_kind.as_deref())?;
+            if stored_records_digest.as_deref()
+                != Some(committed_records_digest(&replay_records).as_str())
+                || (!replay_records.is_empty()
+                    && stored_limit_kind != committed_limit_kind(&replay_records)?)
+                || !assembly_checkpoint_matches(
+                    &transaction,
+                    &first_record.dispatch_id,
+                    projection.checkpoint.as_ref(),
+                    &replay_records,
+                )?
+            {
+                return Err(AdapterEdgeError::SequenceConflict);
+            }
+            if replay_records.is_empty() {
+                if stored_limit_kind.is_none() {
+                    return Err(AdapterEdgeError::IntegrityFailure);
+                }
+                transaction.commit()?;
+                return Ok(SafeContentCommit::Suppressed {
+                    content_event_id: first_record.content_event_id.clone(),
+                });
+            }
+            let first_sequence =
+                u64::try_from(existing[0].2).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            let last_sequence = u64::try_from(existing[existing.len() - 1].2)
+                .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            transaction.commit()?;
+            return Ok(SafeContentCommit::Replay {
+                records: replay_records,
+                first_sequence,
+                last_sequence,
+            });
+        }
+        if candidate_state != "pending"
+            || stored_input_digest.is_some()
+            || stored_records_digest.is_some()
+            || stored_limit_kind.is_some()
+        {
+            return Err(AdapterEdgeError::SequenceConflict);
+        }
+        let (attempt_budget, task_budget) = verified_content_budgets_from_owner_history(
+            &transaction,
+            &first_record.task_id,
+            &first_record.attempt_id,
+        )?;
+        let admission = admit_content_records(
+            source_records,
+            attempt_budget,
+            task_budget,
+            CONTENT_BUDGET_LIMITS,
+        )?;
+        let committed_digest = committed_records_digest(&admission.records);
+        if admission.records.is_empty() {
+            let changed = transaction.execute(
+                "UPDATE adapter_content_candidates
+                 SET projection_state = 'projected', safe_projection_digest_sha256 = ?1,
+                     committed_records_digest_sha256 = ?2, limit_kind = ?3,
+                     projected_at_seconds = ?4
+                 WHERE content_event_id = ?5 AND projection_state = 'pending'",
+                params![
+                    input_digest,
+                    committed_digest,
+                    admission.limit_kind.map(limit_kind_name),
+                    now_seconds,
+                    first_record.content_event_id,
+                ],
+            )?;
+            if changed != 1 || admission.limit_kind.is_none() {
+                return Err(AdapterEdgeError::SequenceConflict);
+            }
+            transaction.commit()?;
+            return Ok(SafeContentCommit::Suppressed {
+                content_event_id: first_record.content_event_id.clone(),
+            });
+        }
+        let records = admission.records;
+        let mut encoded = Vec::with_capacity(records.len());
+        for (expected_part, record) in records.iter().enumerate() {
+            if !projection_record_position_is_valid(record, expected_part, records.len())
+                || canonical_safe_record_digest(record).as_deref()
+                    != Some(record.record_digest_sha256.as_str())
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+            encoded.push(record.encode_to_vec());
+        }
+        let first_sequence: i64 = transaction.query_row(
+            "SELECT next_content_sequence FROM adapter_edge_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut sequenced = Vec::with_capacity(records.len());
+        for (index, (record, encoded)) in records.iter().zip(encoded).enumerate() {
+            let sequence = first_sequence
+                .checked_add(i64::try_from(index).map_err(|_| AdapterEdgeError::IntegrityFailure)?)
+                .ok_or(AdapterEdgeError::IntegrityFailure)?;
+            let event = SafeHarnessContentProjectionEvent {
+                payload: Some(
+                    egopulse_domain_contracts::v01::egopulse::harness::v1::safe_harness_content_projection_event::Payload::ContentRecord(
+                        record.clone(),
+                    ),
+                ),
+            };
+            let event_bytes = event.encode_to_vec();
+            transaction.execute(
+                "INSERT INTO adapter_safe_content_ledger(
+                   record_id, content_event_id, part_index, task_id, record_digest_sha256,
+                   content_sequence, safe_record, created_at_seconds
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    record.record_id,
+                    record.content_event_id,
+                    i64::try_from(index).map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+                    record.task_id,
+                    record.record_digest_sha256,
+                    sequence,
+                    encoded,
+                    now_seconds
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO adapter_content_projection_outbox(
+                   message_id, source_record_id, source_revision, payload_digest_sha256,
+                   payload, delivery_state, created_at_seconds
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+                params![
+                    format!("adapter-content-{}", record.record_id),
+                    record.record_id,
+                    sequence,
+                    sha256(&event_bytes),
+                    event_bytes,
+                    now_seconds
+                ],
+            )?;
+            sequenced.push((sequence, record));
+        }
+        let changed = transaction.execute(
+            "UPDATE adapter_content_candidates
+             SET projection_state = 'projected', safe_projection_digest_sha256 = ?1,
+                 committed_records_digest_sha256 = ?2, limit_kind = ?3,
+                 projected_at_seconds = ?4
+             WHERE content_event_id = ?5 AND projection_state = 'pending'",
+            params![
+                input_digest,
+                committed_digest,
+                admission.limit_kind.map(limit_kind_name),
+                now_seconds,
+                first_record.content_event_id,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(AdapterEdgeError::SequenceConflict);
+        }
+        upsert_content_assembly_checkpoint(
+            &transaction,
+            projection.checkpoint.as_ref(),
+            &records,
+            now_seconds,
+        )?;
+        update_content_owner_metadata(
+            &transaction,
+            &first_record.task_id,
+            &sequenced,
+            now_seconds,
+        )?;
+        let record_count_u64 = records.len() as u64;
+        update_content_budget(
+            &transaction,
+            ContentBudgetUpdate {
+                scope_kind: "attempt",
+                scope_id: &first_record.attempt_id,
+                previous: attempt_budget,
+                added_text_bytes: admission.text_bytes,
+                added_records: record_count_u64,
+                terminal_kind: admission.attempt_terminal_kind,
+            },
+            now_seconds,
+        )?;
+        update_content_budget(
+            &transaction,
+            ContentBudgetUpdate {
+                scope_kind: "task",
+                scope_id: &first_record.task_id,
+                previous: task_budget,
+                added_text_bytes: admission.text_bytes,
+                added_records: record_count_u64,
+                terminal_kind: admission.task_terminal_kind,
+            },
+            now_seconds,
+        )?;
+        let record_count =
+            i64::try_from(records.len()).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+        transaction.execute(
+            "UPDATE adapter_edge_metadata
+             SET next_content_sequence = next_content_sequence + ?1 WHERE singleton = 1",
+            [record_count],
+        )?;
+        let last_sequence = first_sequence
+            .checked_add(record_count - 1)
+            .ok_or(AdapterEdgeError::IntegrityFailure)?;
+        transaction.commit()?;
+        Ok(SafeContentCommit::Committed {
+            records,
+            first_sequence: u64::try_from(first_sequence)
+                .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+            last_sequence: u64::try_from(last_sequence)
+                .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+        })
+    }
+
+    pub fn pending_safe_content_projection(
+        &self,
+    ) -> Result<Vec<SafeContentProjectionMessage>, AdapterEdgeError> {
+        self.safe_content_projection_messages(false)
+    }
+
+    pub fn safe_content_budget_snapshot(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> Result<SafeContentBudgetSnapshot, AdapterEdgeError> {
+        if task_id.trim().is_empty() || attempt_id.trim().is_empty() {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let attempt = load_content_budget(&transaction, "attempt", attempt_id)?;
+        let task = load_content_budget(&transaction, "task", task_id)?;
+        transaction.commit()?;
+        Ok(SafeContentBudgetSnapshot {
+            attempt: attempt.into(),
+            task: task.into(),
+        })
+    }
+
+    /// Returns both pending and acknowledged safe events for Local Read Model
+    /// rebuild. The bytes come only from the Adapter-owned safe outbox and do
+    /// not revisit raw candidates or the current redaction configuration.
+    pub fn retained_safe_content_projection_for_rebuild(
+        &self,
+    ) -> Result<Vec<SafeContentProjectionMessage>, AdapterEdgeError> {
+        self.safe_content_projection_messages(true)
+    }
+
+    fn safe_content_projection_messages(
+        &self,
+        include_consumed: bool,
+    ) -> Result<Vec<SafeContentProjectionMessage>, AdapterEdgeError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut statement = transaction.prepare(
+            "SELECT message_id, source_record_id, source_revision, payload_digest_sha256, payload
+             FROM adapter_content_projection_outbox
+             WHERE ((?1 = 0 AND delivery_state = 'pending')
+                OR (?1 = 1 AND delivery_state IN ('pending', 'consumed')))
+             ORDER BY source_revision",
+        )?;
+        let rows = statement
+            .query_map([i64::from(include_consumed)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let messages = rows
+            .into_iter()
+            .map(
+                |(
+                    message_id,
+                    source_record_id,
+                    source_revision,
+                    payload_digest_sha256,
+                    payload,
+                )| {
+                    let source_revision = u64::try_from(source_revision)
+                        .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+                    let event = validate_safe_projection_outbox_payload(
+                        &transaction,
+                        &message_id,
+                        &source_record_id,
+                        source_revision,
+                        &payload_digest_sha256,
+                        &payload,
+                    )?;
+                    Ok(SafeContentProjectionMessage {
+                        message_id,
+                        source_revision,
+                        payload_digest_sha256,
+                        event,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, AdapterEdgeError>>()?;
+        transaction.commit()?;
+        Ok(messages)
+    }
+
+    pub fn acknowledge_safe_content_projection(
+        &mut self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, AdapterEdgeError> {
+        if message_id.trim().is_empty() || !is_sha256(payload_digest_sha256) {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, i64, String, Vec<u8>, String)> = transaction
+            .query_row(
+                "SELECT source_record_id, source_revision, payload_digest_sha256, payload,
+                        delivery_state
+                 FROM adapter_content_projection_outbox WHERE message_id = ?1",
+                [message_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((source_record_id, source_revision, stored_digest, payload, state)) = row else {
+            return Err(AdapterEdgeError::SequenceConflict);
+        };
+        let source_revision =
+            u64::try_from(source_revision).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+        validate_safe_projection_outbox_payload(
+            &transaction,
+            message_id,
+            &source_record_id,
+            source_revision,
+            &stored_digest,
+            &payload,
+        )?;
+        if stored_digest != payload_digest_sha256 {
+            return Err(AdapterEdgeError::SequenceConflict);
+        }
+        if state == "consumed" {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        if state != "pending" {
+            return Err(AdapterEdgeError::SequenceConflict);
+        }
+        let changed = transaction.execute(
+            "UPDATE adapter_content_projection_outbox SET delivery_state = 'consumed'
+             WHERE message_id = ?1 AND payload_digest_sha256 = ?2
+                AND delivery_state = 'pending'",
+            params![message_id, payload_digest_sha256],
+        )?;
+        if changed != 1 {
+            return Err(AdapterEdgeError::SequenceConflict);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn content_assembly_checkpoint(
+        &self,
+        dispatch_id: &str,
+        message_id: &str,
+    ) -> Result<Option<SafeContentAssemblyCheckpoint>, AdapterEdgeError> {
+        let value: Option<(i64, bool, String, String, Vec<u8>)> = self
+            .connection
+            .query_row(
+                "SELECT current_revision, finalized, raw_cumulative_digest_sha256,
+                        safe_cumulative_digest_sha256, assembly_state
+                 FROM adapter_content_assemblies
+                 WHERE dispatch_id = ?1 AND message_id = ?2",
+                params![dispatch_id, message_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        value
+            .map(|(revision, finalized, raw_digest, safe_digest, bytes)| {
+                let (checkpoint, safe_records) = decode_assembly_state(&bytes)?;
+                let revision =
+                    u64::try_from(revision).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+                let valid = revision > 0
+                    && is_sha256(&raw_digest)
+                    && is_sha256(&safe_digest)
+                    && checkpoint.message_id == message_id
+                    && checkpoint.current_revision == revision
+                    && checkpoint.finalized == finalized
+                    && checkpoint.raw_cumulative_digest_sha256 == raw_digest
+                    && checkpoint.safe_cumulative_digest_sha256 == safe_digest
+                    && safe_records
+                        .iter()
+                        .all(|record| record.dispatch_id == dispatch_id);
+                if !valid {
+                    return Err(AdapterEdgeError::IntegrityFailure);
+                }
+                Ok(SafeContentAssemblyCheckpoint {
+                    dispatch_id: dispatch_id.to_owned(),
+                    message_id: message_id.to_owned(),
+                    current_revision: revision,
+                    finalized,
+                    raw_cumulative_digest_sha256: raw_digest,
+                    safe_cumulative_digest_sha256: safe_digest,
+                    safe_records,
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn content_projection_checkpoint(
+        &self,
+        dispatch_id: &str,
+        signal: &HarnessContentSignalObservation,
+    ) -> Result<Option<ContentAssemblyCheckpoint>, AdapterEdgeError> {
+        let Some(
+            egopulse_domain_contracts::v01::egopulse::harness::v1::user_visible_content_candidate::Payload::AssistantText(
+                assistant,
+            ),
+        ) = signal.candidate.as_ref().and_then(|candidate| candidate.payload.as_ref())
+        else {
+            return Ok(None);
+        };
+        let bytes: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT assembly_state FROM adapter_content_assemblies
+                 WHERE dispatch_id = ?1 AND message_id = ?2",
+                params![dispatch_id, assistant.message_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        bytes
+            .map(|bytes| decode_assembly_state(&bytes).map(|(checkpoint, _)| checkpoint))
+            .transpose()
+    }
+
+    pub fn content_owner_snapshot(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<SafeContentOwnerSnapshot>, AdapterEdgeError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let snapshot = load_content_owner_snapshot(&transaction, task_id)?;
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
+    /// Atomically installs an Adapter-owned terminal baseline, advances the
+    /// history floor, deletes the compacted ledger/outbox range, and emits the
+    /// typed compaction and tombstone events. Scheduling and terminal
+    /// eligibility discovery remain the caller's responsibility.
+    pub fn compact_terminal_safe_content(
+        &mut self,
+        request: &ContentRetentionCompactionRequest,
+    ) -> Result<ContentRetentionCompactionReceipt, AdapterEdgeError> {
+        if request.task_id.trim().is_empty()
+            || request.attempt_id.trim().is_empty()
+            || request.final_epoch.trim().is_empty()
+            || request.expected_owner_sequence == 0
+            || !valid_timestamp(Some(&request.terminal_committed_at))
+            || !valid_timestamp(Some(&request.compacted_at))
+        {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        let eligible_seconds = request
+            .terminal_committed_at
+            .seconds
+            .checked_add(CONTENT_MINIMUM_RETENTION_SECONDS)
+            .ok_or(AdapterEdgeError::IntegrityFailure)?;
+        if request.compacted_at.seconds < eligible_seconds
+            || (request.compacted_at.seconds == eligible_seconds
+                && request.compacted_at.nanos < request.terminal_committed_at.nanos)
+        {
+            return Err(AdapterEdgeError::SequenceConflict);
+        }
+        let compaction_id = history_compaction_id(
+            &request.task_id,
+            &request.attempt_id,
+            &request.final_epoch,
+            request.expected_owner_sequence,
+        );
+        let tombstone_id = retention_tombstone_id(
+            &request.task_id,
+            &request.attempt_id,
+            &request.final_epoch,
+            request.expected_owner_sequence,
+        );
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let existing_tombstone: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT tombstone FROM adapter_content_retention_tombstones
+                 WHERE tombstone_id = ?1",
+                [&tombstone_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let existing_compaction: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT payload FROM adapter_content_projection_outbox
+                 WHERE source_record_id = ?1",
+                [&compaction_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing_tombstone.is_some() || existing_compaction.is_some() {
+            let (Some(tombstone_bytes), Some(compaction_bytes)) =
+                (existing_tombstone, existing_compaction)
+            else {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            };
+            let tombstone = HarnessContentRetentionTombstone::decode(tombstone_bytes.as_slice())?;
+            let compaction_event =
+                SafeHarnessContentProjectionEvent::decode(compaction_bytes.as_slice())?;
+            let Some(safe_harness_content_projection_event::Payload::HistoryCompaction(compaction)) =
+                compaction_event.payload
+            else {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            };
+            if canonical_retention_tombstone_digest(&tombstone).as_deref()
+                != Some(tombstone.tombstone_digest_sha256.as_str())
+                || canonical_history_compaction_digest(&compaction).as_deref()
+                    != Some(compaction.compaction_record_digest_sha256.as_str())
+                || tombstone.task_id != request.task_id
+                || tombstone.attempt_id != request.attempt_id
+                || tombstone.final_epoch != request.final_epoch
+                || tombstone.final_sequence != request.expected_owner_sequence
+                || tombstone.terminal_committed_at.as_ref() != Some(&request.terminal_committed_at)
+                || tombstone.compacted_at.as_ref() != Some(&request.compacted_at)
+                || compaction.compacted_at.as_ref() != Some(&request.compacted_at)
+            {
+                return Err(AdapterEdgeError::SequenceConflict);
+            }
+            let owner_snapshot = load_content_owner_snapshot(&transaction, &request.task_id)?
+                .ok_or(AdapterEdgeError::IntegrityFailure)?;
+            if owner_snapshot.floor_sequence != request.expected_owner_sequence
+                || owner_snapshot.owner_sequence != request.expected_owner_sequence
+                || owner_snapshot.tombstones != [tombstone.clone()]
+                || !owner_snapshot.records.is_empty()
+                || compaction.owner_snapshot_digest_sha256 != owner_snapshot.snapshot_digest_sha256
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+            transaction.commit()?;
+            return Ok(ContentRetentionCompactionReceipt {
+                owner_snapshot,
+                compaction,
+                tombstone,
+            });
+        }
+
+        let current = load_content_owner_snapshot(&transaction, &request.task_id)?
+            .ok_or(AdapterEdgeError::IntegrityFailure)?;
+        if current.owner_sequence != request.expected_owner_sequence
+            || current.floor_sequence >= request.expected_owner_sequence
+            || current.records.is_empty()
+        {
+            return Err(AdapterEdgeError::SequenceConflict);
+        }
+        let unsettled_outbox: i64 = transaction.query_row(
+            "SELECT count(*) FROM adapter_content_projection_outbox o
+             JOIN adapter_safe_content_ledger l ON l.record_id = o.source_record_id
+             WHERE l.task_id = ?1 AND l.content_sequence <= ?2
+               AND o.delivery_state != 'consumed'",
+            params![
+                request.task_id,
+                i64::try_from(request.expected_owner_sequence)
+                    .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+            ],
+            |row| row.get(0),
+        )?;
+        if unsettled_outbox != 0 {
+            return Err(AdapterEdgeError::SequenceConflict);
+        }
+
+        let final_safe_content_digest_sha256 = current.snapshot_digest_sha256.clone();
+        let mut tombstone = HarnessContentRetentionTombstone {
+            tombstone_id,
+            tombstone_digest_sha256: String::new(),
+            task_id: request.task_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            final_epoch: request.final_epoch.clone(),
+            final_sequence: request.expected_owner_sequence,
+            final_safe_content_digest_sha256: final_safe_content_digest_sha256.clone(),
+            disclosure_profile_ref: Some(disclosure_profile_reference()),
+            terminal_committed_at: Some(request.terminal_committed_at),
+            compacted_at: Some(request.compacted_at),
+            reason: HarnessContentRetentionReason::TerminalMinimumExpired as i32,
+        };
+        tombstone.tombstone_digest_sha256 = canonical_retention_tombstone_digest(&tombstone)
+            .ok_or(AdapterEdgeError::IntegrityFailure)?;
+        let baseline_records = Vec::new();
+        let baseline_tombstones = vec![tombstone.clone()];
+        let baseline_state = encode_content_owner_baseline(&baseline_records, &baseline_tombstones);
+        let owner_snapshot_digest_sha256 = content_owner_snapshot_digest(
+            &request.task_id,
+            request.expected_owner_sequence,
+            request.expected_owner_sequence,
+            &baseline_records,
+            &baseline_tombstones,
+        );
+        let mut compaction = HarnessContentHistoryCompactionRecord {
+            compaction_record_id: compaction_id,
+            compaction_record_digest_sha256: String::new(),
+            task_id: request.task_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            final_epoch: request.final_epoch.clone(),
+            final_sequence: request.expected_owner_sequence,
+            final_safe_content_digest_sha256,
+            owner_snapshot_digest_sha256: owner_snapshot_digest_sha256.clone(),
+            disclosure_profile_ref: Some(disclosure_profile_reference()),
+            compacted_at: Some(request.compacted_at),
+            reason: HarnessContentCompactionReason::OwnerHistoryFloorAdvanced as i32,
+        };
+        compaction.compaction_record_digest_sha256 =
+            canonical_history_compaction_digest(&compaction)
+                .ok_or(AdapterEdgeError::IntegrityFailure)?;
+
+        let owner_changed = transaction.execute(
+            "UPDATE adapter_content_owner_snapshots
+             SET owner_sequence = ?1, floor_sequence = ?1, baseline_state = ?2,
+                 baseline_digest_sha256 = ?3, snapshot_digest_sha256 = ?3,
+                 updated_at_seconds = ?4
+             WHERE task_id = ?5 AND owner_sequence = ?1 AND floor_sequence = ?6
+               AND snapshot_digest_sha256 = ?7",
+            params![
+                i64::try_from(request.expected_owner_sequence)
+                    .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+                baseline_state,
+                owner_snapshot_digest_sha256,
+                request.compacted_at.seconds,
+                request.task_id,
+                i64::try_from(current.floor_sequence)
+                    .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+                current.snapshot_digest_sha256,
+            ],
+        )?;
+        let floor_changed = transaction.execute(
+            "UPDATE adapter_content_history_floors
+             SET floor_sequence = ?1, floor_digest_sha256 = ?2, updated_at_seconds = ?3
+             WHERE task_id = ?4 AND floor_sequence = ?5",
+            params![
+                i64::try_from(request.expected_owner_sequence)
+                    .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+                content_floor_digest(&request.task_id, request.expected_owner_sequence),
+                request.compacted_at.seconds,
+                request.task_id,
+                i64::try_from(current.floor_sequence)
+                    .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+            ],
+        )?;
+        if owner_changed != 1 || floor_changed != 1 {
+            return Err(AdapterEdgeError::SequenceConflict);
+        }
+        transaction.execute(
+            "INSERT INTO adapter_content_retention_tombstones(
+               tombstone_id, task_id, tombstone_digest_sha256, tombstone, created_at_seconds
+             ) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![
+                tombstone.tombstone_id,
+                request.task_id,
+                tombstone.tombstone_digest_sha256,
+                tombstone.encode_to_vec(),
+                request.compacted_at.seconds,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM adapter_content_projection_outbox
+             WHERE source_record_id IN (
+               SELECT record_id FROM adapter_safe_content_ledger
+               WHERE task_id = ?1 AND content_sequence <= ?2
+             )",
+            params![
+                request.task_id,
+                i64::try_from(request.expected_owner_sequence)
+                    .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM adapter_safe_content_ledger
+             WHERE task_id = ?1 AND content_sequence <= ?2",
+            params![
+                request.task_id,
+                i64::try_from(request.expected_owner_sequence)
+                    .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM adapter_content_assemblies
+             WHERE dispatch_id IN (
+               SELECT dispatch_id FROM adapter_dispatch_task_lineage WHERE task_id = ?1
+             )",
+            [&request.task_id],
+        )?;
+
+        let first_event_sequence: i64 = transaction.query_row(
+            "SELECT next_content_sequence FROM adapter_edge_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let events = [
+            (
+                compaction.compaction_record_id.as_str(),
+                SafeHarnessContentProjectionEvent {
+                    payload: Some(
+                        safe_harness_content_projection_event::Payload::HistoryCompaction(
+                            compaction.clone(),
+                        ),
+                    ),
+                },
+            ),
+            (
+                tombstone.tombstone_id.as_str(),
+                SafeHarnessContentProjectionEvent {
+                    payload: Some(
+                        safe_harness_content_projection_event::Payload::RetentionTombstone(
+                            tombstone.clone(),
+                        ),
+                    ),
+                },
+            ),
+        ];
+        for (index, (source_record_id, event)) in events.iter().enumerate() {
+            let source_revision = first_event_sequence
+                .checked_add(i64::try_from(index).map_err(|_| AdapterEdgeError::IntegrityFailure)?)
+                .ok_or(AdapterEdgeError::IntegrityFailure)?;
+            let payload = event.encode_to_vec();
+            transaction.execute(
+                "INSERT INTO adapter_content_projection_outbox(
+                   message_id, source_record_id, source_revision, payload_digest_sha256,
+                   payload, delivery_state, created_at_seconds
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+                params![
+                    format!("adapter-content-{source_record_id}"),
+                    source_record_id,
+                    source_revision,
+                    sha256(&payload),
+                    payload,
+                    request.compacted_at.seconds,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE adapter_edge_metadata
+             SET next_content_sequence = next_content_sequence + 2 WHERE singleton = 1",
+            [],
+        )?;
+        let owner_snapshot = SafeContentOwnerSnapshot {
+            task_id: request.task_id.clone(),
+            owner_sequence: request.expected_owner_sequence,
+            floor_sequence: request.expected_owner_sequence,
+            disclosure_profile_digest_sha256: HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256
+                .to_owned(),
+            snapshot_digest_sha256: owner_snapshot_digest_sha256,
+            records: baseline_records,
+            tombstones: baseline_tombstones,
+        };
+        transaction.commit()?;
+        Ok(ContentRetentionCompactionReceipt {
+            owner_snapshot,
+            compaction,
+            tombstone,
+        })
+    }
+
+    pub fn retained_safe_content_for_rebuild(
+        &self,
+        task_id: &str,
+        after_sequence: u64,
+    ) -> Result<Option<RetainedSafeContent>, AdapterEdgeError> {
+        let Some(mut snapshot) = self.content_owner_snapshot(task_id)? else {
+            return Ok(None);
+        };
+        if after_sequence < snapshot.floor_sequence {
+            return Ok(Some(RetainedSafeContent::ResetRequired(snapshot)));
+        }
+        snapshot
+            .records
+            .retain(|record| record.sequence > after_sequence);
+        Ok(Some(RetainedSafeContent::Records(snapshot)))
+    }
+
     pub fn observations_after(
         &self,
         after_sequence: u64,
@@ -754,6 +2290,97 @@ impl AdapterEdge {
             .into_iter()
             .map(|record| HarnessObservation::decode(record.as_slice()).map_err(Into::into))
             .collect()
+    }
+
+    pub fn normal_observation_recovery_view(
+        &self,
+        dispatch_id: &str,
+        expected_capability_profile_id: &str,
+    ) -> Result<NormalObservationRecoveryView, AdapterEdgeError> {
+        if expected_capability_profile_id.trim().is_empty() {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT observation_id, dispatch_id, attempt_id, fencing_token,
+                    observation_sequence, ingestion_state,
+                    native_event_digest_sha256, raw_evidence_ref, raw_event, observation
+             FROM adapter_observations
+             WHERE dispatch_id = ?1
+               AND instr(native_key, 'reconciliation:') <> 1
+             ORDER BY observation_sequence",
+        )?;
+        let records = statement
+            .query_map([dispatch_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut pending = Vec::new();
+        let mut durable_terminal_sequence = None;
+        for (
+            observation_id,
+            row_dispatch_id,
+            attempt_id,
+            fencing_token,
+            observation_sequence,
+            ingestion_state,
+            native_event_digest_sha256,
+            raw_evidence_ref,
+            raw_event,
+            observation,
+        ) in records
+        {
+            let fencing_token =
+                u64::try_from(fencing_token).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            let observation_sequence = u64::try_from(observation_sequence)
+                .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            let observation = HarnessObservation::decode(observation.as_slice())?;
+            let criticality = ObservationCriticality::try_from(observation.criticality)
+                .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            if observation_id.trim().is_empty()
+                || row_dispatch_id.trim().is_empty()
+                || attempt_id.trim().is_empty()
+                || fencing_token == 0
+                || observation_sequence == 0
+                || row_dispatch_id != dispatch_id
+                || observation.observation_id != observation_id
+                || observation.dispatch_id != row_dispatch_id
+                || observation.attempt_id != attempt_id
+                || observation.fencing_token != fencing_token
+                || observation.observation_sequence != observation_sequence
+                || observation.adapter_id != self.adapter_id
+                || observation.capability_profile_id != expected_capability_profile_id
+                || observation.native_event_digest_sha256 != native_event_digest_sha256
+                || observation.raw_evidence_ref != raw_evidence_ref
+                || sha256(&raw_event) != native_event_digest_sha256
+                || !matches!(ingestion_state.as_str(), "pending" | "consumed")
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+            if criticality == ObservationCriticality::Terminal
+                && durable_terminal_sequence.is_none()
+            {
+                durable_terminal_sequence = Some(observation_sequence);
+            }
+            if ingestion_state == "pending" {
+                pending.push(observation);
+            }
+        }
+        Ok(NormalObservationRecoveryView {
+            pending,
+            durable_terminal_sequence,
+        })
     }
 
     pub fn pending_approval_projection_messages(
@@ -1158,20 +2785,83 @@ impl AdapterEdge {
             .transpose()
     }
 
+    pub(crate) fn stored_delivered_dispatch_evidence(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<StoredDeliveredDispatchEvidence>, AdapterEdgeError> {
+        self.connection
+            .query_row(
+                "SELECT dispatch_id, attempt_id, fencing_token, dispatch_fingerprint,
+                        envelope_digest_sha256, envelope, delivery_state, receipt
+                 FROM adapter_dispatches WHERE dispatch_id = ?1",
+                [dispatch_id],
+                |row| {
+                    let fencing_token = row.get::<_, i64>(2)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        fencing_token,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<Vec<u8>>>(7)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(
+                |(
+                    dispatch_id,
+                    attempt_id,
+                    fencing_token,
+                    dispatch_fingerprint,
+                    envelope_digest_sha256,
+                    envelope,
+                    delivery_state,
+                    receipt,
+                )| {
+                    let fencing_token = u64::try_from(fencing_token)
+                        .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+                    Ok(StoredDeliveredDispatchEvidence {
+                        dispatch_id,
+                        attempt_id,
+                        fencing_token,
+                        dispatch_fingerprint,
+                        envelope_digest_sha256,
+                        envelope,
+                        delivery_state,
+                        receipt,
+                    })
+                },
+            )
+            .transpose()
+    }
+
     pub fn dispatch_envelope(
         &self,
         dispatch_id: &str,
     ) -> Result<Option<DispatchEnvelope>, AdapterEdgeError> {
-        let bytes: Option<Vec<u8>> = self
+        let stored: Option<(Vec<u8>, String)> = self
             .connection
             .query_row(
-                "SELECT envelope FROM adapter_dispatches WHERE dispatch_id = ?1",
+                "SELECT envelope, envelope_digest_sha256
+                 FROM adapter_dispatches WHERE dispatch_id = ?1",
                 [dispatch_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        bytes
-            .map(|value| DispatchEnvelope::decode(value.as_slice()).map_err(Into::into))
+        stored
+            .map(|(value, digest)| {
+                if sha256(&value) != digest {
+                    return Err(AdapterEdgeError::IntegrityFailure);
+                }
+                let envelope = DispatchEnvelope::decode(value.as_slice())?;
+                if envelope.dispatch_id != dispatch_id {
+                    return Err(AdapterEdgeError::IntegrityFailure);
+                }
+                Ok(envelope)
+            })
             .transpose()
     }
 
@@ -1469,6 +3159,11 @@ impl AdapterEdge {
             [],
             |row| row.get(0),
         )?;
+        let next_content: i64 = self.connection.query_row(
+            "SELECT next_content_sequence FROM adapter_edge_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(AdapterEdgeInspection {
             dispatch_count: scalar("SELECT count(*) FROM adapter_dispatches")?,
             delivery_unknown_count: scalar(
@@ -1491,7 +3186,25 @@ impl AdapterEdge {
             pending_terminal_output_count: scalar(
                 "SELECT count(*) FROM adapter_terminal_output_outbox WHERE delivery_state = 'pending'",
             )?,
+            dispatch_route_binding_count: scalar(
+                "SELECT count(*) FROM adapter_dispatch_route_bindings",
+            )?,
+            content_candidate_count: scalar("SELECT count(*) FROM adapter_content_candidates")?,
+            pending_content_candidate_count: scalar(
+                "SELECT count(*) FROM adapter_content_candidates WHERE projection_state = 'pending'",
+            )?,
+            quarantined_content_candidate_count: scalar(
+                "SELECT count(*) FROM adapter_content_candidates WHERE projection_state = 'quarantined'",
+            )?,
+            safe_content_ledger_count: scalar("SELECT count(*) FROM adapter_safe_content_ledger")?,
+            content_projection_outbox_count: scalar(
+                "SELECT count(*) FROM adapter_content_projection_outbox",
+            )?,
+            pending_content_projection_count: scalar(
+                "SELECT count(*) FROM adapter_content_projection_outbox WHERE delivery_state = 'pending'",
+            )?,
             next_observation_sequence: next as u64,
+            next_content_sequence: next_content as u64,
         })
     }
 
@@ -1655,6 +3368,1422 @@ fn record_durable_write(
     }
 }
 
+fn upsert_content_assembly_checkpoint(
+    transaction: &Transaction<'_>,
+    checkpoint: Option<&ContentAssemblyCheckpoint>,
+    records: &[SafeHarnessContentRecord],
+    now_seconds: i64,
+) -> Result<(), AdapterEdgeError> {
+    let Some(checkpoint) = checkpoint else {
+        return Ok(());
+    };
+    let Some(record) = records.first() else {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    };
+    if checkpoint.message_id.trim().is_empty()
+        || checkpoint.current_revision == 0
+        || !is_sha256(&checkpoint.raw_cumulative_digest_sha256)
+        || !is_sha256(&checkpoint.safe_cumulative_digest_sha256)
+    {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    for (index, record) in records.iter().enumerate() {
+        match record.payload.as_ref() {
+            Some(safe_harness_content_record::Payload::AssistantText(safe))
+                if safe.revision == checkpoint.current_revision
+                    && safe.safe_cumulative_digest_sha256
+                        == checkpoint.safe_cumulative_digest_sha256 => {}
+            Some(safe_harness_content_record::Payload::Marker(marker))
+                if index.saturating_add(1) == records.len()
+                    && marker.kind == HarnessContentMarkerKind::LimitReached as i32 => {}
+            _ => return Err(AdapterEdgeError::IntegrityFailure),
+        }
+    }
+    let revision = i64::try_from(checkpoint.current_revision)
+        .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+    let encoded = encode_assembly_state(checkpoint, records);
+    let existing: Option<(i64, String, String, Vec<u8>)> = transaction
+        .query_row(
+            "SELECT current_revision, raw_cumulative_digest_sha256,
+                    safe_cumulative_digest_sha256, assembly_state
+             FROM adapter_content_assemblies
+             WHERE dispatch_id = ?1 AND message_id = ?2",
+            params![record.dispatch_id, checkpoint.message_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    match existing {
+        None if checkpoint.current_revision == 1 => {
+            transaction.execute(
+                "INSERT INTO adapter_content_assemblies(
+                   dispatch_id, message_id, current_revision, finalized,
+                   raw_cumulative_digest_sha256, safe_cumulative_digest_sha256,
+                   credential_commitment_hmac_sha256, assembly_state,
+                   updated_at_seconds
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6,
+                   (SELECT credential_commitment_hmac_sha256
+                    FROM adapter_content_redaction_bindings WHERE dispatch_id = ?1),
+                   ?7, ?8)",
+                params![
+                    record.dispatch_id,
+                    checkpoint.message_id,
+                    revision,
+                    checkpoint.finalized,
+                    checkpoint.raw_cumulative_digest_sha256,
+                    checkpoint.safe_cumulative_digest_sha256,
+                    encoded,
+                    now_seconds
+                ],
+            )?;
+        }
+        Some((current, _, _, _)) if checkpoint.current_revision == current as u64 + 1 => {
+            transaction.execute(
+                "UPDATE adapter_content_assemblies
+                 SET current_revision = ?1, finalized = ?2,
+                     raw_cumulative_digest_sha256 = ?3,
+                     safe_cumulative_digest_sha256 = ?4, assembly_state = ?5,
+                     updated_at_seconds = ?6
+                 WHERE dispatch_id = ?7 AND message_id = ?8 AND current_revision = ?9",
+                params![
+                    revision,
+                    checkpoint.finalized,
+                    checkpoint.raw_cumulative_digest_sha256,
+                    checkpoint.safe_cumulative_digest_sha256,
+                    encoded,
+                    now_seconds,
+                    record.dispatch_id,
+                    checkpoint.message_id,
+                    current
+                ],
+            )?;
+        }
+        Some((current, raw, safe, prior))
+            if current == revision
+                && raw == checkpoint.raw_cumulative_digest_sha256
+                && safe == checkpoint.safe_cumulative_digest_sha256
+                && prior == encoded => {}
+        _ => return Err(AdapterEdgeError::SequenceConflict),
+    }
+    Ok(())
+}
+
+fn assembly_checkpoint_matches(
+    transaction: &Transaction<'_>,
+    dispatch_id: &str,
+    checkpoint: Option<&ContentAssemblyCheckpoint>,
+    records: &[SafeHarnessContentRecord],
+) -> Result<bool, AdapterEdgeError> {
+    let Some(checkpoint) = checkpoint else {
+        return Ok(true);
+    };
+    let stored: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT assembly_state FROM adapter_content_assemblies
+             WHERE dispatch_id = ?1 AND message_id = ?2",
+            params![dispatch_id, checkpoint.message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(stored.as_deref() == Some(encode_assembly_state(checkpoint, records).as_slice()))
+}
+
+fn encode_assembly_state(
+    checkpoint: &ContentAssemblyCheckpoint,
+    records: &[SafeHarnessContentRecord],
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for value in [
+        b"egopulse/harness-content/assembly-checkpoint/v1".as_slice(),
+        checkpoint.message_id.as_bytes(),
+        &checkpoint.current_revision.to_le_bytes(),
+        checkpoint.candidate_digest_sha256.as_bytes(),
+        &[u8::from(checkpoint.finalized)],
+        checkpoint.raw_cumulative.as_slice(),
+        checkpoint.raw_cumulative_digest_sha256.as_bytes(),
+        checkpoint.safe_cumulative.as_bytes(),
+        checkpoint.safe_cumulative_digest_sha256.as_bytes(),
+        checkpoint.withheld_suffix.as_bytes(),
+    ] {
+        frame_bytes(&mut bytes, value);
+    }
+    frame_bytes(&mut bytes, &(records.len() as u64).to_le_bytes());
+    for record in records {
+        frame_bytes(&mut bytes, &record.encode_to_vec());
+    }
+    bytes
+}
+
+fn decode_assembly_state(
+    bytes: &[u8],
+) -> Result<(ContentAssemblyCheckpoint, Vec<SafeHarnessContentRecord>), AdapterEdgeError> {
+    let mut cursor = 0_usize;
+    let domain = take_frame(bytes, &mut cursor)?;
+    let message_id = frame_string(bytes, &mut cursor)?;
+    let revision = frame_u64(bytes, &mut cursor)?;
+    let candidate_digest_sha256 = frame_string(bytes, &mut cursor)?;
+    let finalized = match take_frame(bytes, &mut cursor)? {
+        [0] => false,
+        [1] => true,
+        _ => return Err(AdapterEdgeError::IntegrityFailure),
+    };
+    let raw_cumulative = take_frame(bytes, &mut cursor)?.to_vec();
+    let raw_digest = frame_string(bytes, &mut cursor)?;
+    let safe_cumulative = frame_string(bytes, &mut cursor)?;
+    let safe_digest = frame_string(bytes, &mut cursor)?;
+    let withheld_suffix = frame_string(bytes, &mut cursor)?;
+    let record_count = frame_u64(bytes, &mut cursor)?;
+    if domain != b"egopulse/harness-content/assembly-checkpoint/v1"
+        || record_count == 0
+        || record_count > 65_536
+        || message_id.trim().is_empty()
+        || revision == 0
+        || !is_sha256(&candidate_digest_sha256)
+        || withheld_suffix.len() > 3_071
+        || raw_digest
+            != framed_content_digest(
+                b"egopulse/harness-content/raw-cumulative/v1",
+                &raw_cumulative,
+            )
+        || safe_digest
+            != framed_content_digest(
+                b"egopulse/harness-content/safe-cumulative/v1",
+                safe_cumulative.as_bytes(),
+            )
+    {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    let mut records = Vec::with_capacity(
+        usize::try_from(record_count).map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+    );
+    for expected_part in 0..record_count {
+        let record = SafeHarnessContentRecord::decode(take_frame(bytes, &mut cursor)?)?;
+        if canonical_safe_record_digest(&record).as_deref()
+            != Some(record.record_digest_sha256.as_str())
+            || !projection_record_position_is_valid(
+                &record,
+                usize::try_from(expected_part).map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+                usize::try_from(record_count).map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+            )
+        {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        records.push(record);
+    }
+    if cursor != bytes.len() || records.is_empty() {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    Ok((
+        ContentAssemblyCheckpoint {
+            message_id,
+            current_revision: revision,
+            candidate_digest_sha256,
+            finalized,
+            raw_cumulative,
+            raw_cumulative_digest_sha256: raw_digest,
+            safe_cumulative,
+            safe_cumulative_digest_sha256: safe_digest,
+            withheld_suffix,
+        },
+        records,
+    ))
+}
+
+fn take_frame<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], AdapterEdgeError> {
+    let length_bytes: [u8; 8] = bytes
+        .get(*cursor..(*cursor).saturating_add(8))
+        .and_then(|value| value.try_into().ok())
+        .ok_or(AdapterEdgeError::IntegrityFailure)?;
+    *cursor = (*cursor).saturating_add(8);
+    let length = usize::try_from(u64::from_le_bytes(length_bytes))
+        .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+    let end = (*cursor)
+        .checked_add(length)
+        .ok_or(AdapterEdgeError::IntegrityFailure)?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or(AdapterEdgeError::IntegrityFailure)?;
+    *cursor = end;
+    Ok(value)
+}
+
+fn frame_string(bytes: &[u8], cursor: &mut usize) -> Result<String, AdapterEdgeError> {
+    String::from_utf8(take_frame(bytes, cursor)?.to_vec())
+        .map_err(|_| AdapterEdgeError::IntegrityFailure)
+}
+
+fn frame_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, AdapterEdgeError> {
+    let value: [u8; 8] = take_frame(bytes, cursor)?
+        .try_into()
+        .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+    Ok(u64::from_le_bytes(value))
+}
+
+fn framed_content_digest(domain: &[u8], value: &[u8]) -> String {
+    let mut bytes = Vec::new();
+    frame_bytes(&mut bytes, domain);
+    frame_bytes(&mut bytes, value);
+    sha256(&bytes)
+}
+
+#[derive(Clone, Copy)]
+struct ContentBudgetLimits {
+    attempt_text_bytes: u64,
+    attempt_records: u64,
+    task_text_bytes: u64,
+    task_records: u64,
+}
+
+const CONTENT_BUDGET_LIMITS: ContentBudgetLimits = ContentBudgetLimits {
+    attempt_text_bytes: ATTEMPT_SAFE_TEXT_BYTES,
+    attempt_records: ATTEMPT_SAFE_RECORDS,
+    task_text_bytes: TASK_SAFE_TEXT_BYTES,
+    task_records: TASK_SAFE_RECORDS,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContentBudgetState {
+    text_bytes: u64,
+    record_count: u64,
+    terminal_kind: Option<HarnessContentLimitKind>,
+}
+
+impl From<ContentBudgetState> for SafeContentBudgetUsage {
+    fn from(value: ContentBudgetState) -> Self {
+        Self {
+            safe_text_bytes: value.text_bytes,
+            safe_record_count: value.record_count,
+            limit_reached: value.terminal_kind.is_some(),
+        }
+    }
+}
+
+struct ContentAdmission {
+    records: Vec<SafeHarnessContentRecord>,
+    text_bytes: u64,
+    limit_kind: Option<HarnessContentLimitKind>,
+    attempt_terminal_kind: Option<HarnessContentLimitKind>,
+    task_terminal_kind: Option<HarnessContentLimitKind>,
+}
+
+fn safe_record_text_bytes(record: &SafeHarnessContentRecord) -> u64 {
+    match record.payload.as_ref() {
+        Some(safe_harness_content_record::Payload::AssistantText(text)) => {
+            text.safe_text_utf8.len() as u64
+        }
+        _ => 0,
+    }
+}
+
+fn load_content_budget(
+    transaction: &Transaction<'_>,
+    scope_kind: &str,
+    scope_id: &str,
+) -> Result<ContentBudgetState, AdapterEdgeError> {
+    let stored: Option<(i64, i64, bool, Option<String>)> = transaction
+        .query_row(
+            "SELECT safe_text_bytes, safe_record_count, limit_reached, limit_kind
+             FROM adapter_content_budgets WHERE scope_kind = ?1 AND scope_id = ?2",
+            params![scope_kind, scope_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((text_bytes, record_count, limit_reached, limit_kind)) = stored else {
+        return Ok(ContentBudgetState {
+            text_bytes: 0,
+            record_count: 0,
+            terminal_kind: None,
+        });
+    };
+    let terminal_kind = match (limit_reached, limit_kind.as_deref()) {
+        (false, None) => None,
+        (true, Some(value)) => {
+            Some(parse_limit_kind(value).ok_or(AdapterEdgeError::IntegrityFailure)?)
+        }
+        _ => return Err(AdapterEdgeError::IntegrityFailure),
+    };
+    Ok(ContentBudgetState {
+        text_bytes: u64::try_from(text_bytes).map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+        record_count: u64::try_from(record_count)
+            .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+        terminal_kind,
+    })
+}
+
+fn load_stored_content_budget(
+    transaction: &Transaction<'_>,
+    scope_kind: &str,
+    scope_id: &str,
+) -> Result<Option<ContentBudgetState>, AdapterEdgeError> {
+    let exists = transaction
+        .query_row(
+            "SELECT 1 FROM adapter_content_budgets
+             WHERE scope_kind = ?1 AND scope_id = ?2",
+            params![scope_kind, scope_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    exists
+        .then(|| load_content_budget(transaction, scope_kind, scope_id))
+        .transpose()
+}
+
+fn verified_content_budgets_from_owner_history(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<(ContentBudgetState, ContentBudgetState), AdapterEdgeError> {
+    let empty = ContentBudgetState {
+        text_bytes: 0,
+        record_count: 0,
+        terminal_kind: None,
+    };
+    let Some(owner) = load_content_owner_snapshot(transaction, task_id)? else {
+        if load_stored_content_budget(transaction, "task", task_id)?.is_some()
+            || load_stored_content_budget(transaction, "attempt", attempt_id)?.is_some()
+        {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        return Ok((empty, empty));
+    };
+    // Terminal retention intentionally deletes the old ledger. A tombstone is
+    // sufficient to prove that this owner can never accept new content, but it
+    // cannot be used to fabricate the deleted budget history.
+    if !owner.tombstones.is_empty() {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    if owner.records.is_empty() || owner.records.len() as u64 > TASK_SAFE_RECORDS {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+
+    let task = content_budget_from_owner_records(&owner.records, None)?;
+    let attempt = content_budget_from_owner_records(&owner.records, Some(attempt_id))?;
+    let stored_task = load_stored_content_budget(transaction, "task", task_id)?
+        .ok_or(AdapterEdgeError::IntegrityFailure)?;
+    if stored_task != task {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    match load_stored_content_budget(transaction, "attempt", attempt_id)? {
+        Some(stored_attempt)
+            if stored_attempt.text_bytes == attempt.text_bytes
+                && stored_attempt.record_count == attempt.record_count
+                && (stored_attempt.terminal_kind == attempt.terminal_kind
+                    || task.terminal_kind.is_some()
+                        && matches!(
+                            stored_attempt.terminal_kind,
+                            Some(
+                                HarnessContentLimitKind::AttemptRecords
+                                    | HarnessContentLimitKind::AttemptTextBytes
+                            )
+                        )) => {}
+        None if attempt == empty => {}
+        _ => return Err(AdapterEdgeError::IntegrityFailure),
+    }
+    Ok((attempt, task))
+}
+
+fn content_budget_from_owner_records(
+    records: &[SafeContentOwnerRecord],
+    attempt_id: Option<&str>,
+) -> Result<ContentBudgetState, AdapterEdgeError> {
+    let mut text_bytes = 0_u64;
+    let mut record_count = 0_u64;
+    let mut terminal_kinds = Vec::new();
+    for owner_record in records {
+        let record = &owner_record.record;
+        if attempt_id.is_some_and(|expected| record.attempt_id != expected) {
+            continue;
+        }
+        if record.attempt_id.trim().is_empty()
+            || safe_record_text_bytes(record) > CONTENT_SAFE_PART_BYTES as u64
+        {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        record_count = record_count
+            .checked_add(1)
+            .ok_or(AdapterEdgeError::IntegrityFailure)?;
+        text_bytes = text_bytes
+            .checked_add(safe_record_text_bytes(record))
+            .ok_or(AdapterEdgeError::IntegrityFailure)?;
+        if let Some(kind) = committed_limit_kind(std::slice::from_ref(record))?
+            && match attempt_id {
+                Some(_) => matches!(
+                    kind,
+                    HarnessContentLimitKind::AttemptRecords
+                        | HarnessContentLimitKind::AttemptTextBytes
+                ),
+                None => matches!(
+                    kind,
+                    HarnessContentLimitKind::TaskRecords | HarnessContentLimitKind::TaskTextBytes
+                ),
+            }
+        {
+            terminal_kinds.push(Some(kind));
+        }
+    }
+    let (record_limit, text_limit) = if attempt_id.is_some() {
+        (ATTEMPT_SAFE_RECORDS, ATTEMPT_SAFE_TEXT_BYTES)
+    } else {
+        (TASK_SAFE_RECORDS, TASK_SAFE_TEXT_BYTES)
+    };
+    if record_count > record_limit || text_bytes > text_limit {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    Ok(ContentBudgetState {
+        text_bytes,
+        record_count,
+        terminal_kind: winning_limit_kind(terminal_kinds),
+    })
+}
+
+fn utf8_prefix_at_most(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn safe_projection_input_digest(projection: &SafeContentProjection) -> String {
+    let mut bytes = Vec::new();
+    frame_bytes(
+        &mut bytes,
+        b"egopulse/harness-content/safe-projection-input/v1",
+    );
+    frame_bytes(
+        &mut bytes,
+        &(projection.records().len() as u64).to_le_bytes(),
+    );
+    for record in projection.records() {
+        frame_bytes(&mut bytes, &record.encode_to_vec());
+    }
+    match projection.checkpoint.as_ref() {
+        Some(checkpoint) => {
+            frame_bytes(&mut bytes, &[1]);
+            frame_bytes(
+                &mut bytes,
+                &encode_assembly_state(checkpoint, projection.records()),
+            );
+        }
+        None => frame_bytes(&mut bytes, &[0]),
+    }
+    sha256(&bytes)
+}
+
+fn committed_records_digest(records: &[SafeHarnessContentRecord]) -> String {
+    let mut bytes = Vec::new();
+    frame_bytes(&mut bytes, b"egopulse/harness-content/committed-records/v1");
+    frame_bytes(&mut bytes, &(records.len() as u64).to_le_bytes());
+    for record in records {
+        frame_bytes(&mut bytes, &record.encode_to_vec());
+    }
+    sha256(&bytes)
+}
+
+fn limit_marker_record(
+    template: &SafeHarnessContentRecord,
+    limit_kind: HarnessContentLimitKind,
+) -> Result<SafeHarnessContentRecord, AdapterEdgeError> {
+    if limit_kind == HarnessContentLimitKind::Unspecified {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    let mut marker = template.clone();
+    marker.record_id =
+        canonical_safe_record_id(&template.content_event_id, "MARKER", limit_kind, 0);
+    marker.record_digest_sha256.clear();
+    marker.safety_flags.clear();
+    marker.payload = Some(safe_harness_content_record::Payload::Marker(
+        SafeContentMarker {
+            kind: HarnessContentMarkerKind::LimitReached as i32,
+            limit_kind: limit_kind as i32,
+        },
+    ));
+    marker.record_digest_sha256 =
+        canonical_safe_record_digest(&marker).ok_or(AdapterEdgeError::IntegrityFailure)?;
+    Ok(marker)
+}
+
+fn admit_content_records(
+    records: &[SafeHarnessContentRecord],
+    attempt: ContentBudgetState,
+    task: ContentBudgetState,
+    limits: ContentBudgetLimits,
+) -> Result<ContentAdmission, AdapterEdgeError> {
+    if attempt.record_count > limits.attempt_records
+        || task.record_count > limits.task_records
+        || attempt.text_bytes > limits.attempt_text_bytes
+        || task.text_bytes > limits.task_text_bytes
+    {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    if attempt.terminal_kind.is_some() || task.terminal_kind.is_some() {
+        return Ok(ContentAdmission {
+            records: Vec::new(),
+            text_bytes: 0,
+            limit_kind: winning_limit_kind([task.terminal_kind, attempt.terminal_kind]),
+            attempt_terminal_kind: attempt.terminal_kind,
+            task_terminal_kind: task.terminal_kind,
+        });
+    }
+    let attempt_record_capacity = limits
+        .attempt_records
+        .saturating_sub(1)
+        .saturating_sub(attempt.record_count);
+    let task_record_capacity = limits
+        .task_records
+        .saturating_sub(1)
+        .saturating_sub(task.record_count);
+    let mut admitted = Vec::new();
+    let mut text_bytes = 0_u64;
+    let mut attempt_text_remaining = limits.attempt_text_bytes.saturating_sub(attempt.text_bytes);
+    let mut task_text_remaining = limits.task_text_bytes.saturating_sub(task.text_bytes);
+    for record in records {
+        let record_text_bytes = safe_record_text_bytes(record);
+        let admitted_count = admitted.len() as u64;
+        let attempt_record_blocked = admitted_count >= attempt_record_capacity;
+        let task_record_blocked = admitted_count >= task_record_capacity;
+        let attempt_text_blocked = record_text_bytes > attempt_text_remaining;
+        let task_text_blocked = record_text_bytes > task_text_remaining;
+        if !attempt_record_blocked
+            && !task_record_blocked
+            && !attempt_text_blocked
+            && !task_text_blocked
+        {
+            admitted.push(record.clone());
+            attempt_text_remaining -= record_text_bytes;
+            task_text_remaining -= record_text_bytes;
+            text_bytes += record_text_bytes;
+            continue;
+        }
+        if !attempt_record_blocked
+            && !task_record_blocked
+            && let Some(safe_harness_content_record::Payload::AssistantText(text)) =
+                record.payload.as_ref()
+        {
+            let text_capacity = attempt_text_remaining.min(task_text_remaining);
+            let prefix = utf8_prefix_at_most(&text.safe_text_utf8, text_capacity as usize);
+            if !prefix.is_empty() {
+                let mut partial = record.clone();
+                let Some(safe_harness_content_record::Payload::AssistantText(value)) =
+                    partial.payload.as_mut()
+                else {
+                    unreachable!()
+                };
+                value.safe_text_utf8 = prefix.to_owned();
+                partial.record_digest_sha256.clear();
+                partial.record_digest_sha256 = canonical_safe_record_digest(&partial)
+                    .ok_or(AdapterEdgeError::IntegrityFailure)?;
+                text_bytes += prefix.len() as u64;
+                attempt_text_remaining -= prefix.len() as u64;
+                task_text_remaining -= prefix.len() as u64;
+                admitted.push(partial);
+            }
+        }
+        let added_record_count = (admitted.len() as u64)
+            .checked_add(1)
+            .ok_or(AdapterEdgeError::IntegrityFailure)?;
+        let attempt_record_count = attempt
+            .record_count
+            .checked_add(added_record_count)
+            .ok_or(AdapterEdgeError::IntegrityFailure)?;
+        let task_record_count = task
+            .record_count
+            .checked_add(added_record_count)
+            .ok_or(AdapterEdgeError::IntegrityFailure)?;
+        let attempt_record_terminal =
+            attempt_record_blocked || attempt_record_count >= limits.attempt_records;
+        let task_record_terminal = task_record_blocked || task_record_count >= limits.task_records;
+        let attempt_text_terminal = attempt_text_blocked || attempt_text_remaining == 0;
+        let task_text_terminal = task_text_blocked || task_text_remaining == 0;
+        let attempt_terminal_kind = scope_terminal_kind(
+            attempt_record_terminal,
+            attempt_text_terminal,
+            HarnessContentLimitKind::AttemptRecords,
+            HarnessContentLimitKind::AttemptTextBytes,
+        );
+        let task_terminal_kind = scope_terminal_kind(
+            task_record_terminal,
+            task_text_terminal,
+            HarnessContentLimitKind::TaskRecords,
+            HarnessContentLimitKind::TaskTextBytes,
+        );
+        let limit_kind = winning_limit_kind([task_terminal_kind, attempt_terminal_kind])
+            .ok_or(AdapterEdgeError::IntegrityFailure)?;
+        admitted.push(limit_marker_record(&records[0], limit_kind)?);
+        return Ok(ContentAdmission {
+            records: admitted,
+            text_bytes,
+            limit_kind: Some(limit_kind),
+            attempt_terminal_kind,
+            task_terminal_kind,
+        });
+    }
+    Ok(ContentAdmission {
+        records: admitted,
+        text_bytes,
+        limit_kind: None,
+        attempt_terminal_kind: None,
+        task_terminal_kind: None,
+    })
+}
+
+fn scope_terminal_kind(
+    records: bool,
+    text_bytes: bool,
+    records_kind: HarnessContentLimitKind,
+    text_kind: HarnessContentLimitKind,
+) -> Option<HarnessContentLimitKind> {
+    records
+        .then_some(records_kind)
+        .or_else(|| text_bytes.then_some(text_kind))
+}
+
+fn winning_limit_kind(
+    kinds: impl IntoIterator<Item = Option<HarnessContentLimitKind>>,
+) -> Option<HarnessContentLimitKind> {
+    kinds.into_iter().flatten().max_by_key(|kind| match kind {
+        HarnessContentLimitKind::TaskRecords => 4,
+        HarnessContentLimitKind::TaskTextBytes => 3,
+        HarnessContentLimitKind::AttemptRecords => 2,
+        HarnessContentLimitKind::AttemptTextBytes => 1,
+        HarnessContentLimitKind::Unspecified => 0,
+    })
+}
+
+fn limit_kind_name(kind: HarnessContentLimitKind) -> &'static str {
+    kind.as_str_name()
+        .strip_prefix("HARNESS_CONTENT_LIMIT_KIND_")
+        .expect("generated limit kind uses the frozen prefix")
+}
+
+fn parse_limit_kind(value: &str) -> Option<HarnessContentLimitKind> {
+    match value {
+        "ATTEMPT_TEXT_BYTES" => Some(HarnessContentLimitKind::AttemptTextBytes),
+        "ATTEMPT_RECORDS" => Some(HarnessContentLimitKind::AttemptRecords),
+        "TASK_TEXT_BYTES" => Some(HarnessContentLimitKind::TaskTextBytes),
+        "TASK_RECORDS" => Some(HarnessContentLimitKind::TaskRecords),
+        _ => None,
+    }
+}
+
+fn decode_stored_limit_kind(
+    value: Option<&str>,
+) -> Result<Option<HarnessContentLimitKind>, AdapterEdgeError> {
+    value
+        .map(|value| parse_limit_kind(value).ok_or(AdapterEdgeError::IntegrityFailure))
+        .transpose()
+}
+
+fn committed_limit_kind(
+    records: &[SafeHarnessContentRecord],
+) -> Result<Option<HarnessContentLimitKind>, AdapterEdgeError> {
+    let Some(last) = records.last() else {
+        return Ok(None);
+    };
+    let Some(safe_harness_content_record::Payload::Marker(marker)) = last.payload.as_ref() else {
+        return Ok(None);
+    };
+    if marker.kind != HarnessContentMarkerKind::LimitReached as i32 {
+        return Ok(None);
+    }
+    let kind = HarnessContentLimitKind::try_from(marker.limit_kind)
+        .map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+    (kind != HarnessContentLimitKind::Unspecified)
+        .then_some(kind)
+        .ok_or(AdapterEdgeError::IntegrityFailure)
+        .map(Some)
+}
+
+struct ContentBudgetUpdate<'a> {
+    scope_kind: &'a str,
+    scope_id: &'a str,
+    previous: ContentBudgetState,
+    added_text_bytes: u64,
+    added_records: u64,
+    terminal_kind: Option<HarnessContentLimitKind>,
+}
+
+fn update_content_budget(
+    transaction: &Transaction<'_>,
+    update: ContentBudgetUpdate<'_>,
+    now_seconds: i64,
+) -> Result<(), AdapterEdgeError> {
+    let next_text = update
+        .previous
+        .text_bytes
+        .checked_add(update.added_text_bytes)
+        .ok_or(AdapterEdgeError::IntegrityFailure)?;
+    let next_records = update
+        .previous
+        .record_count
+        .checked_add(update.added_records)
+        .ok_or(AdapterEdgeError::IntegrityFailure)?;
+    if update.terminal_kind == Some(HarnessContentLimitKind::Unspecified) {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    let next_terminal_kind = update.terminal_kind.or(update.previous.terminal_kind);
+    let changed = transaction.execute(
+        "INSERT INTO adapter_content_budgets(
+           scope_kind, scope_id, safe_text_bytes, safe_record_count,
+           limit_reached, limit_kind, updated_at_seconds
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(scope_kind, scope_id) DO UPDATE SET
+           safe_text_bytes = excluded.safe_text_bytes,
+           safe_record_count = excluded.safe_record_count,
+           limit_reached = excluded.limit_reached,
+           limit_kind = excluded.limit_kind,
+           updated_at_seconds = excluded.updated_at_seconds
+         WHERE adapter_content_budgets.safe_text_bytes = ?8
+           AND adapter_content_budgets.safe_record_count = ?9
+           AND adapter_content_budgets.limit_reached = ?10
+           AND adapter_content_budgets.limit_kind IS ?11",
+        params![
+            update.scope_kind,
+            update.scope_id,
+            i64::try_from(next_text).map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+            i64::try_from(next_records).map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+            next_terminal_kind.is_some(),
+            next_terminal_kind.map(limit_kind_name),
+            now_seconds,
+            i64::try_from(update.previous.text_bytes)
+                .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+            i64::try_from(update.previous.record_count)
+                .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+            update.previous.terminal_kind.is_some(),
+            update.previous.terminal_kind.map(limit_kind_name),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(AdapterEdgeError::SequenceConflict);
+    }
+    Ok(())
+}
+
+fn update_content_owner_metadata(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    sequenced: &[(i64, &SafeHarnessContentRecord)],
+    now_seconds: i64,
+) -> Result<(), AdapterEdgeError> {
+    if sequenced.is_empty() {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO adapter_content_history_floors(
+           task_id, floor_sequence, floor_digest_sha256, updated_at_seconds
+         ) VALUES(?1, 0, ?2, ?3)",
+        params![task_id, content_floor_digest(task_id, 0), now_seconds],
+    )?;
+    let empty_records = Vec::new();
+    let empty_tombstones = Vec::new();
+    let baseline_state = encode_content_owner_baseline(&empty_records, &empty_tombstones);
+    let baseline_digest =
+        content_owner_snapshot_digest(task_id, 0, 0, &empty_records, &empty_tombstones);
+    transaction.execute(
+        "INSERT INTO adapter_content_owner_snapshots(
+           task_id, owner_sequence, floor_sequence,
+           disclosure_profile_digest_sha256, baseline_state,
+           baseline_digest_sha256, snapshot_digest_sha256, updated_at_seconds
+         ) VALUES(?1, 0, 0, ?2, ?3, ?4, ?4, ?5)
+         ON CONFLICT(task_id) DO NOTHING",
+        params![
+            task_id,
+            HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256,
+            baseline_state,
+            baseline_digest,
+            now_seconds
+        ],
+    )?;
+    let (owner_sequence, mut snapshot_digest): (i64, String) = transaction.query_row(
+        "SELECT owner_sequence, snapshot_digest_sha256
+         FROM adapter_content_owner_snapshots WHERE task_id = ?1",
+        [task_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let mut previous_sequence = owner_sequence;
+    for (sequence, record) in sequenced {
+        if *sequence <= previous_sequence || record.task_id != task_id {
+            return Err(AdapterEdgeError::SequenceConflict);
+        }
+        snapshot_digest = content_owner_incremental_digest(
+            &snapshot_digest,
+            u64::try_from(*sequence).map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+            &record.record_digest_sha256,
+        );
+        previous_sequence = *sequence;
+    }
+    transaction.execute(
+        "UPDATE adapter_content_owner_snapshots
+         SET owner_sequence = ?1, snapshot_digest_sha256 = ?2,
+             updated_at_seconds = ?3
+         WHERE task_id = ?4 AND owner_sequence = ?5",
+        params![
+            previous_sequence,
+            snapshot_digest,
+            now_seconds,
+            task_id,
+            owner_sequence
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_content_owner_snapshot(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+) -> Result<Option<SafeContentOwnerSnapshot>, AdapterEdgeError> {
+    let metadata: Option<(i64, i64, String, Vec<u8>, String, String)> = transaction
+        .query_row(
+            "SELECT owner_sequence, floor_sequence,
+                    disclosure_profile_digest_sha256, baseline_state,
+                    baseline_digest_sha256, snapshot_digest_sha256
+             FROM adapter_content_owner_snapshots WHERE task_id = ?1",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        owner_sequence,
+        floor_sequence,
+        profile_digest,
+        baseline_state,
+        baseline_digest,
+        snapshot_digest,
+    )) = metadata
+    else {
+        return Ok(None);
+    };
+    let floor_row: Option<(i64, String)> = transaction
+        .query_row(
+            "SELECT floor_sequence, floor_digest_sha256
+             FROM adapter_content_history_floors WHERE task_id = ?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let valid_numbers =
+        owner_sequence >= 0 && floor_sequence >= 0 && owner_sequence >= floor_sequence;
+    if !valid_numbers
+        || profile_digest != HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256
+        || !is_sha256(&baseline_digest)
+        || !is_sha256(&snapshot_digest)
+        || floor_row
+            != Some((
+                floor_sequence,
+                content_floor_digest(task_id, floor_sequence as u64),
+            ))
+    {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    let (mut records, tombstones) = decode_content_owner_baseline(&baseline_state, task_id)?;
+    if content_owner_snapshot_digest(
+        task_id,
+        floor_sequence as u64,
+        floor_sequence as u64,
+        &records,
+        &tombstones,
+    ) != baseline_digest
+        || !records.last().map_or_else(
+            || {
+                floor_sequence == 0
+                    || tombstones
+                        .iter()
+                        .any(|tombstone| tombstone.final_sequence == floor_sequence as u64)
+            },
+            |record| record.sequence <= floor_sequence as u64,
+        )
+    {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    let delta = load_owner_records(transaction, task_id, floor_sequence, owner_sequence)?;
+    let mut expected = baseline_digest;
+    for record in &delta {
+        expected = content_owner_incremental_digest(
+            &expected,
+            record.sequence,
+            &record.record.record_digest_sha256,
+        );
+    }
+    if expected != snapshot_digest
+        || delta
+            .last()
+            .map_or(floor_sequence as u64, |record| record.sequence)
+            != owner_sequence as u64
+    {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    records.extend(delta);
+    Ok(Some(SafeContentOwnerSnapshot {
+        task_id: task_id.to_owned(),
+        owner_sequence: owner_sequence as u64,
+        floor_sequence: floor_sequence as u64,
+        disclosure_profile_digest_sha256: profile_digest,
+        snapshot_digest_sha256: snapshot_digest,
+        records,
+        tombstones,
+    }))
+}
+
+fn load_owner_records(
+    transaction: &Transaction<'_>,
+    task_id: &str,
+    floor_sequence: i64,
+    owner_sequence: i64,
+) -> Result<Vec<SafeContentOwnerRecord>, AdapterEdgeError> {
+    let mut statement = transaction.prepare(
+        "SELECT content_sequence, record_digest_sha256, safe_record
+         FROM adapter_safe_content_ledger
+         WHERE task_id = ?1 AND content_sequence > ?2 AND content_sequence <= ?3
+         ORDER BY content_sequence",
+    )?;
+    let rows = statement
+        .query_map(params![task_id, floor_sequence, owner_sequence], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(sequence, stored_digest, bytes)| {
+            let sequence =
+                u64::try_from(sequence).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+            let record = SafeHarnessContentRecord::decode(bytes.as_slice())?;
+            if sequence == 0
+                || record.task_id != task_id
+                || record.record_digest_sha256 != stored_digest
+                || canonical_safe_record_digest(&record).as_deref() != Some(stored_digest.as_str())
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+            Ok(SafeContentOwnerRecord { sequence, record })
+        })
+        .collect()
+}
+
+fn content_floor_digest(task_id: &str, floor_sequence: u64) -> String {
+    let mut bytes = Vec::new();
+    frame_bytes(&mut bytes, b"egopulse/harness-content/owner-floor/v1");
+    frame_bytes(&mut bytes, task_id.as_bytes());
+    frame_bytes(&mut bytes, &floor_sequence.to_le_bytes());
+    sha256(&bytes)
+}
+
+fn content_owner_snapshot_digest(
+    task_id: &str,
+    owner_sequence: u64,
+    floor_sequence: u64,
+    records: &[SafeContentOwnerRecord],
+    tombstones: &[HarnessContentRetentionTombstone],
+) -> String {
+    let mut bytes = Vec::new();
+    frame_bytes(&mut bytes, b"egopulse/harness-content/owner-snapshot/v1");
+    frame_bytes(&mut bytes, task_id.as_bytes());
+    frame_bytes(&mut bytes, &owner_sequence.to_le_bytes());
+    frame_bytes(&mut bytes, &floor_sequence.to_le_bytes());
+    frame_bytes(
+        &mut bytes,
+        HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256.as_bytes(),
+    );
+    frame_bytes(&mut bytes, &(records.len() as u64).to_le_bytes());
+    for record in records {
+        frame_bytes(&mut bytes, &record.sequence.to_le_bytes());
+        frame_bytes(&mut bytes, &record.record.encode_to_vec());
+    }
+    frame_bytes(&mut bytes, &(tombstones.len() as u64).to_le_bytes());
+    for tombstone in tombstones {
+        frame_bytes(&mut bytes, &tombstone.encode_to_vec());
+    }
+    sha256(&bytes)
+}
+
+fn content_owner_incremental_digest(
+    previous_digest_sha256: &str,
+    sequence: u64,
+    record_digest_sha256: &str,
+) -> String {
+    let mut bytes = Vec::new();
+    frame_bytes(
+        &mut bytes,
+        b"egopulse/harness-content/owner-snapshot-increment/v1",
+    );
+    frame_bytes(&mut bytes, previous_digest_sha256.as_bytes());
+    frame_bytes(&mut bytes, &sequence.to_le_bytes());
+    frame_bytes(&mut bytes, record_digest_sha256.as_bytes());
+    sha256(&bytes)
+}
+
+fn encode_content_owner_baseline(
+    records: &[SafeContentOwnerRecord],
+    tombstones: &[HarnessContentRetentionTombstone],
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    frame_bytes(&mut bytes, b"egopulse/harness-content/owner-baseline/v1");
+    frame_bytes(&mut bytes, &(records.len() as u64).to_le_bytes());
+    for record in records {
+        frame_bytes(&mut bytes, &record.sequence.to_le_bytes());
+        frame_bytes(&mut bytes, &record.record.encode_to_vec());
+    }
+    frame_bytes(&mut bytes, &(tombstones.len() as u64).to_le_bytes());
+    for tombstone in tombstones {
+        frame_bytes(&mut bytes, &tombstone.encode_to_vec());
+    }
+    bytes
+}
+
+fn decode_content_owner_baseline(
+    bytes: &[u8],
+    task_id: &str,
+) -> Result<
+    (
+        Vec<SafeContentOwnerRecord>,
+        Vec<HarnessContentRetentionTombstone>,
+    ),
+    AdapterEdgeError,
+> {
+    let mut cursor = 0_usize;
+    if take_frame(bytes, &mut cursor)? != b"egopulse/harness-content/owner-baseline/v1" {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    let record_count = frame_u64(bytes, &mut cursor)?;
+    if record_count > TASK_SAFE_RECORDS {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    let mut records = Vec::with_capacity(
+        usize::try_from(record_count).map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+    );
+    let mut last_sequence = 0;
+    for _ in 0..record_count {
+        let sequence = frame_u64(bytes, &mut cursor)?;
+        let record = SafeHarnessContentRecord::decode(take_frame(bytes, &mut cursor)?)?;
+        if sequence == 0
+            || sequence <= last_sequence
+            || record.task_id != task_id
+            || canonical_safe_record_digest(&record).as_deref()
+                != Some(record.record_digest_sha256.as_str())
+        {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        last_sequence = sequence;
+        records.push(SafeContentOwnerRecord { sequence, record });
+    }
+    let tombstone_count = frame_u64(bytes, &mut cursor)?;
+    if tombstone_count > 1 {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    let mut tombstones = Vec::with_capacity(
+        usize::try_from(tombstone_count).map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+    );
+    for _ in 0..tombstone_count {
+        let tombstone = HarnessContentRetentionTombstone::decode(take_frame(bytes, &mut cursor)?)?;
+        if tombstone.task_id != task_id
+            || canonical_retention_tombstone_digest(&tombstone).as_deref()
+                != Some(tombstone.tombstone_digest_sha256.as_str())
+        {
+            return Err(AdapterEdgeError::IntegrityFailure);
+        }
+        tombstones.push(tombstone);
+    }
+    if cursor != bytes.len() {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    Ok((records, tombstones))
+}
+
+fn projection_record_position_is_valid(
+    record: &SafeHarnessContentRecord,
+    expected_part: usize,
+    record_count: usize,
+) -> bool {
+    match record.payload.as_ref() {
+        Some(safe_harness_content_record::Payload::AssistantText(text)) => {
+            usize::try_from(text.part_index).ok() == Some(expected_part)
+                && text.part_count > text.part_index
+        }
+        Some(safe_harness_content_record::Payload::Marker(marker))
+            if marker.kind == HarnessContentMarkerKind::LimitReached as i32 =>
+        {
+            expected_part.saturating_add(1) == record_count
+        }
+        Some(_) => expected_part == 0 && record_count == 1,
+        None => false,
+    }
+}
+
+fn disclosure_profile_reference() -> ContractReference {
+    ContractReference {
+        contract_id: HARNESS_CONTENT_DISCLOSURE_CONTRACT_ID.to_owned(),
+        version: HARNESS_CONTENT_DISCLOSURE_CONTRACT_VERSION.to_owned(),
+        sha256: HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256.to_owned(),
+    }
+}
+
+fn valid_disclosure_profile_reference(reference: Option<&ContractReference>) -> bool {
+    reference == Some(&disclosure_profile_reference())
+}
+
+fn valid_timestamp(value: Option<&prost_types::Timestamp>) -> bool {
+    value.is_some_and(|value| (0..1_000_000_000).contains(&value.nanos))
+}
+
+fn frame_timestamp(
+    bytes: &mut Vec<u8>,
+    value: Option<&prost_types::Timestamp>,
+) -> Result<(), AdapterEdgeError> {
+    let value = value
+        .filter(|value| (0..1_000_000_000).contains(&value.nanos))
+        .ok_or(AdapterEdgeError::IntegrityFailure)?;
+    frame_bytes(bytes, &value.seconds.to_le_bytes());
+    frame_bytes(
+        bytes,
+        &u32::try_from(value.nanos)
+            .map_err(|_| AdapterEdgeError::IntegrityFailure)?
+            .to_le_bytes(),
+    );
+    Ok(())
+}
+
+fn history_compaction_id(
+    task_id: &str,
+    attempt_id: &str,
+    final_epoch: &str,
+    final_sequence: u64,
+) -> String {
+    let mut bytes = Vec::new();
+    frame_bytes(
+        &mut bytes,
+        b"egopulse/harness-content/history-compaction-id/v1",
+    );
+    frame_bytes(&mut bytes, task_id.as_bytes());
+    frame_bytes(&mut bytes, attempt_id.as_bytes());
+    frame_bytes(&mut bytes, final_epoch.as_bytes());
+    frame_bytes(&mut bytes, &final_sequence.to_le_bytes());
+    frame_bytes(
+        &mut bytes,
+        HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256.as_bytes(),
+    );
+    frame_bytes(&mut bytes, b"OWNER_HISTORY_FLOOR_ADVANCED");
+    format!("hcc_{}", sha256(&bytes))
+}
+
+fn retention_tombstone_id(
+    task_id: &str,
+    attempt_id: &str,
+    final_epoch: &str,
+    final_sequence: u64,
+) -> String {
+    let mut bytes = Vec::new();
+    frame_bytes(
+        &mut bytes,
+        b"egopulse/harness-content/retention-tombstone-id/v1",
+    );
+    frame_bytes(&mut bytes, task_id.as_bytes());
+    frame_bytes(&mut bytes, attempt_id.as_bytes());
+    frame_bytes(&mut bytes, final_epoch.as_bytes());
+    frame_bytes(&mut bytes, &final_sequence.to_le_bytes());
+    frame_bytes(
+        &mut bytes,
+        HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256.as_bytes(),
+    );
+    frame_bytes(&mut bytes, b"TERMINAL_MINIMUM_EXPIRED");
+    format!("hrt_{}", sha256(&bytes))
+}
+
+fn canonical_history_compaction_digest(
+    record: &HarnessContentHistoryCompactionRecord,
+) -> Option<String> {
+    if record.compaction_record_id
+        != history_compaction_id(
+            &record.task_id,
+            &record.attempt_id,
+            &record.final_epoch,
+            record.final_sequence,
+        )
+        || record.task_id.trim().is_empty()
+        || record.attempt_id.trim().is_empty()
+        || record.final_epoch.trim().is_empty()
+        || !is_sha256(&record.final_safe_content_digest_sha256)
+        || !is_sha256(&record.owner_snapshot_digest_sha256)
+        || !valid_disclosure_profile_reference(record.disclosure_profile_ref.as_ref())
+        || !valid_timestamp(record.compacted_at.as_ref())
+        || record.reason != HarnessContentCompactionReason::OwnerHistoryFloorAdvanced as i32
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    frame_bytes(
+        &mut bytes,
+        b"egopulse/harness-content/history-compaction/v1",
+    );
+    frame_bytes(&mut bytes, record.compaction_record_id.as_bytes());
+    frame_bytes(&mut bytes, record.task_id.as_bytes());
+    frame_bytes(&mut bytes, record.attempt_id.as_bytes());
+    frame_bytes(&mut bytes, record.final_epoch.as_bytes());
+    frame_bytes(&mut bytes, &record.final_sequence.to_le_bytes());
+    frame_bytes(
+        &mut bytes,
+        record.final_safe_content_digest_sha256.as_bytes(),
+    );
+    frame_bytes(&mut bytes, record.owner_snapshot_digest_sha256.as_bytes());
+    let profile = record.disclosure_profile_ref.as_ref()?;
+    frame_bytes(&mut bytes, profile.contract_id.as_bytes());
+    frame_bytes(&mut bytes, profile.version.as_bytes());
+    frame_bytes(&mut bytes, profile.sha256.as_bytes());
+    frame_timestamp(&mut bytes, record.compacted_at.as_ref()).ok()?;
+    frame_bytes(&mut bytes, b"OWNER_HISTORY_FLOOR_ADVANCED");
+    Some(sha256(&bytes))
+}
+
+fn canonical_retention_tombstone_digest(
+    tombstone: &HarnessContentRetentionTombstone,
+) -> Option<String> {
+    if tombstone.tombstone_id
+        != retention_tombstone_id(
+            &tombstone.task_id,
+            &tombstone.attempt_id,
+            &tombstone.final_epoch,
+            tombstone.final_sequence,
+        )
+        || tombstone.task_id.trim().is_empty()
+        || tombstone.attempt_id.trim().is_empty()
+        || tombstone.final_epoch.trim().is_empty()
+        || !is_sha256(&tombstone.final_safe_content_digest_sha256)
+        || !valid_disclosure_profile_reference(tombstone.disclosure_profile_ref.as_ref())
+        || !valid_timestamp(tombstone.terminal_committed_at.as_ref())
+        || !valid_timestamp(tombstone.compacted_at.as_ref())
+        || tombstone.reason != HarnessContentRetentionReason::TerminalMinimumExpired as i32
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    frame_bytes(
+        &mut bytes,
+        b"egopulse/harness-content/retention-tombstone/v1",
+    );
+    frame_bytes(&mut bytes, tombstone.tombstone_id.as_bytes());
+    frame_bytes(&mut bytes, tombstone.task_id.as_bytes());
+    frame_bytes(&mut bytes, tombstone.attempt_id.as_bytes());
+    frame_bytes(&mut bytes, tombstone.final_epoch.as_bytes());
+    frame_bytes(&mut bytes, &tombstone.final_sequence.to_le_bytes());
+    frame_bytes(
+        &mut bytes,
+        tombstone.final_safe_content_digest_sha256.as_bytes(),
+    );
+    let profile = tombstone.disclosure_profile_ref.as_ref()?;
+    frame_bytes(&mut bytes, profile.contract_id.as_bytes());
+    frame_bytes(&mut bytes, profile.version.as_bytes());
+    frame_bytes(&mut bytes, profile.sha256.as_bytes());
+    frame_timestamp(&mut bytes, tombstone.terminal_committed_at.as_ref()).ok()?;
+    frame_timestamp(&mut bytes, tombstone.compacted_at.as_ref()).ok()?;
+    frame_bytes(&mut bytes, b"TERMINAL_MINIMUM_EXPIRED");
+    Some(sha256(&bytes))
+}
+
+fn validate_safe_projection_outbox_payload(
+    transaction: &Transaction<'_>,
+    message_id: &str,
+    source_record_id: &str,
+    source_revision: u64,
+    payload_digest_sha256: &str,
+    payload: &[u8],
+) -> Result<SafeHarnessContentProjectionEvent, AdapterEdgeError> {
+    if source_revision == 0
+        || message_id != format!("adapter-content-{source_record_id}")
+        || !is_sha256(payload_digest_sha256)
+        || sha256(payload) != payload_digest_sha256
+    {
+        return Err(AdapterEdgeError::IntegrityFailure);
+    }
+    let event = SafeHarnessContentProjectionEvent::decode(payload)?;
+    match event.payload.as_ref() {
+        Some(safe_harness_content_projection_event::Payload::ContentRecord(record)) => {
+            if record.record_id != source_record_id
+                || canonical_safe_record_digest(record).as_deref()
+                    != Some(record.record_digest_sha256.as_str())
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+            let stored: Option<(i64, String, Vec<u8>)> = transaction
+                .query_row(
+                    "SELECT content_sequence, record_digest_sha256, safe_record
+                     FROM adapter_safe_content_ledger WHERE record_id = ?1",
+                    [source_record_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if stored
+                != Some((
+                    i64::try_from(source_revision)
+                        .map_err(|_| AdapterEdgeError::IntegrityFailure)?,
+                    record.record_digest_sha256.clone(),
+                    record.encode_to_vec(),
+                ))
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+        }
+        Some(safe_harness_content_projection_event::Payload::HistoryCompaction(record)) => {
+            if record.compaction_record_id != source_record_id
+                || canonical_history_compaction_digest(record).as_deref()
+                    != Some(record.compaction_record_digest_sha256.as_str())
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+        }
+        Some(safe_harness_content_projection_event::Payload::RetentionTombstone(tombstone)) => {
+            if tombstone.tombstone_id != source_record_id
+                || canonical_retention_tombstone_digest(tombstone).as_deref()
+                    != Some(tombstone.tombstone_digest_sha256.as_str())
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+            let stored: Option<(String, Vec<u8>)> = transaction
+                .query_row(
+                    "SELECT tombstone_digest_sha256, tombstone
+                     FROM adapter_content_retention_tombstones WHERE tombstone_id = ?1",
+                    [source_record_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if stored
+                != Some((
+                    tombstone.tombstone_digest_sha256.clone(),
+                    tombstone.encode_to_vec(),
+                ))
+            {
+                return Err(AdapterEdgeError::IntegrityFailure);
+            }
+        }
+        None => return Err(AdapterEdgeError::IntegrityFailure),
+    }
+    Ok(event)
+}
+
+fn frame_bytes(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    output.extend_from_slice(value);
+}
+
+fn hmac_sha256_bytes(key: &[u8], message: &[u8]) -> Result<[u8; 32], AdapterEdgeError> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).map_err(|_| AdapterEdgeError::IntegrityFailure)?;
+    mac.update(message);
+    Ok(mac.finalize().into_bytes().into())
+}
+
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -1700,15 +4829,23 @@ fn terminal_output_payload_digest_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disclosure::{
+        TrustedContentLineage, assistant_text_content_candidate, bind_content_signal,
+        canonical_dispatch_route_binding_digest, project_safe_content,
+    };
     use egopulse_domain_contracts::v01::egopulse::harness::v1::{
         ApprovalKind, ApprovalRequestLifecycleKind, ApprovalRequestObservation,
-        DiagnosticObservation, HarnessObservation, ObservationCriticality, harness_observation,
+        ContentMutationOperation, DiagnosticObservation, DispatchContextConsumptionProof,
+        HarnessContentSignalObservation, HarnessObservation, NotContextBoundProof,
+        ObservationCriticality, SafeAssistantTextContent, dispatch_context_consumption_proof,
+        dispatch_route_binding, harness_observation,
     };
     use std::path::Path;
     use std::process::Command;
 
     const ABORT_HELPER_ENV: &str = "EGOPULSE_ADAPTER_EDGE_ABORT_HELPER";
     const ABORT_PATH_ENV: &str = "EGOPULSE_ADAPTER_EDGE_ABORT_PATH";
+    const TEST_CAPABILITY_PROFILE_ID: &str = "profile:test";
 
     struct IsolatedEdge {
         root: PathBuf,
@@ -1791,6 +4928,7 @@ mod tests {
             attempt_id: attempt_id.to_owned(),
             dispatch_id: dispatch_id.to_owned(),
             fencing_token: 1,
+            capability_profile_id: TEST_CAPABILITY_PROFILE_ID.to_owned(),
             criticality: ObservationCriticality::Control as i32,
             payload: Some(harness_observation::Payload::Diagnostic(
                 DiagnosticObservation {
@@ -1808,6 +4946,7 @@ mod tests {
             attempt_id: "attempt-001".to_owned(),
             dispatch_id: "dispatch-001".to_owned(),
             fencing_token: 1,
+            capability_profile_id: TEST_CAPABILITY_PROFILE_ID.to_owned(),
             criticality: ObservationCriticality::Terminal as i32,
             payload: Some(harness_observation::Payload::Lifecycle(
                 egopulse_domain_contracts::v01::egopulse::harness::v1::LifecycleObservation {
@@ -1826,6 +4965,233 @@ mod tests {
             media_type: "text/plain; charset=utf-8".to_owned(),
             content,
         }
+    }
+
+    fn install_owner_budget_history(
+        edge: &mut AdapterEdge,
+        mut record: SafeHarnessContentRecord,
+        task_terminal_kind: Option<HarnessContentLimitKind>,
+    ) {
+        record.record_digest_sha256.clear();
+        record.record_digest_sha256 =
+            canonical_safe_record_digest(&record).expect("canonical owner history record");
+        let owner_records = vec![SafeContentOwnerRecord {
+            sequence: 1,
+            record: record.clone(),
+        }];
+        let baseline = encode_content_owner_baseline(&owner_records, &[]);
+        let snapshot_digest =
+            content_owner_snapshot_digest(&record.task_id, 1, 1, &owner_records, &[]);
+        let text_bytes = safe_record_text_bytes(&record);
+        let transaction = edge
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("owner history transaction");
+        transaction
+            .execute(
+                "INSERT INTO adapter_content_history_floors(
+                   task_id, floor_sequence, floor_digest_sha256, updated_at_seconds
+                 ) VALUES(?1, 1, ?2, 10)",
+                params![record.task_id, content_floor_digest(&record.task_id, 1)],
+            )
+            .expect("owner history floor");
+        transaction
+            .execute(
+                "INSERT INTO adapter_content_owner_snapshots(
+                   task_id, owner_sequence, floor_sequence,
+                   disclosure_profile_digest_sha256, baseline_state,
+                   baseline_digest_sha256, snapshot_digest_sha256, updated_at_seconds
+                 ) VALUES(?1, 1, 1, ?2, ?3, ?4, ?4, 10)",
+                params![
+                    record.task_id,
+                    HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256,
+                    baseline,
+                    snapshot_digest,
+                ],
+            )
+            .expect("owner baseline snapshot");
+        let empty = ContentBudgetState {
+            text_bytes: 0,
+            record_count: 0,
+            terminal_kind: None,
+        };
+        update_content_budget(
+            &transaction,
+            ContentBudgetUpdate {
+                scope_kind: "attempt",
+                scope_id: &record.attempt_id,
+                previous: empty,
+                added_text_bytes: text_bytes,
+                added_records: 1,
+                terminal_kind: None,
+            },
+            10,
+        )
+        .expect("attempt budget");
+        update_content_budget(
+            &transaction,
+            ContentBudgetUpdate {
+                scope_kind: "task",
+                scope_id: &record.task_id,
+                previous: empty,
+                added_text_bytes: text_bytes,
+                added_records: 1,
+                terminal_kind: task_terminal_kind,
+            },
+            10,
+        )
+        .expect("task budget");
+        transaction.commit().expect("commit owner budget history");
+    }
+
+    fn pending_projection_for_budget_drift(
+        edge: &mut AdapterEdge,
+        task_id: &str,
+        attempt_id: &str,
+        suffix: &str,
+    ) -> SafeContentProjection {
+        let dispatch_id = format!("dispatch-budget-drift-{suffix}");
+        let dispatch = dispatch_with_id(&dispatch_id, attempt_id);
+        edge.prepare_dispatch(&dispatch, 20)
+            .expect("prepare drift dispatch");
+        let ObservationAppend::Committed(source) = edge
+            .append_observation(
+                &dispatch_id,
+                &format!("native-budget-drift-{suffix}"),
+                suffix.as_bytes(),
+                observation_for(&dispatch_id, attempt_id),
+                21,
+            )
+            .expect("persist candidate source observation")
+        else {
+            panic!("new source observation")
+        };
+        let mut binding = DispatchRouteBinding {
+            provider_bootstrap_profile_id: "provider-budget-integrity".to_owned(),
+            selected_harness_id: "harness-budget-integrity".to_owned(),
+            provider_model_id: "model-budget-integrity".to_owned(),
+            catalog_snapshot: Some(
+                dispatch_route_binding::CatalogSnapshot::CatalogSnapshotSha256("d".repeat(64)),
+            ),
+            capability_profile_id: TEST_CAPABILITY_PROFILE_ID.to_owned(),
+            route_binding_sha256: String::new(),
+        };
+        binding.route_binding_sha256 =
+            canonical_dispatch_route_binding_digest(&binding).expect("route binding");
+        let mut observation = HarnessObservation {
+            attempt_id: attempt_id.to_owned(),
+            dispatch_id: dispatch_id.clone(),
+            fencing_token: 1,
+            native_event_id: Some(format!("native-content-budget-drift-{suffix}")),
+            native_sequence: Some(1),
+            native_event_digest_sha256: sha256(suffix.as_bytes()),
+            capability_profile_id: TEST_CAPABILITY_PROFILE_ID.to_owned(),
+            criticality: ObservationCriticality::Informational as i32,
+            payload: Some(harness_observation::Payload::ContentSignal(
+                HarnessContentSignalObservation {
+                    candidate: assistant_text_content_candidate(
+                        &format!("message-budget-drift-{suffix}"),
+                        b"next".to_vec(),
+                    ),
+                    ..HarnessContentSignalObservation::default()
+                },
+            )),
+            ..HarnessObservation::default()
+        };
+        let unbound = observation.clone();
+        let Some(harness_observation::Payload::ContentSignal(signal)) =
+            observation.payload.as_mut()
+        else {
+            panic!("content signal")
+        };
+        bind_content_signal(
+            &unbound,
+            signal,
+            &format!("receipt-budget-drift-{suffix}"),
+            &"e".repeat(64),
+            &binding.route_binding_sha256,
+            DispatchContextConsumptionProof {
+                branch: Some(dispatch_context_consumption_proof::Branch::NotContextBound(
+                    NotContextBoundProof {},
+                )),
+            },
+        )
+        .expect("bind drift content signal");
+        let Some(harness_observation::Payload::ContentSignal(signal)) =
+            observation.payload.as_ref()
+        else {
+            panic!("bound content signal")
+        };
+        let projection = project_safe_content(
+            &observation,
+            signal,
+            &binding,
+            &TrustedContentLineage {
+                task_id: task_id.to_owned(),
+                run_id: "run-budget-integrity".to_owned(),
+                step_id: "step-budget-integrity".to_owned(),
+            },
+            &[],
+            None,
+        )
+        .expect("valid pending projection");
+        edge.connection
+            .execute(
+                "INSERT INTO adapter_content_candidates(
+                   content_event_id, source_observation_id, dispatch_id,
+                   candidate_digest_sha256, content_signal, projection_state,
+                   created_at_seconds
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'pending', 22)",
+                params![
+                    projection.record().content_event_id,
+                    source.observation_id,
+                    dispatch_id,
+                    "f".repeat(64),
+                    signal.encode_to_vec(),
+                ],
+            )
+            .expect("insert pending candidate");
+        projection
+    }
+
+    fn safe_content_write_state(
+        edge: &AdapterEdge,
+        content_event_id: &str,
+    ) -> (i64, i64, i64, String) {
+        let ledger: i64 = edge
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM adapter_safe_content_ledger",
+                [],
+                |row| row.get(0),
+            )
+            .expect("safe ledger count");
+        let outbox: i64 = edge
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM adapter_content_projection_outbox",
+                [],
+                |row| row.get(0),
+            )
+            .expect("safe outbox count");
+        let next_sequence = edge
+            .connection
+            .query_row(
+                "SELECT next_content_sequence FROM adapter_edge_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("next safe sequence");
+        let candidate_state = edge
+            .connection
+            .query_row(
+                "SELECT projection_state FROM adapter_content_candidates
+                 WHERE content_event_id = ?1",
+                [content_event_id],
+                |row| row.get(0),
+            )
+            .expect("pending candidate state");
+        (ledger, outbox, next_sequence, candidate_state)
     }
 
     #[test]
@@ -2152,6 +5518,298 @@ mod tests {
     }
 
     #[test]
+    fn normal_observation_recovery_excludes_reconciliation_and_retains_terminal_barrier() {
+        let isolated = IsolatedEdge::new("normal-observation-recovery");
+        let mut edge = open_edge(&isolated.path());
+        edge.prepare_dispatch(&dispatch(), 10)
+            .expect("prepare dispatch");
+
+        let ObservationAppend::Committed(first) = edge
+            .append_observation(
+                "dispatch-001",
+                "normal:control",
+                b"normal-control",
+                observation(),
+                11,
+            )
+            .expect("append first normal observation")
+        else {
+            panic!("first normal observation must commit");
+        };
+        let ObservationAppend::Committed(reconciliation) = edge
+            .append_observation(
+                "dispatch-001",
+                "reconciliation:r1",
+                b"reconciliation",
+                observation(),
+                12,
+            )
+            .expect("append reconciliation observation")
+        else {
+            panic!("reconciliation observation must commit");
+        };
+        let ObservationAppend::Committed(case_variant) = edge
+            .append_observation(
+                "dispatch-001",
+                "Reconciliation:r2",
+                b"case-variant-normal",
+                observation(),
+                13,
+            )
+            .expect("append case-variant normal observation")
+        else {
+            panic!("case-variant normal observation must commit");
+        };
+        let ObservationAppend::Committed(first_terminal) = edge
+            .append_observation(
+                "dispatch-001",
+                "normal:terminal:first",
+                b"normal-terminal-first",
+                terminal_observation(),
+                14,
+            )
+            .expect("append first terminal normal observation")
+        else {
+            panic!("first terminal normal observation must commit");
+        };
+        let ObservationAppend::Committed(second_terminal) = edge
+            .append_observation(
+                "dispatch-001",
+                "normal:terminal:second",
+                b"normal-terminal-second",
+                terminal_observation(),
+                15,
+            )
+            .expect("append second terminal normal observation")
+        else {
+            panic!("second terminal normal observation must commit");
+        };
+        assert_eq!(
+            (
+                first.observation_sequence,
+                reconciliation.observation_sequence,
+                case_variant.observation_sequence,
+                first_terminal.observation_sequence,
+                second_terminal.observation_sequence
+            ),
+            (1, 2, 3, 4, 5)
+        );
+        assert!(matches!(
+            edge.normal_observation_recovery_view("dispatch-001", ""),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+
+        let view = edge
+            .normal_observation_recovery_view("dispatch-001", TEST_CAPABILITY_PROFILE_ID)
+            .expect("read normal recovery view");
+        assert_eq!(
+            view.pending
+                .iter()
+                .map(|observation| observation.observation_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4, 5]
+        );
+        assert_eq!(view.durable_terminal_sequence, Some(4));
+        assert!(
+            view.pending
+                .iter()
+                .all(|observation| observation.observation_id != reconciliation.observation_id)
+        );
+        assert!(
+            view.pending
+                .iter()
+                .any(|observation| observation.observation_id == case_variant.observation_id)
+        );
+
+        edge.mark_observation_consumed(&first_terminal.observation_id)
+            .expect("consume first terminal observation");
+        drop(edge);
+        let reopened = open_edge(&isolated.path());
+        let consumed_view = reopened
+            .normal_observation_recovery_view("dispatch-001", TEST_CAPABILITY_PROFILE_ID)
+            .expect("read recovery view after reopen");
+        assert_eq!(
+            consumed_view
+                .pending
+                .iter()
+                .map(|observation| observation.observation_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        assert_eq!(consumed_view.durable_terminal_sequence, Some(4));
+    }
+
+    #[test]
+    fn normal_observation_recovery_fails_closed_on_row_sequence_or_state_drift() {
+        let isolated = IsolatedEdge::new("normal-observation-recovery-sequence-drift");
+        let mut edge = open_edge(&isolated.path());
+        edge.prepare_dispatch(&dispatch(), 10)
+            .expect("prepare dispatch");
+        let ObservationAppend::Committed(committed_observation) = edge
+            .append_observation(
+                "dispatch-001",
+                "normal:control",
+                b"normal-control",
+                observation(),
+                11,
+            )
+            .expect("append normal observation")
+        else {
+            panic!("normal observation must commit");
+        };
+        assert_eq!(
+            edge.connection
+                .execute(
+                    "UPDATE adapter_observations SET observation_sequence = 7
+                     WHERE observation_id = ?1",
+                    [&committed_observation.observation_id],
+                )
+                .expect("inject row sequence drift"),
+            1
+        );
+
+        assert!(matches!(
+            edge.normal_observation_recovery_view("dispatch-001", TEST_CAPABILITY_PROFILE_ID),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+
+        let state_isolated = IsolatedEdge::new("normal-observation-recovery-ingestion-state-drift");
+        let mut state_edge = open_edge(&state_isolated.path());
+        state_edge
+            .prepare_dispatch(&dispatch(), 10)
+            .expect("prepare dispatch for state drift");
+        let ObservationAppend::Committed(state_observation) = state_edge
+            .append_observation(
+                "dispatch-001",
+                "normal:control",
+                b"normal-control",
+                observation(),
+                11,
+            )
+            .expect("append observation for state drift")
+        else {
+            panic!("normal observation must commit");
+        };
+        state_edge
+            .connection
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .expect("allow controlled ingestion state fault injection");
+        assert_eq!(
+            state_edge
+                .connection
+                .execute(
+                    "UPDATE adapter_observations SET ingestion_state = 'invalid'
+                     WHERE observation_id = ?1",
+                    [&state_observation.observation_id],
+                )
+                .expect("inject ingestion state drift"),
+            1
+        );
+        assert!(matches!(
+            state_edge.normal_observation_recovery_view("dispatch-001", TEST_CAPABILITY_PROFILE_ID),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+    }
+
+    #[test]
+    fn normal_observation_recovery_fails_closed_on_digest_raw_ref_or_profile_drift() {
+        for tamper in ["digest", "raw-ref", "profile"] {
+            let isolated =
+                IsolatedEdge::new(&format!("normal-observation-recovery-{tamper}-drift"));
+            let mut edge = open_edge(&isolated.path());
+            edge.prepare_dispatch(&dispatch(), 10)
+                .expect("prepare dispatch");
+            let ObservationAppend::Committed(observation) = edge
+                .append_observation(
+                    "dispatch-001",
+                    "normal:control",
+                    b"normal-control",
+                    observation(),
+                    11,
+                )
+                .expect("append normal observation")
+            else {
+                panic!("normal observation must commit");
+            };
+
+            match tamper {
+                "digest" => {
+                    let bytes: Vec<u8> = edge
+                        .connection
+                        .query_row(
+                            "SELECT observation FROM adapter_observations
+                             WHERE observation_id = ?1",
+                            [&observation.observation_id],
+                            |row| row.get(0),
+                        )
+                        .expect("read observation for digest drift");
+                    let mut stored = HarnessObservation::decode(bytes.as_slice())
+                        .expect("decode observation for digest drift");
+                    stored.native_event_digest_sha256 = "0".repeat(64);
+                    assert_eq!(
+                        edge.connection
+                            .execute(
+                                "UPDATE adapter_observations
+                                 SET native_event_digest_sha256 = ?1, observation = ?2
+                                 WHERE observation_id = ?3",
+                                params![
+                                    stored.native_event_digest_sha256,
+                                    stored.encode_to_vec(),
+                                    observation.observation_id
+                                ],
+                            )
+                            .expect("inject digest drift"),
+                        1
+                    );
+                }
+                "raw-ref" => {
+                    assert_eq!(
+                        edge.connection
+                            .execute(
+                                "UPDATE adapter_observations
+                                 SET raw_evidence_ref = 'adapter-edge://drift/raw/ref'
+                                 WHERE observation_id = ?1",
+                                [&observation.observation_id],
+                            )
+                            .expect("inject raw evidence ref drift"),
+                        1
+                    );
+                }
+                "profile" => {
+                    let bytes: Vec<u8> = edge
+                        .connection
+                        .query_row(
+                            "SELECT observation FROM adapter_observations
+                             WHERE observation_id = ?1",
+                            [&observation.observation_id],
+                            |row| row.get(0),
+                        )
+                        .expect("read observation for profile drift");
+                    let mut stored = HarnessObservation::decode(bytes.as_slice())
+                        .expect("decode observation for profile drift");
+                    stored.capability_profile_id = "profile:other".to_owned();
+                    assert_eq!(
+                        edge.connection
+                            .execute(
+                                "UPDATE adapter_observations SET observation = ?1
+                                 WHERE observation_id = ?2",
+                                params![stored.encode_to_vec(), observation.observation_id],
+                            )
+                            .expect("inject profile drift"),
+                        1
+                    );
+                }
+                _ => unreachable!("fixed tamper matrix"),
+            }
+
+            assert!(matches!(
+                edge.normal_observation_recovery_view("dispatch-001", TEST_CAPABILITY_PROFILE_ID),
+                Err(AdapterEdgeError::IntegrityFailure)
+            ));
+        }
+    }
+
+    #[test]
     fn abort_after_delivery_begins_recovers_as_unknown_without_redispatch() {
         if std::env::var_os(ABORT_HELPER_ENV).is_some() {
             let path = PathBuf::from(
@@ -2279,5 +5937,611 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn r9c_compaction_and_tombstone_canonical_vectors_match_the_frozen_profile() {
+        let profile = disclosure_profile_reference();
+        let mut tombstone = HarnessContentRetentionTombstone {
+            tombstone_id: retention_tombstone_id("task-001", "attempt-001", "content-epoch-02", 4),
+            tombstone_digest_sha256: String::new(),
+            task_id: "task-001".to_owned(),
+            attempt_id: "attempt-001".to_owned(),
+            final_epoch: "content-epoch-02".to_owned(),
+            final_sequence: 4,
+            final_safe_content_digest_sha256: "d".repeat(64),
+            disclosure_profile_ref: Some(profile.clone()),
+            terminal_committed_at: Some(prost_types::Timestamp {
+                seconds: 1_785_888_000,
+                nanos: 0,
+            }),
+            compacted_at: Some(prost_types::Timestamp {
+                seconds: 1_788_480_000,
+                nanos: 0,
+            }),
+            reason: HarnessContentRetentionReason::TerminalMinimumExpired as i32,
+        };
+        assert_eq!(
+            tombstone.tombstone_id,
+            "hrt_a5ea102e29b1eeac1fa461732090071030bae1bc1fc3ab80970c39ca428c3365"
+        );
+        tombstone.tombstone_digest_sha256 =
+            canonical_retention_tombstone_digest(&tombstone).expect("canonical tombstone");
+        assert_eq!(
+            tombstone.tombstone_digest_sha256,
+            "d0ea91476deef69179199243da72410861300ea4698e033460a5e5c18e07f68e"
+        );
+
+        let mut compaction = HarnessContentHistoryCompactionRecord {
+            compaction_record_id: history_compaction_id(
+                "task-001",
+                "attempt-001",
+                "content-epoch-01",
+                13,
+            ),
+            compaction_record_digest_sha256: String::new(),
+            task_id: "task-001".to_owned(),
+            attempt_id: "attempt-001".to_owned(),
+            final_epoch: "content-epoch-01".to_owned(),
+            final_sequence: 13,
+            final_safe_content_digest_sha256: "f".repeat(64),
+            owner_snapshot_digest_sha256: "e".repeat(64),
+            disclosure_profile_ref: Some(profile),
+            compacted_at: Some(prost_types::Timestamp {
+                seconds: 1_788_480_000,
+                nanos: 0,
+            }),
+            reason: HarnessContentCompactionReason::OwnerHistoryFloorAdvanced as i32,
+        };
+        assert_eq!(
+            compaction.compaction_record_id,
+            "hcc_86ee58c2c699af284440e94a3a4fbcea0e5acbf44f47d971eef5a5cf4b2499ce"
+        );
+        compaction.compaction_record_digest_sha256 =
+            canonical_history_compaction_digest(&compaction).expect("canonical compaction");
+        assert_eq!(
+            compaction.compaction_record_digest_sha256,
+            "9d4289be5038e132b948c0b125ce2051f05d0a169f586d2d29d30d97f38013c0"
+        );
+    }
+
+    fn budget_history_record(
+        task_id: &str,
+        attempt_id: &str,
+        payload: safe_harness_content_record::Payload,
+    ) -> SafeHarnessContentRecord {
+        let content_event_id = format!("event-{task_id}-{attempt_id}");
+        let (payload_kind, limit_kind) = match &payload {
+            safe_harness_content_record::Payload::AssistantText(_) => {
+                ("ASSISTANT_TEXT", HarnessContentLimitKind::Unspecified)
+            }
+            safe_harness_content_record::Payload::Marker(marker) => (
+                "MARKER",
+                HarnessContentLimitKind::try_from(marker.limit_kind)
+                    .expect("typed budget marker kind"),
+            ),
+            _ => panic!("budget history fixture payload"),
+        };
+        SafeHarnessContentRecord {
+            record_id: canonical_safe_record_id(&content_event_id, payload_kind, limit_kind, 0),
+            content_event_id,
+            task_id: task_id.to_owned(),
+            run_id: "run-budget-integrity".to_owned(),
+            step_id: "step-budget-integrity".to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            dispatch_id: "dispatch-budget-integrity".to_owned(),
+            fencing_token: 1,
+            route_binding_sha256: "a".repeat(64),
+            disclosure_profile_ref: Some(disclosure_profile_reference()),
+            provider_family_alias: "provider".to_owned(),
+            model_alias: "model".to_owned(),
+            collaboration_role: "role".to_owned(),
+            payload: Some(payload),
+            ..SafeHarnessContentRecord::default()
+        }
+    }
+
+    #[test]
+    fn r9c_owner_history_rejects_lowered_budget_counts_without_safe_writes() {
+        let isolated = IsolatedEdge::new("r9c-budget-count-drift");
+        let mut edge = open_edge(&isolated.path());
+        let record = budget_history_record(
+            "task-budget-count",
+            "attempt-budget-count",
+            safe_harness_content_record::Payload::AssistantText(SafeAssistantTextContent {
+                safe_message_id: "message-budget-count".to_owned(),
+                revision: 1,
+                operation: ContentMutationOperation::Append as i32,
+                safe_text_utf8: "safe".to_owned(),
+                safe_cumulative_digest_sha256: "b".repeat(64),
+                part_count: 1,
+                ..SafeAssistantTextContent::default()
+            }),
+        );
+        install_owner_budget_history(&mut edge, record, None);
+        edge.connection
+            .execute(
+                "UPDATE adapter_content_budgets SET safe_record_count = 0
+                 WHERE scope_kind = 'task' AND scope_id = 'task-budget-count'",
+                [],
+            )
+            .expect("corrupt persisted task count");
+        let projection = pending_projection_for_budget_drift(
+            &mut edge,
+            "task-budget-count",
+            "attempt-budget-count",
+            "count",
+        );
+        let before = safe_content_write_state(&edge, &projection.record().content_event_id);
+        assert!(matches!(
+            edge.commit_safe_content_projection(&projection, 23),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+        assert_eq!(
+            safe_content_write_state(&edge, &projection.record().content_event_id),
+            before
+        );
+        assert_eq!(before.3, "pending");
+    }
+
+    #[test]
+    fn r9c_owner_history_rejects_cleared_terminal_budget_without_safe_writes() {
+        let isolated = IsolatedEdge::new("r9c-budget-terminal-drift");
+        let mut edge = open_edge(&isolated.path());
+        let record = budget_history_record(
+            "task-budget-terminal",
+            "attempt-budget-terminal",
+            safe_harness_content_record::Payload::Marker(SafeContentMarker {
+                kind: HarnessContentMarkerKind::LimitReached as i32,
+                limit_kind: HarnessContentLimitKind::TaskTextBytes as i32,
+            }),
+        );
+        install_owner_budget_history(
+            &mut edge,
+            record,
+            Some(HarnessContentLimitKind::TaskTextBytes),
+        );
+        edge.connection
+            .execute(
+                "UPDATE adapter_content_budgets
+                 SET limit_reached = 0, limit_kind = NULL
+                 WHERE scope_kind = 'task' AND scope_id = 'task-budget-terminal'",
+                [],
+            )
+            .expect("clear persisted terminal state");
+        let projection = pending_projection_for_budget_drift(
+            &mut edge,
+            "task-budget-terminal",
+            "attempt-budget-terminal",
+            "terminal",
+        );
+        let before = safe_content_write_state(&edge, &projection.record().content_event_id);
+        assert!(matches!(
+            edge.commit_safe_content_projection(&projection, 23),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+        assert_eq!(
+            safe_content_write_state(&edge, &projection.record().content_event_id),
+            before
+        );
+        assert_eq!(before.3, "pending");
+    }
+
+    #[test]
+    fn r9c_exact_text_capacity_without_limit_marker_remains_nonterminal() {
+        let safe_text = "x".repeat(CONTENT_SAFE_PART_BYTES);
+        let records = (1..=ATTEMPT_SAFE_TEXT_BYTES / CONTENT_SAFE_PART_BYTES as u64)
+            .map(|sequence| SafeContentOwnerRecord {
+                sequence,
+                record: budget_history_record(
+                    "task-exact-fill",
+                    "attempt-exact-fill",
+                    safe_harness_content_record::Payload::AssistantText(SafeAssistantTextContent {
+                        safe_message_id: format!("message-exact-fill-{sequence}"),
+                        revision: sequence,
+                        operation: ContentMutationOperation::Append as i32,
+                        safe_text_utf8: safe_text.clone(),
+                        safe_cumulative_digest_sha256: "c".repeat(64),
+                        part_count: 1,
+                        ..SafeAssistantTextContent::default()
+                    }),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let budget = content_budget_from_owner_records(&records, Some("attempt-exact-fill"))
+            .expect("exact text fill remains valid");
+        assert_eq!(budget.text_bytes, ATTEMPT_SAFE_TEXT_BYTES);
+        assert_eq!(budget.record_count, records.len() as u64);
+        assert_eq!(budget.terminal_kind, None);
+    }
+
+    #[test]
+    fn r9c_owner_baseline_rejects_oversized_framed_count_before_allocation() {
+        let mut bytes = Vec::new();
+        frame_bytes(&mut bytes, b"egopulse/harness-content/owner-baseline/v1");
+        frame_bytes(&mut bytes, &(TASK_SAFE_RECORDS + 1).to_le_bytes());
+        assert!(matches!(
+            decode_content_owner_baseline(&bytes, "task-oversized-baseline"),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+    }
+
+    #[test]
+    fn r9c_content_budget_reserves_limit_record_and_splits_only_at_utf8_boundaries() {
+        let mut record = SafeHarnessContentRecord {
+            record_id: canonical_safe_record_id(
+                "content-event-limit",
+                "ASSISTANT_TEXT",
+                HarnessContentLimitKind::Unspecified,
+                0,
+            ),
+            content_event_id: "content-event-limit".to_owned(),
+            task_id: "task-limit".to_owned(),
+            run_id: "run-limit".to_owned(),
+            step_id: "step-limit".to_owned(),
+            attempt_id: "attempt-limit".to_owned(),
+            dispatch_id: "dispatch-limit".to_owned(),
+            fencing_token: 1,
+            route_binding_sha256: "a".repeat(64),
+            disclosure_profile_ref: Some(disclosure_profile_reference()),
+            provider_family_alias: "provider".to_owned(),
+            model_alias: "model".to_owned(),
+            collaboration_role: "role".to_owned(),
+            payload: Some(safe_harness_content_record::Payload::AssistantText(
+                SafeAssistantTextContent {
+                    safe_message_id: "hcm_test".to_owned(),
+                    revision: 1,
+                    previous_revision: 0,
+                    operation: ContentMutationOperation::Append as i32,
+                    safe_text_utf8: "ab鐣畞d".to_owned(),
+                    safe_cumulative_digest_sha256: "b".repeat(64),
+                    part_index: 0,
+                    part_count: 1,
+                },
+            )),
+            ..SafeHarnessContentRecord::default()
+        };
+        record.record_digest_sha256 =
+            canonical_safe_record_digest(&record).expect("canonical source record");
+        let empty = ContentBudgetState {
+            text_bytes: 0,
+            record_count: 0,
+            terminal_kind: None,
+        };
+        let admission = admit_content_records(
+            &[record.clone()],
+            empty,
+            empty,
+            ContentBudgetLimits {
+                attempt_text_bytes: 4,
+                attempt_records: 3,
+                task_text_bytes: 100,
+                task_records: 3,
+            },
+        )
+        .expect("bounded UTF-8 admission");
+        assert_eq!(admission.text_bytes, 2);
+        assert_eq!(
+            admission.limit_kind,
+            Some(HarnessContentLimitKind::AttemptTextBytes)
+        );
+        assert_eq!(
+            admission.attempt_terminal_kind,
+            Some(HarnessContentLimitKind::AttemptTextBytes)
+        );
+        assert_eq!(admission.task_terminal_kind, None);
+        assert_eq!(admission.records.len(), 2);
+        let Some(safe_harness_content_record::Payload::AssistantText(text)) =
+            admission.records[0].payload.as_ref()
+        else {
+            panic!("bounded assistant prefix")
+        };
+        assert_eq!(text.safe_text_utf8, "ab");
+        assert!(matches!(
+            admission.records[1].payload,
+            Some(safe_harness_content_record::Payload::Marker(SafeContentMarker {
+                kind,
+                limit_kind,
+            })) if kind == HarnessContentMarkerKind::LimitReached as i32
+                && limit_kind == HarnessContentLimitKind::AttemptTextBytes as i32
+        ));
+        assert_eq!(
+            canonical_safe_record_digest(&admission.records[1]).as_deref(),
+            Some(admission.records[1].record_digest_sha256.as_str())
+        );
+
+        let records_only = admit_content_records(
+            &[record.clone()],
+            empty,
+            empty,
+            ContentBudgetLimits {
+                attempt_text_bytes: 100,
+                attempt_records: 1,
+                task_text_bytes: 100,
+                task_records: 1,
+            },
+        )
+        .expect("reserved record capacity");
+        assert_eq!(records_only.records.len(), 1);
+        assert_eq!(
+            records_only.limit_kind,
+            Some(HarnessContentLimitKind::TaskRecords)
+        );
+        assert_eq!(
+            records_only.attempt_terminal_kind,
+            Some(HarnessContentLimitKind::AttemptRecords)
+        );
+        assert_eq!(
+            records_only.task_terminal_kind,
+            Some(HarnessContentLimitKind::TaskRecords)
+        );
+        assert!(matches!(
+            records_only.records[0].payload,
+            Some(safe_harness_content_record::Payload::Marker(_))
+        ));
+
+        assert_eq!(
+            winning_limit_kind([
+                Some(HarnessContentLimitKind::AttemptTextBytes),
+                Some(HarnessContentLimitKind::AttemptRecords),
+                Some(HarnessContentLimitKind::TaskTextBytes),
+                Some(HarnessContentLimitKind::TaskRecords),
+            ]),
+            Some(HarnessContentLimitKind::TaskRecords)
+        );
+        assert_eq!(
+            winning_limit_kind([
+                Some(HarnessContentLimitKind::AttemptRecords),
+                Some(HarnessContentLimitKind::TaskTextBytes),
+            ]),
+            Some(HarnessContentLimitKind::TaskTextBytes)
+        );
+
+        let mut scalar_record = record;
+        let Some(safe_harness_content_record::Payload::AssistantText(text)) =
+            scalar_record.payload.as_mut()
+        else {
+            panic!("assistant text fixture")
+        };
+        text.safe_text_utf8 = "界".to_owned();
+        scalar_record.record_digest_sha256.clear();
+        scalar_record.record_digest_sha256 =
+            canonical_safe_record_digest(&scalar_record).expect("scalar record digest");
+        let simultaneous = admit_content_records(
+            &[scalar_record],
+            empty,
+            empty,
+            ContentBudgetLimits {
+                attempt_text_bytes: 100,
+                attempt_records: 1,
+                task_text_bytes: 1,
+                task_records: 10,
+            },
+        )
+        .expect("incomplete scalar and record exhaustion");
+        assert_eq!(simultaneous.text_bytes, 0);
+        assert_eq!(simultaneous.records.len(), 1);
+        assert_eq!(
+            simultaneous.limit_kind,
+            Some(HarnessContentLimitKind::TaskTextBytes)
+        );
+        assert_eq!(
+            simultaneous.attempt_terminal_kind,
+            Some(HarnessContentLimitKind::AttemptRecords)
+        );
+        assert_eq!(
+            simultaneous.task_terminal_kind,
+            Some(HarnessContentLimitKind::TaskTextBytes)
+        );
+        let Some(safe_harness_content_record::Payload::Marker(marker)) =
+            simultaneous.records[0].payload.as_ref()
+        else {
+            panic!("typed terminal marker")
+        };
+        assert_eq!(
+            marker.limit_kind,
+            HarnessContentLimitKind::TaskTextBytes as i32
+        );
+
+        let isolated = IsolatedEdge::new("r9c-typed-content-budget-atomicity");
+        let mut edge = open_edge(&isolated.path());
+        let transaction = edge.connection.transaction().expect("budget transaction");
+        update_content_budget(
+            &transaction,
+            ContentBudgetUpdate {
+                scope_kind: "attempt",
+                scope_id: "attempt-limit",
+                previous: empty,
+                added_text_bytes: simultaneous.text_bytes,
+                added_records: simultaneous.records.len() as u64,
+                terminal_kind: simultaneous.attempt_terminal_kind,
+            },
+            10,
+        )
+        .expect("terminal attempt budget");
+        update_content_budget(
+            &transaction,
+            ContentBudgetUpdate {
+                scope_kind: "task",
+                scope_id: "task-limit",
+                previous: empty,
+                added_text_bytes: simultaneous.text_bytes,
+                added_records: simultaneous.records.len() as u64,
+                terminal_kind: simultaneous.task_terminal_kind,
+            },
+            10,
+        )
+        .expect("terminal task budget");
+        transaction.commit().expect("commit both terminal scopes");
+        let persisted: Vec<(String, String)> = {
+            let mut statement = edge
+                .connection
+                .prepare(
+                    "SELECT scope_kind, limit_kind FROM adapter_content_budgets ORDER BY scope_kind",
+                )
+                .expect("typed terminal budget query");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("typed terminal budget rows")
+                .collect::<Result<_, _>>()
+                .expect("collect typed terminal budgets")
+        };
+        assert_eq!(
+            persisted,
+            vec![
+                ("attempt".to_owned(), "ATTEMPT_RECORDS".to_owned()),
+                ("task".to_owned(), "TASK_TEXT_BYTES".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn r9c_safe_outbox_read_and_ack_recompute_payload_and_ledger_identity() {
+        let isolated = IsolatedEdge::new("r9c-safe-outbox-tamper");
+        let mut edge = open_edge(&isolated.path());
+        edge.prepare_dispatch(&dispatch(), 10).expect("prepare");
+        let ObservationAppend::Committed(observation) = edge
+            .append_observation(
+                "dispatch-001",
+                "native-safe-outbox",
+                b"native-safe-outbox",
+                observation(),
+                11,
+            )
+            .expect("source observation")
+        else {
+            panic!("committed source observation")
+        };
+        edge.connection
+            .execute(
+                "INSERT INTO adapter_content_candidates(
+                   content_event_id, source_observation_id, dispatch_id,
+                   candidate_digest_sha256, content_signal, projection_state,
+                   safe_projection_digest_sha256, committed_records_digest_sha256,
+                   created_at_seconds, projected_at_seconds
+                 ) VALUES(?1, ?2, 'dispatch-001', ?3, ?4, 'projected', ?5, ?6, 12, 12)",
+                params![
+                    "content-event-outbox",
+                    observation.observation_id,
+                    "a".repeat(64),
+                    HarnessContentSignalObservation::default().encode_to_vec(),
+                    "b".repeat(64),
+                    "c".repeat(64),
+                ],
+            )
+            .expect("candidate fixture");
+        let mut record = SafeHarnessContentRecord {
+            record_id: canonical_safe_record_id(
+                "content-event-outbox",
+                "ASSISTANT_TEXT",
+                HarnessContentLimitKind::Unspecified,
+                0,
+            ),
+            content_event_id: "content-event-outbox".to_owned(),
+            task_id: "task-outbox".to_owned(),
+            run_id: "run-001".to_owned(),
+            step_id: "step-001".to_owned(),
+            attempt_id: "attempt-001".to_owned(),
+            dispatch_id: "dispatch-001".to_owned(),
+            fencing_token: 1,
+            route_binding_sha256: "d".repeat(64),
+            disclosure_profile_ref: Some(disclosure_profile_reference()),
+            provider_family_alias: "provider".to_owned(),
+            model_alias: "model".to_owned(),
+            collaboration_role: "role".to_owned(),
+            payload: Some(safe_harness_content_record::Payload::AssistantText(
+                SafeAssistantTextContent {
+                    safe_message_id: "hcm_outbox".to_owned(),
+                    revision: 1,
+                    previous_revision: 0,
+                    operation: ContentMutationOperation::Append as i32,
+                    safe_text_utf8: "safe".to_owned(),
+                    safe_cumulative_digest_sha256: "e".repeat(64),
+                    part_index: 0,
+                    part_count: 1,
+                },
+            )),
+            ..SafeHarnessContentRecord::default()
+        };
+        record.record_digest_sha256 = canonical_safe_record_digest(&record).expect("record digest");
+        let record_bytes = record.encode_to_vec();
+        edge.connection
+            .execute(
+                "INSERT INTO adapter_safe_content_ledger(
+                   record_id, content_event_id, part_index, task_id,
+                   record_digest_sha256, content_sequence, safe_record, created_at_seconds
+                 ) VALUES(?1, ?2, 0, ?3, ?4, 1, ?5, 12)",
+                params![
+                    record.record_id,
+                    record.content_event_id,
+                    record.task_id,
+                    record.record_digest_sha256,
+                    record_bytes,
+                ],
+            )
+            .expect("ledger fixture");
+        let event = SafeHarnessContentProjectionEvent {
+            payload: Some(
+                safe_harness_content_projection_event::Payload::ContentRecord(record.clone()),
+            ),
+        };
+        let payload = event.encode_to_vec();
+        let message_id = format!("adapter-content-{}", record.record_id);
+        let payload_digest = sha256(&payload);
+        edge.connection
+            .execute(
+                "INSERT INTO adapter_content_projection_outbox(
+                   message_id, source_record_id, source_revision, payload_digest_sha256,
+                   payload, delivery_state, created_at_seconds
+                 ) VALUES(?1, ?2, 1, ?3, ?4, 'pending', 12)",
+                params![message_id, record.record_id, payload_digest, payload],
+            )
+            .expect("outbox fixture");
+        assert_eq!(edge.pending_safe_content_projection().unwrap().len(), 1);
+
+        edge.connection
+            .execute(
+                "UPDATE adapter_content_projection_outbox SET payload = ?1 WHERE message_id = ?2",
+                params![b"tampered-payload".as_slice(), message_id],
+            )
+            .expect("tamper payload");
+        assert!(matches!(
+            edge.pending_safe_content_projection(),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+        assert!(matches!(
+            edge.acknowledge_safe_content_projection(&message_id, &payload_digest),
+            Err(AdapterEdgeError::IntegrityFailure)
+        ));
+        let state: String = edge
+            .connection
+            .query_row(
+                "SELECT delivery_state FROM adapter_content_projection_outbox WHERE message_id = ?1",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "pending");
+
+        edge.connection
+            .execute(
+                "UPDATE adapter_content_projection_outbox SET payload = ?1 WHERE message_id = ?2",
+                params![event.encode_to_vec(), message_id],
+            )
+            .expect("restore outbox payload");
+        edge.connection
+            .execute(
+                "UPDATE adapter_safe_content_ledger SET safe_record = ?1 WHERE record_id = ?2",
+                params![b"tampered-ledger".as_slice(), record.record_id],
+            )
+            .expect("tamper ledger");
+        assert!(matches!(
+            edge.pending_safe_content_projection(),
+            Err(AdapterEdgeError::Decode(_)) | Err(AdapterEdgeError::IntegrityFailure)
+        ));
+        assert!(matches!(
+            edge.acknowledge_safe_content_projection(&message_id, &payload_digest),
+            Err(AdapterEdgeError::Decode(_)) | Err(AdapterEdgeError::IntegrityFailure)
+        ));
     }
 }

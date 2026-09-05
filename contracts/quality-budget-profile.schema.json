@@ -21,7 +21,7 @@
         "additionalProperties": false,
         "required": ["requirementId", "class", "metric", "limits", "failureDisposition"],
         "properties": {
-          "requirementId": { "pattern": "^(QH|QT|QC|QR|QM)-[0-9]{2}$" },
+          "requirementId": { "type": "string", "pattern": "^(QH|QT|QC|QR|QM)-[0-9]{2}$" },
           "class": { "enum": ["governance_redline", "latency", "concurrency", "resource", "model_usage"] },
           "metric": { "type": "string", "minLength": 1 },
           "limits": { "type": "object", "minProperties": 1, "additionalProperties": { "type": ["number", "integer", "boolean", "string"] } },
@@ -37,7 +37,7 @@
         "releaseBuildRequired": { "const": true },
         "failedSamplesIncluded": { "const": true },
         "crashInjectionsPerBoundary": { "const": 10 },
-        "crashBoundaryCount": { "const": 7 },
+        "crashBoundaryCount": { "const": 8 },
         "providerAndLocalLatencySeparated": { "const": true }
       }
     }

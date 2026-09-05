@@ -1,6 +1,7 @@
 param(
     [string]$PackageRoot = (Split-Path -Parent $MyInvocation.MyCommand.Path),
     [string]$DataRoot = (Join-Path $env:LOCALAPPDATA 'EgoPulse'),
+    [string]$IpcInstance = 'default',
     [switch]$Force,
     [switch]$SkipMemoryWorker,
     [switch]$Launch,
@@ -9,6 +10,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if ([string]::IsNullOrWhiteSpace($IpcInstance) -or $IpcInstance -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z') {
+    throw 'IpcInstance must be a 1..64 character ASCII token beginning with an alphanumeric character and containing only alphanumeric, dot, underscore, or hyphen characters.'
+}
 
 function New-RandomHex {
     param([int]$ByteCount = 32)
@@ -80,14 +85,10 @@ foreach ($binary in @('agentosd.exe', 'egopulse.exe', 'egopulse-tui.exe')) {
     }
 }
 
-$uv = Get-Command uv -ErrorAction SilentlyContinue
-if (-not $uv) {
-    throw 'uv is required. Install uv from https://docs.astral.sh/uv/ and rerun install-egopulse.ps1.'
-}
-
 $data = (New-Item -ItemType Directory -Force -Path $DataRoot).FullName
 $configPath = Join-Path $data 'agentos-config.json'
 $templatePath = Join-Path $root 'config/agentos-config.example.json'
+$requiresFreshV3Migration = $false
 if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) {
     throw "Configuration template is missing: $templatePath"
 }
@@ -130,6 +131,19 @@ else {
     $config.memory_retrieval.working_directory = $root
     $config.memory_retrieval.environment_overrides.PYTHONPATH = "$memorySource;$bindings"
 
+    # Installation-specific replacement changes the reviewed workflow run ID.
+    # Persist a v2 source and let the daemon's authoritative transition derive
+    # and seal the matching v3 work-capability route; the installer must not
+    # duplicate that digest algorithm in PowerShell.
+    if ([string]$config.schema_version -eq 'egopulse.production-bootstrap/v3') {
+        if (-not $config.PSObject.Properties['work_capabilities']) {
+            throw 'The v3 configuration template is missing work_capabilities.'
+        }
+        Set-JsonProperty -Object $config -Name 'schema_version' -Value 'egopulse.production-bootstrap/v2'
+        $config.PSObject.Properties.Remove('work_capabilities')
+        $requiresFreshV3Migration = $true
+    }
+
     $configJson = $config | ConvertTo-Json -Depth 100
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [IO.File]::WriteAllText($configPath, $configJson, $utf8NoBom)
@@ -149,16 +163,24 @@ $authorityKeys = @(
     'EGOPULSE_TOKEN_MAC_KEY_HEX'
 )
 foreach ($keyName in $authorityKeys) {
-    $existing = [Environment]::GetEnvironmentVariable($keyName, 'User')
-    if ([string]::IsNullOrWhiteSpace($existing)) {
-        Set-UserEnvironment -Name $keyName -Value (New-RandomHex)
+    if ($NoPersistEnvironment) {
+        $existing = [Environment]::GetEnvironmentVariable($keyName, 'Process')
+        if ([string]::IsNullOrWhiteSpace($existing)) {
+            Set-Item -Path "Env:$keyName" -Value (New-RandomHex)
+        }
     }
     else {
-        Set-Item -Path "Env:$keyName" -Value $existing
+        $existing = [Environment]::GetEnvironmentVariable($keyName, 'User')
+        if ([string]::IsNullOrWhiteSpace($existing)) {
+            Set-UserEnvironment -Name $keyName -Value (New-RandomHex)
+        }
+        else {
+            Set-Item -Path "Env:$keyName" -Value $existing
+        }
     }
 }
 Set-UserEnvironment -Name 'EGOPULSE_USER_CONFIG' -Value $configPath
-Set-UserEnvironment -Name 'EGOPULSE_IPC_INSTANCE' -Value 'default'
+Set-UserEnvironment -Name 'EGOPULSE_IPC_INSTANCE' -Value $IpcInstance
 $runtimeConfig = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $taskEpoch = [string]$runtimeConfig.stores.task.store_epoch
 if ([string]::IsNullOrWhiteSpace($taskEpoch)) {
@@ -169,6 +191,10 @@ Set-UserEnvironment -Name 'EGOPULSE_READ_MODEL_DB' -Value (Join-Path $data 'read
 Set-UserEnvironment -Name 'EGOPULSE_READ_MODEL_EPOCH' -Value $readModelEpoch
 
 if (-not $SkipMemoryWorker) {
+    $uv = Get-Command uv -ErrorAction SilentlyContinue
+    if (-not $uv) {
+        throw 'uv is required. Install uv from https://docs.astral.sh/uv/ and rerun install-egopulse.ps1.'
+    }
     & (Join-Path $root 'setup-memory-worker.ps1') -PackageRoot $root
     if ($LASTEXITCODE -ne 0) {
         throw "Memory Worker setup failed with exit code $LASTEXITCODE"
@@ -176,17 +202,58 @@ if (-not $SkipMemoryWorker) {
 }
 
 $daemon = Join-Path $root 'bin/agentosd.exe'
+if ($requiresFreshV3Migration) {
+    & $daemon --migrate-to-v3
+    if ($LASTEXITCODE -ne 0) {
+        throw "EgoPulse fresh-install v3 transition failed with exit code $LASTEXITCODE"
+    }
+}
 & $daemon --check-config
 if ($LASTEXITCODE -ne 0) {
     throw "EgoPulse configuration check failed with exit code $LASTEXITCODE"
 }
 
+# Print safe Provider preflight facts after the configuration has passed.
+# The daemon emits only executable existence and credential-source status;
+# this never starts a Harness or serializes an API-key value.
+$providerReportLines = @(& $daemon --check-config --json)
+if ($LASTEXITCODE -ne 0) {
+    throw "EgoPulse Provider preflight failed with exit code $LASTEXITCODE"
+}
+$providerReport = ($providerReportLines -join [Environment]::NewLine) | ConvertFrom-Json
+foreach ($profile in @($providerReport.provider_profiles)) {
+    Write-Output (
+        'provider_preflight=profile:{0} executable_available:{1} credential_status:{2} admission:{3}' -f
+        $profile.profile_id,
+        $profile.executable_available,
+        $profile.credential_status,
+        $profile.admission
+    )
+}
+$productionProfiles = @($providerReport.provider_profiles | Where-Object { $_.admission -eq 'production' })
+if ($productionProfiles.Count -ne 1) {
+    throw "Expected exactly one production Provider profile, found $($productionProfiles.Count)."
+}
+$productionProfile = $productionProfiles[0]
+if (-not [bool]$productionProfile.executable_available) {
+    throw "Production Harness executable is unavailable for profile '$($productionProfile.profile_id)'. Install the configured Harness or update its executable before rerunning the installer."
+}
+Write-Output "production_provider_preflight=ready profile:$($productionProfile.profile_id)"
+
 if ($Launch) {
-    Start-Process -FilePath $daemon -WorkingDirectory $root
-    Write-Output 'agentosd=launched'
+    $daemonProcess = Start-Process -FilePath $daemon -WorkingDirectory $root -WindowStyle Hidden -PassThru
+    Write-Output "agentosd=launched pid=$($daemonProcess.Id)"
 }
 
+$environmentMode = if ($NoPersistEnvironment) { 'process-only' } else { 'persisted' }
 Write-Output 'egopulse_installation=passed'
 Write-Output "package_root=$root"
 Write-Output "data_root=$data"
-Write-Output 'next=Open a new PowerShell window, then run egopulse.exe status or egopulse-tui.exe'
+Write-Output "environment=$environmentMode"
+Write-Output "ipc_instance=$IpcInstance"
+if ($NoPersistEnvironment) {
+    Write-Output 'next=Process-only values are not persisted beyond the installer process; use -Launch for immediate daemon startup or explicitly provide the environment to a later process.'
+}
+else {
+    Write-Output 'next=Open a new PowerShell window, then run egopulse.exe status or egopulse-tui.exe'
+}

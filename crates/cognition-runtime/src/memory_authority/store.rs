@@ -5,6 +5,10 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+use egopulse_domain_contracts::memory::{
+    MEMORY_MAX_RECORDS, MEMORY_MAX_ROUTING_FIELD_BYTES, MEMORY_MAX_TOTAL_CONTENT_BYTES,
+};
+
 const SCHEMA_PROFILE_ID: &str = "egopulse/memory-authority-store/v1";
 const SCHEMA: &str = r#"
 CREATE TABLE memory_store_metadata (
@@ -70,6 +74,8 @@ pub(super) enum StoreError {
     StoreGenerationMismatch,
     #[error("memory authority store integrity check failed")]
     IntegrityFailure,
+    #[error("accepted memory snapshot exceeds the retrieval boundary")]
+    SnapshotBounds,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,19 +345,52 @@ impl MemoryStore {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(super) fn accepted_memories(
         &self,
         scope_ref: &str,
     ) -> Result<Vec<StoredMemory>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT memory_id,revision,content,content_sha256,source_ref,scope_ref,state,
-                    created_at_seconds,updated_at_seconds
-             FROM memories WHERE scope_ref=?1 AND state='accepted'
-             ORDER BY memory_id",
+        self.memories_in_state(scope_ref, "accepted")
+    }
+
+    /// Reads the Authority revision and accepted rows from one SQLite read
+    /// transaction. This prevents a concurrent Authority process from
+    /// advancing the event sequence between the revision read and the record
+    /// projection.
+    pub(super) fn accepted_memories_with_revision(
+        &self,
+        scope_ref: &str,
+    ) -> Result<(u64, Vec<StoredMemory>), StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let last_sequence: i64 = transaction.query_row(
+            "SELECT last_event_sequence FROM memory_store_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
         )?;
-        let rows = statement.query_map([scope_ref], memory_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
+        if last_sequence < 0 {
+            return Err(StoreError::IntegrityFailure);
+        }
+        let authority_revision = (last_sequence as u64)
+            .checked_add(1)
+            .ok_or(StoreError::IntegrityFailure)?;
+        let records = memories_in_state(&transaction, scope_ref, "accepted")?;
+        transaction.commit()?;
+        Ok((authority_revision, records))
+    }
+
+    pub(super) fn candidate_memories(
+        &self,
+        scope_ref: &str,
+    ) -> Result<Vec<StoredMemory>, StoreError> {
+        self.memories_in_state(scope_ref, "candidate")
+    }
+
+    fn memories_in_state(
+        &self,
+        scope_ref: &str,
+        state: &str,
+    ) -> Result<Vec<StoredMemory>, StoreError> {
+        memories_in_state(&self.connection, scope_ref, state)
     }
 
     pub(super) fn inspect(&self) -> Result<super::MemoryStoreInspection, StoreError> {
@@ -378,6 +417,54 @@ impl MemoryStore {
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         Ok(integrity == "ok")
     }
+}
+
+fn memories_in_state(
+    connection: &Connection,
+    scope_ref: &str,
+    state: &str,
+) -> Result<Vec<StoredMemory>, StoreError> {
+    let bounds: (i64, i64, i64, i64, i64) = connection.query_row(
+        "SELECT count(*),
+                    COALESCE(sum(length(CAST(content AS BLOB))), 0),
+                    COALESCE(max(length(CAST(memory_id AS BLOB))), 0),
+                    COALESCE(max(length(CAST(source_ref AS BLOB))), 0),
+                    COALESCE(max(length(CAST(scope_ref AS BLOB))), 0)
+             FROM memories WHERE scope_ref=?1 AND state=?2",
+        params![scope_ref, state],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    if bounds.0 < 0
+        || bounds.0 as usize > MEMORY_MAX_RECORDS
+        || bounds.1 < 0
+        || bounds.1 as usize > MEMORY_MAX_TOTAL_CONTENT_BYTES
+        || bounds.2 < 0
+        || bounds.2 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
+        || bounds.3 < 0
+        || bounds.3 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
+        || bounds.4 < 0
+        || bounds.4 as usize > MEMORY_MAX_ROUTING_FIELD_BYTES
+    {
+        return Err(StoreError::SnapshotBounds);
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT memory_id,revision,content,content_sha256,source_ref,scope_ref,state,
+                    created_at_seconds,updated_at_seconds
+             FROM memories WHERE scope_ref=?1 AND state=?2
+             ORDER BY memory_id",
+    )?;
+    let rows = statement.query_map(params![scope_ref, state], memory_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
 }
 
 fn memory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemory> {
@@ -447,4 +534,48 @@ fn update_sequence(
         [sequence],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn accepted_snapshot_bounds_are_checked_before_rows_are_loaded() {
+        let root = std::env::temp_dir().join(format!("egopulse-memory-store-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create isolated store directory");
+        let path = root.join("memory-authority.sqlcipher");
+        let mut store = MemoryStore::open(&path, &[71_u8; 32], "store-test-epoch")
+            .expect("open encrypted store");
+        let content = "x".repeat(MEMORY_MAX_TOTAL_CONTENT_BYTES + 1);
+        let memory = StoredMemory {
+            memory_id: "memory-over-limit".to_owned(),
+            revision: 1,
+            content: content.clone(),
+            content_sha256: hex::encode(Sha256::digest(content.as_bytes())),
+            source_ref: "source:test".to_owned(),
+            scope_ref: "scope:test".to_owned(),
+            state: StoredState::from("accepted"),
+            created_at_seconds: 1,
+            updated_at_seconds: 1,
+        };
+        store
+            .insert_candidate(
+                &memory,
+                "event:test",
+                "principal:test",
+                "idempotency:test",
+                "request:test",
+            )
+            .expect("insert semantic-boundary fixture");
+
+        assert!(matches!(
+            store.accepted_memories("scope:test"),
+            Err(StoreError::SnapshotBounds)
+        ));
+
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
 }

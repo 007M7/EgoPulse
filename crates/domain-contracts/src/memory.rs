@@ -8,6 +8,10 @@ pub const MEMORY_MAX_ROUTING_FIELD_BYTES: usize = 4 * 1024;
 pub const MEMORY_MAX_RECORDS: usize = 2_048;
 pub const MEMORY_MAX_RESULTS: usize = 64;
 pub const MEMORY_MAX_TOTAL_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+pub const WORK_MEMORY_PACK_PROFILE_ID: &str = "egopulse/governed-memory-pack/v1";
+pub const WORK_MEMORY_MAX_RESULTS: u32 = 8;
+pub const WORK_MEMORY_MIN_SCORE: f64 = 0.0;
+pub const WORK_MEMORY_MAX_SELECTED_CONTENT_BYTES: usize = 64 * 1024;
 const EVIDENCE_PREFIX: &str = "memory-rag-evidence-sha256:";
 
 #[derive(Debug, Error, Eq, PartialEq)]

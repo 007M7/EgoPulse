@@ -4,9 +4,10 @@ use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
     AwaitProjectionRequest, AwaitProjectionResponse, GetEvidenceGraphRequest,
     GetEvidenceGraphResponse, GetHarnessApprovalViewRequest, GetHarnessApprovalViewResponse,
     GetProjectionStatusRequest, GetProjectionStatusResponse, GetTaskViewRequest,
-    GetTaskViewResponse, HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest,
-    ListHarnessApprovalViewsResponse, ListTaskViewsRequest, ListTaskViewsResponse,
-    TaskViewStreamFrame, WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest,
+    GetTaskViewResponse, HarnessApprovalViewStreamFrame, HarnessContentStreamFrame,
+    ListHarnessApprovalViewsRequest, ListHarnessApprovalViewsResponse, ListHarnessContentRequest,
+    ListHarnessContentResponse, ListTaskViewsRequest, ListTaskViewsResponse, TaskViewStreamFrame,
+    WatchHarnessApprovalViewsRequest, WatchHarnessContentRequest, WatchTaskViewsRequest,
     local_read_model_service_server::LocalReadModelService,
 };
 use egopulse_local_ipc_platform::PeerConnectionInfo;
@@ -14,7 +15,8 @@ use futures_util::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::read_gateway::{
-    ApprovalWatchSubscription, ReadGatewayApplication, TaskWatchSubscription,
+    ApprovalWatchSubscription, HarnessContentWatchSubscription, ReadGatewayApplication,
+    TaskWatchSubscription,
 };
 
 pub struct LocalReadModelEndpoint {
@@ -35,6 +37,8 @@ impl LocalReadModelEndpoint {
 type TaskWatchStream = Pin<Box<dyn Stream<Item = Result<TaskViewStreamFrame, Status>> + Send>>;
 type ApprovalWatchStream =
     Pin<Box<dyn Stream<Item = Result<HarnessApprovalViewStreamFrame, Status>> + Send>>;
+type HarnessContentWatchStream =
+    Pin<Box<dyn Stream<Item = Result<HarnessContentStreamFrame, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl LocalReadModelService for LocalReadModelEndpoint {
@@ -94,6 +98,18 @@ impl LocalReadModelService for LocalReadModelEndpoint {
         Ok(Response::new(
             self.application
                 .list_harness_approval_views(peer.as_ref(), request.into_inner())
+                .await,
+        ))
+    }
+
+    async fn list_harness_content(
+        &self,
+        request: Request<ListHarnessContentRequest>,
+    ) -> Result<Response<ListHarnessContentResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(
+            self.application
+                .list_harness_content(peer.as_ref(), request.into_inner())
                 .await,
         ))
     }
@@ -162,6 +178,32 @@ impl LocalReadModelService for LocalReadModelEndpoint {
         ))))
     }
 
+    type WatchHarnessContentStream = HarnessContentWatchStream;
+
+    async fn watch_harness_content(
+        &self,
+        request: Request<WatchHarnessContentRequest>,
+    ) -> Result<Response<Self::WatchHarnessContentStream>, Status> {
+        let peer =
+            Self::peer(&request).ok_or_else(|| Status::unauthenticated("peer_identity_missing"))?;
+        let subscription = self
+            .application
+            .open_content_watch(peer, request.into_inner())
+            .await
+            .map_err(|error| local_error_status(*error))?;
+        Ok(Response::new(Box::pin(futures_util::stream::unfold(
+            Some(subscription),
+            |state: Option<HarnessContentWatchSubscription>| async move {
+                let mut subscription = state?;
+                match subscription.next_frame().await {
+                    Ok(Some(frame)) => Some((Ok(frame), Some(subscription))),
+                    Ok(None) => None,
+                    Err(error) => Some((Err(local_error_status(*error)), None)),
+                }
+            },
+        ))))
+    }
+
     async fn await_projection(
         &self,
         request: Request<AwaitProjectionRequest>,
@@ -186,7 +228,9 @@ fn local_error_status(
         LocalApiErrorCode::Unauthenticated | LocalApiErrorCode::SessionExpired => {
             tonic::Code::Unauthenticated
         }
-        LocalApiErrorCode::PermissionDenied => tonic::Code::PermissionDenied,
+        LocalApiErrorCode::PermissionDenied | LocalApiErrorCode::OwnerMismatch => {
+            tonic::Code::PermissionDenied
+        }
         LocalApiErrorCode::NotFound => tonic::Code::NotFound,
         LocalApiErrorCode::ContractIncompatible => tonic::Code::FailedPrecondition,
         LocalApiErrorCode::ProjectionBehind
@@ -197,6 +241,12 @@ fn local_error_status(
             tonic::Code::Unavailable
         }
         LocalApiErrorCode::ResourceExhausted => tonic::Code::ResourceExhausted,
+        LocalApiErrorCode::ContextRevoked
+        | LocalApiErrorCode::CapabilityNotAdmitted
+        | LocalApiErrorCode::ConfigurationMigrationRequired => tonic::Code::FailedPrecondition,
+        LocalApiErrorCode::StateRevisionConflict | LocalApiErrorCode::IdempotencyConflict => {
+            tonic::Code::Aborted
+        }
         LocalApiErrorCode::CursorInvalid
         | LocalApiErrorCode::CursorExpired
         | LocalApiErrorCode::IntegrityFailure

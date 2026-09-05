@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
 use egopulse_domain_contracts::FoundationHealth;
 use std::path::{Path, PathBuf};
@@ -133,6 +133,48 @@ pub struct SupervisedProcessSpec {
     pub environment_overrides: Vec<(String, String)>,
 }
 
+/// Bounded user and operating-system environment names required by a locally
+/// installed interactive executable. Harness processes opt into this list
+/// instead of inheriting the daemon's complete environment, which may contain
+/// Authority database keys and other EgoPulse-only secrets.
+const MINIMAL_USER_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "COLORTERM",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+
 impl SupervisedProcessSpec {
     #[must_use]
     pub fn new(executable: impl Into<PathBuf>, working_directory: impl Into<PathBuf>) -> Self {
@@ -155,6 +197,31 @@ impl SupervisedProcessSpec {
         self.environment_overrides.push((name.into(), value.into()));
         self
     }
+
+    /// Clears the parent environment and inherits only the bounded user/OS
+    /// variables needed by a local executable. Provider credentials must still
+    /// be added explicitly with `with_environment_override`.
+    #[must_use]
+    pub fn with_minimal_user_environment(mut self) -> Self {
+        self.clear_environment = true;
+        self.inherited_environment = MINIMAL_USER_ENVIRONMENT
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        self
+    }
+
+    /// Adds one explicitly reviewed environment name to an isolated process.
+    /// Duplicate names are ignored so composition order cannot widen the
+    /// inherited set accidentally.
+    #[must_use]
+    pub fn with_inherited_environment(mut self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        if !self.inherited_environment.contains(&name) {
+            self.inherited_environment.push(name);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Error)]
@@ -165,6 +232,8 @@ pub enum ProcessSupervisionError {
     InvalidWorkingDirectory,
     #[error("supervised process could not be started")]
     Spawn(#[source] std::io::Error),
+    #[error("supervised process could not be assigned to its operating-system process tree")]
+    ProcessTree(#[source] std::io::Error),
     #[error("supervised process did not expose the required stdio handles")]
     MissingStdio,
 }
@@ -203,8 +272,45 @@ pub enum GovernedProcessError {
     Protocol,
 }
 
-pub struct SupervisedProcess {
+struct SupervisedChild {
+    // Kept before `child` so cancellation closes the Windows Job Object before
+    // the direct child handle is dropped. KILL_ON_JOB_CLOSE then reaches every
+    // descendant inherited from the supervised root.
+    process_tree: ProcessTreeGuard,
     child: Child,
+}
+
+impl SupervisedChild {
+    fn process_id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
+        self.child.try_wait()
+    }
+
+    async fn terminate(&mut self) -> Result<(), std::io::Error> {
+        #[cfg(windows)]
+        {
+            self.process_tree.terminate()
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = &self.process_tree;
+            self.child.kill().await
+        }
+    }
+
+    async fn wait(&mut self) -> Result<std::process::ExitStatus, std::io::Error> {
+        self.child.wait().await
+    }
+}
+
+pub struct SupervisedProcess {
+    // The process tree and direct child remain one drop unit even when a
+    // one-shot exchange takes and closes stdin before waiting for completion.
+    supervised_child: SupervisedChild,
     pub stdin: ChildStdin,
     pub stdout: BufReader<ChildStdout>,
     stderr: Option<ChildStderr>,
@@ -212,7 +318,7 @@ pub struct SupervisedProcess {
 
 impl SupervisedProcess {
     pub async fn spawn(spec: &SupervisedProcessSpec) -> Result<Self, ProcessSupervisionError> {
-        if !absolute_file_candidate(&spec.executable) {
+        if !is_supported_executable_file(&spec.executable) {
             return Err(ProcessSupervisionError::InvalidExecutable);
         }
         if !absolute_directory_candidate(&spec.working_directory) {
@@ -241,8 +347,12 @@ impl SupervisedProcess {
         for (name, value) in &spec.environment_overrides {
             command.env(name, value);
         }
+        #[cfg(windows)]
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
 
         let mut child = command.spawn().map_err(ProcessSupervisionError::Spawn)?;
+        let process_tree =
+            ProcessTreeGuard::new(&child).map_err(ProcessSupervisionError::ProcessTree)?;
         let stdin = child
             .stdin
             .take()
@@ -256,7 +366,10 @@ impl SupervisedProcess {
             .take()
             .ok_or(ProcessSupervisionError::MissingStdio)?;
         Ok(Self {
-            child,
+            supervised_child: SupervisedChild {
+                process_tree,
+                child,
+            },
             stdin,
             stdout: BufReader::new(stdout),
             stderr: Some(stderr),
@@ -269,19 +382,19 @@ impl SupervisedProcess {
 
     #[must_use]
     pub fn process_id(&self) -> Option<u32> {
-        self.child.id()
+        self.supervised_child.process_id()
     }
 
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
-        self.child.try_wait()
+        self.supervised_child.try_wait()
     }
 
     pub async fn terminate(&mut self) -> Result<(), std::io::Error> {
-        self.child.kill().await
+        self.supervised_child.terminate().await
     }
 
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus, std::io::Error> {
-        self.child.wait().await
+        self.supervised_child.wait().await
     }
 }
 
@@ -298,24 +411,25 @@ pub async fn run_governed_process(
         .await
         .map_err(|_| GovernedProcessError::Spawn)?;
     let SupervisedProcess {
-        mut child,
+        mut supervised_child,
         mut stdin,
         mut stdout,
         stderr,
     } = process;
     let mut stderr = stderr.ok_or(GovernedProcessError::Spawn)?;
     if stdin.write_all(request).await.is_err() || stdin.shutdown().await.is_err() {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        terminate_and_reap(&mut supervised_child).await;
         return Err(GovernedProcessError::InputDelivery);
     }
+    // `shutdown` flushes pending bytes but does not guarantee the Windows pipe
+    // handle is closed. Drop it explicitly so EOF-driven Workers can finish.
     drop(stdin);
 
     let operation = async {
         let (stdout, stderr, status) = tokio::try_join!(
             read_bounded(&mut stdout, budget.output_limit_bytes),
             read_bounded(&mut stderr, budget.output_limit_bytes),
-            child.wait(),
+            supervised_child.wait(),
         )
         .map_err(|_| GovernedProcessError::Io)?;
         if stdout.len() as u64 > budget.output_limit_bytes
@@ -336,11 +450,11 @@ pub async fn run_governed_process(
     match tokio::time::timeout(budget.timeout, operation).await {
         Ok(Ok(receipt)) => Ok(receipt),
         Ok(Err(error)) => {
-            terminate_and_reap(&mut child).await;
+            terminate_and_reap(&mut supervised_child).await;
             Err(error)
         }
         Err(_) => {
-            terminate_and_reap(&mut child).await;
+            terminate_and_reap(&mut supervised_child).await;
             Err(GovernedProcessError::Timeout)
         }
     }
@@ -379,15 +493,58 @@ async fn read_bounded(
     Ok(bytes)
 }
 
-async fn terminate_and_reap(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_none() {
-        let _ = child.kill().await;
+async fn terminate_and_reap(process: &mut SupervisedChild) {
+    if process.try_wait().ok().flatten().is_none() {
+        let _ = process.terminate().await;
     }
-    let _ = child.wait().await;
+    let _ = process.wait().await;
 }
 
-fn absolute_file_candidate(path: &Path) -> bool {
-    path.is_absolute() && path.file_name().is_some()
+#[cfg(windows)]
+use egopulse_local_ipc_platform::WindowsProcessTree as ProcessTreeGuard;
+
+#[cfg(not(windows))]
+#[derive(Debug)]
+struct ProcessTreeGuard;
+
+#[cfg(not(windows))]
+impl ProcessTreeGuard {
+    fn new(_child: &Child) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+}
+
+/// Returns whether an exact absolute path currently names a file type that the
+/// operating system can start directly. This is repeated immediately before
+/// every spawn; an earlier installer/bootstrap preflight is never treated as a
+/// permanent capability attestation.
+#[must_use]
+pub fn is_supported_executable_file(path: &Path) -> bool {
+    if !path.is_absolute() || path.file_name().is_none() || !path.is_file() {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+            return false;
+        };
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "exe" | "com" | "cmd" | "bat"
+        )
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    true
 }
 
 fn absolute_directory_candidate(path: &Path) -> bool {
@@ -405,8 +562,36 @@ mod tests {
 
     #[test]
     fn supervised_process_requires_explicit_absolute_boundaries() {
-        assert!(!absolute_file_candidate(Path::new("codex")));
+        assert!(!is_supported_executable_file(Path::new("codex")));
         assert!(!absolute_directory_candidate(Path::new(".")));
+    }
+
+    #[test]
+    fn minimal_user_environment_excludes_daemon_authority_secrets() {
+        let spec = SupervisedProcessSpec::new("codex", ".")
+            .with_minimal_user_environment()
+            .with_inherited_environment("CODEX_HOME")
+            .with_inherited_environment("CODEX_HOME");
+
+        assert!(spec.clear_environment);
+        assert!(spec.inherited_environment.iter().any(|name| name == "PATH"));
+        assert!(
+            spec.inherited_environment
+                .iter()
+                .any(|name| name == "USERPROFILE")
+        );
+        assert_eq!(
+            spec.inherited_environment
+                .iter()
+                .filter(|name| name.as_str() == "CODEX_HOME")
+                .count(),
+            1
+        );
+        assert!(
+            spec.inherited_environment
+                .iter()
+                .all(|name| !name.starts_with("EGOPULSE_") && !name.ends_with("_API_KEY"))
+        );
     }
 
     #[test]

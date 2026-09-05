@@ -461,6 +461,7 @@ mod tests {
                     policy: None,
                     verdict: None,
                     memory: Some(MemoryPrincipalKind::Founder),
+                    context: None,
                 },
                 crate::AuthorityPrincipalBinding {
                     principal_id: "governance-local".to_owned(),
@@ -468,6 +469,7 @@ mod tests {
                     policy: None,
                     verdict: None,
                     memory: Some(MemoryPrincipalKind::FounderAuthority),
+                    context: None,
                 },
             ])
             .expect("memory principal resolver"),
@@ -574,6 +576,7 @@ mod tests {
                 policy: None,
                 verdict: None,
                 memory: Some(MemoryPrincipalKind::FounderAuthority),
+                context: None,
             }])
             .expect("memory principal resolver"),
         );

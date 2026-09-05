@@ -487,6 +487,7 @@ fn create_command(acceptance: &ContractReference) -> TaskCommand {
             target_scope_ref: "scope-g4-10".to_owned(),
             acceptance_contract_ref: Some(acceptance.clone()),
             budget_profile_ref: Some(contract("budget", SHA_B)),
+            work_capability_route: None,
         })),
     }
 }

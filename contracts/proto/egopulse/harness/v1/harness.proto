@@ -192,6 +192,56 @@ enum HarnessErrorCode {
   HARNESS_ERROR_CODE_INTERNAL = 25;
 }
 
+// Closed mutation semantics for one explicitly user-visible assistant message.
+// UNSPECIFIED is always invalid for a content candidate or safe text record.
+enum ContentMutationOperation {
+  CONTENT_MUTATION_OPERATION_UNSPECIFIED = 0;
+  CONTENT_MUTATION_OPERATION_APPEND = 1;
+  CONTENT_MUTATION_OPERATION_REPLACE = 2;
+  CONTENT_MUTATION_OPERATION_FINALIZE = 3;
+}
+
+// Safe, non-secret disclosure facts. Unknown values fail closed.
+enum HarnessContentSafetyFlag {
+  HARNESS_CONTENT_SAFETY_FLAG_UNSPECIFIED = 0;
+  HARNESS_CONTENT_SAFETY_FLAG_CONTROL_REDACTED = 1;
+  HARNESS_CONTENT_SAFETY_FLAG_CREDENTIAL_REDACTED = 2;
+  HARNESS_CONTENT_SAFETY_FLAG_TRUNCATED = 3;
+  HARNESS_CONTENT_SAFETY_FLAG_PROVISIONAL = 4;
+}
+
+enum HarnessContentMarkerKind {
+  HARNESS_CONTENT_MARKER_KIND_UNSPECIFIED = 0;
+  HARNESS_CONTENT_MARKER_KIND_INVALID_TEXT = 1;
+  HARNESS_CONTENT_MARKER_KIND_FORBIDDEN_CATEGORY = 2;
+  HARNESS_CONTENT_MARKER_KIND_UNKNOWN_CATEGORY = 3;
+  HARNESS_CONTENT_MARKER_KIND_REDACTION_INPUT_UNAVAILABLE = 4;
+  HARNESS_CONTENT_MARKER_KIND_LIMIT_REACHED = 5;
+  HARNESS_CONTENT_MARKER_KIND_PROFILE_CHANGED_HISTORY_UNAVAILABLE = 6;
+  HARNESS_CONTENT_MARKER_KIND_COMPACTED = 7;
+}
+
+// Closed reason carried only by LIMIT_REACHED safe markers. The selected
+// value is part of the marker payload and stable safe-record identity;
+// UNSPECIFIED is required for every non-limit marker.
+enum HarnessContentLimitKind {
+  HARNESS_CONTENT_LIMIT_KIND_UNSPECIFIED = 0;
+  HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_TEXT_BYTES = 1;
+  HARNESS_CONTENT_LIMIT_KIND_ATTEMPT_RECORDS = 2;
+  HARNESS_CONTENT_LIMIT_KIND_TASK_TEXT_BYTES = 3;
+  HARNESS_CONTENT_LIMIT_KIND_TASK_RECORDS = 4;
+}
+
+enum HarnessContentCompactionReason {
+  HARNESS_CONTENT_COMPACTION_REASON_UNSPECIFIED = 0;
+  HARNESS_CONTENT_COMPACTION_REASON_OWNER_HISTORY_FLOOR_ADVANCED = 1;
+}
+
+enum HarnessContentRetentionReason {
+  HARNESS_CONTENT_RETENTION_REASON_UNSPECIFIED = 0;
+  HARNESS_CONTENT_RETENTION_REASON_TERMINAL_MINIMUM_EXPIRED = 1;
+}
+
 message NativeProtocolFingerprint {
   string protocol_name = 1;
   string protocol_version = 2;
@@ -212,6 +262,9 @@ message CapabilitySemantics {
   CancellationSemantics cancellation = 8;
   repeated ResumeSemantics resume = 9;
   EventOrderingGuarantee event_ordering = 10;
+  // Independent from structured_events. A Provider that leaves this
+  // unspecified is not admitted for governed assistant-text disclosure.
+  SupportLevel governed_user_visible_content = 11;
 }
 
 message CapabilityDeclaration {
@@ -305,6 +358,24 @@ message ProbeHarnessResult {
   google.protobuf.Timestamp observed_at = 6;
 }
 
+// Presence is the explicit no-catalog sentinel. It is mutually exclusive with
+// a catalog digest and therefore cannot be confused with an empty digest.
+message NoCatalogSnapshot {}
+
+// Constructed from trusted bootstrap/catalog state before Collaboration
+// commits the dispatch intent. A Provider candidate cannot author this value.
+message DispatchRouteBinding {
+  string provider_bootstrap_profile_id = 1;
+  string selected_harness_id = 2;
+  string provider_model_id = 3;
+  oneof catalog_snapshot {
+    string catalog_snapshot_sha256 = 4;
+    NoCatalogSnapshot no_catalog_snapshot = 5;
+  }
+  string capability_profile_id = 6;
+  string route_binding_sha256 = 7;
+}
+
 message DispatchEnvelope {
   egopulse.common.v1.CommandMetadata meta = 1;
   string run_id = 2;
@@ -328,6 +399,7 @@ message DispatchEnvelope {
   NativeSessionStrategy session_strategy = 20;
   optional string native_session_ref = 21;
   optional string checkpoint_ref = 22;
+  DispatchRouteBinding route_binding = 23;
 }
 
 message DispatchReceipt {
@@ -405,6 +477,197 @@ message DiagnosticObservation {
   bool recovery_required = 3;
 }
 
+// Closed proof branch resolved against the already-persisted dispatch. The
+// not-context-bound branch is validated by re-running the trusted classifier
+// over that stored envelope. The authorized branch reuses the existing R-9A
+// authorization identity and committed request digest; it does not invent a
+// bearer token or a second receipt digest.
+message NotContextBoundProof {}
+
+message AuthorizedContextConsumptionProof {
+  string authorization_id = 1;
+  string committed_request_digest_sha256 = 2;
+}
+
+message DispatchContextConsumptionProof {
+  oneof branch {
+    NotContextBoundProof not_context_bound = 1;
+    AuthorizedContextConsumptionProof authorized_context = 2;
+  }
+}
+
+// This type is inside the Adapter trust boundary. text_utf8 may contain bytes
+// that the deterministic disclosure projector later blocks or redacts.
+message AssistantTextContentCandidate {
+  string message_id = 1;
+  uint64 revision = 2;
+  uint64 previous_revision = 3;
+  ContentMutationOperation operation = 4;
+  bytes text_utf8 = 5;
+  string delta_or_snapshot_digest_sha256 = 6;
+  string previous_raw_cumulative_digest_sha256 = 7;
+  string raw_cumulative_digest_sha256 = 8;
+}
+
+message LifecycleContentCandidate {
+  LifecycleKind kind = 1;
+  SideEffectCertainty side_effect_certainty = 2;
+  optional bool native_will_retry = 3;
+}
+
+message UsageContentCandidate {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  optional uint64 cached_input_tokens = 3;
+}
+
+// Request identity/details remain exclusively in the Approval projection.
+message ApprovalRequiredContentCandidate {}
+
+// Adapter-generated classification result for a denied or unknown native
+// source. It carries a closed marker only; source bytes remain raw evidence and
+// can never cross into a safe record through this branch.
+message BlockedSourceContentCandidate {
+  HarnessContentMarkerKind reason = 1;
+}
+
+message UserVisibleContentCandidate {
+  oneof payload {
+    AssistantTextContentCandidate assistant_text = 1;
+    LifecycleContentCandidate lifecycle = 2;
+    UsageContentCandidate usage = 3;
+    ApprovalRequiredContentCandidate approval_required = 4;
+    BlockedSourceContentCandidate blocked_source = 5;
+  }
+  string candidate_digest_sha256 = 10;
+}
+
+// Paired with the outer durable HarnessObservation tuple. It carries no Task,
+// Provider or model identity supplied by the Provider candidate.
+message HarnessContentSignalObservation {
+  string content_event_id = 1;
+  string delivered_receipt_id = 2;
+  string delivered_receipt_digest_sha256 = 3;
+  string dispatch_route_binding_sha256 = 4;
+  DispatchContextConsumptionProof context_consumption_proof = 5;
+  UserVisibleContentCandidate candidate = 6;
+}
+
+// The following payloads have crossed the deterministic safe-record boundary.
+// They deliberately omit raw evidence, native routing/session identifiers,
+// raw cumulative digests and credential material.
+message SafeAssistantTextContent {
+  string safe_message_id = 1;
+  uint64 revision = 2;
+  uint64 previous_revision = 3;
+  ContentMutationOperation operation = 4;
+  string safe_text_utf8 = 5;
+  string safe_cumulative_digest_sha256 = 6;
+  uint32 part_index = 7;
+  uint32 part_count = 8;
+}
+
+message SafeLifecycleContent {
+  LifecycleKind kind = 1;
+  SideEffectCertainty side_effect_certainty = 2;
+  optional bool native_will_retry = 3;
+}
+
+message SafeUsageContent {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  optional uint64 cached_input_tokens = 3;
+}
+
+message SafeApprovalRequiredContent {}
+
+message SafeArtifactIdentity {
+  string artifact_id = 1;
+  string artifact_digest_sha256 = 2;
+}
+
+message SafeArtifactRelationContent {
+  bool safe_content_differs_from_artifact = 1;
+  // Owner-side immutable identity. Per-principal visibility is applied only by
+  // the Local API and is never persisted as an Adapter disclosure choice.
+  SafeArtifactIdentity artifact = 2;
+}
+
+message SafeContentMarker {
+  HarnessContentMarkerKind kind = 1;
+  HarnessContentLimitKind limit_kind = 2;
+}
+
+// Adapter Edge owns this exact safe record and its replay identity. Internal
+// lineage is trusted-store derived, never copied from the Provider candidate.
+message SafeHarnessContentRecord {
+  string record_id = 1;
+  string record_digest_sha256 = 2;
+  string content_event_id = 3;
+  string task_id = 4;
+  string run_id = 5;
+  string step_id = 6;
+  string attempt_id = 7;
+  string dispatch_id = 8;
+  uint64 fencing_token = 9;
+  string route_binding_sha256 = 10;
+  egopulse.common.v1.ContractReference disclosure_profile_ref = 11;
+  string provider_family_alias = 12;
+  string model_alias = 13;
+  string collaboration_role = 14;
+  repeated HarnessContentSafetyFlag safety_flags = 15;
+  oneof payload {
+    SafeAssistantTextContent assistant_text = 30;
+    SafeLifecycleContent lifecycle = 31;
+    SafeUsageContent usage = 32;
+    SafeApprovalRequiredContent approval_required = 33;
+    SafeArtifactRelationContent artifact_relation = 34;
+    SafeContentMarker marker = 35;
+  }
+}
+
+// Owner-side compaction fact emitted only after the current-message/baseline
+// snapshot and history floor advance commit atomically. It carries no text.
+message HarnessContentHistoryCompactionRecord {
+  string compaction_record_id = 1;
+  string compaction_record_digest_sha256 = 2;
+  string task_id = 3;
+  string attempt_id = 4;
+  string final_epoch = 5;
+  uint64 final_sequence = 6;
+  string final_safe_content_digest_sha256 = 7;
+  string owner_snapshot_digest_sha256 = 8;
+  egopulse.common.v1.ContractReference disclosure_profile_ref = 9;
+  google.protobuf.Timestamp compacted_at = 10;
+  HarnessContentCompactionReason reason = 11;
+}
+
+// Terminal-retention tombstone. It is sufficient to prevent a rebuild from
+// resurrecting expired content and deliberately contains no source or text.
+message HarnessContentRetentionTombstone {
+  string tombstone_id = 1;
+  string tombstone_digest_sha256 = 2;
+  string task_id = 3;
+  string attempt_id = 4;
+  string final_epoch = 5;
+  uint64 final_sequence = 6;
+  string final_safe_content_digest_sha256 = 7;
+  egopulse.common.v1.ContractReference disclosure_profile_ref = 8;
+  google.protobuf.Timestamp terminal_committed_at = 9;
+  google.protobuf.Timestamp compacted_at = 10;
+  HarnessContentRetentionReason reason = 11;
+}
+
+// Exact acknowledged-outbox payload. Closed branches prevent a consumer from
+// interpreting a history floor or retention tombstone as display content.
+message SafeHarnessContentProjectionEvent {
+  oneof payload {
+    SafeHarnessContentRecord content_record = 1;
+    HarnessContentHistoryCompactionRecord history_compaction = 2;
+    HarnessContentRetentionTombstone retention_tombstone = 3;
+  }
+}
+
 message HarnessObservation {
   string observation_id = 1;
   string adapter_id = 2;
@@ -428,6 +691,7 @@ message HarnessObservation {
     CheckpointObservation checkpoint = 24;
     ArtifactReturnObservation artifact_return = 25;
     DiagnosticObservation diagnostic = 26;
+    HarnessContentSignalObservation content_signal = 27;
   }
 }
 

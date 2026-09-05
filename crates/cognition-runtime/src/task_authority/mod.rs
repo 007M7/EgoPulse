@@ -8,8 +8,9 @@ mod store;
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::task::v1::{
     ApplyFounderVerdictCommand, CreateTaskCommand, FounderDecision, GetTaskResponse,
-    ReviseTaskCommand, TaskCommand, TaskCommandResult, TaskError, TaskErrorCode, TaskEvent,
-    TaskEventKind, TaskSnapshot, TaskStatus, get_task_response, task_command, task_command_result,
+    RequestTaskCancellationCommand, ReviseTaskCommand, TaskCommand, TaskCommandResult, TaskError,
+    TaskErrorCode, TaskEvent, TaskEventKind, TaskSnapshot, TaskStatus, get_task_response,
+    task_command, task_command_result,
 };
 use egopulse_domain_contracts::v01::egopulse::verdict::v1::{
     ConsumeFounderVerdictCommand, VerdictCommand, verdict_command,
@@ -41,6 +42,15 @@ impl SqlCipherKey {
 
     pub(crate) fn expose(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Creates a related-store key without exposing key bytes to callers.
+    /// Context Authority is a sibling local store in the same installation;
+    /// composition code may use this method to bind it to the same protected
+    /// key material while keeping the bytes opaque.
+    #[must_use]
+    pub fn duplicate_for_related_store(&self) -> Self {
+        Self(self.0)
     }
 }
 
@@ -210,9 +220,9 @@ impl TaskAuthority {
         })
     }
 
-    /// Executes one frozen Task command. Only CreateTask reaches a mutation in
-    /// G4-02; other operations fail closed after the applicable front-door
-    /// checks until their cross-domain proof is implemented.
+    /// Executes one frozen Task command. Task creation and the bounded
+    /// cancellation-request transition are local Authority mutations; other
+    /// operations fail closed until their cross-domain proof is implemented.
     pub fn execute(
         &mut self,
         command: &TaskCommand,
@@ -329,7 +339,12 @@ impl TaskAuthority {
             | Some(task_command::Command::SubmitTaskEvidence(_))
             | Some(task_command::Command::RecordTaskVerification(_))
             | Some(task_command::Command::ApplyFounderVerdict(_))
-            | Some(task_command::Command::ReviseTask(_)) => {
+            | Some(task_command::Command::ReviseTask(_))
+            | Some(task_command::Command::InterruptTask(_))
+            | Some(task_command::Command::HoldTask(_))
+            | Some(task_command::Command::ResumeTask(_))
+            | Some(task_command::Command::RequestTaskCancellation(_))
+            | Some(task_command::Command::RecordTaskCancellationOutcome(_)) => {
                 self.commit_transition(command, principal, &actual_digest)
             }
             Some(_) => Ok(error_result(
@@ -363,6 +378,18 @@ impl TaskAuthority {
         Ok(GetTaskResponse {
             outcome: Some(outcome),
         })
+    }
+
+    /// Resolves the principal that durably created a Task. This read-only
+    /// owner fact is used by Local API scope enforcement; it does not grant a
+    /// caller access to the Task Authority store or permit any write.
+    pub fn task_owner_principal_id(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<String>, TaskAuthorityFailure> {
+        self.store
+            .task_owner_principal_id(task_id)
+            .map_err(TaskAuthorityFailure::from)
     }
 
     pub fn inspect_store(&self) -> Result<TaskStoreInspection, TaskAuthorityFailure> {
@@ -558,6 +585,7 @@ impl TaskAuthority {
             hold_reason_code: None,
             created_at: Some(now),
             updated_at: Some(now),
+            work_capability_route: command.work_capability_route.clone(),
         };
         let event = TaskEvent {
             event_id: event_id.clone(),
@@ -769,6 +797,108 @@ impl TaskAuthority {
                 (
                     TaskEventKind::Revised,
                     vec![value.new_input_snapshot_id.clone()],
+                    None,
+                )
+            }
+            Some(task_command::Command::RequestTaskCancellation(value)) => {
+                if !request_task_cancellation_structure_is_complete(value)
+                    || !matches!(
+                        current.status,
+                        status if status == TaskStatus::Ready as i32
+                            || status == TaskStatus::Active as i32
+                    )
+                {
+                    return Ok(error_result(
+                        TaskErrorCode::StateConflict,
+                        "CANCELLATION_PRECONDITION_FAILED",
+                        Some(current.revision),
+                    ));
+                }
+                next.status = TaskStatus::CancellationPending as i32;
+                (
+                    TaskEventKind::CancellationRequested,
+                    vec![format!("cancellation-reason:{}", value.reason_code)],
+                    None,
+                )
+            }
+            Some(task_command::Command::InterruptTask(value)) => {
+                if current.status != TaskStatus::Active as i32
+                    || value.interruption_evidence_id.trim().is_empty()
+                {
+                    return Ok(error_result(
+                        TaskErrorCode::StateConflict,
+                        "INTERRUPT_PRECONDITION_FAILED",
+                        Some(current.revision),
+                    ));
+                }
+                next.status = TaskStatus::Interrupted as i32;
+                (
+                    TaskEventKind::Interrupted,
+                    vec![format!("interruption:{}", value.interruption_evidence_id)],
+                    None,
+                )
+            }
+            Some(task_command::Command::HoldTask(value)) => {
+                if current.status != TaskStatus::Active as i32
+                    || value.hold_reason_code.trim().is_empty()
+                    || value.recovery_evidence_id.trim().is_empty()
+                {
+                    return Ok(error_result(
+                        TaskErrorCode::StateConflict,
+                        "HOLD_PRECONDITION_FAILED",
+                        Some(current.revision),
+                    ));
+                }
+                next.status = TaskStatus::Held as i32;
+                (
+                    TaskEventKind::Held,
+                    vec![
+                        format!("hold-reason:{}", value.hold_reason_code),
+                        format!("recovery:{}", value.recovery_evidence_id),
+                    ],
+                    None,
+                )
+            }
+            Some(task_command::Command::ResumeTask(value)) => {
+                // Interruption and hold only leave an Active task, so Active is
+                // the only honest resume target the current state machine can
+                // restore without inventing a second execution continuation.
+                if (current.status != TaskStatus::Interrupted as i32
+                    && current.status != TaskStatus::Held as i32)
+                    || value.expected_resume_status != TaskStatus::Active as i32
+                    || value.recovery_evidence_id.trim().is_empty()
+                {
+                    return Ok(error_result(
+                        TaskErrorCode::StateConflict,
+                        "RESUME_PRECONDITION_FAILED",
+                        Some(current.revision),
+                    ));
+                }
+                next.status = TaskStatus::Active as i32;
+                (
+                    TaskEventKind::Resumed,
+                    vec![format!("recovery:{}", value.recovery_evidence_id)],
+                    None,
+                )
+            }
+            Some(task_command::Command::RecordTaskCancellationOutcome(value)) => {
+                if current.status != TaskStatus::CancellationPending as i32
+                    || value.outcome != TaskStatus::Cancelled as i32
+                    || value.cancellation_receipt_id.trim().is_empty()
+                {
+                    return Ok(error_result(
+                        TaskErrorCode::StateConflict,
+                        "CANCELLATION_OUTCOME_PRECONDITION_FAILED",
+                        Some(current.revision),
+                    ));
+                }
+                next.status = TaskStatus::Cancelled as i32;
+                (
+                    TaskEventKind::CancellationRecorded,
+                    vec![format!(
+                        "cancellation-receipt:{}",
+                        value.cancellation_receipt_id
+                    )],
                     None,
                 )
             }
@@ -1036,6 +1166,12 @@ fn revise_structure_complete(command: &ReviseTaskCommand) -> bool {
             .new_acceptance_contract_ref
             .as_ref()
             .is_some_and(contract_reference_is_complete)
+}
+
+fn request_task_cancellation_structure_is_complete(
+    command: &RequestTaskCancellationCommand,
+) -> bool {
+    !command.task_id.trim().is_empty() && !command.reason_code.trim().is_empty()
 }
 
 fn build_consume_verdict_command(

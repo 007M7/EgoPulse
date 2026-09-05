@@ -11,5 +11,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+egopulse-local-ipc-platform.workspace = true
+windows-sys = { version = "=0.61.2", features = ["Win32_System_Threading"] }
+
 [lib]
 path = "src/lib.rs"

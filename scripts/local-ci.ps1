@@ -1,5 +1,6 @@
 param(
-    [string]$EvidenceDirectory = '.local-ci/evidence'
+    [string]$EvidenceDirectory = '.local-ci/evidence',
+    [switch]$IncludeDesktop
 )
 
 $ErrorActionPreference = 'Stop'
@@ -22,9 +23,21 @@ function Invoke-External {
         [Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments
     )
 
-    & $Command @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "Command failed with exit code $LASTEXITCODE`: $Command $($Arguments -join ' ')"
+    # Native tools commonly write harmless diagnostics (for example Git's
+    # line-ending warning) to stderr.  With Stop enabled PowerShell promotes
+    # that stream to an exception before the process exit code is inspected.
+    # The local gate contract is process-exit based, so preserve the stream
+    # while treating only a non-zero exit code as command failure.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $Command @Arguments
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
+        throw "Command failed with exit code $exitCode`: $Command $($Arguments -join ' ')"
     }
 }
 
@@ -92,18 +105,29 @@ try {
     }
 
     Invoke-GateStep 'locked-node-manifest' {
-        # Local CI must not tear down/recreate node_modules on every run. The
-        # frozen dry-run validates lockfile consistency; a clean checkout can
-        # perform the explicit one-time `pnpm install --frozen-lockfile`.
-        Invoke-External pnpm install --frozen-lockfile --lockfile-only --ignore-scripts --dry-run --reporter=append-only
+        # Do not invoke pnpm install from CI: pnpm 11 may remove workspace
+        # links even in lockfile-only mode on Windows. A clean checkout must
+        # run `pnpm install --frozen-lockfile` once before CI; this gate only
+        # proves that the installed manifest is present and usable.
+        if (-not (Test-Path -LiteralPath (Join-Path $repoRoot 'node_modules\.modules.yaml'))) {
+            throw 'Root pnpm manifest is missing; run pnpm install --frozen-lockfile once'
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $repoRoot 'node_modules\.pnpm'))) {
+            throw 'pnpm virtual store is missing; run pnpm install --frozen-lockfile once'
+        }
+        Write-Output 'node_workspace_manifest=present'
     }
 
     Invoke-GateStep 'contracts-boundaries-typescript' {
         Invoke-External pnpm run check
     }
 
-    Invoke-GateStep 'desktop-frontend' {
-        Invoke-External pnpm --filter '@egopulse/desktop' run build
+    if ($IncludeDesktop) {
+        Invoke-GateStep 'desktop-frontend' {
+            Invoke-External pnpm --filter '@egopulse/desktop' run build
+        }
+    } else {
+        Write-Output 'local_ci_step=skipped name=desktop-frontend reason=phase-one-cli-tui-scope'
     }
 
     Invoke-GateStep 'rust-workspace' {

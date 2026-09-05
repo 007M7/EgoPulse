@@ -10,10 +10,13 @@ use egopulse_domain_contracts::v01::egopulse::{
         RunCommandBase, RunPlan, collaboration_command, collaboration_command_result,
     },
     common::v1::{CommandMetadata, ContractReference},
-    harness::v1::DispatchEnvelope,
+    harness::v1::{
+        DispatchEnvelope, DispatchRouteBinding, NoCatalogSnapshot, dispatch_route_binding,
+    },
     task::v1::TaskSnapshot,
 };
 use prost_types::Timestamp;
+use sha2::Digest;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -44,6 +47,81 @@ pub struct SingleHarnessWorkResult {
     pub envelope: DispatchEnvelope,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedDispatchRouteProfile {
+    pub provider_bootstrap_profile_id: String,
+    pub selected_harness_id: String,
+    pub provider_model_id: String,
+    pub catalog_snapshot_sha256: Option<String>,
+    pub capability_profile_id: String,
+}
+
+pub fn build_dispatch_route_binding(
+    profile: &TrustedDispatchRouteProfile,
+) -> Result<DispatchRouteBinding, SingleHarnessWorkError> {
+    if profile.provider_bootstrap_profile_id.trim().is_empty()
+        || profile.selected_harness_id.trim().is_empty()
+        || profile.provider_model_id.trim().is_empty()
+        || profile.capability_profile_id.trim().is_empty()
+        || profile
+            .catalog_snapshot_sha256
+            .as_ref()
+            .is_some_and(|digest| !is_sha256(digest))
+    {
+        return Err(SingleHarnessWorkError::InvalidConfiguration(
+            "dispatch route profile",
+        ));
+    }
+    let catalog_snapshot = match &profile.catalog_snapshot_sha256 {
+        Some(digest) => {
+            dispatch_route_binding::CatalogSnapshot::CatalogSnapshotSha256(digest.clone())
+        }
+        None => dispatch_route_binding::CatalogSnapshot::NoCatalogSnapshot(NoCatalogSnapshot {}),
+    };
+    let mut binding = DispatchRouteBinding {
+        provider_bootstrap_profile_id: profile.provider_bootstrap_profile_id.clone(),
+        selected_harness_id: profile.selected_harness_id.clone(),
+        provider_model_id: profile.provider_model_id.clone(),
+        capability_profile_id: profile.capability_profile_id.clone(),
+        route_binding_sha256: String::new(),
+        catalog_snapshot: Some(catalog_snapshot),
+    };
+    binding.route_binding_sha256 = canonical_route_binding_digest(&binding)?;
+    Ok(binding)
+}
+
+pub fn canonical_route_binding_digest(
+    binding: &DispatchRouteBinding,
+) -> Result<String, SingleHarnessWorkError> {
+    let (catalog_kind, catalog_value) = match binding.catalog_snapshot.as_ref() {
+        Some(dispatch_route_binding::CatalogSnapshot::CatalogSnapshotSha256(digest))
+            if is_sha256(digest) =>
+        {
+            ("DIGEST", digest.as_str())
+        }
+        Some(dispatch_route_binding::CatalogSnapshot::NoCatalogSnapshot(_)) => ("NO_CATALOG", ""),
+        _ => {
+            return Err(SingleHarnessWorkError::InvalidConfiguration(
+                "dispatch route catalog snapshot",
+            ));
+        }
+    };
+    let mut canonical = Vec::new();
+    for value in [
+        "egopulse/harness-content/route-binding/v1",
+        binding.provider_bootstrap_profile_id.as_str(),
+        binding.selected_harness_id.as_str(),
+        binding.provider_model_id.as_str(),
+        catalog_kind,
+        catalog_value,
+        binding.capability_profile_id.as_str(),
+    ] {
+        canonical.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(value.as_bytes());
+    }
+    Ok(hex::encode(sha2::Sha256::digest(canonical)))
+}
+
 #[derive(Debug, Error)]
 pub enum SingleHarnessWorkError {
     #[error("collaboration control operation failed")]
@@ -69,7 +147,35 @@ where
     G: CollaborationReferenceGuard + HarnessEvidenceResolver,
     C: AuthorityClock,
 {
+    start_single_harness_workflow_with_route_binding(control, task, config, None)
+}
+
+pub(crate) fn start_single_harness_workflow_with_route_binding<G, C>(
+    control: &mut CollaborationControl<G, C>,
+    task: &TaskSnapshot,
+    config: &SingleHarnessWorkConfig,
+    route_binding: Option<&DispatchRouteBinding>,
+) -> Result<SingleHarnessWorkResult, SingleHarnessWorkError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+{
     validate_config(task, config)?;
+    if config.material.route_binding.as_ref() != route_binding {
+        return Err(SingleHarnessWorkError::InvalidConfiguration(
+            "dispatch route material",
+        ));
+    }
+    if let Some(binding) = route_binding {
+        let digest = canonical_route_binding_digest(binding)?;
+        if binding.route_binding_sha256 != digest
+            || binding.capability_profile_id != config.capability_profile_ref.contract_id
+        {
+            return Err(SingleHarnessWorkError::InvalidConfiguration(
+                "dispatch route binding",
+            ));
+        }
+    }
     let step_id = config.plan.steps[0].step_id.clone();
     let task_principal = principal(
         CollaborationPrincipalKind::TaskAuthority,
@@ -346,6 +452,7 @@ fn dispatch_intent_command(
         session_strategy: config.material.session_strategy as i32,
         native_session_ref: config.material.native_session_ref.clone(),
         checkpoint_ref: config.material.checkpoint_ref.clone(),
+        route_binding: config.material.route_binding.clone(),
     };
     let fingerprint = canonical_dispatch_fingerprint(&envelope);
     envelope.dispatch_fingerprint = fingerprint.clone();
@@ -370,6 +477,13 @@ fn dispatch_intent_command(
     };
     seal_request_digest(&mut command).ok_or(SingleHarnessWorkError::MissingSnapshot)?;
     Ok(command)
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn snapshot_after<G, C>(

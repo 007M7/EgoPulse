@@ -131,6 +131,11 @@ pub struct DshAcpDriver {
     config: DshAcpConfig,
     session: Option<DshSession>,
     active: Option<ActiveDispatch>,
+    /// Any native terminal response closes event polling for this dispatch.
+    /// This is deliberately separate from successful completion because
+    /// cancelled or failed executions must not expose partial output as a
+    /// terminal Artifact candidate.
+    terminal_dispatch_id: Option<String>,
     completed_dispatch_id: Option<String>,
     pending_approvals: HashMap<String, PendingApproval>,
 }
@@ -142,9 +147,16 @@ impl DshAcpDriver {
             config,
             session: None,
             active: None,
+            terminal_dispatch_id: None,
             completed_dispatch_id: None,
             pending_approvals: HashMap::new(),
         }
+    }
+
+    fn record_terminal_dispatch(&mut self, dispatch_id: &str, kind: LifecycleKind) {
+        self.terminal_dispatch_id = Some(dispatch_id.to_owned());
+        self.completed_dispatch_id =
+            (kind == LifecycleKind::ExecutionCompleted).then(|| dispatch_id.to_owned());
     }
 
     /// Performs the ACP initialize plus session creation probe without a
@@ -245,7 +257,7 @@ impl NativeHarnessDriver for DshAcpDriver {
     ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
         Box::pin(async move {
             if self.active.is_some()
-                && self.completed_dispatch_id.as_deref()
+                && self.terminal_dispatch_id.as_deref()
                     != self.active.as_ref().map(|value| value.dispatch_id.as_str())
             {
                 return Err(dependency_error("DSH_ACP_ACTIVE_DISPATCH_EXISTS"));
@@ -278,6 +290,7 @@ impl NativeHarnessDriver for DshAcpDriver {
                 output_text: String::new(),
                 output_candidate_taken: false,
             });
+            self.terminal_dispatch_id = None;
             self.completed_dispatch_id = None;
             Ok(DriverDelivery {
                 native_request_ref: format!("dsh-acp-jsonrpc:{request_id}"),
@@ -293,7 +306,7 @@ impl NativeHarnessDriver for DshAcpDriver {
         envelope: &'a DispatchEnvelope,
     ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
         Box::pin(async move {
-            if self.completed_dispatch_id.as_deref() == Some(envelope.dispatch_id.as_str()) {
+            if self.terminal_dispatch_id.as_deref() == Some(envelope.dispatch_id.as_str()) {
                 return Ok(None);
             }
             // A native permission request is a governance handoff. The worker
@@ -361,13 +374,17 @@ impl NativeHarnessDriver for DshAcpDriver {
                                 (LifecycleKind::ExecutionInterrupted, "cancelled")
                             }
                             _ => {
+                                self.record_terminal_dispatch(
+                                    &dispatch_id,
+                                    LifecycleKind::ExecutionFailed,
+                                );
                                 return Err(driver_error(
                                     "DSH_ACP_TERMINAL_STATUS_UNKNOWN",
                                     line.as_bytes(),
                                 ));
                             }
                         };
-                        self.completed_dispatch_id = Some(dispatch_id);
+                        self.record_terminal_dispatch(&dispatch_id, kind);
                         return Ok(Some(lifecycle_event(
                             "session/prompt",
                             kind,
@@ -378,6 +395,7 @@ impl NativeHarnessDriver for DshAcpDriver {
                     DshAcpMessage::Response(DshAcpResponse::Error { id, .. })
                         if id.as_ref().and_then(Value::as_u64) == Some(prompt_request_id) =>
                     {
+                        self.record_terminal_dispatch(&dispatch_id, LifecycleKind::ExecutionFailed);
                         return Ok(Some(lifecycle_event(
                             "session/prompt",
                             LifecycleKind::ExecutionFailed,
@@ -651,14 +669,20 @@ fn select_permission_option(params: &Value, accepted_kinds: &[&str]) -> Result<V
 }
 
 async fn spawn_process(config: &DshAcpConfig) -> Result<SupervisedProcess, DriverError> {
-    let mut spec = SupervisedProcessSpec::new(&config.executable, &config.working_directory);
+    SupervisedProcess::spawn(&process_spec(config))
+        .await
+        .map_err(|error| driver_error("DSH_ACP_SPAWN_FAILED", format!("{error:?}").as_bytes()))
+}
+
+fn process_spec(config: &DshAcpConfig) -> SupervisedProcessSpec {
+    let mut spec = SupervisedProcessSpec::new(&config.executable, &config.working_directory)
+        .with_minimal_user_environment()
+        .with_inherited_environment("DSH_HOME");
     spec.arguments = config.arguments.clone();
     for (name, value) in &config.environment_overrides {
         spec = spec.with_environment_override(name.clone(), value.clone());
     }
-    SupervisedProcess::spawn(&spec)
-        .await
-        .map_err(|error| driver_error("DSH_ACP_SPAWN_FAILED", format!("{error:?}").as_bytes()))
+    spec
 }
 
 fn initialize_request() -> Vec<u8> {
@@ -905,6 +929,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_environment_is_isolated_and_credentials_are_explicit() {
+        let config = DshAcpConfig::new(r"C:\dsh.exe", r"C:\workspace")
+            .with_environment_override("DEEPSEEK_API_KEY", "managed-secret");
+        let spec = process_spec(&config);
+
+        assert!(spec.clear_environment);
+        assert!(
+            spec.inherited_environment
+                .iter()
+                .all(|name| !name.starts_with("EGOPULSE_") && !name.ends_with("_API_KEY"))
+        );
+        assert_eq!(
+            spec.environment_overrides,
+            vec![("DEEPSEEK_API_KEY".to_owned(), "managed-secret".to_owned())]
+        );
+    }
+
+    #[test]
     fn initialize_response_is_reachable_but_not_probe_verified_without_schema_digest() {
         let result = parse_initialize_response(
             br#"{"jsonrpc":"2.0","id":1,"result":{"agentInfo":{"name":"deepseek-harness-acp","version":"0.0.1"},"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false}},"authMethods":[]}}"#,
@@ -1107,7 +1149,10 @@ mod tests {
             output_text: "committed answer".to_owned(),
             output_candidate_taken: false,
         });
-        driver.completed_dispatch_id = Some("dispatch:dsh-output-candidate".to_owned());
+        driver.record_terminal_dispatch(
+            "dispatch:dsh-output-candidate",
+            LifecycleKind::ExecutionCompleted,
+        );
         let envelope = DispatchEnvelope {
             dispatch_id: "dispatch:dsh-output-candidate".to_owned(),
             ..DispatchEnvelope::default()
@@ -1129,5 +1174,46 @@ mod tests {
                 .expect("replay candidate extraction")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn non_success_terminal_closes_polling_without_exposing_partial_output() {
+        for kind in [
+            LifecycleKind::ExecutionInterrupted,
+            LifecycleKind::ExecutionFailed,
+        ] {
+            let dispatch_id = format!("dispatch:dsh-non-success-{kind:?}");
+            let mut driver = DshAcpDriver::new(DshAcpConfig::new(
+                r"C:\dsh.exe",
+                std::env::current_dir().expect("cwd"),
+            ));
+            driver.active = Some(ActiveDispatch {
+                dispatch_id: dispatch_id.clone(),
+                native_session_ref: "dsh-session-non-success".to_owned(),
+                prompt_request_id: 42,
+                output_text: "partial output must not become an Artifact".to_owned(),
+                output_candidate_taken: false,
+            });
+            driver.record_terminal_dispatch(&dispatch_id, kind);
+            let envelope = DispatchEnvelope {
+                dispatch_id,
+                ..DispatchEnvelope::default()
+            };
+
+            assert!(
+                driver
+                    .next_event(&envelope)
+                    .await
+                    .expect("terminal dispatch must drain without another native read")
+                    .is_none()
+            );
+            assert!(
+                driver
+                    .take_terminal_output_candidate(&envelope)
+                    .await
+                    .expect("non-success candidate check")
+                    .is_none()
+            );
+        }
     }
 }

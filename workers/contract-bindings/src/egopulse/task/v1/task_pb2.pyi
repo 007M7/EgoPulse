@@ -119,8 +119,34 @@ TASK_ERROR_CODE_RESOURCE_EXHAUSTED: TaskErrorCode
 TASK_ERROR_CODE_RECOVERY_REQUIRED: TaskErrorCode
 TASK_ERROR_CODE_INTERNAL: TaskErrorCode
 
+class WorkCapabilityRouteBinding(_message.Message):
+    __slots__ = ("route_id", "route_generation", "provider_profile_id", "provider_id", "harness_id", "harness_model_id", "provider_model_id", "capability_profile_ref", "catalog_snapshot_sha256", "native_composition_generation", "route_binding_sha256")
+    ROUTE_ID_FIELD_NUMBER: _ClassVar[int]
+    ROUTE_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    PROVIDER_PROFILE_ID_FIELD_NUMBER: _ClassVar[int]
+    PROVIDER_ID_FIELD_NUMBER: _ClassVar[int]
+    HARNESS_ID_FIELD_NUMBER: _ClassVar[int]
+    HARNESS_MODEL_ID_FIELD_NUMBER: _ClassVar[int]
+    PROVIDER_MODEL_ID_FIELD_NUMBER: _ClassVar[int]
+    CAPABILITY_PROFILE_REF_FIELD_NUMBER: _ClassVar[int]
+    CATALOG_SNAPSHOT_SHA256_FIELD_NUMBER: _ClassVar[int]
+    NATIVE_COMPOSITION_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    ROUTE_BINDING_SHA256_FIELD_NUMBER: _ClassVar[int]
+    route_id: str
+    route_generation: int
+    provider_profile_id: str
+    provider_id: str
+    harness_id: str
+    harness_model_id: str
+    provider_model_id: str
+    capability_profile_ref: _common_pb2.ContractReference
+    catalog_snapshot_sha256: str
+    native_composition_generation: str
+    route_binding_sha256: str
+    def __init__(self, route_id: _Optional[str] = ..., route_generation: _Optional[int] = ..., provider_profile_id: _Optional[str] = ..., provider_id: _Optional[str] = ..., harness_id: _Optional[str] = ..., harness_model_id: _Optional[str] = ..., provider_model_id: _Optional[str] = ..., capability_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., catalog_snapshot_sha256: _Optional[str] = ..., native_composition_generation: _Optional[str] = ..., route_binding_sha256: _Optional[str] = ...) -> None: ...
+
 class TaskSnapshot(_message.Message):
-    __slots__ = ("task_id", "revision", "work_revision", "status", "resume_status", "work_type", "input_snapshot_id", "target_scope_ref", "acceptance_contract_ref", "budget_profile_ref", "current_run_id", "artifact_set_id", "verification_artifact_id", "founder_verdict_id", "hold_reason_code", "created_at", "updated_at")
+    __slots__ = ("task_id", "revision", "work_revision", "status", "resume_status", "work_type", "input_snapshot_id", "target_scope_ref", "acceptance_contract_ref", "budget_profile_ref", "current_run_id", "artifact_set_id", "verification_artifact_id", "founder_verdict_id", "hold_reason_code", "created_at", "updated_at", "work_capability_route")
     TASK_ID_FIELD_NUMBER: _ClassVar[int]
     REVISION_FIELD_NUMBER: _ClassVar[int]
     WORK_REVISION_FIELD_NUMBER: _ClassVar[int]
@@ -138,6 +164,7 @@ class TaskSnapshot(_message.Message):
     HOLD_REASON_CODE_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_FIELD_NUMBER: _ClassVar[int]
     UPDATED_AT_FIELD_NUMBER: _ClassVar[int]
+    WORK_CAPABILITY_ROUTE_FIELD_NUMBER: _ClassVar[int]
     task_id: str
     revision: int
     work_revision: int
@@ -155,23 +182,26 @@ class TaskSnapshot(_message.Message):
     hold_reason_code: str
     created_at: _timestamp_pb2.Timestamp
     updated_at: _timestamp_pb2.Timestamp
-    def __init__(self, task_id: _Optional[str] = ..., revision: _Optional[int] = ..., work_revision: _Optional[int] = ..., status: _Optional[_Union[TaskStatus, str]] = ..., resume_status: _Optional[_Union[TaskStatus, str]] = ..., work_type: _Optional[str] = ..., input_snapshot_id: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., current_run_id: _Optional[str] = ..., artifact_set_id: _Optional[str] = ..., verification_artifact_id: _Optional[str] = ..., founder_verdict_id: _Optional[str] = ..., hold_reason_code: _Optional[str] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+    work_capability_route: WorkCapabilityRouteBinding
+    def __init__(self, task_id: _Optional[str] = ..., revision: _Optional[int] = ..., work_revision: _Optional[int] = ..., status: _Optional[_Union[TaskStatus, str]] = ..., resume_status: _Optional[_Union[TaskStatus, str]] = ..., work_type: _Optional[str] = ..., input_snapshot_id: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., current_run_id: _Optional[str] = ..., artifact_set_id: _Optional[str] = ..., verification_artifact_id: _Optional[str] = ..., founder_verdict_id: _Optional[str] = ..., hold_reason_code: _Optional[str] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., work_capability_route: _Optional[_Union[WorkCapabilityRouteBinding, _Mapping]] = ...) -> None: ...
 
 class CreateTaskCommand(_message.Message):
-    __slots__ = ("meta", "work_type", "input_snapshot_id", "target_scope_ref", "acceptance_contract_ref", "budget_profile_ref")
+    __slots__ = ("meta", "work_type", "input_snapshot_id", "target_scope_ref", "acceptance_contract_ref", "budget_profile_ref", "work_capability_route")
     META_FIELD_NUMBER: _ClassVar[int]
     WORK_TYPE_FIELD_NUMBER: _ClassVar[int]
     INPUT_SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
     TARGET_SCOPE_REF_FIELD_NUMBER: _ClassVar[int]
     ACCEPTANCE_CONTRACT_REF_FIELD_NUMBER: _ClassVar[int]
     BUDGET_PROFILE_REF_FIELD_NUMBER: _ClassVar[int]
+    WORK_CAPABILITY_ROUTE_FIELD_NUMBER: _ClassVar[int]
     meta: _common_pb2.CommandMetadata
     work_type: str
     input_snapshot_id: str
     target_scope_ref: str
     acceptance_contract_ref: _common_pb2.ContractReference
     budget_profile_ref: _common_pb2.ContractReference
-    def __init__(self, meta: _Optional[_Union[_common_pb2.CommandMetadata, _Mapping]] = ..., work_type: _Optional[str] = ..., input_snapshot_id: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ...) -> None: ...
+    work_capability_route: WorkCapabilityRouteBinding
+    def __init__(self, meta: _Optional[_Union[_common_pb2.CommandMetadata, _Mapping]] = ..., work_type: _Optional[str] = ..., input_snapshot_id: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., work_capability_route: _Optional[_Union[WorkCapabilityRouteBinding, _Mapping]] = ...) -> None: ...
 
 class ActivateTaskCommand(_message.Message):
     __slots__ = ("meta", "task_id", "expected_revision", "work_revision", "run_id")

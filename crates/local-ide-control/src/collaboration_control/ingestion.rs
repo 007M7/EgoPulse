@@ -42,12 +42,17 @@ where
                 None,
             )));
         }
-        if DeliveryDisposition::try_from(receipt.disposition) != Ok(DeliveryDisposition::Delivered)
-        {
-            return Ok(HarnessFactIngestionResult {
-                disposition: HarnessFactIngestionDisposition::RetainedForDependency,
-                authority_result: None,
-            });
+        match DeliveryDisposition::try_from(receipt.disposition) {
+            Ok(DeliveryDisposition::Unknown) => {
+                return self.hold_unknown_delivery_receipt(receipt);
+            }
+            Ok(DeliveryDisposition::Delivered) => {}
+            _ => {
+                return Ok(HarnessFactIngestionResult {
+                    disposition: HarnessFactIngestionDisposition::RetainedForDependency,
+                    authority_result: None,
+                });
+            }
         }
         let source_evidence = format!("delivery-receipt-digest:{}", receipt.receipt_digest_sha256);
         if let Some(result) = self.replay_harness_source(
@@ -80,6 +85,55 @@ where
         seal_ingestion_command(&mut command);
         let result = self.execute(&command, principal)?;
         Ok(classify_ingestion_result(result))
+    }
+
+    fn hold_unknown_delivery_receipt(
+        &mut self,
+        receipt: &DispatchReceipt,
+    ) -> Result<HarnessFactIngestionResult, CollaborationControlError> {
+        let recovery_principal = harness_recovery_principal();
+        let evidence = format!(
+            "adapter-delivery-unknown:{}:{}@durable",
+            receipt.receipt_id, receipt.receipt_digest_sha256
+        );
+        if let Some(result) = self.replay_harness_source(
+            &recovery_principal,
+            "mark_attempt_outcome_unknown",
+            &receipt.attempt_id,
+            &receipt.receipt_id,
+            &evidence,
+        )? {
+            return Ok(HarnessFactIngestionResult {
+                disposition: HarnessFactIngestionDisposition::QuarantineRequired {
+                    reason_code: DELIVERY_OUTCOME_UNKNOWN_REASON_CODE.to_owned(),
+                },
+                authority_result: Some(result),
+            });
+        }
+        let snapshot = self.snapshot_for_attempt(&receipt.attempt_id)?;
+        let mut command = CollaborationCommand {
+            command: Some(collaboration_command::Command::MarkAttemptOutcomeUnknown(
+                MarkAttemptOutcomeUnknownCommand {
+                    base: Some(ingestion_base(
+                        &snapshot,
+                        &receipt.attempt_id,
+                        &receipt.receipt_id,
+                        "outcome-unknown",
+                        self.clock.now(),
+                    )?),
+                    reason_code: DELIVERY_OUTCOME_UNKNOWN_REASON_CODE.to_owned(),
+                    uncertainty_evidence_id: receipt.receipt_id.clone(),
+                },
+            )),
+        };
+        seal_ingestion_command(&mut command);
+        let result = self.execute(&command, &recovery_principal)?;
+        Ok(HarnessFactIngestionResult {
+            disposition: HarnessFactIngestionDisposition::QuarantineRequired {
+                reason_code: DELIVERY_OUTCOME_UNKNOWN_REASON_CODE.to_owned(),
+            },
+            authority_result: Some(result),
+        })
     }
 
     pub fn ingest_harness_observation(

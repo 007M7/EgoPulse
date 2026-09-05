@@ -282,6 +282,7 @@ fn advance_to_verdict_pending(task: &mut TaskAuthority) -> TaskSnapshot {
                 target_scope_ref: "scope-01".to_owned(),
                 acceptance_contract_ref: Some(contract("acceptance", 0x11)),
                 budget_profile_ref: Some(contract("budget", 0x22)),
+                work_capability_route: None,
             })),
         }),
         PrincipalKind::Founder,

@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["contracts/toolchain/fault-conformance"]
 members = [
   "apps/agentosd",
   "apps/cli",
@@ -11,6 +12,7 @@ members = [
   "crates/local-api",
   "crates/client-kernel",
   "crates/client-operations",
+  "crates/director-facade",
   "crates/local-ipc-platform",
   "crates/local-read-model",
   "crates/process-supervision",
@@ -67,6 +69,7 @@ egopulse-local-ide-control = { path = "crates/local-ide-control" }
 egopulse-local-api = { path = "crates/local-api" }
 egopulse-client-kernel = { path = "crates/client-kernel" }
 egopulse-client-operations = { path = "crates/client-operations" }
+egopulse-director-facade = { path = "crates/director-facade" }
 egopulse-local-ipc-platform = { path = "crates/local-ipc-platform" }
 egopulse-local-read-model = { path = "crates/local-read-model" }
 egopulse-process-supervision = { path = "crates/process-supervision" }

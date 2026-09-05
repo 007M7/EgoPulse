@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -237,6 +237,7 @@ pub struct CollaborationStoreInspection {
 pub(super) struct PendingDispatchRecord {
     pub message_id: String,
     pub source_event_id: String,
+    pub attempt_id: Option<String>,
     pub canonical_payload_digest_sha256: String,
     pub payload: Vec<u8>,
 }
@@ -273,6 +274,59 @@ pub(super) struct ProjectionBootstrapWrite {
 pub(super) struct CollaborationStore {
     connection: Connection,
     store_epoch: String,
+}
+
+pub(super) struct CollaborationLineageStore {
+    connection: Connection,
+}
+
+impl CollaborationLineageStore {
+    pub fn open(path: &Path, key: &[u8; 32], store_epoch: &str) -> Result<Self, StoreError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.pragma_update(None, "key", format!("x'{}'", hex::encode(key)))?;
+        let cipher_version: String = connection
+            .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+            .map_err(|_| StoreError::CipherUnavailable)?;
+        if cipher_version.trim().is_empty() {
+            return Err(StoreError::CipherUnavailable);
+        }
+        connection.pragma_update(None, "query_only", "ON")?;
+        let schema_digest = hex::encode(Sha256::digest(
+            format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes(),
+        ));
+        let metadata: (String, String, String) = connection.query_row(
+            "SELECT store_epoch, schema_profile_id, schema_profile_sha256
+             FROM collaboration_store_metadata WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if metadata.0 != store_epoch
+            || metadata.1 != SCHEMA_PROFILE_ID
+            || metadata.2 != schema_digest
+        {
+            return Err(StoreError::StoreGenerationMismatch);
+        }
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(StoreError::IntegrityFailure);
+        }
+        Ok(Self { connection })
+    }
+
+    pub fn task_id_for_attempt(&self, attempt_id: &str) -> Result<Option<String>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT r.task_id
+                 FROM collaboration_attempts a
+                 JOIN collaboration_runs r ON r.run_id = a.run_id
+                 WHERE a.attempt_id = ?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
 }
 
 impl CollaborationStore {
@@ -757,15 +811,18 @@ impl CollaborationStore {
         )?;
 
         if let Some(attempt_id) = &commit.hold_dispatch_for_attempt {
-            transaction.execute(
+            let changed = transaction.execute(
                 "UPDATE collaboration_outbox
                  SET delivery_state = 'held'
                  WHERE attempt_id = ?1
                    AND destination_domain = 'harness-adapter'
                    AND payload_kind = 'dispatch-envelope'
-                   AND delivery_state = 'pending'",
+                   AND delivery_state IN ('pending','delivered','held')",
                 [attempt_id],
             )?;
+            if changed != 1 {
+                return Err(StoreError::CasConflict("dispatch-outbox-hold"));
+            }
         }
 
         if let Some(attempt_id) = &commit.deliver_dispatch_for_attempt {
@@ -838,21 +895,38 @@ impl CollaborationStore {
     }
 
     pub fn pending_dispatches(&self) -> Result<Vec<PendingDispatchRecord>, StoreError> {
+        self.dispatches_with_delivery_state("pending")
+    }
+
+    pub fn delivered_dispatches(&self) -> Result<Vec<PendingDispatchRecord>, StoreError> {
+        self.dispatches_with_delivery_state("delivered")
+    }
+
+    pub fn held_dispatches(&self) -> Result<Vec<PendingDispatchRecord>, StoreError> {
+        self.dispatches_with_delivery_state("held")
+    }
+
+    fn dispatches_with_delivery_state(
+        &self,
+        delivery_state: &str,
+    ) -> Result<Vec<PendingDispatchRecord>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT message_id, source_event_id, canonical_payload_digest_sha256, payload
+            "SELECT message_id, source_event_id, attempt_id,
+                    canonical_payload_digest_sha256, payload
              FROM collaboration_outbox
              WHERE destination_domain = 'harness-adapter'
                AND payload_kind = 'dispatch-envelope'
-               AND delivery_state = 'pending'
+               AND delivery_state = ?1
              ORDER BY rowid",
         )?;
         statement
-            .query_map([], |row| {
+            .query_map([delivery_state], |row| {
                 Ok(PendingDispatchRecord {
                     message_id: row.get(0)?,
                     source_event_id: row.get(1)?,
-                    canonical_payload_digest_sha256: row.get(2)?,
-                    payload: row.get(3)?,
+                    attempt_id: row.get(2)?,
+                    canonical_payload_digest_sha256: row.get(3)?,
+                    payload: row.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()

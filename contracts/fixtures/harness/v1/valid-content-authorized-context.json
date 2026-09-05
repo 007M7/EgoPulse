@@ -1,0 +1,63 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1",
+  "fixtureId": "harness-valid-content-authorized-context",
+  "category": "valid",
+  "requirementRefs": ["R9C-D03", "R9C-D04", "R9C-CONTRACT-GATE"],
+  "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:glm", "authenticated": true },
+  "startingState": {
+    "fencingToken": 4,
+    "lastObservationSequence": 7,
+    "deliveredReceiptId": "receipt-authorized-001",
+    "deliveredReceiptDigestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "dispatchRouteBindingSha256": "587d3a6f20042c32eec5f2e0a6152f1aef494dd2d3ea0c7bf5d452c5aaf5d442",
+    "contextAuthorizationId": "ctx-auth-001",
+    "contextAuthorizationRequestDigestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "command": {
+    "ingestObservation": {
+      "attemptId": "attempt-authorized-001",
+      "dispatchId": "dispatch-authorized-001",
+      "fencingToken": 4,
+      "observationSequence": 8,
+      "nativeEventId": "native-event-authorized-001",
+      "nativeSequence": 8,
+      "nativeEventDigestSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "capabilityProfileId": "glm-cli-v1",
+      "contentSignal": {
+        "contentEventId": "3551a421b7932d428930fcd7211cc91505acefb623e9a4419bc974ffe3d2b7d1",
+        "deliveredReceiptId": "receipt-authorized-001",
+        "deliveredReceiptDigestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dispatchRouteBindingSha256": "587d3a6f20042c32eec5f2e0a6152f1aef494dd2d3ea0c7bf5d452c5aaf5d442",
+        "contextConsumptionProof": {
+          "authorizedContext": {
+            "authorizationId": "ctx-auth-001",
+            "committedRequestDigestSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          }
+        },
+        "candidate": {
+          "lifecycle": {
+            "kind": "LIFECYCLE_KIND_EXECUTION_STARTED",
+            "sideEffectCertainty": "SIDE_EFFECT_CERTAINTY_NONE_PROVEN",
+            "nativeWillRetry": true
+          },
+          "candidateDigestSha256": "3609d7b8e9b483160120f839a839eda159a8efab3364957b54809fa7d91d3d18"
+        }
+      }
+    }
+  },
+  "canonicalVectors": {
+    "lifecycleCandidateHex": "2f0000000000000065676f70756c73652f6861726e6573732d636f6e74656e742f6c6966656379636c652d63616e6469646174652f76311100000000000000455845435554494f4e5f535441525445440b000000000000004e4f4e455f50524f56454e0400000000000000534f4d4508000000000000000100000000000000",
+    "lifecycleCandidateSha256": "3609d7b8e9b483160120f839a839eda159a8efab3364957b54809fa7d91d3d18",
+    "contentEventHex": "210000000000000065676f70756c73652f6861726e6573732d636f6e74656e742f6576656e742f76311600000000000000726563656970742d617574686f72697a65642d3030314000000000000000626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262621200000000000000415554484f52495a45445f434f4e544558540c000000000000006374782d617574682d3030314000000000000000636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363634000000000000000353837643361366632303034326333326565633566326530613631353266316165663439346464326433656130633762663564343532633561616635643434321600000000000000617474656d70742d617574686f72697a65642d303031170000000000000064697370617463682d617574686f72697a65642d303031080000000000000004000000000000000a00000000000000676c6d2d636c692d76311b000000000000006e61746976652d6576656e742d617574686f72697a65642d30303140000000000000006464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646408000000000000000800000000000000400000000000000033363039643762386539623438333136303132306638333961383339656461313539613865666162333336343935376235343830396661376439316433643138",
+    "contentEventSha256": "3551a421b7932d428930fcd7211cc91505acefb623e9a4419bc974ffe3d2b7d1"
+  },
+  "expected": {
+    "outcome": "committed",
+    "businessWriteCount": 1,
+    "resultingObservationSequence": 8,
+    "authorizedContextProofReused": true,
+    "newContextAuthorizationIssued": false,
+    "contextRevokeAppliedRetrospectively": false,
+    "taskAuthorityWriteCount": 0
+  }
+}

@@ -6,6 +6,27 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+. (Join-Path $PSScriptRoot 'windows-package-integrity.ps1')
+
+function Get-ExactCandidateIdentity {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Output,
+        [Parameter(Mandatory = $true)][string]$Prefix
+    )
+
+    $matches = @($Output |
+        ForEach-Object { [string]$_ } |
+        Where-Object { $_.StartsWith($Prefix, [StringComparison]::Ordinal) })
+    if ($matches.Count -ne 1) {
+        throw "Windows packaging must report exactly one ${Prefix} identity line; found $($matches.Count)"
+    }
+    $value = $matches[0].Substring($Prefix.Length)
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "Windows packaging reported an empty ${Prefix} identity value"
+    }
+    return $value
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location -LiteralPath $repoRoot
 $env:CI = 'true'
@@ -28,25 +49,10 @@ $packageExitCode = $LASTEXITCODE
 $packageOutput | ForEach-Object { Write-Output $_ }
 if ($packageExitCode -ne 0) { throw "Windows packaging failed with exit code $packageExitCode" }
 
-$candidateDirectoryLine = $packageOutput |
-    ForEach-Object { [string]$_ } |
-    Where-Object { $_ -like 'candidate_directory=*' } |
-    Select-Object -Last 1
-$candidateArchiveLine = $packageOutput |
-    ForEach-Object { [string]$_ } |
-    Where-Object { $_ -like 'candidate_archive=*' } |
-    Select-Object -Last 1
-$candidateSha256Line = $packageOutput |
-    ForEach-Object { [string]$_ } |
-    Where-Object { $_ -like 'candidate_sha256=*' } |
-    Select-Object -Last 1
-if (-not $candidateDirectoryLine -or -not $candidateArchiveLine -or -not $candidateSha256Line) {
-    throw 'Windows packaging did not report a complete candidate identity'
-}
-
-$candidateDirectory = $candidateDirectoryLine.Substring('candidate_directory='.Length)
-$candidateArchive = $candidateArchiveLine.Substring('candidate_archive='.Length)
-$candidateSha256 = $candidateSha256Line.Substring('candidate_sha256='.Length)
+$candidateDirectory = Get-ExactCandidateIdentity -Output $packageOutput -Prefix 'candidate_directory='
+$candidateArchive = Get-ExactCandidateIdentity -Output $packageOutput -Prefix 'candidate_archive='
+$candidateSha256 = Get-ExactCandidateIdentity -Output $packageOutput -Prefix 'candidate_sha256='
+$null = Assert-EgoPulseArchiveArguments -ArchivePath $candidateArchive -ExpectedArchiveSha256 $candidateSha256
 & (Join-Path $PSScriptRoot 'verify-windows-package.ps1') `
     -PackageRoot $candidateDirectory `
     -ArchivePath $candidateArchive `

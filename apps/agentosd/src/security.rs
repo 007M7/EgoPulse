@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use egopulse_cognition_runtime::memory_authority::MemoryPrincipalKind;
 use egopulse_cognition_runtime::task_authority::PrincipalKind as TaskPrincipalKind;
+use egopulse_cognition_runtime::{
+    context_authority::ContextPrincipalKind, memory_authority::MemoryPrincipalKind,
+};
 use egopulse_founder_verdict_authority::VerdictPrincipalKind;
 use egopulse_local_api::{
     command_gateway::{CommandPortFailure, CommandPrincipal},
@@ -20,10 +22,10 @@ pub struct AllowlistedPrincipal {
     pub grant: PrincipalGrant,
 }
 
-/// A reviewed mapping from one authenticated session principal to the three
+/// A reviewed mapping from one authenticated session principal to its
 /// owner-specific Authority principal kinds. Each field is optional on
 /// purpose: a local user may be allowed to use one owner without being
-/// silently promoted in the other two Authorities.
+/// silently promoted in any other Authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorityPrincipalBinding {
     pub principal_id: String,
@@ -31,6 +33,7 @@ pub struct AuthorityPrincipalBinding {
     pub policy: Option<PolicyPrincipalKind>,
     pub verdict: Option<VerdictPrincipalKind>,
     pub memory: Option<MemoryPrincipalKind>,
+    pub context: Option<ContextPrincipalKind>,
 }
 
 /// Validated, immutable local identity policy used by the production
@@ -96,6 +99,7 @@ impl ConfiguredAuthorityPrincipalResolver {
                 && entry.policy.is_none()
                 && entry.verdict.is_none()
                 && entry.memory.is_none()
+                && entry.context.is_none()
             {
                 return Err(PrincipalPolicyError::EmptyAuthorityMapping);
             }
@@ -156,6 +160,15 @@ impl crate::AuthorityPrincipalResolver for ConfiguredAuthorityPrincipalResolver 
     ) -> Result<MemoryPrincipalKind, CommandPortFailure> {
         self.binding(principal)?
             .memory
+            .ok_or(CommandPortFailure::Unavailable)
+    }
+
+    fn resolve_context(
+        &self,
+        principal: &CommandPrincipal,
+    ) -> Result<ContextPrincipalKind, CommandPortFailure> {
+        self.binding(principal)?
+            .context
             .ok_or(CommandPortFailure::Unavailable)
     }
 }
@@ -235,6 +248,7 @@ mod tests {
             policy: None,
             verdict: None,
             memory: None,
+            context: None,
         }])
         .expect("valid explicit task-only mapping");
         let principal = CommandPrincipal {
@@ -253,6 +267,10 @@ mod tests {
             resolver.resolve_verdict(&principal),
             Err(CommandPortFailure::Unavailable)
         );
+        assert_eq!(
+            resolver.resolve_context(&principal),
+            Err(CommandPortFailure::Unavailable)
+        );
     }
 
     #[test]
@@ -264,6 +282,7 @@ mod tests {
                 policy: None,
                 verdict: None,
                 memory: None,
+                context: None,
             }]),
             Err(PrincipalPolicyError::EmptyAuthorityMapping)
         ));

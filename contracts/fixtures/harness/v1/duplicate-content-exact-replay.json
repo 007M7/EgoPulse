@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "v01-harness-fixture/v0.1",
+  "fixtureId": "harness-duplicate-content-exact-replay",
+  "category": "duplicate",
+  "requirementRefs": ["R9C-D03", "R9C-D07", "R9C-D12-PROJECTION"],
+  "principal": { "kind": "HARNESS_ADAPTER", "principalId": "adapter:codex", "authenticated": true },
+  "startingState": {
+    "fencingToken": 3,
+    "lastObservationSequence": 7,
+    "processedContentEventIds": ["8bf9b6392731854455807e7a35791f39e99e1c119bc0d43c0bcdf813fdc768c3"],
+    "safeRecordCount": 1
+  },
+  "resolvedReferences": { "originalCandidateDigestSha256": "97de32300fc9f29a2482e2e46917a1caa2ffd14218ca795847ebb682ea81843f" },
+  "command": {
+    "ingestObservation": {
+      "observationId": "obs-content-001",
+      "adapterId": "codex-adapter",
+      "attemptId": "attempt-001",
+      "dispatchId": "dispatch-001",
+      "fencingToken": 3,
+      "observationSequence": 7,
+      "nativeEventId": "native-event-001",
+      "nativeSequence": 7,
+      "nativeEventDigestSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "capabilityProfileId": "codex-app-server-v2-0.148.0-alpha.15",
+      "criticality": "OBSERVATION_CRITICALITY_INFORMATIONAL",
+      "rawEvidenceRef": "raw-content-001",
+      "contentSignal": {
+        "contentEventId": "8bf9b6392731854455807e7a35791f39e99e1c119bc0d43c0bcdf813fdc768c3",
+        "deliveredReceiptId": "receipt-001",
+        "deliveredReceiptDigestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "dispatchRouteBindingSha256": "5fc3d40c5d3ecdc61ccac5826e0e2d0b10131133adcd8a5ca8438188c01c39a8",
+        "contextConsumptionProof": { "notContextBound": {} },
+        "candidate": { "assistantText": { "messageId": "msg-safe-001", "revision": 1, "previousRevision": 0, "operation": "CONTENT_MUTATION_OPERATION_APPEND", "textUtf8Hex": "48656c6c6f2c0d0a776f726c642109", "deltaOrSnapshotDigestSha256": "7fc849816061c35cc7d05023a41064e6df98009688072686b66916e7ea6f36af", "previousRawCumulativeDigestSha256": "87daed9be3cf1353adde646397681802b85f5dff8321d313e339229c92bdba28", "rawCumulativeDigestSha256": "3f5278a253c9e81ad98f135a3d0262abbfa5f551a222d5060b83dc5d1f5330df" }, "candidateDigestSha256": "97de32300fc9f29a2482e2e46917a1caa2ffd14218ca795847ebb682ea81843f" }
+      }
+    }
+  },
+  "expected": {
+    "outcome": "replayed",
+    "replayed": true,
+    "businessWriteCount": 0,
+    "safeRecordWriteCount": 0,
+    "sameSafeRecordReturned": true,
+    "resultingObservationSequence": 7
+  }
+}

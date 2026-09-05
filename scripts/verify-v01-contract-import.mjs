@@ -7,11 +7,13 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..");
 const contractsRoot = join(repositoryRoot, "contracts");
 const manifestPath = join(contractsRoot, "manifest.json");
-const expectedManifestSha256 = "ddeff9d0f3bcb860e44cddc25233cadb0e21768bbf8193589eb1f8f7aa719b07";
-const expectedArtifactCount = 239;
-const expectedFixtureCount = 182;
-const expectedClientKernelProfileSha256 = "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9";
-const expectedAuthorizationProfileSha256 = "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1";
+const expectedManifestSha256 = "e267e1636b56066d0bd937b5309e878728dfd7cc5dbba9464a6b70eb8e61a306";
+const expectedArtifactCount = 269;
+const expectedFixtureCount = 201;
+const expectedClientKernelProfileSha256 = "500d1421381ea3929e6cd92c0ce7bc0e849a93f32d941366ff35037915aaea3d";
+const expectedAuthorizationProfileSha256 = "c174126b56818b78e6588536fb0b64d570910e9212c041e888487962079b7c86";
+const expectedContextRevokeProfileSha256 = "ee77f4894dfd64394f674d37634a29383bf453dc68494f3d75268e85df2590e4";
+const expectedHarnessContentProfileSha256 = "c969c9eda5394617aa8bcbca4ed0086eb0dd61ced2519818db830cc73ed1e58f";
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
@@ -37,10 +39,16 @@ const manifestSha256 = sha256(manifestBytes);
 assert(manifestSha256 === expectedManifestSha256, `manifest digest mismatch: ${manifestSha256}`);
 
 const manifest = JSON.parse(manifestBytes.toString("utf8"));
-assert(manifest.candidateVersion === "0.1.0-draft.16", "unexpected V-01 implementation contract version");
+assert(manifest.candidateVersion === "0.1.0-draft.23", "unexpected V-01 implementation contract version");
+assert(manifest.status === "targeted_revision_work_capability_routing_founder_frozen_implementation_authorized", "unexpected ADR-0004 contract status");
 assert(manifest.targetedRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-a1-a2-a3", "missing Founder authority for targeted revision");
 assert(manifest.approvalReadModelRevisionAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08-approval-read-model-a", "missing Founder authority for approval read model revision");
 assert(manifest.g408cSupportProfilesAuthorityRef === "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3", "missing Founder authority for G4-08C support profiles");
+assert(manifest.contextRevokeLinearizationAuthorityRef === "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze", "missing Founder authority for R-9A Context revoke linearization");
+assert(manifest.contextRevokeSchemeCAuthorityRef === "conversation:2026-08-31:founder-r9a-gate11-scheme-c", "missing Founder authority for R-9A Scheme C validation and historical replay");
+assert(manifest.r9cHarnessContentAuthorityRef === "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7", "missing Founder authority for R-9C Harness content and migration/rollback contract");
+assert(manifest.m13MemoryContextAuthorityRef === "conversation:2026-09-05:founder-resume-after-m13-decision-package", "missing Founder authority for M-13 governed Memory consumption");
+assert(manifest.workCapabilityRoutingAuthorityRef === "conversation:2026-09-05:founder-adr0004-option-b-freeze", "missing Founder authority for ADR-0004 work-capability routing");
 assert(manifest.artifacts.length === expectedArtifactCount, "unexpected V-01 artifact count");
 
 let fixtureCount = 0;
@@ -55,6 +63,8 @@ for (const artifact of manifest.artifacts) {
 assert(fixtureCount === expectedFixtureCount, `unexpected fixture count: ${fixtureCount}`);
 assert(sha256(readFileSync(join(contractsRoot, "profiles", "client-kernel", "v1", "v01-default.json"))) === expectedClientKernelProfileSha256, "client-kernel profile digest mismatch");
 assert(sha256(readFileSync(join(contractsRoot, "profiles", "authorization", "v1", "v01-default.json"))) === expectedAuthorizationProfileSha256, "authorization capability profile digest mismatch");
+assert(sha256(readFileSync(join(contractsRoot, "profiles", "context-revoke", "v1", "v01-default.json"))) === expectedContextRevokeProfileSha256, "Context revoke semantic profile digest mismatch");
+assert(sha256(readFileSync(join(contractsRoot, "profiles", "harness-content-disclosure", "v1", "v01-default.json"))) === expectedHarnessContentProfileSha256, "Harness content disclosure profile digest mismatch");
 assert(existsSync(join(contractsRoot, "proto", "egopulse", "foundation", "v1", "health.proto")), "Foundation health contract was lost during V-01 import");
 
 console.log(

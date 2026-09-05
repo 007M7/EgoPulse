@@ -1,8 +1,8 @@
 {
   "schemaVersion": "v01-gate3-contract-candidate-manifest/v0.1",
   "candidateId": "v01-gate3-contracts",
-  "candidateVersion": "0.1.0-draft.16",
-  "status": "targeted_gate3_revision_founder_confirmed_g4_08c_support_profiles_reverified_memory_retrieval_daemon_cli_tui_frozen",
+  "candidateVersion": "0.1.0-draft.23",
+  "status": "targeted_revision_work_capability_routing_founder_frozen_implementation_authorized",
   "ssotRole": "implementation_contract_ssot",
   "featureId": "v01-governed-single-harness-work-loop",
   "architectureAuthorityRef": "conversation:2026-08-23:founder-v01-feature-adr-a01",
@@ -25,6 +25,12 @@
   "g408cSupportProfilesAuthorityRef": "conversation:2026-08-24:founder-v01-g4-08c-a1-a2-a3",
   "memoryRagAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m01-m06-freeze",
   "memoryRetrievalAuthorityRef": "conversation:2026-08-26:founder-memory-rag-m07-m10-freeze",
+  "workPrepareConfirmAuthorityRef": "conversation:2026-08-28:founder-work-prepare-confirm-candidate",
+  "contextRevokeLinearizationAuthorityRef": "conversation:2026-08-30:founder-r9a-context-revoke-linearization-freeze",
+  "contextRevokeSchemeCAuthorityRef": "conversation:2026-08-31:founder-r9a-gate11-scheme-c",
+  "r9cHarnessContentAuthorityRef": "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7",
+  "m13MemoryContextAuthorityRef": "conversation:2026-09-05:founder-resume-after-m13-decision-package",
+  "workCapabilityRoutingAuthorityRef": "conversation:2026-09-05:founder-adr0004-option-b-freeze",
   "implementationAuthorized": true,
   "handoffRule": {
     "gate": "Gate 4",
@@ -116,20 +122,49 @@
       "name": "Memory Retrieval Daemon, Authorization, CLI and TUI Boundary",
       "status": "founder_confirmed_locally_verified",
       "founderDecisionRequired": true
+    },
+    {
+      "id": "M-13",
+      "name": "Governed Memory to Context Consumption",
+      "status": "founder_frozen_implementation_authorized",
+      "founderDecisionRequired": true
+    },
+    {
+      "id": "ADR-0004",
+      "name": "Governed Future-Work Default and Immutable Work Capability Route",
+      "status": "founder_frozen_implementation_authorized",
+      "founderDecisionRequired": true
+    },
+    {
+      "id": "R-9A.2",
+      "name": "Context Revoke Local API and Shared Semantic Confirmation",
+      "status": "founder_confirmed_locally_verified",
+      "founderDecisionRequired": true
+    },
+    {
+      "id": "R-9C.1",
+      "name": "Governed Harness Content Contract Truth",
+      "status": "founder_frozen_contract_locally_verified",
+      "founderDecisionRequired": true
     }
   ],
   "validation": {
     "localCandidateValidator": "scripts/validate-candidate.js",
-    "localCandidateStatus": "passed_181_domain_fixtures_plus_1_foundation_fixture",
-    "bufLint": "passed_buf_1.72.0_draft16_with_two_documented_rpc_naming_exceptions",
-    "bufBuild": "passed_draft16_proto_descriptor",
+    "localCandidateStatus": "passed_200_domain_fixtures_plus_1_foundation_fixture",
+    "bufLint": "passed_buf_1.72.0_draft22_with_documented_rpc_naming_exceptions",
+    "bufBuild": "passed_draft22_proto_descriptor",
     "bufBreaking": "passed_no_new_wire_breaks_against_draft13_and_exact_founder_authorized_two_field_breaks_against_draft11",
-    "protocCompile": "passed_libprotoc_35.1_draft16_eleven_v01_modules_plus_foundation",
-    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_draft16_eleven_v01_modules_plus_foundation",
+    "protocCompile": "passed_libprotoc_35.1_draft22_eleven_v01_modules_plus_foundation",
+    "crossLanguageGeneration": "passed_typescript_rust_tonic_python_draft22_eleven_v01_modules_plus_foundation",
     "faultConformance": "passed_existing_real_process_and_sqlcipher_suite_plus_memory_retrieval_permission_scope_concurrency_crash_timeout_and_real_daemon_cli_tui_parity",
     "qualityBudgetProfile": "passed_33_d03_rules_exactly_once_with_gate3_design_gate6_verification_binding",
-    "clientKernelProfile": "passed_versioned_surface_neutral_rust_shared_kernel_profile_with_exact_digest_reference",
-    "authorizationCapabilityProfile": "passed_exact_permission_rpc_command_oneof_catalog_with_fail_closed_defaults"
+    "clientKernelProfile": "passed_versioned_surface_neutral_rust_shared_kernel_profile_with_context_revoke_confirmation",
+    "authorizationCapabilityProfile": "passed_exact_permission_rpc_command_oneof_catalog_with_context_authority_binding",
+    "contextRevokeSemanticProfile": "passed_exact_canonical_bytes_fixed_digest_scheme_c_and_historical_replay_fixture_matrix",
+    "harnessContentDisclosureProfile": "passed_exact_source_disclosure_limits_recovery_authorization_and_fixture_catalog",
+    "r9cContractGate": "passed_r9c_d01_d12_proto_profile_fixture_fixed_vectors_and_generated_bindings",
+    "m13ContractGate": "passed_m13_work_memory_mode_compatibility_and_cross_language_bindings",
+    "r9aAcceptanceGates": "passed_gate7_existing_adapter_receipt_and_task_run_step_attempt_unchanged_after_revoke;gate9_authorization_first_and_revoke_first_restart_paths_use_independent_external_side_effect_witness;gate10_context_paths_do_not_create_or_advance_founder_verdict;gate11_scheme_c_new_commit_validation_and_exact_historical_replay_zero_writes_with_changed_semantics_conflict"
   },
   "artifacts": [
     {
@@ -138,7 +173,7 @@
     },
     {
       "path": "authorization-capability-profile.schema.json",
-      "sha256": "da6d77db28985d13c17b55335f6c268077916319f00dac6cb68333ea6be1cf74"
+      "sha256": "8302bda9d15418d4d03c0da565fff9b981c28637622d878bfda8ae8b03f49868"
     },
     {
       "path": "baselines/v01-gate3-draft11.binpb",
@@ -170,11 +205,15 @@
     },
     {
       "path": "client-kernel-profile.schema.json",
-      "sha256": "c37fddd130d4d8da3d4036ba07a808392bad99b07ff2c4c3dfd51196047c97c7"
+      "sha256": "3b85f23b2f68b7c5e8d81f3ccfa8cce51e850c27fd827116d5f3ffc9fa721173"
     },
     {
       "path": "collaboration-fixture-envelope.schema.json",
       "sha256": "70178234a478c104a7b4f67c12226da39a2f38afc5fd42ecc0013602d65fae51"
+    },
+    {
+      "path": "context-revoke-semantic-profile.schema.json",
+      "sha256": "6e51a4933f81a35c067386ece05b06e9f5cc1b4b4948be948b2c022a5de595f0"
     },
     {
       "path": "fixture-envelope.schema.json",
@@ -309,8 +348,24 @@
       "sha256": "c1caa64426a501f28cb724ed84993a71fa3717ecab25fbec0125abb5bc4f3985"
     },
     {
+      "path": "fixtures/harness/v1/duplicate-content-exact-replay.json",
+      "sha256": "181642073c126ea369b5053015d3738e6286b768c6716144bdf096cca43bafa6"
+    },
+    {
       "path": "fixtures/harness/v1/duplicate-observation-replay.json",
       "sha256": "8f2b9145239228045fdb3d92b3aee2ad99ef81711cfeae9e2e8128474f509247"
+    },
+    {
+      "path": "fixtures/harness/v1/invalid-content-forbidden-category.json",
+      "sha256": "5cbe3a3db88c178959b90f4758c6e4447b19440a036454dfa721d49c717e2012"
+    },
+    {
+      "path": "fixtures/harness/v1/invalid-content-revision-digest-drift.json",
+      "sha256": "6bb5cbaf1211ae00beebc87c217982441b669d16f737b4de004ea3a3ebab0061"
+    },
+    {
+      "path": "fixtures/harness/v1/invalid-content-source-binding-drift.json",
+      "sha256": "674d13f40c74597ec1a360c0037916aebf08bec3cda326614da26cf8ccfae5ce"
     },
     {
       "path": "fixtures/harness/v1/invalid-natural-language-completion.json",
@@ -362,15 +417,27 @@
     },
     {
       "path": "fixtures/harness/v1/valid-attest-codex-profile.json",
-      "sha256": "0e4424dcb4d33063cda86ac639756f6f9b377a5451c6d6a193bc6349ce3bb6e7"
+      "sha256": "5d42335b20b14330b8beb827c38e2903c051ddebfa6e3125a1a5486c7116559a"
+    },
+    {
+      "path": "fixtures/harness/v1/valid-content-append-not-context-bound.json",
+      "sha256": "e667eec2a99469a37821fd9651bba8e5f8530422fa7c88c3e3941f114be71ab5"
+    },
+    {
+      "path": "fixtures/harness/v1/valid-content-authorized-context.json",
+      "sha256": "cc4062cabd8667c7f7a7f1c246e5c35d31fa286a0d40227c97dfb1612d10f0fb"
     },
     {
       "path": "fixtures/harness/v1/valid-dispatch-delivery.json",
-      "sha256": "307c499c8147333edfed2783d6f5c716a03ead74f5e61285af109c899b48a520"
+      "sha256": "55b79f8e740bba9f62f88bb46fbe370f83c35985578a9bd547912316e3609656"
     },
     {
       "path": "fixtures/harness/v1/valid-governed-approval-decision.json",
       "sha256": "f58b9bdfd83841177f4076b1f5bb6f96af26ecfa92a944662faffc38da9557d4"
+    },
+    {
+      "path": "fixtures/harness/v1/valid-route-binding-no-catalog.json",
+      "sha256": "90f4fb063713d589a56afc6de0470403058e66e4c17c262098a854b1723b2f26"
     },
     {
       "path": "fixtures/harness/v1/valid-running-observation.json",
@@ -379,6 +446,10 @@
     {
       "path": "fixtures/harness/v1/valid-session-continue-resume.json",
       "sha256": "9dd6db604530eb2d4fb13c09d0f2318a8ce14265ae7d7d8a7d1a5aa39441605d"
+    },
+    {
+      "path": "fixtures/localapi/v1/context-revoke-scheme-c-boundaries-and-history.json",
+      "sha256": "d9ac9350481b84123a005a51f760ccba8b19de9e89e64beea7f9faa07edb3fe6"
     },
     {
       "path": "fixtures/localapi/v1/duplicate-harness-approval-observation-projection.json",
@@ -405,6 +476,10 @@
       "sha256": "b38dd8ffe5cb2d3a0a849043b57bcc19aa14c60a8955bb899b38d05bec09f3d1"
     },
     {
+      "path": "fixtures/localapi/v1/invalid-context-revoke-confirmation-digests.json",
+      "sha256": "4360dc151f34fd849ab3621a8c276cccd02bb0a47d18c2818892cafea38deaa2"
+    },
+    {
       "path": "fixtures/localapi/v1/invalid-cursor-filter-mismatch.json",
       "sha256": "eac339788b0fc89c6975b866f8d2349fe6a43e8bc52bac2bec2b691a54915c33"
     },
@@ -415,6 +490,10 @@
     {
       "path": "fixtures/localapi/v1/invalid-harness-approval-source-binding-mismatch.json",
       "sha256": "c5a6fdf5004cb4ee0b8237752a0780735248bf8b930c81d06b59dd8c4632aaf2"
+    },
+    {
+      "path": "fixtures/localapi/v1/invalid-harness-content-frame-combination.json",
+      "sha256": "8e81b571b64c54e567762c97ab79c9357ec7d1aaf215f400c62120dab04f21e1"
     },
     {
       "path": "fixtures/localapi/v1/invalid-incoherent-source-vector.json",
@@ -449,6 +528,10 @@
       "sha256": "b89a0f9a2750197ce2f8283f64eb6ee90b04654fa269d4c5c3ad15cb0f202d62"
     },
     {
+      "path": "fixtures/localapi/v1/recovery-harness-content-retention-reset.json",
+      "sha256": "eebc45bbe597f74bec07d5e60fcf6a00b1c33d6b05580897ace9cc9f173ffa62"
+    },
+    {
       "path": "fixtures/localapi/v1/recovery-projector-rebuild-new-epoch.json",
       "sha256": "5483c4239b4737b747b5e5568114765d1e1bbd05ca69da22993d8b54e645e63e"
     },
@@ -463,6 +546,10 @@
     {
       "path": "fixtures/localapi/v1/stale-minimum-position-timeout.json",
       "sha256": "fff317041c5dafd8778803419510b0e051bede80920f5c8b57fb68dafe39361e"
+    },
+    {
+      "path": "fixtures/localapi/v1/unauthorized-harness-content-read.json",
+      "sha256": "08c8b1fe78cb920e57f33a22bb2101176b50c9047f503583d5ec395d37c7236b"
     },
     {
       "path": "fixtures/localapi/v1/unauthorized-model-founder-write.json",
@@ -497,6 +584,10 @@
       "sha256": "b341d9f53be36db8584b930c8e3b43ee48125edbce5604c27923e2299726d5f2"
     },
     {
+      "path": "fixtures/localapi/v1/valid-context-revoke-semantic-digest.json",
+      "sha256": "c6de9b9c9ec38cbbb0e7b94814931a3b9c80dd45500bb5ae251b111784b38d2f"
+    },
+    {
       "path": "fixtures/localapi/v1/valid-desktop-founder-verdict-gateway.json",
       "sha256": "a7a403c5c65842dc2a89419e16526ad57f6fc03a03464ee8766516d5af19cd3c"
     },
@@ -517,6 +608,18 @@
       "sha256": "23a82d5c33aec4acc6c753ba42da6a3230206fc0870241dc667e80caa64f8bc7"
     },
     {
+      "path": "fixtures/localapi/v1/valid-governed-memory-work-preparation.json",
+      "sha256": "4c717dc08eac426183e28d0b25da22d265c7eedf81fb20a35325d2d383eb9f13"
+    },
+    {
+      "path": "fixtures/localapi/v1/valid-harness-content-baseline.json",
+      "sha256": "d2af3de7792f8d95c4bff66a6ae51dcf50060a74451ead6fa1a58833e7466618"
+    },
+    {
+      "path": "fixtures/localapi/v1/valid-harness-content-watch.json",
+      "sha256": "9d730abbf2bfe5b7ef4184fabedaf35785785781bf378f5ef6e9ed3fa9579f45"
+    },
+    {
       "path": "fixtures/localapi/v1/valid-list-actionable-harness-approvals.json",
       "sha256": "75d9ecaaa8d04f4dcb2ef87f65fea3c7f1e25ae88ac850f6adc407d57ab7a364"
     },
@@ -526,7 +629,7 @@
     },
     {
       "path": "fixtures/localapi/v1/valid-open-desktop-session.json",
-      "sha256": "174649e6d6e174a4c1295df14424dfb8aaac08a4e7dca5df6bb01f949b9590d9"
+      "sha256": "6c6e93b2f9ff801e3b6a3ac18fdf3ee994edd6b04b328eb9ef113739add6a421"
     },
     {
       "path": "fixtures/localapi/v1/valid-task-command-authority-result.json",
@@ -633,12 +736,24 @@
       "sha256": "6c31f60091d6182e7132dc27407d425f9ecbd0fd3b607b4b41e173866fa0b25d"
     },
     {
+      "path": "fixtures/persistence/v1/recovery-r9c-postwrite-forward-disable.json",
+      "sha256": "0978b545b37244aab5dd83d4c150ae277bad809a649249146bc805730cbd637a"
+    },
+    {
+      "path": "fixtures/persistence/v1/recovery-r9c-prewrite-migration-backup-restore.json",
+      "sha256": "0eeaff5165178e6385be84ce18b022e600c87346703734383307f38e633cecec"
+    },
+    {
       "path": "fixtures/persistence/v1/recovery-readmodel-checkpoint-gap-new-epoch.json",
       "sha256": "81ef10cdf9bc145a1847e68806a946e9ff9ffd7c2967314e7eb1a14951b8789c"
     },
     {
       "path": "fixtures/persistence/v1/recovery-restored-pending-outbox-delivered.json",
       "sha256": "13701050c0b8fcf9fb9d4a1a58ad8dbfc6e404c204e394949a58fa3a4fa2ea6c"
+    },
+    {
+      "path": "fixtures/persistence/v1/recovery-safe-content-outbox-after-consumer-commit.json",
+      "sha256": "326d75af7479b878a85f20f2ce6102dba0f67feb891c68a41a4670b8a8cf0659"
     },
     {
       "path": "fixtures/persistence/v1/stale-backup-domain-watermark.json",
@@ -909,16 +1024,20 @@
       "sha256": "677d88b09c62f4ebeac20c182e63e4c379335b64c16504c62263dace18c2a8bc"
     },
     {
+      "path": "harness-content-disclosure-profile.schema.json",
+      "sha256": "4fa4655f871c12bc5c2e3aaccc19338ff4736b9b42605b0a0f5456c8bf3351a2"
+    },
+    {
       "path": "harness-fixture-envelope.schema.json",
-      "sha256": "fd55cd3eefa3b2610473dfafc8a73d163a8fa12c3b6412fec552fa8e9829d6e0"
+      "sha256": "7dc8a8d2bda3593c3073ac21e9d58e2ab2fac7e9ab6ccf389d0418c58b340052"
     },
     {
       "path": "IMPLEMENTATION-SSOT.json",
-      "sha256": "ac2199effc73c2ab859892a454cf03df2c9822aa0d2bdb081796de2ce073227c"
+      "sha256": "98d958aaa8f02efab73d94861699b08bdc17465f3db2ce588520cd0dac2b03e4"
     },
     {
       "path": "IMPLEMENTATION-SSOT.md",
-      "sha256": "ec3b65a56255a6caffa2846e24b2152e2bccbf6b3b2c36347205231ef4d105c2"
+      "sha256": "cfa0e4e7585ce717aa3196fff0f48225535e05dc3675389b0e23113d1e0f1f0a"
     },
     {
       "path": "json-schema/foundation-health.schema.json",
@@ -926,11 +1045,11 @@
     },
     {
       "path": "localapi-fixture-envelope.schema.json",
-      "sha256": "a64d571032b5fe09699dcb9d3e50a37a79594ad5dfe3e84e97d0d85f27c3012f"
+      "sha256": "44ac6281cd15018c1d2d7888a463e545923cf7558ca78e756355cae7718364ef"
     },
     {
       "path": "persistence-fixture-envelope.schema.json",
-      "sha256": "f94687c97fd8be1c001be123026bf973dd6b6a3a4bf5926a675610df1a0f7e43"
+      "sha256": "cee5535c2ca90d6329b62ffd2bb9d66c4c975c11924c329581f2b9340e2244ba"
     },
     {
       "path": "policy-fixture-envelope.schema.json",
@@ -938,11 +1057,19 @@
     },
     {
       "path": "profiles/authorization/v1/v01-default.json",
-      "sha256": "5d17887f8e6555d0e4c973583dd07590a68a4be99c8b80a9e31877b9b2ed99b1"
+      "sha256": "c174126b56818b78e6588536fb0b64d570910e9212c041e888487962079b7c86"
     },
     {
       "path": "profiles/client-kernel/v1/v01-default.json",
-      "sha256": "0d9222fd5569ce5f7baa062d8353e9565be88da1fc55934e8cc21ba4067629e9"
+      "sha256": "500d1421381ea3929e6cd92c0ce7bc0e849a93f32d941366ff35037915aaea3d"
+    },
+    {
+      "path": "profiles/context-revoke/v1/v01-default.json",
+      "sha256": "ee77f4894dfd64394f674d37634a29383bf453dc68494f3d75268e85df2590e4"
+    },
+    {
+      "path": "profiles/harness-content-disclosure/v1/v01-default.json",
+      "sha256": "c969c9eda5394617aa8bcbca4ed0086eb0dd61ced2519818db830cc73ed1e58f"
     },
     {
       "path": "profiles/quality-budget/v1/v01-default.json",
@@ -966,11 +1093,11 @@
     },
     {
       "path": "proto/egopulse/harness/v1/harness.proto",
-      "sha256": "fc3d69093fd8e4eb93daa427ba217f5142d2c10f6c7938f9a4a2751b552462d8"
+      "sha256": "4b02839c5b33edae2b203b730c0cc8c44c270329a0f79480b6fc24fc30faf1dd"
     },
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
-      "sha256": "0a8247e4446d718e502cecc7c61e61d0c167f30dfbad8295f939a49fb735abd9"
+      "sha256": "187f358851f24d61fcc92da33919f55336f30136e15b9fafc96fb2fea490a229"
     },
     {
       "path": "proto/egopulse/memory/v1/memory.proto",
@@ -986,7 +1113,7 @@
     },
     {
       "path": "proto/egopulse/task/v1/task.proto",
-      "sha256": "804a68aa4ef7b1ed294f61a3f7b01993091fd0dc68b185d85a3f91e78aa9243e"
+      "sha256": "c8360c9cf510e94413052beccc7a1596d99a1250ccf7c60c2de23478032f550f"
     },
     {
       "path": "proto/egopulse/verdict/v1/verdict.proto",
@@ -998,7 +1125,7 @@
     },
     {
       "path": "quality-budget-profile.schema.json",
-      "sha256": "79984e27669306ad914166f2e1a04885dc87b5c202d88436547febbcb89bfdb2"
+      "sha256": "e7aa5014ab8662fb577439194e197cb73efea1f04a9209fe08ca85e06f2918ee"
     },
     {
       "path": "README.md",
@@ -1010,7 +1137,7 @@
     },
     {
       "path": "scripts/validate-candidate.js",
-      "sha256": "f14c24585da4e6ba8c523647e67aabc18587b3190c3be8610fb0f1361f221eef"
+      "sha256": "0e73488b2104d45b1a87e6ef3018fd852b9758f1c19be8a55170902a17656d39"
     },
     {
       "path": "scripts/verify-faults.ps1",
@@ -1026,15 +1153,43 @@
     },
     {
       "path": "toolchain/fault-conformance/Cargo.toml",
-      "sha256": "65d535ea0a69daae9384e2f6f9f8b17414947fa973e1f7ba122e8022d4fb864c"
+      "sha256": "dd0d6983ef92ff6feb7d198c0914872233c2c9d504229cd1cc72a06c2c8e1cbd"
     },
     {
       "path": "toolchain/fault-conformance/src/lib.rs",
-      "sha256": "be00ff589d2380aac3948f1d52ed16ec0f3234ebf388432d9462ddee12ca4899"
+      "sha256": "c81fc41df1bca834b14aaca49487c27583fa09b834816095af3779f0dd0957e4"
     },
     {
       "path": "toolchain/fault-conformance/src/main.rs",
       "sha256": "aa1300d58b1d574f17a38effd6502fcd860ca5c41450477643813534da690e69"
+    },
+    {
+      "path": "toolchain/fault-conformance/src/memory_restart_oracle.rs",
+      "sha256": "a197ac39c8e605d77378e2011b8a200f05fe4a0b1596fd4485b5168af434cca3"
+    },
+    {
+      "path": "toolchain/fault-conformance/src/r8b2c.rs",
+      "sha256": "9291a04ccd25b257ae49cca7c49301d62aaafe930981b488cd416665fcdaf33f"
+    },
+    {
+      "path": "toolchain/fault-conformance/src/r9a3_context.rs",
+      "sha256": "1bf8c1a1aefbca6494e2bc6b0663cb3997b061782b9108193ed1f2600059d2ae"
+    },
+    {
+      "path": "toolchain/fault-conformance/src/r9a3.rs",
+      "sha256": "c5405236b55f44a33978ad04ac5d41ab20d3ff93680244a74373b4469a481ffa"
+    },
+    {
+      "path": "toolchain/fault-conformance/src/r9b_governed_state.rs",
+      "sha256": "2b258d20f922de2c74b0e2dffc76c66cd279a613617d55d8fe60899fe5f78193"
+    },
+    {
+      "path": "toolchain/fault-conformance/src/u03c_result_review.rs",
+      "sha256": "27f07a4d8b055abbeb9c90d1744b04ff69e6f234de73040d1c95ad00d714c913"
+    },
+    {
+      "path": "toolchain/fault-conformance/src/u04c_work_start.rs",
+      "sha256": "1db92ea63dbc827a3c196061f6cb2e2bf19a15e1b8ace9427248ee4dab0f01fe"
     },
     {
       "path": "toolchain/fault-conformance/tests/crash_recovery.rs",

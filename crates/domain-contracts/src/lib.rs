@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
+pub mod context_revoke;
+pub mod harness_content;
 pub mod memory;
 pub mod profiles;
+pub mod work_capability;
 
 pub const ARCHITECTURE_VERSION: &str = "1.0";
 

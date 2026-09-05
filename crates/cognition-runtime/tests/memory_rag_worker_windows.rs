@@ -100,6 +100,7 @@ fn snapshot() -> AcceptedMemorySnapshot {
     let content = "Rust owns accepted Memory facts.".to_owned();
     AcceptedMemorySnapshot {
         scope_ref: "scope:founder".to_owned(),
+        authority_revision: 8,
         records: vec![MemoryRecord {
             memory_id: "memory-01".to_owned(),
             revision: 7,

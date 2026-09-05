@@ -4,6 +4,20 @@
 - Evidence date: 2026-08-27
 - Scope: GPT, DeepSeek, Kimi and GLM
 
+## Local CI evidence
+
+The provider catalog provenance change was verified by the complete local CI
+pipeline against the clean commit `c97110890ea025ab115288ca88171af21f0a6615`:
+
+- status: passed;
+- stages: 8/8;
+- failed stages: 0;
+- duration: 56,296 ms.
+
+This evidence validates repository contracts, boundary checks, generated
+bindings and the workspace test gates. It does not promote the four offline
+catalog snapshots to live Provider admission.
+
 ## Correction
 
 A Provider is not a model. One Provider profile owns a model catalog and one
@@ -70,8 +84,17 @@ status, logs and serialized configuration.
 
 ## Remaining implementation gates
 
-1. Add a provider-neutral model-catalog read contract and local snapshot with
-   source, fetched-at time, Harness version and evidence digest.
+The configuration baseline now accepts and redacts an optional
+`catalog_snapshot` containing source, fetched-at time, Harness version and a
+canonical evidence digest. The example profiles carry explicit
+`offline-fallback` provenance and `not-probed` Harness versions. This is
+configuration provenance only; it does not imply a live catalog refresh or
+Provider admission.
+
+The remaining gates are:
+
+1. Add a provider-neutral model-catalog read contract and local refresh
+   projection without changing selected-model semantics.
 2. Implement Harness-native refresh in this order: Codex app-server, DSH,
    Kimi Code, OpenCode. Direct Provider API calls are fallback adapters, not a
    second Agent framework.
