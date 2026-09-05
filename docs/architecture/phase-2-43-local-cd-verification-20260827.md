@@ -44,7 +44,7 @@ Codex, provide a signed Windows binary, or admit semantic RAG/Kimi/DSH.
 ## Acceptance evidence
 
 The authoritative evidence is a successful `pnpm run cd:local` (or
-`pnpm run cd:local -- -SkipCi` with matching local CI evidence) whose output
+`pnpm run cd:local:skip-ci` with matching local CI evidence) whose output
 contains:
 
 ```text
@@ -55,7 +55,7 @@ windows_package_verification=passed files=52
 ```
 
 The first automated run completed on 2026-08-27 with
-`pnpm run cd:local -- -SkipCi`, using the matching clean local CI evidence for
+`pnpm run cd:local:skip-ci`, using the matching clean local CI evidence for
 commit `d3258b320d9d6ed7682ea5a684b87c4916b69adf`. It produced and verified:
 
 ```text

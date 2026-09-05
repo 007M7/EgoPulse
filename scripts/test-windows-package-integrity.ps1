@@ -194,6 +194,10 @@ try {
     $happy = New-TestPackage -Path (Join-Path $testRoot 'fixture-package')
     $manifestResult = Test-EgoPulsePackageManifest -PackageRoot $happy
     Assert-Condition ($manifestResult.Entries.Count -eq 3) 'happy manifest did not cover every non-manifest file'
+    $manifestRequiredResult = Test-EgoPulsePackageManifest `
+        -PackageRoot $happy `
+        -RequiredFiles @('SHA256SUMS', 'config/agentos-config.example.json')
+    Assert-Condition ($manifestRequiredResult.Entries.Count -eq 3) 'manifest must be independently required without listing itself'
     $happyZip = New-TestZipFromPackage -PackageRoot $happy -ArchivePath (Join-Path $testRoot 'happy.zip')
     $happyDigest = Get-EgoPulseSha256Hex -LiteralPath $happyZip
     $preflight = Test-EgoPulseArchiveEnvelope -ArchivePath $happyZip -ExpectedArchiveSha256 $happyDigest -ExpectedTopLevel 'fixture-package'

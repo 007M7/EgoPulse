@@ -471,6 +471,11 @@ function Test-EgoPulsePackageManifest {
     }
     foreach ($required in $RequiredFiles) {
         $safeRequired = ConvertTo-EgoPulsePackagePath -Path $required
+        # The manifest is verified independently above and is deliberately
+        # excluded from its own closed payload set.
+        if ($safeRequired -ceq 'SHA256SUMS') {
+            continue
+        }
         if (-not $packageSet.Contains($safeRequired)) {
             throw "Required package file is missing: $safeRequired"
         }

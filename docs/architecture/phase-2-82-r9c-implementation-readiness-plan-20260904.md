@@ -580,7 +580,7 @@ after every packet. Given fresh passing local-CI evidence for the same HEAD,
 the non-duplicating packaging command is:
 
 ```text
-pnpm run cd:local -- -SkipCi
+pnpm run cd:local:skip-ci
 ```
 
 Tagging and public release remain a separate release authorization; R-9C does

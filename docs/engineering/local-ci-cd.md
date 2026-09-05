@@ -64,7 +64,7 @@ pnpm run cd:local
 `pnpm run cd:local` is an offline reproduction command. It runs local CI once,
 calls the shared Windows packaging script, and automatically verifies the exact
 candidate directory and archive it just produced. If local CI has already
-passed for the same clean `HEAD`, use `pnpm run cd:local -- -SkipCi` to avoid
+passed for the same clean `HEAD`, use `pnpm run cd:local:skip-ci` to avoid
 rerunning it. The first candidate packages the shared kernel as three Windows
 x64 binaries: `agentosd.exe`, `egopulse.exe` and `egopulse-tui.exe`, plus public
 configuration templates, the locked Memory/RAG Worker source, generated Python
