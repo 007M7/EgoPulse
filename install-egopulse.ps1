@@ -88,6 +88,7 @@ foreach ($binary in @('agentosd.exe', 'egopulse.exe', 'egopulse-tui.exe')) {
 $data = (New-Item -ItemType Directory -Force -Path $DataRoot).FullName
 $configPath = Join-Path $data 'agentos-config.json'
 $templatePath = Join-Path $root 'config/agentos-config.example.json'
+$requiresFreshV3Migration = $false
 if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) {
     throw "Configuration template is missing: $templatePath"
 }
@@ -129,6 +130,19 @@ else {
     $config.memory_retrieval.worker_executable = $worker
     $config.memory_retrieval.working_directory = $root
     $config.memory_retrieval.environment_overrides.PYTHONPATH = "$memorySource;$bindings"
+
+    # Installation-specific replacement changes the reviewed workflow run ID.
+    # Persist a v2 source and let the daemon's authoritative transition derive
+    # and seal the matching v3 work-capability route; the installer must not
+    # duplicate that digest algorithm in PowerShell.
+    if ([string]$config.schema_version -eq 'egopulse.production-bootstrap/v3') {
+        if (-not $config.PSObject.Properties['work_capabilities']) {
+            throw 'The v3 configuration template is missing work_capabilities.'
+        }
+        Set-JsonProperty -Object $config -Name 'schema_version' -Value 'egopulse.production-bootstrap/v2'
+        $config.PSObject.Properties.Remove('work_capabilities')
+        $requiresFreshV3Migration = $true
+    }
 
     $configJson = $config | ConvertTo-Json -Depth 100
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -188,6 +202,12 @@ if (-not $SkipMemoryWorker) {
 }
 
 $daemon = Join-Path $root 'bin/agentosd.exe'
+if ($requiresFreshV3Migration) {
+    & $daemon --migrate-to-v3
+    if ($LASTEXITCODE -ne 0) {
+        throw "EgoPulse fresh-install v3 transition failed with exit code $LASTEXITCODE"
+    }
+}
 & $daemon --check-config
 if ($LASTEXITCODE -ne 0) {
     throw "EgoPulse configuration check failed with exit code $LASTEXITCODE"

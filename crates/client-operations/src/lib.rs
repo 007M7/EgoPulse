@@ -53,13 +53,18 @@ use egopulse_domain_contracts::{
             GetTaskViewResponse, HarnessApprovalAuthorityResult, HarnessApprovalView,
             HarnessApprovalViewStreamFrame, ListHarnessApprovalViewsRequest,
             ListHarnessApprovalViewsResponse, ListTaskViewsRequest, ListTaskViewsResponse,
-            LocalApiError, PrepareWorkRequest, PrepareWorkResponse, ProjectionAwaitToken,
-            ProjectionHealth, ProjectionMetadata, ProjectionPosition, RevokeContextSnapshotCommand,
-            SourceDomain, SourceRevision, StreamFrameKind, TaskView, TaskViewStreamFrame,
-            WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, WorkMemoryMode,
-            WorkPreparationPreview, WorkSourceRequest, context_mutation_command,
+            ListWorkCapabilitiesRequest, ListWorkCapabilitiesResult, LocalApiError,
+            PrepareWorkRequest, PrepareWorkResponse, ProjectionAwaitToken, ProjectionHealth,
+            ProjectionMetadata, ProjectionPosition, RevokeContextSnapshotCommand,
+            SetDefaultWorkCapabilityRequest, SourceDomain, SourceRevision, StreamFrameKind,
+            TaskView, TaskViewStreamFrame, UseDefaultWorkCapability,
+            WatchHarnessApprovalViewsRequest, WatchTaskViewsRequest, WorkCapabilityAvailability,
+            WorkCapabilityPreferenceReceipt, WorkCapabilitySelectionSource, WorkCapabilityView,
+            WorkMemoryMode, WorkPreparationPreview, WorkSourceRequest, context_mutation_command,
             execute_context_mutation_response, get_evidence_graph_response,
             get_harness_approval_view_response, get_task_view_response,
+            list_work_capabilities_response, prepare_work_request,
+            set_default_work_capability_response,
         },
         policy::v1::{
             HarnessApprovalDecisionStateKind, IssueHarnessApprovalDecisionCommand,
@@ -73,6 +78,7 @@ use egopulse_domain_contracts::{
         },
         verification::v1::VerificationConclusion,
     },
+    work_capability::validate_work_capability_route_binding,
 };
 use egopulse_local_api::{LocalApiClient, LocalApiConnection, LocalIpcAddress};
 use prost::Message;
@@ -96,6 +102,8 @@ const GET_TASK_VIEW_RPC: &str = "LocalReadModelService/GetTaskView";
 const GET_EVIDENCE_GRAPH_RPC: &str = "LocalReadModelService/GetEvidenceGraph";
 const PREPARE_WORK_RPC: &str = "LocalCommandGatewayService/PrepareWork";
 const CONFIRM_WORK_RPC: &str = "LocalCommandGatewayService/ConfirmWork";
+const LIST_WORK_CAPABILITIES_RPC: &str = "LocalCommandGatewayService/ListWorkCapabilities";
+const SET_DEFAULT_WORK_CAPABILITY_RPC: &str = "LocalCommandGatewayService/SetDefaultWorkCapability";
 const LIST_TASK_VIEWS_RPC: &str = "LocalReadModelService/ListTaskViews";
 const GOVERNED_TASK_BASELINE_PAGE_SIZE: u32 = 100;
 const GOVERNED_TASK_BASELINE_MAX_PAGES: usize = 100;
@@ -1034,6 +1042,43 @@ pub enum ClientWorkError {
     Protocol(&'static str),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GovernedWorkCapabilityAvailability {
+    Admitted,
+    Candidate,
+    Held,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GovernedWorkCapabilitySelectionSource {
+    FutureWorkDefault,
+    ExplicitChoice,
+    LegacyOmittedDefault,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedWorkCapability {
+    pub provider_profile_id: String,
+    pub provider_alias: String,
+    pub harness_alias: String,
+    pub harness_model_alias: String,
+    pub provider_model_alias: String,
+    pub availability: GovernedWorkCapabilityAvailability,
+    pub selectable: bool,
+    pub safe_reason_code: Option<String>,
+    pub choice_id: Option<String>,
+    pub route_binding_sha256: Option<String>,
+    pub current_future_work_default: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedWorkCapabilityCatalog {
+    pub capabilities: Vec<GovernedWorkCapability>,
+    pub default_choice_id: String,
+    pub preference_revision: u64,
+    pub configuration_migration_required: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuidedWorkSource {
     pub source_ref: String,
@@ -1047,6 +1092,31 @@ pub struct GuidedWorkSource {
 pub enum GuidedWorkMemoryMode {
     Disabled,
     GovernedRetrieval,
+}
+
+/// Closed user choice for one work item. The public identifier is resolved by
+/// the daemon; clients cannot supply an authoritative route tuple.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GuidedWorkCapabilityChoice {
+    FutureWorkDefault,
+    Explicit(String),
+}
+
+impl GuidedWorkCapabilityChoice {
+    fn to_wire(&self) -> prepare_work_request::WorkCapabilityPreference {
+        match self {
+            Self::FutureWorkDefault => {
+                prepare_work_request::WorkCapabilityPreference::UseDefaultWorkCapability(
+                    UseDefaultWorkCapability {},
+                )
+            }
+            Self::Explicit(choice_id) => {
+                prepare_work_request::WorkCapabilityPreference::ExplicitWorkCapabilityChoiceId(
+                    choice_id.clone(),
+                )
+            }
+        }
+    }
 }
 
 impl GuidedWorkMemoryMode {
@@ -1065,11 +1135,12 @@ pub struct GuidedWorkInput {
     pub target_scope_ref: String,
     pub sources: Vec<GuidedWorkSource>,
     pub memory_mode: GuidedWorkMemoryMode,
+    pub capability: GuidedWorkCapabilityChoice,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GuidedWorkNonGoal {
-    ProviderSelectionDeferred,
+    ProviderRouteCannotBeModelSelected,
     MemoryMutationExcluded,
 }
 
@@ -1077,8 +1148,8 @@ impl GuidedWorkNonGoal {
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::ProviderSelectionDeferred => {
-                "provider/model selection is not made by preparation"
+            Self::ProviderRouteCannotBeModelSelected => {
+                "provider/model route cannot be selected or changed by model output"
             }
             Self::MemoryMutationExcluded => "memory is not mutated by preparation",
         }
@@ -1122,6 +1193,14 @@ pub struct GuidedWorkPreview {
     memory_mode: GuidedWorkMemoryMode,
     memory_authority_revision: Option<u64>,
     memory_pack_snapshot_sha256: Option<String>,
+    capability_choice_id: String,
+    provider_alias: String,
+    harness_alias: String,
+    harness_model_alias: String,
+    provider_model_alias: String,
+    route_binding_sha256: String,
+    capability_selection_source: GovernedWorkCapabilitySelectionSource,
+    preference_revision_at_resolution: Option<u64>,
     gate_ready: bool,
     ready_for_founder_confirmation: bool,
 }
@@ -1180,6 +1259,46 @@ impl GuidedWorkPreview {
     #[must_use]
     pub fn memory_pack_snapshot_sha256(&self) -> Option<&str> {
         self.memory_pack_snapshot_sha256.as_deref()
+    }
+
+    #[must_use]
+    pub fn capability_choice_id(&self) -> &str {
+        &self.capability_choice_id
+    }
+
+    #[must_use]
+    pub fn provider_alias(&self) -> &str {
+        &self.provider_alias
+    }
+
+    #[must_use]
+    pub fn harness_alias(&self) -> &str {
+        &self.harness_alias
+    }
+
+    #[must_use]
+    pub fn harness_model_alias(&self) -> &str {
+        &self.harness_model_alias
+    }
+
+    #[must_use]
+    pub fn provider_model_alias(&self) -> &str {
+        &self.provider_model_alias
+    }
+
+    #[must_use]
+    pub fn route_binding_sha256(&self) -> &str {
+        &self.route_binding_sha256
+    }
+
+    #[must_use]
+    pub const fn capability_selection_source(&self) -> GovernedWorkCapabilitySelectionSource {
+        self.capability_selection_source
+    }
+
+    #[must_use]
+    pub const fn preference_revision_at_resolution(&self) -> Option<u64> {
+        self.preference_revision_at_resolution
     }
 
     #[must_use]
@@ -1760,18 +1879,99 @@ impl ClientAttachment {
         .await
     }
 
+    /// Lists redaction-safe route choices through the same shared kernel used
+    /// by every surface. Candidate and held entries remain visible but cannot
+    /// carry a selectable choice or admitted route.
+    pub async fn list_work_capabilities(
+        &self,
+    ) -> Result<GovernedWorkCapabilityCatalog, ClientWorkError> {
+        self.require_rpc(LIST_WORK_CAPABILITIES_RPC)?;
+        let response = self
+            .connection
+            .command_gateway_service()
+            .list_work_capabilities(ListWorkCapabilitiesRequest {
+                client: Some(self.metadata(None)?),
+            })
+            .await
+            .map_err(|error| ClientWorkError::Transport(error.to_string()))?
+            .into_inner();
+        match response.outcome {
+            Some(list_work_capabilities_response::Outcome::Result(result)) => {
+                parse_work_capability_catalog(result)
+            }
+            Some(list_work_capabilities_response::Outcome::Error(error)) => {
+                Err(ClientWorkError::Api(Box::new(error)))
+            }
+            None => Err(ClientWorkError::Protocol(
+                "work capability list outcome missing",
+            )),
+        }
+    }
+
+    pub async fn set_default_work_capability(
+        &self,
+        choice_id: String,
+        expected_preference_revision: u64,
+    ) -> Result<WorkCapabilityPreferenceReceipt, ClientWorkError> {
+        self.require_rpc(SET_DEFAULT_WORK_CAPABILITY_RPC)?;
+        if !is_guided_work_text(&choice_id, GUIDED_WORK_MAX_ROUTING_BYTES)
+            || expected_preference_revision == 0
+        {
+            return Err(ClientWorkError::Protocol(
+                "work capability preference input is invalid",
+            ));
+        }
+        let response = self
+            .connection
+            .command_gateway_service()
+            .set_default_work_capability(SetDefaultWorkCapabilityRequest {
+                client: Some(self.metadata(None)?),
+                choice_id: choice_id.clone(),
+                expected_preference_revision,
+            })
+            .await
+            .map_err(|error| ClientWorkError::Transport(error.to_string()))?
+            .into_inner();
+        match response.outcome {
+            Some(set_default_work_capability_response::Outcome::Receipt(receipt))
+                if receipt.default_choice_id == choice_id
+                    && receipt.previous_preference_revision == expected_preference_revision
+                    && ((!receipt.changed
+                        && receipt.preference_revision == expected_preference_revision)
+                        || (receipt.changed
+                            && receipt.preference_revision
+                                == expected_preference_revision.saturating_add(1))) =>
+            {
+                Ok(receipt)
+            }
+            Some(set_default_work_capability_response::Outcome::Receipt(_)) => Err(
+                ClientWorkError::Protocol("work capability preference receipt is invalid"),
+            ),
+            Some(set_default_work_capability_response::Outcome::Error(error)) => {
+                Err(ClientWorkError::Api(Box::new(error)))
+            }
+            None => Err(ClientWorkError::Protocol(
+                "work capability preference outcome missing",
+            )),
+        }
+    }
+
     /// The shared client operation for both CLI and TUI. The request contains
     /// only user intent, scope and explicit source references; all governance
     /// facts are returned by the daemon-owned preparation compiler.
     pub async fn prepare_work(
         &self,
-        intent: String,
-        work_type: String,
-        target_scope_ref: String,
-        sources: Vec<(String, String)>,
-        memory_mode: GuidedWorkMemoryMode,
+        input: GuidedWorkInput,
         idempotency_key: String,
     ) -> Result<WorkPreparationPreview, ClientWorkError> {
+        let GuidedWorkInput {
+            intent,
+            work_type,
+            target_scope_ref,
+            sources,
+            memory_mode,
+            capability,
+        } = input;
         let response = self
             .connection
             .command_gateway_service()
@@ -1782,10 +1982,14 @@ impl ClientAttachment {
                 target_scope_ref,
                 sources: sources
                     .into_iter()
-                    .map(|(source_ref, label)| WorkSourceRequest { source_ref, label })
+                    .map(|source| WorkSourceRequest {
+                        source_ref: source.source_ref,
+                        label: source.label,
+                    })
                     .collect(),
                 idempotency_key,
                 memory_mode: memory_mode.wire_value(),
+                work_capability_preference: Some(capability.to_wire()),
             })
             .await
             .map_err(|error| ClientWorkError::Transport(error.to_string()))?
@@ -1863,6 +2067,7 @@ where
             .collect(),
         idempotency_key: prepare_idempotency_key,
         memory_mode: input.memory_mode.wire_value(),
+        work_capability_preference: Some(input.capability.to_wire()),
     };
     let recovery = RecoverableWorkPreparation {
         authenticated_principal_id: session.authenticated_principal_id.clone(),
@@ -1906,6 +2111,10 @@ fn parse_guided_work_preparation(
         &recovery.request.work_type,
         &recovery.request.target_scope_ref,
         guided_memory_mode_from_wire(recovery.request.memory_mode)?,
+    )?;
+    validate_guided_work_capability_choice(
+        &preview,
+        recovery.request.work_capability_preference.as_ref(),
     )?;
     let safe_preview = guided_work_safe_preview(
         &preview,
@@ -1983,6 +2192,13 @@ pub fn validate_guided_work_input(input: &GuidedWorkInput) -> Result<(), ClientG
             "source count or source fields are invalid",
         ));
     }
+    if let GuidedWorkCapabilityChoice::Explicit(choice_id) = &input.capability
+        && !is_guided_work_text(choice_id, GUIDED_WORK_MAX_ROUTING_BYTES)
+    {
+        return Err(ClientGuidedWorkError::InvalidInput(
+            "work capability choice is invalid",
+        ));
+    }
     let mut total_bytes = input
         .intent
         .len()
@@ -2003,6 +2219,250 @@ pub fn validate_guided_work_input(input: &GuidedWorkInput) -> Result<(), ClientG
 
 fn is_guided_work_text(value: &str, max_bytes: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn parse_work_capability_catalog(
+    result: ListWorkCapabilitiesResult,
+) -> Result<GovernedWorkCapabilityCatalog, ClientWorkError> {
+    let preference = result.preference.ok_or(ClientWorkError::Protocol(
+        "work capability preference missing",
+    ))?;
+    if result.capabilities.is_empty()
+        || result.capabilities.len() > 1_024
+        || !is_guided_work_text(&preference.default_choice_id, GUIDED_WORK_MAX_ROUTING_BYTES)
+        || preference.preference_revision == 0
+    {
+        return Err(ClientWorkError::Protocol(
+            "work capability catalog is incomplete",
+        ));
+    }
+
+    let mut choices = BTreeSet::new();
+    let mut current_default_count = 0usize;
+    let mut capabilities = Vec::with_capacity(result.capabilities.len());
+    for view in result.capabilities {
+        let capability = parse_work_capability_view(&view)?;
+        if let Some(choice_id) = capability.choice_id.as_ref()
+            && !choices.insert(choice_id.clone())
+        {
+            return Err(ClientWorkError::Protocol(
+                "work capability choice identity is duplicated",
+            ));
+        }
+        if capability.current_future_work_default {
+            current_default_count += 1;
+            if capability.choice_id.as_deref() != Some(preference.default_choice_id.as_str()) {
+                return Err(ClientWorkError::Protocol(
+                    "work capability default projection is inconsistent",
+                ));
+            }
+        }
+        capabilities.push(capability);
+    }
+    if current_default_count != 1 || !choices.contains(&preference.default_choice_id) {
+        return Err(ClientWorkError::Protocol(
+            "work capability default is not admitted",
+        ));
+    }
+    Ok(GovernedWorkCapabilityCatalog {
+        capabilities,
+        default_choice_id: preference.default_choice_id,
+        preference_revision: preference.preference_revision,
+        configuration_migration_required: preference.configuration_migration_required,
+    })
+}
+
+fn parse_work_capability_view(
+    view: &WorkCapabilityView,
+) -> Result<GovernedWorkCapability, ClientWorkError> {
+    for value in [
+        &view.provider_profile_id,
+        &view.provider_alias,
+        &view.harness_alias,
+        &view.harness_model_alias,
+        &view.provider_model_alias,
+    ] {
+        if !is_guided_work_text(value, GUIDED_WORK_MAX_ROUTING_BYTES) {
+            return Err(ClientWorkError::Protocol(
+                "work capability alias is invalid",
+            ));
+        }
+    }
+    if view
+        .safe_reason_code
+        .as_deref()
+        .is_some_and(|value| !is_guided_work_text(value, GUIDED_WORK_MAX_ROUTING_BYTES))
+        || view
+            .choice_id
+            .as_deref()
+            .is_some_and(|value| !is_guided_work_text(value, GUIDED_WORK_MAX_ROUTING_BYTES))
+    {
+        return Err(ClientWorkError::Protocol(
+            "work capability safe metadata is invalid",
+        ));
+    }
+
+    let availability = match WorkCapabilityAvailability::try_from(view.availability) {
+        Ok(WorkCapabilityAvailability::Admitted) => {
+            let route = view
+                .admitted_route
+                .as_ref()
+                .ok_or(ClientWorkError::Protocol(
+                    "admitted work capability route missing",
+                ))?;
+            validate_work_capability_route_binding(route).map_err(|_| {
+                ClientWorkError::Protocol("admitted work capability route is invalid")
+            })?;
+            if !view.selectable
+                || view.safe_reason_code.is_some()
+                || view.choice_id.is_none()
+                || route.provider_profile_id != view.provider_profile_id
+                || route.provider_id != view.provider_alias
+                || route.harness_id != view.harness_alias
+                || route.harness_model_id != view.harness_model_alias
+                || route.provider_model_id != view.provider_model_alias
+            {
+                return Err(ClientWorkError::Protocol(
+                    "admitted work capability projection is inconsistent",
+                ));
+            }
+            GovernedWorkCapabilityAvailability::Admitted
+        }
+        Ok(WorkCapabilityAvailability::Candidate) => {
+            if view.selectable
+                || view.choice_id.is_some()
+                || view.admitted_route.is_some()
+                || view.current_future_work_default
+                || view.safe_reason_code.is_none()
+            {
+                return Err(ClientWorkError::Protocol(
+                    "candidate work capability became selectable",
+                ));
+            }
+            GovernedWorkCapabilityAvailability::Candidate
+        }
+        Ok(WorkCapabilityAvailability::Held) => {
+            if view.selectable
+                || view.choice_id.is_some()
+                || view.admitted_route.is_some()
+                || view.current_future_work_default
+                || view.safe_reason_code.is_none()
+            {
+                return Err(ClientWorkError::Protocol(
+                    "held work capability became selectable",
+                ));
+            }
+            GovernedWorkCapabilityAvailability::Held
+        }
+        Ok(WorkCapabilityAvailability::Unspecified) | Err(_) => {
+            return Err(ClientWorkError::Protocol(
+                "work capability availability is unknown",
+            ));
+        }
+    };
+    Ok(GovernedWorkCapability {
+        provider_profile_id: view.provider_profile_id.clone(),
+        provider_alias: view.provider_alias.clone(),
+        harness_alias: view.harness_alias.clone(),
+        harness_model_alias: view.harness_model_alias.clone(),
+        provider_model_alias: view.provider_model_alias.clone(),
+        availability,
+        selectable: view.selectable,
+        safe_reason_code: view.safe_reason_code.clone(),
+        choice_id: view.choice_id.clone(),
+        route_binding_sha256: view
+            .admitted_route
+            .as_ref()
+            .map(|route| route.route_binding_sha256.clone()),
+        current_future_work_default: view.current_future_work_default,
+    })
+}
+
+fn validated_work_capability_selection(
+    preview: &WorkPreparationPreview,
+) -> Result<GovernedWorkCapabilitySelectionSource, ClientGuidedWorkError> {
+    let view = preview
+        .work_capability
+        .as_ref()
+        .ok_or(ClientGuidedWorkError::Protocol(
+            "prepared work capability is missing",
+        ))?;
+    let capability = parse_work_capability_view(view)
+        .map_err(|_| ClientGuidedWorkError::Protocol("prepared work capability is invalid"))?;
+    if capability.availability != GovernedWorkCapabilityAvailability::Admitted
+        || !capability.selectable
+        || capability.choice_id.is_none()
+        || capability.route_binding_sha256.is_none()
+    {
+        return Err(ClientGuidedWorkError::Protocol(
+            "prepared work capability is not admitted",
+        ));
+    }
+
+    match WorkCapabilitySelectionSource::try_from(preview.work_capability_selection_source) {
+        Ok(WorkCapabilitySelectionSource::FutureWorkDefault) => {
+            if !preview
+                .preference_revision_at_resolution
+                .is_some_and(|revision| revision > 0)
+            {
+                return Err(ClientGuidedWorkError::Protocol(
+                    "prepared future-work default binding is incomplete",
+                ));
+            }
+            Ok(GovernedWorkCapabilitySelectionSource::FutureWorkDefault)
+        }
+        Ok(WorkCapabilitySelectionSource::ExplicitChoice) => {
+            if preview.preference_revision_at_resolution.is_some() {
+                return Err(ClientGuidedWorkError::Protocol(
+                    "explicit work capability unexpectedly depends on the mutable default",
+                ));
+            }
+            Ok(GovernedWorkCapabilitySelectionSource::ExplicitChoice)
+        }
+        Ok(WorkCapabilitySelectionSource::LegacyOmittedDefault) => {
+            if !preview
+                .preference_revision_at_resolution
+                .is_some_and(|revision| revision > 0)
+            {
+                return Err(ClientGuidedWorkError::Protocol(
+                    "legacy work capability default binding is incomplete",
+                ));
+            }
+            Ok(GovernedWorkCapabilitySelectionSource::LegacyOmittedDefault)
+        }
+        Ok(WorkCapabilitySelectionSource::Unspecified) | Err(_) => Err(
+            ClientGuidedWorkError::Protocol("work capability selection source is unknown"),
+        ),
+    }
+}
+
+fn validate_guided_work_capability_choice(
+    preview: &WorkPreparationPreview,
+    requested: Option<&prepare_work_request::WorkCapabilityPreference>,
+) -> Result<(), ClientGuidedWorkError> {
+    let source = validated_work_capability_selection(preview)?;
+    let view = preview
+        .work_capability
+        .as_ref()
+        .ok_or(ClientGuidedWorkError::Protocol(
+            "prepared work capability is missing",
+        ))?;
+    match (requested, source) {
+        (
+            Some(prepare_work_request::WorkCapabilityPreference::UseDefaultWorkCapability(_)),
+            GovernedWorkCapabilitySelectionSource::FutureWorkDefault,
+        )
+        | (None, GovernedWorkCapabilitySelectionSource::LegacyOmittedDefault) => Ok(()),
+        (
+            Some(prepare_work_request::WorkCapabilityPreference::ExplicitWorkCapabilityChoiceId(
+                requested_choice_id,
+            )),
+            GovernedWorkCapabilitySelectionSource::ExplicitChoice,
+        ) if view.choice_id.as_deref() == Some(requested_choice_id.as_str()) => Ok(()),
+        _ => Err(ClientGuidedWorkError::Protocol(
+            "prepared work capability does not match the requested selection",
+        )),
+    }
 }
 
 fn validate_guided_work_preview(
@@ -2047,6 +2507,7 @@ fn validate_guided_work_preview(
                     .is_some_and(is_canonical_sha256)
         }
     };
+    let capability_binding_valid = validated_work_capability_selection(preview).is_ok();
     let expected_gate_ready = preview.excluded_sources.is_empty()
         && (!preview.included_sources.is_empty()
             || expected_memory_mode == GuidedWorkMemoryMode::GovernedRetrieval);
@@ -2070,7 +2531,7 @@ fn validate_guided_work_preview(
         || preview.warnings.len() > GUIDED_WORK_MAX_SOURCES
         || preview.non_goals
             != [
-                "provider/model selection is not made by preparation",
+                "provider/model route cannot be selected or changed by model output",
                 "memory is not mutated by preparation",
             ]
         || !is_guided_work_text(&preview.normalized_intent, GUIDED_WORK_MAX_TEXT_BYTES)
@@ -2102,6 +2563,7 @@ fn validate_guided_work_preview(
             .any(|notice| !is_valid_guided_work_warning(notice))
         || (expected_memory_mode == GuidedWorkMemoryMode::Disabled && !preview.warnings.is_empty())
         || !memory_binding_valid
+        || !capability_binding_valid
         || preview.gate_ready != preview.ready_for_founder_confirmation
         || preview.gate_ready != expected_gate_ready
     {
@@ -2148,8 +2610,8 @@ fn safe_guided_work_warning(value: &str) -> Option<GovernedWorkNotice> {
 
 fn safe_guided_work_non_goal(value: &str) -> Option<GuidedWorkNonGoal> {
     match value {
-        "provider/model selection is not made by preparation" => {
-            Some(GuidedWorkNonGoal::ProviderSelectionDeferred)
+        "provider/model route cannot be selected or changed by model output" => {
+            Some(GuidedWorkNonGoal::ProviderRouteCannotBeModelSelected)
         }
         "memory is not mutated by preparation" => Some(GuidedWorkNonGoal::MemoryMutationExcluded),
         _ => None,
@@ -2218,6 +2680,19 @@ fn guided_work_safe_preview(
         .ok_or(ClientGuidedWorkError::Protocol(
             "prepared work contains an unknown warning",
         ))?;
+    let capability_selection_source = validated_work_capability_selection(preview)?;
+    let capability = preview
+        .work_capability
+        .as_ref()
+        .ok_or(ClientGuidedWorkError::Protocol(
+            "prepared work capability is missing",
+        ))?;
+    let route = capability
+        .admitted_route
+        .as_ref()
+        .ok_or(ClientGuidedWorkError::Protocol(
+            "prepared work capability route is missing",
+        ))?;
     Ok(GuidedWorkPreview {
         normalized_intent: preview.normalized_intent.clone(),
         work_type: preview.work_type.clone(),
@@ -2230,6 +2705,16 @@ fn guided_work_safe_preview(
         memory_mode,
         memory_authority_revision: preview.memory_authority_revision,
         memory_pack_snapshot_sha256: preview.memory_pack_snapshot_sha256.clone(),
+        capability_choice_id: capability.choice_id.clone().ok_or(
+            ClientGuidedWorkError::Protocol("prepared work capability choice is missing"),
+        )?,
+        provider_alias: capability.provider_alias.clone(),
+        harness_alias: capability.harness_alias.clone(),
+        harness_model_alias: capability.harness_model_alias.clone(),
+        provider_model_alias: capability.provider_model_alias.clone(),
+        route_binding_sha256: route.route_binding_sha256.clone(),
+        capability_selection_source,
+        preference_revision_at_resolution: preview.preference_revision_at_resolution,
         gate_ready: preview.gate_ready,
         ready_for_founder_confirmation: preview.ready_for_founder_confirmation,
     })
@@ -4526,6 +5011,45 @@ mod tests {
                 label: "label-sensitive-sentinel".to_owned(),
             }],
             memory_mode: GuidedWorkMemoryMode::Disabled,
+            capability: GuidedWorkCapabilityChoice::FutureWorkDefault,
+        }
+    }
+
+    fn guided_work_capability() -> WorkCapabilityView {
+        let route = egopulse_domain_contracts::work_capability::seal_work_capability_route_binding(
+            egopulse_domain_contracts::v01::egopulse::task::v1::WorkCapabilityRouteBinding {
+                route_id: "route:guided:test".to_owned(),
+                route_generation: 1,
+                provider_profile_id: "provider-profile:guided".to_owned(),
+                provider_id: "provider".to_owned(),
+                harness_id: "native_harness".to_owned(),
+                harness_model_id: "model:guided".to_owned(),
+                provider_model_id: "model:provider".to_owned(),
+                capability_profile_ref: Some(
+                    egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference {
+                        contract_id: "egopulse.harness.capability.generic".to_owned(),
+                        version: "1.0.0".to_owned(),
+                        sha256: "d".repeat(64),
+                    },
+                ),
+                catalog_snapshot_sha256: Some("e".repeat(64)),
+                native_composition_generation: "native:test".to_owned(),
+                route_binding_sha256: String::new(),
+            },
+        )
+        .expect("sealed test work capability route");
+        WorkCapabilityView {
+            provider_profile_id: route.provider_profile_id.clone(),
+            provider_alias: route.provider_id.clone(),
+            harness_alias: route.harness_id.clone(),
+            harness_model_alias: route.harness_model_id.clone(),
+            provider_model_alias: route.provider_model_id.clone(),
+            availability: WorkCapabilityAvailability::Admitted as i32,
+            selectable: true,
+            safe_reason_code: None,
+            choice_id: Some("capability:guided:test".to_owned()),
+            admitted_route: Some(route),
+            current_future_work_default: true,
         }
     }
 
@@ -4561,9 +5085,13 @@ mod tests {
             excluded_sources: excluded_sources.clone(),
             blockers: excluded_sources,
             non_goals: vec![
-                "provider/model selection is not made by preparation".to_owned(),
+                "provider/model route cannot be selected or changed by model output".to_owned(),
                 "memory is not mutated by preparation".to_owned(),
             ],
+            work_capability: Some(guided_work_capability()),
+            work_capability_selection_source: WorkCapabilitySelectionSource::FutureWorkDefault
+                as i32,
+            preference_revision_at_resolution: Some(1),
             gate_ready: !blocked,
             ready_for_founder_confirmation: !blocked,
             ..WorkPreparationPreview::default()
@@ -4611,6 +5139,33 @@ mod tests {
     }
 
     #[test]
+    fn guided_work_prepared_default_remains_valid_after_default_moves() {
+        for (wire_source, expected) in [
+            (
+                WorkCapabilitySelectionSource::FutureWorkDefault,
+                GovernedWorkCapabilitySelectionSource::FutureWorkDefault,
+            ),
+            (
+                WorkCapabilitySelectionSource::LegacyOmittedDefault,
+                GovernedWorkCapabilitySelectionSource::LegacyOmittedDefault,
+            ),
+        ] {
+            let mut preview = guided_work_preview(false);
+            preview.work_capability_selection_source = wire_source as i32;
+            preview
+                .work_capability
+                .as_mut()
+                .expect("prepared capability")
+                .current_future_work_default = false;
+            assert_eq!(
+                validated_work_capability_selection(&preview)
+                    .expect("sealed prepared capability remains valid"),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn guided_work_prepares_opaque_safe_preview_and_enforces_input_bounds_before_dispatch() {
         let now = SystemTime::now();
         let kernel = authenticated_kernel_with_permissions(
@@ -4653,7 +5208,7 @@ mod tests {
         assert_eq!(
             prepared.preview().non_goals(),
             &[
-                GuidedWorkNonGoal::ProviderSelectionDeferred,
+                GuidedWorkNonGoal::ProviderRouteCannotBeModelSelected,
                 GuidedWorkNonGoal::MemoryMutationExcluded,
             ]
         );
@@ -4739,13 +5294,13 @@ mod tests {
             ))
         ));
         for non_goals in [
-            vec!["provider/model selection is not made by preparation".to_owned()],
+            vec!["provider/model route cannot be selected or changed by model output".to_owned()],
             vec![
                 "memory is not mutated by preparation".to_owned(),
-                "provider/model selection is not made by preparation".to_owned(),
+                "provider/model route cannot be selected or changed by model output".to_owned(),
             ],
             vec![
-                "provider/model selection is not made by preparation".to_owned(),
+                "provider/model route cannot be selected or changed by model output".to_owned(),
                 "memory is not mutated by preparation".to_owned(),
                 "memory is not mutated by preparation".to_owned(),
             ],

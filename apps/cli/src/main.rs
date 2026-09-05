@@ -27,12 +27,14 @@ use egopulse_client_operations::{
     GovernedHoldReason, GovernedProjectionPosition, GovernedProjectionReason,
     GovernedStateComposite, GovernedStateDomain, GovernedStateDomainPhase, GovernedStateReason,
     GovernedStateSession, GovernedTaskBaseline, GovernedTaskSession, GovernedTaskState,
-    GovernedTaskUpdate, GuidedApprovalDecision, GuidedApprovalDecisionInput,
-    GuidedWorkConfirmationAttempt, GuidedWorkInput, GuidedWorkMemoryMode,
-    GuidedWorkPreparationAttempt, GuidedWorkPreview, GuidedWorkSource, HarnessContentFilter,
-    HarnessContentSession, HarnessContentUpdate, HarnessContentUpdateKind, TaskResultReview,
-    TaskResultReviewStage, TaskWatchClassification, attach as attach_client, command_metadata,
-    set_task_digest, set_verdict_digest, timestamp_after, validate_guided_work_input,
+    GovernedTaskUpdate, GovernedWorkCapabilityAvailability, GovernedWorkCapabilityCatalog,
+    GovernedWorkCapabilitySelectionSource, GuidedApprovalDecision, GuidedApprovalDecisionInput,
+    GuidedWorkCapabilityChoice, GuidedWorkConfirmationAttempt, GuidedWorkInput,
+    GuidedWorkMemoryMode, GuidedWorkPreparationAttempt, GuidedWorkPreview, GuidedWorkSource,
+    HarnessContentFilter, HarnessContentSession, HarnessContentUpdate, HarnessContentUpdateKind,
+    TaskResultReview, TaskResultReviewStage, TaskWatchClassification, attach as attach_client,
+    command_metadata, set_task_digest, set_verdict_digest, timestamp_after,
+    validate_guided_work_input,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -57,6 +59,9 @@ use egopulse_domain_contracts::v01::egopulse::{
         ListHarnessApprovalViewsRequest, ListTaskViewsRequest, LocalApiError, LocalApiErrorCode,
         MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth,
         ProjectionMetadata, RetrieveMemoryRequest, SourceDomain, SourceRevision, TaskView,
+        WorkCapabilityAvailability as WireWorkCapabilityAvailability,
+        WorkCapabilityPreferenceReceipt,
+        WorkCapabilitySelectionSource as WireWorkCapabilitySelectionSource, WorkCapabilityView,
         await_projection_response, get_evidence_graph_response, get_harness_approval_view_response,
         get_task_view_response, harness_artifact_relation_view, harness_content_record_view,
         memory_mutation_command, retrieve_memory_response,
@@ -223,6 +228,9 @@ enum WorkCommand {
         /// Do not retrieve accepted Memory for this work. Governed retrieval is the default.
         #[arg(long)]
         no_memory: bool,
+        /// Public work-capability choice. Omit to use the governed future-work default.
+        #[arg(long)]
+        capability: Option<String>,
         /// Explicitly confirm after the safe preview (required without a TTY).
         #[arg(long, conflicts_with = "cancel")]
         confirm: bool,
@@ -262,6 +270,9 @@ enum WorkCommand {
         /// Do not retrieve accepted Memory for this work. Governed retrieval is the default.
         #[arg(long)]
         no_memory: bool,
+        /// Public work-capability choice. Omit to use the governed future-work default.
+        #[arg(long)]
+        capability: Option<String>,
         #[arg(long)]
         idempotency_key: String,
         #[arg(long)]
@@ -274,6 +285,18 @@ enum WorkCommand {
         confirmation_binding_sha256: String,
         #[arg(long)]
         idempotency_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List daemon-governed work-capability choices and the future-work default.
+    Capabilities {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change the daemon-owned default for future work using optimistic CAS.
+    SetDefault {
+        choice_id: String,
+        expected_revision: u64,
         #[arg(long)]
         json: bool,
     },
@@ -998,7 +1021,9 @@ fn command_json(command: &Command) -> bool {
                 WorkCommand::Plan { json, .. }
                 | WorkCommand::Start { json, .. }
                 | WorkCommand::Prepare { json, .. }
-                | WorkCommand::Confirm { json, .. },
+                | WorkCommand::Confirm { json, .. }
+                | WorkCommand::Capabilities { json }
+                | WorkCommand::SetDefault { json, .. },
         }
         | Command::Context {
             command: ContextCommand::Revoke { json, .. },
@@ -1281,6 +1306,7 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
             work_type,
             context_refs,
             no_memory,
+            capability,
             confirm,
             cancel,
             json,
@@ -1302,6 +1328,7 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
                     } else {
                         GuidedWorkMemoryMode::GovernedRetrieval
                     },
+                    capability: guided_work_capability_choice(capability, "work.start")?,
                 },
                 confirm,
                 cancel,
@@ -1379,25 +1406,33 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
             work_type,
             context_refs,
             no_memory,
+            capability,
             idempotency_key,
             json,
         } => {
+            let capability = guided_work_capability_choice(capability, "work.prepare")?;
             let attached = attach("work.prepare").await?;
             attached.require_rpc("LocalCommandGatewayService/PrepareWork", "work.prepare")?;
             let preview = attached
                 .0
                 .prepare_work(
-                    intent,
-                    work_type,
-                    scope,
-                    context_refs
-                        .into_iter()
-                        .map(|value| (value.clone(), value))
-                        .collect(),
-                    if no_memory {
-                        GuidedWorkMemoryMode::Disabled
-                    } else {
-                        GuidedWorkMemoryMode::GovernedRetrieval
+                    GuidedWorkInput {
+                        intent,
+                        work_type,
+                        target_scope_ref: scope,
+                        sources: context_refs
+                            .into_iter()
+                            .map(|value| GuidedWorkSource {
+                                source_ref: value.clone(),
+                                label: value,
+                            })
+                            .collect(),
+                        memory_mode: if no_memory {
+                            GuidedWorkMemoryMode::Disabled
+                        } else {
+                            GuidedWorkMemoryMode::GovernedRetrieval
+                        },
+                        capability,
                     },
                     idempotency_key,
                 )
@@ -1433,6 +1468,28 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
                         .map(|value| value.seconds.to_string())
                         .unwrap_or_else(|| "-".to_owned()),
                 );
+                if let Some(capability) = preview.work_capability.as_ref() {
+                    println!(
+                        "Capability: choice={} provider={} harness={} harness_model={} provider_model={} route_digest={} selection_source={} preference_revision={}",
+                        capability.choice_id.as_deref().unwrap_or("-"),
+                        capability.provider_alias,
+                        capability.harness_alias,
+                        capability.harness_model_alias,
+                        capability.provider_model_alias,
+                        capability
+                            .admitted_route
+                            .as_ref()
+                            .map(|route| route.route_binding_sha256.as_str())
+                            .unwrap_or("-"),
+                        wire_work_capability_selection_source_name(
+                            preview.work_capability_selection_source,
+                        ),
+                        preview
+                            .preference_revision_at_resolution
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "-".to_owned()),
+                    );
+                }
                 println!("Next: review the preview, then run work confirm with its binding.");
             }
             Ok(())
@@ -1493,6 +1550,165 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
             }
             Ok(())
         }
+        WorkCommand::Capabilities { json } => {
+            let attached = attach("work.capabilities").await?;
+            let catalog = attached
+                .0
+                .list_work_capabilities()
+                .await
+                .map_err(|error| client_work_failure(error, "work.capabilities"))?;
+            render_work_capabilities(&catalog, json);
+            Ok(())
+        }
+        WorkCommand::SetDefault {
+            choice_id,
+            expected_revision,
+            json,
+        } => {
+            let attached = attach("work.set-default").await?;
+            let receipt = attached
+                .0
+                .set_default_work_capability(choice_id, expected_revision)
+                .await
+                .map_err(|error| client_work_failure(error, "work.set-default"))?;
+            render_work_capability_preference_receipt(&receipt, json);
+            Ok(())
+        }
+    }
+}
+
+fn guided_work_capability_choice(
+    choice_id: Option<String>,
+    operation: &'static str,
+) -> Result<GuidedWorkCapabilityChoice, CliFailure> {
+    match choice_id {
+        None => Ok(GuidedWorkCapabilityChoice::FutureWorkDefault),
+        Some(choice_id) if !choice_id.trim().is_empty() => {
+            Ok(GuidedWorkCapabilityChoice::Explicit(choice_id))
+        }
+        Some(_) => Err(
+            CliFailure::protocol("work capability choice must be non-empty")
+                .for_operation(operation),
+        ),
+    }
+}
+
+fn render_work_capabilities(catalog: &GovernedWorkCapabilityCatalog, json_output: bool) {
+    let data = work_capabilities_json(catalog);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "schemaVersion": "egopulse.cli-result/v0.1",
+                "ok": true,
+                "operation": "work.capabilities",
+                "data": data,
+                "correlationId": Uuid::now_v7().to_string(),
+            }))
+            .unwrap()
+        );
+        return;
+    }
+
+    println!(
+        "Work capabilities: default={} preference_revision={} migration_required={}",
+        catalog.default_choice_id,
+        catalog.preference_revision,
+        catalog.configuration_migration_required,
+    );
+    for capability in &catalog.capabilities {
+        println!(
+            "Capability: choice={} default={} availability={} selectable={} provider={} harness={} harness_model={} provider_model={} reason={}",
+            capability.choice_id.as_deref().unwrap_or("-"),
+            capability.current_future_work_default,
+            work_capability_availability_name(capability.availability),
+            capability.selectable,
+            capability.provider_alias,
+            capability.harness_alias,
+            capability.harness_model_alias,
+            capability.provider_model_alias,
+            capability.safe_reason_code.as_deref().unwrap_or("-"),
+        );
+    }
+}
+
+fn work_capabilities_json(catalog: &GovernedWorkCapabilityCatalog) -> serde_json::Value {
+    json!({
+        "defaultChoiceId": catalog.default_choice_id,
+        "preferenceRevision": catalog.preference_revision,
+        "configurationMigrationRequired": catalog.configuration_migration_required,
+        "capabilities": catalog.capabilities.iter().map(|capability| json!({
+            "choiceId": capability.choice_id,
+            "currentFutureWorkDefault": capability.current_future_work_default,
+            "availability": work_capability_availability_name(capability.availability),
+            "selectable": capability.selectable,
+            "reasonCode": capability.safe_reason_code,
+            "providerAlias": capability.provider_alias,
+            "harnessAlias": capability.harness_alias,
+            "harnessModelAlias": capability.harness_model_alias,
+            "providerModelAlias": capability.provider_model_alias,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn render_work_capability_preference_receipt(
+    receipt: &WorkCapabilityPreferenceReceipt,
+    json_output: bool,
+) {
+    let data = work_capability_preference_receipt_json(receipt);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "schemaVersion": "egopulse.cli-result/v0.1",
+                "ok": true,
+                "operation": "work.set-default",
+                "data": data,
+                "correlationId": Uuid::now_v7().to_string(),
+            }))
+            .unwrap()
+        );
+    } else {
+        println!(
+            "Future-work default: previous={} current={} previous_revision={} revision={} changed={}",
+            receipt.previous_default_choice_id,
+            receipt.default_choice_id,
+            receipt.previous_preference_revision,
+            receipt.preference_revision,
+            receipt.changed,
+        );
+    }
+}
+
+fn work_capability_preference_receipt_json(
+    receipt: &WorkCapabilityPreferenceReceipt,
+) -> serde_json::Value {
+    json!({
+        "previousDefaultChoiceId": receipt.previous_default_choice_id,
+        "defaultChoiceId": receipt.default_choice_id,
+        "previousPreferenceRevision": receipt.previous_preference_revision,
+        "preferenceRevision": receipt.preference_revision,
+        "changed": receipt.changed,
+    })
+}
+
+const fn work_capability_availability_name(
+    availability: GovernedWorkCapabilityAvailability,
+) -> &'static str {
+    match availability {
+        GovernedWorkCapabilityAvailability::Admitted => "admitted",
+        GovernedWorkCapabilityAvailability::Candidate => "candidate",
+        GovernedWorkCapabilityAvailability::Held => "held",
+    }
+}
+
+const fn work_capability_selection_source_name(
+    source: GovernedWorkCapabilitySelectionSource,
+) -> &'static str {
+    match source {
+        GovernedWorkCapabilitySelectionSource::FutureWorkDefault => "future_work_default",
+        GovernedWorkCapabilitySelectionSource::ExplicitChoice => "explicit_choice",
+        GovernedWorkCapabilitySelectionSource::LegacyOmittedDefault => "legacy_omitted_default",
     }
 }
 
@@ -1793,6 +2009,20 @@ fn render_guided_work_preview(preview: &GuidedWorkPreview, json_output: bool) {
                 .unwrap_or_else(|| "disabled".to_owned()),
             preview.memory_pack_snapshot_sha256().unwrap_or("-"),
         );
+        eprintln!(
+            "Capability: choice={} provider={} harness={} harness_model={} provider_model={} route_digest={} selection_source={} preference_revision={}",
+            preview.capability_choice_id(),
+            preview.provider_alias(),
+            preview.harness_alias(),
+            preview.harness_model_alias(),
+            preview.provider_model_alias(),
+            preview.route_binding_sha256(),
+            work_capability_selection_source_name(preview.capability_selection_source()),
+            preview
+                .preference_revision_at_resolution()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+        );
     }
 }
 
@@ -1826,6 +2056,14 @@ fn guided_work_preview_json(preview: &GuidedWorkPreview) -> serde_json::Value {
         preview.memory_mode(),
         preview.memory_authority_revision(),
         preview.memory_pack_snapshot_sha256(),
+        preview.capability_choice_id(),
+        preview.provider_alias(),
+        preview.harness_alias(),
+        preview.harness_model_alias(),
+        preview.provider_model_alias(),
+        preview.route_binding_sha256(),
+        preview.capability_selection_source(),
+        preview.preference_revision_at_resolution(),
     )
 }
 
@@ -1844,6 +2082,14 @@ fn guided_work_preview_value(
     memory_mode: GuidedWorkMemoryMode,
     memory_authority_revision: Option<u64>,
     memory_pack_snapshot_sha256: Option<&str>,
+    capability_choice_id: &str,
+    provider_alias: &str,
+    harness_alias: &str,
+    harness_model_alias: &str,
+    provider_model_alias: &str,
+    route_binding_sha256: &str,
+    capability_selection_source: GovernedWorkCapabilitySelectionSource,
+    preference_revision_at_resolution: Option<u64>,
 ) -> serde_json::Value {
     json!({
         "schemaVersion": "egopulse.cli-result/v0.1",
@@ -1866,6 +2112,16 @@ fn guided_work_preview_value(
             },
             "memoryAuthorityRevision": memory_authority_revision,
             "memoryPackSnapshotSha256": memory_pack_snapshot_sha256,
+            "workCapability": {
+                "choiceId": capability_choice_id,
+                "providerAlias": provider_alias,
+                "harnessAlias": harness_alias,
+                "harnessModelAlias": harness_model_alias,
+                "providerModelAlias": provider_model_alias,
+                "routeBindingSha256": route_binding_sha256,
+                "selectionSource": work_capability_selection_source_name(capability_selection_source),
+                "preferenceRevisionAtResolution": preference_revision_at_resolution,
+            },
         }
     })
 }
@@ -1968,6 +2224,9 @@ fn work_preview_json(
         "budgetProfileRef": preview.budget_profile_ref.as_ref().map(contract_ref_json),
         "memoryAuthorityRevision": preview.memory_authority_revision,
         "memoryPackSnapshotSha256": preview.memory_pack_snapshot_sha256,
+        "workCapability": preview.work_capability.as_ref().map(work_capability_preview_json),
+        "workCapabilitySelectionSource": wire_work_capability_selection_source_name(preview.work_capability_selection_source),
+        "preferenceRevisionAtResolution": preview.preference_revision_at_resolution,
         "contextStateRevision": preview.context_state_revision,
         "recoveryEntry": preview.recovery_entry,
         "visibility": preview.visibility,
@@ -1981,6 +2240,42 @@ fn work_preview_json(
         "readyForFounderConfirmation": preview.ready_for_founder_confirmation,
         "deadline": preview.deadline.as_ref().map(timestamp_json),
     })
+}
+
+fn work_capability_preview_json(capability: &WorkCapabilityView) -> serde_json::Value {
+    json!({
+        "choiceId": capability.choice_id,
+        "currentFutureWorkDefault": capability.current_future_work_default,
+        "availability": wire_work_capability_availability_name(capability.availability),
+        "selectable": capability.selectable,
+        "reasonCode": capability.safe_reason_code,
+        "providerAlias": capability.provider_alias,
+        "harnessAlias": capability.harness_alias,
+        "harnessModelAlias": capability.harness_model_alias,
+        "providerModelAlias": capability.provider_model_alias,
+        "routeBindingSha256": capability
+            .admitted_route
+            .as_ref()
+            .map(|route| route.route_binding_sha256.as_str()),
+    })
+}
+
+fn wire_work_capability_availability_name(value: i32) -> &'static str {
+    match WireWorkCapabilityAvailability::try_from(value) {
+        Ok(WireWorkCapabilityAvailability::Admitted) => "admitted",
+        Ok(WireWorkCapabilityAvailability::Candidate) => "candidate",
+        Ok(WireWorkCapabilityAvailability::Held) => "held",
+        Ok(WireWorkCapabilityAvailability::Unspecified) | Err(_) => "unspecified",
+    }
+}
+
+fn wire_work_capability_selection_source_name(value: i32) -> &'static str {
+    match WireWorkCapabilitySelectionSource::try_from(value) {
+        Ok(WireWorkCapabilitySelectionSource::FutureWorkDefault) => "future_work_default",
+        Ok(WireWorkCapabilitySelectionSource::ExplicitChoice) => "explicit_choice",
+        Ok(WireWorkCapabilitySelectionSource::LegacyOmittedDefault) => "legacy_omitted_default",
+        Ok(WireWorkCapabilitySelectionSource::Unspecified) | Err(_) => "unspecified",
+    }
 }
 
 fn contract_ref_json(
@@ -4621,6 +4916,7 @@ async fn task_create(
             target_scope_ref,
             acceptance_contract_ref: Some(acceptance_contract_ref),
             budget_profile_ref: Some(budget_profile_ref),
+            work_capability_route: None,
         })),
     };
     set_task_digest(&mut command);
@@ -6522,6 +6818,7 @@ mod tests {
                 label: "docs/brief.md".to_owned(),
             }],
             memory_mode: GuidedWorkMemoryMode::GovernedRetrieval,
+            capability: GuidedWorkCapabilityChoice::FutureWorkDefault,
         }
     }
 
@@ -6547,12 +6844,55 @@ mod tests {
             cli.command,
             Command::Work {
                 command: WorkCommand::Start {
+                    capability: None,
                     confirm: true,
                     cancel: false,
                     json: true,
                     ..
                 }
             }
+        ));
+        assert_eq!(
+            guided_work_capability_choice(None, "work.start").unwrap(),
+            GuidedWorkCapabilityChoice::FutureWorkDefault
+        );
+        assert_eq!(
+            guided_work_capability_choice(Some("choice:codex:gpt-5".to_owned()), "work.start",)
+                .unwrap(),
+            GuidedWorkCapabilityChoice::Explicit("choice:codex:gpt-5".to_owned())
+        );
+        assert!(matches!(
+            guided_work_capability_choice(Some("  ".to_owned()), "work.start"),
+            Err(CliFailure {
+                reason_code: "LOCAL_API_PROTOCOL_ERROR",
+                operation: "work.start",
+                ..
+            })
+        ));
+
+        let explicit = Cli::try_parse_from([
+            "egopulse",
+            "work",
+            "start",
+            "--intent",
+            "work",
+            "--scope",
+            "project:guided",
+            "--work-type",
+            "implementation",
+            "--capability",
+            "choice:codex:gpt-5",
+            "--confirm",
+        ])
+        .expect("explicit work capability");
+        assert!(matches!(
+            explicit.command,
+            Command::Work {
+                command: WorkCommand::Start {
+                    capability: Some(choice_id),
+                    ..
+                }
+            } if choice_id == "choice:codex:gpt-5"
         ));
         for forbidden in [
             "--snapshot-id",
@@ -6604,6 +6944,166 @@ mod tests {
     }
 
     #[test]
+    fn work_capability_cli_parses_prepare_list_and_default_cas_without_route_fields() {
+        let prepare = Cli::try_parse_from([
+            "egopulse",
+            "work",
+            "prepare",
+            "--intent",
+            "work",
+            "--scope",
+            "project:guided",
+            "--work-type",
+            "implementation",
+            "--capability",
+            "choice:codex:gpt-5",
+            "--idempotency-key",
+            "idem:prepare:1",
+        ])
+        .expect("explicit prepare capability");
+        assert!(matches!(
+            prepare.command,
+            Command::Work {
+                command: WorkCommand::Prepare {
+                    capability: Some(choice_id),
+                    ..
+                }
+            } if choice_id == "choice:codex:gpt-5"
+        ));
+
+        let default_prepare = Cli::try_parse_from([
+            "egopulse",
+            "work",
+            "prepare",
+            "--intent",
+            "work",
+            "--scope",
+            "project:guided",
+            "--work-type",
+            "implementation",
+            "--idempotency-key",
+            "idem:prepare:2",
+        ])
+        .expect("default prepare capability");
+        assert!(matches!(
+            default_prepare.command,
+            Command::Work {
+                command: WorkCommand::Prepare {
+                    capability: None,
+                    ..
+                }
+            }
+        ));
+
+        let capabilities = Cli::try_parse_from(["egopulse", "work", "capabilities", "--json"])
+            .expect("work capabilities command");
+        assert!(command_json(&capabilities.command));
+        assert!(matches!(
+            capabilities.command,
+            Command::Work {
+                command: WorkCommand::Capabilities { json: true }
+            }
+        ));
+
+        let set_default = Cli::try_parse_from([
+            "egopulse",
+            "work",
+            "set-default",
+            "choice:codex:gpt-5",
+            "7",
+            "--json",
+        ])
+        .expect("work default CAS command");
+        assert!(command_json(&set_default.command));
+        assert!(matches!(
+            set_default.command,
+            Command::Work {
+                command: WorkCommand::SetDefault {
+                    choice_id,
+                    expected_revision: 7,
+                    json: true,
+                }
+            } if choice_id == "choice:codex:gpt-5"
+        ));
+
+        for forbidden in ["--provider-id", "--harness-id", "--route-binding-sha256"] {
+            assert!(
+                Cli::try_parse_from([
+                    "egopulse",
+                    "work",
+                    "set-default",
+                    "choice:codex:gpt-5",
+                    "7",
+                    forbidden,
+                    "forged",
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn work_capability_renderers_whitelist_safe_catalog_and_receipt_fields() {
+        let catalog = GovernedWorkCapabilityCatalog {
+            capabilities: vec![egopulse_client_operations::GovernedWorkCapability {
+                provider_profile_id: "sensitive-provider-profile-canary".to_owned(),
+                provider_alias: "OpenAI".to_owned(),
+                harness_alias: "Codex".to_owned(),
+                harness_model_alias: "GPT-5".to_owned(),
+                provider_model_alias: "GPT-5 exact".to_owned(),
+                availability: GovernedWorkCapabilityAvailability::Admitted,
+                selectable: true,
+                safe_reason_code: None,
+                choice_id: Some("choice:codex:gpt-5".to_owned()),
+                route_binding_sha256: Some("sensitive-route-digest-canary".to_owned()),
+                current_future_work_default: true,
+            }],
+            default_choice_id: "choice:codex:gpt-5".to_owned(),
+            preference_revision: 7,
+            configuration_migration_required: false,
+        };
+        let encoded = serde_json::to_string(&work_capabilities_json(&catalog)).unwrap();
+        for expected in [
+            "OpenAI",
+            "Codex",
+            "GPT-5",
+            "GPT-5 exact",
+            "admitted",
+            "choice:codex:gpt-5",
+            "preferenceRevision",
+            "configurationMigrationRequired",
+        ] {
+            assert!(encoded.contains(expected), "missing {expected}");
+        }
+        for forbidden in [
+            "sensitive-provider-profile-canary",
+            "sensitive-route-digest-canary",
+            "credential",
+            "executable",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+
+        let receipt = WorkCapabilityPreferenceReceipt {
+            previous_default_choice_id: "choice:old".to_owned(),
+            default_choice_id: "choice:new".to_owned(),
+            previous_preference_revision: 7,
+            preference_revision: 8,
+            changed: true,
+        };
+        assert_eq!(
+            work_capability_preference_receipt_json(&receipt),
+            json!({
+                "previousDefaultChoiceId": "choice:old",
+                "defaultChoiceId": "choice:new",
+                "previousPreferenceRevision": 7,
+                "preferenceRevision": 8,
+                "changed": true,
+            })
+        );
+    }
+
+    #[test]
     fn work_start_safe_preview_excludes_authority_and_sensitive_binding_fields() {
         let value = guided_work_preview_value(
             "normalized safe intent",
@@ -6619,10 +7119,29 @@ mod tests {
             GuidedWorkMemoryMode::GovernedRetrieval,
             Some(7),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "choice:codex:gpt-5",
+            "OpenAI",
+            "Codex",
+            "GPT-5",
+            "GPT-5 exact",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            GovernedWorkCapabilitySelectionSource::FutureWorkDefault,
+            Some(11),
         );
         let encoded = serde_json::to_string(&value).unwrap();
         assert!(encoded.contains("implementation"));
         assert!(encoded.contains("project:guided"));
+        for expected in [
+            "choice:codex:gpt-5",
+            "OpenAI",
+            "Codex",
+            "GPT-5 exact",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "future_work_default",
+            "preferenceRevisionAtResolution",
+        ] {
+            assert!(encoded.contains(expected), "missing {expected}");
+        }
         for forbidden in [
             "snapshotId",
             "confirmationBindingSha256",

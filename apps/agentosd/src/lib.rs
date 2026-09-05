@@ -19,7 +19,7 @@ use egopulse_domain_contracts::v01::egopulse::{
     common::v1::ContractReference,
     harness::v1::{CapabilityProfile, NativeProtocolFingerprint},
     policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
-    task::v1::{TaskCommand, TaskCommandResult},
+    task::v1::{TaskCommand, TaskCommandResult, WorkCapabilityRouteBinding},
     verdict::v1::{VerdictCommand, VerdictCommandResult},
 };
 use egopulse_domain_contracts::{
@@ -44,8 +44,9 @@ use egopulse_local_api::{
     command_gateway::{
         CommandExtensionPorts, CommandGatewayApplication, CommandPortFailure, CommandPortResult,
         CommandPrincipal, ContextMutationPort, FailClosedContextMutationPort,
-        FailClosedMemoryMutationPort, LocalCommandGatewayEndpoint, MemoryMutationPort,
-        PolicyCommandPort, TaskCommandPort, VerdictCommandPort, WorkPreparationPort,
+        FailClosedMemoryMutationPort, FailClosedWorkCapabilityPort, LocalCommandGatewayEndpoint,
+        MemoryMutationPort, PolicyCommandPort, TaskCommandPort, VerdictCommandPort,
+        WorkCapabilityPort, WorkPreparationPort,
     },
     read_gateway::{NoopReadGatewayAuditSink, ReadGatewayApplication},
     read_gateway_policy::ReadGatewayPolicy,
@@ -94,6 +95,7 @@ mod task_recovery;
 mod verdict;
 mod verdict_consumer;
 mod verification;
+mod work_capability;
 mod work_preparation;
 
 pub use artifact::{
@@ -102,9 +104,12 @@ pub use artifact::{
 };
 pub use bootstrap::{
     DenyVerificationReferences, LocalUserPolicyBootstrapConfig, ProductionBootstrapConfig,
-    ProductionBootstrapError, ProviderBootstrapProfile, ProviderCatalogModelView,
-    ProviderCatalogProfileView, ProviderCatalogRefreshError, ProviderCatalogRefreshPreview,
-    ProviderCatalogSnapshot, ProviderModelBinding,
+    ProductionBootstrapError, ProviderAdmission, ProviderBootstrapProfile,
+    ProviderCatalogModelView, ProviderCatalogProfileView, ProviderCatalogRefreshError,
+    ProviderCatalogRefreshPreview, ProviderCatalogSnapshot, ProviderCredentialReference,
+    ProviderHarnessKind, ProviderId, ProviderModelBinding, WorkCapabilityConfigTransitionReport,
+    apply_work_capability_config_migration, preview_work_capability_config_migration,
+    preview_work_capability_config_rollback, rollback_work_capability_config_to_v2,
 };
 pub use context_mutation::ContextMutationPortAdapter;
 pub use memory_mutation::{
@@ -159,6 +164,9 @@ pub use verification::{
     VerificationHandoffPlan, VerificationHandoffPlanError, VerificationHandoffRequest,
     VerificationWorker, VerificationWorkerConfig, VerificationWorkerConfigurationError,
     VerificationWorkerCycleError, VerificationWorkerCycleResult,
+};
+pub use work_capability::{
+    ResolvedWorkCapability, WorkCapabilityRegistry, WorkCapabilityRegistryError,
 };
 pub use work_preparation::ConfiguredWorkPreparationPort;
 
@@ -350,6 +358,7 @@ pub struct DaemonProviders {
     pub memory_retrieval_audit: Arc<dyn MemoryRetrievalAuditSink>,
     pub memory_mutation_port: Arc<dyn MemoryMutationPort>,
     pub context_mutation_port: Arc<dyn ContextMutationPort>,
+    pub work_capability_port: Arc<dyn WorkCapabilityPort>,
     /// Internal candidate-only producer capabilities. This is deliberately
     /// separate from the public Local API mutation port.
     pub memory_candidate_producers: Arc<MemoryCandidateProducerRegistry>,
@@ -424,6 +433,7 @@ pub struct ConfiguredSingleHarnessWorkflow {
     config: SingleHarnessWorkConfig,
     context_authority: Option<Arc<Mutex<ContextAuthority>>>,
     route_profile: Option<TrustedDispatchRouteProfile>,
+    work_capability_route: Option<WorkCapabilityRouteBinding>,
 }
 
 impl ConfiguredSingleHarnessWorkflow {
@@ -433,6 +443,7 @@ impl ConfiguredSingleHarnessWorkflow {
             config,
             context_authority: None,
             route_profile: None,
+            work_capability_route: None,
         }
     }
 
@@ -450,6 +461,12 @@ impl ConfiguredSingleHarnessWorkflow {
         self.route_profile = Some(profile);
         self
     }
+
+    #[must_use]
+    pub fn with_work_capability_route(mut self, route: WorkCapabilityRouteBinding) -> Self {
+        self.work_capability_route = Some(route);
+        self
+    }
 }
 
 impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
@@ -457,10 +474,50 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
         &self,
         activation: &egopulse_local_ide_control::collaboration_control::TaskActivationHandoff,
     ) -> Result<SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolverError> {
-        if activation.task.current_run_id.as_deref() != Some(self.config.run_id.as_str()) {
-            return Ok(SingleHarnessWorkflowResolution::NotApplicable);
-        }
         let mut config = self.config.clone();
+        let task_route = activation.task.work_capability_route.as_ref();
+        match (task_route, self.work_capability_route.as_ref()) {
+            (Some(route), Some(expected)) => {
+                egopulse_domain_contracts::work_capability::validate_work_capability_route_binding(
+                    route,
+                )
+                .map_err(|_| SingleHarnessWorkflowResolverError::InvalidConfiguration)?;
+                if route != expected {
+                    return Ok(SingleHarnessWorkflowResolution::NotApplicable);
+                }
+                let run_id =
+                    work_preparation::work_capability_run_id(&activation.task.task_id, route)
+                        .map_err(|_| SingleHarnessWorkflowResolverError::InvalidConfiguration)?;
+                if activation.task.current_run_id.as_deref() != Some(run_id.as_str()) {
+                    return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+                }
+                config.run_id = run_id;
+                config.attempt_id = format!(
+                    "attempt:work:{}:{}",
+                    activation.task.task_id, route.route_binding_sha256
+                );
+                config.dispatch_id = format!(
+                    "dispatch:work:{}:{}",
+                    activation.task.task_id, route.route_binding_sha256
+                );
+                if route.capability_profile_ref.as_ref() != Some(&config.capability_profile_ref)
+                    || config.plan.steps.iter().any(|step| {
+                        step.required_capability_profile_ref.as_ref()
+                            != route.capability_profile_ref.as_ref()
+                    })
+                {
+                    return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+                }
+            }
+            (Some(_), None) => return Ok(SingleHarnessWorkflowResolution::NotApplicable),
+            (None, _) => {
+                // Historical/static tasks have no additive route field and
+                // retain their exact pre-draft.23 workflow identity.
+                if activation.task.current_run_id.as_deref() != Some(self.config.run_id.as_str()) {
+                    return Ok(SingleHarnessWorkflowResolution::NotApplicable);
+                }
+            }
+        }
         if let Some(digest) = context_snapshot_digest(&activation.task.input_snapshot_id)? {
             let now_seconds = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -489,6 +546,13 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
             if resolved.snapshot.compiled_context_sha256 != digest {
                 return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
             }
+            let compiled_route = work_preparation::work_capability_route_from_compiled_context(
+                &resolved.compiled_context,
+            )
+            .map_err(|_| SingleHarnessWorkflowResolverError::InvalidConfiguration)?;
+            if compiled_route.as_ref() != task_route {
+                return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+            }
             if config.plan.steps.is_empty() {
                 return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
             }
@@ -502,6 +566,8 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
                 step.input_bundle_ref.clone_from(&input_bundle_ref);
             }
             config.material.input_bundle_sha256 = digest.to_owned();
+        } else if task_route.is_some() {
+            return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
         }
         match self.route_profile.as_ref() {
             Some(profile) => {
@@ -564,6 +630,9 @@ pub struct CodexHarnessCompositionConfig {
     pub native: NativeHarnessCompositionConfig,
     pub codex_executable: PathBuf,
     pub environment_overrides: Vec<(String, String)>,
+    /// Exact admitted route compiled into new Context/Task facts. This is a
+    /// typed bootstrap input, not a second user-facing process setting.
+    pub work_capability_route: Option<WorkCapabilityRouteBinding>,
 }
 
 /// One provider-specific native Harness unit for the multi-model composition
@@ -574,6 +643,7 @@ pub struct ProfiledNativeHarnessComposition {
     pub profile: NativeHarnessCompositionProfile,
     pub driver: Box<dyn NativeHarnessDriver + Send>,
     route_profile: Option<TrustedDispatchRouteProfile>,
+    work_capability_route: Option<WorkCapabilityRouteBinding>,
     disclosure_credentials: egopulse_harness_adapter::ManagedDisclosureCredentials,
 }
 
@@ -594,6 +664,7 @@ impl ProfiledNativeHarnessComposition {
             profile,
             driver: Box::new(driver),
             route_profile: None,
+            work_capability_route: None,
             disclosure_credentials:
                 egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(),
         }
@@ -607,6 +678,12 @@ impl ProfiledNativeHarnessComposition {
         route_profile: TrustedDispatchRouteProfile,
     ) -> Self {
         self.route_profile = Some(route_profile);
+        self
+    }
+
+    #[must_use]
+    pub fn with_work_capability_route(mut self, route: WorkCapabilityRouteBinding) -> Self {
+        self.work_capability_route = Some(route);
         self
     }
 
@@ -739,6 +816,43 @@ fn trusted_codex_route_profile(
     })
 }
 
+fn validate_codex_work_capability_route(
+    route: &WorkCapabilityRouteBinding,
+    profile: &ProviderBootstrapProfile,
+    native: &NativeHarnessCompositionConfig,
+) -> Result<(), DaemonCompositionError> {
+    egopulse_domain_contracts::work_capability::validate_work_capability_route_binding(route)
+        .map_err(|_| {
+            DaemonCompositionError::InvalidConfiguration("production Codex work-capability route")
+        })?;
+    let model = profile
+        .models
+        .iter()
+        .find(|model| model.harness_model_id == profile.exact_model)
+        .ok_or(DaemonCompositionError::InvalidConfiguration(
+            "production Codex provider model binding",
+        ))?;
+    if route.provider_profile_id != profile.profile_id
+        || route.provider_id != "gpt"
+        || route.harness_id != "codex_app_server"
+        || route.harness_model_id != model.harness_model_id
+        || route.provider_model_id != model.provider_model_id
+        || route.capability_profile_ref.as_ref() != Some(&native.workflow.capability_profile_ref)
+        || route.catalog_snapshot_sha256
+            != profile
+                .catalog_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.evidence_digest_sha256.clone())
+        || route.native_composition_generation != native.workflow.run_id
+        || native.default_model.as_deref() != Some(route.harness_model_id.as_str())
+    {
+        return Err(DaemonCompositionError::InvalidConfiguration(
+            "production Codex work-capability runtime binding",
+        ));
+    }
+    Ok(())
+}
+
 fn codex_disclosure_credentials(
     profile: &ProviderBootstrapProfile,
     environment_overrides: &[(String, String)],
@@ -852,6 +966,7 @@ impl DaemonProviders {
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             context_mutation_port: Arc::new(FailClosedContextMutationPort),
+            work_capability_port: Arc::new(FailClosedWorkCapabilityPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
@@ -933,6 +1048,7 @@ impl DaemonProviders {
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             context_mutation_port: Arc::new(FailClosedContextMutationPort),
+            work_capability_port: Arc::new(FailClosedWorkCapabilityPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
@@ -988,6 +1104,7 @@ impl DaemonProviders {
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             context_mutation_port: Arc::new(FailClosedContextMutationPort),
+            work_capability_port: Arc::new(FailClosedWorkCapabilityPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
@@ -1008,6 +1125,12 @@ impl DaemonProviders {
     #[must_use]
     pub fn with_context_mutation(mut self, port: Arc<dyn ContextMutationPort>) -> Self {
         self.context_mutation_port = port;
+        self
+    }
+
+    #[must_use]
+    pub fn with_work_capability_port(mut self, port: Arc<dyn WorkCapabilityPort>) -> Self {
+        self.work_capability_port = port;
         self
     }
 
@@ -1153,6 +1276,7 @@ impl DaemonProviders {
             native,
             codex_executable,
             environment_overrides,
+            work_capability_route,
         } = config;
         let disclosure_credentials =
             codex_disclosure_credentials(&provider_profile, &environment_overrides);
@@ -1161,6 +1285,9 @@ impl DaemonProviders {
             process = process.with_environment_override(name, value);
         }
         let route_profile = trusted_codex_route_profile(&provider_profile, &native)?;
+        if let Some(route) = work_capability_route.as_ref() {
+            validate_codex_work_capability_route(route, &provider_profile, &native)?;
+        }
         let capability_profile_ref = native.workflow.capability_profile_ref.clone();
         self.with_profiled_native_harness_drivers(
             vec![ProfiledNativeHarnessComposition {
@@ -1173,6 +1300,7 @@ impl DaemonProviders {
                 },
                 driver: Box::new(CodexAppServerDriver::new(process)),
                 route_profile: Some(route_profile),
+                work_capability_route,
                 disclosure_credentials,
             }],
             artifact_authority,
@@ -1237,6 +1365,7 @@ impl DaemonProviders {
                 profile,
                 driver: Box::new(driver),
                 route_profile: None,
+                work_capability_route: None,
                 disclosure_credentials:
                     egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(),
             }],
@@ -1301,6 +1430,7 @@ impl DaemonProviders {
                 profile,
                 driver,
                 route_profile,
+                work_capability_route,
                 disclosure_credentials,
             } = composition;
             let NativeHarnessCompositionProfile {
@@ -1433,6 +1563,10 @@ impl DaemonProviders {
             let resolver = ConfiguredSingleHarnessWorkflow::new(config.workflow);
             let resolver = match route_profile {
                 Some(route_profile) => resolver.with_trusted_dispatch_route_profile(route_profile),
+                None => resolver,
+            };
+            let resolver = match work_capability_route {
+                Some(route) => resolver.with_work_capability_route(route),
                 None => resolver,
             };
             let resolver = match self.context_authority.as_ref() {
@@ -1645,7 +1779,8 @@ impl DaemonComposition {
                 providers.memory_mutation_port,
                 providers.work_preparation_port,
             )
-            .with_context(providers.context_mutation_port),
+            .with_context(providers.context_mutation_port)
+            .with_work_capability(providers.work_capability_port),
         ));
         let command = LocalCommandGatewayEndpoint::new(command_application);
         let cognition_application = Arc::new(CognitionGatewayApplication::new(
@@ -2124,11 +2259,21 @@ impl VerdictCommandPort for FailClosedVerdictPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egopulse_domain_contracts::v01::egopulse::harness::v1::{
+        ApprovalDecisionEnvelope, CancelExecutionEnvelope, DispatchEnvelope, ProbeHarnessRequest,
+        ProbeHarnessResult,
+    };
     use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
-        ClientSurface, ExecuteFounderVerdictRequest, GetTaskViewRequest, LocalApiErrorCode,
-        OpenSessionRequest, local_command_gateway_service_client::LocalCommandGatewayServiceClient,
+        ClientSurface, ConfirmWorkRequest, ExecuteFounderVerdictRequest, GetTaskViewRequest,
+        LocalApiErrorCode, OpenSessionRequest, PrepareWorkRequest, UseDefaultWorkCapability,
+        WorkMemoryMode, WorkSourceRequest,
+        local_command_gateway_service_client::LocalCommandGatewayServiceClient,
         local_read_model_service_client::LocalReadModelServiceClient,
-        local_session_service_client::LocalSessionServiceClient,
+        local_session_service_client::LocalSessionServiceClient, prepare_work_request,
+    };
+    use egopulse_harness_adapter::{
+        DriverDelivery, DriverError, NativeHarnessFuture, ReconciliationContext,
+        ReconciliationFinding, ResolvedDispatchMaterial,
     };
     use egopulse_local_ide_control::collaboration_control::HarnessDispatchCycleReport;
     use hyper_util::rt::TokioIo;
@@ -2184,6 +2329,165 @@ mod tests {
         > {
             self.runs.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(HarnessDispatchCycleReport::default()) })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct WorkRoutePrincipalResolver;
+
+    impl AuthorityPrincipalResolver for WorkRoutePrincipalResolver {
+        fn resolve_task(
+            &self,
+            _principal: &CommandPrincipal,
+        ) -> Result<egopulse_cognition_runtime::task_authority::PrincipalKind, CommandPortFailure>
+        {
+            Ok(egopulse_cognition_runtime::task_authority::PrincipalKind::Founder)
+        }
+
+        fn resolve_policy(
+            &self,
+            _principal: &CommandPrincipal,
+        ) -> Result<egopulse_policy_decision_authority::PolicyPrincipalKind, CommandPortFailure>
+        {
+            Err(CommandPortFailure::Unavailable)
+        }
+
+        fn resolve_verdict(
+            &self,
+            _principal: &CommandPrincipal,
+        ) -> Result<egopulse_founder_verdict_authority::VerdictPrincipalKind, CommandPortFailure>
+        {
+            Err(CommandPortFailure::Unavailable)
+        }
+
+        fn resolve_memory(
+            &self,
+            _principal: &CommandPrincipal,
+        ) -> Result<
+            egopulse_cognition_runtime::memory_authority::MemoryPrincipalKind,
+            CommandPortFailure,
+        > {
+            Err(CommandPortFailure::Unavailable)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct UnusedPolicyReferences;
+
+    impl egopulse_policy_decision_authority::PolicyReferenceResolver for UnusedPolicyReferences {
+        fn resolve_issue(
+            &self,
+            _command: &egopulse_domain_contracts::v01::egopulse::policy::v1::IssueHarnessApprovalDecisionCommand,
+            _principal: &egopulse_policy_decision_authority::AuthenticatedPolicyPrincipal,
+        ) -> Result<
+            egopulse_policy_decision_authority::ResolvedApprovalAuthorization,
+            egopulse_policy_decision_authority::PolicyReferenceRejection,
+        > {
+            Err(egopulse_policy_decision_authority::PolicyReferenceRejection::PermissionDenied)
+        }
+
+        fn validate_adapter_receipt(
+            &self,
+            _command: &egopulse_domain_contracts::v01::egopulse::policy::v1::ConsumeHarnessApprovalDecisionCommand,
+            _record: &egopulse_domain_contracts::v01::egopulse::policy::v1::HarnessApprovalDecisionRecord,
+            _principal: &egopulse_policy_decision_authority::AuthenticatedPolicyPrincipal,
+        ) -> Result<Vec<String>, egopulse_policy_decision_authority::PolicyReferenceRejection>
+        {
+            Err(egopulse_policy_decision_authority::PolicyReferenceRejection::PermissionDenied)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct UnusedVerdictReferences;
+
+    impl egopulse_founder_verdict_authority::VerdictReferenceResolver for UnusedVerdictReferences {
+        fn resolve_issue(
+            &self,
+            _command: &egopulse_domain_contracts::v01::egopulse::verdict::v1::IssueFounderVerdictCommand,
+            _principal: &egopulse_founder_verdict_authority::AuthenticatedVerdictPrincipal,
+        ) -> Result<
+            (
+                egopulse_founder_verdict_authority::ResolvedVerdictContext,
+                egopulse_founder_verdict_authority::FounderAuthorization,
+            ),
+            egopulse_founder_verdict_authority::VerdictReferenceRejection,
+        > {
+            Err(egopulse_founder_verdict_authority::VerdictReferenceRejection::PermissionDenied)
+        }
+
+        fn validate_task_commit(
+            &self,
+            _command: &egopulse_domain_contracts::v01::egopulse::verdict::v1::ConsumeFounderVerdictCommand,
+            _scope: &egopulse_domain_contracts::v01::egopulse::verdict::v1::VerdictScope,
+        ) -> Result<(), egopulse_founder_verdict_authority::VerdictReferenceRejection> {
+            Err(egopulse_founder_verdict_authority::VerdictReferenceRejection::PermissionDenied)
+        }
+    }
+
+    struct RouteProofDriver {
+        sends: Arc<AtomicUsize>,
+        envelope: Arc<Mutex<Option<DispatchEnvelope>>>,
+    }
+
+    impl NativeHarnessDriver for RouteProofDriver {
+        fn probe<'a>(
+            &'a mut self,
+            _request: &'a ProbeHarnessRequest,
+        ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+            Box::pin(async { panic!("runtime dispatch proof must not probe during execution") })
+        }
+
+        fn send_dispatch<'a>(
+            &'a mut self,
+            envelope: &'a DispatchEnvelope,
+            _material: &'a ResolvedDispatchMaterial,
+        ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            *self.envelope.lock().expect("route proof envelope lock") = Some(envelope.clone());
+            let dispatch_id = envelope.dispatch_id.clone();
+            Box::pin(async move {
+                Ok(DriverDelivery {
+                    native_request_ref: format!("native-request:{dispatch_id}"),
+                    native_session_ref: format!("native-session:{dispatch_id}"),
+                    native_execution_ref: Some(format!("native-execution:{dispatch_id}")),
+                    raw_evidence: b"route-proof-delivered".to_vec(),
+                })
+            })
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+        ) -> NativeHarnessFuture<
+            'a,
+            Result<Option<egopulse_harness_adapter::DriverEvent>, DriverError>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn decide_approval<'a>(
+            &'a mut self,
+            _envelope: &'a ApprovalDecisionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn cancel<'a>(
+            &'a mut self,
+            _envelope: &'a CancelExecutionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn reconcile<'a>(
+            &'a mut self,
+            _context: &'a ReconciliationContext,
+        ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+            Box::pin(async {
+                Ok(ReconciliationFinding::NoEffectProven {
+                    evidence_ref: "route-proof:no-effect".to_owned(),
+                })
+            })
         }
     }
 
@@ -2530,6 +2834,7 @@ mod tests {
                 native: native_config(),
                 codex_executable: PathBuf::new(),
                 environment_overrides: Vec::new(),
+                work_capability_route: None,
             }
             .validate(),
             Err(DaemonCompositionError::InvalidConfiguration(
@@ -2666,6 +2971,578 @@ mod tests {
         assert_eq!(*static_resolved, config);
         drop(context);
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn resolver_work_capability_route(
+        config: &SingleHarnessWorkConfig,
+    ) -> WorkCapabilityRouteBinding {
+        egopulse_domain_contracts::work_capability::seal_work_capability_route_binding(
+            WorkCapabilityRouteBinding {
+                route_id: "route:resolver-test:v1".to_owned(),
+                route_generation: 1,
+                provider_profile_id: "provider-profile:resolver-test".to_owned(),
+                provider_id: "gpt".to_owned(),
+                harness_id: "codex_app_server".to_owned(),
+                harness_model_id: "resolver/model".to_owned(),
+                provider_model_id: "provider-resolver-model".to_owned(),
+                capability_profile_ref: Some(config.capability_profile_ref.clone()),
+                catalog_snapshot_sha256: Some("ef".repeat(32)),
+                native_composition_generation: config.run_id.clone(),
+                route_binding_sha256: String::new(),
+            },
+        )
+        .expect("sealed resolver route")
+    }
+
+    fn compiled_context_for_route(route: &WorkCapabilityRouteBinding) -> Vec<u8> {
+        let profile = route
+            .capability_profile_ref
+            .as_ref()
+            .expect("route capability profile");
+        serde_json::to_vec(&serde_json::json!({
+            "prompt": "route-aware context",
+            "model": route.harness_model_id,
+            "work_capability": {
+                "choice_id": "choice:resolver-test",
+                "selection_source": egopulse_domain_contracts::v01::egopulse::localapi::v1::WorkCapabilitySelectionSource::ExplicitChoice as i32,
+                "preference_revision_at_resolution": null,
+                "route": {
+                    "route_id": route.route_id,
+                    "route_generation": route.route_generation,
+                    "provider_profile_id": route.provider_profile_id,
+                    "provider_id": route.provider_id,
+                    "harness_id": route.harness_id,
+                    "harness_model_id": route.harness_model_id,
+                    "provider_model_id": route.provider_model_id,
+                    "capability_profile_ref": {
+                        "contract_id": profile.contract_id,
+                        "version": profile.version,
+                        "sha256": profile.sha256,
+                    },
+                    "catalog_snapshot_sha256": route.catalog_snapshot_sha256,
+                    "native_composition_generation": route.native_composition_generation,
+                    "route_binding_sha256": route.route_binding_sha256,
+                }
+            }
+        }))
+        .expect("compiled route context")
+    }
+
+    #[test]
+    fn route_aware_workflow_binds_context_task_run_attempt_dispatch_and_rejects_drift() {
+        use egopulse_cognition_runtime::context_authority::{
+            AuthenticatedContextPrincipal, ContextAuthorityConfig, ContextPrincipalKind,
+            IssueContextSnapshot,
+        };
+        let root =
+            std::env::temp_dir().join(format!("egopulse-route-aware-workflow-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("route workflow root");
+        let mut config = multi_native_config(&root, "resolver").workflow;
+        config.plan.steps = vec![
+            egopulse_domain_contracts::v01::egopulse::collaboration::v1::StepPlan {
+                step_id: "step-route".to_owned(),
+                input_bundle_ref: "static.json".to_owned(),
+                required_capability_profile_ref: Some(config.capability_profile_ref.clone()),
+                ..Default::default()
+            },
+        ];
+        let route = resolver_work_capability_route(&config);
+        let compiled = compiled_context_for_route(&route);
+        let mut authority = ContextAuthority::open(ContextAuthorityConfig {
+            database_path: root.join("context.db"),
+            store_epoch: "route-aware-workflow-context".to_owned(),
+            key: egopulse_cognition_runtime::task_authority::SqlCipherKey::new([0x72; 32]),
+        })
+        .expect("route context authority");
+        let (_, context_snapshot) = authority
+            .issue(
+                &IssueContextSnapshot {
+                    owner_principal_id: "founder:test".to_owned(),
+                    intent: "route-aware work".to_owned(),
+                    work_type: "governed_repository_change".to_owned(),
+                    target_scope_ref: "scope:repo".to_owned(),
+                    compiled_context: compiled,
+                    sources: Vec::new(),
+                    memory_pack: None,
+                    allowed_read_paths: vec!["workspace".to_owned()],
+                    allowed_write_paths: vec!["workspace".to_owned()],
+                    allowed_tools: Vec::new(),
+                    external_resources: Vec::new(),
+                    non_goals: Vec::new(),
+                    acceptance_contract_ref: "acceptance:v1".to_owned(),
+                    budget_profile_ref: "budget:v1".to_owned(),
+                    deadline_seconds: None,
+                    recovery_entry: "hold-and-reconcile".to_owned(),
+                    visibility: "founder-only".to_owned(),
+                    redactions: Vec::new(),
+                    expires_at_seconds: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("clock")
+                        .as_secs() as i64
+                        + 600,
+                    idempotency_key: "route-aware-workflow-context".to_owned(),
+                },
+                &AuthenticatedContextPrincipal {
+                    kind: ContextPrincipalKind::ContextCompiler,
+                    principal_id: "context-compiler:test".to_owned(),
+                    authenticated: true,
+                },
+            )
+            .expect("issue route context");
+        let context = Arc::new(Mutex::new(authority));
+        let task_id = "task:route-aware";
+        let run_id =
+            work_preparation::work_capability_run_id(task_id, &route).expect("route-bound run ID");
+        let activation = egopulse_local_ide_control::collaboration_control::TaskActivationHandoff {
+            message_id: "message-route-aware".to_owned(),
+            payload_digest_sha256: "payload-route-aware".to_owned(),
+            task: egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
+                task_id: task_id.to_owned(),
+                current_run_id: Some(run_id.clone()),
+                input_snapshot_id: context_snapshot.snapshot_id.clone(),
+                target_scope_ref: "scope:repo".to_owned(),
+                work_capability_route: Some(route.clone()),
+                ..Default::default()
+            },
+        };
+        let route_profile = TrustedDispatchRouteProfile {
+            provider_bootstrap_profile_id: route.provider_profile_id.clone(),
+            selected_harness_id: route.harness_id.clone(),
+            provider_model_id: route.provider_model_id.clone(),
+            catalog_snapshot_sha256: route.catalog_snapshot_sha256.clone(),
+            capability_profile_id: config.capability_profile_ref.contract_id.clone(),
+        };
+        let resolved = ConfiguredSingleHarnessWorkflow::new(config.clone())
+            .with_context_authority(Arc::clone(&context))
+            .with_work_capability_route(route.clone())
+            .with_trusted_dispatch_route_profile(route_profile.clone())
+            .resolve(&activation)
+            .expect("resolve exact route-aware workflow");
+        let SingleHarnessWorkflowResolution::ResolvedWithRouteBinding {
+            config: resolved,
+            route_binding,
+        } = resolved
+        else {
+            panic!("route-aware workflow must carry dispatch route binding");
+        };
+        assert_eq!(resolved.run_id, run_id);
+        assert_eq!(
+            resolved.attempt_id,
+            format!("attempt:work:{task_id}:{}", route.route_binding_sha256)
+        );
+        assert_eq!(
+            resolved.dispatch_id,
+            format!("dispatch:work:{task_id}:{}", route.route_binding_sha256)
+        );
+        assert_eq!(
+            resolved.material.input_bundle_sha256,
+            context_snapshot.compiled_context_sha256
+        );
+        assert_eq!(
+            *route_binding,
+            build_dispatch_route_binding(&route_profile).expect("expected dispatch route")
+        );
+
+        let mut wrong_run = activation.clone();
+        wrong_run.task.current_run_id = Some(config.run_id.clone());
+        assert_eq!(
+            ConfiguredSingleHarnessWorkflow::new(config.clone())
+                .with_context_authority(Arc::clone(&context))
+                .with_work_capability_route(route.clone())
+                .resolve(&wrong_run),
+            Err(SingleHarnessWorkflowResolverError::InvalidConfiguration)
+        );
+
+        let mut other_route = route.clone();
+        other_route.route_id.push_str(":other");
+        other_route.route_binding_sha256.clear();
+        let other_route =
+            egopulse_domain_contracts::work_capability::seal_work_capability_route_binding(
+                other_route,
+            )
+            .expect("seal other route");
+        assert_eq!(
+            ConfiguredSingleHarnessWorkflow::new(config)
+                .with_context_authority(Arc::clone(&context))
+                .with_work_capability_route(other_route)
+                .resolve(&activation),
+            Ok(SingleHarnessWorkflowResolution::NotApplicable)
+        );
+
+        drop(context);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn governed_work_capability_crosses_real_authorities_and_only_the_exact_route_dispatches()
+    {
+        use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{RunPlan, StepPlan};
+        use egopulse_domain_contracts::v01::egopulse::task::v1::{TaskStatus, task_command_result};
+
+        let root = std::env::temp_dir().join(format!(
+            "egopulse-work-capability-production-seams-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).expect("route integration root");
+        fs::write(root.join("intent.md"), "execute the exact admitted route")
+            .expect("route integration source");
+
+        let acceptance = composition_reference("route-acceptance");
+        let budget = composition_reference("route-budget");
+        let mut exact_config = multi_native_config(&root, "route-exact");
+        exact_config.workflow.plan = RunPlan {
+            plan_id: "route-plan".to_owned(),
+            digest_sha256: "93".repeat(32),
+            max_active_attempts: 1,
+            steps: vec![StepPlan {
+                step_id: "route-step".to_owned(),
+                step_kind: "governed_repository_change".to_owned(),
+                depends_on_step_ids: Vec::new(),
+                input_bundle_ref: "static-route-input.json".to_owned(),
+                expected_output_contract_ref: Some(composition_reference("route-output")),
+                required_capability_profile_ref: Some(
+                    exact_config.workflow.capability_profile_ref.clone(),
+                ),
+                max_attempts: 2,
+            }],
+            budget_profile_ref: Some(budget.clone()),
+        };
+        let exact_route = resolver_work_capability_route(&exact_config.workflow);
+        exact_config.default_model = Some(exact_route.harness_model_id.clone());
+        fs::create_dir_all(
+            exact_config
+                .workspace_root
+                .join(&exact_config.workflow.workspace_ref),
+        )
+        .expect("exact governed workspace");
+
+        let context = Arc::new(Mutex::new(
+            egopulse_cognition_runtime::context_authority::ContextAuthority::open(
+                egopulse_cognition_runtime::context_authority::ContextAuthorityConfig {
+                    database_path: root.join("route-context.db"),
+                    store_epoch: "route-context-epoch".to_owned(),
+                    key: egopulse_cognition_runtime::task_authority::SqlCipherKey::new([0x81; 32]),
+                },
+            )
+            .expect("route Context Authority"),
+        ));
+        let task_guard = ConfiguredTaskCreationGuard::new(ConfiguredTaskCreationGuardConfig {
+            allowed_work_types: ["governed_repository_change".to_owned()]
+                .into_iter()
+                .collect(),
+            allowed_input_snapshot_ids: ["static-reviewed".to_owned()].into_iter().collect(),
+            allowed_target_scope_refs: ["scope:route-integration".to_owned()].into_iter().collect(),
+            acceptance_contract_ref: acceptance.clone(),
+            budget_profile_ref: budget.clone(),
+        })
+        .expect("route Task creation guard")
+        .with_context_authority(Arc::clone(&context));
+        let task =
+            egopulse_cognition_runtime::task_authority::TaskAuthority::open_with_transition_guard(
+                egopulse_cognition_runtime::task_authority::TaskAuthorityConfig {
+                    database_path: root.join("route-task.db"),
+                    store_epoch: "route-task-epoch".to_owned(),
+                    key: egopulse_cognition_runtime::task_authority::SqlCipherKey::new([0x82; 32]),
+                },
+                task_guard,
+                ConfiguredTaskTransitionGuard::new().with_context_authority(Arc::clone(&context)),
+            )
+            .expect("route Task Authority");
+        let policy = egopulse_policy_decision_authority::PolicyDecisionAuthority::open(
+            egopulse_policy_decision_authority::PolicyAuthorityConfig {
+                database_path: root.join("route-policy.db"),
+                store_epoch: "route-policy-epoch".to_owned(),
+                key: egopulse_policy_decision_authority::PolicySqlCipherKey::new([0x83; 32]),
+            },
+            UnusedPolicyReferences,
+        )
+        .expect("route Policy Authority");
+        let verdict = egopulse_founder_verdict_authority::FounderVerdictAuthority::open(
+            egopulse_founder_verdict_authority::VerdictAuthorityConfig {
+                database_path: root.join("route-verdict.db"),
+                store_epoch: "route-verdict-epoch".to_owned(),
+                key: egopulse_founder_verdict_authority::VerdictSqlCipherKey::new([0x84; 32]),
+            },
+            UnusedVerdictReferences,
+        )
+        .expect("route Founder Verdict Authority");
+        let mut providers = DaemonProviders::from_authorities(
+            task,
+            policy,
+            verdict,
+            Arc::new(WorkRoutePrincipalResolver),
+            Arc::new(DenyAllPrincipalResolver),
+            Arc::new(SystemSessionClock),
+            Arc::new(NoopSessionAuditSink),
+        )
+        .with_context_authority(Arc::clone(&context));
+
+        let provider_profile = bootstrap::ProviderBootstrapProfile {
+            profile_id: exact_route.provider_profile_id.clone(),
+            provider: bootstrap::ProviderId::Gpt,
+            harness: bootstrap::ProviderHarnessKind::CodexAppServer,
+            admission: bootstrap::ProviderAdmission::Production,
+            models: vec![bootstrap::ProviderModelBinding {
+                harness_model_id: exact_route.harness_model_id.clone(),
+                provider_model_id: exact_route.provider_model_id.clone(),
+            }],
+            catalog_snapshot: Some(bootstrap::ProviderCatalogSnapshot {
+                source: "route-integration-fixture".to_owned(),
+                fetched_at: "2026-09-05T00:00:00Z".to_owned(),
+                harness_version: "fixture-v1".to_owned(),
+                evidence_digest_sha256: exact_route
+                    .catalog_snapshot_sha256
+                    .clone()
+                    .expect("route catalog digest"),
+            }),
+            exact_model: exact_route.harness_model_id.clone(),
+            executable: PathBuf::from("unused-route-proof-driver"),
+            credential: bootstrap::ProviderCredentialReference::HarnessAccount,
+            hold_reason: None,
+        };
+        let registry = Arc::new(
+            work_capability::WorkCapabilityRegistry::new(
+                root.join("route-agentos.json"),
+                &[provider_profile],
+                exact_route.clone(),
+                "choice:resolver-test".to_owned(),
+                1,
+                false,
+            )
+            .expect("route work-capability registry"),
+        );
+        let work_port = ConfiguredWorkPreparationPort::new(
+            Arc::clone(&context),
+            Arc::clone(&providers.task_port),
+            providers.work_memory_retrieval_port(),
+            root.clone(),
+            ["governed_repository_change".to_owned()]
+                .into_iter()
+                .collect(),
+            acceptance,
+            budget,
+        )
+        .expect("route Work Preparation")
+        .with_input_bundle_root(exact_config.input_bundle_root.clone())
+        .and_then(|port| port.with_activation_run_id(exact_config.workflow.run_id.clone()))
+        .expect("route Work Preparation dispatch binding")
+        .with_work_capability_registry(registry);
+        let principal = CommandPrincipal {
+            principal_id: "founder:route-integration".to_owned(),
+            required_authority_principal_kinds: vec!["TaskAuthority.Founder".to_owned()],
+        };
+        let preview = work_port
+            .prepare(
+                &PrepareWorkRequest {
+                    intent: "run one admitted capability through production seams".to_owned(),
+                    work_type: "governed_repository_change".to_owned(),
+                    target_scope_ref: "scope:route-integration".to_owned(),
+                    sources: vec![WorkSourceRequest {
+                        source_ref: "intent.md".to_owned(),
+                        label: "reviewed intent".to_owned(),
+                    }],
+                    memory_mode: WorkMemoryMode::Disabled as i32,
+                    work_capability_preference: Some(
+                        prepare_work_request::WorkCapabilityPreference::UseDefaultWorkCapability(
+                            UseDefaultWorkCapability {},
+                        ),
+                    ),
+                    idempotency_key: "route-prepare".to_owned(),
+                    ..Default::default()
+                },
+                &principal,
+            )
+            .await
+            .expect("prepare exact admitted route");
+        assert_eq!(
+            preview
+                .work_capability
+                .as_ref()
+                .and_then(|capability| capability.admitted_route.as_ref()),
+            Some(&exact_route)
+        );
+        let confirmed = work_port
+            .confirm(
+                &ConfirmWorkRequest {
+                    snapshot_id: preview.snapshot_id.clone(),
+                    confirmation_binding_sha256: preview.confirmation_binding_sha256.clone(),
+                    idempotency_key: "route-confirm".to_owned(),
+                    ..Default::default()
+                },
+                &principal,
+            )
+            .expect("confirm exact admitted route");
+        let task = match confirmed.result.outcome.as_ref() {
+            Some(task_command_result::Outcome::Task(task)) => task.clone(),
+            _ => panic!("route confirmation must return the activated Task"),
+        };
+        assert_eq!(task.status, TaskStatus::Active as i32);
+        assert_eq!(task.work_capability_route.as_ref(), Some(&exact_route));
+        let expected_run_id = work_preparation::work_capability_run_id(&task.task_id, &exact_route)
+            .expect("route-bound run ID");
+        let expected_attempt_id = format!(
+            "attempt:work:{}:{}",
+            task.task_id, exact_route.route_binding_sha256
+        );
+        let expected_dispatch_id = format!(
+            "dispatch:work:{}:{}",
+            task.task_id, exact_route.route_binding_sha256
+        );
+        assert_eq!(
+            task.current_run_id.as_deref(),
+            Some(expected_run_id.as_str())
+        );
+        providers = providers.with_work_preparation_port(Arc::new(work_port));
+
+        let mut drift_route = exact_route.clone();
+        drift_route.route_id.push_str(":drift");
+        drift_route.route_binding_sha256.clear();
+        let drift_route =
+            egopulse_domain_contracts::work_capability::seal_work_capability_route_binding(
+                drift_route,
+            )
+            .expect("seal drift route");
+        let trusted_route = TrustedDispatchRouteProfile {
+            provider_bootstrap_profile_id: exact_route.provider_profile_id.clone(),
+            selected_harness_id: exact_route.harness_id.clone(),
+            provider_model_id: exact_route.provider_model_id.clone(),
+            catalog_snapshot_sha256: exact_route.catalog_snapshot_sha256.clone(),
+            capability_profile_id: exact_config
+                .workflow
+                .capability_profile_ref
+                .contract_id
+                .clone(),
+        };
+        let expected_dispatch_route =
+            build_dispatch_route_binding(&trusted_route).expect("trusted dispatch route");
+
+        let mut drift_config = multi_native_config(&root, "route-drift");
+        drift_config.input_bundle_root = exact_config.input_bundle_root.clone();
+        drift_config.workspace_root = exact_config.workspace_root.clone();
+        drift_config.default_model = exact_config.default_model.clone();
+        drift_config.workflow = exact_config.workflow.clone();
+        let drift_adapter_config = AdapterEdgeConfig {
+            database_path: drift_config.adapter_database_path.clone(),
+            adapter_id: drift_config.workflow.harness_adapter_principal_id.clone(),
+            store_epoch: drift_config.adapter_store_epoch.clone(),
+            key: AdapterEdgeKey::new(drift_config.adapter_key),
+        };
+        let exact_adapter_config = AdapterEdgeConfig {
+            database_path: exact_config.adapter_database_path.clone(),
+            adapter_id: exact_config.workflow.harness_adapter_principal_id.clone(),
+            store_epoch: exact_config.adapter_store_epoch.clone(),
+            key: AdapterEdgeKey::new(exact_config.adapter_key),
+        };
+        let drift_sends = Arc::new(AtomicUsize::new(0));
+        let drift_envelope = Arc::new(Mutex::new(None));
+        let exact_sends = Arc::new(AtomicUsize::new(0));
+        let exact_envelope = Arc::new(Mutex::new(None));
+        let drift_driver = RouteProofDriver {
+            sends: Arc::clone(&drift_sends),
+            envelope: Arc::clone(&drift_envelope),
+        };
+        let exact_driver = RouteProofDriver {
+            sends: Arc::clone(&exact_sends),
+            envelope: Arc::clone(&exact_envelope),
+        };
+        let drift_profile = multi_native_profile(&drift_config);
+        let exact_profile = multi_native_profile(&exact_config);
+        let (artifact, verification) = multi_native_authorities(&root);
+        providers = providers
+            .with_profiled_native_harness_drivers(
+                vec![
+                    ProfiledNativeHarnessComposition::new(
+                        drift_config,
+                        drift_profile,
+                        drift_driver,
+                    )
+                    .with_trusted_dispatch_route_profile(trusted_route.clone())
+                    .with_work_capability_route(drift_route),
+                    ProfiledNativeHarnessComposition::new(
+                        exact_config,
+                        exact_profile,
+                        exact_driver,
+                    )
+                    .with_trusted_dispatch_route_profile(trusted_route)
+                    .with_work_capability_route(exact_route.clone()),
+                ],
+                artifact,
+                verification,
+            )
+            .expect("production route runners");
+        let report = providers
+            .harness_dispatch_runner
+            .as_ref()
+            .expect("production Harness runner")
+            .run_once()
+            .await
+            .expect("production route cycle");
+
+        assert_eq!(report.activations_started, 1);
+        assert_eq!(report.activations_acknowledged, 1);
+        assert_eq!(report.dispatches_delivered, 1);
+        assert_eq!(drift_sends.load(Ordering::SeqCst), 0);
+        assert!(
+            drift_envelope
+                .lock()
+                .expect("drift envelope lock")
+                .is_none()
+        );
+        assert_eq!(exact_sends.load(Ordering::SeqCst), 1);
+        let delivered = exact_envelope
+            .lock()
+            .expect("exact envelope lock")
+            .clone()
+            .expect("exact route reaches native driver");
+        assert_eq!(delivered.run_id, expected_run_id);
+        assert_eq!(delivered.attempt_id, expected_attempt_id);
+        assert_eq!(delivered.dispatch_id, expected_dispatch_id);
+        assert_eq!(
+            delivered.route_binding.as_ref(),
+            Some(&expected_dispatch_route)
+        );
+
+        assert_eq!(providers.harness_content_lineage_readers.len(), 2);
+        assert_eq!(
+            providers.harness_content_lineage_readers[0]
+                .lock()
+                .expect("drift lineage lock")
+                .task_id_for_attempt(&expected_attempt_id)
+                .expect("read drift lineage"),
+            None,
+            "route drift must create no Collaboration run or attempt"
+        );
+        assert_eq!(
+            providers.harness_content_lineage_readers[1]
+                .lock()
+                .expect("exact lineage lock")
+                .task_id_for_attempt(&expected_attempt_id)
+                .expect("read exact lineage")
+                .as_deref(),
+            Some(task.task_id.as_str())
+        );
+        let drift_adapter = AdapterEdge::open(drift_adapter_config).expect("drift Adapter Edge");
+        let exact_adapter = AdapterEdge::open(exact_adapter_config).expect("exact Adapter Edge");
+        assert_eq!(
+            drift_adapter
+                .inspect()
+                .expect("inspect drift Adapter Edge")
+                .dispatch_count,
+            0
+        );
+        assert_eq!(
+            exact_adapter
+                .inspect()
+                .expect("inspect exact Adapter Edge")
+                .dispatch_count,
+            1
+        );
+
+        drop(drift_adapter);
+        drop(exact_adapter);
+        drop(providers);
+        drop(context);
+        fs::remove_dir_all(root).expect("remove route integration root");
     }
 
     #[test]
@@ -2909,6 +3786,7 @@ mod tests {
                             PathBuf::from("codex"),
                         ))),
                         route_profile: None,
+                        work_capability_route: None,
                         disclosure_credentials: egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(),
                     },
                     ProfiledNativeHarnessComposition {
@@ -2924,6 +3802,7 @@ mod tests {
                             ),
                         )),
                         route_profile: None,
+                        work_capability_route: None,
                         disclosure_credentials: egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(),
                     },
                 ],
@@ -2964,6 +3843,7 @@ mod tests {
                         PathBuf::from("codex"),
                     ))),
                     route_profile: None,
+                    work_capability_route: None,
                     disclosure_credentials:
                         egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(
                         ),
@@ -2975,6 +3855,7 @@ mod tests {
                         PathBuf::from("codex"),
                     ))),
                     route_profile: None,
+                    work_capability_route: None,
                     disclosure_credentials:
                         egopulse_harness_adapter::ManagedDisclosureCredentials::managed_unavailable(
                         ),

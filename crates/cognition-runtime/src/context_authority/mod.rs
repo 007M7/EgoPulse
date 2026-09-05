@@ -674,6 +674,46 @@ impl ContextAuthority {
             .transpose()
     }
 
+    /// Looks up an already-issued snapshot by the exact issuer/idempotency
+    /// tuple without creating a new binding. Callers use this to reconstruct
+    /// the original immutable input before retrying an issue operation whose
+    /// response may have been lost.
+    pub fn issued_snapshot_by_idempotency(
+        &self,
+        principal: &AuthenticatedContextPrincipal,
+        idempotency_key: &str,
+    ) -> Result<Option<ResolvedContextSnapshot>, ContextAuthorityFailure> {
+        validate_principal(principal)?;
+        if !matches!(
+            principal.kind,
+            ContextPrincipalKind::ContextCompiler | ContextPrincipalKind::GovernanceKernel
+        ) {
+            return Err(ContextAuthorityFailure::Unauthorized);
+        }
+        validate_routing(idempotency_key, "idempotency_key")?;
+        let Some(record) = self
+            .store
+            .idempotency_record(&principal.principal_id, idempotency_key)?
+        else {
+            return Ok(None);
+        };
+        let stored = self
+            .store
+            .snapshot_with_bytes(&record.snapshot_id)?
+            .ok_or(ContextAuthorityFailure::IntegrityFailure)?;
+        if stored.snapshot.snapshot_id != record.snapshot_id
+            || stored.snapshot.revision != record.revision
+            || snapshot_digest(&stored.snapshot) != record.request_digest_sha256
+            || sha256(&stored.compiled_context) != stored.snapshot.compiled_context_sha256
+        {
+            return Err(ContextAuthorityFailure::IntegrityFailure);
+        }
+        Ok(Some(ResolvedContextSnapshot {
+            snapshot: stored.snapshot,
+            compiled_context: stored.compiled_context,
+        }))
+    }
+
     /// Issues an immutable snapshot and returns a digest-bound receipt.
     pub fn issue(
         &mut self,

@@ -164,6 +164,10 @@ fn packaged_example_grants_every_advertised_user_operation() {
         "local.memory.retrieve",
         "local.memory.candidate.submit",
         "local.memory.govern",
+        "local.work-capability.read",
+        "local.work-capability.default.set",
+        "local.work.prepare",
+        "local.work.confirm",
     ] {
         assert!(
             permissions.contains(permission),

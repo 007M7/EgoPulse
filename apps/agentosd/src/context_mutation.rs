@@ -106,6 +106,11 @@ impl ContextMutationPort for ContextMutationPortAdapter {
 
 fn map_principal_resolution_failure(failure: CommandPortFailure) -> ContextMutationPortFailure {
     match failure {
+        CommandPortFailure::InvalidArgument
+        | CommandPortFailure::CapabilityNotAdmitted
+        | CommandPortFailure::ConfigurationMigrationRequired => {
+            ContextMutationPortFailure::IntegrityFailure
+        }
         CommandPortFailure::Unavailable => ContextMutationPortFailure::PermissionDenied,
         CommandPortFailure::IntegrityFailure => ContextMutationPortFailure::IntegrityFailure,
         CommandPortFailure::DeliveryUnknown => ContextMutationPortFailure::UnknownCriticalSemantics,

@@ -139,7 +139,7 @@ fn embedded_profiles_are_digest_bound_and_fail_closed_by_default() {
     let profiles = ContractProfiles::embedded().unwrap();
     assert_eq!(
         client_kernel_contract_ref().sha256,
-        "d1eee23877a6b55cbfe12a7b90041a86a1eaebbdb4a6a863e924ba101ad694bc"
+        "500d1421381ea3929e6cd92c0ce7bc0e849a93f32d941366ff35037915aaea3d"
     );
     assert_eq!(
         authorization_contract_ref().sha256,

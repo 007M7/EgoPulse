@@ -13,6 +13,8 @@ use egopulse_founder_verdict_authority::FounderVerdictAuthority;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
+use crate::work_preparation::work_capability_route_from_compiled_context;
+
 /// Reviewed creation policy for the first local vertical.
 ///
 /// This guard proves that a create request belongs to an explicitly reviewed
@@ -85,10 +87,13 @@ impl ConfiguredTaskCreationGuard {
             return false;
         };
         let snapshot = resolved.snapshot;
+        let route_matches = work_capability_route_from_compiled_context(&resolved.compiled_context)
+            .is_ok_and(|route| route.as_ref() == command.work_capability_route.as_ref());
         snapshot.work_type == command.work_type
             && snapshot.acceptance_contract_ref
                 == contract_reference_key(&self.acceptance_contract_ref)
             && snapshot.budget_profile_ref == contract_reference_key(&self.budget_profile_ref)
+            && route_matches
     }
 }
 
@@ -112,13 +117,15 @@ impl TaskCreationGuard for ConfiguredTaskCreationGuard {
         {
             return Err(CreationGuardRejection::InvalidArgument);
         }
-        let snapshot_is_reviewed =
-            self.allowed_input_snapshot_ids
-                .contains(&command.input_snapshot_id)
-                || (command.input_snapshot_id.starts_with("ctx:")
-                    && self.context_authority.as_ref().is_some_and(|authority| {
-                        self.context_snapshot_matches(authority, command)
-                    }));
+        let snapshot_is_reviewed = (command.work_capability_route.is_none()
+            && self
+                .allowed_input_snapshot_ids
+                .contains(&command.input_snapshot_id))
+            || (command.input_snapshot_id.starts_with("ctx:")
+                && self
+                    .context_authority
+                    .as_ref()
+                    .is_some_and(|authority| self.context_snapshot_matches(authority, command)));
         if !self.allowed_work_types.contains(&command.work_type)
             || !snapshot_is_reviewed
             || !self
@@ -517,6 +524,7 @@ mod tests {
             TaskErrorCode, get_task_response, task_command_result,
         },
     };
+    use egopulse_domain_contracts::work_capability::seal_work_capability_route_binding;
     use prost_types::Timestamp;
     use std::fs;
     use uuid::Uuid;
@@ -584,6 +592,61 @@ mod tests {
             }
             _ => panic!("test helper only seals create and activate"),
         }
+    }
+
+    fn guarded_work_capability_route()
+    -> egopulse_domain_contracts::v01::egopulse::task::v1::WorkCapabilityRouteBinding {
+        seal_work_capability_route_binding(
+            egopulse_domain_contracts::v01::egopulse::task::v1::WorkCapabilityRouteBinding {
+                route_id: "route:task-guard:v1".to_owned(),
+                route_generation: 1,
+                provider_profile_id: "provider-profile:task-guard".to_owned(),
+                provider_id: "gpt".to_owned(),
+                harness_id: "codex_app_server".to_owned(),
+                harness_model_id: "guarded-model".to_owned(),
+                provider_model_id: "provider-guarded-model".to_owned(),
+                capability_profile_ref: Some(contract("capability", "v1", 0x33)),
+                catalog_snapshot_sha256: Some(hex::encode([0x44; 32])),
+                native_composition_generation: "native:task-guard:v1".to_owned(),
+                route_binding_sha256: String::new(),
+            },
+        )
+        .expect("sealed task-guard route")
+    }
+
+    fn compiled_route_context(
+        route: &egopulse_domain_contracts::v01::egopulse::task::v1::WorkCapabilityRouteBinding,
+    ) -> Vec<u8> {
+        let profile = route
+            .capability_profile_ref
+            .as_ref()
+            .expect("route capability profile");
+        serde_json::to_vec(&serde_json::json!({
+            "model": route.harness_model_id,
+            "work_capability": {
+                "choice_id": "choice:task-guard",
+                "selection_source": egopulse_domain_contracts::v01::egopulse::localapi::v1::WorkCapabilitySelectionSource::ExplicitChoice as i32,
+                "preference_revision_at_resolution": null,
+                "route": {
+                    "route_id": route.route_id,
+                    "route_generation": route.route_generation,
+                    "provider_profile_id": route.provider_profile_id,
+                    "provider_id": route.provider_id,
+                    "harness_id": route.harness_id,
+                    "harness_model_id": route.harness_model_id,
+                    "provider_model_id": route.provider_model_id,
+                    "capability_profile_ref": {
+                        "contract_id": profile.contract_id,
+                        "version": profile.version,
+                        "sha256": profile.sha256,
+                    },
+                    "catalog_snapshot_sha256": route.catalog_snapshot_sha256,
+                    "native_composition_generation": route.native_composition_generation,
+                    "route_binding_sha256": route.route_binding_sha256,
+                }
+            }
+        }))
+        .expect("compiled task-guard context")
     }
 
     #[test]
@@ -676,6 +739,158 @@ mod tests {
             guard.validate(&denied, &active),
             Err(TransitionGuardRejection::UnverifiedReference)
         );
+    }
+
+    #[test]
+    fn task_creation_guard_requires_the_exact_context_bound_work_capability_route() {
+        let root =
+            std::env::temp_dir().join(format!("egopulse-task-route-guard-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("task route guard root");
+        let acceptance = contract("repository-change", "v1", 0x11);
+        let budget = contract("quality-budget", "v1", 0x22);
+        let route = guarded_work_capability_route();
+        let context = Arc::new(Mutex::new(
+            ContextAuthority::open(ContextAuthorityConfig {
+                database_path: root.join("context.db"),
+                store_epoch: "task-route-guard-context".to_owned(),
+                key: TaskSqlCipherKey::new([43; 32]),
+            })
+            .expect("Context Authority"),
+        ));
+        let expires_at_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+            .saturating_add(600) as i64;
+        let (_, snapshot) = context
+            .lock()
+            .expect("Context lock")
+            .issue(
+                &IssueContextSnapshot {
+                    owner_principal_id: "founder:route-guard".to_owned(),
+                    intent: "create an exact-route task".to_owned(),
+                    work_type: "governed_repository_change".to_owned(),
+                    target_scope_ref: "scope:route-guard".to_owned(),
+                    compiled_context: compiled_route_context(&route),
+                    sources: vec![ContextSourceFact {
+                        source_ref: "source:route-guard".to_owned(),
+                        label: "route guard".to_owned(),
+                        authority: "project".to_owned(),
+                        content_sha256: "a".repeat(64),
+                        included: true,
+                    }],
+                    memory_pack: None,
+                    allowed_read_paths: vec!["src".to_owned()],
+                    allowed_write_paths: vec!["src".to_owned()],
+                    allowed_tools: Vec::new(),
+                    external_resources: Vec::new(),
+                    non_goals: Vec::new(),
+                    acceptance_contract_ref: contract_reference_key(&acceptance),
+                    budget_profile_ref: contract_reference_key(&budget),
+                    deadline_seconds: None,
+                    recovery_entry: "hold-and-reconcile".to_owned(),
+                    visibility: "founder-only".to_owned(),
+                    redactions: Vec::new(),
+                    expires_at_seconds,
+                    idempotency_key: "task-route-guard-context".to_owned(),
+                },
+                &AuthenticatedContextPrincipal {
+                    kind: ContextPrincipalKind::ContextCompiler,
+                    principal_id: "context-compiler:route-guard".to_owned(),
+                    authenticated: true,
+                },
+            )
+            .expect("issue route-bound Context");
+        let guard = ConfiguredTaskCreationGuard::new(ConfiguredTaskCreationGuardConfig {
+            allowed_work_types: BTreeSet::from(["governed_repository_change".to_owned()]),
+            allowed_input_snapshot_ids: BTreeSet::from(["static-reviewed".to_owned()]),
+            allowed_target_scope_refs: BTreeSet::from(["scope:route-guard".to_owned()]),
+            acceptance_contract_ref: acceptance.clone(),
+            budget_profile_ref: budget.clone(),
+        })
+        .expect("creation guard")
+        .with_context_authority(Arc::clone(&context));
+        let base = CreateTaskCommand {
+            work_type: "governed_repository_change".to_owned(),
+            input_snapshot_id: snapshot.snapshot_id,
+            target_scope_ref: "scope:route-guard".to_owned(),
+            acceptance_contract_ref: Some(acceptance),
+            budget_profile_ref: Some(budget),
+            work_capability_route: Some(route.clone()),
+            ..Default::default()
+        };
+        assert!(guard.validate(&base).is_ok());
+
+        let mut stripped = base.clone();
+        stripped.work_capability_route = None;
+        assert_eq!(
+            guard.validate(&stripped),
+            Err(CreationGuardRejection::UnverifiedReference)
+        );
+
+        let mut static_with_route = base.clone();
+        static_with_route.input_snapshot_id = "static-reviewed".to_owned();
+        assert_eq!(
+            guard.validate(&static_with_route),
+            Err(CreationGuardRejection::UnverifiedReference)
+        );
+        static_with_route.work_capability_route = None;
+        assert!(guard.validate(&static_with_route).is_ok());
+
+        type Route = egopulse_domain_contracts::v01::egopulse::task::v1::WorkCapabilityRouteBinding;
+        type Mutator = fn(&mut Route);
+        let mutations: [Mutator; 13] = [
+            |value| value.route_id.push_str(":drift"),
+            |value| value.route_generation += 1,
+            |value| value.provider_profile_id.push_str(":drift"),
+            |value| value.provider_id.push_str(":drift"),
+            |value| value.harness_id.push_str(":drift"),
+            |value| value.harness_model_id.push_str(":drift"),
+            |value| value.provider_model_id.push_str(":drift"),
+            |value| {
+                value
+                    .capability_profile_ref
+                    .as_mut()
+                    .expect("profile")
+                    .contract_id
+                    .push_str(":drift")
+            },
+            |value| {
+                value
+                    .capability_profile_ref
+                    .as_mut()
+                    .expect("profile")
+                    .version
+                    .push_str(":drift")
+            },
+            |value| {
+                value
+                    .capability_profile_ref
+                    .as_mut()
+                    .expect("profile")
+                    .sha256 = hex::encode([0x55; 32])
+            },
+            |value| value.catalog_snapshot_sha256 = None,
+            |value| value.native_composition_generation.push_str(":drift"),
+            |value| value.catalog_snapshot_sha256 = Some(hex::encode([0x66; 32])),
+        ];
+        for mutate in mutations {
+            let mut drifted_route = route.clone();
+            drifted_route.route_binding_sha256.clear();
+            mutate(&mut drifted_route);
+            let drifted_route =
+                seal_work_capability_route_binding(drifted_route).expect("seal drifted route");
+            let mut command = base.clone();
+            command.work_capability_route = Some(drifted_route);
+            assert_eq!(
+                guard.validate(&command),
+                Err(CreationGuardRejection::UnverifiedReference)
+            );
+        }
+
+        drop(guard);
+        drop(context);
+        fs::remove_dir_all(root).expect("remove task route guard root");
     }
 
     #[test]
@@ -774,6 +989,7 @@ mod tests {
                 target_scope_ref: snapshot.target_scope_ref.clone(),
                 acceptance_contract_ref: Some(acceptance),
                 budget_profile_ref: Some(budget),
+                work_capability_route: None,
             })),
         };
         seal_task_command(&mut create);

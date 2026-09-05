@@ -727,6 +727,7 @@ async fn create_task(request: DesktopTaskCreateRequest) -> Result<DesktopTaskCre
                 version: budget_profile_version,
                 sha256: budget_profile_sha256,
             }),
+            work_capability_route: None,
         })),
     };
     egopulse_client_operations::set_task_digest(&mut command);

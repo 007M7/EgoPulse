@@ -10,17 +10,17 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const API_CONTRACT_ID: &str = "egopulse.localapi.v1";
-pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.22";
+pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.23";
 pub const API_CONTRACT_DIGEST_SHA256: &str =
-    "c5996f33fa260c2599a4c3c28ced43959d648e34978c3175940e1dd22c58babd";
+    "187f358851f24d61fcc92da33919f55336f30136e15b9fafc96fb2fea490a229";
 pub const CLIENT_KERNEL_CONTRACT_ID: &str = "egopulse.client-kernel.v1";
 pub const CLIENT_KERNEL_CONTRACT_VERSION: &str = "0.1.0";
 pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =
-    "d1eee23877a6b55cbfe12a7b90041a86a1eaebbdb4a6a863e924ba101ad694bc";
+    "500d1421381ea3929e6cd92c0ce7bc0e849a93f32d941366ff35037915aaea3d";
 pub const AUTHORIZATION_CONTRACT_ID: &str = "egopulse.authorization.v1";
 pub const AUTHORIZATION_CONTRACT_VERSION: &str = "0.1.0";
 pub const AUTHORIZATION_PROFILE_DIGEST_SHA256: &str =
-    "8426ece110ca30ca64bc384daee0bd1b6b2ab1966eed2b3b8c1a17cea5f0cc06";
+    "c174126b56818b78e6588536fb0b64d570910e9212c041e888487962079b7c86";
 pub const HARNESS_CONTENT_DISCLOSURE_CONTRACT_ID: &str = "egopulse.harness-content-disclosure.v1";
 pub const HARNESS_CONTENT_DISCLOSURE_CONTRACT_VERSION: &str = "0.1.1";
 pub const HARNESS_CONTENT_DISCLOSURE_PROFILE_ID: &str = "harness-content-disclosure-v01-default";
@@ -28,8 +28,8 @@ pub const HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256: &str =
     "c969c9eda5394617aa8bcbca4ed0086eb0dd61ced2519818db830cc73ed1e58f";
 const R9C_PROFILE_AUTHORITY_REF: &str =
     "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7";
-const M13_PROFILE_AUTHORITY_REF: &str =
-    "conversation:2026-09-05:founder-resume-after-m13-decision-package";
+const CURRENT_PROFILE_AUTHORITY_REF: &str =
+    "conversation:2026-09-05:founder-adr0004-option-b-freeze";
 
 const CLIENT_KERNEL_PROFILE_BYTES: &[u8] =
     include_bytes!("../../../contracts/profiles/client-kernel/v1/v01-default.json");
@@ -671,6 +671,7 @@ fn validate_client_kernel_profile(
         "frame_deduplication",
         "memory_retrieval",
         "governed_memory_work_preparation",
+        "governed_work_capability_routing",
         "context_revoke_full_digest_confirmation",
         "content_baseline_pagination",
         "watch_operation_records",
@@ -679,7 +680,7 @@ fn validate_client_kernel_profile(
     if profile.schema_version != "egopulse.client-kernel-profile/v0.1"
         || profile.contract_id != CLIENT_KERNEL_CONTRACT_ID
         || profile.contract_version != CLIENT_KERNEL_CONTRACT_VERSION
-        || profile.authority_ref != M13_PROFILE_AUTHORITY_REF
+        || profile.authority_ref != CURRENT_PROFILE_AUTHORITY_REF
         || profile.local_api_compatibility.contract_id != API_CONTRACT_ID
         || !profile.local_api_compatibility.runtime_reference_required
         || profile.local_api_compatibility.minimum_version != API_CONTRACT_VERSION
@@ -743,7 +744,7 @@ fn validate_authorization_profile(
         || profile.schema_version != "egopulse.authorization-capability-profile/v0.1"
         || profile.contract_id != AUTHORIZATION_CONTRACT_ID
         || profile.contract_version != AUTHORIZATION_CONTRACT_VERSION
-        || profile.authority_ref != M13_PROFILE_AUTHORITY_REF
+        || profile.authority_ref != CURRENT_PROFILE_AUTHORITY_REF
         || profile.local_api_contract_id != API_CONTRACT_ID
         || defaults.unknown_permission != "fail_closed"
         || defaults.unknown_rpc != "fail_closed"
@@ -1342,7 +1343,7 @@ fn validate_harness_content_authorization(
         })
         .count();
 
-    if authorization.authority_ref != M13_PROFILE_AUTHORITY_REF
+    if authorization.authority_ref != CURRENT_PROFILE_AUTHORITY_REF
         || disclosure.authority_ref != R9C_PROFILE_AUTHORITY_REF
         || disclosure.contract_bindings.permission_code != PERMISSION
         || disclosure.authorization.permission_code != PERMISSION
@@ -1414,8 +1415,8 @@ mod tests {
 
     #[test]
     fn r9c_harness_content_profile_and_permission_are_exact_and_independent() {
-        let profiles = ContractProfiles::embedded().expect("draft.22 profiles load");
-        assert_eq!(API_CONTRACT_VERSION, "0.1.0-draft.22");
+        let profiles = ContractProfiles::embedded().expect("draft.23 profiles load");
+        assert_eq!(API_CONTRACT_VERSION, "0.1.0-draft.23");
         assert_eq!(
             profiles.harness_content_disclosure.contract_id,
             HARNESS_CONTENT_DISCLOSURE_CONTRACT_ID

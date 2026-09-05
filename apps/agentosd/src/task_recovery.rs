@@ -401,6 +401,7 @@ mod tests {
                     version: "0.1".to_owned(),
                     sha256: "b".repeat(64),
                 }),
+                work_capability_route: None,
             })),
         };
         seal(&mut create);

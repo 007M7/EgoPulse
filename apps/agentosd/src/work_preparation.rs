@@ -23,25 +23,28 @@ use egopulse_domain_contracts::memory::{
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::{CommandMetadata, ContractReference},
     localapi::v1::{
-        ConfirmWorkRequest, PrepareWorkRequest, WorkGateNotice, WorkMemoryMode,
-        WorkPreparationPreview, WorkSourceFact,
+        ConfirmWorkRequest, PrepareWorkRequest, WorkCapabilitySelectionSource, WorkGateNotice,
+        WorkMemoryMode, WorkPreparationPreview, WorkSourceFact, prepare_work_request,
     },
     memory::v1::{AcceptedMemoryInput, RetrievalRequest},
     task::v1::{
         ActivateTaskCommand, CreateTaskCommand, TaskCommand, TaskCommandResult, TaskStatus,
-        task_command, task_command_result,
+        WorkCapabilityRouteBinding, task_command, task_command_result,
     },
 };
+use egopulse_domain_contracts::work_capability::validate_work_capability_route_binding;
 use egopulse_local_api::cognition_gateway::{MemoryRetrievalInput, MemoryRetrievalPortError};
 use egopulse_local_api::command_gateway::{
-    CommandPortFailure, CommandPortResult, CommandPrincipal, TaskCommandPort, WorkPreparationPort,
+    CommandPortFailure, CommandPortResult, CommandPrincipal, TaskCommandPort,
+    WorkCapabilityPortFailure, WorkPreparationPort,
 };
 use prost_types::Timestamp;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::memory_retrieval::{GovernedWorkMemoryRetrieval, WorkMemoryRetrievalPort};
+use crate::work_capability::{ResolvedWorkCapability, WorkCapabilityRegistry};
 
 #[derive(Clone, Debug, Serialize)]
 struct CompiledMemoryRecord {
@@ -75,6 +78,187 @@ struct PreparedMemoryPack {
     warnings: Vec<WorkGateNotice>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompiledContractReference {
+    contract_id: String,
+    version: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompiledWorkCapabilityRoute {
+    route_id: String,
+    route_generation: u64,
+    provider_profile_id: String,
+    provider_id: String,
+    harness_id: String,
+    harness_model_id: String,
+    provider_model_id: String,
+    capability_profile_ref: CompiledContractReference,
+    catalog_snapshot_sha256: Option<String>,
+    native_composition_generation: String,
+    route_binding_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompiledWorkCapabilityBinding {
+    choice_id: String,
+    selection_source: i32,
+    preference_revision_at_resolution: Option<u64>,
+    route: CompiledWorkCapabilityRoute,
+}
+
+impl CompiledWorkCapabilityBinding {
+    fn from_resolution(resolved: &ResolvedWorkCapability) -> Result<Self, CommandPortFailure> {
+        validate_work_capability_route_binding(&resolved.route)
+            .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+        validate_compiled_selection(
+            &resolved.choice_id,
+            resolved.selection_source,
+            resolved.preference_revision_at_resolution,
+        )?;
+        let profile = resolved
+            .route
+            .capability_profile_ref
+            .as_ref()
+            .ok_or(CommandPortFailure::IntegrityFailure)?;
+        Ok(Self {
+            choice_id: resolved.choice_id.clone(),
+            selection_source: resolved.selection_source as i32,
+            preference_revision_at_resolution: resolved.preference_revision_at_resolution,
+            route: CompiledWorkCapabilityRoute {
+                route_id: resolved.route.route_id.clone(),
+                route_generation: resolved.route.route_generation,
+                provider_profile_id: resolved.route.provider_profile_id.clone(),
+                provider_id: resolved.route.provider_id.clone(),
+                harness_id: resolved.route.harness_id.clone(),
+                harness_model_id: resolved.route.harness_model_id.clone(),
+                provider_model_id: resolved.route.provider_model_id.clone(),
+                capability_profile_ref: CompiledContractReference {
+                    contract_id: profile.contract_id.clone(),
+                    version: profile.version.clone(),
+                    sha256: profile.sha256.clone(),
+                },
+                catalog_snapshot_sha256: resolved.route.catalog_snapshot_sha256.clone(),
+                native_composition_generation: resolved.route.native_composition_generation.clone(),
+                route_binding_sha256: resolved.route.route_binding_sha256.clone(),
+            },
+        })
+    }
+
+    fn into_resolution(self) -> Result<ResolvedWorkCapability, CommandPortFailure> {
+        let source = WorkCapabilitySelectionSource::try_from(self.selection_source)
+            .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+        validate_compiled_selection(
+            &self.choice_id,
+            source,
+            self.preference_revision_at_resolution,
+        )?;
+        let route = WorkCapabilityRouteBinding {
+            route_id: self.route.route_id,
+            route_generation: self.route.route_generation,
+            provider_profile_id: self.route.provider_profile_id,
+            provider_id: self.route.provider_id,
+            harness_id: self.route.harness_id,
+            harness_model_id: self.route.harness_model_id,
+            provider_model_id: self.route.provider_model_id,
+            capability_profile_ref: Some(ContractReference {
+                contract_id: self.route.capability_profile_ref.contract_id,
+                version: self.route.capability_profile_ref.version,
+                sha256: self.route.capability_profile_ref.sha256,
+            }),
+            catalog_snapshot_sha256: self.route.catalog_snapshot_sha256,
+            native_composition_generation: self.route.native_composition_generation,
+            route_binding_sha256: self.route.route_binding_sha256,
+        };
+        ResolvedWorkCapability::restore_from_compiled_context(
+            self.choice_id,
+            route,
+            source,
+            self.preference_revision_at_resolution,
+        )
+        .map_err(work_capability_failure)
+    }
+}
+
+fn validate_compiled_selection(
+    choice_id: &str,
+    source: WorkCapabilitySelectionSource,
+    preference_revision_at_resolution: Option<u64>,
+) -> Result<(), CommandPortFailure> {
+    if choice_id.trim().is_empty()
+        || choice_id != choice_id.trim()
+        || choice_id.len() > 256
+        || choice_id.chars().any(char::is_control)
+    {
+        return Err(CommandPortFailure::IntegrityFailure);
+    }
+    match source {
+        WorkCapabilitySelectionSource::FutureWorkDefault
+        | WorkCapabilitySelectionSource::LegacyOmittedDefault
+            if preference_revision_at_resolution.is_some_and(|revision| revision > 0) =>
+        {
+            Ok(())
+        }
+        WorkCapabilitySelectionSource::ExplicitChoice
+            if preference_revision_at_resolution.is_none() =>
+        {
+            Ok(())
+        }
+        _ => Err(CommandPortFailure::IntegrityFailure),
+    }
+}
+
+pub(crate) fn work_capability_route_from_compiled_context(
+    compiled_context: &[u8],
+) -> Result<Option<WorkCapabilityRouteBinding>, CommandPortFailure> {
+    work_capability_resolution_from_compiled_context(compiled_context)
+        .map(|resolved| resolved.map(|resolved| resolved.route))
+}
+
+fn work_capability_resolution_from_compiled_context(
+    compiled_context: &[u8],
+) -> Result<Option<ResolvedWorkCapability>, CommandPortFailure> {
+    let root: serde_json::Value = serde_json::from_slice(compiled_context)
+        .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+    let root = root
+        .as_object()
+        .ok_or(CommandPortFailure::IntegrityFailure)?;
+    let Some(value) = root.get("work_capability") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let binding: CompiledWorkCapabilityBinding =
+        serde_json::from_value(value.clone()).map_err(|_| CommandPortFailure::IntegrityFailure)?;
+    let resolved = binding.into_resolution()?;
+    if root.get("model").and_then(serde_json::Value::as_str)
+        != Some(resolved.route.harness_model_id.as_str())
+    {
+        return Err(CommandPortFailure::IntegrityFailure);
+    }
+    Ok(Some(resolved))
+}
+
+pub(crate) fn work_capability_run_id(
+    task_id: &str,
+    route: &WorkCapabilityRouteBinding,
+) -> Result<String, CommandPortFailure> {
+    if task_id.trim().is_empty() {
+        return Err(CommandPortFailure::IntegrityFailure);
+    }
+    validate_work_capability_route_binding(route)
+        .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+    Ok(format!(
+        "run:work:{}:{}",
+        task_id, route.route_binding_sha256
+    ))
+}
+
 /// The first real preparation compiler. It is intentionally small and
 /// deterministic: source refs are reviewed relative paths under the local
 /// workspace, and all authority fields are supplied by this daemon-owned
@@ -88,6 +272,7 @@ pub struct ConfiguredWorkPreparationPort {
     acceptance_contract_ref: ContractReference,
     budget_profile_ref: ContractReference,
     input_bundle_root: Option<PathBuf>,
+    work_capability_registry: Option<Arc<WorkCapabilityRegistry>>,
     /// Reviewed daemon-owned workflow instance used for post-confirmation
     /// activation. None is retained by foundation/unit-test compositions.
     activation_run_id: Option<String>,
@@ -121,6 +306,7 @@ impl ConfiguredWorkPreparationPort {
             acceptance_contract_ref,
             budget_profile_ref,
             input_bundle_root: None,
+            work_capability_registry: None,
             activation_run_id: None,
         })
     }
@@ -139,6 +325,77 @@ impl ConfiguredWorkPreparationPort {
         }
         self.activation_run_id = Some(run_id);
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_work_capability_registry(mut self, registry: Arc<WorkCapabilityRegistry>) -> Self {
+        self.work_capability_registry = Some(registry);
+        self
+    }
+
+    fn resolve_work_capability(
+        &self,
+        request: &PrepareWorkRequest,
+    ) -> Result<Option<ResolvedWorkCapability>, CommandPortFailure> {
+        let Some(registry) = self.work_capability_registry.as_ref() else {
+            return match request.work_capability_preference.as_ref() {
+                None => Ok(None),
+                Some(_) => Err(CommandPortFailure::Unavailable),
+            };
+        };
+        let resolved = match request.work_capability_preference.as_ref() {
+            Some(prepare_work_request::WorkCapabilityPreference::UseDefaultWorkCapability(_)) => {
+                registry.resolve_default()
+            }
+            Some(
+                prepare_work_request::WorkCapabilityPreference::ExplicitWorkCapabilityChoiceId(
+                    choice_id,
+                ),
+            ) => registry.resolve_choice(choice_id),
+            None => registry.resolve_legacy_default(),
+        }
+        .map_err(work_capability_failure)?;
+        Ok(Some(resolved))
+    }
+
+    fn replayed_work_capability(
+        &self,
+        request: &PrepareWorkRequest,
+        compiled_context: &[u8],
+    ) -> Result<Option<ResolvedWorkCapability>, CommandPortFailure> {
+        let resolved = work_capability_resolution_from_compiled_context(compiled_context)?;
+        let selection_matches = match (
+            request.work_capability_preference.as_ref(),
+            resolved.as_ref(),
+        ) {
+            (
+                Some(prepare_work_request::WorkCapabilityPreference::UseDefaultWorkCapability(_)),
+                Some(resolved),
+            ) => resolved.selection_source == WorkCapabilitySelectionSource::FutureWorkDefault,
+            (
+                Some(
+                    prepare_work_request::WorkCapabilityPreference::ExplicitWorkCapabilityChoiceId(
+                        choice_id,
+                    ),
+                ),
+                Some(resolved),
+            ) => {
+                resolved.selection_source == WorkCapabilitySelectionSource::ExplicitChoice
+                    && resolved.choice_id.as_str() == choice_id
+            }
+            (None, Some(resolved)) => {
+                resolved.selection_source == WorkCapabilitySelectionSource::LegacyOmittedDefault
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if !selection_matches {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        if resolved.is_some() && self.work_capability_registry.is_none() {
+            return Err(CommandPortFailure::Unavailable);
+        }
+        Ok(resolved)
     }
 
     fn compile_project_sources(
@@ -270,6 +527,7 @@ impl ConfiguredWorkPreparationPort {
         sources: &[ContextSourceFact],
         project_source_prompt: &str,
         memory: Option<&CompiledMemoryPack>,
+        work_capability: Option<&ResolvedWorkCapability>,
     ) -> Result<Vec<u8>, CommandPortFailure> {
         let memory_prompt = memory
             .map(|pack| {
@@ -286,6 +544,9 @@ impl ConfiguredWorkPreparationPort {
             })
             .transpose()?
             .unwrap_or_default();
+        let compiled_work_capability = work_capability
+            .map(CompiledWorkCapabilityBinding::from_resolution)
+            .transpose()?;
         serde_json::to_vec(&serde_json::json!({
             "prompt": format!(
                 "{}{}{}",
@@ -297,6 +558,8 @@ impl ConfiguredWorkPreparationPort {
             "target_scope_ref": request.target_scope_ref.trim(),
             "sources": sources,
             "memory_pack": memory,
+            "model": work_capability.map(|resolved| resolved.route.harness_model_id.as_str()),
+            "work_capability": compiled_work_capability,
         }))
         .map_err(|_| CommandPortFailure::IntegrityFailure)
     }
@@ -314,6 +577,21 @@ impl ConfiguredWorkPreparationPort {
         {
             return Err(CommandPortFailure::IntegrityFailure);
         }
+        let principal = AuthenticatedContextPrincipal {
+            kind: ContextPrincipalKind::ContextCompiler,
+            principal_id: "agentosd:work-preparation".to_owned(),
+            authenticated: true,
+        };
+        let replayed_context = self
+            .context
+            .lock()
+            .map_err(|_| CommandPortFailure::IntegrityFailure)?
+            .issued_snapshot_by_idempotency(&principal, request.idempotency_key.trim())
+            .map_err(context_failure)?;
+        let work_capability = match replayed_context.as_ref() {
+            Some(existing) => self.replayed_work_capability(request, &existing.compiled_context)?,
+            None => self.resolve_work_capability(request)?,
+        };
         let memory = self
             .prepare_memory_pack(request, owner_principal_id)
             .await?;
@@ -327,16 +605,25 @@ impl ConfiguredWorkPreparationPort {
             &sources,
             &project_source_prompt,
             memory.as_ref().map(|memory| &memory.compiled),
+            work_capability.as_ref(),
         )?;
         let recovery_entry = if excluded_sources.is_empty() {
             "hold-and-reconcile"
         } else {
             "blocked-context-source"
         };
-        let now = unix_seconds().ok_or(CommandPortFailure::IntegrityFailure)?;
-        let expires_at_seconds = now
-            .checked_add(60 * 60)
-            .ok_or(CommandPortFailure::IntegrityFailure)?;
+        let (deadline_seconds, expires_at_seconds) = if let Some(existing) = &replayed_context {
+            (
+                existing.snapshot.deadline_seconds,
+                existing.snapshot.expires_at_seconds,
+            )
+        } else {
+            let now = unix_seconds().ok_or(CommandPortFailure::IntegrityFailure)?;
+            let expires_at_seconds = now
+                .checked_add(60 * 60)
+                .ok_or(CommandPortFailure::IntegrityFailure)?;
+            (Some(expires_at_seconds), expires_at_seconds)
+        };
         let input = IssueContextSnapshot {
             owner_principal_id: owner_principal_id.to_owned(),
             intent: request.intent.trim().to_owned(),
@@ -350,22 +637,17 @@ impl ConfiguredWorkPreparationPort {
             allowed_tools: Vec::new(),
             external_resources: Vec::new(),
             non_goals: vec![
-                "provider/model selection is not made by preparation".to_owned(),
+                "provider/model route cannot be selected or changed by model output".to_owned(),
                 "memory is not mutated by preparation".to_owned(),
             ],
             acceptance_contract_ref: contract_key(&self.acceptance_contract_ref),
             budget_profile_ref: contract_key(&self.budget_profile_ref),
-            deadline_seconds: Some(expires_at_seconds),
+            deadline_seconds,
             recovery_entry: recovery_entry.to_owned(),
             visibility: "founder-only".to_owned(),
             redactions: Vec::new(),
             expires_at_seconds,
             idempotency_key: request.idempotency_key.trim().to_owned(),
-        };
-        let principal = AuthenticatedContextPrincipal {
-            kind: ContextPrincipalKind::ContextCompiler,
-            principal_id: "agentosd:work-preparation".to_owned(),
-            authenticated: true,
         };
         let (_receipt, snapshot, context_state_revision) = {
             let mut context = self
@@ -387,6 +669,18 @@ impl ConfiguredWorkPreparationPort {
         )?;
         let gate_ready = excluded_sources.is_empty()
             && (!snapshot.sources.is_empty() || snapshot.memory_pack.is_some());
+        let work_capability_view = match (
+            self.work_capability_registry.as_ref(),
+            work_capability.as_ref(),
+        ) {
+            (Some(registry), Some(resolved)) => Some(
+                registry
+                    .projection_for_resolution(resolved)
+                    .map_err(work_capability_failure)?,
+            ),
+            (None, None) => None,
+            _ => return Err(CommandPortFailure::IntegrityFailure),
+        };
         let preview = WorkPreparationPreview {
             snapshot_id: snapshot.snapshot_id.clone(),
             snapshot_revision: snapshot.revision,
@@ -432,11 +726,18 @@ impl ConfiguredWorkPreparationPort {
                 "founder_verdict".to_owned(),
             ],
             ready_for_founder_confirmation: gate_ready,
-            deadline: Some(Timestamp {
-                seconds: expires_at_seconds,
-                nanos: 0,
-            }),
+            deadline: snapshot
+                .deadline_seconds
+                .map(|seconds| Timestamp { seconds, nanos: 0 }),
             context_state_revision,
+            work_capability: work_capability_view,
+            work_capability_selection_source: work_capability.as_ref().map_or(
+                WorkCapabilitySelectionSource::Unspecified as i32,
+                |resolved| resolved.selection_source as i32,
+            ),
+            preference_revision_at_resolution: work_capability
+                .as_ref()
+                .and_then(|resolved| resolved.preference_revision_at_resolution),
         };
         Ok((preview, snapshot.snapshot_id))
     }
@@ -501,6 +802,8 @@ impl WorkPreparationPort for ConfiguredWorkPreparationPort {
         if resolved.snapshot.confirmation_binding_sha256 != request.confirmation_binding_sha256 {
             return Err(CommandPortFailure::IntegrityFailure);
         }
+        let work_capability_route =
+            work_capability_route_from_compiled_context(&resolved.compiled_context)?;
 
         let correlation_id = request
             .client
@@ -526,11 +829,12 @@ impl WorkPreparationPort for ConfiguredWorkPreparationPort {
                 target_scope_ref: resolved.snapshot.target_scope_ref,
                 acceptance_contract_ref: Some(self.acceptance_contract_ref.clone()),
                 budget_profile_ref: Some(self.budget_profile_ref.clone()),
+                work_capability_route: work_capability_route.clone(),
             })),
         };
         set_task_digest(&mut command);
         let created = self.task_port.execute(&command, principal)?;
-        let Some(run_id) = self.activation_run_id.as_deref() else {
+        let Some(configured_run_id) = self.activation_run_id.as_deref() else {
             return Ok(created);
         };
         let Some(task) = created
@@ -547,6 +851,10 @@ impl WorkPreparationPort for ConfiguredWorkPreparationPort {
         if task.status != TaskStatus::Ready as i32 {
             return Ok(created);
         }
+        let run_id = match work_capability_route.as_ref() {
+            Some(route) => work_capability_run_id(&task.task_id, route)?,
+            None => configured_run_id.to_owned(),
+        };
 
         // Founder confirmation creates the Task. Activation is a separate,
         // daemon-owned settlement against the reviewed workflow. The client
@@ -570,7 +878,7 @@ impl WorkPreparationPort for ConfiguredWorkPreparationPort {
                 task_id: task.task_id.clone(),
                 expected_revision: task.revision,
                 work_revision: task.work_revision,
-                run_id: run_id.to_owned(),
+                run_id,
             })),
         };
         set_activation_digest(&mut activation);
@@ -788,6 +1096,21 @@ fn memory_failure(error: MemoryRetrievalPortError) -> CommandPortFailure {
     }
 }
 
+fn work_capability_failure(error: WorkCapabilityPortFailure) -> CommandPortFailure {
+    match error {
+        WorkCapabilityPortFailure::InvalidArgument => CommandPortFailure::InvalidArgument,
+        WorkCapabilityPortFailure::CapabilityNotAdmitted => {
+            CommandPortFailure::CapabilityNotAdmitted
+        }
+        WorkCapabilityPortFailure::ConfigurationMigrationRequired => {
+            CommandPortFailure::ConfigurationMigrationRequired
+        }
+        WorkCapabilityPortFailure::Unavailable => CommandPortFailure::Unavailable,
+        WorkCapabilityPortFailure::StateRevisionConflict
+        | WorkCapabilityPortFailure::IntegrityFailure => CommandPortFailure::IntegrityFailure,
+    }
+}
+
 fn safe_source_path(root: &Path, source_ref: &str) -> Option<PathBuf> {
     let candidate = Path::new(source_ref);
     if candidate.is_absolute()
@@ -924,10 +1247,15 @@ fn set_activation_digest(command: &mut TaskCommand) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootstrap::{
+        ProviderAdmission, ProviderBootstrapProfile, ProviderCatalogSnapshot,
+        ProviderCredentialReference, ProviderHarnessKind, ProviderId, ProviderModelBinding,
+    };
     use egopulse_domain_contracts::v01::egopulse::{
-        localapi::v1::WorkSourceRequest,
+        localapi::v1::{UseDefaultWorkCapability, WorkSourceRequest},
         memory::v1::{RetrievalCandidate, RetrievalResponse},
     };
+    use egopulse_domain_contracts::work_capability::seal_work_capability_route_binding;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -1076,6 +1404,22 @@ mod tests {
         }
 
         fn open_with_memory_port(tag: &str, memory_port: Arc<dyn WorkMemoryRetrievalPort>) -> Self {
+            Self::open_internal(tag, memory_port, false)
+        }
+
+        fn open_with_work_capability(tag: &str) -> Self {
+            Self::open_internal(
+                tag,
+                Arc::new(crate::memory_retrieval::FailClosedMemoryRetrievalPort),
+                true,
+            )
+        }
+
+        fn open_internal(
+            tag: &str,
+            memory_port: Arc<dyn WorkMemoryRetrievalPort>,
+            with_work_capability: bool,
+        ) -> Self {
             let root = std::env::temp_dir().join(format!("egopulse-work-{tag}-{}", Uuid::now_v7()));
             fs::create_dir_all(&root).expect("workspace");
             fs::write(root.join("intent.md"), "founder-owned source").expect("source file");
@@ -1098,7 +1442,7 @@ mod tests {
                 commands: Mutex::new(Vec::new()),
                 return_task_snapshots: Mutex::new(false),
             });
-            let port = ConfiguredWorkPreparationPort::new(
+            let mut port = ConfiguredWorkPreparationPort::new(
                 Arc::clone(&context),
                 Arc::clone(&task_port) as Arc<dyn TaskCommandPort>,
                 memory_port,
@@ -1110,6 +1454,9 @@ mod tests {
             .expect("work preparation port")
             .with_input_bundle_root(root.join("input-bundles"))
             .expect("input bundle root");
+            if with_work_capability {
+                port = port.with_work_capability_registry(test_work_capability_registry(&root));
+            }
             Self {
                 root,
                 context,
@@ -1192,6 +1539,57 @@ mod tests {
         }
     }
 
+    fn test_work_capability_route() -> WorkCapabilityRouteBinding {
+        seal_work_capability_route_binding(WorkCapabilityRouteBinding {
+            route_id: "route:test-codex:v1".to_owned(),
+            route_generation: 1,
+            provider_profile_id: "provider-profile:test-codex".to_owned(),
+            provider_id: "gpt".to_owned(),
+            harness_id: "codex_app_server".to_owned(),
+            harness_model_id: "gpt-test-exact".to_owned(),
+            provider_model_id: "gpt-test-provider".to_owned(),
+            capability_profile_ref: Some(contract("capability")),
+            catalog_snapshot_sha256: Some("b".repeat(64)),
+            native_composition_generation: "native:test:v1".to_owned(),
+            route_binding_sha256: String::new(),
+        })
+        .expect("sealed test work capability")
+    }
+
+    fn test_work_capability_registry(root: &Path) -> Arc<WorkCapabilityRegistry> {
+        let profile = ProviderBootstrapProfile {
+            profile_id: "provider-profile:test-codex".to_owned(),
+            provider: ProviderId::Gpt,
+            harness: ProviderHarnessKind::CodexAppServer,
+            admission: ProviderAdmission::Production,
+            models: vec![ProviderModelBinding {
+                harness_model_id: "gpt-test-exact".to_owned(),
+                provider_model_id: "gpt-test-provider".to_owned(),
+            }],
+            catalog_snapshot: Some(ProviderCatalogSnapshot {
+                source: "fixture".to_owned(),
+                fetched_at: "2026-09-05T00:00:00Z".to_owned(),
+                harness_version: "fixture-v1".to_owned(),
+                evidence_digest_sha256: "b".repeat(64),
+            }),
+            exact_model: "gpt-test-exact".to_owned(),
+            executable: PathBuf::from("fixture-codex.exe"),
+            credential: ProviderCredentialReference::HarnessAccount,
+            hold_reason: None,
+        };
+        Arc::new(
+            WorkCapabilityRegistry::new(
+                root.join("agentos-config.json"),
+                &[profile],
+                test_work_capability_route(),
+                "choice:test-codex".to_owned(),
+                1,
+                false,
+            )
+            .expect("test work-capability registry"),
+        )
+    }
+
     fn memory_record(
         memory_id: &str,
         source_ref: &str,
@@ -1262,6 +1660,349 @@ mod tests {
             }
             _ => panic!("expected a delegated create task command"),
         }
+    }
+
+    #[tokio::test]
+    async fn work_capability_default_explicit_and_legacy_selection_bind_one_immutable_route() {
+        for case in ["default", "explicit", "legacy"] {
+            let mut fixture = WorkFixture::open_with_work_capability(case);
+            fixture.enable_activation();
+            fixture.port = fixture
+                .port
+                .with_activation_run_id("legacy-static-run".to_owned())
+                .expect("activation fallback");
+            let principal = WorkFixture::founder("founder-1");
+            let mut request = fixture.prepare_request(
+                "run one immutable governed route",
+                &format!("prepare-capability-{case}"),
+                vec![WorkSourceRequest {
+                    source_ref: "intent.md".to_owned(),
+                    label: "intent".to_owned(),
+                }],
+            );
+            let (expected_source, expected_revision) = match case {
+                "default" => {
+                    request.work_capability_preference = Some(
+                        prepare_work_request::WorkCapabilityPreference::UseDefaultWorkCapability(
+                            UseDefaultWorkCapability {},
+                        ),
+                    );
+                    (WorkCapabilitySelectionSource::FutureWorkDefault, Some(1))
+                }
+                "explicit" => {
+                    request.work_capability_preference = Some(
+                        prepare_work_request::WorkCapabilityPreference::ExplicitWorkCapabilityChoiceId(
+                            "choice:test-codex".to_owned(),
+                        ),
+                    );
+                    (WorkCapabilitySelectionSource::ExplicitChoice, None)
+                }
+                "legacy" => (WorkCapabilitySelectionSource::LegacyOmittedDefault, Some(1)),
+                _ => unreachable!(),
+            };
+
+            let preview = fixture
+                .port
+                .prepare(&request, &principal)
+                .await
+                .expect("capability preview");
+            let preview_capability = preview
+                .work_capability
+                .as_ref()
+                .expect("safe admitted capability projection");
+            let expected_route = test_work_capability_route();
+            assert_eq!(
+                preview.work_capability_selection_source,
+                expected_source as i32
+            );
+            assert_eq!(preview.preference_revision_at_resolution, expected_revision);
+            assert_eq!(
+                preview_capability.choice_id.as_deref(),
+                Some("choice:test-codex")
+            );
+            assert_eq!(
+                preview_capability.admitted_route.as_ref(),
+                Some(&expected_route)
+            );
+
+            let digest = preview
+                .snapshot_id
+                .strip_prefix("ctx:")
+                .expect("content-addressed snapshot id");
+            let bundle = fs::read(
+                fixture
+                    .root
+                    .join("input-bundles")
+                    .join(format!("ctx-{digest}.json")),
+            )
+            .expect("compiled capability bundle");
+            assert_eq!(
+                work_capability_route_from_compiled_context(&bundle)
+                    .expect("parse immutable compiled route"),
+                Some(expected_route.clone())
+            );
+
+            // Confirmation resolves the Authority-owned Context bytes. It
+            // does not consult a later config/default value.
+            fs::write(
+                fixture.root.join("agentos-config.json"),
+                b"later-config-drift",
+            )
+            .expect("write irrelevant later config drift");
+            fixture
+                .port
+                .confirm(
+                    &fixture.confirm_request(&preview, &format!("confirm-capability-{case}")),
+                    &principal,
+                )
+                .expect("confirm immutable capability route");
+
+            let commands = fixture
+                .task_port
+                .commands
+                .lock()
+                .expect("recorded capability commands");
+            assert_eq!(commands.len(), 2);
+            let create = match commands[0].command.as_ref().expect("create command") {
+                task_command::Command::CreateTask(create) => create,
+                _ => panic!("expected create command"),
+            };
+            assert_eq!(create.work_capability_route.as_ref(), Some(&expected_route));
+            let activate = match commands[1].command.as_ref().expect("activate command") {
+                task_command::Command::ActivateTask(activate) => activate,
+                _ => panic!("expected activate command"),
+            };
+            assert_eq!(
+                activate.run_id,
+                work_capability_run_id("task-work-preparation", &expected_route)
+                    .expect("route-bound run ID")
+            );
+            assert_ne!(activate.run_id, "legacy-static-run");
+            drop(commands);
+            fixture.finish();
+        }
+    }
+
+    #[tokio::test]
+    async fn work_capability_unknown_or_non_admitted_choice_creates_no_context_or_task() {
+        let fixture = WorkFixture::open_with_work_capability("capability-not-admitted");
+        let principal = WorkFixture::founder("founder-1");
+        for choice_id in ["choice:held", "choice:candidate", "choice:unknown"] {
+            let mut request = fixture.prepare_request(
+                "reject a non-admitted route",
+                &format!("prepare-{choice_id}"),
+                vec![WorkSourceRequest {
+                    source_ref: "intent.md".to_owned(),
+                    label: "intent".to_owned(),
+                }],
+            );
+            request.work_capability_preference = Some(
+                prepare_work_request::WorkCapabilityPreference::ExplicitWorkCapabilityChoiceId(
+                    choice_id.to_owned(),
+                ),
+            );
+            assert!(matches!(
+                fixture.port.prepare(&request, &principal).await,
+                Err(CommandPortFailure::CapabilityNotAdmitted)
+            ));
+        }
+        assert_eq!(
+            fixture
+                .context
+                .lock()
+                .expect("context lock")
+                .inspect_store()
+                .expect("context inspection")
+                .snapshot_count,
+            0
+        );
+        assert_eq!(fixture.delegated_command_count(), 0);
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn work_capability_default_and_legacy_replay_keep_the_original_resolution() {
+        for legacy in [false, true] {
+            let fixture = WorkFixture::open_with_work_capability(if legacy {
+                "legacy-replay"
+            } else {
+                "default-replay"
+            });
+            let principal = WorkFixture::founder("founder-1");
+            let mut request = fixture.prepare_request(
+                "replay one immutable governed route",
+                if legacy {
+                    "prepare-legacy-replay"
+                } else {
+                    "prepare-default-replay"
+                },
+                vec![WorkSourceRequest {
+                    source_ref: "intent.md".to_owned(),
+                    label: "intent".to_owned(),
+                }],
+            );
+            if !legacy {
+                request.work_capability_preference = Some(
+                    prepare_work_request::WorkCapabilityPreference::UseDefaultWorkCapability(
+                        UseDefaultWorkCapability {},
+                    ),
+                );
+            }
+
+            let first = fixture
+                .port
+                .prepare(&request, &principal)
+                .await
+                .expect("first capability preparation");
+            fixture
+                .port
+                .work_capability_registry
+                .as_ref()
+                .expect("work capability registry")
+                .replace_preference_for_test("choice:moved-default", 2);
+            let replay = fixture
+                .port
+                .prepare(&request, &principal)
+                .await
+                .expect("replay after default moved");
+
+            assert_eq!(replay.snapshot_id, first.snapshot_id);
+            assert_eq!(
+                replay.compiled_context_sha256,
+                first.compiled_context_sha256
+            );
+            assert_eq!(
+                replay.work_capability_selection_source,
+                first.work_capability_selection_source
+            );
+            assert_eq!(replay.preference_revision_at_resolution, Some(1));
+            assert_eq!(
+                replay
+                    .work_capability
+                    .as_ref()
+                    .and_then(|view| view.admitted_route.as_ref()),
+                first
+                    .work_capability
+                    .as_ref()
+                    .and_then(|view| view.admitted_route.as_ref())
+            );
+            assert!(
+                !replay
+                    .work_capability
+                    .as_ref()
+                    .expect("replayed work capability")
+                    .current_future_work_default
+            );
+            assert_eq!(
+                fixture
+                    .context
+                    .lock()
+                    .expect("context lock")
+                    .inspect_store()
+                    .expect("context inspection")
+                    .snapshot_count,
+                1
+            );
+            fixture.finish();
+        }
+    }
+
+    #[tokio::test]
+    async fn work_capability_preference_without_registry_is_rejected_before_context_write() {
+        let fixture = WorkFixture::open("missing-capability-registry");
+        let principal = WorkFixture::founder("founder-1");
+        for (tag, preference) in [
+            (
+                "default",
+                prepare_work_request::WorkCapabilityPreference::UseDefaultWorkCapability(
+                    UseDefaultWorkCapability {},
+                ),
+            ),
+            (
+                "explicit",
+                prepare_work_request::WorkCapabilityPreference::ExplicitWorkCapabilityChoiceId(
+                    "choice:test-codex".to_owned(),
+                ),
+            ),
+        ] {
+            let mut request = fixture.prepare_request(
+                "reject an unconfigured capability preference",
+                &format!("prepare-missing-registry-{tag}"),
+                vec![WorkSourceRequest {
+                    source_ref: "intent.md".to_owned(),
+                    label: "intent".to_owned(),
+                }],
+            );
+            request.work_capability_preference = Some(preference);
+            assert_eq!(
+                fixture.port.prepare(&request, &principal).await,
+                Err(CommandPortFailure::Unavailable)
+            );
+        }
+        assert_eq!(
+            fixture
+                .context
+                .lock()
+                .expect("context lock")
+                .inspect_store()
+                .expect("context inspection")
+                .snapshot_count,
+            0
+        );
+        assert_eq!(fixture.delegated_command_count(), 0);
+        fixture.finish();
+    }
+
+    #[test]
+    fn compiled_work_capability_parser_rejects_non_object_or_route_model_drift() {
+        assert!(matches!(
+            work_capability_route_from_compiled_context(br#"[]"#),
+            Err(CommandPortFailure::IntegrityFailure)
+        ));
+        assert_eq!(
+            work_capability_route_from_compiled_context(br#"{"model":null}"#),
+            Ok(None)
+        );
+
+        let route = test_work_capability_route();
+        let resolved = ResolvedWorkCapability::restore_from_compiled_context(
+            "choice:test-codex".to_owned(),
+            route.clone(),
+            WorkCapabilitySelectionSource::ExplicitChoice,
+            None,
+        )
+        .expect("valid explicit resolution");
+        let binding =
+            CompiledWorkCapabilityBinding::from_resolution(&resolved).expect("compiled binding");
+        let valid = serde_json::json!({
+            "model": route.harness_model_id,
+            "work_capability": binding,
+        });
+        assert_eq!(
+            work_capability_route_from_compiled_context(
+                &serde_json::to_vec(&valid).expect("valid JSON")
+            ),
+            Ok(Some(route.clone()))
+        );
+
+        let mut model_drift = valid.clone();
+        model_drift["model"] = serde_json::json!("fallback-model");
+        assert!(matches!(
+            work_capability_route_from_compiled_context(
+                &serde_json::to_vec(&model_drift).expect("drift JSON")
+            ),
+            Err(CommandPortFailure::IntegrityFailure)
+        ));
+
+        let mut digest_drift = valid;
+        digest_drift["work_capability"]["route"]["route_binding_sha256"] =
+            serde_json::json!("f".repeat(64));
+        assert!(matches!(
+            work_capability_route_from_compiled_context(
+                &serde_json::to_vec(&digest_drift).expect("digest drift JSON")
+            ),
+            Err(CommandPortFailure::IntegrityFailure)
+        ));
     }
 
     #[tokio::test]

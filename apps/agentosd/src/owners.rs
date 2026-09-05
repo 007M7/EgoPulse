@@ -972,6 +972,7 @@ mod tests {
                         "1",
                         &"b".repeat(64),
                     )),
+                    work_capability_route: None,
                 })),
             };
             set_task_digest(&mut create);
@@ -1007,6 +1008,7 @@ mod tests {
                     &"a".repeat(64),
                 )),
                 budget_profile_ref: Some(task_contract_ref("budget-sysact", "1", &"b".repeat(64))),
+                work_capability_route: None,
             })),
         };
         set_task_digest(&mut smuggled_create);
@@ -1099,6 +1101,7 @@ mod tests {
                         "1",
                         &"b".repeat(64),
                     )),
+                    work_capability_route: None,
                 })),
             };
             set_task_digest(&mut create);
@@ -1236,6 +1239,7 @@ mod tests {
                         "1",
                         &"b".repeat(64),
                     )),
+                    work_capability_route: None,
                 })),
             };
             set_task_digest(&mut create);

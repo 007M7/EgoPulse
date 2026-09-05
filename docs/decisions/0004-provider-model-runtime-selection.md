@@ -27,7 +27,7 @@ The first action is mutable user configuration. The second becomes an
 immutable governed workflow fact. A global JSON edit cannot safely stand in
 for both.
 
-## Confirmed facts
+## Confirmed facts at the decision baseline
 
 The following are code or frozen-contract facts at the evidence baseline:
 
@@ -281,6 +281,12 @@ one of the review triggers is reached.
 - shared CLI/TUI E2E over the same client operation;
 - real authenticated lifecycle evidence for each newly admitted route.
 
+For this pre-release contract, compatibility means additive protobuf decoding:
+fixed pre-draft.23 messages that omit the new preference or route fields still
+decode into the legacy path. Session negotiation remains exact against the
+current candidate contract; this decision does not introduce a second live
+draft.22 service surface for an application version that was never released.
+
 ## Founder decision record
 
 ```text
@@ -326,5 +332,9 @@ Re-open this decision only if one of these facts changes:
 - Frozen choices: defaults affect future work only; held/candidate profiles
   are visible but not selectable for work; first release has no live reload;
   route/default configuration migration precedes second-Provider admission.
-- Remaining delivery gap: route/default contract and implementation, plus
-  independent authenticated admission evidence for every non-Codex route.
+- Candidate implementation: the route/default contract, explicit v2-to-v3
+  migration and rollback, shared CLI/TUI operations, and immutable
+  Context-to-dispatch propagation are implemented in the current candidate
+  and remain subject to the repository quality gate.
+- Remaining delivery gap: independent authenticated admission evidence for
+  every non-Codex route. No held route is promoted by this implementation.

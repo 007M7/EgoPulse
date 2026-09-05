@@ -493,6 +493,7 @@ fn seed_activation(root: &TempRoot) -> (String, u64, u64) {
             target_scope_ref: TARGET_SCOPE_REF.to_owned(),
             acceptance_contract_ref: Some(contract("replace-acceptance-contract", 0xcc)),
             budget_profile_ref: Some(contract("replace-budget-profile", 0xdd)),
+            work_capability_route: None,
         })),
     });
     let founder = AuthenticatedPrincipal {

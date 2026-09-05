@@ -65,6 +65,31 @@ resolve it only at startup and inject it into the selected child process.
 Candidate and held profiles are visible configuration, but they are not
 production dispatch routes.
 
+`work_capabilities` is the separate v3 routing boundary. Each selectable
+`choice_id` resolves to one fully sealed Provider/Harness/model route. The
+mutable `default_choice_id` is used only when preparing future work;
+confirmation copies the exact route into the immutable Context and Task facts.
+Changing the default never rewrites active or recoverable work, and catalog
+visibility alone never admits a route.
+
+Existing v2 installations remain readable but cannot change the future-work
+default until the explicit migration is applied. Startup never edits the
+configuration. Preview, apply and (while the migrated v3 remains unchanged)
+rollback with:
+
+```powershell
+agentosd.exe --preview-v3-migration --json
+agentosd.exe --migrate-to-v3 --json
+agentosd.exe --preview-v2-rollback --json
+agentosd.exe --rollback-to-v2 --json
+```
+
+Migration retains the complete prior file as
+`agentos-config.json.v2.bak`. Rollback restores those exact bytes and retains
+the migrated file as `agentos-config.json.v3-rollback.bak`. A concurrent edit,
+preference revision change or any other post-migration drift fails closed.
+These commands do not open or migrate Authority stores.
+
 For Memory/RAG retrieval, first run the packaged
 `setup-memory-worker.ps1`. Set `memory_retrieval.worker_executable` to the
 created `workers\memory-rag\.venv\Scripts\python.exe`, set its working

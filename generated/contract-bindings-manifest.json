@@ -1,6 +1,6 @@
 {
     "schemaVersion":  "egopulse-generated-contract-bindings/v0.1",
-    "sourceManifestSha256":  "f55a751a14cd4eff3f65a1ca2c13f08312a7f0a1a5e42615a785ecf00c2122b0",
+    "sourceManifestSha256":  "e267e1636b56066d0bd937b5309e878728dfd7cc5dbba9464a6b70eb8e61a306",
     "generators":  {
                        "buf":  "1.72.0",
                        "protocGenEs":  "2.14.0",
@@ -28,7 +28,7 @@
                   },
                   {
                       "path":  "crates/domain-contracts/src/generated/egopulse.localapi.v1.rs",
-                      "sha256":  "4c2f82912cb63345ac3be7248b76247ac15775be31eb01cd70dbb29b0061ec5b"
+                      "sha256":  "13e6a2010e9a03fcbe0ea2b75f75466e1b762c85e0924e7e1ceb285b5c1d2719"
                   },
                   {
                       "path":  "crates/domain-contracts/src/generated/egopulse.memory.v1.rs",
@@ -44,7 +44,7 @@
                   },
                   {
                       "path":  "crates/domain-contracts/src/generated/egopulse.task.v1.rs",
-                      "sha256":  "9bd32a722c1897334208a40e947a3478edcbd03a638e9ff4f220b2cff0dbdfcb"
+                      "sha256":  "73fcc17d64c984f9f29828082c9b15c0ee870898c7db001cdafc78542fb4f71f"
                   },
                   {
                       "path":  "crates/domain-contracts/src/generated/egopulse.verdict.v1.rs",
@@ -72,7 +72,7 @@
                   },
                   {
                       "path":  "packages/generated-client/src/generated/egopulse/localapi/v1/local_api_pb.ts",
-                      "sha256":  "191e6ecff25b5bd2619befe412953783e15443b0b9b0e984c08128b5f1e32253"
+                      "sha256":  "e49f75b2d47a5f601624486b56dd8cffa61191eec9b3d096f9fbbc19a6d032dc"
                   },
                   {
                       "path":  "packages/generated-client/src/generated/egopulse/memory/v1/memory_pb.ts",
@@ -88,7 +88,7 @@
                   },
                   {
                       "path":  "packages/generated-client/src/generated/egopulse/task/v1/task_pb.ts",
-                      "sha256":  "1669e85fc1148653959005a3efefc2e73611201c36c6a644e1fea5b76b190257"
+                      "sha256":  "8146d6c1de106453760ec297e92b1216ef946a48c9a8d10dacc4ba20b34d2601"
                   },
                   {
                       "path":  "packages/generated-client/src/generated/egopulse/verdict/v1/verdict_pb.ts",
@@ -132,11 +132,11 @@
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/localapi/v1/local_api_pb2.py",
-                      "sha256":  "c33a9eba1a9406fa10918848ac3dd7a8c70bb74546b4e40f3e3526288199d9cd"
+                      "sha256":  "8ec1ae8d5db51efe906bb7cbd15d4a81840bd287230714ad6a30220e7e0518ca"
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/localapi/v1/local_api_pb2.pyi",
-                      "sha256":  "07e0d7c59aa9088ee607f2ca2544a5dafeb55b66ec5414dd5c3058f8778c2d61"
+                      "sha256":  "164cd52fd1f5e7b2ab4b4ffc0ce60871ebd08184654699bb3f156fd9b22934d1"
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/memory/v1/memory_pb2.py",
@@ -164,11 +164,11 @@
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/task/v1/task_pb2.py",
-                      "sha256":  "6089c124b667f933de2d87648ef2db60fcebff55e3629a0382005a4e50a5fdf8"
+                      "sha256":  "9ab40dd71b3b9c0a1186b240326f41883c3fc4b32657d6dec95f328f58add5a7"
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/task/v1/task_pb2.pyi",
-                      "sha256":  "0b16d2881be4b7e6c51d641c822f5814c892e5b637fdf7b05e2d75baa83b6372"
+                      "sha256":  "1697f98f5e7f8bc33983ded8c21080e023c83457ec96ed4d8b90a4ebbd909596"
                   },
                   {
                       "path":  "workers/contract-bindings/src/egopulse/verdict/v1/verdict_pb2.py",

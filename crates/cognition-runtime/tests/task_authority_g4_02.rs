@@ -149,6 +149,7 @@ fn valid_create_command() -> TaskCommand {
                 &"a".repeat(64),
             )),
             budget_profile_ref: Some(contract_ref("v01-quality-budget", "0.1", &"b".repeat(64))),
+            work_capability_route: None,
         })),
     };
     set_digest(&mut command);

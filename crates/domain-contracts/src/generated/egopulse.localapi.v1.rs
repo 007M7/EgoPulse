@@ -153,6 +153,113 @@ pub struct WorkGateNotice {
     #[prost(string, tag = "3")]
     pub source_ref: ::prost::alloc::string::String,
 }
+/// Safe setup/work projection. A public choice_id is only a daemon lookup key;
+/// admitted_route is the immutable fact that confirmation binds. Candidate or
+/// held entries never carry an admitted route and are never selectable.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WorkCapabilityView {
+    #[prost(string, tag = "1")]
+    pub provider_profile_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub provider_alias: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub harness_alias: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub harness_model_alias: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub provider_model_alias: ::prost::alloc::string::String,
+    #[prost(enumeration = "WorkCapabilityAvailability", tag = "6")]
+    pub availability: i32,
+    #[prost(bool, tag = "7")]
+    pub selectable: bool,
+    #[prost(string, optional, tag = "8")]
+    pub safe_reason_code: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "9")]
+    pub choice_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "10")]
+    pub admitted_route: ::core::option::Option<
+        super::super::task::v1::WorkCapabilityRouteBinding,
+    >,
+    #[prost(bool, tag = "11")]
+    pub current_future_work_default: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WorkCapabilityPreferenceView {
+    #[prost(string, tag = "1")]
+    pub default_choice_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub preference_revision: u64,
+    /// v2 is read-compatible and yields one in-memory Codex compatibility route,
+    /// but mutation remains closed until explicit v3 migration.
+    #[prost(bool, tag = "3")]
+    pub configuration_migration_required: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListWorkCapabilitiesRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListWorkCapabilitiesResult {
+    #[prost(message, repeated, tag = "1")]
+    pub capabilities: ::prost::alloc::vec::Vec<WorkCapabilityView>,
+    #[prost(message, optional, tag = "2")]
+    pub preference: ::core::option::Option<WorkCapabilityPreferenceView>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListWorkCapabilitiesResponse {
+    #[prost(oneof = "list_work_capabilities_response::Outcome", tags = "1, 2")]
+    pub outcome: ::core::option::Option<list_work_capabilities_response::Outcome>,
+}
+/// Nested message and enum types in `ListWorkCapabilitiesResponse`.
+pub mod list_work_capabilities_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Outcome {
+        #[prost(message, tag = "1")]
+        Result(super::ListWorkCapabilitiesResult),
+        #[prost(message, tag = "2")]
+        Error(super::LocalApiError),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetDefaultWorkCapabilityRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub choice_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub expected_preference_revision: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WorkCapabilityPreferenceReceipt {
+    #[prost(string, tag = "1")]
+    pub previous_default_choice_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub default_choice_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub previous_preference_revision: u64,
+    #[prost(uint64, tag = "4")]
+    pub preference_revision: u64,
+    #[prost(bool, tag = "5")]
+    pub changed: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetDefaultWorkCapabilityResponse {
+    #[prost(oneof = "set_default_work_capability_response::Outcome", tags = "1, 2")]
+    pub outcome: ::core::option::Option<set_default_work_capability_response::Outcome>,
+}
+/// Nested message and enum types in `SetDefaultWorkCapabilityResponse`.
+pub mod set_default_work_capability_response {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Outcome {
+        #[prost(message, tag = "1")]
+        Receipt(super::WorkCapabilityPreferenceReceipt),
+        #[prost(message, tag = "2")]
+        Error(super::LocalApiError),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UseDefaultWorkCapability {}
 /// Sanitized, Authority-owned preparation result. Raw compiled context,
 /// credentials, process configuration and client-selected authority fields are
 /// never returned here.
@@ -228,6 +335,12 @@ pub struct WorkPreparationPreview {
     /// immutable snapshot revision and MUST NOT be reconstructed by a client.
     #[prost(uint64, tag = "30")]
     pub context_state_revision: u64,
+    #[prost(message, optional, tag = "31")]
+    pub work_capability: ::core::option::Option<WorkCapabilityView>,
+    #[prost(enumeration = "WorkCapabilitySelectionSource", tag = "32")]
+    pub work_capability_selection_source: i32,
+    #[prost(uint64, optional, tag = "33")]
+    pub preference_revision_at_resolution: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrepareWorkRequest {
@@ -245,6 +358,20 @@ pub struct PrepareWorkRequest {
     pub idempotency_key: ::prost::alloc::string::String,
     #[prost(enumeration = "WorkMemoryMode", tag = "7")]
     pub memory_mode: i32,
+    #[prost(oneof = "prepare_work_request::WorkCapabilityPreference", tags = "8, 9")]
+    pub work_capability_preference: ::core::option::Option<
+        prepare_work_request::WorkCapabilityPreference,
+    >,
+}
+/// Nested message and enum types in `PrepareWorkRequest`.
+pub mod prepare_work_request {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum WorkCapabilityPreference {
+        #[prost(message, tag = "8")]
+        UseDefaultWorkCapability(super::UseDefaultWorkCapability),
+        #[prost(string, tag = "9")]
+        ExplicitWorkCapabilityChoiceId(::prost::alloc::string::String),
+    }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrepareWorkResponse {
@@ -1279,6 +1406,82 @@ impl WorkMemoryMode {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
+pub enum WorkCapabilityAvailability {
+    Unspecified = 0,
+    Admitted = 1,
+    Candidate = 2,
+    Held = 3,
+}
+impl WorkCapabilityAvailability {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WORK_CAPABILITY_AVAILABILITY_UNSPECIFIED",
+            Self::Admitted => "WORK_CAPABILITY_AVAILABILITY_ADMITTED",
+            Self::Candidate => "WORK_CAPABILITY_AVAILABILITY_CANDIDATE",
+            Self::Held => "WORK_CAPABILITY_AVAILABILITY_HELD",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WORK_CAPABILITY_AVAILABILITY_UNSPECIFIED" => Some(Self::Unspecified),
+            "WORK_CAPABILITY_AVAILABILITY_ADMITTED" => Some(Self::Admitted),
+            "WORK_CAPABILITY_AVAILABILITY_CANDIDATE" => Some(Self::Candidate),
+            "WORK_CAPABILITY_AVAILABILITY_HELD" => Some(Self::Held),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WorkCapabilitySelectionSource {
+    Unspecified = 0,
+    FutureWorkDefault = 1,
+    ExplicitChoice = 2,
+    /// Compatibility decoding only: an older request omitted the additive
+    /// preference oneof and was resolved through the same governed default.
+    LegacyOmittedDefault = 3,
+}
+impl WorkCapabilitySelectionSource {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WORK_CAPABILITY_SELECTION_SOURCE_UNSPECIFIED",
+            Self::FutureWorkDefault => {
+                "WORK_CAPABILITY_SELECTION_SOURCE_FUTURE_WORK_DEFAULT"
+            }
+            Self::ExplicitChoice => "WORK_CAPABILITY_SELECTION_SOURCE_EXPLICIT_CHOICE",
+            Self::LegacyOmittedDefault => {
+                "WORK_CAPABILITY_SELECTION_SOURCE_LEGACY_OMITTED_DEFAULT"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WORK_CAPABILITY_SELECTION_SOURCE_UNSPECIFIED" => Some(Self::Unspecified),
+            "WORK_CAPABILITY_SELECTION_SOURCE_FUTURE_WORK_DEFAULT" => {
+                Some(Self::FutureWorkDefault)
+            }
+            "WORK_CAPABILITY_SELECTION_SOURCE_EXPLICIT_CHOICE" => {
+                Some(Self::ExplicitChoice)
+            }
+            "WORK_CAPABILITY_SELECTION_SOURCE_LEGACY_OMITTED_DEFAULT" => {
+                Some(Self::LegacyOmittedDefault)
+            }
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
 pub enum ProjectionHealth {
     Unspecified = 0,
     Ready = 1,
@@ -1549,6 +1752,8 @@ pub enum LocalApiErrorCode {
     ContextRevoked = 19,
     StateRevisionConflict = 20,
     IdempotencyConflict = 21,
+    CapabilityNotAdmitted = 22,
+    ConfigurationMigrationRequired = 23,
 }
 impl LocalApiErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1585,6 +1790,10 @@ impl LocalApiErrorCode {
             Self::ContextRevoked => "LOCAL_API_ERROR_CODE_CONTEXT_REVOKED",
             Self::StateRevisionConflict => "LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT",
             Self::IdempotencyConflict => "LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT",
+            Self::CapabilityNotAdmitted => "LOCAL_API_ERROR_CODE_CAPABILITY_NOT_ADMITTED",
+            Self::ConfigurationMigrationRequired => {
+                "LOCAL_API_ERROR_CODE_CONFIGURATION_MIGRATION_REQUIRED"
+            }
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1625,6 +1834,12 @@ impl LocalApiErrorCode {
             }
             "LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT" => {
                 Some(Self::IdempotencyConflict)
+            }
+            "LOCAL_API_ERROR_CODE_CAPABILITY_NOT_ADMITTED" => {
+                Some(Self::CapabilityNotAdmitted)
+            }
+            "LOCAL_API_ERROR_CODE_CONFIGURATION_MIGRATION_REQUIRED" => {
+                Some(Self::ConfigurationMigrationRequired)
             }
             _ => None,
         }
@@ -3225,6 +3440,64 @@ pub mod local_command_gateway_service_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
+        pub async fn list_work_capabilities(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListWorkCapabilitiesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListWorkCapabilitiesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalCommandGatewayService/ListWorkCapabilities",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalCommandGatewayService",
+                        "ListWorkCapabilities",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn set_default_work_capability(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SetDefaultWorkCapabilityRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SetDefaultWorkCapabilityResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalCommandGatewayService/SetDefaultWorkCapability",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalCommandGatewayService",
+                        "SetDefaultWorkCapability",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn prepare_work(
             &mut self,
             request: impl tonic::IntoRequest<super::PrepareWorkRequest>,
@@ -3443,6 +3716,20 @@ pub mod local_command_gateway_service_server {
     /// Generated trait containing gRPC methods that should be implemented for use with LocalCommandGatewayServiceServer.
     #[async_trait]
     pub trait LocalCommandGatewayService: std::marker::Send + std::marker::Sync + 'static {
+        async fn list_work_capabilities(
+            &self,
+            request: tonic::Request<super::ListWorkCapabilitiesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListWorkCapabilitiesResponse>,
+            tonic::Status,
+        >;
+        async fn set_default_work_capability(
+            &self,
+            request: tonic::Request<super::SetDefaultWorkCapabilityRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SetDefaultWorkCapabilityResponse>,
+            tonic::Status,
+        >;
         async fn prepare_work(
             &self,
             request: tonic::Request<super::PrepareWorkRequest>,
@@ -3570,6 +3857,110 @@ pub mod local_command_gateway_service_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
+                "/egopulse.localapi.v1.LocalCommandGatewayService/ListWorkCapabilities" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListWorkCapabilitiesSvc<T: LocalCommandGatewayService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: LocalCommandGatewayService,
+                    > tonic::server::UnaryService<super::ListWorkCapabilitiesRequest>
+                    for ListWorkCapabilitiesSvc<T> {
+                        type Response = super::ListWorkCapabilitiesResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListWorkCapabilitiesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalCommandGatewayService>::list_work_capabilities(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListWorkCapabilitiesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/egopulse.localapi.v1.LocalCommandGatewayService/SetDefaultWorkCapability" => {
+                    #[allow(non_camel_case_types)]
+                    struct SetDefaultWorkCapabilitySvc<T: LocalCommandGatewayService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: LocalCommandGatewayService,
+                    > tonic::server::UnaryService<super::SetDefaultWorkCapabilityRequest>
+                    for SetDefaultWorkCapabilitySvc<T> {
+                        type Response = super::SetDefaultWorkCapabilityResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::SetDefaultWorkCapabilityRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalCommandGatewayService>::set_default_work_capability(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SetDefaultWorkCapabilitySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/egopulse.localapi.v1.LocalCommandGatewayService/PrepareWork" => {
                     #[allow(non_camel_case_types)]
                     struct PrepareWorkSvc<T: LocalCommandGatewayService>(pub Arc<T>);

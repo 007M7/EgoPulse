@@ -157,6 +157,7 @@ fn create_task_command() -> TaskCommand {
             target_scope_ref: "repo-scope-g4-08a2".to_owned(),
             acceptance_contract_ref: Some(contract_ref("acceptance-g4-08a2", 'a')),
             budget_profile_ref: Some(contract_ref("budget-g4-08a2", 'b')),
+            work_capability_route: None,
         })),
     };
     let request_digest = canonical_request_digest(&command).expect("canonical Task digest");

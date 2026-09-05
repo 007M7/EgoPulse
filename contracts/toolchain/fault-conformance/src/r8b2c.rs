@@ -533,6 +533,30 @@ pub struct R8b2cAdapterStoreSnapshot {
     pub observations: Vec<R8b2cAdapterObservationRow>,
 }
 
+/// Reads the sole durable dispatch identity through the same query-only,
+/// SQLCipher-authenticated conformance boundary used by the detailed oracle.
+/// Crash-window fixtures intentionally admit exactly one dispatch.
+pub fn read_single_r8b2c_adapter_dispatch_id(
+    path: &Path,
+    key: &[u8; 32],
+) -> FaultConformanceResult<String> {
+    let connection = open_sqlcipher_read_only(path, key)?;
+    let count: i64 =
+        connection.query_row("SELECT count(*) FROM adapter_dispatches", [], |row| {
+            row.get(0)
+        })?;
+    if count != 1 {
+        return Err(FaultConformanceError::invariant(
+            "R-8B.2c adapter store must contain exactly one dispatch identity",
+        ));
+    }
+    connection
+        .query_row("SELECT dispatch_id FROM adapter_dispatches", [], |row| {
+            row.get(0)
+        })
+        .map_err(Into::into)
+}
+
 pub fn read_r8b2c_adapter_store(
     path: &Path,
     key: &[u8; 32],

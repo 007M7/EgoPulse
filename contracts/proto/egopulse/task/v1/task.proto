@@ -29,6 +29,24 @@ enum FounderDecision {
   FOUNDER_DECISION_REJECT = 3;
 }
 
+// Immutable work-level execution route selected before Task creation. It
+// carries no executable, credential, Adapter store, or mutable catalog state.
+// route_binding_sha256 canonically binds every preceding field; the exact
+// capability profile remains the activation and dispatch routing key.
+message WorkCapabilityRouteBinding {
+  string route_id = 1;
+  uint64 route_generation = 2;
+  string provider_profile_id = 3;
+  string provider_id = 4;
+  string harness_id = 5;
+  string harness_model_id = 6;
+  string provider_model_id = 7;
+  egopulse.common.v1.ContractReference capability_profile_ref = 8;
+  optional string catalog_snapshot_sha256 = 9;
+  string native_composition_generation = 10;
+  string route_binding_sha256 = 11;
+}
+
 enum TaskEventKind {
   TASK_EVENT_KIND_UNSPECIFIED = 0;
   TASK_EVENT_KIND_CREATED = 1;
@@ -83,6 +101,7 @@ message TaskSnapshot {
   optional string hold_reason_code = 15;
   google.protobuf.Timestamp created_at = 16;
   google.protobuf.Timestamp updated_at = 17;
+  WorkCapabilityRouteBinding work_capability_route = 18;
 }
 
 message CreateTaskCommand {
@@ -92,6 +111,7 @@ message CreateTaskCommand {
   string target_scope_ref = 4;
   egopulse.common.v1.ContractReference acceptance_contract_ref = 5;
   egopulse.common.v1.ContractReference budget_profile_ref = 6;
+  WorkCapabilityRouteBinding work_capability_route = 7;
 }
 
 message ActivateTaskCommand {

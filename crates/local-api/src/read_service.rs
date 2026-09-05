@@ -241,7 +241,9 @@ fn local_error_status(
             tonic::Code::Unavailable
         }
         LocalApiErrorCode::ResourceExhausted => tonic::Code::ResourceExhausted,
-        LocalApiErrorCode::ContextRevoked => tonic::Code::FailedPrecondition,
+        LocalApiErrorCode::ContextRevoked
+        | LocalApiErrorCode::CapabilityNotAdmitted
+        | LocalApiErrorCode::ConfigurationMigrationRequired => tonic::Code::FailedPrecondition,
         LocalApiErrorCode::StateRevisionConflict | LocalApiErrorCode::IdempotencyConflict => {
             tonic::Code::Aborted
         }

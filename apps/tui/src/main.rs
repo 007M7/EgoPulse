@@ -18,9 +18,10 @@ use crossterm::{
 use egopulse_client_operations::{
     ClientAttachment, ClientContextRevokeError, ClientReadError, ClientWorkError,
     ContextRevokeInput, GovernedHoldReason, GovernedProjectionReason, GovernedTaskState,
-    GuidedApprovalDecision, GuidedApprovalDecisionInput, GuidedWorkMemoryMode,
-    HarnessContentFilter, PreparedContextRevoke, attach as attach_client, command_metadata,
-    set_task_digest, set_verdict_digest, timestamp_after,
+    GuidedApprovalDecision, GuidedApprovalDecisionInput, GuidedWorkCapabilityChoice,
+    GuidedWorkInput, GuidedWorkMemoryMode, GuidedWorkSource, HarnessContentFilter,
+    PreparedContextRevoke, attach as attach_client, command_metadata, set_task_digest,
+    set_verdict_digest, timestamp_after,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -96,6 +97,19 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum TuiCommand {
+    /// List safe Provider/Harness/model choices and the future-work default.
+    WorkCapabilities {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change only the default proposed for work prepared after this write.
+    WorkSetDefault {
+        choice_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Build the same governed work preview as the CLI without creating a Task.
     WorkPlan {
         /// Natural-language work intent from the Founder.
@@ -126,6 +140,9 @@ enum TuiCommand {
         /// Do not retrieve accepted Memory for this work. Governed retrieval is the default.
         #[arg(long)]
         no_memory: bool,
+        /// Public admitted capability choice; omit to use the current future-work default.
+        #[arg(long)]
+        capability: Option<String>,
         #[arg(long)]
         idempotency_key: String,
         #[arg(long)]
@@ -345,6 +362,8 @@ impl Panel {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandKind {
+    WorkCapabilities,
+    WorkSetDefault,
     WorkPlan,
     WorkPrepare,
     WorkConfirm,
@@ -364,7 +383,7 @@ enum CommandKind {
 }
 
 impl CommandKind {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 18] = [
         Self::WorkPlan,
         Self::WorkPrepare,
         Self::WorkConfirm,
@@ -381,10 +400,14 @@ impl CommandKind {
         Self::MemoryAccept,
         Self::MemoryRevoke,
         Self::ContextRevoke,
+        Self::WorkCapabilities,
+        Self::WorkSetDefault,
     ];
 
     const fn label(self) -> &'static str {
         match self {
+            Self::WorkCapabilities => "List work capabilities",
+            Self::WorkSetDefault => "Set future-work default",
             Self::WorkPlan => "Preview governed work",
             Self::WorkPrepare => "Prepare governed work",
             Self::WorkConfirm => "Confirm and create governed task",
@@ -454,6 +477,11 @@ struct CommandForm {
 impl CommandForm {
     fn new(kind: CommandKind) -> Self {
         let fields = match kind {
+            CommandKind::WorkCapabilities => vec![],
+            CommandKind::WorkSetDefault => vec![
+                FormField::required("choice-id"),
+                FormField::required("expected-revision"),
+            ],
             CommandKind::WorkPlan => vec![
                 FormField::required("intent"),
                 FormField::required("scope-ref"),
@@ -465,6 +493,7 @@ impl CommandForm {
                 FormField::required("scope-ref"),
                 FormField::required("work-type"),
                 FormField::optional("context-ref"),
+                FormField::optional("capability-choice-id"),
                 FormField::required("idempotency-key"),
             ],
             CommandKind::WorkConfirm => vec![
@@ -673,6 +702,14 @@ impl CommandForm {
             values.next().ok_or_else(|| format!("{label} is missing"))
         };
         match self.kind {
+            CommandKind::WorkCapabilities => Ok(TuiCommand::WorkCapabilities { json: false }),
+            CommandKind::WorkSetDefault => Ok(TuiCommand::WorkSetDefault {
+                choice_id: next(&mut values, "choice-id")?,
+                expected_revision: next(&mut values, "expected-revision")?
+                    .parse()
+                    .map_err(|_| "expected-revision must be an integer".to_owned())?,
+                json: false,
+            }),
             CommandKind::WorkPlan => Ok(TuiCommand::WorkPlan {
                 intent: next(&mut values, "intent")?,
                 scope: next(&mut values, "scope-ref")?,
@@ -698,6 +735,10 @@ impl CommandForm {
                         .collect()
                 },
                 no_memory: false,
+                capability: {
+                    let value = next(&mut values, "capability-choice-id")?;
+                    (!value.trim().is_empty()).then_some(value)
+                },
                 idempotency_key: next(&mut values, "idempotency-key")?,
                 json: false,
             }),
@@ -1324,6 +1365,204 @@ enum CommandResult {
     ReadView(String),
 }
 
+async fn run_work_capabilities_command(
+    instance: &str,
+    json_output: bool,
+) -> Result<CommandResult, String> {
+    let attached = AttachedClient::open(instance).await?;
+    let catalog = attached
+        .0
+        .list_work_capabilities()
+        .await
+        .map_err(tui_work_error)?;
+    let capabilities = catalog
+        .capabilities
+        .iter()
+        .map(|capability| {
+            json!({
+                "providerProfileId": capability.provider_profile_id,
+                "provider": capability.provider_alias,
+                "harness": capability.harness_alias,
+                "harnessModel": capability.harness_model_alias,
+                "providerModel": capability.provider_model_alias,
+                "availability": format!("{:?}", capability.availability),
+                "selectable": capability.selectable,
+                "safeReasonCode": capability.safe_reason_code,
+                "choiceId": capability.choice_id,
+                "routeBindingSha256": capability.route_binding_sha256,
+                "currentFutureWorkDefault": capability.current_future_work_default,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "schemaVersion": "egopulse.tui-result/v0.1",
+        "ok": true,
+        "operation": "work.capabilities",
+        "data": {
+            "capabilities": capabilities,
+            "defaultChoiceId": catalog.default_choice_id,
+            "preferenceRevision": catalog.preference_revision,
+            "configurationMigrationRequired": catalog.configuration_migration_required,
+        },
+    });
+    if json_output {
+        println!("{}", serde_json::to_string(&payload).unwrap());
+    } else {
+        println!(
+            "Future-work default: {} (revision {}, migration_required={})",
+            catalog.default_choice_id,
+            catalog.preference_revision,
+            catalog.configuration_migration_required,
+        );
+        for capability in &catalog.capabilities {
+            println!(
+                "{} / {} / {} -> {} [{}] choice={} selectable={}{}",
+                capability.provider_alias,
+                capability.harness_alias,
+                capability.harness_model_alias,
+                capability.provider_model_alias,
+                format!("{:?}", capability.availability).to_lowercase(),
+                capability.choice_id.as_deref().unwrap_or("-"),
+                capability.selectable,
+                capability
+                    .safe_reason_code
+                    .as_deref()
+                    .map(|reason| format!(" reason={reason}"))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    Ok(CommandResult::Completed)
+}
+
+async fn run_work_set_default_command(
+    instance: &str,
+    choice_id: String,
+    expected_revision: u64,
+    json_output: bool,
+) -> Result<CommandResult, String> {
+    let attached = AttachedClient::open(instance).await?;
+    let receipt = attached
+        .0
+        .set_default_work_capability(choice_id, expected_revision)
+        .await
+        .map_err(tui_work_error)?;
+    let payload = json!({
+        "schemaVersion": "egopulse.tui-result/v0.1",
+        "ok": true,
+        "operation": "work.set-default",
+        "data": {
+            "previousDefaultChoiceId": receipt.previous_default_choice_id,
+            "defaultChoiceId": receipt.default_choice_id,
+            "previousPreferenceRevision": receipt.previous_preference_revision,
+            "preferenceRevision": receipt.preference_revision,
+            "changed": receipt.changed,
+        },
+    });
+    if json_output {
+        println!("{}", serde_json::to_string(&payload).unwrap());
+    } else {
+        println!(
+            "Future-work default: {} -> {} (revision {} -> {}, changed={})",
+            receipt.previous_default_choice_id,
+            receipt.default_choice_id,
+            receipt.previous_preference_revision,
+            receipt.preference_revision,
+            receipt.changed,
+        );
+    }
+    Ok(CommandResult::Completed)
+}
+
+async fn run_work_prepare_command(
+    instance: &str,
+    input: GuidedWorkInput,
+    idempotency_key: String,
+    json_output: bool,
+) -> Result<CommandResult, String> {
+    let attached = AttachedClient::open(instance).await?;
+    attached.require_rpc("LocalCommandGatewayService/PrepareWork", "work.prepare")?;
+    let preview = attached
+        .0
+        .prepare_work(input, idempotency_key)
+        .await
+        .map_err(tui_work_error)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "schemaVersion": "egopulse.tui-result/v0.1",
+                "ok": true,
+                "operation": "work.prepare",
+                "data": {
+                    "snapshotId": preview.snapshot_id,
+                    "snapshotRevision": preview.snapshot_revision,
+                    "contextStateRevision": preview.context_state_revision,
+                    "gateReady": preview.gate_ready,
+                    "readyForFounderConfirmation": preview.ready_for_founder_confirmation,
+                    "compiledContextSha256": preview.compiled_context_sha256,
+                    "confirmationBindingSha256": preview.confirmation_binding_sha256,
+                    "memoryAuthorityRevision": preview.memory_authority_revision,
+                    "memoryPackSnapshotSha256": preview.memory_pack_snapshot_sha256,
+                    "workCapability": preview.work_capability.as_ref().map(|capability| json!({
+                        "choiceId": capability.choice_id,
+                        "provider": capability.provider_alias,
+                        "harness": capability.harness_alias,
+                        "harnessModel": capability.harness_model_alias,
+                        "providerModel": capability.provider_model_alias,
+                        "routeBindingSha256": capability.admitted_route.as_ref().map(|route| &route.route_binding_sha256),
+                    })),
+                    "workCapabilitySelectionSource": preview.work_capability_selection_source,
+                    "preferenceRevisionAtResolution": preview.preference_revision_at_resolution,
+                    "includedSources": preview.included_sources.iter().map(|source| json!({"sourceRef": source.source_ref, "label": source.label, "contentSha256": source.content_sha256, "authority": source.authority, "included": source.included})).collect::<Vec<_>>(),
+                    "excludedSources": preview.excluded_sources.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
+                    "blockers": preview.blockers.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
+                    "warnings": preview.warnings.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
+                }
+            }))
+            .unwrap()
+        );
+    } else {
+        println!(
+            "Work prepared: snapshot={} context_state_revision={} gate_ready={} sources={} memory_revision={} memory_pack={} capability={} provider={} harness={} model={}",
+            preview.snapshot_id,
+            preview.context_state_revision,
+            preview.gate_ready,
+            preview.included_sources.len(),
+            preview
+                .memory_authority_revision
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "disabled".to_owned()),
+            preview
+                .memory_pack_snapshot_sha256
+                .as_deref()
+                .unwrap_or("-"),
+            preview
+                .work_capability
+                .as_ref()
+                .and_then(|value| value.choice_id.as_deref())
+                .unwrap_or("-"),
+            preview
+                .work_capability
+                .as_ref()
+                .map(|value| value.provider_alias.as_str())
+                .unwrap_or("-"),
+            preview
+                .work_capability
+                .as_ref()
+                .map(|value| value.harness_alias.as_str())
+                .unwrap_or("-"),
+            preview
+                .work_capability
+                .as_ref()
+                .map(|value| value.harness_model_alias.as_str())
+                .unwrap_or("-"),
+        );
+        println!("Next: review the preview, then run work-confirm with its binding.");
+    }
+    Ok(CommandResult::Completed)
+}
+
 async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> {
     Box::pin(run_command_with_output(
         instance,
@@ -1332,6 +1571,10 @@ async fn run_command(instance: &str, command: TuiCommand) -> Result<(), String> 
     ))
     .await
     .map(|_| ())
+}
+
+async fn run_owned_command(instance: String, command: TuiCommand) -> Result<(), String> {
+    run_command(&instance, command).await
 }
 
 async fn run_command_quiet(instance: &str, command: TuiCommand) -> Result<CommandResult, String> {
@@ -1349,6 +1592,22 @@ async fn run_command_with_output(
     output: CommandOutput,
 ) -> Result<CommandResult, String> {
     match command {
+        TuiCommand::WorkCapabilities { json } => {
+            Box::pin(run_work_capabilities_command(instance, json)).await
+        }
+        TuiCommand::WorkSetDefault {
+            choice_id,
+            expected_revision,
+            json,
+        } => {
+            Box::pin(run_work_set_default_command(
+                instance,
+                choice_id,
+                expected_revision,
+                json,
+            ))
+            .await
+        }
         TuiCommand::WorkPlan {
             intent,
             scope,
@@ -1416,74 +1675,36 @@ async fn run_command_with_output(
             work_type,
             context_refs,
             no_memory,
+            capability,
             idempotency_key,
             json,
         } => {
-            let attached = AttachedClient::open(instance).await?;
-            attached.require_rpc("LocalCommandGatewayService/PrepareWork", "work.prepare")?;
-            let preview = attached
-                .0
-                .prepare_work(
+            Box::pin(run_work_prepare_command(
+                instance,
+                GuidedWorkInput {
                     intent,
                     work_type,
-                    scope,
-                    context_refs
+                    target_scope_ref: scope,
+                    sources: context_refs
                         .into_iter()
-                        .map(|value| (value.clone(), value))
+                        .map(|value| GuidedWorkSource {
+                            source_ref: value.clone(),
+                            label: value,
+                        })
                         .collect(),
-                    if no_memory {
+                    memory_mode: if no_memory {
                         GuidedWorkMemoryMode::Disabled
                     } else {
                         GuidedWorkMemoryMode::GovernedRetrieval
                     },
-                    idempotency_key,
-                )
-                .await
-                .map_err(tui_work_error)?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&json!({
-                        "schemaVersion": "egopulse.tui-result/v0.1",
-                        "ok": true,
-                        "operation": "work.prepare",
-                        "data": {
-                            "snapshotId": preview.snapshot_id,
-                            "snapshotRevision": preview.snapshot_revision,
-                            "contextStateRevision": preview.context_state_revision,
-                            "gateReady": preview.gate_ready,
-                            "readyForFounderConfirmation": preview.ready_for_founder_confirmation,
-                            "compiledContextSha256": preview.compiled_context_sha256,
-                            "confirmationBindingSha256": preview.confirmation_binding_sha256,
-                            "memoryAuthorityRevision": preview.memory_authority_revision,
-                            "memoryPackSnapshotSha256": preview.memory_pack_snapshot_sha256,
-                            "includedSources": preview.included_sources.iter().map(|source| json!({"sourceRef": source.source_ref, "label": source.label, "contentSha256": source.content_sha256, "authority": source.authority, "included": source.included})).collect::<Vec<_>>(),
-                            "excludedSources": preview.excluded_sources.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
-                            "blockers": preview.blockers.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
-                            "warnings": preview.warnings.iter().map(|notice| json!({"code": notice.code, "detail": notice.detail, "sourceRef": notice.source_ref})).collect::<Vec<_>>(),
-                        }
-                    }))
-                    .unwrap()
-                );
-            } else {
-                println!(
-                    "Work prepared: snapshot={} context_state_revision={} gate_ready={} sources={} memory_revision={} memory_pack={}",
-                    preview.snapshot_id,
-                    preview.context_state_revision,
-                    preview.gate_ready,
-                    preview.included_sources.len(),
-                    preview
-                        .memory_authority_revision
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "disabled".to_owned()),
-                    preview
-                        .memory_pack_snapshot_sha256
-                        .as_deref()
-                        .unwrap_or("-")
-                );
-                println!("Next: review the preview, then run work-confirm with its binding.");
-            }
-            Ok(CommandResult::Completed)
+                    capability: capability
+                        .map(GuidedWorkCapabilityChoice::Explicit)
+                        .unwrap_or(GuidedWorkCapabilityChoice::FutureWorkDefault),
+                },
+                idempotency_key,
+                json,
+            ))
+            .await
         }
         TuiCommand::WorkConfirm {
             snapshot_id,
@@ -1576,6 +1797,7 @@ async fn run_command_with_output(
                         version: budget_profile_version,
                         sha256: budget_profile_sha256,
                     }),
+                    work_capability_route: None,
                 })),
             };
             set_task_digest(&mut command);
@@ -2445,6 +2667,8 @@ async fn run_memory_mutation(
 
 fn command_kind(command: &TuiCommand) -> &'static str {
     match command {
+        TuiCommand::WorkCapabilities { .. } => "work.capabilities",
+        TuiCommand::WorkSetDefault { .. } => "work.set-default",
         TuiCommand::WorkPlan { .. } => "work.plan",
         TuiCommand::WorkPrepare { .. } => "work.prepare",
         TuiCommand::WorkConfirm { .. } => "work.confirm",
@@ -4935,7 +5159,10 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let result = if let Some(command) = args.command {
-        run_command(&args.instance, command).await
+        tokio::spawn(run_owned_command(args.instance, command))
+            .await
+            .map_err(|_| "TUI command runtime stopped unexpectedly".to_owned())
+            .and_then(|result| result)
     } else if args.once {
         run_once(App::new(args.instance)).await
     } else {
@@ -6337,6 +6564,7 @@ mod tests {
             "project:egopulse".to_owned(),
             "research_implementation".to_owned(),
             "docs/ARCHITECTURE.md".to_owned(),
+            "capability:codex:test".to_owned(),
             "idem-prepare-1".to_owned(),
         ]) {
             field.value = value;
@@ -6349,12 +6577,14 @@ mod tests {
                 work_type,
                 context_refs,
                 no_memory: false,
+                capability,
                 idempotency_key,
                 json: false,
             } if intent == "整理当前项目的 Memory 治理"
                 && scope == "project:egopulse"
                 && work_type == "research_implementation"
                 && context_refs == vec!["docs/ARCHITECTURE.md"]
+                && capability.as_deref() == Some("capability:codex:test")
                 && idempotency_key == "idem-prepare-1"
         ));
 

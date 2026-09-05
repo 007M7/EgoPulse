@@ -585,6 +585,7 @@ impl TaskAuthority {
             hold_reason_code: None,
             created_at: Some(now),
             updated_at: Some(now),
+            work_capability_route: command.work_capability_route.clone(),
         };
         let event = TaskEvent {
             event_id: event_id.clone(),

@@ -1,5 +1,5 @@
 {
-  "schema_version": "egopulse.production-bootstrap/v2",
+  "schema_version": "egopulse.production-bootstrap/v3",
   "stores": {
     "task": {
       "database_path": "egopulse-data/task.db",
@@ -62,7 +62,11 @@
       "local.memory.retrieve",
       "local.memory.candidate.submit",
       "local.memory.govern",
-      "local.context.revoke"
+      "local.context.revoke",
+      "local.work-capability.read",
+      "local.work-capability.default.set",
+      "local.work.prepare",
+      "local.work.confirm"
     ],
     "authorization_policy_ref": {
       "contract_id": "egopulse.authorization.v1",
@@ -282,6 +286,30 @@
       "hold_reason": "OpenCode Z.AI /connect credential storage, GLM-5.3 lifecycle, schema and recovery evidence are pending"
     }
   ],
+  "work_capabilities": {
+    "preference_revision": 1,
+    "default_choice_id": "compat-codex:303c19bbf2534edf",
+    "routes": [
+      {
+        "choice_id": "compat-codex:303c19bbf2534edf",
+        "route_id": "route:compat-codex:v1",
+        "route_generation": 1,
+        "provider_profile_id": "gpt-codex-default",
+        "provider_id": "gpt",
+        "harness_id": "codex_app_server",
+        "harness_model_id": "gpt-5.6-sol",
+        "provider_model_id": "gpt-5.6-sol",
+        "capability_profile_ref": {
+          "contract_id": "codex-app-server-v2-0.148.0-alpha.15",
+          "version": "v1",
+          "sha256": "b4e8157096dd054c008a4f1b538fb6cd8f1f2cb9577a97a4afef59c2296ed608"
+        },
+        "catalog_snapshot_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "native_composition_generation": "run:replace-me",
+        "route_binding_sha256": "303c19bbf2534edfe855e88b46a85715bdb1044ad76d0c7be74294f0f0fd8653"
+      }
+    ]
+  },
   "codex": {
     "input_bundle_root": "egopulse-data/input-bundles",
     "workspace_root": "egopulse-workspaces",

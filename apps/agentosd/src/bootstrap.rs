@@ -24,8 +24,10 @@ use egopulse_domain_contracts::v01::egopulse::{
     collaboration::v1::{RunPlan, StepPlan},
     common::v1::ContractReference,
     harness::v1::NativeSessionStrategy,
+    task::v1::WorkCapabilityRouteBinding,
     verification::v1::{CheckerProfile, VerificationBinding, VerificationRequest},
 };
+use egopulse_domain_contracts::work_capability::seal_work_capability_route_binding;
 use egopulse_founder_verdict_authority::{FounderVerdictAuthority, VerdictAuthorityConfig};
 use egopulse_founder_verdict_authority::{VerdictPrincipalKind, VerdictSqlCipherKey};
 use egopulse_harness_adapter::{AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeKey};
@@ -49,6 +51,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::ConfiguredWorkPreparationPort;
+use crate::work_capability::{
+    WorkCapabilityRegistry, WorkCapabilityRegistryError, persist_explicit_config_transition,
+};
 use crate::{AllowlistedPrincipal, AllowlistedPrincipalResolver, PrincipalPolicyError};
 use crate::{
     ArtifactAuthorityReferenceSource, ArtifactProjectionSource, AuthorityPrincipalBinding,
@@ -63,6 +68,12 @@ use crate::{
     SharedAuthorityCompositionInputs, TaskAuthorityCommitReceiptSource,
     VerificationAuthorityArtifactSource, VerificationProjectionSource, VerificationWorkerConfig,
 };
+
+const PRODUCTION_BOOTSTRAP_V2: &str = "egopulse.production-bootstrap/v2";
+const PRODUCTION_BOOTSTRAP_V3: &str = "egopulse.production-bootstrap/v3";
+const V2_MIGRATION_BACKUP_SUFFIX: &str = ".v2.bak";
+const V3_ROLLBACK_BACKUP_SUFFIX: &str = ".v3-rollback.bak";
+const MAX_MIGRATION_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 
 /// Explicit scalar configuration for the local-user Policy resolver. The
 /// Adapter edge is opened by the composition root so the resolver reads the
@@ -188,6 +199,27 @@ pub struct ProviderCatalogProfileView {
 pub struct ProviderCatalogModelView {
     pub harness_model_id: String,
     pub provider_model_id: String,
+}
+
+/// Redaction-safe report for the explicit v2/v3 work-capability config
+/// transition. It contains only public route identities and file locations;
+/// authority keys and Provider credential values are never decoded here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkCapabilityConfigTransitionReport {
+    pub transition: String,
+    pub applied: bool,
+    pub from_schema_version: String,
+    pub to_schema_version: String,
+    pub config_path: String,
+    pub retained_backup_path: String,
+    pub choice_id: String,
+    pub provider_profile_id: String,
+    pub provider_id: String,
+    pub harness_id: String,
+    pub harness_model_id: String,
+    pub provider_model_id: String,
+    pub route_binding_sha256: String,
+    pub preference_revision: u64,
 }
 
 /// A provider-neutral preview of a refreshed Harness catalog.
@@ -428,6 +460,7 @@ pub struct ProductionBootstrapConfig {
     pub os_principal: AllowlistedPrincipal,
     pub authority_binding: AuthorityPrincipalBinding,
     pub provider_profiles: Vec<ProviderBootstrapProfile>,
+    pub work_capability_registry: Arc<WorkCapabilityRegistry>,
     pub codex: CodexHarnessCompositionConfig,
 }
 
@@ -456,7 +489,7 @@ impl ProductionBootstrapConfig {
                 source,
             }
         })?;
-        file.into_typed()
+        file.into_typed(path.to_path_buf())
     }
 
     /// Returns the redaction-safe Provider catalog. It intentionally does not
@@ -634,7 +667,8 @@ impl ProductionBootstrapConfig {
             .with_context_mutation(Arc::new(ContextMutationPortAdapter::new(
                 Arc::clone(&context),
                 context_principal_resolver,
-            )));
+            )))
+            .with_work_capability_port(self.work_capability_registry.clone());
         if let Some(worker_config) = self.verification_worker {
             let worker = ConfiguredVerificationWorker::new(
                 Arc::clone(&task),
@@ -662,6 +696,7 @@ impl ProductionBootstrapConfig {
         )
         .and_then(|port| port.with_input_bundle_root(self.codex.native.input_bundle_root.clone()))
         .and_then(|port| port.with_activation_run_id(self.codex.native.workflow.run_id.clone()))
+        .map(|port| port.with_work_capability_registry(Arc::clone(&self.work_capability_registry)))
         .map_err(|_| ProductionBootstrapError::WorkPreparation)?;
         providers = providers.with_work_preparation_port(Arc::new(work_port));
         if !self.memory_candidate_producers.is_empty() {
@@ -716,7 +751,35 @@ struct UserOwnedBootstrapFile {
     founder: FounderFile,
     #[serde(default)]
     provider_profiles: Vec<ProviderProfileFile>,
+    #[serde(default)]
+    work_capabilities: Option<WorkCapabilitiesFile>,
     codex: CodexFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkCapabilitiesFile {
+    preference_revision: u64,
+    default_choice_id: String,
+    routes: Vec<WorkCapabilityRouteFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkCapabilityRouteFile {
+    choice_id: String,
+    route_id: String,
+    route_generation: u64,
+    provider_profile_id: String,
+    provider_id: String,
+    harness_id: String,
+    harness_model_id: String,
+    provider_model_id: String,
+    capability_profile_ref: ReferenceFile,
+    #[serde(default)]
+    catalog_snapshot_sha256: Option<String>,
+    native_composition_generation: String,
+    route_binding_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1074,6 +1137,439 @@ struct ReferenceFile {
     sha256: String,
 }
 
+impl WorkCapabilitiesFile {
+    fn into_typed(
+        self,
+        production_profile: &ProviderBootstrapProfile,
+        codex: &CodexHarnessCompositionConfig,
+    ) -> Result<(WorkCapabilityRouteBinding, String, u64), ProductionBootstrapError> {
+        if self.preference_revision == 0 || self.routes.len() != 1 {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "work_capabilities initial single-route state",
+            ));
+        }
+        let default_choice_id = required(
+            self.default_choice_id,
+            "work_capabilities.default_choice_id",
+        )?;
+        let route_file = self.routes.into_iter().next().ok_or(
+            ProductionBootstrapError::InvalidConfiguration("work_capabilities.routes"),
+        )?;
+        let (choice_id, route) = route_file.into_typed()?;
+        if choice_id != default_choice_id {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "work_capabilities.default_choice_id",
+            ));
+        }
+        validate_codex_route_runtime_binding(&route, production_profile, codex)?;
+        Ok((route, default_choice_id, self.preference_revision))
+    }
+}
+
+impl WorkCapabilityRouteFile {
+    fn into_typed(self) -> Result<(String, WorkCapabilityRouteBinding), ProductionBootstrapError> {
+        let choice_id = required(self.choice_id, "work_capabilities.routes.choice_id")?;
+        let route = WorkCapabilityRouteBinding {
+            route_id: required(self.route_id, "work_capabilities.routes.route_id")?,
+            route_generation: self.route_generation,
+            provider_profile_id: required(
+                self.provider_profile_id,
+                "work_capabilities.routes.provider_profile_id",
+            )?,
+            provider_id: required(self.provider_id, "work_capabilities.routes.provider_id")?,
+            harness_id: required(self.harness_id, "work_capabilities.routes.harness_id")?,
+            harness_model_id: required(
+                self.harness_model_id,
+                "work_capabilities.routes.harness_model_id",
+            )?,
+            provider_model_id: required(
+                self.provider_model_id,
+                "work_capabilities.routes.provider_model_id",
+            )?,
+            capability_profile_ref: Some(self.capability_profile_ref.into_typed()),
+            catalog_snapshot_sha256: self.catalog_snapshot_sha256,
+            native_composition_generation: required(
+                self.native_composition_generation,
+                "work_capabilities.routes.native_composition_generation",
+            )?,
+            route_binding_sha256: required(
+                self.route_binding_sha256,
+                "work_capabilities.routes.route_binding_sha256",
+            )?,
+        };
+        let route = seal_work_capability_route_binding(route).map_err(|_| {
+            ProductionBootstrapError::InvalidConfiguration("work_capabilities.routes.route_binding")
+        })?;
+        Ok((choice_id, route))
+    }
+}
+
+fn compatibility_codex_route(
+    profile: &ProviderBootstrapProfile,
+    codex: &CodexHarnessCompositionConfig,
+) -> Result<WorkCapabilityRouteBinding, ProductionBootstrapError> {
+    let route = compatibility_codex_route_from_parts(
+        profile,
+        codex.native.workflow.capability_profile_ref.clone(),
+        codex.native.workflow.run_id.clone(),
+    )?;
+    validate_codex_route_runtime_binding(&route, profile, codex)?;
+    Ok(route)
+}
+
+fn compatibility_codex_route_from_parts(
+    profile: &ProviderBootstrapProfile,
+    capability_profile_ref: ContractReference,
+    native_composition_generation: String,
+) -> Result<WorkCapabilityRouteBinding, ProductionBootstrapError> {
+    let model = profile
+        .models
+        .iter()
+        .find(|model| model.harness_model_id == profile.exact_model)
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.production_codex_model",
+        ))?;
+    let route = seal_work_capability_route_binding(WorkCapabilityRouteBinding {
+        route_id: "route:compat-codex:v1".to_owned(),
+        route_generation: 1,
+        provider_profile_id: profile.profile_id.clone(),
+        provider_id: "gpt".to_owned(),
+        harness_id: "codex_app_server".to_owned(),
+        harness_model_id: model.harness_model_id.clone(),
+        provider_model_id: model.provider_model_id.clone(),
+        capability_profile_ref: Some(capability_profile_ref),
+        catalog_snapshot_sha256: profile
+            .catalog_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.evidence_digest_sha256.clone()),
+        native_composition_generation,
+        route_binding_sha256: String::new(),
+    })
+    .map_err(|_| {
+        ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.production_codex_route_binding",
+        )
+    })?;
+    Ok(route)
+}
+
+fn validate_codex_route_runtime_binding(
+    route: &WorkCapabilityRouteBinding,
+    profile: &ProviderBootstrapProfile,
+    codex: &CodexHarnessCompositionConfig,
+) -> Result<(), ProductionBootstrapError> {
+    let model = profile
+        .models
+        .iter()
+        .find(|model| model.harness_model_id == profile.exact_model)
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.production_codex_model",
+        ))?;
+    let catalog_snapshot_sha256 = profile
+        .catalog_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.evidence_digest_sha256.as_str());
+    if route.provider_profile_id != profile.profile_id
+        || route.provider_id != "gpt"
+        || route.harness_id != "codex_app_server"
+        || route.harness_model_id != model.harness_model_id
+        || route.provider_model_id != model.provider_model_id
+        || route.capability_profile_ref.as_ref()
+            != Some(&codex.native.workflow.capability_profile_ref)
+        || route.catalog_snapshot_sha256.as_deref() != catalog_snapshot_sha256
+        || route.native_composition_generation != codex.native.workflow.run_id
+    {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "work_capabilities.routes.runtime_binding",
+        ));
+    }
+    Ok(())
+}
+
+/// Previews the additive v2 -> v3 work-capability configuration transition.
+/// No file is opened for writing and no secret environment variable is read.
+pub fn preview_work_capability_config_migration(
+    path: impl AsRef<Path>,
+) -> Result<WorkCapabilityConfigTransitionReport, ProductionBootstrapError> {
+    let path = path.as_ref();
+    let original = read_transition_config(path)?;
+    render_v3_migration(path, &original).map(|(report, _)| report)
+}
+
+/// Applies exactly the previously previewable v2 -> v3 transition under the
+/// daemon configuration lock. Startup never calls this function.
+pub fn apply_work_capability_config_migration(
+    path: impl AsRef<Path>,
+) -> Result<WorkCapabilityConfigTransitionReport, ProductionBootstrapError> {
+    let path = path.as_ref();
+    let original = read_transition_config(path)?;
+    let (mut report, replacement) = render_v3_migration(path, &original)?;
+    persist_explicit_config_transition(path, &original, &replacement, V2_MIGRATION_BACKUP_SUFFIX)
+        .map_err(transition_persistence_error)?;
+    report.applied = true;
+    Ok(report)
+}
+
+/// Previews a rollback only when the current v3 file is the exact semantic
+/// result of migrating its retained v2 backup. Any later route/default/config
+/// edit makes rollback fail closed.
+pub fn preview_work_capability_config_rollback(
+    path: impl AsRef<Path>,
+) -> Result<WorkCapabilityConfigTransitionReport, ProductionBootstrapError> {
+    let path = path.as_ref();
+    let current = read_transition_config(path)?;
+    render_v2_rollback(path, &current).map(|(report, _)| report)
+}
+
+/// Restores the retained complete v2 file and preserves the current v3 file
+/// as a separate rollback backup. Authority stores are not touched.
+pub fn rollback_work_capability_config_to_v2(
+    path: impl AsRef<Path>,
+) -> Result<WorkCapabilityConfigTransitionReport, ProductionBootstrapError> {
+    let path = path.as_ref();
+    let current = read_transition_config(path)?;
+    let (mut report, replacement) = render_v2_rollback(path, &current)?;
+    persist_explicit_config_transition(path, &current, &replacement, V3_ROLLBACK_BACKUP_SUFFIX)
+        .map_err(transition_persistence_error)?;
+    report.applied = true;
+    Ok(report)
+}
+
+fn render_v3_migration(
+    path: &Path,
+    original: &[u8],
+) -> Result<(WorkCapabilityConfigTransitionReport, Vec<u8>), ProductionBootstrapError> {
+    let file: UserOwnedBootstrapFile = serde_json::from_slice(original).map_err(|source| {
+        ProductionBootstrapError::ConfigurationFormat {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    let UserOwnedBootstrapFile {
+        schema_version,
+        provider_profiles,
+        work_capabilities,
+        codex,
+        ..
+    } = file;
+    if schema_version != PRODUCTION_BOOTSTRAP_V2 || work_capabilities.is_some() {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "configuration migration requires an unmigrated v2 file",
+        ));
+    }
+
+    let provider_profiles = provider_profiles
+        .into_iter()
+        .map(ProviderProfileFile::into_typed)
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_provider_profiles(&provider_profiles)?;
+    let production_profiles = provider_profiles
+        .iter()
+        .filter(|profile| {
+            profile.provider == ProviderId::Gpt
+                && profile.harness == ProviderHarnessKind::CodexAppServer
+                && profile.admission == ProviderAdmission::Production
+        })
+        .collect::<Vec<_>>();
+    let [production_profile] = production_profiles.as_slice() else {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "configuration migration requires exactly one production Codex profile",
+        ));
+    };
+
+    let CodexFile {
+        codex_executable,
+        default_model,
+        workflow,
+        ..
+    } = codex;
+    let default_model = required(default_model.unwrap_or_default(), "codex.default_model")?;
+    let codex_executable = required(codex_executable, "codex.codex_executable")?;
+    if default_model != production_profile.exact_model
+        || Path::new(&codex_executable) != production_profile.executable.as_path()
+    {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.production_codex_binding",
+        ));
+    }
+    let WorkflowFile {
+        run_id,
+        capability_profile_ref,
+        ..
+    } = workflow;
+    let route = compatibility_codex_route_from_parts(
+        production_profile,
+        capability_profile_ref.into_typed(),
+        required(run_id, "codex.workflow.run_id")?,
+    )?;
+    let choice_id = format!("compat-codex:{}", &route.route_binding_sha256[..16]);
+
+    let mut document: serde_json::Value = serde_json::from_slice(original).map_err(|source| {
+        ProductionBootstrapError::ConfigurationFormat {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    let root = document
+        .as_object_mut()
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "configuration document root",
+        ))?;
+    root.insert(
+        "schema_version".to_owned(),
+        serde_json::Value::String(PRODUCTION_BOOTSTRAP_V3.to_owned()),
+    );
+    let profile_ref = route.capability_profile_ref.as_ref().ok_or(
+        ProductionBootstrapError::InvalidConfiguration("work-capability route capability profile"),
+    )?;
+    root.insert(
+        "work_capabilities".to_owned(),
+        serde_json::json!({
+            "preference_revision": 1,
+            "default_choice_id": choice_id,
+            "routes": [{
+                "choice_id": choice_id,
+                "route_id": route.route_id,
+                "route_generation": route.route_generation,
+                "provider_profile_id": route.provider_profile_id,
+                "provider_id": route.provider_id,
+                "harness_id": route.harness_id,
+                "harness_model_id": route.harness_model_id,
+                "provider_model_id": route.provider_model_id,
+                "capability_profile_ref": {
+                    "contract_id": profile_ref.contract_id,
+                    "version": profile_ref.version,
+                    "sha256": profile_ref.sha256,
+                },
+                "catalog_snapshot_sha256": route.catalog_snapshot_sha256,
+                "native_composition_generation": route.native_composition_generation,
+                "route_binding_sha256": route.route_binding_sha256,
+            }]
+        }),
+    );
+    let mut replacement = serde_json::to_vec_pretty(&document).map_err(|_| {
+        ProductionBootstrapError::InvalidConfiguration("configuration migration serialization")
+    })?;
+    replacement.push(b'\n');
+    if replacement.len() > MAX_MIGRATION_CONFIG_BYTES {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "configuration file exceeds migration size limit",
+        ));
+    }
+
+    let route = document["work_capabilities"]["routes"][0]
+        .as_object()
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "work-capability migration route",
+        ))?;
+    let string_field = |name: &str| {
+        route
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                "work-capability migration route field",
+            ))
+    };
+    Ok((
+        WorkCapabilityConfigTransitionReport {
+            transition: "migrate_v2_to_v3".to_owned(),
+            applied: false,
+            from_schema_version: PRODUCTION_BOOTSTRAP_V2.to_owned(),
+            to_schema_version: PRODUCTION_BOOTSTRAP_V3.to_owned(),
+            config_path: path.display().to_string(),
+            retained_backup_path: transition_backup_path(path, V2_MIGRATION_BACKUP_SUFFIX)?
+                .display()
+                .to_string(),
+            choice_id,
+            provider_profile_id: string_field("provider_profile_id")?,
+            provider_id: string_field("provider_id")?,
+            harness_id: string_field("harness_id")?,
+            harness_model_id: string_field("harness_model_id")?,
+            provider_model_id: string_field("provider_model_id")?,
+            route_binding_sha256: string_field("route_binding_sha256")?,
+            preference_revision: 1,
+        },
+        replacement,
+    ))
+}
+
+fn render_v2_rollback(
+    path: &Path,
+    current: &[u8],
+) -> Result<(WorkCapabilityConfigTransitionReport, Vec<u8>), ProductionBootstrapError> {
+    let v2_backup_path = transition_backup_path(path, V2_MIGRATION_BACKUP_SUFFIX)?;
+    let v2_backup = read_transition_config(&v2_backup_path)?;
+    let (migrated_report, expected_v3) = render_v3_migration(path, &v2_backup)?;
+    let current_value: serde_json::Value = serde_json::from_slice(current).map_err(|source| {
+        ProductionBootstrapError::ConfigurationFormat {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    let expected_value: serde_json::Value =
+        serde_json::from_slice(&expected_v3).map_err(|source| {
+            ProductionBootstrapError::ConfigurationFormat {
+                path: path.display().to_string(),
+                source,
+            }
+        })?;
+    if current_value != expected_value {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "rollback requires the unchanged initial v3 migration state",
+        ));
+    }
+
+    Ok((
+        WorkCapabilityConfigTransitionReport {
+            transition: "rollback_v3_to_v2".to_owned(),
+            applied: false,
+            from_schema_version: PRODUCTION_BOOTSTRAP_V3.to_owned(),
+            to_schema_version: PRODUCTION_BOOTSTRAP_V2.to_owned(),
+            retained_backup_path: transition_backup_path(path, V3_ROLLBACK_BACKUP_SUFFIX)?
+                .display()
+                .to_string(),
+            ..migrated_report
+        },
+        v2_backup,
+    ))
+}
+
+fn read_transition_config(path: &Path) -> Result<Vec<u8>, ProductionBootstrapError> {
+    let bytes = fs::read(path).map_err(|source| ProductionBootstrapError::ConfigurationFile {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if bytes.len() > MAX_MIGRATION_CONFIG_BYTES {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "configuration file exceeds migration size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn transition_backup_path(path: &Path, suffix: &str) -> Result<PathBuf, ProductionBootstrapError> {
+    let mut file_name = path
+        .file_name()
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "configuration file path",
+        ))?
+        .to_os_string();
+    file_name.push(suffix);
+    Ok(path.with_file_name(file_name))
+}
+
+fn transition_persistence_error(
+    failure: egopulse_local_api::command_gateway::WorkCapabilityPortFailure,
+) -> ProductionBootstrapError {
+    match failure {
+        egopulse_local_api::command_gateway::WorkCapabilityPortFailure::StateRevisionConflict => {
+            ProductionBootstrapError::ConfigurationTransitionConflict
+        }
+        _ => ProductionBootstrapError::ConfigurationTransition,
+    }
+}
+
 impl ProviderProfileFile {
     fn into_typed(self) -> Result<ProviderBootstrapProfile, ProductionBootstrapError> {
         let profile_id = required(self.profile_id, "provider_profiles.profile_id")?;
@@ -1357,12 +1853,30 @@ fn validate_provider_profiles(
 }
 
 impl UserOwnedBootstrapFile {
-    fn into_typed(self) -> Result<ProductionBootstrapConfig, ProductionBootstrapError> {
-        if self.schema_version != "egopulse.production-bootstrap/v2" {
-            return Err(ProductionBootstrapError::InvalidConfiguration(
-                "schema_version",
-            ));
-        }
+    fn into_typed(
+        self,
+        config_path: PathBuf,
+    ) -> Result<ProductionBootstrapConfig, ProductionBootstrapError> {
+        let migration_required = match self.schema_version.as_str() {
+            "egopulse.production-bootstrap/v2" if self.work_capabilities.is_none() => true,
+            "egopulse.production-bootstrap/v3" if self.work_capabilities.is_some() => false,
+            "egopulse.production-bootstrap/v2" => {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "work_capabilities are not valid in v2",
+                ));
+            }
+            "egopulse.production-bootstrap/v3" => {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "work_capabilities are required in v3",
+                ));
+            }
+            _ => {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "schema_version",
+                ));
+            }
+        };
+        let work_capabilities_file = self.work_capabilities;
         let provider_profiles = self
             .provider_profiles
             .into_iter()
@@ -1561,7 +2075,7 @@ impl UserOwnedBootstrapFile {
             collector_principal_id: "collector:terminal-output".to_owned(),
             artifact_authority_principal_id: "authority:artifact".to_owned(),
         };
-        let codex = CodexHarnessCompositionConfig {
+        let mut codex = CodexHarnessCompositionConfig {
             native: NativeHarnessCompositionConfig {
                 collaboration_database_path: collaboration_store.database_path,
                 collaboration_store_epoch: collaboration_store.store_epoch,
@@ -1591,6 +2105,7 @@ impl UserOwnedBootstrapFile {
                 "codex.codex_executable",
             )?),
             environment_overrides: gpt_environment_overrides,
+            work_capability_route: None,
         };
         if let Some(profile) = provider_profiles.iter().find(|profile| {
             profile.provider == ProviderId::Gpt
@@ -1602,6 +2117,36 @@ impl UserOwnedBootstrapFile {
                 "provider_profiles.production_codex_binding",
             ));
         }
+        let production_codex_profile = provider_profiles
+            .iter()
+            .find(|profile| {
+                profile.provider == ProviderId::Gpt
+                    && profile.harness == ProviderHarnessKind::CodexAppServer
+                    && profile.admission == ProviderAdmission::Production
+            })
+            .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_codex_route_binding",
+            ))?;
+        let (admitted_route, default_choice_id, preference_revision) = if migration_required {
+            let route = compatibility_codex_route(production_codex_profile, &codex)?;
+            let choice_id = format!("compat-codex:{}", &route.route_binding_sha256[..16]);
+            (route, choice_id, 1)
+        } else {
+            let file =
+                work_capabilities_file.ok_or(ProductionBootstrapError::InvalidConfiguration(
+                    "work_capabilities are required in v3",
+                ))?;
+            file.into_typed(production_codex_profile, &codex)?
+        };
+        codex.work_capability_route = Some(admitted_route.clone());
+        let work_capability_registry = Arc::new(WorkCapabilityRegistry::new(
+            config_path,
+            &provider_profiles,
+            admitted_route,
+            default_choice_id,
+            preference_revision,
+            migration_required,
+        )?);
 
         Ok(ProductionBootstrapConfig {
             task: TaskAuthorityConfig {
@@ -1686,6 +2231,7 @@ impl UserOwnedBootstrapFile {
             },
             authority_binding,
             provider_profiles,
+            work_capability_registry,
             codex,
         })
     }
@@ -2377,6 +2923,10 @@ pub enum ProductionBootstrapError {
     },
     #[error("user-owned production configuration is invalid: {0}")]
     InvalidConfiguration(&'static str),
+    #[error("user-owned configuration changed while the explicit transition was in progress")]
+    ConfigurationTransitionConflict,
+    #[error("user-owned configuration transition could not be persisted atomically")]
+    ConfigurationTransition,
     #[error("required bootstrap secret is missing: {0}")]
     MissingSecret(String),
     #[error("production Provider executable is unavailable: {0}")]
@@ -2393,6 +2943,8 @@ pub enum ProductionBootstrapError {
     ContextAuthority,
     #[error("Work preparation composition is invalid")]
     WorkPreparation,
+    #[error("work-capability registry configuration is invalid")]
+    WorkCapability(#[from] WorkCapabilityRegistryError),
     #[error("Artifact admission guard configuration is invalid")]
     ArtifactGuard(#[from] crate::ArtifactAdmissionGuardConfigurationError),
     #[error("Artifact Authority could not be opened")]
@@ -2429,6 +2981,21 @@ mod tests {
     use egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationBinding;
     use std::fs;
     use uuid::Uuid;
+
+    fn packaged_v2_config_bytes() -> Vec<u8> {
+        let mut value: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../config/agentos-config.example.json"
+        ))
+        .expect("packaged configuration JSON");
+        value["schema_version"] = serde_json::json!(PRODUCTION_BOOTSTRAP_V2);
+        value
+            .as_object_mut()
+            .expect("packaged configuration object")
+            .remove("work_capabilities");
+        let mut bytes = serde_json::to_vec_pretty(&value).expect("render packaged v2 fixture");
+        bytes.push(b'\n');
+        bytes
+    }
 
     #[test]
     fn provider_executable_resolution_produces_an_absolute_file_boundary() {
@@ -2489,6 +3056,103 @@ mod tests {
             Err(ProductionBootstrapError::ConfigurationFormat { .. })
         ));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn work_capability_config_migration_is_explicit_complete_and_reversible() {
+        let directory = tempfile::tempdir().expect("migration tempdir");
+        let path = directory.path().join("agentos-config.json");
+        let original = packaged_v2_config_bytes();
+        fs::write(&path, &original).expect("write v2 config");
+
+        let preview =
+            preview_work_capability_config_migration(&path).expect("preview v2 migration");
+        assert!(!preview.applied);
+        assert_eq!(preview.from_schema_version, PRODUCTION_BOOTSTRAP_V2);
+        assert_eq!(preview.to_schema_version, PRODUCTION_BOOTSTRAP_V3);
+        assert_eq!(preview.preference_revision, 1);
+        assert_eq!(preview.harness_model_id, "gpt-5.6-sol");
+        assert_eq!(fs::read(&path).expect("read after preview"), original);
+        assert!(!Path::new(&preview.retained_backup_path).exists());
+
+        let applied = apply_work_capability_config_migration(&path).expect("apply v2 migration");
+        assert!(applied.applied);
+        assert_eq!(applied.route_binding_sha256.len(), 64);
+        assert_eq!(
+            fs::read(&applied.retained_backup_path).expect("retained v2 backup"),
+            original
+        );
+        let migrated = fs::read(&path).expect("read migrated v3");
+        let migrated_value: serde_json::Value =
+            serde_json::from_slice(&migrated).expect("parse migrated v3");
+        assert_eq!(migrated_value["schema_version"], PRODUCTION_BOOTSTRAP_V3);
+        assert_eq!(
+            migrated_value["work_capabilities"]["default_choice_id"],
+            applied.choice_id
+        );
+        assert_eq!(
+            migrated_value["work_capabilities"]["routes"][0]["route_binding_sha256"],
+            applied.route_binding_sha256
+        );
+
+        let rollback_preview =
+            preview_work_capability_config_rollback(&path).expect("preview v2 rollback");
+        assert!(!rollback_preview.applied);
+        assert_eq!(
+            rollback_preview.from_schema_version,
+            PRODUCTION_BOOTSTRAP_V3
+        );
+        assert_eq!(rollback_preview.to_schema_version, PRODUCTION_BOOTSTRAP_V2);
+        assert_eq!(
+            fs::read(&path).expect("rollback preview is read-only"),
+            migrated
+        );
+
+        let rolled_back = rollback_work_capability_config_to_v2(&path).expect("apply v2 rollback");
+        assert!(rolled_back.applied);
+        assert_eq!(fs::read(&path).expect("restored v2"), original);
+        assert_eq!(
+            fs::read(&rolled_back.retained_backup_path).expect("retained v3 rollback backup"),
+            migrated
+        );
+    }
+
+    #[test]
+    fn work_capability_config_rollback_rejects_any_post_migration_drift() {
+        let directory = tempfile::tempdir().expect("migration tempdir");
+        let path = directory.path().join("agentos-config.json");
+        let original = packaged_v2_config_bytes();
+        fs::write(&path, original).expect("write v2 config");
+        apply_work_capability_config_migration(&path).expect("apply v2 migration");
+
+        let mut current: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read v3")).expect("parse v3");
+        current["work_capabilities"]["preference_revision"] = serde_json::json!(2);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&current).expect("render drifted v3"),
+        )
+        .expect("write drifted v3");
+        let before = fs::read(&path).expect("read drifted bytes");
+
+        assert!(matches!(
+            preview_work_capability_config_rollback(&path),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "rollback requires the unchanged initial v3 migration state"
+            ))
+        ));
+        assert!(matches!(
+            rollback_work_capability_config_to_v2(&path),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "rollback requires the unchanged initial v3 migration state"
+            ))
+        ));
+        assert_eq!(fs::read(&path).expect("drift remains untouched"), before);
+        assert!(
+            !transition_backup_path(&path, V3_ROLLBACK_BACKUP_SUFFIX)
+                .expect("rollback backup path")
+                .exists()
+        );
     }
 
     #[test]

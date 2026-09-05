@@ -1,10 +1,10 @@
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use egopulse_client_operations::{
-    ClientAttachment, ClientGuidedWorkError, ConfirmedWork, GovernedWorkNotice,
-    GuidedWorkConfirmationAttempt, GuidedWorkInput, GuidedWorkMemoryMode, GuidedWorkNonGoal,
-    GuidedWorkPreparationAttempt, GuidedWorkPreview, GuidedWorkSource, PreparedWork,
-    RecoverableWorkConfirmation, RecoverableWorkPreparation,
+    ClientAttachment, ClientGuidedWorkError, ConfirmedWork, GovernedWorkCapabilitySelectionSource,
+    GovernedWorkNotice, GuidedWorkCapabilityChoice, GuidedWorkConfirmationAttempt, GuidedWorkInput,
+    GuidedWorkMemoryMode, GuidedWorkNonGoal, GuidedWorkPreparationAttempt, GuidedWorkPreview,
+    GuidedWorkSource, PreparedWork, RecoverableWorkConfirmation, RecoverableWorkPreparation,
 };
 use egopulse_domain_contracts::v01::egopulse::task::v1::task_command_result;
 use ratatui::{
@@ -84,6 +84,14 @@ pub struct WorkStartPreview {
     memory_mode: GuidedWorkMemoryMode,
     memory_authority_revision: Option<u64>,
     memory_pack_snapshot_sha256: Option<String>,
+    capability_choice_id: String,
+    provider_alias: String,
+    harness_alias: String,
+    harness_model_alias: String,
+    provider_model_alias: String,
+    route_binding_sha256: String,
+    capability_selection_source: GovernedWorkCapabilitySelectionSource,
+    preference_revision_at_resolution: Option<u64>,
     gate_ready: bool,
     ready_for_founder_confirmation: bool,
 }
@@ -104,6 +112,14 @@ impl WorkStartPreview {
             memory_pack_snapshot_sha256: preview
                 .memory_pack_snapshot_sha256()
                 .map(ToOwned::to_owned),
+            capability_choice_id: preview.capability_choice_id().to_owned(),
+            provider_alias: preview.provider_alias().to_owned(),
+            harness_alias: preview.harness_alias().to_owned(),
+            harness_model_alias: preview.harness_model_alias().to_owned(),
+            provider_model_alias: preview.provider_model_alias().to_owned(),
+            route_binding_sha256: preview.route_binding_sha256().to_owned(),
+            capability_selection_source: preview.capability_selection_source(),
+            preference_revision_at_resolution: preview.preference_revision_at_resolution(),
             gate_ready: preview.gate_ready(),
             ready_for_founder_confirmation: preview.ready_for_founder_confirmation(),
         }
@@ -166,6 +182,46 @@ impl WorkStartPreview {
     #[must_use]
     pub fn memory_pack_snapshot_sha256(&self) -> Option<&str> {
         self.memory_pack_snapshot_sha256.as_deref()
+    }
+
+    #[must_use]
+    pub fn capability_choice_id(&self) -> &str {
+        &self.capability_choice_id
+    }
+
+    #[must_use]
+    pub fn provider_alias(&self) -> &str {
+        &self.provider_alias
+    }
+
+    #[must_use]
+    pub fn harness_alias(&self) -> &str {
+        &self.harness_alias
+    }
+
+    #[must_use]
+    pub fn harness_model_alias(&self) -> &str {
+        &self.harness_model_alias
+    }
+
+    #[must_use]
+    pub fn provider_model_alias(&self) -> &str {
+        &self.provider_model_alias
+    }
+
+    #[must_use]
+    pub fn route_binding_sha256(&self) -> &str {
+        &self.route_binding_sha256
+    }
+
+    #[must_use]
+    pub const fn capability_selection_source(&self) -> GovernedWorkCapabilitySelectionSource {
+        self.capability_selection_source
+    }
+
+    #[must_use]
+    pub const fn preference_revision_at_resolution(&self) -> Option<u64> {
+        self.preference_revision_at_resolution
     }
 
     #[must_use]
@@ -341,14 +397,16 @@ pub enum WorkStartField {
     Intent,
     WorkType,
     Scope,
+    Capability,
     ContextReferences,
 }
 
 impl WorkStartField {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Intent,
         Self::WorkType,
         Self::Scope,
+        Self::Capability,
         Self::ContextReferences,
     ];
 
@@ -358,6 +416,7 @@ impl WorkStartField {
             Self::Intent => "Intent",
             Self::WorkType => "Work type",
             Self::Scope => "Scope",
+            Self::Capability => "Capability choice (blank = future-work default)",
             Self::ContextReferences => "Context refs (comma separated)",
         }
     }
@@ -368,6 +427,7 @@ pub struct WorkStartDraft {
     pub intent: String,
     pub work_type: String,
     pub target_scope_ref: String,
+    pub capability_choice_id: String,
     pub context_references: String,
     pub memory_enabled: bool,
 }
@@ -378,6 +438,7 @@ impl Default for WorkStartDraft {
             intent: String::new(),
             work_type: String::new(),
             target_scope_ref: String::new(),
+            capability_choice_id: String::new(),
             context_references: String::new(),
             memory_enabled: true,
         }
@@ -404,6 +465,11 @@ impl WorkStartDraft {
                 GuidedWorkMemoryMode::GovernedRetrieval
             } else {
                 GuidedWorkMemoryMode::Disabled
+            },
+            capability: if self.capability_choice_id.trim().is_empty() {
+                GuidedWorkCapabilityChoice::FutureWorkDefault
+            } else {
+                GuidedWorkCapabilityChoice::Explicit(self.capability_choice_id.clone())
             },
         }
     }
@@ -473,7 +539,10 @@ impl WorkStartPageModel {
             .iter()
             .position(|field| *field == self.active_field)
             .expect("Work Start field is enumerated");
-        self.active_field = WorkStartField::ALL[index.checked_sub(1).unwrap_or(3)];
+        let previous = index
+            .checked_sub(1)
+            .unwrap_or(WorkStartField::ALL.len() - 1);
+        self.active_field = WorkStartField::ALL[previous];
     }
 
     pub fn push(&mut self, character: char) {
@@ -498,6 +567,7 @@ impl WorkStartPageModel {
             WorkStartField::Intent => &mut self.draft.intent,
             WorkStartField::WorkType => &mut self.draft.work_type,
             WorkStartField::Scope => &mut self.draft.target_scope_ref,
+            WorkStartField::Capability => &mut self.draft.capability_choice_id,
             WorkStartField::ContextReferences => &mut self.draft.context_references,
         }
     }
@@ -532,6 +602,15 @@ pub fn render_work_start_page(frame: &mut Frame<'_>, area: Rect, model: &WorkSta
             draft.target_scope_ref
         )),
         Line::from(format!(
+            "{} Capability: {}",
+            marker(WorkStartField::Capability),
+            if draft.capability_choice_id.is_empty() {
+                "<future-work default>"
+            } else {
+                draft.capability_choice_id.as_str()
+            }
+        )),
+        Line::from(format!(
             "{} Context refs: {}",
             marker(WorkStartField::ContextReferences),
             draft.context_references
@@ -555,6 +634,23 @@ pub fn render_work_start_page(frame: &mut Frame<'_>, area: Rect, model: &WorkSta
             )),
             Line::from(format!("Governed work type: {}", preview.work_type())),
             Line::from(format!("Governed scope: {}", preview.target_scope_ref())),
+            Line::from(format!(
+                "Capability: {} / provider: {} / harness: {} / model: {} -> {}",
+                preview.capability_choice_id(),
+                preview.provider_alias(),
+                preview.harness_alias(),
+                preview.harness_model_alias(),
+                preview.provider_model_alias(),
+            )),
+            Line::from(format!(
+                "Route: {} / selection: {:?} / preference revision: {}",
+                preview.route_binding_sha256(),
+                preview.capability_selection_source(),
+                preview
+                    .preference_revision_at_resolution()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "not used".to_owned()),
+            )),
             Line::from(format!(
                 "Sources: {} included, {} excluded",
                 preview.included_source_count(),
@@ -596,7 +692,7 @@ pub fn render_work_start_page(frame: &mut Frame<'_>, area: Rect, model: &WorkSta
 enum WorkStartWorkerEvent {
     Prepared {
         generation: u64,
-        prepared: WorkStartPrepared,
+        prepared: Box<WorkStartPrepared>,
     },
     PreparationUnknown {
         generation: u64,
@@ -711,7 +807,7 @@ impl<C: WorkStartClient + ?Sized + 'static> WorkStartControllerCore<C> {
                 Ok(WorkStartPreparationOutcome::Prepared(prepared)) => {
                     WorkStartWorkerEvent::Prepared {
                         generation,
-                        prepared: *prepared,
+                        prepared,
                     }
                 }
                 Ok(WorkStartPreparationOutcome::OutcomeUnknown(recovery)) => {
@@ -756,7 +852,7 @@ impl<C: WorkStartClient + ?Sized + 'static> WorkStartControllerCore<C> {
             move |result| match result {
                 Ok(prepared) => WorkStartWorkerEvent::Prepared {
                     generation,
-                    prepared,
+                    prepared: Box::new(prepared),
                 },
                 Err(detail) => WorkStartWorkerEvent::Failed { generation, detail },
             },
@@ -900,6 +996,7 @@ impl<C: WorkStartClient + ?Sized + 'static> WorkStartControllerCore<C> {
         }
         match event {
             WorkStartWorkerEvent::Prepared { prepared, .. } => {
+                let prepared = *prepared;
                 self.preparation_recovery.take();
                 if self.return_after_preparation {
                     self.prepared.take();
@@ -1173,7 +1270,7 @@ mod tests {
             work_type: "implementation".to_owned(),
             target_scope_ref: "project:test".to_owned(),
             non_goals: vec![
-                GuidedWorkNonGoal::ProviderSelectionDeferred,
+                GuidedWorkNonGoal::ProviderRouteCannotBeModelSelected,
                 GuidedWorkNonGoal::MemoryMutationExcluded,
             ],
             included_source_count: usize::from(ready),
@@ -1186,6 +1283,14 @@ mod tests {
             memory_mode: GuidedWorkMemoryMode::Disabled,
             memory_authority_revision: None,
             memory_pack_snapshot_sha256: None,
+            capability_choice_id: "capability:codex:test".to_owned(),
+            provider_alias: "gpt".to_owned(),
+            harness_alias: "codex_app_server".to_owned(),
+            harness_model_alias: "gpt-5.4".to_owned(),
+            provider_model_alias: "gpt-5.4".to_owned(),
+            route_binding_sha256: "d".repeat(64),
+            capability_selection_source: GovernedWorkCapabilitySelectionSource::FutureWorkDefault,
+            preference_revision_at_resolution: Some(1),
             gate_ready: ready,
             ready_for_founder_confirmation: ready,
         }
@@ -1210,6 +1315,7 @@ mod tests {
             intent: "implement".to_owned(),
             work_type: "implementation".to_owned(),
             target_scope_ref: "project:test".to_owned(),
+            capability_choice_id: String::new(),
             context_references: "docs/one.md, docs/two.md".to_owned(),
             memory_enabled: true,
         };
@@ -1419,10 +1525,10 @@ mod tests {
             &mut controller,
             WorkStartWorkerEvent::Prepared {
                 generation: 8,
-                prepared: prepared(
+                prepared: Box::new(prepared(
                     Arc::clone(&confirms),
                     WorkStartConfirmationOutcome::Confirmed("task:stale-prepared".to_owned()),
-                ),
+                )),
             },
         )
         .await;

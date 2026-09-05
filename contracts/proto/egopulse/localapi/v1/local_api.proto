@@ -30,6 +30,22 @@ enum WorkMemoryMode {
   WORK_MEMORY_MODE_GOVERNED_RETRIEVAL = 2;
 }
 
+enum WorkCapabilityAvailability {
+  WORK_CAPABILITY_AVAILABILITY_UNSPECIFIED = 0;
+  WORK_CAPABILITY_AVAILABILITY_ADMITTED = 1;
+  WORK_CAPABILITY_AVAILABILITY_CANDIDATE = 2;
+  WORK_CAPABILITY_AVAILABILITY_HELD = 3;
+}
+
+enum WorkCapabilitySelectionSource {
+  WORK_CAPABILITY_SELECTION_SOURCE_UNSPECIFIED = 0;
+  WORK_CAPABILITY_SELECTION_SOURCE_FUTURE_WORK_DEFAULT = 1;
+  WORK_CAPABILITY_SELECTION_SOURCE_EXPLICIT_CHOICE = 2;
+  // Compatibility decoding only: an older request omitted the additive
+  // preference oneof and was resolved through the same governed default.
+  WORK_CAPABILITY_SELECTION_SOURCE_LEGACY_OMITTED_DEFAULT = 3;
+}
+
 enum ProjectionHealth {
   PROJECTION_HEALTH_UNSPECIFIED = 0;
   PROJECTION_HEALTH_READY = 1;
@@ -110,6 +126,8 @@ enum LocalApiErrorCode {
   LOCAL_API_ERROR_CODE_CONTEXT_REVOKED = 19;
   LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT = 20;
   LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT = 21;
+  LOCAL_API_ERROR_CODE_CAPABILITY_NOT_ADMITTED = 22;
+  LOCAL_API_ERROR_CODE_CONFIGURATION_MIGRATION_REQUIRED = 23;
 }
 
 message ClientRequestMetadata {
@@ -202,6 +220,70 @@ message WorkGateNotice {
   string source_ref = 3;
 }
 
+// Safe setup/work projection. A public choice_id is only a daemon lookup key;
+// admitted_route is the immutable fact that confirmation binds. Candidate or
+// held entries never carry an admitted route and are never selectable.
+message WorkCapabilityView {
+  string provider_profile_id = 1;
+  string provider_alias = 2;
+  string harness_alias = 3;
+  string harness_model_alias = 4;
+  string provider_model_alias = 5;
+  WorkCapabilityAvailability availability = 6;
+  bool selectable = 7;
+  optional string safe_reason_code = 8;
+  optional string choice_id = 9;
+  egopulse.task.v1.WorkCapabilityRouteBinding admitted_route = 10;
+  bool current_future_work_default = 11;
+}
+
+message WorkCapabilityPreferenceView {
+  string default_choice_id = 1;
+  uint64 preference_revision = 2;
+  // v2 is read-compatible and yields one in-memory Codex compatibility route,
+  // but mutation remains closed until explicit v3 migration.
+  bool configuration_migration_required = 3;
+}
+
+message ListWorkCapabilitiesRequest {
+  ClientRequestMetadata client = 1;
+}
+
+message ListWorkCapabilitiesResult {
+  repeated WorkCapabilityView capabilities = 1;
+  WorkCapabilityPreferenceView preference = 2;
+}
+
+message ListWorkCapabilitiesResponse {
+  oneof outcome {
+    ListWorkCapabilitiesResult result = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message SetDefaultWorkCapabilityRequest {
+  ClientRequestMetadata client = 1;
+  string choice_id = 2;
+  uint64 expected_preference_revision = 3;
+}
+
+message WorkCapabilityPreferenceReceipt {
+  string previous_default_choice_id = 1;
+  string default_choice_id = 2;
+  uint64 previous_preference_revision = 3;
+  uint64 preference_revision = 4;
+  bool changed = 5;
+}
+
+message SetDefaultWorkCapabilityResponse {
+  oneof outcome {
+    WorkCapabilityPreferenceReceipt receipt = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message UseDefaultWorkCapability {}
+
 // Sanitized, Authority-owned preparation result. Raw compiled context,
 // credentials, process configuration and client-selected authority fields are
 // never returned here.
@@ -240,6 +322,9 @@ message WorkPreparationPreview {
   // Independent governance CAS read from Context Authority. It is not the
   // immutable snapshot revision and MUST NOT be reconstructed by a client.
   uint64 context_state_revision = 30;
+  WorkCapabilityView work_capability = 31;
+  WorkCapabilitySelectionSource work_capability_selection_source = 32;
+  optional uint64 preference_revision_at_resolution = 33;
 }
 
 message PrepareWorkRequest {
@@ -250,6 +335,10 @@ message PrepareWorkRequest {
   repeated WorkSourceRequest sources = 5;
   string idempotency_key = 6;
   WorkMemoryMode memory_mode = 7;
+  oneof work_capability_preference {
+    UseDefaultWorkCapability use_default_work_capability = 8;
+    string explicit_work_capability_choice_id = 9;
+  }
 }
 
 message PrepareWorkResponse {
@@ -809,6 +898,8 @@ service LocalReadModelService {
 }
 
 service LocalCommandGatewayService {
+  rpc ListWorkCapabilities(ListWorkCapabilitiesRequest) returns (ListWorkCapabilitiesResponse);
+  rpc SetDefaultWorkCapability(SetDefaultWorkCapabilityRequest) returns (SetDefaultWorkCapabilityResponse);
   rpc PrepareWork(PrepareWorkRequest) returns (PrepareWorkResponse);
   rpc ConfirmWork(ConfirmWorkRequest) returns (ConfirmWorkResponse);
   rpc ExecuteTaskCommand(ExecuteTaskCommandRequest) returns (ExecuteTaskCommandResponse);

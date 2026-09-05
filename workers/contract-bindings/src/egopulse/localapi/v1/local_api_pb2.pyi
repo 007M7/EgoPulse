@@ -32,6 +32,20 @@ class WorkMemoryMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     WORK_MEMORY_MODE_DISABLED: _ClassVar[WorkMemoryMode]
     WORK_MEMORY_MODE_GOVERNED_RETRIEVAL: _ClassVar[WorkMemoryMode]
 
+class WorkCapabilityAvailability(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    WORK_CAPABILITY_AVAILABILITY_UNSPECIFIED: _ClassVar[WorkCapabilityAvailability]
+    WORK_CAPABILITY_AVAILABILITY_ADMITTED: _ClassVar[WorkCapabilityAvailability]
+    WORK_CAPABILITY_AVAILABILITY_CANDIDATE: _ClassVar[WorkCapabilityAvailability]
+    WORK_CAPABILITY_AVAILABILITY_HELD: _ClassVar[WorkCapabilityAvailability]
+
+class WorkCapabilitySelectionSource(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    WORK_CAPABILITY_SELECTION_SOURCE_UNSPECIFIED: _ClassVar[WorkCapabilitySelectionSource]
+    WORK_CAPABILITY_SELECTION_SOURCE_FUTURE_WORK_DEFAULT: _ClassVar[WorkCapabilitySelectionSource]
+    WORK_CAPABILITY_SELECTION_SOURCE_EXPLICIT_CHOICE: _ClassVar[WorkCapabilitySelectionSource]
+    WORK_CAPABILITY_SELECTION_SOURCE_LEGACY_OMITTED_DEFAULT: _ClassVar[WorkCapabilitySelectionSource]
+
 class ProjectionHealth(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     PROJECTION_HEALTH_UNSPECIFIED: _ClassVar[ProjectionHealth]
@@ -109,6 +123,8 @@ class LocalApiErrorCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     LOCAL_API_ERROR_CODE_CONTEXT_REVOKED: _ClassVar[LocalApiErrorCode]
     LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT: _ClassVar[LocalApiErrorCode]
     LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_CAPABILITY_NOT_ADMITTED: _ClassVar[LocalApiErrorCode]
+    LOCAL_API_ERROR_CODE_CONFIGURATION_MIGRATION_REQUIRED: _ClassVar[LocalApiErrorCode]
 CLIENT_SURFACE_UNSPECIFIED: ClientSurface
 CLIENT_SURFACE_DESKTOP: ClientSurface
 CLIENT_SURFACE_CLI: ClientSurface
@@ -116,6 +132,14 @@ CLIENT_SURFACE_TUI: ClientSurface
 WORK_MEMORY_MODE_UNSPECIFIED: WorkMemoryMode
 WORK_MEMORY_MODE_DISABLED: WorkMemoryMode
 WORK_MEMORY_MODE_GOVERNED_RETRIEVAL: WorkMemoryMode
+WORK_CAPABILITY_AVAILABILITY_UNSPECIFIED: WorkCapabilityAvailability
+WORK_CAPABILITY_AVAILABILITY_ADMITTED: WorkCapabilityAvailability
+WORK_CAPABILITY_AVAILABILITY_CANDIDATE: WorkCapabilityAvailability
+WORK_CAPABILITY_AVAILABILITY_HELD: WorkCapabilityAvailability
+WORK_CAPABILITY_SELECTION_SOURCE_UNSPECIFIED: WorkCapabilitySelectionSource
+WORK_CAPABILITY_SELECTION_SOURCE_FUTURE_WORK_DEFAULT: WorkCapabilitySelectionSource
+WORK_CAPABILITY_SELECTION_SOURCE_EXPLICIT_CHOICE: WorkCapabilitySelectionSource
+WORK_CAPABILITY_SELECTION_SOURCE_LEGACY_OMITTED_DEFAULT: WorkCapabilitySelectionSource
 PROJECTION_HEALTH_UNSPECIFIED: ProjectionHealth
 PROJECTION_HEALTH_READY: ProjectionHealth
 PROJECTION_HEALTH_CATCHING_UP: ProjectionHealth
@@ -173,6 +197,8 @@ LOCAL_API_ERROR_CODE_OWNER_MISMATCH: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_CONTEXT_REVOKED: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_STATE_REVISION_CONFLICT: LocalApiErrorCode
 LOCAL_API_ERROR_CODE_IDEMPOTENCY_CONFLICT: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_CAPABILITY_NOT_ADMITTED: LocalApiErrorCode
+LOCAL_API_ERROR_CODE_CONFIGURATION_MIGRATION_REQUIRED: LocalApiErrorCode
 
 class ClientRequestMetadata(_message.Message):
     __slots__ = ("request_id", "client_instance_id", "surface", "session_id", "api_contract_ref", "correlation_id")
@@ -322,8 +348,102 @@ class WorkGateNotice(_message.Message):
     source_ref: str
     def __init__(self, code: _Optional[str] = ..., detail: _Optional[str] = ..., source_ref: _Optional[str] = ...) -> None: ...
 
+class WorkCapabilityView(_message.Message):
+    __slots__ = ("provider_profile_id", "provider_alias", "harness_alias", "harness_model_alias", "provider_model_alias", "availability", "selectable", "safe_reason_code", "choice_id", "admitted_route", "current_future_work_default")
+    PROVIDER_PROFILE_ID_FIELD_NUMBER: _ClassVar[int]
+    PROVIDER_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    HARNESS_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    HARNESS_MODEL_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    PROVIDER_MODEL_ALIAS_FIELD_NUMBER: _ClassVar[int]
+    AVAILABILITY_FIELD_NUMBER: _ClassVar[int]
+    SELECTABLE_FIELD_NUMBER: _ClassVar[int]
+    SAFE_REASON_CODE_FIELD_NUMBER: _ClassVar[int]
+    CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    ADMITTED_ROUTE_FIELD_NUMBER: _ClassVar[int]
+    CURRENT_FUTURE_WORK_DEFAULT_FIELD_NUMBER: _ClassVar[int]
+    provider_profile_id: str
+    provider_alias: str
+    harness_alias: str
+    harness_model_alias: str
+    provider_model_alias: str
+    availability: WorkCapabilityAvailability
+    selectable: bool
+    safe_reason_code: str
+    choice_id: str
+    admitted_route: _task_pb2.WorkCapabilityRouteBinding
+    current_future_work_default: bool
+    def __init__(self, provider_profile_id: _Optional[str] = ..., provider_alias: _Optional[str] = ..., harness_alias: _Optional[str] = ..., harness_model_alias: _Optional[str] = ..., provider_model_alias: _Optional[str] = ..., availability: _Optional[_Union[WorkCapabilityAvailability, str]] = ..., selectable: _Optional[bool] = ..., safe_reason_code: _Optional[str] = ..., choice_id: _Optional[str] = ..., admitted_route: _Optional[_Union[_task_pb2.WorkCapabilityRouteBinding, _Mapping]] = ..., current_future_work_default: _Optional[bool] = ...) -> None: ...
+
+class WorkCapabilityPreferenceView(_message.Message):
+    __slots__ = ("default_choice_id", "preference_revision", "configuration_migration_required")
+    DEFAULT_CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    PREFERENCE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    CONFIGURATION_MIGRATION_REQUIRED_FIELD_NUMBER: _ClassVar[int]
+    default_choice_id: str
+    preference_revision: int
+    configuration_migration_required: bool
+    def __init__(self, default_choice_id: _Optional[str] = ..., preference_revision: _Optional[int] = ..., configuration_migration_required: _Optional[bool] = ...) -> None: ...
+
+class ListWorkCapabilitiesRequest(_message.Message):
+    __slots__ = ("client",)
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ...) -> None: ...
+
+class ListWorkCapabilitiesResult(_message.Message):
+    __slots__ = ("capabilities", "preference")
+    CAPABILITIES_FIELD_NUMBER: _ClassVar[int]
+    PREFERENCE_FIELD_NUMBER: _ClassVar[int]
+    capabilities: _containers.RepeatedCompositeFieldContainer[WorkCapabilityView]
+    preference: WorkCapabilityPreferenceView
+    def __init__(self, capabilities: _Optional[_Iterable[_Union[WorkCapabilityView, _Mapping]]] = ..., preference: _Optional[_Union[WorkCapabilityPreferenceView, _Mapping]] = ...) -> None: ...
+
+class ListWorkCapabilitiesResponse(_message.Message):
+    __slots__ = ("result", "error")
+    RESULT_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    result: ListWorkCapabilitiesResult
+    error: LocalApiError
+    def __init__(self, result: _Optional[_Union[ListWorkCapabilitiesResult, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class SetDefaultWorkCapabilityRequest(_message.Message):
+    __slots__ = ("client", "choice_id", "expected_preference_revision")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_PREFERENCE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    choice_id: str
+    expected_preference_revision: int
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., choice_id: _Optional[str] = ..., expected_preference_revision: _Optional[int] = ...) -> None: ...
+
+class WorkCapabilityPreferenceReceipt(_message.Message):
+    __slots__ = ("previous_default_choice_id", "default_choice_id", "previous_preference_revision", "preference_revision", "changed")
+    PREVIOUS_DEFAULT_CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    DEFAULT_CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    PREVIOUS_PREFERENCE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    PREFERENCE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    CHANGED_FIELD_NUMBER: _ClassVar[int]
+    previous_default_choice_id: str
+    default_choice_id: str
+    previous_preference_revision: int
+    preference_revision: int
+    changed: bool
+    def __init__(self, previous_default_choice_id: _Optional[str] = ..., default_choice_id: _Optional[str] = ..., previous_preference_revision: _Optional[int] = ..., preference_revision: _Optional[int] = ..., changed: _Optional[bool] = ...) -> None: ...
+
+class SetDefaultWorkCapabilityResponse(_message.Message):
+    __slots__ = ("receipt", "error")
+    RECEIPT_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    receipt: WorkCapabilityPreferenceReceipt
+    error: LocalApiError
+    def __init__(self, receipt: _Optional[_Union[WorkCapabilityPreferenceReceipt, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class UseDefaultWorkCapability(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
 class WorkPreparationPreview(_message.Message):
-    __slots__ = ("snapshot_id", "snapshot_revision", "normalized_intent", "work_type", "target_scope_ref", "compiled_context_sha256", "included_sources", "excluded_sources", "non_goals", "allowed_read_paths", "allowed_write_paths", "allowed_tools", "external_resources", "acceptance_contract_ref", "budget_profile_ref", "memory_authority_revision", "memory_pack_snapshot_sha256", "recovery_entry", "visibility", "redactions", "expires_at", "confirmation_binding_sha256", "gate_ready", "blockers", "warnings", "required_confirmations", "evidence_required", "ready_for_founder_confirmation", "deadline", "context_state_revision")
+    __slots__ = ("snapshot_id", "snapshot_revision", "normalized_intent", "work_type", "target_scope_ref", "compiled_context_sha256", "included_sources", "excluded_sources", "non_goals", "allowed_read_paths", "allowed_write_paths", "allowed_tools", "external_resources", "acceptance_contract_ref", "budget_profile_ref", "memory_authority_revision", "memory_pack_snapshot_sha256", "recovery_entry", "visibility", "redactions", "expires_at", "confirmation_binding_sha256", "gate_ready", "blockers", "warnings", "required_confirmations", "evidence_required", "ready_for_founder_confirmation", "deadline", "context_state_revision", "work_capability", "work_capability_selection_source", "preference_revision_at_resolution")
     SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
     SNAPSHOT_REVISION_FIELD_NUMBER: _ClassVar[int]
     NORMALIZED_INTENT_FIELD_NUMBER: _ClassVar[int]
@@ -354,6 +474,9 @@ class WorkPreparationPreview(_message.Message):
     READY_FOR_FOUNDER_CONFIRMATION_FIELD_NUMBER: _ClassVar[int]
     DEADLINE_FIELD_NUMBER: _ClassVar[int]
     CONTEXT_STATE_REVISION_FIELD_NUMBER: _ClassVar[int]
+    WORK_CAPABILITY_FIELD_NUMBER: _ClassVar[int]
+    WORK_CAPABILITY_SELECTION_SOURCE_FIELD_NUMBER: _ClassVar[int]
+    PREFERENCE_REVISION_AT_RESOLUTION_FIELD_NUMBER: _ClassVar[int]
     snapshot_id: str
     snapshot_revision: int
     normalized_intent: str
@@ -384,10 +507,13 @@ class WorkPreparationPreview(_message.Message):
     ready_for_founder_confirmation: bool
     deadline: _timestamp_pb2.Timestamp
     context_state_revision: int
-    def __init__(self, snapshot_id: _Optional[str] = ..., snapshot_revision: _Optional[int] = ..., normalized_intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., compiled_context_sha256: _Optional[str] = ..., included_sources: _Optional[_Iterable[_Union[WorkSourceFact, _Mapping]]] = ..., excluded_sources: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., non_goals: _Optional[_Iterable[str]] = ..., allowed_read_paths: _Optional[_Iterable[str]] = ..., allowed_write_paths: _Optional[_Iterable[str]] = ..., allowed_tools: _Optional[_Iterable[str]] = ..., external_resources: _Optional[_Iterable[str]] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., memory_authority_revision: _Optional[int] = ..., memory_pack_snapshot_sha256: _Optional[str] = ..., recovery_entry: _Optional[str] = ..., visibility: _Optional[str] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., confirmation_binding_sha256: _Optional[str] = ..., gate_ready: _Optional[bool] = ..., blockers: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., warnings: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., required_confirmations: _Optional[_Iterable[str]] = ..., evidence_required: _Optional[_Iterable[str]] = ..., ready_for_founder_confirmation: _Optional[bool] = ..., deadline: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., context_state_revision: _Optional[int] = ...) -> None: ...
+    work_capability: WorkCapabilityView
+    work_capability_selection_source: WorkCapabilitySelectionSource
+    preference_revision_at_resolution: int
+    def __init__(self, snapshot_id: _Optional[str] = ..., snapshot_revision: _Optional[int] = ..., normalized_intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., compiled_context_sha256: _Optional[str] = ..., included_sources: _Optional[_Iterable[_Union[WorkSourceFact, _Mapping]]] = ..., excluded_sources: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., non_goals: _Optional[_Iterable[str]] = ..., allowed_read_paths: _Optional[_Iterable[str]] = ..., allowed_write_paths: _Optional[_Iterable[str]] = ..., allowed_tools: _Optional[_Iterable[str]] = ..., external_resources: _Optional[_Iterable[str]] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., memory_authority_revision: _Optional[int] = ..., memory_pack_snapshot_sha256: _Optional[str] = ..., recovery_entry: _Optional[str] = ..., visibility: _Optional[str] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., confirmation_binding_sha256: _Optional[str] = ..., gate_ready: _Optional[bool] = ..., blockers: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., warnings: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., required_confirmations: _Optional[_Iterable[str]] = ..., evidence_required: _Optional[_Iterable[str]] = ..., ready_for_founder_confirmation: _Optional[bool] = ..., deadline: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., context_state_revision: _Optional[int] = ..., work_capability: _Optional[_Union[WorkCapabilityView, _Mapping]] = ..., work_capability_selection_source: _Optional[_Union[WorkCapabilitySelectionSource, str]] = ..., preference_revision_at_resolution: _Optional[int] = ...) -> None: ...
 
 class PrepareWorkRequest(_message.Message):
-    __slots__ = ("client", "intent", "work_type", "target_scope_ref", "sources", "idempotency_key", "memory_mode")
+    __slots__ = ("client", "intent", "work_type", "target_scope_ref", "sources", "idempotency_key", "memory_mode", "use_default_work_capability", "explicit_work_capability_choice_id")
     CLIENT_FIELD_NUMBER: _ClassVar[int]
     INTENT_FIELD_NUMBER: _ClassVar[int]
     WORK_TYPE_FIELD_NUMBER: _ClassVar[int]
@@ -395,6 +521,8 @@ class PrepareWorkRequest(_message.Message):
     SOURCES_FIELD_NUMBER: _ClassVar[int]
     IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
     MEMORY_MODE_FIELD_NUMBER: _ClassVar[int]
+    USE_DEFAULT_WORK_CAPABILITY_FIELD_NUMBER: _ClassVar[int]
+    EXPLICIT_WORK_CAPABILITY_CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
     client: ClientRequestMetadata
     intent: str
     work_type: str
@@ -402,7 +530,9 @@ class PrepareWorkRequest(_message.Message):
     sources: _containers.RepeatedCompositeFieldContainer[WorkSourceRequest]
     idempotency_key: str
     memory_mode: WorkMemoryMode
-    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., sources: _Optional[_Iterable[_Union[WorkSourceRequest, _Mapping]]] = ..., idempotency_key: _Optional[str] = ..., memory_mode: _Optional[_Union[WorkMemoryMode, str]] = ...) -> None: ...
+    use_default_work_capability: UseDefaultWorkCapability
+    explicit_work_capability_choice_id: str
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., sources: _Optional[_Iterable[_Union[WorkSourceRequest, _Mapping]]] = ..., idempotency_key: _Optional[str] = ..., memory_mode: _Optional[_Union[WorkMemoryMode, str]] = ..., use_default_work_capability: _Optional[_Union[UseDefaultWorkCapability, _Mapping]] = ..., explicit_work_capability_choice_id: _Optional[str] = ...) -> None: ...
 
 class PrepareWorkResponse(_message.Message):
     __slots__ = ("preview", "error")

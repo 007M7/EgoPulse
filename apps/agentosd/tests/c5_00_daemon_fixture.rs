@@ -27,8 +27,10 @@ use egopulse_agentosd::{
     DaemonProviders, DenyVerificationReferences, GovernedReturnCollectorConfig,
     MemoryRetrievalCompositionConfig, NativeHarnessCompositionConfig,
     NativeHarnessCompositionProfile, OwnerProjectionSource, PendingOwnerProjection,
-    ProfiledNativeHarnessComposition, ProjectionPump, ProjectionSourceFailure,
-    SharedAuthorityCompositionInputs, VerificationProjectionSource,
+    ProfiledNativeHarnessComposition, ProjectionPump, ProjectionSourceFailure, ProviderAdmission,
+    ProviderBootstrapProfile, ProviderCatalogSnapshot, ProviderCredentialReference,
+    ProviderHarnessKind, ProviderId, ProviderModelBinding, SharedAuthorityCompositionInputs,
+    VerificationProjectionSource, WorkCapabilityRegistry,
 };
 use egopulse_artifact_authority::{
     ArtifactAuthority, ArtifactAuthorityConfig, ArtifactPrincipalKind, ArtifactSqlCipherKey,
@@ -105,7 +107,8 @@ use egopulse_domain_contracts::v01::egopulse::{
     task::v1::{
         ActivateTaskCommand, ApplyFounderVerdictCommand, CreateTaskCommand,
         RecordTaskVerificationCommand, RequestTaskCancellationCommand, SubmitTaskEvidenceCommand,
-        TaskCommand, TaskCommandResult, TaskEvent, TaskSnapshot, TaskStatus, task_command,
+        TaskCommand, TaskCommandResult, TaskEvent, TaskSnapshot, TaskStatus,
+        WorkCapabilityRouteBinding, task_command,
     },
     verdict::v1::{
         ConfirmationClass, ConsumeFounderVerdictCommand, FounderVerdictDecision,
@@ -179,7 +182,7 @@ use egopulse_tui::{
 use egopulse_v01_fault_conformance::memory_restart_oracle::MemoryRestartOracle;
 use egopulse_v01_fault_conformance::r8b2c::{
     R8b2cNativeEventRecord, R8b2cWitnessReader, R8b2cWitnessWriter, read_r8b2c_adapter_store,
-    read_r8b2c_collaboration_store, read_r8b2c_task_store,
+    read_r8b2c_collaboration_store, read_r8b2c_task_store, read_single_r8b2c_adapter_dispatch_id,
 };
 use egopulse_v01_fault_conformance::r9a3::{
     PROTOCOL_VERSION as R9A3_PROTOCOL_VERSION, SendAck as R9a3SendAck,
@@ -912,7 +915,10 @@ fn r9a3d_request(
 ) -> R9a3SendRequest {
     R9a3SendRequest {
         protocol_version: R9A3_PROTOCOL_VERSION,
-        operation_id: format!("operation-r9a3d-{}", envelope.dispatch_id),
+        operation_id: format!(
+            "operation:r9a3d:{:x}",
+            Sha256::digest(envelope.dispatch_id.as_bytes())
+        ),
         dispatch_id: envelope.dispatch_id.clone(),
         attempt_id: envelope.attempt_id.clone(),
         fencing_token: envelope.fencing_token,
@@ -1599,7 +1605,12 @@ impl HarnessDispatchRunner for R8b2cCheckpointRunner {
                 ),
             };
             if reached {
-                publish_r8b2c_checkpoint(&self.root, &self.instance, "r8a-dispatch", phase);
+                let dispatch_id = read_single_r8b2c_adapter_dispatch_id(
+                    &self.root.join("r8a-adapter.db"),
+                    &[0x32; 32],
+                )
+                .expect("read the sole routed dispatch for the runner checkpoint");
+                publish_r8b2c_checkpoint(&self.root, &self.instance, &dispatch_id, phase);
                 if block {
                     std::future::pending::<()>().await;
                     unreachable!("R-8B.2c runner checkpoint is permanently blocked");
@@ -3307,6 +3318,79 @@ fn r8a_native_config(root: &Path) -> NativeHarnessCompositionConfig {
     }
 }
 
+fn fixture_work_capability(
+    root: &Path,
+    native: &NativeHarnessCompositionConfig,
+) -> (Arc<WorkCapabilityRegistry>, WorkCapabilityRouteBinding) {
+    let (provider_profile_id, catalog_digest) = match fixture_mode().as_str() {
+        M13_MEMORY_DISPATCH_MODE => ("gpt-codex-m13-fixture", "68".repeat(32)),
+        R9C_CONTENT_MODE => ("gpt-codex-r9c-fixture", "67".repeat(32)),
+        _ => ("gpt-codex-r8a-fixture", "66".repeat(32)),
+    };
+    let model = native
+        .default_model
+        .clone()
+        .expect("C5 native fixture exact model");
+    let route = egopulse_domain_contracts::work_capability::seal_work_capability_route_binding(
+        WorkCapabilityRouteBinding {
+            route_id: format!("route:{provider_profile_id}:v1"),
+            route_generation: 1,
+            provider_profile_id: provider_profile_id.to_owned(),
+            provider_id: "gpt".to_owned(),
+            harness_id: "codex_app_server".to_owned(),
+            harness_model_id: model.clone(),
+            provider_model_id: model.clone(),
+            capability_profile_ref: Some(native.workflow.capability_profile_ref.clone()),
+            catalog_snapshot_sha256: Some(catalog_digest.clone()),
+            native_composition_generation: native.workflow.run_id.clone(),
+            route_binding_sha256: String::new(),
+        },
+    )
+    .expect("seal C5 fixture work-capability route");
+    let profile = ProviderBootstrapProfile {
+        profile_id: provider_profile_id.to_owned(),
+        provider: ProviderId::Gpt,
+        harness: ProviderHarnessKind::CodexAppServer,
+        admission: ProviderAdmission::Production,
+        models: vec![ProviderModelBinding {
+            harness_model_id: model.clone(),
+            provider_model_id: model.clone(),
+        }],
+        catalog_snapshot: Some(ProviderCatalogSnapshot {
+            source: "fixture://c5/provider-catalog".to_owned(),
+            fetched_at: "2026-09-05T00:00:00Z".to_owned(),
+            harness_version: "fixture".to_owned(),
+            evidence_digest_sha256: catalog_digest,
+        }),
+        exact_model: model,
+        executable: PathBuf::from("fixture-codex.exe"),
+        credential: ProviderCredentialReference::HarnessAccount,
+        hold_reason: None,
+    };
+    let registry = WorkCapabilityRegistry::new(
+        root.join("fixture-agentos-config.json"),
+        &[profile],
+        route.clone(),
+        "fixture-codex".to_owned(),
+        1,
+        false,
+    )
+    .expect("build C5 fixture work-capability registry");
+    (Arc::new(registry), route)
+}
+
+fn routed_fixture_composition<D>(
+    native: NativeHarnessCompositionConfig,
+    driver: D,
+    route: WorkCapabilityRouteBinding,
+) -> ProfiledNativeHarnessComposition
+where
+    D: NativeHarnessDriver + Send + 'static,
+{
+    let profile = r9c_native_profile(&native);
+    ProfiledNativeHarnessComposition::new(native, profile, driver).with_work_capability_route(route)
+}
+
 fn r9c_native_profile(native: &NativeHarnessCompositionConfig) -> NativeHarnessCompositionProfile {
     let required = native.workflow.capability_profile_ref.clone();
     let observed_protocol = codex_protocol_fingerprint();
@@ -3476,6 +3560,7 @@ fn u03c_seed_task_ready(authority: &mut TaskAuthority) -> TaskSnapshot {
                 target_scope_ref: "scope:u03c-result".to_owned(),
                 acceptance_contract_ref: Some(r8a_reference("u03c-acceptance")),
                 budget_profile_ref: Some(r8a_reference("u03c-budget")),
+                work_capability_route: None,
             })),
         },
         &u03c_task_principal(TaskPrincipalKind::Founder, "founder:u03c"),
@@ -4898,6 +4983,8 @@ where
         .with_memory_retrieval(Arc::clone(&memory), memory_worker_config())
         .expect("fixture Memory retrieval should configure")
         .with_memory_mutation(memory, Arc::new(FixtureAuthorityPrincipalResolver));
+    let native = r8a_native_config(root);
+    let (work_capability_registry, work_capability_route) = fixture_work_capability(root, &native);
     let mut work_port = ConfiguredWorkPreparationPort::new(
         Arc::clone(&context),
         Arc::clone(&providers.task_port),
@@ -4915,7 +5002,8 @@ where
             sha256: "55".repeat(32),
         },
     )
-    .expect("fixture Work Preparation should configure");
+    .expect("fixture Work Preparation should configure")
+    .with_work_capability_registry(Arc::clone(&work_capability_registry));
     if dynamic_fixture_mode() {
         work_port = work_port
             .with_input_bundle_root(root.join("input-bundles"))
@@ -4937,6 +5025,7 @@ where
     };
     let providers = providers
         .with_work_preparation_port(work_port)
+        .with_work_capability_port(work_capability_registry)
         .with_context_authority(Arc::clone(&context))
         .with_context_mutation(Arc::new(ContextMutationPortAdapter::new(
             Arc::clone(&context),
@@ -4946,7 +5035,6 @@ where
         return providers;
     }
 
-    let native = r8a_native_config(root);
     fs::create_dir_all(root.join(&native.workflow.workspace_ref))
         .expect("R-8A governed workspace should exist");
     let (artifact, verification) = r8a_authorities(root, &native.return_collector);
@@ -4954,7 +5042,10 @@ where
     let providers = if mode == M13_MEMORY_DISPATCH_MODE {
         providers
             .with_profiled_native_harness_drivers(
-                vec![m13_profiled_composition(native, root)],
+                vec![
+                    m13_profiled_composition(native, root)
+                        .with_work_capability_route(work_capability_route.clone()),
+                ],
                 artifact,
                 verification,
             )
@@ -4962,7 +5053,10 @@ where
     } else if mode == R9C_CONTENT_MODE {
         providers
             .with_profiled_native_harness_drivers(
-                vec![r9c_profiled_composition(native, root)],
+                vec![
+                    r9c_profiled_composition(native, root)
+                        .with_work_capability_route(work_capability_route.clone()),
+                ],
                 artifact,
                 verification,
             )
@@ -4974,29 +5068,38 @@ where
             R8b2cDriverMode::Recover
         };
         providers
-            .with_native_harness_driver(
-                native,
+            .with_profiled_native_harness_drivers(
+                vec![routed_fixture_composition(
+                    native,
+                    R8b2cFixtureDriver::new(root, &fixture_instance(), driver_mode),
+                    work_capability_route.clone(),
+                )],
                 artifact,
                 verification,
-                R8b2cFixtureDriver::new(root, &fixture_instance(), driver_mode),
             )
             .expect("R-8B.2c native Harness composition")
     } else if r9a3d_fixture_mode() {
         providers
-            .with_native_harness_driver(
-                native,
+            .with_profiled_native_harness_drivers(
+                vec![routed_fixture_composition(
+                    native,
+                    R9a3dFixtureDriver::from_environment(),
+                    work_capability_route.clone(),
+                )],
                 artifact,
                 verification,
-                R9a3dFixtureDriver::from_environment(),
             )
             .expect("R-9A.3d native Harness composition")
     } else {
         providers
-            .with_native_harness_driver(
-                native,
+            .with_profiled_native_harness_drivers(
+                vec![routed_fixture_composition(
+                    native,
+                    RecordingFixtureDriver::new(root),
+                    work_capability_route,
+                )],
                 artifact,
                 verification,
-                RecordingFixtureDriver::new(root),
             )
             .expect("R-8A native Harness composition")
     };
@@ -5608,9 +5711,36 @@ async fn wait_for_r9a3d_task(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RoutedWorkIds {
+    run_id: String,
+    attempt_id: String,
+    dispatch_id: String,
+}
+
+impl RoutedWorkIds {
+    fn from_preview(preview: &serde_json::Value, task_id: &str) -> Self {
+        let route_binding_sha256 = preview["data"]["workCapability"]["routeBindingSha256"]
+            .as_str()
+            .expect("admitted work-capability route binding");
+        assert_eq!(route_binding_sha256.len(), 64);
+        assert!(
+            route_binding_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+        Self {
+            run_id: format!("run:work:{task_id}:{route_binding_sha256}"),
+            attempt_id: format!("attempt:work:{task_id}:{route_binding_sha256}"),
+            dispatch_id: format!("dispatch:work:{task_id}:{route_binding_sha256}"),
+        }
+    }
+}
+
 struct R8b2cPreparedWork {
     task_id: String,
     snapshot_id: String,
+    routed_ids: RoutedWorkIds,
 }
 
 async fn prepare_and_confirm_r8b2c_work(
@@ -5692,9 +5822,11 @@ async fn prepare_and_confirm_r8b2c_work(
         .as_str()
         .expect("R-8B.2c Task id")
         .to_owned();
+    let routed_ids = RoutedWorkIds::from_preview(&prepared, &task_id);
     R8b2cPreparedWork {
         task_id,
         snapshot_id,
+        routed_ids,
     }
 }
 
@@ -5747,13 +5879,16 @@ struct R8b2cTaskOracle {
     event_count: u64,
 }
 
-fn read_r8b2c_collaboration_oracle(root: &Path) -> R8b2cCollaborationOracle {
+fn read_r8b2c_collaboration_oracle(
+    root: &Path,
+    routed_ids: &RoutedWorkIds,
+) -> R8b2cCollaborationOracle {
     let stored = read_r8b2c_collaboration_store(
         &root.join("r8a-collaboration.db"),
         &[0x31; 32],
-        R8A_ACTIVATION_RUN_ID,
+        &routed_ids.run_id,
         "r8a-step",
-        "r8a-attempt",
+        &routed_ids.attempt_id,
     )
     .expect("read R-8B.2c Collaboration store through conformance boundary");
     let run =
@@ -5770,10 +5905,10 @@ fn read_r8b2c_collaboration_oracle(root: &Path) -> R8b2cCollaborationOracle {
     assert_eq!(attempt.status, stored.attempt_status);
     let envelope =
         DispatchEnvelope::decode(stored.envelope.as_slice()).expect("decode R-8B.2c envelope");
-    assert_eq!(envelope.run_id, R8A_ACTIVATION_RUN_ID);
+    assert_eq!(envelope.run_id, routed_ids.run_id);
     assert_eq!(envelope.step_id, "r8a-step");
-    assert_eq!(envelope.attempt_id, "r8a-attempt");
-    assert_eq!(envelope.dispatch_id, "r8a-dispatch");
+    assert_eq!(envelope.attempt_id, routed_ids.attempt_id);
+    assert_eq!(envelope.dispatch_id, routed_ids.dispatch_id);
     R8b2cCollaborationOracle {
         run,
         step,
@@ -5847,10 +5982,13 @@ struct R8b2cAdapterOracle {
     observations: Vec<R8b2cAdapterObservationOracle>,
 }
 
-fn read_r8b2c_adapter_oracle(root: &Path) -> R8b2cAdapterOracle {
-    let stored =
-        read_r8b2c_adapter_store(&root.join("r8a-adapter.db"), &[0x32; 32], "r8a-dispatch")
-            .expect("read R-8B.2c Adapter store through conformance boundary");
+fn read_r8b2c_adapter_oracle(root: &Path, routed_ids: &RoutedWorkIds) -> R8b2cAdapterOracle {
+    let stored = read_r8b2c_adapter_store(
+        &root.join("r8a-adapter.db"),
+        &[0x32; 32],
+        &routed_ids.dispatch_id,
+    )
+    .expect("read R-8B.2c Adapter store through conformance boundary");
     let envelope_bytes = stored.envelope.clone();
     let envelope = DispatchEnvelope::decode(envelope_bytes.as_slice())
         .expect("decode R-8B.2c Adapter dispatch envelope");
@@ -9738,6 +9876,7 @@ async fn r8a_cli_prepare_tui_confirm_dispatches_context_material_once() {
         .as_str()
         .expect("R-8A confirmed task id")
         .to_owned();
+    let routed_ids = RoutedWorkIds::from_preview(&prepare_json, &task_id);
     assert_eq!(
         confirm_json["data"]["status"],
         TaskStatus::Active.as_str_name()
@@ -9761,10 +9900,10 @@ async fn r8a_cli_prepare_tui_confirm_dispatches_context_material_once() {
         driver_record.expect("R-8A driver must receive a governed dispatch after activation");
     let expected_bundle_ref = format!("ctx-{compiled_digest}.json");
     assert_eq!(driver_record["dispatchCount"], 1);
-    assert_eq!(driver_record["runId"], R8A_ACTIVATION_RUN_ID);
+    assert_eq!(driver_record["runId"], routed_ids.run_id);
     assert_eq!(driver_record["stepId"], "r8a-step");
-    assert_eq!(driver_record["attemptId"], "r8a-attempt");
-    assert_eq!(driver_record["dispatchId"], "r8a-dispatch");
+    assert_eq!(driver_record["attemptId"], routed_ids.attempt_id);
+    assert_eq!(driver_record["dispatchId"], routed_ids.dispatch_id);
     assert_eq!(driver_record["inputBundleRef"], expected_bundle_ref);
     assert_eq!(driver_record["workspaceRef"], "workspace-r8a");
     assert_eq!(driver_record["envelopeInputBundleSha256"], compiled_digest);
@@ -9802,7 +9941,7 @@ async fn r8a_cli_prepare_tui_confirm_dispatches_context_material_once() {
     let task_view = task_view.expect("R-8A active Task projection");
     assert_eq!(task_view["data"]["taskId"], task_id);
     assert_eq!(
-        task_view["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID,
+        task_view["data"]["currentRunId"], routed_ids.run_id,
         "Task activation and governed dispatch must share the same run identity"
     );
     assert_eq!(
@@ -9936,6 +10075,7 @@ async fn r8b_activation_outbox_survives_daemon_kill_and_dispatches_once_after_re
         .as_str()
         .expect("R-8B.1 confirmed task id")
         .to_owned();
+    let routed_ids = RoutedWorkIds::from_preview(&prepare_json, &task_id);
     assert_eq!(
         confirm_json["data"]["status"],
         TaskStatus::Active.as_str_name()
@@ -9957,7 +10097,7 @@ async fn r8b_activation_outbox_survives_daemon_kill_and_dispatches_once_after_re
         active_before_restart.expect("R-8B.1 Task must be Active before daemon termination");
     assert_eq!(
         active_before_restart["data"]["currentRunId"],
-        R8A_ACTIVATION_RUN_ID
+        routed_ids.run_id
     );
     let driver_record_path = root.join(R8A_DRIVER_RECORD);
     assert!(
@@ -9990,10 +10130,10 @@ async fn r8b_activation_outbox_survives_daemon_kill_and_dispatches_once_after_re
     }
     let driver_record = driver_record.expect("R-8B.1 restart must dispatch the pending activation");
     assert_eq!(driver_record["dispatchCount"], 1);
-    assert_eq!(driver_record["runId"], R8A_ACTIVATION_RUN_ID);
+    assert_eq!(driver_record["runId"], routed_ids.run_id);
     assert_eq!(driver_record["stepId"], "r8a-step");
-    assert_eq!(driver_record["attemptId"], "r8a-attempt");
-    assert_eq!(driver_record["dispatchId"], "r8a-dispatch");
+    assert_eq!(driver_record["attemptId"], routed_ids.attempt_id);
+    assert_eq!(driver_record["dispatchId"], routed_ids.dispatch_id);
     assert_eq!(
         driver_record["inputBundleRef"],
         format!("ctx-{compiled_digest}.json")
@@ -10024,7 +10164,7 @@ async fn r8b_activation_outbox_survives_daemon_kill_and_dispatches_once_after_re
     assert_eq!(active_after_restart["data"]["taskId"], task_id);
     assert_eq!(
         active_after_restart["data"]["currentRunId"],
-        R8A_ACTIVATION_RUN_ID
+        routed_ids.run_id
     );
 
     drop(restarted.stdin.take());
@@ -10190,6 +10330,7 @@ async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without
         .as_str()
         .expect("R-9A.3e task id")
         .to_owned();
+    let routed_ids = RoutedWorkIds::from_preview(&prepared, &task_id);
     assert_eq!(
         confirmed["data"]["status"],
         TaskStatus::Active.as_str_name()
@@ -10213,7 +10354,7 @@ async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without
     wait_for_r8b2c_checkpoint(
         &root,
         &instance,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
         R9A3E_PREAUTH_UNAVAILABLE_PHASE,
         &mut daemon_one,
     )
@@ -10221,7 +10362,7 @@ async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without
     assert!(!bundle_path.exists());
     assert!(!root.join(R8A_DRIVER_RECORD).exists());
 
-    let adapter_before_revoke = read_r8b2c_adapter_oracle(&root);
+    let adapter_before_revoke = read_r8b2c_adapter_oracle(&root, &routed_ids);
     assert_eq!(adapter_before_revoke.dispatch_count, 1);
     assert_eq!(adapter_before_revoke.dispatch_state, "prepared");
     assert_eq!(adapter_before_revoke.delivery_unknown_count, 0);
@@ -10229,7 +10370,7 @@ async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without
     assert_eq!(adapter_before_revoke.pending_observation_count, 0);
     assert!(adapter_before_revoke.receipt.is_none());
     assert!(adapter_before_revoke.receipt_bytes.is_none());
-    let collaboration_before_revoke = read_r8b2c_collaboration_oracle(&root);
+    let collaboration_before_revoke = read_r8b2c_collaboration_oracle(&root, &routed_ids);
     assert_eq!(collaboration_before_revoke.outbox_state, "pending");
     assert_eq!(
         collaboration_before_revoke.attempt.status,
@@ -10242,7 +10383,7 @@ async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without
     );
     assert_eq!(
         task_before_revoke.snapshot.current_run_id.as_deref(),
-        Some(R8A_ACTIVATION_RUN_ID)
+        Some(routed_ids.run_id.as_str())
     );
     let verdict_before_revoke = read_empty_r9a3_verdict_oracle(&root);
     let context_before_revoke = read_r9a3_context_authority_store(
@@ -10250,7 +10391,7 @@ async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without
         &[0x15; 32],
         "c5-context-epoch",
         &snapshot_id,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
     )
     .expect("read R-9A.3e Context before revoke");
     assert_eq!(
@@ -10334,7 +10475,7 @@ async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without
         &[0x15; 32],
         "c5-context-epoch",
         &snapshot_id,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
     )
     .expect("read R-9A.3e Context after revoke");
     assert_eq!(
@@ -10352,9 +10493,12 @@ async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without
     );
     assert!(context_after_revoke.dispatch_authorization.is_none());
     assert_eq!(context_after_revoke.counts.authorization_count, 0);
-    assert_eq!(read_r8b2c_adapter_oracle(&root), adapter_before_revoke);
     assert_eq!(
-        read_r8b2c_collaboration_oracle(&root),
+        read_r8b2c_adapter_oracle(&root, &routed_ids),
+        adapter_before_revoke
+    );
+    assert_eq!(
+        read_r8b2c_collaboration_oracle(&root, &routed_ids),
         collaboration_before_revoke
     );
     assert_eq!(read_r8b2c_task_oracle(&root, &task_id), task_before_revoke);
@@ -10397,7 +10541,7 @@ async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without
     wait_for_r8b2c_checkpoint(
         &root,
         &instance,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
         R9A3E_REVOKED_READY_PHASE,
         &mut daemon_two,
     )
@@ -10409,14 +10553,17 @@ async fn r9a3e_revoke_before_context_authorization_blocks_ready_dispatch_without
             &[0x15; 32],
             "c5-context-epoch",
             &snapshot_id,
-            "r8a-dispatch",
+            &routed_ids.dispatch_id,
         )
         .expect("read R-9A.3e Context after D2 Ready rejection"),
         context_after_revoke
     );
-    assert_eq!(read_r8b2c_adapter_oracle(&root), adapter_before_revoke);
     assert_eq!(
-        read_r8b2c_collaboration_oracle(&root),
+        read_r8b2c_adapter_oracle(&root, &routed_ids),
+        adapter_before_revoke
+    );
+    assert_eq!(
+        read_r8b2c_collaboration_oracle(&root, &routed_ids),
         collaboration_before_revoke
     );
     let task_after_ready_rejection = read_r8b2c_task_oracle(&root, &task_id);
@@ -10561,6 +10708,7 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         .as_str()
         .expect("R-9A.3d Task id")
         .to_owned();
+    let routed_ids = RoutedWorkIds::from_preview(&prepared, &task_id);
     assert!(
         confirmed["data"]["status"] == TaskStatus::Ready.as_str_name()
             || confirmed["data"]["status"] == TaskStatus::Active.as_str_name(),
@@ -10570,7 +10718,7 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
 
     let active =
         wait_for_r9a3d_task(&instance, &task_id, TaskStatus::Active, &mut daemon_one).await;
-    assert_eq!(active["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID);
+    assert_eq!(active["data"]["currentRunId"], routed_ids.run_id);
 
     let committed: R9a3dRequestEvidence = wait_for_r9a3d_json(
         &r9a3d_path(root.path(), R9A3D_COMMITTED_FILE),
@@ -10583,8 +10731,8 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
     assert_eq!(committed.fixture_instance, witness_instance);
     assert_eq!(committed.phase, "effect-committed-before-ack");
     assert_eq!(committed.send_count, 1);
-    assert_eq!(committed.dispatch_id, "r8a-dispatch");
-    assert_eq!(committed.attempt_id, "r8a-attempt");
+    assert_eq!(committed.dispatch_id, routed_ids.dispatch_id);
+    assert_eq!(committed.attempt_id, routed_ids.attempt_id);
     assert_eq!(committed.payload_digest_sha256, compiled_digest);
     let request = committed.request();
 
@@ -10673,7 +10821,7 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         &[0x15; 32],
         "c5-context-epoch",
         &snapshot_id,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
     )
     .expect("read R-9A.3d Context authority before restart");
     assert_eq!(
@@ -10694,8 +10842,14 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         .as_ref()
         .expect("R-9A.3d dispatch authorization exists before restart");
     assert_eq!(authorization_before_restart.snapshot_id, snapshot_id);
-    assert_eq!(authorization_before_restart.dispatch_id, "r8a-dispatch");
-    assert_eq!(authorization_before_restart.attempt_id, "r8a-attempt");
+    assert_eq!(
+        authorization_before_restart.dispatch_id,
+        routed_ids.dispatch_id
+    );
+    assert_eq!(
+        authorization_before_restart.attempt_id,
+        routed_ids.attempt_id
+    );
     assert_eq!(
         authorization_before_restart.input_digest_sha256,
         compiled_digest
@@ -10748,22 +10902,25 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         &[0x15; 32],
         "c5-context-epoch",
         &snapshot_id,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
     )
     .expect("reopen R-9A.3d Context authority after D1 kill");
     assert_eq!(context_after_kill, context_before_restart);
 
-    let adapter_after_kill = read_r8b2c_adapter_oracle(root.path());
+    let adapter_after_kill = read_r8b2c_adapter_oracle(root.path(), &routed_ids);
     assert_eq!(adapter_after_kill.dispatch_count, 1);
     assert_eq!(adapter_after_kill.delivery_unknown_count, 1);
     assert_eq!(adapter_after_kill.observation_count, 0);
     assert_eq!(adapter_after_kill.pending_observation_count, 0);
     assert_eq!(adapter_after_kill.dispatch_state, "delivery_unknown");
-    assert_eq!(adapter_after_kill.dispatch_attempt_id, "r8a-attempt");
+    assert_eq!(
+        adapter_after_kill.dispatch_attempt_id,
+        routed_ids.attempt_id
+    );
     assert!(adapter_after_kill.receipt.is_none());
     assert!(adapter_after_kill.receipt_bytes.is_none());
 
-    let collaboration_after_kill = read_r8b2c_collaboration_oracle(root.path());
+    let collaboration_after_kill = read_r8b2c_collaboration_oracle(root.path(), &routed_ids);
     assert_eq!(collaboration_after_kill.outbox_state, "pending");
     assert_eq!(
         collaboration_after_kill.run.status,
@@ -10775,17 +10932,17 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
     );
     assert_eq!(
         collaboration_after_kill.step.attempt_ids,
-        vec!["r8a-attempt"]
+        vec![routed_ids.attempt_id.clone()]
     );
     assert_eq!(
         collaboration_after_kill.step.current_attempt_id.as_deref(),
-        Some("r8a-attempt")
+        Some(routed_ids.attempt_id.as_str())
     );
-    assert_eq!(collaboration_after_kill.attempt.attempt_id, "r8a-attempt");
     assert_eq!(
-        collaboration_after_kill.attempt.run_id,
-        R8A_ACTIVATION_RUN_ID
+        collaboration_after_kill.attempt.attempt_id,
+        routed_ids.attempt_id
     );
+    assert_eq!(collaboration_after_kill.attempt.run_id, routed_ids.run_id);
     assert_eq!(collaboration_after_kill.attempt.step_id, "r8a-step");
     assert!(collaboration_after_kill.attempt.attempt_number > 0);
     assert_eq!(
@@ -10794,7 +10951,7 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
     );
     assert_eq!(
         collaboration_after_kill.attempt.dispatch_id.as_deref(),
-        Some("r8a-dispatch")
+        Some(routed_ids.dispatch_id.as_str())
     );
     let original_attempt_number = collaboration_after_kill.attempt.attempt_number;
 
@@ -10802,7 +10959,7 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
     assert_eq!(task_after_kill.snapshot.status, TaskStatus::Active as i32);
     assert_eq!(
         task_after_kill.snapshot.current_run_id.as_deref(),
-        Some(R8A_ACTIVATION_RUN_ID)
+        Some(routed_ids.run_id.as_str())
     );
     assert_ne!(
         task_after_kill.snapshot.status,
@@ -10843,13 +11000,13 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         &mut daemon_two,
     )
     .await;
-    assert_eq!(interrupted["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID);
+    assert_eq!(interrupted["data"]["currentRunId"], routed_ids.run_id);
     assert_ne!(
         interrupted["data"]["status"],
         TaskStatus::Completed.as_str_name()
     );
 
-    let adapter_after_recovery = read_r8b2c_adapter_oracle(root.path());
+    let adapter_after_recovery = read_r8b2c_adapter_oracle(root.path(), &routed_ids);
     assert_eq!(adapter_after_recovery.dispatch_count, 1);
     assert_eq!(adapter_after_recovery.delivery_unknown_count, 1);
     assert_eq!(adapter_after_recovery.observation_count, 1);
@@ -10857,16 +11014,22 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
     let reconciliation_observation = &adapter_after_recovery.observations[0];
     assert_eq!(
         reconciliation_observation.native_key,
-        "reconciliation:adapter-reconciliation:r8a-dispatch"
+        format!(
+            "reconciliation:adapter-reconciliation:{}",
+            routed_ids.dispatch_id
+        )
     );
-    assert_eq!(reconciliation_observation.dispatch_id, "r8a-dispatch");
+    assert_eq!(
+        reconciliation_observation.dispatch_id,
+        routed_ids.dispatch_id
+    );
     assert!(!reconciliation_observation.raw_event.is_empty());
     assert!(matches!(
         reconciliation_observation.observation.payload,
         Some(harness_observation::Payload::Diagnostic(ref diagnostic))
             if diagnostic.safe_diagnostic_code == "ADAPTER_RECONCILIATION_OUTCOME_UNKNOWN"
     ));
-    let collaboration_after_recovery = read_r8b2c_collaboration_oracle(root.path());
+    let collaboration_after_recovery = read_r8b2c_collaboration_oracle(root.path(), &routed_ids);
     assert_eq!(collaboration_after_recovery.outbox_state, "held");
     assert_eq!(
         collaboration_after_recovery.run.status,
@@ -10886,22 +11049,22 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
     );
     assert_eq!(
         collaboration_after_recovery.step.attempt_ids,
-        vec!["r8a-attempt"]
+        vec![routed_ids.attempt_id.clone()]
     );
     assert_eq!(
         collaboration_after_recovery
             .step
             .current_attempt_id
             .as_deref(),
-        Some("r8a-attempt")
+        Some(routed_ids.attempt_id.as_str())
     );
     assert_eq!(
         collaboration_after_recovery.attempt.attempt_id,
-        "r8a-attempt"
+        routed_ids.attempt_id
     );
     assert_eq!(
         collaboration_after_recovery.attempt.run_id,
-        R8A_ACTIVATION_RUN_ID
+        routed_ids.run_id
     );
     assert_eq!(collaboration_after_recovery.attempt.step_id, "r8a-step");
     assert_eq!(
@@ -10927,7 +11090,7 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         &[0x15; 32],
         "c5-context-epoch",
         &snapshot_id,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
     )
     .expect("read R-9A.3d Context authority after recovery");
     assert_eq!(
@@ -10949,27 +11112,27 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
     assert_eq!(stable.fixture_instance, instance);
     assert_eq!(stable.phase, "stable-cycle");
     assert_eq!(
-        read_r8b2c_adapter_oracle(root.path()),
+        read_r8b2c_adapter_oracle(root.path(), &routed_ids),
         adapter_after_recovery
     );
-    let collaboration_after_stable = read_r8b2c_collaboration_oracle(root.path());
+    let collaboration_after_stable = read_r8b2c_collaboration_oracle(root.path(), &routed_ids);
     assert_eq!(collaboration_after_stable, collaboration_after_recovery);
     assert_eq!(
         collaboration_after_stable.step.attempt_ids,
-        vec!["r8a-attempt"]
+        vec![routed_ids.attempt_id.clone()]
     );
     assert_eq!(
         collaboration_after_stable
             .step
             .current_attempt_id
             .as_deref(),
-        Some("r8a-attempt")
+        Some(routed_ids.attempt_id.as_str())
     );
-    assert_eq!(collaboration_after_stable.attempt.attempt_id, "r8a-attempt");
     assert_eq!(
-        collaboration_after_stable.attempt.run_id,
-        R8A_ACTIVATION_RUN_ID
+        collaboration_after_stable.attempt.attempt_id,
+        routed_ids.attempt_id
     );
+    assert_eq!(collaboration_after_stable.attempt.run_id, routed_ids.run_id);
     assert_eq!(collaboration_after_stable.attempt.step_id, "r8a-step");
     assert_eq!(
         collaboration_after_stable.attempt.attempt_number,
@@ -10984,7 +11147,7 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         &[0x15; 32],
         "c5-context-epoch",
         &snapshot_id,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
     )
     .expect("read R-9A.3d Context authority after stable recovery cycle");
     assert_eq!(context_after_stable, context_after_recovery);
@@ -11030,23 +11193,23 @@ async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll(
     let instance = format!("r8b2c-begin-{}", Uuid::now_v7());
     let mut child = spawn_fixture_with_mode(&root, &instance, R8B2C_BEGIN_DELIVERY_MODE).await;
     wait_for_cli_status_with_child(&instance, &mut child).await;
-    let prepared = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-begin").await;
-    let task_id = prepared.task_id;
+    let R8b2cPreparedWork {
+        task_id,
+        snapshot_id: _,
+        routed_ids,
+    } = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-begin").await;
 
     wait_for_r8b2c_checkpoint(
         &root,
         &instance,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
         R8B2C_BEGIN_DELIVERY_PHASE,
         &mut child,
     )
     .await;
     let task_before_kill =
         wait_for_r8b2c_task_status(&instance, &task_id, TaskStatus::Active, &mut child).await;
-    assert_eq!(
-        task_before_kill["data"]["currentRunId"],
-        R8A_ACTIVATION_RUN_ID
-    );
+    assert_eq!(task_before_kill["data"]["currentRunId"], routed_ids.run_id);
 
     let witness = R8b2cWitnessOracle::open_existing(&root, &instance);
     assert_eq!(witness.ledger_count("send_dispatch"), 1);
@@ -11054,11 +11217,11 @@ async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll(
     assert_eq!(witness.ledger_count("reconcile"), 0);
     assert_eq!(witness.ledger_count("ack_emitted"), 0);
     assert_eq!(
-        witness.native_event_state("r8a-dispatch"),
+        witness.native_event_state(&routed_ids.dispatch_id),
         Some(("pending".to_owned(), 0))
     );
 
-    let adapter = read_r8b2c_adapter_oracle(&root);
+    let adapter = read_r8b2c_adapter_oracle(&root, &routed_ids);
     assert_eq!(adapter.dispatch_count, 1);
     assert_eq!(adapter.delivery_unknown_count, 1);
     assert_eq!(adapter.observation_count, 0);
@@ -11066,9 +11229,9 @@ async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll(
     assert_eq!(adapter.dispatch_state, "delivery_unknown");
     assert!(adapter.receipt.is_none());
     assert!(adapter.receipt_bytes.is_none());
-    assert_eq!(adapter.envelope.dispatch_id, "r8a-dispatch");
+    assert_eq!(adapter.envelope.dispatch_id, routed_ids.dispatch_id);
 
-    let collaboration = read_r8b2c_collaboration_oracle(&root);
+    let collaboration = read_r8b2c_collaboration_oracle(&root, &routed_ids);
     assert_eq!(collaboration.outbox_state, "pending");
     assert_eq!(collaboration.run.status, RunStatus::Active as i32);
     assert_eq!(collaboration.step.status, StepStatus::Active as i32);
@@ -11089,7 +11252,7 @@ async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll(
     wait_for_r8b2c_checkpoint(
         &root,
         &instance,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
         R8B2C_UNKNOWN_RECOVERED_PHASE,
         &mut restarted,
     )
@@ -11098,17 +11261,17 @@ async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll(
     let interrupted =
         wait_for_r8b2c_task_status(&instance, &task_id, TaskStatus::Interrupted, &mut restarted)
             .await;
-    assert_eq!(interrupted["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID);
+    assert_eq!(interrupted["data"]["currentRunId"], routed_ids.run_id);
     assert_eq!(witness.ledger_count("send_dispatch"), 1);
     assert_eq!(witness.ledger_count("next_event"), 0);
     assert_eq!(witness.ledger_count("reconcile"), 1);
     assert_eq!(witness.ledger_count("ack_emitted"), 0);
     assert_eq!(
-        witness.native_event_state("r8a-dispatch"),
+        witness.native_event_state(&routed_ids.dispatch_id),
         Some(("pending".to_owned(), 0))
     );
 
-    let adapter = read_r8b2c_adapter_oracle(&root);
+    let adapter = read_r8b2c_adapter_oracle(&root, &routed_ids);
     assert_eq!(adapter.dispatch_count, 1);
     assert_eq!(adapter.delivery_unknown_count, 1);
     assert_eq!(adapter.observation_count, 1);
@@ -11121,13 +11284,16 @@ async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll(
         DeliveryDisposition::try_from(unknown_receipt.disposition),
         Ok(DeliveryDisposition::Unknown)
     );
-    let reconciliation_key = "reconciliation:adapter-reconciliation:r8a-dispatch";
+    let reconciliation_key = format!(
+        "reconciliation:adapter-reconciliation:{}",
+        routed_ids.dispatch_id
+    );
     let reconciliation = adapter
         .observations
         .iter()
         .find(|observation| observation.native_key == reconciliation_key)
         .expect("OutcomeUnknown reconciliation evidence must be durable");
-    assert_eq!(reconciliation.dispatch_id, "r8a-dispatch");
+    assert_eq!(reconciliation.dispatch_id, routed_ids.dispatch_id);
     assert_eq!(reconciliation.ingestion_state, "pending");
     assert!(!reconciliation.raw_event.is_empty());
     assert!(matches!(
@@ -11135,7 +11301,7 @@ async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll(
         Some(harness_observation::Payload::Diagnostic(ref diagnostic))
             if diagnostic.safe_diagnostic_code == "ADAPTER_RECONCILIATION_OUTCOME_UNKNOWN"
     ));
-    let collaboration = read_r8b2c_collaboration_oracle(&root);
+    let collaboration = read_r8b2c_collaboration_oracle(&root, &routed_ids);
     assert_eq!(collaboration.outbox_state, "held");
     assert_eq!(collaboration.run.status, RunStatus::Held as i32);
     assert_eq!(collaboration.step.status, StepStatus::Held as i32);
@@ -11186,7 +11352,7 @@ async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll(
     assert_eq!(owner_oracle.snapshot.status, TaskStatus::Interrupted as i32);
     assert_eq!(
         owner_oracle.snapshot.current_run_id.as_deref(),
-        Some(R8A_ACTIVATION_RUN_ID)
+        Some(routed_ids.run_id.as_str())
     );
     fs::remove_dir_all(&root).expect("remove R-8B.2c begin-delivery fixture root");
 }
@@ -11199,21 +11365,23 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     let mut child =
         spawn_fixture_with_mode(&root, &instance, R8B2C_DELIVERED_BEFORE_POLL_MODE).await;
     wait_for_cli_status_with_child(&instance, &mut child).await;
-    let prepared = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-delivered").await;
-    let task_id = prepared.task_id;
-    let snapshot_id = prepared.snapshot_id;
+    let R8b2cPreparedWork {
+        task_id,
+        snapshot_id,
+        routed_ids,
+    } = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-delivered").await;
 
     wait_for_r8b2c_checkpoint(
         &root,
         &instance,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
         R8B2C_DELIVERED_BEFORE_POLL_PHASE,
         &mut child,
     )
     .await;
     let active =
         wait_for_r8b2c_task_status(&instance, &task_id, TaskStatus::Active, &mut child).await;
-    assert_eq!(active["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID);
+    assert_eq!(active["data"]["currentRunId"], routed_ids.run_id);
 
     let witness = R8b2cWitnessOracle::open_existing(&root, &instance);
     assert_eq!(witness.ledger_count("send_dispatch"), 1);
@@ -11221,11 +11389,11 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     assert_eq!(witness.ledger_count("reconcile"), 0);
     assert_eq!(witness.ledger_count("ack_emitted"), 0);
     assert_eq!(
-        witness.native_event_state("r8a-dispatch"),
+        witness.native_event_state(&routed_ids.dispatch_id),
         Some(("pending".to_owned(), 0))
     );
 
-    let adapter_before_revoke = read_r8b2c_adapter_oracle(&root);
+    let adapter_before_revoke = read_r8b2c_adapter_oracle(&root, &routed_ids);
     assert_eq!(adapter_before_revoke.dispatch_count, 1);
     assert_eq!(adapter_before_revoke.delivery_unknown_count, 0);
     assert_eq!(adapter_before_revoke.observation_count, 0);
@@ -11243,7 +11411,7 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
         DeliveryDisposition::try_from(receipt_before_kill.disposition),
         Ok(DeliveryDisposition::Delivered)
     );
-    let collaboration_before_revoke = read_r8b2c_collaboration_oracle(&root);
+    let collaboration_before_revoke = read_r8b2c_collaboration_oracle(&root, &routed_ids);
     assert_eq!(collaboration_before_revoke.outbox_state, "delivered");
     assert_eq!(
         collaboration_before_revoke.run.status,
@@ -11316,14 +11484,14 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
         String::from_utf8_lossy(&revoke.stdout),
         String::from_utf8_lossy(&revoke.stderr)
     );
-    let adapter_after_revoke = read_r8b2c_adapter_oracle(&root);
+    let adapter_after_revoke = read_r8b2c_adapter_oracle(&root, &routed_ids);
     assert_eq!(adapter_after_revoke, adapter_before_revoke);
     assert_eq!(
         adapter_after_revoke.receipt_bytes.as_deref(),
         Some(receipt_bytes_before_revoke.as_slice())
     );
     assert_eq!(
-        read_r8b2c_collaboration_oracle(&root),
+        read_r8b2c_collaboration_oracle(&root, &routed_ids),
         collaboration_before_revoke
     );
     assert_eq!(read_r8b2c_task_oracle(&root, &task_id), task_before_revoke);
@@ -11336,7 +11504,7 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     wait_for_r8b2c_checkpoint(
         &root,
         &instance,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
         R8B2C_ACK_REHYDRATED_PHASE,
         &mut restarted,
     )
@@ -11347,11 +11515,11 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     assert_eq!(witness.ledger_count("ack_emitted"), 1);
     assert!(witness.ledger_count("next_event") >= 1);
     assert_eq!(
-        witness.native_event_state("r8a-dispatch"),
+        witness.native_event_state(&routed_ids.dispatch_id),
         Some(("emitted".to_owned(), 1))
     );
 
-    let adapter = read_r8b2c_adapter_oracle(&root);
+    let adapter = read_r8b2c_adapter_oracle(&root, &routed_ids);
     assert_eq!(adapter.dispatch_count, 1);
     assert_eq!(adapter.delivery_unknown_count, 0);
     assert_eq!(adapter.observation_count, 1);
@@ -11378,14 +11546,14 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
         .find(|observation| observation.native_key == "fake-ack")
         .expect("original FakeCodexDriver ACK row must remain durable");
     let observation_id = &observation.observation_id;
-    assert_eq!(observation.dispatch_id, "r8a-dispatch");
+    assert_eq!(observation.dispatch_id, routed_ids.dispatch_id);
     assert_eq!(observation.ingestion_state, "consumed");
     assert_eq!(observation.observation.observation_id, *observation_id);
     assert_eq!(observation.observation.dispatch_id, observation.dispatch_id);
     assert!(matches!(
         observation.observation.payload,
         Some(harness_observation::Payload::Ack(ref ack))
-            if ack.ack_receipt_id == "fake-ack-r8a-dispatch"
+            if ack.ack_receipt_id == format!("fake-ack-{}", routed_ids.dispatch_id)
     ));
     assert_eq!(observation.raw_event, b"fake-ack");
     assert_eq!(
@@ -11394,7 +11562,7 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     );
     assert!(!observation.raw_evidence_ref.trim().is_empty());
 
-    let collaboration = read_r8b2c_collaboration_oracle(&root);
+    let collaboration = read_r8b2c_collaboration_oracle(&root, &routed_ids);
     assert_eq!(collaboration.outbox_state, "delivered");
     assert_eq!(collaboration.run.status, RunStatus::Active as i32);
     assert_eq!(collaboration.step.status, StepStatus::Active as i32);
@@ -11410,7 +11578,7 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     );
     assert_eq!(
         task_before_stable.snapshot.current_run_id,
-        Some(R8A_ACTIVATION_RUN_ID.to_string())
+        Some(routed_ids.run_id.clone())
     );
     assert_eq!(read_empty_r9a3_verdict_oracle(&root), verdict_before_revoke);
     let stable_counts = (
@@ -11419,8 +11587,8 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
         witness.ledger_count("ack_emitted"),
     );
     sleep(Duration::from_millis(175)).await;
-    let adapter_after_stable = read_r8b2c_adapter_oracle(&root);
-    let collaboration_after_stable = read_r8b2c_collaboration_oracle(&root);
+    let adapter_after_stable = read_r8b2c_adapter_oracle(&root, &routed_ids);
+    let collaboration_after_stable = read_r8b2c_collaboration_oracle(&root, &routed_ids);
     let task_after_stable = read_r8b2c_task_oracle(&root, &task_id);
     assert_eq!(adapter_after_stable, adapter);
     assert_eq!(collaboration_after_stable, collaboration);
@@ -11437,7 +11605,7 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     );
     let active =
         wait_for_r8b2c_task_status(&instance, &task_id, TaskStatus::Active, &mut restarted).await;
-    assert_eq!(active["data"]["currentRunId"], R8A_ACTIVATION_RUN_ID);
+    assert_eq!(active["data"]["currentRunId"], routed_ids.run_id);
 
     drop(restarted.stdin.take());
     let status = restarted
@@ -11535,6 +11703,7 @@ async fn c5_05_real_desktop_surface_uses_shared_kernel_for_read_and_writes() {
                     sha256: "55".repeat(32),
                 },
             ),
+            work_capability_route: None,
         })),
     };
     egopulse_client_operations::set_task_digest(&mut task_command);
@@ -13565,7 +13734,7 @@ async fn u04c_real_windows_conpty_drives_normal_tui_from_dashboard_to_exact_task
     terminal.send_keys(b"n");
     terminal.wait_for_checkpoint("Stage: Editing").await;
     terminal.send_keys(
-        b"start one governed U-04c ConPTY task\tgoverned_repository_change\tscope:u04c-conpty\tcontext.md\x1bOQ\r",
+        b"start one governed U-04c ConPTY task\tgoverned_repository_change\tscope:u04c-conpty\t\tcontext.md\x1bOQ\r",
     );
     terminal
         .wait_for_checkpoint("Review the governed preview; Enter")
@@ -13709,6 +13878,7 @@ async fn r9c_real_daemon_cli_and_tui_share_one_governed_harness_content_stream()
         .as_str()
         .expect("R-9C Task identity")
         .to_owned();
+    let routed_ids = RoutedWorkIds::from_preview(&prepared, &task_id);
     assert_eq!(
         confirmed["data"]["status"],
         TaskStatus::Active.as_str_name()
@@ -13819,7 +13989,7 @@ async fn r9c_real_daemon_cli_and_tui_share_one_governed_harness_content_stream()
         .expect("R-9C CLI must receive a live safe assistant record");
     assert_eq!(streamed["event"], "record");
     assert_eq!(streamed["record"]["taskId"], task_id);
-    assert_eq!(streamed["record"]["attemptId"], "r8a-attempt");
+    assert_eq!(streamed["record"]["attemptId"], routed_ids.attempt_id);
     assert_eq!(streamed["record"]["source"]["providerFamily"], "openai");
     assert_eq!(streamed["record"]["source"]["model"], "fixture/model");
     assert_eq!(streamed["record"]["source"]["collaborationRole"], "primary");
@@ -13853,7 +14023,10 @@ async fn r9c_real_daemon_cli_and_tui_share_one_governed_harness_content_stream()
         tui_screen.contains("openai / fixture/model"),
         "{tui_screen}"
     );
-    assert!(tui_screen.contains("primary / r8a-attempt"), "{tui_screen}");
+    assert!(
+        tui_screen.contains("primary / attempt:work:"),
+        "{tui_screen}"
+    );
     assert!(
         tui_screen.contains("[finalized | revision 3"),
         "{tui_screen}"
@@ -14036,6 +14209,10 @@ async fn m13_real_daemon_cli_tui_dispatch_and_restart_preserve_one_memory_pair()
         confirmed["data"]["status"],
         TaskStatus::Active.as_str_name()
     );
+    let task_id = confirmed["data"]["taskId"]
+        .as_str()
+        .expect("M-13 Task identity");
+    let routed_ids = RoutedWorkIds::from_preview(&cli_preview, task_id);
 
     let record_path = root.join(R8A_DRIVER_RECORD);
     timeout(Duration::from_secs(10), async {
@@ -14074,7 +14251,7 @@ async fn m13_real_daemon_cli_tui_dispatch_and_restart_preserve_one_memory_pair()
         &[0x15; 32],
         "c5-context-epoch",
         &snapshot_id,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
     )
     .expect("read first M-13 Context/Memory pair");
     assert_eq!(first_pair.content_digest_sha256, compiled_digest);
@@ -14084,11 +14261,14 @@ async fn m13_real_daemon_cli_tui_dispatch_and_restart_preserve_one_memory_pair()
     assert_eq!(first_pair.memory_pack_snapshot_sha256, memory_pack);
     assert_eq!(first_pair.consumer_principal_id, "codex_app_server");
     assert_eq!(first_pair.model_ref, "fixture/model");
-    assert_eq!(first_pair.attempt_id, "r8a-attempt");
-    assert_eq!(first_pair.dispatch_id, "r8a-dispatch");
-    let first_adapter =
-        read_r8b2c_adapter_store(&root.join("r8a-adapter.db"), &[0x32; 32], "r8a-dispatch")
-            .expect("read first M-13 Adapter evidence");
+    assert_eq!(first_pair.attempt_id, routed_ids.attempt_id);
+    assert_eq!(first_pair.dispatch_id, routed_ids.dispatch_id);
+    let first_adapter = read_r8b2c_adapter_store(
+        &root.join("r8a-adapter.db"),
+        &[0x32; 32],
+        &routed_ids.dispatch_id,
+    )
+    .expect("read first M-13 Adapter evidence");
     assert_eq!(first_adapter.dispatch_count, 1);
     assert_eq!(first_adapter.delivery_unknown_count, 0);
 
@@ -14108,12 +14288,15 @@ async fn m13_real_daemon_cli_tui_dispatch_and_restart_preserve_one_memory_pair()
         &[0x15; 32],
         "c5-context-epoch",
         &snapshot_id,
-        "r8a-dispatch",
+        &routed_ids.dispatch_id,
     )
     .expect("read restarted M-13 Context/Memory pair");
-    let second_adapter =
-        read_r8b2c_adapter_store(&root.join("r8a-adapter.db"), &[0x32; 32], "r8a-dispatch")
-            .expect("read restarted M-13 Adapter evidence");
+    let second_adapter = read_r8b2c_adapter_store(
+        &root.join("r8a-adapter.db"),
+        &[0x32; 32],
+        &routed_ids.dispatch_id,
+    )
+    .expect("read restarted M-13 Adapter evidence");
     assert_eq!(second_pair, first_pair);
     assert_eq!(second_adapter, first_adapter);
     assert_eq!(

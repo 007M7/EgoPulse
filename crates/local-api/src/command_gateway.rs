@@ -11,12 +11,16 @@ use egopulse_domain_contracts::{
             ExecuteContextMutationRequest, ExecuteContextMutationResponse,
             ExecuteFounderVerdictRequest, ExecuteFounderVerdictResponse,
             ExecuteMemoryMutationRequest, ExecuteMemoryMutationResponse, ExecuteTaskCommandRequest,
-            ExecuteTaskCommandResponse, HarnessApprovalAuthorityResult, LocalApiError,
-            LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt, PrepareWorkRequest,
-            PrepareWorkResponse, ProjectionAwaitToken, SourceRevision, WorkPreparationPreview,
-            confirm_work_response, context_mutation_command, execute_context_mutation_response,
+            ExecuteTaskCommandResponse, HarnessApprovalAuthorityResult,
+            ListWorkCapabilitiesRequest, ListWorkCapabilitiesResponse, ListWorkCapabilitiesResult,
+            LocalApiError, LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt,
+            PrepareWorkRequest, PrepareWorkResponse, ProjectionAwaitToken,
+            SetDefaultWorkCapabilityRequest, SetDefaultWorkCapabilityResponse, SourceRevision,
+            WorkCapabilityPreferenceReceipt, WorkPreparationPreview, confirm_work_response,
+            context_mutation_command, execute_context_mutation_response,
+            list_work_capabilities_response,
             local_command_gateway_service_server::LocalCommandGatewayService,
-            prepare_work_response,
+            prepare_work_response, set_default_work_capability_response,
         },
         policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
         task::v1::{TaskCommand, TaskCommandResult, task_command},
@@ -37,6 +41,8 @@ const RPC_DECIDE_APPROVAL: &str = "LocalCommandGatewayService/DecideHarnessAppro
 const RPC_EXECUTE_VERDICT: &str = "LocalCommandGatewayService/ExecuteFounderVerdict";
 const RPC_EXECUTE_MEMORY: &str = "LocalCommandGatewayService/ExecuteMemoryMutation";
 const RPC_EXECUTE_CONTEXT: &str = "LocalCommandGatewayService/ExecuteContextMutation";
+const RPC_LIST_WORK_CAPABILITIES: &str = "LocalCommandGatewayService/ListWorkCapabilities";
+const RPC_SET_DEFAULT_WORK_CAPABILITY: &str = "LocalCommandGatewayService/SetDefaultWorkCapability";
 const RPC_PREPARE_WORK: &str = "LocalCommandGatewayService/PrepareWork";
 const RPC_CONFIRM_WORK: &str = "LocalCommandGatewayService/ConfirmWork";
 
@@ -63,6 +69,9 @@ pub struct CommandPortResult<R> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandPortFailure {
+    InvalidArgument,
+    CapabilityNotAdmitted,
+    ConfigurationMigrationRequired,
     Unavailable,
     /// The owner may have committed an external side effect, but the result
     /// of delivery is not known. Callers must reconcile before retrying.
@@ -290,6 +299,52 @@ impl WorkPreparationPort for FailClosedWorkPreparationPort {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkCapabilityPortFailure {
+    InvalidArgument,
+    CapabilityNotAdmitted,
+    StateRevisionConflict,
+    ConfigurationMigrationRequired,
+    IntegrityFailure,
+    Unavailable,
+}
+
+/// Narrow daemon-owned configuration boundary. It owns neither Task facts nor
+/// dispatch: it exposes safe route choices and mutates only the revisioned
+/// default used by future work preparations.
+pub trait WorkCapabilityPort: Send + Sync + 'static {
+    fn list(
+        &self,
+        principal: &CommandPrincipal,
+    ) -> Result<ListWorkCapabilitiesResult, WorkCapabilityPortFailure>;
+
+    fn set_default(
+        &self,
+        request: &SetDefaultWorkCapabilityRequest,
+        principal: &CommandPrincipal,
+    ) -> Result<WorkCapabilityPreferenceReceipt, WorkCapabilityPortFailure>;
+}
+
+#[derive(Default)]
+pub struct FailClosedWorkCapabilityPort;
+
+impl WorkCapabilityPort for FailClosedWorkCapabilityPort {
+    fn list(
+        &self,
+        _principal: &CommandPrincipal,
+    ) -> Result<ListWorkCapabilitiesResult, WorkCapabilityPortFailure> {
+        Err(WorkCapabilityPortFailure::Unavailable)
+    }
+
+    fn set_default(
+        &self,
+        _request: &SetDefaultWorkCapabilityRequest,
+        _principal: &CommandPrincipal,
+    ) -> Result<WorkCapabilityPreferenceReceipt, WorkCapabilityPortFailure> {
+        Err(WorkCapabilityPortFailure::Unavailable)
+    }
+}
+
 pub struct CommandGatewayApplication {
     registry: Arc<SessionRegistry>,
     profiles: Arc<ContractProfiles>,
@@ -299,12 +354,14 @@ pub struct CommandGatewayApplication {
     verdict_port: Arc<dyn VerdictCommandPort>,
     memory_port: Arc<dyn MemoryMutationPort>,
     context_port: Arc<dyn ContextMutationPort>,
+    work_capability_port: Arc<dyn WorkCapabilityPort>,
     work_port: Arc<dyn WorkPreparationPort>,
 }
 
 pub struct CommandExtensionPorts {
     memory: Arc<dyn MemoryMutationPort>,
     context: Arc<dyn ContextMutationPort>,
+    work_capability: Arc<dyn WorkCapabilityPort>,
     work: Arc<dyn WorkPreparationPort>,
 }
 
@@ -314,6 +371,7 @@ impl CommandExtensionPorts {
         Self {
             memory,
             context: Arc::new(FailClosedContextMutationPort),
+            work_capability: Arc::new(FailClosedWorkCapabilityPort),
             work,
         }
     }
@@ -321,6 +379,12 @@ impl CommandExtensionPorts {
     #[must_use]
     pub fn with_context(mut self, context: Arc<dyn ContextMutationPort>) -> Self {
         self.context = context;
+        self
+    }
+
+    #[must_use]
+    pub fn with_work_capability(mut self, work_capability: Arc<dyn WorkCapabilityPort>) -> Self {
+        self.work_capability = work_capability;
         self
     }
 }
@@ -386,7 +450,74 @@ impl CommandGatewayApplication {
             verdict_port,
             memory_port: extensions.memory,
             context_port: extensions.context,
+            work_capability_port: extensions.work_capability,
             work_port: extensions.work,
+        }
+    }
+
+    pub fn list_work_capabilities(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: ListWorkCapabilitiesRequest,
+    ) -> ListWorkCapabilitiesResponse {
+        let correlation_id = client_correlation_id(request.client.as_ref());
+        let context =
+            match self.authorize_rpc(peer, request.client.as_ref(), RPC_LIST_WORK_CAPABILITIES) {
+                Ok(context) => context,
+                Err(error) => {
+                    return ListWorkCapabilitiesResponse {
+                        outcome: Some(list_work_capabilities_response::Outcome::Error(
+                            (*error).with_correlation(correlation_id),
+                        )),
+                    };
+                }
+            };
+        match self.work_capability_port.list(&context.principal) {
+            Ok(result) => ListWorkCapabilitiesResponse {
+                outcome: Some(list_work_capabilities_response::Outcome::Result(result)),
+            },
+            Err(error) => ListWorkCapabilitiesResponse {
+                outcome: Some(list_work_capabilities_response::Outcome::Error(
+                    work_capability_port_error(error, correlation_id),
+                )),
+            },
+        }
+    }
+
+    pub fn set_default_work_capability(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: SetDefaultWorkCapabilityRequest,
+    ) -> SetDefaultWorkCapabilityResponse {
+        let correlation_id = client_correlation_id(request.client.as_ref());
+        let context = match self.authorize_rpc(
+            peer,
+            request.client.as_ref(),
+            RPC_SET_DEFAULT_WORK_CAPABILITY,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return SetDefaultWorkCapabilityResponse {
+                    outcome: Some(set_default_work_capability_response::Outcome::Error(
+                        (*error).with_correlation(correlation_id),
+                    )),
+                };
+            }
+        };
+        match self
+            .work_capability_port
+            .set_default(&request, &context.principal)
+        {
+            Ok(receipt) => SetDefaultWorkCapabilityResponse {
+                outcome: Some(set_default_work_capability_response::Outcome::Receipt(
+                    receipt,
+                )),
+            },
+            Err(error) => SetDefaultWorkCapabilityResponse {
+                outcome: Some(set_default_work_capability_response::Outcome::Error(
+                    work_capability_port_error(error, correlation_id),
+                )),
+            },
         }
     }
 
@@ -944,6 +1075,28 @@ impl LocalCommandGatewayEndpoint {
 
 #[tonic::async_trait]
 impl LocalCommandGatewayService for LocalCommandGatewayEndpoint {
+    async fn list_work_capabilities(
+        &self,
+        request: Request<ListWorkCapabilitiesRequest>,
+    ) -> Result<Response<ListWorkCapabilitiesResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(self.application.list_work_capabilities(
+            peer.as_ref(),
+            request.into_inner(),
+        )))
+    }
+
+    async fn set_default_work_capability(
+        &self,
+        request: Request<SetDefaultWorkCapabilityRequest>,
+    ) -> Result<Response<SetDefaultWorkCapabilityResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(self.application.set_default_work_capability(
+            peer.as_ref(),
+            request.into_inner(),
+        )))
+    }
+
     async fn prepare_work(
         &self,
         request: Request<PrepareWorkRequest>,
@@ -1349,6 +1502,27 @@ fn profile_error(failure: ContractProfileError, correlation_id: String) -> Local
 
 fn port_error(failure: CommandPortFailure, correlation_id: String) -> LocalApiError {
     match failure {
+        CommandPortFailure::InvalidArgument => api_error(
+            LocalApiErrorCode::InvalidArgument,
+            "work_preparation_invalid_argument",
+            false,
+            None,
+            correlation_id,
+        ),
+        CommandPortFailure::CapabilityNotAdmitted => api_error(
+            LocalApiErrorCode::CapabilityNotAdmitted,
+            "work_capability_not_admitted",
+            false,
+            Some("SELECT_ADMITTED_CAPABILITY"),
+            correlation_id,
+        ),
+        CommandPortFailure::ConfigurationMigrationRequired => api_error(
+            LocalApiErrorCode::ConfigurationMigrationRequired,
+            "work_capability_configuration_migration_required",
+            false,
+            Some("MIGRATE_CONFIGURATION"),
+            correlation_id,
+        ),
         CommandPortFailure::Unavailable => api_error(
             LocalApiErrorCode::AuthorityUnavailable,
             "authority_unavailable",
@@ -1368,6 +1542,56 @@ fn port_error(failure: CommandPortFailure, correlation_id: String) -> LocalApiEr
             "authority_integrity_failure",
             false,
             Some("RESTART_DAEMON"),
+            correlation_id,
+        ),
+    }
+}
+
+fn work_capability_port_error(
+    failure: WorkCapabilityPortFailure,
+    correlation_id: String,
+) -> LocalApiError {
+    match failure {
+        WorkCapabilityPortFailure::InvalidArgument => api_error(
+            LocalApiErrorCode::InvalidArgument,
+            "work_capability_invalid_argument",
+            false,
+            None,
+            correlation_id,
+        ),
+        WorkCapabilityPortFailure::CapabilityNotAdmitted => api_error(
+            LocalApiErrorCode::CapabilityNotAdmitted,
+            "work_capability_not_admitted",
+            false,
+            Some("SELECT_ADMITTED_CAPABILITY"),
+            correlation_id,
+        ),
+        WorkCapabilityPortFailure::StateRevisionConflict => api_error(
+            LocalApiErrorCode::StateRevisionConflict,
+            "work_capability_preference_revision_conflict",
+            false,
+            Some("REFRESH_WORK_CAPABILITIES"),
+            correlation_id,
+        ),
+        WorkCapabilityPortFailure::ConfigurationMigrationRequired => api_error(
+            LocalApiErrorCode::ConfigurationMigrationRequired,
+            "work_capability_configuration_migration_required",
+            false,
+            Some("MIGRATE_CONFIGURATION"),
+            correlation_id,
+        ),
+        WorkCapabilityPortFailure::IntegrityFailure => api_error(
+            LocalApiErrorCode::IntegrityFailure,
+            "work_capability_integrity_failure",
+            false,
+            Some("RESTART_DAEMON"),
+            correlation_id,
+        ),
+        WorkCapabilityPortFailure::Unavailable => api_error(
+            LocalApiErrorCode::AuthorityUnavailable,
+            "work_capability_configuration_unavailable",
+            true,
+            Some("RETRY"),
             correlation_id,
         ),
     }
