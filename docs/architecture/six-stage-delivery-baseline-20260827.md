@@ -209,11 +209,11 @@ Exit evidence:
   included surface;
 - a clean Windows x64 package can be installed and used by a new user.
 
-Current disposition: **CLI/TUI first-release implementation is closed and is
-awaiting refreshed package acceptance**. Desktop shared-kernel code remains in
-the repository, but native GUI acceptance and distribution are intentionally
-outside phase one. The included surfaces use the same Rust client kernel and
-daemon semantics.
+Current disposition: **CLI/TUI first-release implementation and refreshed
+Windows x64 package acceptance are closed at commit `5c8a1e8`**. Desktop
+shared-kernel code remains in the repository, but native GUI acceptance and
+distribution are intentionally outside phase one. The included surfaces use
+the same Rust client kernel and daemon semantics.
 
 ### Stage 6 — release, maintenance and governed evolution
 
@@ -244,28 +244,25 @@ Exit evidence:
 - the release can return to the last accepted profile without data loss.
 
 Current disposition: **unsigned CLI/TUI early-access candidate verified at
-commit `38d665b`; the current package contains 55 files and passes package,
-startup and Memory Worker checks. Desktop remains a separately buildable
+commit `5c8a1e8`; the package contains 55 files and passes package, startup,
+installer and Memory Worker checks. Desktop remains a separately buildable
 shared-kernel candidate and is not included until native GUI acceptance is
-closed. Final release and governed evolution loop remain pending**. See
-`phase-2-54-windows-cli-tui-candidate-20260827.md`.
-The reproducible evidence is recorded in
-`docs/release/windows-candidate-20260827.md`.
+closed. Public GitHub Release publication and the governed evolution loop
+remain pending**. The reproducible evidence, exact archive name and SHA-256 are
+recorded in `docs/release/windows-candidate-20260905.md`.
 
 ## Current next actions
 
-The order after this baseline is deliberately narrow:
+The phase-one clean-CI, Windows package and evidence sequence is closed.
+Remaining work is deliberately outside this candidate gate:
 
-1. run the complete local CI once at the exact clean release commit;
-2. build and verify the unsigned Windows x64 package containing the daemon,
-   CLI, TUI and locked Memory Worker;
-3. record archive identity, SHA-256, install and startup evidence, then push
-   the exact candidate commit;
-4. after phase one, run real authenticated lifecycle probes before promoting
+1. publish the verified archive only after explicit GitHub Release approval,
+   preserving the recorded SHA-256 beside the download;
+2. after phase one, run real authenticated lifecycle probes before promoting
    DeepSeek, Kimi, GLM or another Harness route;
-5. evaluate semantic/hybrid Memory candidates without replacing the admitted
+3. evaluate semantic/hybrid Memory candidates without replacing the admitted
    lexical rollback profile; and
-6. resume Desktop as a later presentation surface over the same kernel.
+4. resume Desktop as a later presentation surface over the same kernel.
 
 ## Evidence rule
 
