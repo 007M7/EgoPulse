@@ -1,18 +1,20 @@
 # ADR 0004: Provider/model setup and governed work-route selection
 
-- Status: `pending_founder_decision`
+- Status: accepted for Stage 3 Provider/Harness/Model routing
+- Decision date: 2026-09-05
 - Decision owner: Founder
 - Scope: Stage 3 Provider/Harness/Model user-facing capability
-- Evidence baseline: commit `48b4bfb86c3cd9504b9fb5a5978cace1380337a0`
+- Evidence baseline: commit `f1f221c3fad002ac8ef62e7beb8ce7d467c1daac`
 - Affected boundaries: user configuration, Local API, Work preparation,
   reviewed workflow routing, CLI and TUI
 
-This file is a decision package, not an accepted architecture or a frozen
-contract. It replaces the earlier assumption that one restart-based
+This file records the accepted architecture boundary. It is not, by itself,
+the generated Local API contract or evidence that a held Provider has been
+admitted. It replaces the earlier assumption that one restart-based
 `SelectProviderModel` operation would also solve work-level multi-model
 selection.
 
-## Decision that must be made
+## Decision
 
 EgoPulse needs to support two different user actions without conflating them:
 
@@ -115,7 +117,7 @@ Codex compatibility profile, it must update both `selected_model` and
 Candidate A is no longer recommended as the complete Stage 3 solution.
 
 ## Candidate B: immutable admitted routes plus future-work preference
-   (recommended)
+   (accepted)
 
 Treat a production execution route as an immutable, versioned configuration
 record. A route binds:
@@ -220,9 +222,9 @@ quality attributes and is not recommended for the first release.
 | CLI/TUI semantic parity | strong | strong | strong |
 | Long-term migration burden | high when multi-model arrives | lower | high |
 
-## Recommendation
+## Accepted decision
 
-Recommend Candidate B.
+The Founder accepted Candidate B on 2026-09-05.
 
 The stable architecture point is not a particular model catalog or Harness.
 It is the distinction between mutable setup preference and immutable governed
@@ -242,7 +244,7 @@ For the first implementation:
 - admit DeepSeek, Kimi or GLM routes only after their independent real-process
   evidence closes.
 
-## Migration and rollback candidate for B
+## Accepted migration and rollback boundary for B
 
 1. Read the existing v2 configuration without changing current behavior.
 2. Derive one immutable Codex compatibility route from the matching
@@ -259,10 +261,11 @@ For the first implementation:
    this configuration change.
 
 The exact v3 JSON shape, backup retention count and Windows replacement API
-are implementation details to freeze in the contract unit after Candidate B
-is approved; they are not silently accepted by this recommendation.
+remain implementation details to freeze in the contract unit. They must
+preserve this boundary and do not require a new architecture decision unless
+one of the review triggers is reached.
 
-## Verification gates if B is accepted
+## Verification gates
 
 - Local API compatibility and regenerated Rust/TypeScript/Python bindings;
 - owner-only list, preference mutation and work confirmation;
@@ -278,7 +281,7 @@ is approved; they are not silently accepted by this recommendation.
 - shared CLI/TUI E2E over the same client operation;
 - real authenticated lifecycle evidence for each newly admitted route.
 
-## Required Founder response
+## Founder decision record
 
 ```text
 Architecture: A / B / C
@@ -289,7 +292,7 @@ Introduce the route/default configuration migration before second-provider
 admission: yes / no
 ```
 
-Recommended response:
+Recorded response on 2026-09-05:
 
 ```text
 Architecture: B
@@ -300,9 +303,10 @@ Introduce the route/default configuration migration before second-provider
 admission: yes
 ```
 
-Until the Founder response is recorded, the repository may retain the
-redacted read-only preflight and candidate probes, but must not add a mutable
-runtime selection API or claim per-work multi-model support.
+This acceptance authorizes the route/default contract and implementation
+unit. It does not admit a second Provider. Redacted read-only preflight and
+candidate probes may remain, but production selection and dispatch require
+the independent admission evidence listed by the verification gates.
 
 ## Review triggers
 
@@ -317,7 +321,10 @@ Re-open this decision only if one of these facts changes:
 
 ## Decision status
 
-- Founder-confirmed decision: none yet.
-- Current state: `recommended_pending_founder`.
-- Evidence gap: Founder choice and second-provider authenticated admission.
-- No production contract or runtime behavior is changed by this ADR draft.
+- Founder-confirmed decision: Candidate B.
+- Current state: `accepted`.
+- Frozen choices: defaults affect future work only; held/candidate profiles
+  are visible but not selectable for work; first release has no live reload;
+  route/default configuration migration precedes second-Provider admission.
+- Remaining delivery gap: route/default contract and implementation, plus
+  independent authenticated admission evidence for every non-Codex route.
