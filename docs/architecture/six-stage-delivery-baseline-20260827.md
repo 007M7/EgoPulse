@@ -4,8 +4,8 @@
 - Repository: `007M7/EgoPulse`
 - Decision owner: Founder
 - Classification: implementation roadmap and evidence index
-- Status: stages one and two closed; stages three and four in controlled
-  implementation; stages five and six pending
+- Status: stages one through four and the phase-one CLI/TUI slice are
+  implemented; refreshed Windows candidate verification is pending
 
 This document translates the frozen architecture into a delivery sequence.
 It is not a new architecture decision and it does not promote a candidate
@@ -129,12 +129,14 @@ Non-negotiable exit conditions:
    evidenced separately from a fresh prompt;
 6. one provider's state cannot write another provider's authority store.
 
-Current disposition: **composition boundary implemented; admission incomplete**.
-Codex is active. DSH, Kimi and GLM/OpenCode have candidate boundaries and
-authenticated probe entry points, but no new production route is promoted by
-configuration alone. The next product implementation requires a
-contract-compatible provider/model read-and-select surface; the frozen Local
-API contract must not be silently changed.
+Current disposition: **phase-one composition and governed selection are
+closed; additional production admissions are deferred**. Codex is active.
+Provider, Harness and exact model are independently represented, one synthetic
+GPT model is composed through Codex and DSH driver implementations, and the
+shared CLI/TUI work-capability surface resolves immutable routes. DSH, Kimi
+and GLM/OpenCode remain candidate/held routes. Their real authentication is a
+post-release promotion gate rather than a blocker for the first Codex-backed
+package.
 
 ### Stage 4 — Memory Authority and production RAG
 
@@ -165,8 +167,9 @@ Worker result
   -> Founder acceptance required for fact promotion
 ```
 
-Current disposition: **governance boundary and lexical production baseline
-closed; semantic RAG admission incomplete**. M-01–M-12 and the current
+Current disposition: **governance boundary, lexical production baseline and
+governed work-context consumption are closed; semantic RAG admission remains
+optional and incomplete**. M-01 through M-13 and the current
 evaluation gate are locally verified. M-12 proves that accepted and revoked
 Memory facts, read-only lexical retrieval and exact revoke replay survive a
 graceful C5 fixture-daemon restart with the same DataRoot and IPC instance; it
@@ -206,12 +209,11 @@ Exit evidence:
   included surface;
 - a clean Windows x64 package can be installed and used by a new user.
 
-Current disposition: **CLI/TUI first-release slice is substantially usable;
-Desktop shared-kernel read surface, TaskCreate, Approval decision and Memory
-mutation commands are implemented and locally verified, including a real
-Windows IPC loopback; native Tauri GUI automation, remaining workflows and
-distribution remain pending**. The authoritative slice evidence
-is `phase-2-53-desktop-read-surface-20260827.md`.
+Current disposition: **CLI/TUI first-release implementation is closed and is
+awaiting refreshed package acceptance**. Desktop shared-kernel code remains in
+the repository, but native GUI acceptance and distribution are intentionally
+outside phase one. The included surfaces use the same Rust client kernel and
+daemon semantics.
 
 ### Stage 6 — release, maintenance and governed evolution
 
@@ -254,20 +256,16 @@ The reproducible evidence is recorded in
 
 The order after this baseline is deliberately narrow:
 
-1. finish the contract-compatible Provider/model read-and-select design and
-   obtain Founder approval before changing frozen Local API messages;
-2. run real authenticated DeepSeek, Kimi and GLM lifecycle probes when the
-   user-owned executable and credential readiness are available;
-3. record independent admission outcomes rather than treating a successful
-   fresh prompt as full Harness admission;
-4. complete the Memory candidate proposal review path and decide whether the
-   semantic profile is opt-in or remains evaluation-only;
-5. complete the included-surface acceptance work: native Desktop GUI smoke,
-   reconnect/restart behavior and the remaining equivalent CLI/TUI/Desktop
-   workflows;
-6. refresh the three-surface Windows package only after the selected
-   Provider/Memory capabilities have their required evidence, then close the
-   final release and governed-evolution obligations.
+1. run the complete local CI once at the exact clean release commit;
+2. build and verify the unsigned Windows x64 package containing the daemon,
+   CLI, TUI and locked Memory Worker;
+3. record archive identity, SHA-256, install and startup evidence, then push
+   the exact candidate commit;
+4. after phase one, run real authenticated lifecycle probes before promoting
+   DeepSeek, Kimi, GLM or another Harness route;
+5. evaluate semantic/hybrid Memory candidates without replacing the admitted
+   lexical rollback profile; and
+6. resume Desktop as a later presentation surface over the same kernel.
 
 ## Evidence rule
 

@@ -1584,6 +1584,9 @@ impl ProviderProfileFile {
                 ));
             }
         };
+        // Provider and Harness are independent route identities. Parsing a
+        // known pair proves only that configuration can represent it;
+        // production eligibility is enforced separately by admission.
         let harness = match self.harness.as_str() {
             "codex_app_server" => ProviderHarnessKind::CodexAppServer,
             "dsh_acp" => ProviderHarnessKind::DshAcp,
@@ -1712,7 +1715,6 @@ impl ProviderProfileFile {
                 "provider_profiles.hold_reason",
             ));
         }
-        validate_provider_harness(provider, harness)?;
         Ok(ProviderBootstrapProfile {
             profile_id,
             provider,
@@ -1754,26 +1756,6 @@ impl ProviderCatalogSnapshotFile {
             harness_version,
             evidence_digest_sha256,
         })
-    }
-}
-
-fn validate_provider_harness(
-    provider: ProviderId,
-    harness: ProviderHarnessKind,
-) -> Result<(), ProductionBootstrapError> {
-    let valid = matches!(
-        (provider, harness),
-        (ProviderId::Gpt, ProviderHarnessKind::CodexAppServer)
-            | (ProviderId::DeepSeek, ProviderHarnessKind::DshAcp)
-            | (ProviderId::Kimi, ProviderHarnessKind::KimiCliAcp)
-            | (ProviderId::Glm, ProviderHarnessKind::OpenCodeAcp)
-    );
-    if valid {
-        Ok(())
-    } else {
-        Err(ProductionBootstrapError::InvalidConfiguration(
-            "provider_profiles.provider_harness_mapping",
-        ))
     }
 }
 
@@ -3258,6 +3240,56 @@ mod tests {
                 evidence_digest_sha256: "a".repeat(64),
             })
         );
+    }
+
+    #[test]
+    fn gpt_candidate_profiles_can_bind_each_known_harness_without_production_admission() {
+        let harnesses = [
+            ("codex_app_server", ProviderHarnessKind::CodexAppServer),
+            ("dsh_acp", ProviderHarnessKind::DshAcp),
+            ("kimi_cli_acp", ProviderHarnessKind::KimiCliAcp),
+            ("opencode_acp", ProviderHarnessKind::OpenCodeAcp),
+        ];
+        let mut profiles = Vec::new();
+
+        for (harness_name, expected_harness) in harnesses {
+            let profile = ProviderProfileFile {
+                profile_id: format!("gpt-{harness_name}"),
+                provider: "gpt".to_owned(),
+                harness: harness_name.to_owned(),
+                admission: "held".to_owned(),
+                exact_model: None,
+                model_ids: Vec::new(),
+                models: vec![ProviderModelFile {
+                    harness_model_id: "gpt-cross-harness-test".to_owned(),
+                    provider_model_id: "gpt-cross-harness-test".to_owned(),
+                }],
+                catalog_snapshot: None,
+                selected_model: Some("gpt-cross-harness-test".to_owned()),
+                executable: harness_name.to_owned(),
+                credential: ProviderCredentialFile::HarnessAccount,
+                hold_reason: Some("real authentication is outside this release gate".to_owned()),
+            }
+            .into_typed()
+            .expect("known Provider and Harness identities should compose as held data");
+
+            assert_eq!(profile.provider, ProviderId::Gpt);
+            assert_eq!(profile.harness, expected_harness);
+            assert_eq!(profile.admission, ProviderAdmission::Held);
+            profiles.push(profile);
+        }
+
+        validate_provider_profiles(&profiles)
+            .expect("held cross-Harness profiles must remain valid configuration");
+
+        let mut unproven_production_profile = profiles[1].clone();
+        unproven_production_profile.admission = ProviderAdmission::Production;
+        assert!(matches!(
+            validate_provider_profiles(&[unproven_production_profile]),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_admission_pending"
+            ))
+        ));
     }
 
     #[test]

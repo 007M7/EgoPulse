@@ -3764,14 +3764,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_profile_native_builder_assembles_isolated_runners_over_one_source() {
+    async fn gpt_model_composes_through_codex_and_dsh_harness_drivers_without_authentication() {
         let root = std::env::temp_dir().join(format!(
             "egopulse-agentosd-multi-harness-{}",
             Uuid::now_v7()
         ));
         fs::create_dir_all(&root).expect("test root");
-        let config_a = multi_native_config(&root, "a");
-        let config_b = multi_native_config(&root, "b");
+        let shared_gpt_model = "gpt-cross-harness-test";
+        let mut config_a = multi_native_config(&root, "a");
+        config_a.default_model = Some(shared_gpt_model.to_owned());
+        config_a.workflow.harness_id = "codex_app_server".to_owned();
+        let mut config_b = multi_native_config(&root, "b");
+        config_b.default_model = Some(shared_gpt_model.to_owned());
+        config_b.workflow.harness_id = "dsh_acp".to_owned();
         let (artifact, verification) = multi_native_authorities(&root);
         let mut providers = DaemonProviders::fail_closed();
         providers.task_activation_source = Some(Arc::new(EmptyTaskActivationSource));
@@ -3799,7 +3804,8 @@ mod tests {
                             egopulse_dsh_adapter::DshAcpConfig::new(
                                 PathBuf::from("dsh"),
                                 PathBuf::from("workspace-dsh-candidate"),
-                            ),
+                            )
+                            .with_required_model(shared_gpt_model),
                         )),
                         route_profile: None,
                         work_capability_route: None,
@@ -3809,7 +3815,7 @@ mod tests {
                 artifact,
                 verification,
             )
-            .expect("two admitted profiles should compose");
+            .expect("one GPT model should compose through two replaceable Harness drivers");
         let runner = providers
             .harness_dispatch_runner
             .take()

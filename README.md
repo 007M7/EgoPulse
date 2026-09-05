@@ -6,7 +6,7 @@ The repository starts from the frozen architecture and technology baseline. It d
 
 ## Foundation status
 
-Current maturity: **Gate 4 vertical implementation in progress — V-01/C5 CLI+TUI closed, the Desktop surface is attached to the same shared Rust kernel, typed production bootstrap is wired, Sego single-criterion verification is closed, and Memory/RAG M-01–M-11 are locally verified**.
+Current maturity: **phase-one Windows x64 CLI/TUI release-candidate preparation — the governed V-01 loop, immutable per-work capability routing, governed Memory context consumption, Sego verification and shared natural-language Work Start flow are implemented; Desktop remains outside this package**.
 
 Available now:
 
@@ -20,11 +20,13 @@ Available now:
 - isolated CPython 3.14 Worker projects managed by uv;
 - internal Rust Memory Authority with SQLCipher persistence, candidate-only agent writes, Founder promotion/revocation and accepted retrieval snapshots;
 - governed `LocalCognitionService/RetrieveMemory` exposed consistently through CLI, TUI and Desktop, with daemon-owned scope authorization, supervised Python retrieval, typed failure semantics and reference-only output;
+- governed future-work defaults and immutable per-work Provider/Harness/model route selection shared by CLI and TUI;
+- a cross-Harness composition proof showing one exact GPT model can be represented and composed through Codex and DSH driver implementations while unproven routes remain non-selectable;
 - offline Memory retrieval evaluation with dataset-digest evidence, Recall/MRR/nDCG metrics, injected exact-vector scoring and validated RRF experiment adapters;
 - explicit Sego/checker verification composition with owner-backed Artifact reads, supervised execution, immutable verification artifacts and Task write-back;
 - Protobuf/Buf and JSON Schema contract roots;
 - local CI, repository-boundary checks and commit-bound unsigned Windows early-access packaging;
-- a verified Windows x64 CLI/TUI candidate at commit `38d665b` (the current package intentionally excludes the not-yet-closed native Desktop distribution path); the exact archive and SHA-256 evidence are recorded in `docs/architecture/phase-2-54-windows-cli-tui-candidate-20260827.md`;
+- commit-bound Windows x64 CLI/TUI packaging, one-click installation checks and archive/per-file SHA-256 verification; candidate-specific evidence is recorded under `docs/release/`;
 - account-authenticated Windows Named Pipe / Unix Domain Socket transport and an ephemeral, policy-resolved local session service.
 
 For the current Windows x64 package path, see [Windows early access](WINDOWS-EARLY-ACCESS.md).
@@ -32,7 +34,7 @@ For the current Windows x64 package path, see [Windows early access](WINDOWS-EAR
 Not admitted or not yet closed:
 
 - native Desktop GUI automation and the remaining end-to-end Desktop workflows (the shared-kernel read, TaskCreate, Task cancellation, Approval and Memory mutation paths are locally verified);
-- the contract-compatible Provider/Model selection surface, plus authenticated production admission for DeepSeek/DSH, Kimi and GLM/OpenCode;
+- authenticated production admission for DeepSeek/DSH, Kimi and GLM/OpenCode; this is a post-release promotion gate, not a blocker for the first Codex-backed CLI/TUI package;
 - production semantic/vector retrieval and reranking; exact-vector and RRF plumbing exists only behind the offline experiment gate, while the release baseline remains deterministic lexical retrieval;
 - signed production release and SmartScreen reputation; the current package is
   explicitly unsigned and must be treated as early access.

@@ -244,6 +244,29 @@ For the first implementation:
 - admit DeepSeek, Kimi or GLM routes only after their independent real-process
   evidence closes.
 
+## Phase-one release boundary
+
+The Founder clarified the first Windows CLI/TUI release boundary on
+2026-09-05:
+
+- real authentication for DeepSeek, Kimi and GLM is not a release blocker;
+- Codex app-server remains the only production-admitted route in this
+  candidate;
+- a known Provider may be represented with any known Harness as candidate or
+  held configuration, because Provider and Harness are independent route
+  identities rather than a hard-coded pair;
+- configuration or composition of such a pair is not compatibility,
+  authentication or admission evidence;
+- the release must prove that the same synthetic exact GPT model can be
+  composed through different real Harness driver implementations without
+  starting a Provider process or requiring credentials;
+- promotion of any additional route still requires the real authenticated
+  lifecycle and exact-route evidence in this ADR.
+
+This changes release scheduling, not the authority boundary. Candidate and
+held routes remain visible but non-selectable, and the production admission
+validator continues to reject every route except GPT through Codex app-server.
+
 ## Accepted migration and rollback boundary for B
 
 1. Read the existing v2 configuration without changing current behavior.
@@ -336,5 +359,6 @@ Re-open this decision only if one of these facts changes:
   migration and rollback, shared CLI/TUI operations, and immutable
   Context-to-dispatch propagation are implemented in the current candidate
   and remain subject to the repository quality gate.
-- Remaining delivery gap: independent authenticated admission evidence for
-  every non-Codex route. No held route is promoted by this implementation.
+- Post-release admission gap: independent authenticated admission evidence
+  for every non-Codex route. It does not block the first Codex-backed CLI/TUI
+  candidate, and no held route is promoted by this implementation.

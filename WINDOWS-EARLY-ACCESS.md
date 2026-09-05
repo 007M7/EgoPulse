@@ -53,8 +53,23 @@ loaded and run:
 
 ```powershell
 .\bin\egopulse.exe status
+.\bin\egopulse.exe work capabilities
 .\bin\egopulse-tui.exe
 ```
+
+The capability list shows Provider, Harness, Harness-model and provider-model
+identities separately. Only entries marked `admitted` have a public choice ID
+and can start work. Candidate and held entries are diagnostics, not selectable
+routes. To start a natural-language work request with the governed default and
+Memory retrieval, use:
+
+```powershell
+.\bin\egopulse.exe work start --intent 'Summarize this project and propose the next safe change' --scope 'scope:founder' --work-type 'general' --confirm
+```
+
+The TUI exposes the same kernel operation: press `n` to open Work Start, review
+the resolved capability and Memory-bound preview, then confirm. Provider output
+is projected as a governed stream; CLI and TUI do not call a Harness directly.
 
 The current CLI/TUI package does not contain `egopulse-desktop.exe`. A Desktop
 candidate must be built with the explicit `-IncludeDesktop` packaging option
@@ -114,4 +129,7 @@ The retrieval path is read-only, deterministic lexical retrieval in this
 early-access release. Agent writes remain candidates and require the frozen
 Memory governance path for promotion or revocation. Semantic/vector retrieval,
 reranking, a second production Harness, cloud telemetry and enterprise
-identity are outside this package.
+identity are outside this package. DeepSeek, Kimi and GLM profiles may be
+configured for evaluation, but their real authentication is deliberately not
+a blocker for this Codex-backed release and does not grant production
+admission.

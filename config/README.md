@@ -48,6 +48,15 @@ Harness and the provider-native identifier; these differ for routes such as
 exist in the catalog. EgoPulse sends that exact value and must reject silent
 substitution.
 
+Provider and Harness are independent identities. A candidate or held profile
+may pair any known Provider with any known Harness so compatibility can be
+evaluated without changing the schema or runtime architecture. Parsing that
+pair proves only representability: it does not prove that the Harness can
+authenticate to the Provider, preserve the exact model, or satisfy the
+governed lifecycle. The first release admits only GPT through Codex
+app-server; all other combinations remain non-selectable until separately
+promoted with evidence.
+
 The example catalog is only an offline fallback snapshot. Vendor model lists
 change faster than EgoPulse releases, so the production flow will refresh from
 the Harness/provider-owned model catalog, cache a redacted snapshot and let the

@@ -902,6 +902,13 @@ mod tests {
         let config_path = temp.path().join("agentos.json");
         write_v3(&config_path, "choice-production", 7);
         let before = fs::read(&config_path).expect("read before");
+        let mut candidate = profile(
+            "provider-profile:candidate",
+            ProviderAdmission::Candidate,
+            "model-candidate",
+            "provider-model-candidate",
+        );
+        candidate.harness = ProviderHarnessKind::DshAcp;
         let profiles = vec![
             profile(
                 "provider-profile:production",
@@ -909,12 +916,7 @@ mod tests {
                 "model-production",
                 "provider-model-production",
             ),
-            profile(
-                "provider-profile:candidate",
-                ProviderAdmission::Candidate,
-                "model-candidate",
-                "provider-model-candidate",
-            ),
+            candidate,
             profile(
                 "provider-profile:held",
                 ProviderAdmission::Held,
@@ -941,6 +943,18 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(selectable.len(), 1);
         assert!(selectable[0].admitted_route.is_some());
+        let cross_harness_candidate = listed
+            .capabilities
+            .iter()
+            .find(|view| view.provider_profile_id == "provider-profile:candidate")
+            .expect("GPT/DSH candidate projection");
+        assert_eq!(cross_harness_candidate.provider_alias, "gpt");
+        assert_eq!(cross_harness_candidate.harness_alias, "dsh_acp");
+        assert!(!cross_harness_candidate.selectable);
+        assert_eq!(
+            cross_harness_candidate.safe_reason_code.as_deref(),
+            Some(CANDIDATE_REASON)
+        );
         for blocked in listed.capabilities.iter().filter(|view| !view.selectable) {
             assert!(blocked.choice_id.is_none());
             assert!(blocked.admitted_route.is_none());
