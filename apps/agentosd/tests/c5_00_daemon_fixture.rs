@@ -82,13 +82,13 @@ use egopulse_domain_contracts::v01::egopulse::{
     },
     common::v1::{CommandMetadata, ContractReference},
     harness::v1::{
-        ApprovalDecisionEnvelope, ApprovalKind, ApprovalRequestLifecycleKind,
+        AckDisposition, ApprovalDecisionEnvelope, ApprovalKind, ApprovalRequestLifecycleKind,
         ApprovalRequestObservation, AttestationLevel, CancelExecutionEnvelope,
         CapabilityDeclaration, CapabilityProfile, CapabilityProfileStatus,
-        ContentMutationOperation, DeliveryDisposition, DispatchEnvelope,
-        HarnessContentSignalObservation, HarnessErrorCode, HarnessObservation,
-        NativeSessionStrategy, ObservationCriticality, ProbeHarnessRequest, ProbeHarnessResult,
-        harness_observation,
+        ContentMutationOperation, DeliveryDisposition, DispatchEnvelope, HarnessAckObservation,
+        HarnessContentSignalObservation, HarnessErrorCode, HarnessObservation, LifecycleKind,
+        LifecycleObservation, NativeSessionStrategy, ObservationCriticality, ProbeHarnessRequest,
+        ProbeHarnessResult, SideEffectCertainty, harness_observation,
     },
     localapi::v1::{
         ClientSurface, ConfirmWorkRequest, EvidenceGraphView, ExecuteMemoryMutationRequest,
@@ -134,6 +134,7 @@ use egopulse_harness_adapter::{
     AdapterEdge, AdapterEdgeConfig, AdapterEdgeKey, DriverDelivery, DriverError,
     DriverErrorCertainty, DriverEvent, ManagedDisclosureCredentials, NativeHarnessDriver,
     NativeHarnessFuture, ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
+    TerminalOutputCandidate,
 };
 use egopulse_local_api::session::{
     FixedProjectionPosition, LocalSessionEndpoint, NoopSessionAuditSink, PrincipalGrant,
@@ -237,6 +238,8 @@ const R9A3E_PREAUTH_UNAVAILABLE_MODE: &str = "dynamic-r9a3e-preauth-unavailable"
 const R9A3E_REVOKED_READY_MODE: &str = "dynamic-r9a3e-revoked-ready";
 const R9C_CONTENT_MODE: &str = "dynamic-r9c-content";
 const M13_MEMORY_DISPATCH_MODE: &str = "dynamic-m13-memory-dispatch";
+const PHASE_ONE_MULTI_TASK_MODE: &str = "dynamic-phase-one-multi-task";
+const PHASE_ONE_DRIVER_LEDGER: &str = "phase-one-driver-ledger.json";
 const R9C_CONTENT_RELEASE_FILE: &str = "r9c-content-release";
 const R9C_VISIBLE_PREFIX: &str = "R9C governed stream ";
 const R9C_VISIBLE_SUFFIX: &str = "reaches both clients.";
@@ -1371,6 +1374,201 @@ impl NativeHarnessDriver for R9cContentFixtureDriver {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct PhaseOneDriverRecord {
+    dispatch_id: String,
+    run_id: String,
+    step_id: String,
+    attempt_id: String,
+    native_execution_ref: String,
+}
+
+struct PhaseOneMultiTaskDriver {
+    inner: FakeCodexDriver,
+    record_path: PathBuf,
+    records: Vec<PhaseOneDriverRecord>,
+    events: BTreeMap<String, VecDeque<DriverEvent>>,
+    terminal_outputs: BTreeMap<String, TerminalOutputCandidate>,
+}
+
+impl PhaseOneMultiTaskDriver {
+    fn new(root: &Path) -> Self {
+        let record_path = root.join(PHASE_ONE_DRIVER_LEDGER);
+        let records = fs::read(&record_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        Self {
+            inner: FakeCodexDriver::default(),
+            record_path,
+            records,
+            events: BTreeMap::new(),
+            terminal_outputs: BTreeMap::new(),
+        }
+    }
+
+    fn persist_records(&self) {
+        fs::write(
+            &self.record_path,
+            serde_json::to_vec(&self.records).expect("serialize phase-one driver ledger"),
+        )
+        .expect("persist phase-one driver ledger");
+    }
+
+    fn event(
+        dispatch_id: &str,
+        sequence: u64,
+        label: &str,
+        criticality: ObservationCriticality,
+        payload: harness_observation::Payload,
+    ) -> DriverEvent {
+        let native_key = format!("phase-one:{dispatch_id}:{sequence}:{label}");
+        DriverEvent {
+            native_event_id: Some(native_key.clone()),
+            native_key: native_key.clone(),
+            native_sequence: Some(sequence),
+            native_observed_at: prost_types::Timestamp {
+                seconds: 1_788_633_600,
+                nanos: 0,
+            },
+            criticality,
+            payload,
+            raw_event: native_key.into_bytes(),
+        }
+    }
+}
+
+impl NativeHarnessDriver for PhaseOneMultiTaskDriver {
+    fn probe<'a>(
+        &'a mut self,
+        request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        self.inner.probe(request)
+    }
+
+    fn send_dispatch<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+        material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        Box::pin(async move {
+            assert!(
+                self.records
+                    .iter()
+                    .all(|record| record.dispatch_id != envelope.dispatch_id),
+                "restart or exact replay must not redeliver dispatch {}",
+                envelope.dispatch_id
+            );
+            let delivery = self.inner.send_dispatch(envelope, material).await?;
+            let native_execution_ref = delivery
+                .native_execution_ref
+                .clone()
+                .expect("phase-one fixture native execution reference");
+            self.records.push(PhaseOneDriverRecord {
+                dispatch_id: envelope.dispatch_id.clone(),
+                run_id: envelope.run_id.clone(),
+                step_id: envelope.step_id.clone(),
+                attempt_id: envelope.attempt_id.clone(),
+                native_execution_ref: native_execution_ref.clone(),
+            });
+            self.persist_records();
+
+            let events = VecDeque::from([
+                Self::event(
+                    &envelope.dispatch_id,
+                    1,
+                    "ack",
+                    ObservationCriticality::Control,
+                    harness_observation::Payload::Ack(HarnessAckObservation {
+                        disposition: AckDisposition::Accepted as i32,
+                        ack_receipt_id: format!("phase-one-ack-{}", envelope.dispatch_id),
+                        native_session_ref: Some(delivery.native_session_ref.clone()),
+                        native_execution_ref: Some(native_execution_ref.clone()),
+                    }),
+                ),
+                Self::event(
+                    &envelope.dispatch_id,
+                    2,
+                    "running",
+                    ObservationCriticality::Control,
+                    harness_observation::Payload::Lifecycle(LifecycleObservation {
+                        kind: LifecycleKind::ExecutionStarted as i32,
+                        native_item_ref: None,
+                        safe_status_code: Some("inProgress".to_owned()),
+                        side_effect_certainty: SideEffectCertainty::Unknown as i32,
+                        native_will_retry: None,
+                    }),
+                ),
+                Self::event(
+                    &envelope.dispatch_id,
+                    3,
+                    "completed",
+                    ObservationCriticality::Terminal,
+                    harness_observation::Payload::Lifecycle(LifecycleObservation {
+                        kind: LifecycleKind::ExecutionCompleted as i32,
+                        native_item_ref: None,
+                        safe_status_code: Some("completed".to_owned()),
+                        side_effect_certainty: SideEffectCertainty::Unknown as i32,
+                        native_will_retry: None,
+                    }),
+                ),
+            ]);
+            self.events.insert(envelope.dispatch_id.clone(), events);
+            self.terminal_outputs.insert(
+                envelope.dispatch_id.clone(),
+                TerminalOutputCandidate {
+                    dispatch_id: envelope.dispatch_id.clone(),
+                    native_completion_ref: native_execution_ref,
+                    media_type: "text/plain; charset=utf-8".to_owned(),
+                    content: format!("phase-one governed return for {}", envelope.dispatch_id)
+                        .into_bytes(),
+                },
+            );
+            Ok(delivery)
+        })
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        Box::pin(async move {
+            Ok(self
+                .events
+                .get_mut(&envelope.dispatch_id)
+                .and_then(VecDeque::pop_front))
+        })
+    }
+
+    fn take_terminal_output_candidate<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<TerminalOutputCandidate>, DriverError>> {
+        Box::pin(async move { Ok(self.terminal_outputs.remove(&envelope.dispatch_id)) })
+    }
+
+    fn decide_approval<'a>(
+        &'a mut self,
+        envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        self.inner.decide_approval(envelope)
+    }
+
+    fn cancel<'a>(
+        &'a mut self,
+        envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        self.inner.cancel(envelope)
+    }
+
+    fn reconcile<'a>(
+        &'a mut self,
+        context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        self.inner.reconcile(context)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum R8b2cDriverMode {
     BeginDeliveryBlock,
@@ -2159,6 +2357,18 @@ struct StaticApprovalProjectionSource {
 impl StaticApprovalProjectionSource {
     fn new() -> Self {
         let action_digest = "33".repeat(32);
+        let summary = egopulse_domain_contracts::approval_display::seal_approval_display_summary(
+            egopulse_domain_contracts::v01::egopulse::harness::v1::ApprovalDisplaySummary {
+                state: 1,
+                summary_ref: "summary-c5-03".to_owned(),
+                action_digest_sha256: action_digest.clone(),
+                source_binding_sha256: "c".repeat(64),
+                command_preview: "cargo test".to_owned(),
+                working_directory_label: ".".to_owned(),
+                policy_code: "egopulse.approval-display/v1".to_owned(),
+                ..Default::default()
+            },
+        );
         let observation = HarnessObservation {
             observation_id: "observation-c5-03".to_owned(),
             adapter_id: "c5-adapter".to_owned(),
@@ -2173,6 +2383,7 @@ impl StaticApprovalProjectionSource {
                     action_digest_sha256: action_digest,
                     requested_scope_ref: "scope-c5-03".to_owned(),
                     display_summary_ref: "summary-c5-03".to_owned(),
+                    display_summary: Some(summary),
                     native_routing_ref: String::new(),
                     lifecycle: ApprovalRequestLifecycleKind::Open as i32,
                     request_revision: 1,
@@ -2359,6 +2570,7 @@ impl R9bTaskDisconnectProjectionSource {
                     action_digest_sha256: "44".repeat(32),
                     requested_scope_ref: "scope-r9b-task-disconnect".to_owned(),
                     display_summary_ref: "summary-r9b-task-disconnect".to_owned(),
+                    display_summary: None,
                     native_routing_ref: String::new(),
                     lifecycle: ApprovalRequestLifecycleKind::Open as i32,
                     request_revision: 1,
@@ -3020,6 +3232,29 @@ struct U04cPostCommitUnavailableWorkPort {
     state: Mutex<U04cWorkPortState>,
 }
 
+fn u04c_replay_has_no_authority_growth(
+    first: &U04cWorkStartDurabilitySnapshot,
+    replay: &U04cWorkStartDurabilitySnapshot,
+) -> bool {
+    let mut first = first.clone();
+    let mut replay = replay.clone();
+    for snapshot in [&mut first, &mut replay] {
+        if let Some(outbox) = snapshot
+            .task
+            .table_digests
+            .iter_mut()
+            .find(|table| table.table_name == "task_outbox")
+        {
+            // The daemon may acknowledge the already-created outbox row
+            // between the injected post-commit failure and the exact replay.
+            // Preserve its row-count check while excluding only that mutable
+            // delivery-state digest from the no-growth comparison.
+            outbox.content_sha256.clear();
+        }
+    }
+    first == replay
+}
+
 impl U04cPostCommitUnavailableWorkPort {
     fn new(
         inner: Arc<dyn WorkPreparationPort>,
@@ -3077,11 +3312,15 @@ impl U04cPostCommitUnavailableWorkPort {
                     }
                     _ => false,
                 });
+        let durability_matches = state
+            .durability
+            .as_ref()
+            .is_some_and(|first| u04c_replay_has_no_authority_growth(first, &durability));
         if state.calls != 1
             || state.request != request
             || state.principal.as_ref() != Some(principal)
             || !response_matches
-            || state.durability.as_ref() != Some(&durability)
+            || !durability_matches
         {
             return Err(CommandPortFailure::IntegrityFailure);
         }
@@ -3202,6 +3441,7 @@ fn dynamic_fixture_mode() -> bool {
         fixture_mode().as_str(),
         R8A_FIXTURE_MODE
             | M13_MEMORY_DISPATCH_MODE
+            | PHASE_ONE_MULTI_TASK_MODE
             | R8B_PAUSE_BEFORE_RUNNER_MODE
             | R8B2C_BEGIN_DELIVERY_MODE
             | R8B2C_UNKNOWN_RECOVERY_MODE
@@ -3404,6 +3644,14 @@ fn r9c_native_profile(native: &NativeHarnessCompositionConfig) -> NativeHarnessC
             harness_id: "codex_app_server".to_owned(),
             model_family_selectors: vec!["codex".to_owned()],
             native_protocol: Some(observed_protocol.clone()),
+            semantics: Some(
+                egopulse_domain_contracts::v01::egopulse::harness::v1::CapabilitySemantics {
+                    governed_user_visible_content:
+                        egopulse_domain_contracts::v01::egopulse::harness::v1::SupportLevel::AdapterEmulated
+                            as i32,
+                    ..Default::default()
+                },
+            ),
             ..CapabilityDeclaration::default()
         }),
         attestation_level: AttestationLevel::ProbeVerified as i32,
@@ -4833,6 +5081,7 @@ fn open_fixture_providers(root: &Path) -> DaemonProviders {
             | R9B_DENY_APPROVAL_READ_MODE
             | R8A_FIXTURE_MODE
             | M13_MEMORY_DISPATCH_MODE
+            | PHASE_ONE_MULTI_TASK_MODE
             | R8B_PAUSE_BEFORE_RUNNER_MODE
             | R8B2C_BEGIN_DELIVERY_MODE
             | R8B2C_UNKNOWN_RECOVERY_MODE
@@ -5061,6 +5310,18 @@ where
                 verification,
             )
             .expect("R-9C native Harness content composition")
+    } else if mode == PHASE_ONE_MULTI_TASK_MODE {
+        providers
+            .with_profiled_native_harness_drivers(
+                vec![routed_fixture_composition(
+                    native,
+                    PhaseOneMultiTaskDriver::new(root),
+                    work_capability_route,
+                )],
+                artifact,
+                verification,
+            )
+            .expect("phase-one multi-task native Harness composition")
     } else if r8b2c_fixture_mode() {
         let driver_mode = if mode == R8B2C_BEGIN_DELIVERY_MODE {
             R8b2cDriverMode::BeginDeliveryBlock
@@ -5209,6 +5470,7 @@ async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Chi
                 mode,
                 R8A_FIXTURE_MODE
                     | M13_MEMORY_DISPATCH_MODE
+                    | PHASE_ONE_MULTI_TASK_MODE
                     | R8B_PAUSE_BEFORE_RUNNER_MODE
                     | R8B2C_BEGIN_DELIVERY_MODE
                     | R8B2C_UNKNOWN_RECOVERY_MODE
@@ -5295,6 +5557,33 @@ async fn run_cli(instance: &str, arguments: &[&str]) -> std::process::Output {
         .output()
         .await
         .expect("run real egopulse CLI process")
+}
+
+async fn reviewed_approval_summary_digest(instance: &str, approval_request_id: &str) -> String {
+    let output = run_cli(
+        instance,
+        &["approval", "get", approval_request_id, "--json"],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "approval get must return the current trusted summary: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("approval get JSON envelope");
+    assert_eq!(payload["operation"], "approval.get");
+    assert_eq!(payload["data"]["approvalRequestId"], approval_request_id);
+    assert_eq!(
+        payload["data"]["operationSummary"]["reviewable"], true,
+        "AllowOnce fixture requires a validated reviewable summary"
+    );
+    payload["data"]["operationSummary"]["summaryDigestSha256"]
+        .as_str()
+        .filter(|digest| digest.len() == 64)
+        .expect("trusted approval summary digest")
+        .to_owned()
 }
 
 async fn run_tui_once(instance: &str) -> std::process::Output {
@@ -5714,6 +6003,7 @@ async fn wait_for_r9a3d_task(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RoutedWorkIds {
     run_id: String,
+    step_id: String,
     attempt_id: String,
     dispatch_id: String,
 }
@@ -5731,6 +6021,7 @@ impl RoutedWorkIds {
         );
         Self {
             run_id: format!("run:work:{task_id}:{route_binding_sha256}"),
+            step_id: format!("step:work:{task_id}:{route_binding_sha256}"),
             attempt_id: format!("attempt:work:{task_id}:{route_binding_sha256}"),
             dispatch_id: format!("dispatch:work:{task_id}:{route_binding_sha256}"),
         }
@@ -5740,6 +6031,8 @@ impl RoutedWorkIds {
 struct R8b2cPreparedWork {
     task_id: String,
     snapshot_id: String,
+    confirmation_binding: String,
+    confirm_key: String,
     routed_ids: RoutedWorkIds,
 }
 
@@ -5826,6 +6119,8 @@ async fn prepare_and_confirm_r8b2c_work(
     R8b2cPreparedWork {
         task_id,
         snapshot_id,
+        confirmation_binding,
+        confirm_key,
         routed_ids,
     }
 }
@@ -5887,7 +6182,7 @@ fn read_r8b2c_collaboration_oracle(
         &root.join("r8a-collaboration.db"),
         &[0x31; 32],
         &routed_ids.run_id,
-        "r8a-step",
+        &routed_ids.step_id,
         &routed_ids.attempt_id,
     )
     .expect("read R-8B.2c Collaboration store through conformance boundary");
@@ -5906,7 +6201,7 @@ fn read_r8b2c_collaboration_oracle(
     let envelope =
         DispatchEnvelope::decode(stored.envelope.as_slice()).expect("decode R-8B.2c envelope");
     assert_eq!(envelope.run_id, routed_ids.run_id);
-    assert_eq!(envelope.step_id, "r8a-step");
+    assert_eq!(envelope.step_id, routed_ids.step_id);
     assert_eq!(envelope.attempt_id, routed_ids.attempt_id);
     assert_eq!(envelope.dispatch_id, routed_ids.dispatch_id);
     R8b2cCollaborationOracle {
@@ -6056,6 +6351,19 @@ fn read_r8b2c_adapter_oracle(root: &Path, routed_ids: &RoutedWorkIds) -> R8b2cAd
         receipt_bytes,
         observations,
     }
+}
+
+fn phase_one_observation_summary(oracle: &R8b2cAdapterOracle) -> Vec<String> {
+    oracle
+        .observations
+        .iter()
+        .map(|observation| {
+            format!(
+                "observation_id={} native_key={} payload={:?}",
+                observation.observation_id, observation.native_key, observation.observation.payload
+            )
+        })
+        .collect()
 }
 
 fn u03c_oracle_request<'a>(root: &'a Path, task_id: &'a str) -> GovernedResultOracleRequest<'a> {
@@ -9901,7 +10209,7 @@ async fn r8a_cli_prepare_tui_confirm_dispatches_context_material_once() {
     let expected_bundle_ref = format!("ctx-{compiled_digest}.json");
     assert_eq!(driver_record["dispatchCount"], 1);
     assert_eq!(driver_record["runId"], routed_ids.run_id);
-    assert_eq!(driver_record["stepId"], "r8a-step");
+    assert_eq!(driver_record["stepId"], routed_ids.step_id);
     assert_eq!(driver_record["attemptId"], routed_ids.attempt_id);
     assert_eq!(driver_record["dispatchId"], routed_ids.dispatch_id);
     assert_eq!(driver_record["inputBundleRef"], expected_bundle_ref);
@@ -10131,7 +10439,7 @@ async fn r8b_activation_outbox_survives_daemon_kill_and_dispatches_once_after_re
     let driver_record = driver_record.expect("R-8B.1 restart must dispatch the pending activation");
     assert_eq!(driver_record["dispatchCount"], 1);
     assert_eq!(driver_record["runId"], routed_ids.run_id);
-    assert_eq!(driver_record["stepId"], "r8a-step");
+    assert_eq!(driver_record["stepId"], routed_ids.step_id);
     assert_eq!(driver_record["attemptId"], routed_ids.attempt_id);
     assert_eq!(driver_record["dispatchId"], routed_ids.dispatch_id);
     assert_eq!(
@@ -10943,7 +11251,7 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         routed_ids.attempt_id
     );
     assert_eq!(collaboration_after_kill.attempt.run_id, routed_ids.run_id);
-    assert_eq!(collaboration_after_kill.attempt.step_id, "r8a-step");
+    assert_eq!(collaboration_after_kill.attempt.step_id, routed_ids.step_id);
     assert!(collaboration_after_kill.attempt.attempt_number > 0);
     assert_eq!(
         collaboration_after_kill.attempt.status,
@@ -11066,7 +11374,10 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         collaboration_after_recovery.attempt.run_id,
         routed_ids.run_id
     );
-    assert_eq!(collaboration_after_recovery.attempt.step_id, "r8a-step");
+    assert_eq!(
+        collaboration_after_recovery.attempt.step_id,
+        routed_ids.step_id
+    );
     assert_eq!(
         collaboration_after_recovery.attempt.attempt_number,
         original_attempt_number
@@ -11133,7 +11444,10 @@ async fn r9a3d_daemon_crash_after_external_commit_recovers_without_resend() {
         routed_ids.attempt_id
     );
     assert_eq!(collaboration_after_stable.attempt.run_id, routed_ids.run_id);
-    assert_eq!(collaboration_after_stable.attempt.step_id, "r8a-step");
+    assert_eq!(
+        collaboration_after_stable.attempt.step_id,
+        routed_ids.step_id
+    );
     assert_eq!(
         collaboration_after_stable.attempt.attempt_number,
         original_attempt_number
@@ -11197,6 +11511,7 @@ async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll(
         task_id,
         snapshot_id: _,
         routed_ids,
+        ..
     } = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-begin").await;
 
     wait_for_r8b2c_checkpoint(
@@ -11369,6 +11684,7 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
         task_id,
         snapshot_id,
         routed_ids,
+        ..
     } = prepare_and_confirm_r8b2c_work(&root, &instance, "r8b2c-delivered").await;
 
     wait_for_r8b2c_checkpoint(
@@ -12034,6 +12350,8 @@ async fn c5_04_real_cli_rejects_malformed_await_and_submits_guided_approval() {
     assert_eq!(malformed_json["error"]["code"], "LOCAL_API_PROTOCOL_ERROR");
     assert_eq!(malformed_json["data"], serde_json::Value::Null);
 
+    let reviewed_summary_digest =
+        reviewed_approval_summary_digest(&instance, "approval-c5-03").await;
     let accepted = run_cli(
         &instance,
         &[
@@ -12046,6 +12364,8 @@ async fn c5_04_real_cli_rejects_malformed_await_and_submits_guided_approval() {
             "c5-04-guided-accepted",
             "--confirmation-proof-ref",
             "proof:c5-04:guided-accepted",
+            "--reviewed-summary-digest",
+            reviewed_summary_digest.as_str(),
             "--json",
         ],
     )
@@ -12100,11 +12420,19 @@ async fn u02c_real_daemon_seeded_projection_uses_production_approval_queue_contr
             })
     );
 
+    let reviewed_summary_digest = controller
+        .model()
+        .expect("approval model")
+        .items
+        .iter()
+        .find(|item| item.approval_request_id == "approval-c5-03")
+        .and_then(|item| item.summary_digest.clone());
     let receipt = controller
         .decide_selected(
             GuidedApprovalDecision::AllowOnce,
             "u02c-founder-approved".to_owned(),
             Some("proof:u02c:approval".to_owned()),
+            reviewed_summary_digest,
         )
         .await
         .expect("submit guided approval through shared operation");
@@ -12679,6 +13007,8 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
     assert_eq!(task_await_json["data"]["kind"], "task");
     assert_eq!(task_await_json["data"]["view"]["taskId"], task_id);
 
+    let reviewed_summary_digest =
+        reviewed_approval_summary_digest(&instance, "approval-c5-03").await;
     let approval_output = run_cli(
         &instance,
         &[
@@ -12691,6 +13021,8 @@ async fn c5_03_real_cli_process_completes_owner_writes_and_awaits_projection() {
             "c5-03-approved",
             "--confirmation-proof-ref",
             "confirmation-c5-03",
+            "--reviewed-summary-digest",
+            reviewed_summary_digest.as_str(),
             "--json",
         ],
     )
@@ -14158,7 +14490,7 @@ async fn m13_real_daemon_cli_tui_dispatch_and_restart_preserve_one_memory_pair()
             "--context-ref",
             "context.md",
             "--idempotency-key",
-            "m13-tui-prepare",
+            "m13-cli-prepare",
             "--json",
         ],
     )
@@ -14306,4 +14638,410 @@ async fn m13_real_daemon_cli_tui_dispatch_and_restart_preserve_one_memory_pair()
     );
 
     fs::remove_dir_all(&root).expect("remove M-13 C5 fixture root");
+}
+
+fn phase_one_seed_restart_tasks(root: &Path) -> (TaskSnapshot, TaskSnapshot) {
+    let verdict_handle = Arc::new(Mutex::new(None));
+    let transition_guard =
+        ConfiguredTaskTransitionGuard::with_founder_verdict(Arc::clone(&verdict_handle));
+    let mut authority = TaskAuthority::open_with_transition_guard(
+        TaskAuthorityConfig {
+            database_path: root.join("task-authority.db"),
+            store_epoch: "c5-00-task-epoch".to_owned(),
+            key: SqlCipherKey::new([0x11; 32]),
+        },
+        AllowTaskReferences,
+        transition_guard,
+    )
+    .expect("open isolated phase-one Task Authority");
+    let founder = u03c_task_principal(TaskPrincipalKind::Founder, "founder:phase-one-restart");
+    let collaboration = u03c_task_principal(
+        TaskPrincipalKind::CollaborationControl,
+        "collaboration-control:phase-one-restart",
+    );
+    let mut seed = |label: &str| {
+        let mut created = u03c_execute_task(
+            &mut authority,
+            TaskCommand {
+                command: Some(task_command::Command::CreateTask(CreateTaskCommand {
+                    meta: Some(CommandMetadata {
+                        command_id: format!("phase-one-create-{label}"),
+                        idempotency_key: format!("phase-one-create-{label}"),
+                        idempotency_scope: "phase-one-restart".to_owned(),
+                        request_digest_sha256: String::new(),
+                        issued_at: Some(prost_types::Timestamp {
+                            seconds: 1_788_633_600,
+                            nanos: 0,
+                        }),
+                        correlation_id: format!("phase-one-{label}"),
+                        causation_id: None,
+                    }),
+                    work_type: "governed_repository_change".to_owned(),
+                    input_snapshot_id: format!("input-phase-one-{label}"),
+                    target_scope_ref: "scope:phase-one-restart".to_owned(),
+                    acceptance_contract_ref: Some(r8a_reference("phase-one-acceptance")),
+                    budget_profile_ref: Some(r8a_reference("phase-one-budget")),
+                    work_capability_route: None,
+                })),
+            },
+            &founder,
+        );
+        created = u03c_execute_task(
+            &mut authority,
+            TaskCommand {
+                command: Some(task_command::Command::ActivateTask(ActivateTaskCommand {
+                    meta: Some(CommandMetadata {
+                        command_id: format!("phase-one-activate-{label}"),
+                        idempotency_key: format!("phase-one-activate-{label}"),
+                        idempotency_scope: "phase-one-restart".to_owned(),
+                        request_digest_sha256: String::new(),
+                        issued_at: Some(prost_types::Timestamp {
+                            seconds: 1_788_633_601,
+                            nanos: 0,
+                        }),
+                        correlation_id: format!("phase-one-{label}"),
+                        causation_id: None,
+                    }),
+                    task_id: created.task_id.clone(),
+                    expected_revision: created.revision,
+                    work_revision: created.work_revision,
+                    run_id: format!("run:phase-one:{label}"),
+                })),
+            },
+            &collaboration,
+        );
+        created
+    };
+    let active = seed("active");
+    let cancellation_active = seed("cancellation-pending");
+    let cancellation_pending = u03c_execute_task(
+        &mut authority,
+        TaskCommand {
+            command: Some(task_command::Command::RequestTaskCancellation(
+                RequestTaskCancellationCommand {
+                    meta: Some(CommandMetadata {
+                        command_id: "phase-one-cancel-pending".to_owned(),
+                        idempotency_key: "phase-one-cancel-pending".to_owned(),
+                        idempotency_scope: "phase-one-restart".to_owned(),
+                        request_digest_sha256: String::new(),
+                        issued_at: Some(prost_types::Timestamp {
+                            seconds: 1_788_633_602,
+                            nanos: 0,
+                        }),
+                        correlation_id: "phase-one-cancellation-pending".to_owned(),
+                        causation_id: None,
+                    }),
+                    task_id: cancellation_active.task_id.clone(),
+                    expected_revision: cancellation_active.revision,
+                    reason_code: "restart-read-fixture".to_owned(),
+                },
+            )),
+        },
+        &founder,
+    );
+    assert_eq!(active.status, TaskStatus::Active as i32);
+    assert_eq!(
+        cancellation_pending.status,
+        TaskStatus::CancellationPending as i32
+    );
+    (active, cancellation_pending)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase_one_two_tasks_exact_replay_return_and_restart_remain_isolated() {
+    let root = std::env::temp_dir().join(format!("egopulse-phase-one-multi-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create phase-one multi-task fixture root");
+    let instance = format!("phase-one-multi-{}", Uuid::now_v7());
+    let mut daemon = spawn_fixture_with_mode(&root, &instance, PHASE_ONE_MULTI_TASK_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut daemon).await;
+
+    let first = prepare_and_confirm_r8b2c_work(&root, &instance, "phase-one-first").await;
+    wait_for_r8b2c_task_status(&instance, &first.task_id, TaskStatus::Active, &mut daemon).await;
+    let first_task_before_replay = read_r8b2c_task_oracle(&root, &first.task_id);
+    let replay = run_tui(
+        &instance,
+        &[
+            "--instance",
+            &instance,
+            "work-confirm",
+            &first.snapshot_id,
+            "--confirmation-binding-sha256",
+            &first.confirmation_binding,
+            "--idempotency-key",
+            &first.confirm_key,
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        replay.status.success(),
+        "phase-one exact replay failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay: serde_json::Value =
+        serde_json::from_slice(&replay.stdout).expect("decode phase-one replay");
+    assert_eq!(replay["data"]["taskId"], first.task_id);
+    assert_eq!(replay["data"]["replayed"], true);
+    assert_eq!(
+        read_r8b2c_task_oracle(&root, &first.task_id),
+        first_task_before_replay
+    );
+
+    let second = prepare_and_confirm_r8b2c_work(&root, &instance, "phase-one-second").await;
+    assert_ne!(first.task_id, second.task_id);
+    assert_ne!(first.routed_ids.run_id, second.routed_ids.run_id);
+    assert_ne!(first.routed_ids.step_id, second.routed_ids.step_id);
+    assert_ne!(first.routed_ids.attempt_id, second.routed_ids.attempt_id);
+    assert_ne!(first.routed_ids.dispatch_id, second.routed_ids.dispatch_id);
+
+    timeout(Duration::from_secs(15), async {
+        loop {
+            let records = fs::read(root.join(PHASE_ONE_DRIVER_LEDGER))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Vec<PhaseOneDriverRecord>>(&bytes).ok());
+            let returned = [&first, &second].iter().all(|work| {
+                read_r8b2c_collaboration_store(
+                    &root.join("r8a-collaboration.db"),
+                    &[0x31; 32],
+                    &work.routed_ids.run_id,
+                    &work.routed_ids.step_id,
+                    &work.routed_ids.attempt_id,
+                )
+                .ok()
+                .is_some_and(|stored| stored.attempt_status == AttemptStatus::Returned as i32)
+            });
+            if records.as_ref().is_some_and(|records| records.len() == 2) && returned {
+                break;
+            }
+            if let Some(status) = daemon
+                .try_wait()
+                .expect("inspect phase-one multi-task daemon")
+            {
+                panic!("phase-one multi-task daemon exited before return: {status}");
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("phase-one two-task governed return deadline");
+
+    let ledger_before = fs::read(root.join(PHASE_ONE_DRIVER_LEDGER))
+        .expect("read phase-one driver ledger before restart");
+    let records: Vec<PhaseOneDriverRecord> =
+        serde_json::from_slice(&ledger_before).expect("decode phase-one driver ledger");
+    assert_eq!(records.len(), 2);
+    for work in [&first, &second] {
+        let record = records
+            .iter()
+            .find(|record| record.dispatch_id == work.routed_ids.dispatch_id)
+            .expect("one driver record for each phase-one task");
+        assert_eq!(record.run_id, work.routed_ids.run_id);
+        assert_eq!(record.step_id, work.routed_ids.step_id);
+        assert_eq!(record.attempt_id, work.routed_ids.attempt_id);
+    }
+    let first_collaboration = read_r8b2c_collaboration_oracle(&root, &first.routed_ids);
+    let second_collaboration = read_r8b2c_collaboration_oracle(&root, &second.routed_ids);
+    for collaboration in [&first_collaboration, &second_collaboration] {
+        assert_eq!(collaboration.run.status, RunStatus::ReturnPending as i32);
+        assert_eq!(collaboration.step.status, StepStatus::ReturnPending as i32);
+        assert_eq!(collaboration.attempt.status, AttemptStatus::Returned as i32);
+    }
+    let first_adapter = read_r8b2c_adapter_oracle(&root, &first.routed_ids);
+    let second_adapter = read_r8b2c_adapter_oracle(&root, &second.routed_ids);
+    let first_observations = phase_one_observation_summary(&first_adapter);
+    let second_observations = phase_one_observation_summary(&second_adapter);
+    assert_eq!(
+        first_adapter.observations.len(),
+        3,
+        "first dispatch observation sequence: {first_observations:#?}"
+    );
+    assert_eq!(
+        second_adapter.observations.len(),
+        3,
+        "second dispatch observation sequence: {second_observations:#?}"
+    );
+    stop_u04c_fixture(&mut daemon, "phase-one multi-task daemon").await;
+
+    let adapter = AdapterEdge::open(AdapterEdgeConfig {
+        database_path: root.join("r8a-adapter.db"),
+        adapter_id: CODEX_ADAPTER_ID.to_owned(),
+        store_epoch: "r8a-adapter-epoch".to_owned(),
+        key: AdapterEdgeKey::new([0x32; 32]),
+    })
+    .expect("reopen phase-one Adapter Edge");
+    let adapter_before = adapter.inspect().expect("inspect phase-one Adapter Edge");
+    assert_eq!(adapter_before.dispatch_count, 2);
+    assert_eq!(
+        adapter_before.observation_count, 6,
+        "first dispatch observations={first_observations:#?}; second dispatch observations={second_observations:#?}"
+    );
+    assert_eq!(adapter_before.terminal_output_outbox_count, 2);
+    assert_eq!(adapter_before.pending_terminal_output_count, 0);
+    drop(adapter);
+    let (artifact, _) = r8a_authorities(&root, &r8a_native_config(&root).return_collector);
+    let artifact_before = artifact
+        .lock()
+        .expect("lock phase-one Artifact Authority")
+        .inspect_store()
+        .expect("inspect phase-one Artifact Authority");
+    assert_eq!(artifact_before.return_handoff_count, 2);
+    assert_eq!(artifact_before.return_receipt_count, 2);
+    drop(artifact);
+
+    let mut restarted = spawn_fixture_with_mode(&root, &instance, PHASE_ONE_MULTI_TASK_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut restarted).await;
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        restarted
+            .try_wait()
+            .expect("inspect restarted phase-one daemon")
+            .is_none()
+    );
+    stop_u04c_fixture(&mut restarted, "restarted phase-one multi-task daemon").await;
+    assert_eq!(
+        fs::read(root.join(PHASE_ONE_DRIVER_LEDGER)).expect("read restarted driver ledger"),
+        ledger_before
+    );
+    assert_eq!(
+        read_r8b2c_collaboration_oracle(&root, &first.routed_ids),
+        first_collaboration
+    );
+    assert_eq!(
+        read_r8b2c_collaboration_oracle(&root, &second.routed_ids),
+        second_collaboration
+    );
+    fs::remove_dir_all(&root).expect("remove phase-one multi-task fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase_one_no_context_defaults_to_memory() {
+    let root = std::env::temp_dir().join(format!("egopulse-phase-one-memory-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create phase-one memory fixture root");
+    let instance = format!("phase-one-memory-{}", Uuid::now_v7());
+    let mut daemon = spawn_fixture_with_mode(&root, &instance, M13_MEMORY_DISPATCH_MODE).await;
+    wait_for_cli_status_with_child(&instance, &mut daemon).await;
+
+    let memory = run_cli(
+        &instance,
+        &[
+            "work",
+            "prepare",
+            "--intent",
+            "use accepted Memory without an explicit context reference",
+            "--scope",
+            "scope:founder",
+            "--work-type",
+            "governed_repository_change",
+            "--idempotency-key",
+            "phase-one-memory-default",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        memory.status.success(),
+        "default Memory preparation failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&memory.stdout),
+        String::from_utf8_lossy(&memory.stderr)
+    );
+    let memory: serde_json::Value =
+        serde_json::from_slice(&memory.stdout).expect("decode default Memory preparation");
+    assert!(
+        memory["data"]["memoryPackSnapshotSha256"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64)
+    );
+    assert!(
+        memory["data"]["includedSources"]
+            .as_array()
+            .is_some_and(|sources| sources.iter().any(|source| source["authority"] == "memory"))
+    );
+
+    stop_u04c_fixture(&mut daemon, "phase-one memory-default daemon").await;
+    fs::remove_dir_all(&root).expect("remove phase-one memory fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase_one_no_memory_without_sources_is_blocked_and_creates_no_task() {
+    let root =
+        std::env::temp_dir().join(format!("egopulse-phase-one-no-source-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create phase-one no-source fixture root");
+    let instance = format!("phase-one-no-source-{}", Uuid::now_v7());
+    let mut daemon = spawn_fixture_with_mode(&root, &instance, "allow").await;
+    wait_for_cli_status_with_child(&instance, &mut daemon).await;
+    let task_before_start = u04c_durability(&root, None, None).task;
+    let start = run_cli(
+        &instance,
+        &[
+            "work",
+            "start",
+            "--intent",
+            "reject an empty governed work start",
+            "--scope",
+            "scope:founder",
+            "--work-type",
+            "governed_repository_change",
+            "--no-memory",
+            "--confirm",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(
+        !start.status.success(),
+        "no-source work start must fail: stdout={} stderr={}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let start: serde_json::Value =
+        serde_json::from_slice(&start.stdout).expect("decode no-source work start failure");
+    assert_eq!(start["error"]["code"], "GUIDED_WORK_INPUT_INVALID");
+    assert_eq!(u04c_durability(&root, None, None).task, task_before_start);
+
+    stop_u04c_fixture(&mut daemon, "phase-one no-source daemon").await;
+    fs::remove_dir_all(&root).expect("remove phase-one no-source fixture root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase_one_restart_reads_existing_active_and_cancellation_pending_tasks_without_writes() {
+    let root = std::env::temp_dir().join(format!("egopulse-phase-one-restart-{}", Uuid::now_v7()));
+    fs::create_dir_all(&root).expect("create phase-one restart fixture root");
+    let (active, cancellation_pending) = phase_one_seed_restart_tasks(&root);
+    let active_before = read_r8b2c_task_oracle(&root, &active.task_id);
+    let cancellation_before = read_r8b2c_task_oracle(&root, &cancellation_pending.task_id);
+    let instance = format!("phase-one-restart-{}", Uuid::now_v7());
+    let mut daemon = spawn_fixture_with_mode(&root, &instance, "allow").await;
+    wait_for_cli_status_with_child(&instance, &mut daemon).await;
+
+    let active_read = run_cli(&instance, &["task", "get", &active.task_id, "--json"]).await;
+    assert!(active_read.status.success());
+    let active_read: serde_json::Value =
+        serde_json::from_slice(&active_read.stdout).expect("decode restarted Active task");
+    assert_eq!(
+        active_read["data"]["status"],
+        TaskStatus::Active.as_str_name()
+    );
+    let cancellation_read = run_cli(
+        &instance,
+        &["task", "get", &cancellation_pending.task_id, "--json"],
+    )
+    .await;
+    assert!(cancellation_read.status.success());
+    let cancellation_read: serde_json::Value = serde_json::from_slice(&cancellation_read.stdout)
+        .expect("decode restarted CancellationPending task");
+    assert_eq!(
+        cancellation_read["data"]["status"],
+        TaskStatus::CancellationPending.as_str_name()
+    );
+    stop_u04c_fixture(&mut daemon, "phase-one restart-read daemon").await;
+    assert_eq!(
+        read_r8b2c_task_oracle(&root, &active.task_id),
+        active_before
+    );
+    assert_eq!(
+        read_r8b2c_task_oracle(&root, &cancellation_pending.task_id),
+        cancellation_before
+    );
+    fs::remove_dir_all(&root).expect("remove phase-one restart fixture root");
 }

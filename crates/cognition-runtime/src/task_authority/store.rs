@@ -202,6 +202,15 @@ pub struct PendingTaskOutbox {
     pub payload: Vec<u8>,
 }
 
+pub(super) struct CommittedTaskEvent {
+    pub payload: Vec<u8>,
+    pub event_id: String,
+    pub command_id: String,
+    pub request_digest_sha256: String,
+    pub idempotency_key: String,
+    pub committed_at_seconds: i64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingTaskProjectionOutbox {
     pub message_id: String,
@@ -511,6 +520,51 @@ impl TaskStore {
             |row| row.get(0),
         )?;
         Ok(count == 1)
+    }
+
+    pub fn committed_event_at_revision(
+        &self,
+        task_id: &str,
+        revision: u64,
+    ) -> Result<Option<CommittedTaskEvent>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT e.event,o.canonical_payload_digest_sha256,e.event_id,e.command_id,
+                    e.request_digest_sha256,r.idempotency_key,r.committed_at_seconds
+             FROM task_events e
+             JOIN task_commit_receipts r ON r.event_id=e.event_id
+             JOIN task_outbox o ON o.message_id=r.outbox_message_id AND o.source_event_id=e.event_id
+             WHERE e.task_id=?1 AND e.resulting_revision=?2
+               AND r.aggregate_id=e.task_id AND r.aggregate_revision=e.resulting_revision
+               AND r.request_digest_sha256=e.request_digest_sha256
+               AND r.store_epoch=?3 AND r.acknowledged_after_durability_barrier=1
+               AND o.source_revision=e.resulting_revision AND o.payload=e.event
+             LIMIT 2",
+        )?;
+        let events = statement
+            .query_map(params![task_id, revision as i64, self.store_epoch], |row| {
+                Ok((
+                    CommittedTaskEvent {
+                        payload: row.get(0)?,
+                        event_id: row.get(2)?,
+                        command_id: row.get(3)?,
+                        request_digest_sha256: row.get(4)?,
+                        idempotency_key: row.get(5)?,
+                        committed_at_seconds: row.get(6)?,
+                    },
+                    row.get::<_, String>(1)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if events.len() > 1 {
+            return Err(StoreError::IntegrityFailure);
+        }
+        let Some((event, payload_digest)) = events.into_iter().next() else {
+            return Ok(None);
+        };
+        if hex::encode(Sha256::digest(&event.payload)) != payload_digest {
+            return Err(StoreError::IntegrityFailure);
+        }
+        Ok(Some(event))
     }
 
     pub fn pending_cross_authority_outbox(&self) -> Result<Vec<PendingTaskOutbox>, StoreError> {

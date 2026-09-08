@@ -1,4 +1,5 @@
 mod adapter_evidence;
+mod cancellation_recovery;
 mod composite_guard;
 mod harness_dispatch;
 mod ingestion;
@@ -10,8 +11,11 @@ pub use adapter_evidence::AdapterBackedHarnessEvidenceResolver;
 pub use composite_guard::CompositeCollaborationGuard;
 pub use harness_dispatch::{
     CompositeHarnessDispatchRunner, GovernedHarnessDispatchRunner, GovernedTaskActivationRunner,
-    HarnessDispatchCycleError, HarnessDispatchCycleReport, HarnessDispatchRunner,
-    TaskRecoveryFinding, TaskRecoveryKind, dispatch_pending, pump_observations,
+    HarnessApprovalDeliveryTarget, HarnessCancellationDeliveryError,
+    HarnessCancellationDeliveryTarget, HarnessDispatchCycleError, HarnessDispatchCycleReport,
+    HarnessDispatchRunner, TaskActivationBlockage, TaskDispatchMaterialPreparer,
+    TaskDispatchMaterialRejection, TaskRecoveryFinding, TaskRecoveryKind, dispatch_pending,
+    pump_observations,
 };
 pub use ingestion::{HarnessFactIngestionDisposition, HarnessFactIngestionResult};
 pub use single_harness_workflow::{
@@ -219,6 +223,17 @@ pub trait HarnessEvidenceResolver {
         snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection>;
 
+    /// Resolves a sealed Artifact return that won a pending cancellation.
+    /// A terminal notification or interrupt delivery alone is insufficient.
+    fn resolve_cancellation_return(
+        &self,
+        command: &RecordAttemptCancellationOutcomeCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
+        let _ = (command, snapshot);
+        Err(ReferenceGuardRejection::UnverifiedReference)
+    }
+
     fn validate_reconciliation(
         &self,
         command: &RecordAttemptReconciliationCommand,
@@ -392,6 +407,18 @@ pub struct TaskActivationHandoff {
     pub task: egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot,
 }
 
+/// Typed, digest-checked Task cancellation intent. It reuses the immutable
+/// Task event already persisted in the cross-authority outbox; no native
+/// request identity is synthesized on recovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskCancellationHandoff {
+    pub message_id: String,
+    pub payload_digest_sha256: String,
+    pub cancellation_request_id: String,
+    pub requested_at: Timestamp,
+    pub task: egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskActivationSourceError {
     Unavailable,
@@ -426,6 +453,48 @@ where
         payload_digest_sha256: &str,
     ) -> Result<bool, TaskActivationSourceError> {
         (**self).acknowledge_task_activation(message_id, payload_digest_sha256)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum TaskCancellationSourceError {
+    #[error("Task cancellation owner is unavailable")]
+    Unavailable,
+    #[error("Task cancellation owner data failed integrity validation")]
+    Integrity,
+}
+
+/// The Task Authority owns cancellation intent and outbox acknowledgement.
+/// The daemon owns delivery through the already-live Collaboration/Adapter
+/// runner, so an implementation must not construct another native session.
+pub trait TaskCancellationSource: Send + Sync {
+    fn pending_task_cancellations(
+        &self,
+    ) -> Result<Vec<TaskCancellationHandoff>, TaskCancellationSourceError>;
+
+    fn acknowledge_task_cancellation(
+        &self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, TaskCancellationSourceError>;
+}
+
+impl<T> TaskCancellationSource for std::sync::Arc<T>
+where
+    T: TaskCancellationSource + ?Sized,
+{
+    fn pending_task_cancellations(
+        &self,
+    ) -> Result<Vec<TaskCancellationHandoff>, TaskCancellationSourceError> {
+        (**self).pending_task_cancellations()
+    }
+
+    fn acknowledge_task_cancellation(
+        &self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, TaskCancellationSourceError> {
+        (**self).acknowledge_task_cancellation(message_id, payload_digest_sha256)
     }
 }
 
@@ -1834,9 +1903,36 @@ where
             }
             Ok(value) => value,
         };
-        let authorization = match self.guard.validate_cancellation_outcome(value, &snapshot) {
-            Ok(value) => value,
-            Err(value) => return Ok(guard_error(value)),
+        let (authorization, returned) = if disposition
+            == AttemptCancellationDisposition::ReturnFound
+        {
+            let resolved = match self.guard.resolve_cancellation_return(value, &snapshot) {
+                Ok(value) => value,
+                Err(value) => return Ok(guard_error(value)),
+            };
+            if resolved.artifact_set_id.trim().is_empty()
+                || resolved.return_handoff_id.trim().is_empty()
+                || attempt.dispatch_id.as_deref() != Some(resolved.dispatch_id.as_str())
+                || resolved.evidence_refs.is_empty()
+                || resolved
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference.trim().is_empty())
+            {
+                return Ok(invalid("CANCELLATION_RETURN_PROOF_INVALID"));
+            }
+            (
+                ReferenceAuthorization {
+                    evidence_refs: resolved.evidence_refs.clone(),
+                },
+                Some(resolved),
+            )
+        } else {
+            let authorization = match self.guard.validate_cancellation_outcome(value, &snapshot) {
+                Ok(value) => value,
+                Err(value) => return Ok(guard_error(value)),
+            };
+            (authorization, None)
         };
         let now = self.clock.now();
         let run_previous = snapshot.run.as_ref().expect("run").revision;
@@ -1875,6 +1971,10 @@ where
         step.revision += 1;
         step.status = step_status as i32;
         step.hold_reason_code = hold.clone();
+        if let Some(returned) = returned.as_ref() {
+            step.artifact_set_id = Some(returned.artifact_set_id.clone());
+            step.return_handoff_id = Some(returned.return_handoff_id.clone());
+        }
         step.updated_at = Some(now);
         let attempt = &mut snapshot.attempts[attempt_index];
         attempt.revision += 1;
@@ -2090,7 +2190,7 @@ where
         let Some(base) = value.base.as_ref() else {
             return Ok(invalid("OUTCOME_UNKNOWN_BASE_REQUIRED"));
         };
-        let Some(mut snapshot) = self.load_snapshot(&base.run_id)? else {
+        let Some(snapshot) = self.load_snapshot(&base.run_id)? else {
             return Ok(not_found("COLLABORATION_RUN_NOT_FOUND"));
         };
         let (step_index, attempt_index) = match validate_attempt_preconditions(&snapshot, base) {
@@ -2115,10 +2215,32 @@ where
             Ok(value) => value,
             Err(rejection) => return Ok(guard_error(rejection)),
         };
+        self.persist_outcome_unknown(
+            value,
+            command,
+            principal,
+            snapshot,
+            step_index,
+            attempt_index,
+            authorization,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_outcome_unknown(
+        &mut self,
+        value: &MarkAttemptOutcomeUnknownCommand,
+        command: &CollaborationCommand,
+        principal: &AuthenticatedCollaborationPrincipal,
+        mut snapshot: CollaborationSnapshot,
+        step_index: usize,
+        attempt_index: usize,
+        authorization: ReferenceAuthorization,
+    ) -> Result<CollaborationCommandResult, CollaborationControlError> {
         let now = self.clock.now();
         let run_previous = snapshot.run.as_ref().expect("stored run").revision;
         let step_previous = snapshot.steps[step_index].revision;
-        let attempt_previous = attempt.revision;
+        let attempt_previous = snapshot.attempts[attempt_index].revision;
         let run = snapshot.run.as_mut().expect("stored run");
         run.revision += 1;
         run.status = RunStatus::Held as i32;

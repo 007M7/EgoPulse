@@ -8,7 +8,9 @@ use egopulse_harness_adapter::{
     AdapterClock, AdapterEdge, AdapterEdgeConfig, AdapterEdgeKey, DispatchMaterialResolver,
     DispatchPreparation, GovernedHarnessAdapter, ReconciliationFinding, ResolvedDispatchMaterial,
 };
+use prost::Message;
 use prost_types::Timestamp;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
@@ -101,7 +103,7 @@ fn envelope() -> DispatchEnvelope {
 }
 
 fn unknown_delivery_receipt(value: &DispatchEnvelope) -> DispatchReceipt {
-    DispatchReceipt {
+    let mut receipt = DispatchReceipt {
         receipt_id: "receipt-dsh-recovery-unknown".to_owned(),
         disposition: DeliveryDisposition::Unknown as i32,
         attempt_id: value.attempt_id.clone(),
@@ -117,10 +119,12 @@ fn unknown_delivery_receipt(value: &DispatchEnvelope) -> DispatchReceipt {
             native_executable_version: "dsh-replay".to_owned(),
             native_binary_sha256: None,
         }),
-        receipt_digest_sha256: "4".repeat(64),
+        receipt_digest_sha256: String::new(),
         evidence_ref: "dsh-delivery-unknown".to_owned(),
         ..Default::default()
-    }
+    };
+    receipt.receipt_digest_sha256 = hex::encode(Sha256::digest(receipt.encode_to_vec()));
+    receipt
 }
 
 fn adapter(edge: AdapterEdge) -> GovernedHarnessAdapter<StaticResolver, DshAcpDriver, FixedClock> {

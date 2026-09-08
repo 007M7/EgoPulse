@@ -50,11 +50,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $cargo test --workspace --exclude egopulse-agentosd --locked
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# The daemon's real-process fixture starts child daemons and owns Windows
-# Named Pipe instances. Keep its test binary serial so the local quality gate
-# validates the lifecycle deterministically instead of racing child teardown.
-& $cargo test -p egopulse-agentosd --lib --locked -- --test-threads=1
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-& $cargo test -p egopulse-agentosd --test c5_00_daemon_fixture --locked -- --test-threads=1
+# Daemon integration targets cover Verification intake, Artifact returns,
+# Verdict settlement and recovery in addition to the CLI/TUI C5 fixture.
+# Select every target so a new integration test cannot silently miss the gate.
+# These tests own child daemons and Named Pipes, so keep each binary serial.
+# Explicitly ignored live-provider tests remain a separate acceptance step.
+& $cargo test -p egopulse-agentosd --lib --bins --tests --locked -- --test-threads=1
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

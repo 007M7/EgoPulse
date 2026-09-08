@@ -7,7 +7,7 @@ use egopulse_artifact_authority::ArtifactProjectionMessage;
 use egopulse_cognition_runtime::task_authority::TaskProjectionMessage;
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::ProjectionPosition;
 use egopulse_founder_verdict_authority::VerdictProjectionMessage;
-use egopulse_harness_adapter::PendingAdapterApprovalProjection;
+use egopulse_harness_adapter::{AdapterEdge, PendingAdapterApprovalProjection};
 use egopulse_local_api::read_model_reader::ProjectionCommitNotifier;
 use egopulse_local_ide_control::collaboration_control::PendingCollaborationProjection;
 use egopulse_local_read_model::{
@@ -152,6 +152,55 @@ where
 
 pub struct AdapterApprovalProjectionSource<R, D, C> {
     owner: Mutex<egopulse_harness_adapter::GovernedHarnessAdapter<R, D, C>>,
+}
+
+/// Projects approval observations through a read/ACK-only Adapter Edge handle
+/// when the live governed adapter is owned by the dispatch runner. This keeps
+/// projection access separate from native driver/session ownership.
+pub struct AdapterEdgeApprovalProjectionSource {
+    edge: Mutex<AdapterEdge>,
+}
+
+impl AdapterEdgeApprovalProjectionSource {
+    #[must_use]
+    pub fn new(edge: AdapterEdge) -> Self {
+        Self {
+            edge: Mutex::new(edge),
+        }
+    }
+}
+
+impl OwnerProjectionSource for AdapterEdgeApprovalProjectionSource {
+    fn pending(&self) -> Result<Vec<PendingOwnerProjection>, ProjectionSourceFailure> {
+        self.edge
+            .lock()
+            .map_err(|_| ProjectionSourceFailure::AdapterApproval)?
+            .pending_approval_projection_messages()
+            .map_err(|_| ProjectionSourceFailure::AdapterApproval)
+            .map(|messages| {
+                messages
+                    .into_iter()
+                    .map(|message| PendingOwnerProjection::AdapterApproval(Box::new(message)))
+                    .collect()
+            })
+    }
+
+    fn acknowledge(
+        &self,
+        message: &PendingOwnerProjection,
+    ) -> Result<bool, ProjectionSourceFailure> {
+        let PendingOwnerProjection::AdapterApproval(message) = message else {
+            return Ok(false);
+        };
+        self.edge
+            .lock()
+            .map_err(|_| ProjectionSourceFailure::AdapterApproval)?
+            .acknowledge_approval_projection_message(
+                &message.message_id,
+                &message.payload_digest_sha256,
+            )
+            .map_err(|_| ProjectionSourceFailure::AdapterApproval)
+    }
 }
 
 impl<R, D, C> AdapterApprovalProjectionSource<R, D, C> {

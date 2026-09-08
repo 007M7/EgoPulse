@@ -17,8 +17,10 @@ $typescriptDestination = Join-Path $repositoryRoot 'packages\generated-client\sr
 $rustDestination = Join-Path $repositoryRoot 'crates\domain-contracts\src\generated'
 $pythonDestination = Join-Path $repositoryRoot 'workers\contract-bindings\src'
 $generatedManifestPath = Join-Path $repositoryRoot 'generated\contract-bindings-manifest.json'
-$expectedContractManifestSha256 = 'e267e1636b56066d0bd937b5309e878728dfd7cc5dbba9464a6b70eb8e61a306'
+$expectedContractManifestSha256 = '96aec62ba142624d7674c1c5216be48b3ce2629b179b86d05bb90f0761ff61ab'
 $cargoCommand = Get-Command 'cargo' -ErrorAction SilentlyContinue
+$uvCommand = Get-Command 'uv' -ErrorAction SilentlyContinue
+$pythonToolchainExecutable = Join-Path $contractsRoot 'toolchain\python\.venv\Scripts\python.exe'
 $cargoExecutable = if ($null -ne $cargoCommand) {
     $cargoCommand.Source
 } elseif ($IsWindows -or $env:OS -eq 'Windows_NT') {
@@ -219,13 +221,22 @@ plugins:
 
     $pythonProtoFiles = @($protoArtifacts | ForEach-Object { $_.path.Substring('proto/'.Length) })
     $pythonArguments = @(
-        'run', '--project', (Join-Path $contractsRoot 'toolchain\python'), '--frozen',
-        'python', '-m', 'grpc_tools.protoc',
+        '-m', 'grpc_tools.protoc',
         '-I', (Join-Path $contractsRoot 'proto'),
         "--python_out=$pythonStage",
         "--pyi_out=$pythonStage"
     ) + $pythonProtoFiles
-    Invoke-Checked -Executable 'uv' -Arguments $pythonArguments -Failure 'Python contract generation failed'
+    if ($null -ne $uvCommand) {
+        $uvArguments = @(
+            'run', '--project', (Join-Path $contractsRoot 'toolchain\python'), '--frozen',
+            'python'
+        ) + $pythonArguments
+        Invoke-Checked -Executable $uvCommand.Source -Arguments $uvArguments -Failure 'Python contract generation failed'
+    } elseif (Test-Path -LiteralPath $pythonToolchainExecutable) {
+        Invoke-Checked -Executable $pythonToolchainExecutable -Arguments $pythonArguments -Failure 'Python contract generation failed'
+    } else {
+        throw 'uv and the frozen Python contract toolchain are both unavailable'
+    }
 }
 finally {
     $env:PATH = $oldPath
@@ -289,7 +300,13 @@ if ($Mode -eq 'Write') {
         throw 'generated contract manifest is missing; run pnpm run generate:contracts'
     }
     $actualManifestText = Get-Content -Raw -Encoding utf8 -LiteralPath $generatedManifestPath
-    if ($actualManifestText.Replace("`r`n", "`n") -ne $generatedManifestText.Replace("`r`n", "`n")) {
+    # PowerShell 5.1 and 7 indent JSON differently. Compare every manifest
+    # field and file digest using the current host's compact serialization;
+    # the generated source trees above still require exact file contents.
+    $actualManifestValue = $actualManifestText | ConvertFrom-Json
+    $actualManifestCanonical = $actualManifestValue | ConvertTo-Json -Depth 8 -Compress
+    $expectedManifestCanonical = $generatedManifest | ConvertTo-Json -Depth 8 -Compress
+    if ($actualManifestCanonical -cne $expectedManifestCanonical) {
         throw 'generated contract manifest drift; run pnpm run generate:contracts'
     }
     Write-Output "contract_codegen=clean files=$($generatedEntries.Count)"

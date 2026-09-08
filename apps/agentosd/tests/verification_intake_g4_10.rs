@@ -20,7 +20,8 @@ use egopulse_domain_contracts::v01::egopulse::{
     },
     verification::v1::{
         AttestCheckerProfileCommand, CheckerAssuranceClass, CheckerProfile, CheckerProfileStatus,
-        CriterionRequirement, DiscrepancySeverity, VerificationCommand, verification_command,
+        CriterionRequirement, DiscrepancySeverity, StartVerificationRunCommand,
+        VerificationCommand, verification_command,
     },
 };
 use egopulse_verification_authority::{
@@ -133,6 +134,15 @@ impl Drop for TempRoot {
 
 #[tokio::test(flavor = "current_thread")]
 async fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox() {
+    exercise_verification_worker(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unfinished_verification_is_held_without_failing_the_worker_or_writing_task_completion() {
+    exercise_verification_worker(true).await;
+}
+
+async fn exercise_verification_worker(unfinished_run: bool) {
     let root = TempRoot::new();
     let acceptance = contract("task-acceptance", SHA_A);
     let mut task = TaskAuthority::open_with_transition_guard(
@@ -357,6 +367,29 @@ async fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox(
             .is_none()
     );
 
+    if unfinished_run {
+        let mut authority = verification.lock().expect("verification lock");
+        let requests = authority.execution_requests().expect("read queued request");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        let start = signed_verification_command(VerificationCommand {
+            command: Some(verification_command::Command::StartVerificationRun(
+                StartVerificationRunCommand {
+                    metadata: Some(metadata("unfinished-run", "verification")),
+                    verification_request_id: request.verification_request_id.clone(),
+                    expected_request_revision: request.revision,
+                    verification_run_id: format!("worker-run-{}", request.verification_request_id),
+                },
+            )),
+        });
+        assert!(
+            authority
+                .execute(&start, &verification_principal)
+                .expect("persist unfinished run before creating worker")
+                .committed
+        );
+    }
+
     let mapper_profile_ref = profile_ref.clone();
     let worker = ConfiguredVerificationWorker::new(
         Arc::clone(&task),
@@ -413,6 +446,43 @@ async fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox(
         .run_once()
         .await
         .expect("run governed verification worker");
+    if unfinished_run {
+        assert!(matches!(
+            first,
+            egopulse_agentosd::VerificationWorkerCycleResult::Held {
+                task_id,
+                reason_code,
+                ..
+            } if task_id == created.task_id
+                && reason_code == "CHECKER_EXECUTION_OUTCOME_UNKNOWN_AFTER_RESTART"
+        ));
+        let written = task
+            .lock()
+            .expect("task lock")
+            .get_task(&created.task_id)
+            .expect("read pending task");
+        assert!(matches!(written.outcome,
+            Some(get_task_response::Outcome::Task(snapshot)) if snapshot == pending));
+        let held_inspection = verification
+            .lock()
+            .expect("verification lock")
+            .inspect_store()
+            .expect("inspect held run");
+        assert_eq!(held_inspection.verification_artifact_count, 0);
+        assert_eq!(
+            worker.run_once().await.expect("worker remains available"),
+            egopulse_agentosd::VerificationWorkerCycleResult::Idle
+        );
+        assert_eq!(
+            verification
+                .lock()
+                .expect("verification lock")
+                .inspect_store()
+                .expect("inspect idle cycle"),
+            held_inspection
+        );
+        return;
+    }
     assert!(matches!(
         first,
         egopulse_agentosd::VerificationWorkerCycleResult::Completed {
@@ -440,15 +510,11 @@ async fn task_handoff_reads_artifacts_commits_verification_and_acks_task_outbox(
     let second = worker
         .run_once()
         .await
-        .expect("replay completed worker and write-back");
-    assert!(matches!(
+        .expect("skip completed request already written to its Task");
+    assert_eq!(
         second,
-        egopulse_agentosd::VerificationWorkerCycleResult::Completed {
-            execution_replayed: true,
-            write_back_replayed: true,
-            ..
-        }
-    ));
+        egopulse_agentosd::VerificationWorkerCycleResult::Idle
+    );
 }
 
 fn contract(id: &str, digest: &str) -> ContractReference {
@@ -536,7 +602,8 @@ fn signed_verification_command(mut command: VerificationCommand) -> Verification
     let digest = canonical_request_digest(&command).expect("verification command digest");
     match command.command.as_mut().expect("verification operation") {
         verification_command::Command::AttestCheckerProfile(value) => value.metadata.as_mut(),
-        _ => unreachable!("G4-10 signs only the checker profile attestation"),
+        verification_command::Command::StartVerificationRun(value) => value.metadata.as_mut(),
+        _ => unreachable!("G4-10 signs only checker attestation and recovery setup"),
     }
     .expect("verification metadata")
     .request_digest_sha256 = digest;

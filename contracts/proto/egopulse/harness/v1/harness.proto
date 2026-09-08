@@ -147,6 +147,42 @@ enum ApprovalRequestLifecycleKind {
   APPROVAL_REQUEST_LIFECYCLE_KIND_RESOLVED = 3;
 }
 
+// Safe, additive approval-display state. Absence of the optional summary on an
+// older observation remains valid, but it is never sufficient for a positive
+// user decision. UNKNOWN is reserved for decoding and must not be rendered as
+// reviewable content.
+enum ApprovalDisplaySummaryState {
+  APPROVAL_DISPLAY_SUMMARY_STATE_UNSPECIFIED = 0;
+  APPROVAL_DISPLAY_SUMMARY_STATE_REVIEWABLE = 1;
+  APPROVAL_DISPLAY_SUMMARY_STATE_UNAVAILABLE = 2;
+  APPROVAL_DISPLAY_SUMMARY_STATE_REDACTED = 3;
+  APPROVAL_DISPLAY_SUMMARY_STATE_CONFLICT = 4;
+}
+
+message ApprovalDisplayFileChange {
+  string relative_path = 1;
+  string change_kind = 2;
+}
+
+// Versioned safe display material for an approval request. The fixed v1 policy
+// code is egopulse.approval-display/v1. summary_digest_sha256 seals the protobuf
+// bytes with that field cleared. This payload is presentation evidence only: it
+// grants no Authority, carries no native routing/thread/turn/item identifiers,
+// and must never contain raw request JSON, diffs or credentials.
+message ApprovalDisplaySummary {
+  ApprovalDisplaySummaryState state = 1;
+  string summary_ref = 2;
+  string summary_digest_sha256 = 3;
+  string action_digest_sha256 = 4;
+  string source_binding_sha256 = 5;
+  string command_preview = 6;
+  string working_directory_label = 7;
+  repeated ApprovalDisplayFileChange files = 8;
+  repeated string redaction_reason_codes = 9;
+  bool truncated = 10;
+  string policy_code = 11;
+}
+
 enum CancellationDeliveryDisposition {
   CANCELLATION_DELIVERY_DISPOSITION_UNSPECIFIED = 0;
   CANCELLATION_DELIVERY_DISPOSITION_DELIVERED = 1;
@@ -443,6 +479,9 @@ message ApprovalRequestObservation {
   string native_routing_ref = 6;
   ApprovalRequestLifecycleKind lifecycle = 7;
   uint64 request_revision = 8;
+  // Additive v1 safe display material. None is legacy-compatible but cannot be
+  // treated as reviewable by a client.
+  optional ApprovalDisplaySummary display_summary = 9;
 }
 
 message UsageObservation {

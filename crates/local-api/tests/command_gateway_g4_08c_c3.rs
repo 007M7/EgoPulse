@@ -14,9 +14,10 @@ use egopulse_domain_contracts::{
     v01::egopulse::{
         common::v1::{CommandMetadata, ContractReference},
         localapi::v1::{
-            ClientRequestMetadata, ClientSurface, ExecuteFounderVerdictRequest,
-            ExecuteTaskCommandRequest, LocalApiErrorCode, OpenSessionRequest, ProjectionPosition,
-            SourceDomain, SourceRevision, local_session_service_server::LocalSessionService,
+            ClientRequestMetadata, ClientSurface, CreateFounderSupportingMaterialRequest,
+            ExecuteFounderVerdictRequest, ExecuteTaskCommandRequest, LocalApiErrorCode,
+            OpenSessionRequest, ProjectionPosition, SourceDomain, SourceRevision,
+            local_session_service_server::LocalSessionService,
         },
         policy::v1::{
             HarnessApprovalDecisionRecord, HarnessApprovalDecisionState,
@@ -28,15 +29,17 @@ use egopulse_domain_contracts::{
             task_command, task_command_result,
         },
         verdict::v1::{
-            IssueFounderVerdictCommand, VerdictCommand, VerdictCommandResult, VerdictErrorCode,
-            verdict_command,
+            CreateFounderSupportingMaterialCommand, FounderSupportingMaterialReceipt,
+            FounderSupportingMaterialRole, IssueFounderVerdictCommand, VerdictCommand,
+            VerdictCommandResult, VerdictErrorCode, verdict_command,
         },
     },
 };
 use egopulse_local_api::{
     command_gateway::{
-        CommandGatewayApplication, CommandPortFailure, CommandPortResult, CommandPrincipal,
-        PolicyCommandPort, TaskCommandPort, VerdictCommandPort,
+        CommandExtensionPorts, CommandGatewayApplication, CommandPortFailure, CommandPortResult,
+        CommandPrincipal, FailClosedMemoryMutationPort, FailClosedWorkPreparationPort,
+        FounderSupportingMaterialPort, PolicyCommandPort, TaskCommandPort, VerdictCommandPort,
     },
     read_gateway_policy::ReadGatewayPolicy,
     read_tokens::{AwaitTarget, ReadTokenCodec, TokenMacKey},
@@ -131,6 +134,26 @@ impl PolicyCommandPort for RecordingPolicyPort {
 #[derive(Clone)]
 struct RecordingVerdictPort {
     outcome: Arc<Mutex<Result<CommandPortResult<VerdictCommandResult>, CommandPortFailure>>>,
+}
+
+#[derive(Clone)]
+struct RecordingFounderMaterialPort {
+    calls: Arc<AtomicUsize>,
+    last_principal: Arc<Mutex<Option<CommandPrincipal>>>,
+    outcome:
+        Arc<Mutex<Result<CommandPortResult<FounderSupportingMaterialReceipt>, CommandPortFailure>>>,
+}
+
+impl FounderSupportingMaterialPort for RecordingFounderMaterialPort {
+    fn create(
+        &self,
+        _command: &CreateFounderSupportingMaterialCommand,
+        principal: &CommandPrincipal,
+    ) -> Result<CommandPortResult<FounderSupportingMaterialReceipt>, CommandPortFailure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_principal.lock().expect("principal lock") = Some(principal.clone());
+        self.outcome.lock().expect("material port lock").clone()
+    }
 }
 
 impl VerdictCommandPort for RecordingVerdictPort {
@@ -281,6 +304,100 @@ async fn test_context(
         }),
     ));
     (peer, client, app, task_calls, last_principal, last_metadata)
+}
+
+async fn founder_material_context(
+    outcome: Result<CommandPortResult<FounderSupportingMaterialReceipt>, CommandPortFailure>,
+) -> (
+    PeerConnectionInfo,
+    ClientRequestMetadata,
+    Arc<CommandGatewayApplication>,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Option<CommandPrincipal>>>,
+) {
+    let peer = real_peer().await;
+    let clock: Arc<dyn SessionClock> = Arc::new(FixedClock(UNIX_EPOCH + Duration::from_secs(100)));
+    let endpoint = LocalSessionEndpoint::new(
+        SessionConfig::new(
+            vec![api_contract()],
+            kernel_contract(),
+            Duration::from_secs(60),
+        )
+        .expect("session config"),
+        Arc::new(Resolver {
+            peer: peer.principal().clone(),
+            grant: founder_grant(),
+        }),
+        Arc::clone(&clock),
+        Arc::new(FixedProjectionPosition(position())) as Arc<dyn ProjectionPositionProvider>,
+        Arc::new(NoopSessionAudit),
+    );
+    let open = OpenSessionRequest {
+        request_id: Uuid::now_v7().to_string(),
+        client_instance_id: "founder-material-gateway-test".to_owned(),
+        surface: ClientSurface::Cli as i32,
+        supported_contracts: vec![api_contract()],
+    };
+    let mut open_request = Request::new(open.clone());
+    open_request.extensions_mut().insert(peer.clone());
+    let opened = endpoint
+        .open_session(open_request)
+        .await
+        .expect("open session transport")
+        .into_inner();
+    assert!(opened.error.is_none());
+    let client = ClientRequestMetadata {
+        request_id: Uuid::now_v7().to_string(),
+        client_instance_id: open.client_instance_id,
+        surface: open.surface,
+        session_id: opened.session_id,
+        api_contract_ref: Some(api_contract()),
+        correlation_id: Some("material-correlation".to_owned()),
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let last_principal = Arc::new(Mutex::new(None));
+    let extensions = CommandExtensionPorts::new(
+        Arc::new(FailClosedMemoryMutationPort),
+        Arc::new(FailClosedWorkPreparationPort),
+    )
+    .with_founder_supporting_material(Arc::new(RecordingFounderMaterialPort {
+        calls: Arc::clone(&calls),
+        last_principal: Arc::clone(&last_principal),
+        outcome: Arc::new(Mutex::new(outcome)),
+    }));
+    let app = Arc::new(CommandGatewayApplication::new_with_memory_and_work(
+        endpoint.registry(),
+        Arc::new(ContractProfiles::embedded().expect("profiles")),
+        Arc::new(ReadTokenCodec::new(
+            TokenMacKey::new([9; 32]).expect("key"),
+            ReadGatewayPolicy::v01(),
+            clock,
+        )),
+        Arc::new(RecordingTaskPort {
+            calls: Arc::new(AtomicUsize::new(0)),
+            last_principal: Arc::new(Mutex::new(None)),
+            last_metadata: Arc::new(Mutex::new(None)),
+            outcome: Arc::new(Mutex::new(Err(CommandPortFailure::Unavailable))),
+        }),
+        Arc::new(RecordingPolicyPort {
+            outcome: Arc::new(Mutex::new(Err(CommandPortFailure::Unavailable))),
+        }),
+        Arc::new(RecordingVerdictPort {
+            outcome: Arc::new(Mutex::new(Err(CommandPortFailure::Unavailable))),
+        }),
+        extensions,
+    ));
+    (peer, client, app, calls, last_principal)
+}
+
+fn founder_material_command(correlation_id: &str) -> CreateFounderSupportingMaterialCommand {
+    CreateFounderSupportingMaterialCommand {
+        metadata: Some(metadata(correlation_id)),
+        material_id: "material-1".to_owned(),
+        role: FounderSupportingMaterialRole::ReworkRequiredChanges as i32,
+        body: "Correct the reported discrepancy.".to_owned(),
+        ..Default::default()
+    }
 }
 
 fn task_metadata(command: &TaskCommand) -> Option<&CommandMetadata> {
@@ -567,6 +684,70 @@ async fn authority_expiry_is_preserved_in_founder_verdict_result() {
         result.safe_error_fingerprint.as_deref(),
         Some("verdict_expired")
     );
+}
+
+#[tokio::test]
+async fn founder_supporting_material_crosses_authenticated_narrow_port() {
+    let receipt = FounderSupportingMaterialReceipt {
+        committed: true,
+        material_id: "material-1".to_owned(),
+        artifact_id: "artifact-founder-material-1".to_owned(),
+        role: FounderSupportingMaterialRole::ReworkRequiredChanges as i32,
+        command_id: "material-command".to_owned(),
+        correlation_id: "material-correlation".to_owned(),
+        ..Default::default()
+    };
+    let (peer, client, app, calls, principal) = founder_material_context(Ok(CommandPortResult {
+        result: receipt.clone(),
+        source_revision: None,
+        await_target: None,
+    }))
+    .await;
+
+    let response = app.create_founder_supporting_material(
+        Some(&peer),
+        CreateFounderSupportingMaterialRequest {
+            client: Some(client),
+            command: Some(founder_material_command("material-correlation")),
+        },
+    );
+
+    assert!(response.gateway_error.is_none());
+    assert_eq!(response.authority_result, Some(receipt));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        principal.lock().expect("principal lock").as_ref(),
+        Some(&CommandPrincipal {
+            principal_id: "os-user:founder".to_owned(),
+            required_authority_principal_kinds: vec![
+                "FounderVerdictAuthority.FounderAuthority".to_owned(),
+            ],
+        })
+    );
+}
+
+#[tokio::test]
+async fn founder_supporting_material_metadata_mismatch_is_zero_send() {
+    let (peer, client, app, calls, _) = founder_material_context(Ok(CommandPortResult {
+        result: FounderSupportingMaterialReceipt::default(),
+        source_revision: None,
+        await_target: None,
+    }))
+    .await;
+    let response = app.create_founder_supporting_material(
+        Some(&peer),
+        CreateFounderSupportingMaterialRequest {
+            client: Some(client),
+            command: Some(founder_material_command("different-correlation")),
+        },
+    );
+
+    assert_eq!(
+        response.gateway_error.as_ref().map(|error| error.code),
+        Some(LocalApiErrorCode::InvalidArgument as i32)
+    );
+    assert!(response.authority_result.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

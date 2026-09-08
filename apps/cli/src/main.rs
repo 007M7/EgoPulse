@@ -5,8 +5,10 @@
 #![allow(clippy::result_large_err)]
 
 use std::{
+    fs,
     future::Future,
     io::{self, IsTerminal, Write},
+    path::PathBuf,
     pin::Pin,
     process::ExitCode,
     sync::Arc,
@@ -22,19 +24,25 @@ use egopulse_client_kernel::KernelError;
 use egopulse_client_operations::{
     ApprovalWatch, ApprovalWatchClassification, ApprovalWatchCursor, ApprovalWatchUpdate,
     AttachError, ClientApprovalWatchError, ClientAttachment, ClientContextRevokeError,
-    ClientGovernedTaskError, ClientGuidedApprovalDecisionError, ClientGuidedWorkError,
-    ClientHarnessContentError, ClientTaskResultReviewError, ClientWorkError, ContextRevokeInput,
-    GovernedHoldReason, GovernedProjectionPosition, GovernedProjectionReason,
-    GovernedStateComposite, GovernedStateDomain, GovernedStateDomainPhase, GovernedStateReason,
-    GovernedStateSession, GovernedTaskBaseline, GovernedTaskSession, GovernedTaskState,
-    GovernedTaskUpdate, GovernedWorkCapabilityAvailability, GovernedWorkCapabilityCatalog,
-    GovernedWorkCapabilitySelectionSource, GuidedApprovalDecision, GuidedApprovalDecisionInput,
-    GuidedWorkCapabilityChoice, GuidedWorkConfirmationAttempt, GuidedWorkInput,
-    GuidedWorkMemoryMode, GuidedWorkPreparationAttempt, GuidedWorkPreview, GuidedWorkSource,
-    HarnessContentFilter, HarnessContentSession, HarnessContentUpdate, HarnessContentUpdateKind,
-    TaskResultReview, TaskResultReviewStage, TaskWatchClassification, attach as attach_client,
-    command_metadata, set_task_digest, set_verdict_digest, timestamp_after,
-    validate_guided_work_input,
+    ClientFounderSupportingMaterialError, ClientGovernedTaskError,
+    ClientGuidedApprovalDecisionError, ClientGuidedFounderVerdictError, ClientGuidedWorkError,
+    ClientHarnessContentError, ClientTaskResultReviewError, ClientWorkError,
+    ConfirmedFounderSupportingMaterialReceipt, ContextRevokeInput, DurableFounderDecisionAttempt,
+    DurableFounderMaterialAttempt, DurableFounderMaterialRecovery, DurableFounderRecoveryError,
+    DurableFounderVerdictRecovery, FounderSupportingMaterialBuilder,
+    FounderSupportingMaterialCollection, GovernedHoldReason, GovernedProjectionPosition,
+    GovernedProjectionReason, GovernedStateComposite, GovernedStateDomain,
+    GovernedStateDomainPhase, GovernedStateReason, GovernedStateSession, GovernedTaskBaseline,
+    GovernedTaskSession, GovernedTaskState, GovernedTaskUpdate, GovernedWorkCapabilityAvailability,
+    GovernedWorkCapabilityCatalog, GovernedWorkCapabilitySelectionSource, GuidedApprovalDecision,
+    GuidedApprovalDecisionInput, GuidedFounderDecisionResult, GuidedFounderVerdictInput,
+    GuidedFounderVerdictSelection, GuidedWorkCapabilityChoice, GuidedWorkConfirmationAttempt,
+    GuidedWorkInput, GuidedWorkMemoryMode, GuidedWorkPreparationAttempt, GuidedWorkPreview,
+    GuidedWorkSource, HarnessContentFilter, HarnessContentSession, HarnessContentUpdate,
+    HarnessContentUpdateKind, TaskResultReview, TaskResultReviewStage, TaskWatchClassification,
+    attach as attach_client, build_guided_founder_verdict,
+    build_guided_founder_verdict_with_materials, command_metadata, set_task_digest,
+    set_verdict_digest, timestamp_after, validate_guided_work_input,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -72,9 +80,9 @@ use egopulse_domain_contracts::v01::egopulse::{
         TaskErrorCode, TaskStatus, task_command, task_command_result,
     },
     verdict::v1::{
-        FounderVerdictDecision, FounderVerdictStateKind, IssueFounderVerdictCommand,
-        RevokeFounderVerdictCommand, RiskCategory, VerdictCommand, VerdictErrorCode, VerdictScope,
-        verdict_command,
+        FounderSupportingMaterialCoverage, FounderSupportingMaterialRole, FounderVerdictDecision,
+        FounderVerdictStateKind, IssueFounderVerdictCommand, RevokeFounderVerdictCommand,
+        RiskCategory, VerdictCommand, VerdictErrorCode, VerdictScope, verdict_command,
     },
     verification::v1::{
         CheckerAssuranceClass, CriterionOutcome, CriterionRequirement, DiscrepancySeverity,
@@ -85,6 +93,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 const DEFAULT_INSTANCE: &str = "default";
+const DEFAULT_FOUNDER_VERDICT_EXPIRY_SECONDS: u64 = 240;
 
 #[derive(Debug, Parser)]
 #[command(name = "egopulse", version, about = "EgoPulse local client")]
@@ -372,6 +381,57 @@ enum TaskCommandCli {
         #[arg(long)]
         json: bool,
     },
+    /// Submit a Founder Verdict bound to the current trusted result review.
+    Decide {
+        task_id: String,
+        #[arg(long)]
+        decision: String,
+        #[arg(long)]
+        reason_code: String,
+        #[arg(long)]
+        confirmation_proof_ref: String,
+        /// Founder-authored Rework directive text.
+        #[arg(long, conflicts_with = "required_changes_file")]
+        required_changes: Option<String>,
+        /// UTF-8 file containing the Founder-authored Rework directive.
+        #[arg(long, conflicts_with = "required_changes")]
+        required_changes_file: Option<PathBuf>,
+        /// Founder-authored rationale for explicitly accepting residual risk.
+        #[arg(long, conflicts_with = "risk_rationale_file")]
+        risk_rationale: Option<String>,
+        /// UTF-8 file containing the residual-risk rationale.
+        #[arg(long, conflicts_with = "risk_rationale")]
+        risk_rationale_file: Option<PathBuf>,
+        /// Founder-authored compensating control; repeat for multiple controls.
+        #[arg(long)]
+        compensating_control: Vec<String>,
+        /// UTF-8 compensating-control file; repeat for multiple controls.
+        #[arg(long)]
+        compensating_control_file: Vec<PathBuf>,
+        /// Residual-risk class: quality, business, or operational.
+        #[arg(long)]
+        risk_category: Option<String>,
+        /// Current discrepancy covered by these materials; repeat as needed.
+        #[arg(long)]
+        discrepancy_id: Vec<String>,
+        /// Current unverified item covered by these materials; repeat as needed.
+        #[arg(long)]
+        unverified_item_id: Vec<String>,
+        /// Resume an exact supporting-material write; repeat for multiple records.
+        #[arg(long)]
+        material_recovery: Vec<PathBuf>,
+        /// Verdict lifetime from final submission; must be 1-240 seconds.
+        #[arg(long)]
+        expires_in_seconds: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume one exact Founder Verdict from its client-private recovery record.
+    DecideRecover {
+        recovery_path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// List projected Tasks using a bounded page.
     List {
         #[arg(long, default_value_t = 50)]
@@ -489,6 +549,9 @@ enum ApprovalCommand {
         reason_code: String,
         #[arg(long)]
         confirmation_proof_ref: Option<String>,
+        /// Copy summaryDigestSha256 from the operation details you reviewed.
+        #[arg(long)]
+        reviewed_summary_digest: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -559,6 +622,10 @@ struct CliFailure {
     retryable: bool,
     required_action_code: Option<String>,
     safe_fingerprint: Option<String>,
+    safe_command_id: Option<String>,
+    safe_correlation_id: Option<String>,
+    safe_recovery_path: Option<String>,
+    safe_material_recovery_paths: Vec<String>,
     operation: &'static str,
 }
 
@@ -603,6 +670,10 @@ impl CliFailure {
             retryable: true,
             required_action_code: Some("attach_to_daemon".to_owned()),
             safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation: "status",
         }
     }
@@ -616,8 +687,142 @@ impl CliFailure {
             retryable: false,
             required_action_code: None,
             safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation: "status",
         }
+    }
+
+    fn guided_work_input(message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 2,
+            reason_code: "GUIDED_WORK_INPUT_INVALID",
+            message: message.into(),
+            category: "invalid_request",
+            retryable: false,
+            required_action_code: Some("CORRECT_GUIDED_WORK_INPUT".to_owned()),
+            safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
+            operation: "work.start",
+        }
+    }
+
+    fn guided_verdict_input(message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 2,
+            reason_code: "GUIDED_FOUNDER_VERDICT_INPUT_INVALID",
+            message: message.into(),
+            category: "invalid_request",
+            retryable: false,
+            required_action_code: Some("CORRECT_FOUNDER_VERDICT_INPUT".to_owned()),
+            safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
+            operation: "task.decide",
+        }
+    }
+
+    fn guided_approval_input(message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 2,
+            reason_code: "INVALID_ARGUMENT",
+            message: message.into(),
+            category: "invalid_request",
+            retryable: false,
+            required_action_code: Some("READ_APPROVAL_DETAILS".to_owned()),
+            safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
+            operation: "approval.decide",
+        }
+    }
+
+    fn recovery_storage(operation: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 8,
+            reason_code: "FOUNDER_RECOVERY_STORAGE_FAILED",
+            message: message.into(),
+            category: "recovery",
+            retryable: false,
+            required_action_code: Some("PRESERVE_EXISTING_RECOVERY_RECORD".to_owned()),
+            safe_fingerprint: Some("founder_recovery_storage_failed".to_owned()),
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
+            operation,
+        }
+    }
+
+    fn guided_verdict_unavailable(reason_code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 6,
+            reason_code,
+            message: message.into(),
+            category: "domain_conflict",
+            retryable: false,
+            required_action_code: Some("REVIEW_TASK_RESULT_MATERIALS".to_owned()),
+            safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
+            operation: "task.decide",
+        }
+    }
+
+    fn durable_founder_verdict_outcome_unknown(
+        reason_code: &'static str,
+        command_id: String,
+        recovery_path: &std::path::Path,
+    ) -> Self {
+        Self {
+            exit_code: 8,
+            reason_code,
+            message: format!(
+                "Founder Verdict outcome is unknown; use task decide-recover with the existing recovery file (command_id={command_id}, recovery_path={})",
+                recovery_path.display()
+            ),
+            category: "recovery",
+            retryable: false,
+            required_action_code: Some("RECOVER_EXISTING_FOUNDER_VERDICT".to_owned()),
+            safe_fingerprint: Some("founder_verdict_outcome_unknown".to_owned()),
+            safe_command_id: (!command_id.is_empty()).then_some(command_id),
+            safe_correlation_id: None,
+            safe_recovery_path: Some(recovery_path.display().to_string()),
+            safe_material_recovery_paths: Vec::new(),
+            operation: "task.decide",
+        }
+    }
+
+    fn with_recovery_path(mut self, recovery_path: &std::path::Path) -> Self {
+        self.safe_recovery_path = Some(recovery_path.display().to_string());
+        self
+    }
+
+    fn with_material_recovery_paths(mut self, recovery_paths: &[PathBuf]) -> Self {
+        let existing = std::mem::take(&mut self.safe_material_recovery_paths);
+        for path in recovery_paths {
+            let path = path.display().to_string();
+            if !self.safe_material_recovery_paths.contains(&path) {
+                self.safe_material_recovery_paths.push(path);
+            }
+        }
+        for path in existing {
+            if !self.safe_material_recovery_paths.contains(&path) {
+                self.safe_material_recovery_paths.push(path);
+            }
+        }
+        self
     }
 
     fn stream_recovery(operation: &'static str, message: impl Into<String>) -> Self {
@@ -629,6 +834,10 @@ impl CliFailure {
             retryable: true,
             required_action_code: Some("REFETCH_PROJECTION".to_owned()),
             safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation,
         }
     }
@@ -644,6 +853,10 @@ impl CliFailure {
             retryable: true,
             required_action_code: Some("WAIT_FOR_PROJECTION".to_owned()),
             safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation: "task.watch",
         }
     }
@@ -658,6 +871,10 @@ impl CliFailure {
             retryable: true,
             required_action_code: Some("REFETCH_PROJECTION".to_owned()),
             safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation: "task.watch",
         }
     }
@@ -671,6 +888,10 @@ impl CliFailure {
             retryable: false,
             required_action_code: Some("REATTACH_SESSION".to_owned()),
             safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation: "task.watch",
         }
     }
@@ -686,6 +907,10 @@ impl CliFailure {
             retryable: true,
             required_action_code: Some("REFETCH_CONTENT_BASELINE".to_owned()),
             safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation: "content.watch",
         }
     }
@@ -700,6 +925,10 @@ impl CliFailure {
             retryable: false,
             required_action_code: Some("REATTACH_SESSION".to_owned()),
             safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation: "content.watch",
         }
     }
@@ -713,6 +942,10 @@ impl CliFailure {
             retryable: false,
             required_action_code: Some("USE_AUTHORIZED_SESSION".to_owned()),
             safe_fingerprint: Some("client_profile_denied".to_owned()),
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation,
         }
     }
@@ -762,6 +995,10 @@ impl CliFailure {
             required_action_code: error.required_action_code,
             safe_fingerprint: (!error.safe_fingerprint.is_empty())
                 .then_some(error.safe_fingerprint),
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation: "status",
         }
     }
@@ -775,6 +1012,10 @@ impl CliFailure {
             retryable: false,
             required_action_code: Some("SUPPLY_EXACT_CONTEXT_DIGEST".to_owned()),
             safe_fingerprint: Some("context_confirmation_rejected".to_owned()),
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation: "context.revoke",
         }
     }
@@ -789,6 +1030,10 @@ impl CliFailure {
             retryable: false,
             required_action_code: Some("REPREPARE_CONTEXT_REVOKE".to_owned()),
             safe_fingerprint: Some("context_session_binding_changed".to_owned()),
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation: "context.revoke",
         }
     }
@@ -826,6 +1071,10 @@ impl CliFailure {
             retryable,
             required_action_code: required_action_code.map(str::to_owned),
             safe_fingerprint: None,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation,
         }
     }
@@ -870,6 +1119,10 @@ impl CliFailure {
             retryable,
             required_action_code: required_action_code.map(str::to_owned),
             safe_fingerprint,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation,
         }
     }
@@ -911,6 +1164,10 @@ impl CliFailure {
             retryable,
             required_action_code: required_action_code.map(str::to_owned),
             safe_fingerprint,
+            safe_command_id: None,
+            safe_correlation_id: None,
+            safe_recovery_path: None,
+            safe_material_recovery_paths: Vec::new(),
             operation,
         }
     }
@@ -921,7 +1178,11 @@ impl CliFailure {
     }
 
     fn json_envelope(&self) -> serde_json::Value {
-        json!({
+        let correlation_id = self
+            .safe_correlation_id
+            .clone()
+            .unwrap_or_else(|| Uuid::now_v7().to_string());
+        let mut envelope = json!({
             "schemaVersion": "egopulse.cli-result/v0.1",
             "ok": false,
             "operation": self.operation,
@@ -933,8 +1194,20 @@ impl CliFailure {
                 "safeFingerprint": self.safe_fingerprint,
             },
             "projection": serde_json::Value::Null,
-            "correlationId": Uuid::now_v7().to_string(),
-        })
+            "correlationId": correlation_id,
+        });
+        if let Some(command_id) = self.safe_command_id.as_ref() {
+            envelope["error"]["commandId"] = json!(command_id);
+            envelope["error"]["outcome"] = json!("unknown");
+            envelope["error"]["safeInstruction"] = json!("do_not_issue_new_decision");
+        }
+        if let Some(recovery_path) = self.safe_recovery_path.as_ref() {
+            envelope["error"]["recoveryPath"] = json!(recovery_path);
+        }
+        if !self.safe_material_recovery_paths.is_empty() {
+            envelope["error"]["materialRecoveryPaths"] = json!(self.safe_material_recovery_paths);
+        }
+        envelope
     }
 }
 
@@ -990,6 +1263,8 @@ fn command_json(command: &Command) -> bool {
             command:
                 TaskCommandCli::Get { json, .. }
                 | TaskCommandCli::Review { json, .. }
+                | TaskCommandCli::Decide { json, .. }
+                | TaskCommandCli::DecideRecover { json, .. }
                 | TaskCommandCli::List { json, .. }
                 | TaskCommandCli::Watch { json, .. }
                 | TaskCommandCli::Create { json, .. }
@@ -2165,9 +2440,7 @@ fn guided_work_failure(error: ClientGuidedWorkError) -> CliFailure {
         ClientGuidedWorkError::Kernel(error) => {
             CliFailure::protocol(error.to_string()).for_operation("work.start")
         }
-        ClientGuidedWorkError::InvalidInput(detail) => {
-            CliFailure::protocol(detail).for_operation("work.start")
-        }
+        ClientGuidedWorkError::InvalidInput(detail) => CliFailure::guided_work_input(detail),
         ClientGuidedWorkError::Blocked => {
             CliFailure::protocol("the governed preview is blocked; no Task confirmation was sent")
                 .for_operation("work.start")
@@ -2184,6 +2457,14 @@ fn guided_work_failure(error: ClientGuidedWorkError) -> CliFailure {
             "guided work confirmation outcome remains unknown; do not prepare a replacement",
         )
         .for_operation("work.start"),
+        ClientGuidedWorkError::ApiOutcomeUnknown(error) => {
+            let mut failure = CliFailure::from_local_api_error(*error).for_operation("work.start");
+            failure.message.push_str(
+                "; the API responded but the commit outcome remains unknown; reconcile the exact request before replacement",
+            );
+            failure.required_action_code = Some("RECONCILE_EXACT_WORK_REQUEST".to_owned());
+            failure
+        }
         ClientGuidedWorkError::Api(error) => {
             CliFailure::from_local_api_error(*error).for_operation("work.start")
         }
@@ -3470,6 +3751,55 @@ async fn task(command: TaskCommandCli) -> Result<(), CliFailure> {
     match command {
         TaskCommandCli::Get { task_id, json } => task_get(task_id, json).await,
         TaskCommandCli::Review { task_id, json } => task_review(task_id, json).await,
+        TaskCommandCli::Decide {
+            task_id,
+            decision,
+            reason_code,
+            confirmation_proof_ref,
+            required_changes,
+            required_changes_file,
+            risk_rationale,
+            risk_rationale_file,
+            compensating_control,
+            compensating_control_file,
+            risk_category,
+            discrepancy_id,
+            unverified_item_id,
+            material_recovery,
+            expires_in_seconds,
+            json,
+        } => {
+            // `task_decide` retains the review, supporting-material recovery,
+            // and durable verdict submission states across several awaits.
+            // Keep that state machine heap-backed inside the already boxed
+            // command boundary so it does not inflate the Task dispatcher
+            // future on the Windows main thread.
+            Box::pin(task_decide(TaskDecideRequest {
+                task_id,
+                decision,
+                reason_code,
+                confirmation_proof_ref,
+                materials: TaskDecisionMaterialInput {
+                    required_changes,
+                    required_changes_file,
+                    risk_rationale,
+                    risk_rationale_file,
+                    compensating_controls: compensating_control,
+                    compensating_control_files: compensating_control_file,
+                    risk_category,
+                    discrepancy_ids: discrepancy_id,
+                    unverified_item_ids: unverified_item_id,
+                },
+                material_recovery_paths: material_recovery,
+                expires_in_seconds,
+                json,
+            }))
+            .await
+        }
+        TaskCommandCli::DecideRecover {
+            recovery_path,
+            json,
+        } => task_decide_recover(recovery_path, json).await,
         TaskCommandCli::List {
             page_size,
             cursor,
@@ -3576,6 +3906,1026 @@ async fn task_review(task_id: String, json: bool) -> Result<(), CliFailure> {
         .map_err(task_result_review_failure)?;
     render_task_result_review(&review, json);
     Ok(())
+}
+
+struct TaskDecideRequest {
+    task_id: String,
+    decision: String,
+    reason_code: String,
+    confirmation_proof_ref: String,
+    materials: TaskDecisionMaterialInput,
+    material_recovery_paths: Vec<PathBuf>,
+    expires_in_seconds: Option<u64>,
+    json: bool,
+}
+
+struct TaskDecisionMaterialInput {
+    required_changes: Option<String>,
+    required_changes_file: Option<PathBuf>,
+    risk_rationale: Option<String>,
+    risk_rationale_file: Option<PathBuf>,
+    compensating_controls: Vec<String>,
+    compensating_control_files: Vec<PathBuf>,
+    risk_category: Option<String>,
+    discrepancy_ids: Vec<String>,
+    unverified_item_ids: Vec<String>,
+}
+
+struct SupportingMaterialDraft {
+    role: FounderSupportingMaterialRole,
+    body: String,
+    coverage: FounderSupportingMaterialCoverage,
+}
+
+struct CreatedSupportingMaterials {
+    receipts: Vec<ConfirmedFounderSupportingMaterialReceipt>,
+    recovery_paths: Vec<PathBuf>,
+}
+
+async fn task_decide(request: TaskDecideRequest) -> Result<(), CliFailure> {
+    let selection = parse_guided_verdict_selection(&request.decision)
+        .map_err(CliFailure::guided_verdict_input)?;
+    let material_recovery_paths =
+        parse_founder_material_recovery_paths(request.material_recovery_paths)?;
+    let attached = attach("task.decide")
+        .await
+        .map_err(|failure| failure.with_material_recovery_paths(&material_recovery_paths))?;
+    let review = attached
+        .0
+        .read_task_result_review(&request.task_id)
+        .await
+        .map_err(|error| task_result_review_failure(error).for_operation("task.decide"))
+        .map_err(|failure| failure.with_material_recovery_paths(&material_recovery_paths))?;
+    let has_material_recovery = !material_recovery_paths.is_empty();
+    let material_drafts =
+        supporting_material_drafts(&review, selection, request.materials, has_material_recovery)
+            .map_err(|failure| failure.with_material_recovery_paths(&material_recovery_paths))?;
+    let mut confirmed = recover_confirmed_supporting_materials(
+        &attached.0,
+        &review,
+        selection,
+        &material_recovery_paths,
+    )
+    .await
+    .map_err(|failure| failure.with_material_recovery_paths(&material_recovery_paths))?;
+    let created = create_confirmed_supporting_materials(&attached.0, &review, material_drafts)
+        .await
+        .map_err(|failure| failure.with_material_recovery_paths(&material_recovery_paths))?;
+    confirmed.extend(created.receipts);
+    let mut all_material_recovery_paths = material_recovery_paths;
+    all_material_recovery_paths.extend(created.recovery_paths);
+    let materials = if confirmed.is_empty() {
+        None
+    } else {
+        Some(
+            FounderSupportingMaterialCollection::from_confirmed(confirmed)
+                .map_err(guided_founder_verdict_failure)
+                .map_err(|failure| {
+                    failure.with_material_recovery_paths(&all_material_recovery_paths)
+                })?,
+        )
+    };
+    let expiry = founder_verdict_expiry(request.expires_in_seconds)
+        .map_err(|failure| failure.with_material_recovery_paths(&all_material_recovery_paths))?;
+    let correlation_id = Uuid::now_v7().to_string();
+    let input = GuidedFounderVerdictInput {
+        current_task_id: request.task_id,
+        metadata: command_metadata(&correlation_id, "egopulse-cli/task-decide"),
+        selection,
+        reason_code: request.reason_code,
+        confirmation_proof_ref: request.confirmation_proof_ref,
+        expires_at: timestamp_after(expiry),
+    };
+    let recovery_path = new_founder_verdict_recovery_path()
+        .map_err(|failure| failure.with_material_recovery_paths(&all_material_recovery_paths))?;
+    let attempt = if let Some(materials) = materials.as_ref() {
+        let session = attached.0.kernel.session().ok_or_else(|| {
+            CliFailure::protocol("authenticated Founder session missing")
+                .for_operation("task.decide")
+                .with_material_recovery_paths(&all_material_recovery_paths)
+        })?;
+        let command =
+            build_guided_founder_verdict_with_materials(&review, input, session, materials)
+                .map_err(guided_founder_verdict_failure)
+                .map_err(|failure| {
+                    failure.with_material_recovery_paths(&all_material_recovery_paths)
+                })?;
+        attached
+            .0
+            .submit_guided_founder_decision_durable(
+                command,
+                selection,
+                Some(materials),
+                &recovery_path,
+            )
+            .await
+            .map_err(|error| guided_founder_verdict_durable_failure(error, &recovery_path))
+            .map_err(|failure| failure.with_material_recovery_paths(&all_material_recovery_paths))?
+    } else {
+        let command = build_guided_founder_verdict(&review, input)
+            .map_err(guided_founder_verdict_failure)
+            .map_err(|failure| {
+                failure.with_material_recovery_paths(&all_material_recovery_paths)
+            })?;
+        attached
+            .0
+            .submit_guided_founder_decision_durable(command, selection, None, &recovery_path)
+            .await
+            .map_err(|error| guided_founder_verdict_durable_failure(error, &recovery_path))
+            .map_err(|failure| failure.with_material_recovery_paths(&all_material_recovery_paths))?
+    };
+    let result = match attempt {
+        DurableFounderDecisionAttempt::Applied(result) => result,
+        DurableFounderDecisionAttempt::Unknown {
+            safe_reason_code, ..
+        } => {
+            let command_id = DurableFounderVerdictRecovery::read(&recovery_path)
+                .map_err(durable_founder_recovery_failure)
+                .map_err(|failure| {
+                    failure
+                        .with_recovery_path(&recovery_path)
+                        .with_material_recovery_paths(&all_material_recovery_paths)
+                })?
+                .command_id()
+                .to_owned();
+            return Err(CliFailure::durable_founder_verdict_outcome_unknown(
+                safe_reason_code,
+                command_id,
+                &recovery_path,
+            )
+            .with_material_recovery_paths(&all_material_recovery_paths));
+        }
+    };
+    render_guided_founder_verdict_result(
+        &result,
+        &correlation_id,
+        &recovery_path,
+        request.json,
+        "task.decide",
+        None,
+    )?;
+    Ok(())
+}
+
+fn render_guided_founder_verdict_result(
+    result: &GuidedFounderDecisionResult,
+    correlation_id: &str,
+    recovery_path: &std::path::Path,
+    json: bool,
+    operation: &'static str,
+    recovery_summary: Option<(&str, &str, &str)>,
+) -> Result<(), CliFailure> {
+    let verdict = result.verdict();
+    let task = result.task();
+    let projection_warning = verdict.projection_warning().map(|warning| {
+        json!({
+            "code": LocalApiErrorCode::try_from(warning.code)
+                .map(|code| code.as_str_name())
+                .unwrap_or("LOCAL_API_ERROR_UNKNOWN"),
+            "retryable": warning.retryable,
+            "requiredActionCode": warning.required_action_code,
+            "safeFingerprint": warning.safe_fingerprint,
+        })
+    });
+    let task_projection_warning = result.projection_warning().map(|warning| {
+        json!({
+            "code": LocalApiErrorCode::try_from(warning.code)
+                .map(|code| code.as_str_name())
+                .unwrap_or("LOCAL_API_ERROR_UNKNOWN"),
+            "retryable": warning.retryable,
+            "requiredActionCode": warning.required_action_code,
+            "safeFingerprint": warning.safe_fingerprint,
+        })
+    });
+    let recovery_summary_json = recovery_summary.map(|(task_id, command_id, selection)| {
+        json!({
+            "taskId": task_id,
+            "commandId": command_id,
+            "selection": selection,
+        })
+    });
+    let payload = json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": operation,
+        "data": {
+            "committed": verdict.committed(),
+            "replayed": verdict.replayed(),
+            "founderVerdictId": verdict.founder_verdict_id(),
+            "decision": verdict.decision().as_str_name(),
+            "taskId": task.task_id,
+            "taskRevision": task.revision,
+            "taskStatus": TaskStatus::try_from(task.status)
+                .map(|status| status.as_str_name())
+                .unwrap_or("TASK_STATUS_UNSPECIFIED"),
+            "taskReplayed": result.task_replayed(),
+            "awaitToken": await_token_json(result.await_token().cloned()),
+            "projectionWarning": projection_warning,
+            "taskProjectionWarning": task_projection_warning,
+            "recoveryPath": recovery_path.display().to_string(),
+            "recoverySummary": recovery_summary_json,
+        },
+        "correlationId": correlation_id,
+    });
+    if json {
+        let rendered = serde_json::to_string(&payload).map_err(|error| {
+            CliFailure::protocol(format!(
+                "Founder Verdict result serialization failed: {error}"
+            ))
+            .for_operation(operation)
+        })?;
+        println!("{rendered}");
+    } else {
+        println!(
+            "Founder Verdict applied: id={} decision={} replayed={} task={} task_revision={} task_status={} task_replayed={}",
+            verdict.founder_verdict_id(),
+            verdict.decision().as_str_name(),
+            verdict.replayed(),
+            task.task_id,
+            task.revision,
+            TaskStatus::try_from(task.status)
+                .map(|status| status.as_str_name())
+                .unwrap_or("TASK_STATUS_UNSPECIFIED"),
+            result.task_replayed(),
+        );
+        println!("Recovery path: {}", recovery_path.display());
+        if let Some((task_id, command_id, selection)) = recovery_summary {
+            println!(
+                "Recovered command: task={} command={} decision={}",
+                task_id, command_id, selection,
+            );
+        }
+        if result.await_token().is_none() {
+            println!(
+                "Projection await token unavailable; the Task application committed and projection must be checked separately."
+            );
+        }
+        if let Some(warning) = verdict.projection_warning() {
+            println!(
+                "Founder Verdict projection warning: code={} retryable={} required_action={}",
+                LocalApiErrorCode::try_from(warning.code)
+                    .map(|code| code.as_str_name())
+                    .unwrap_or("LOCAL_API_ERROR_UNKNOWN"),
+                warning.retryable,
+                warning.required_action_code.as_deref().unwrap_or("none"),
+            );
+        }
+        if let Some(warning) = result.projection_warning() {
+            println!(
+                "Task projection warning: code={} retryable={} required_action={}",
+                LocalApiErrorCode::try_from(warning.code)
+                    .map(|code| code.as_str_name())
+                    .unwrap_or("LOCAL_API_ERROR_UNKNOWN"),
+                warning.retryable,
+                warning.required_action_code.as_deref().unwrap_or("none"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn supporting_material_drafts(
+    review: &TaskResultReview,
+    selection: GuidedFounderVerdictSelection,
+    input: TaskDecisionMaterialInput,
+    has_material_recovery: bool,
+) -> Result<Vec<SupportingMaterialDraft>, CliFailure> {
+    let conclusion = review
+        .task_view
+        .verification
+        .as_ref()
+        .and_then(|verification| VerificationConclusion::try_from(verification.conclusion).ok())
+        .filter(|conclusion| *conclusion != VerificationConclusion::Unspecified)
+        .ok_or_else(|| {
+            CliFailure::guided_verdict_input(
+                "current trusted review has no recognized Verification conclusion",
+            )
+        })?;
+    let has_material_input = has_material_recovery
+        || input.required_changes.is_some()
+        || input.required_changes_file.is_some()
+        || input.risk_rationale.is_some()
+        || input.risk_rationale_file.is_some()
+        || !input.compensating_controls.is_empty()
+        || !input.compensating_control_files.is_empty()
+        || input.risk_category.is_some()
+        || !input.discrepancy_ids.is_empty()
+        || !input.unverified_item_ids.is_empty();
+
+    match selection {
+        GuidedFounderVerdictSelection::Rework => {
+            if input.risk_rationale.is_some()
+                || input.risk_rationale_file.is_some()
+                || !input.compensating_controls.is_empty()
+                || !input.compensating_control_files.is_empty()
+                || input.risk_category.is_some()
+            {
+                return Err(CliFailure::guided_verdict_input(
+                    "Rework accepts required changes and optional current coverage only",
+                ));
+            }
+            let body = read_exact_material_body(
+                input.required_changes,
+                input.required_changes_file,
+                "required changes",
+            )?;
+            if body.is_none() && !has_material_recovery {
+                return Err(CliFailure::guided_verdict_input(
+                    "Rework requires --required-changes or --required-changes-file",
+                ));
+            }
+            if body.is_some() && has_material_recovery {
+                return Err(CliFailure::guided_verdict_input(
+                    "Rework accepts either one recovered directive or one newly authored directive",
+                ));
+            }
+            if body.is_none()
+                && (!input.discrepancy_ids.is_empty() || !input.unverified_item_ids.is_empty())
+            {
+                return Err(CliFailure::guided_verdict_input(
+                    "coverage options apply only to a newly authored Rework directive",
+                ));
+            }
+            Ok(body
+                .map(|body| SupportingMaterialDraft {
+                    role: FounderSupportingMaterialRole::ReworkRequiredChanges,
+                    body,
+                    coverage: FounderSupportingMaterialCoverage {
+                        risk_category: RiskCategory::Unspecified as i32,
+                        discrepancy_ids: input.discrepancy_ids,
+                        unverified_item_ids: input.unverified_item_ids,
+                    },
+                })
+                .into_iter()
+                .collect())
+        }
+        GuidedFounderVerdictSelection::Accept if conclusion != VerificationConclusion::Passed => {
+            if input.required_changes.is_some() || input.required_changes_file.is_some() {
+                return Err(CliFailure::guided_verdict_input(
+                    "risk Accept does not accept Rework required changes",
+                ));
+            }
+            let rationale = read_exact_material_body(
+                input.risk_rationale,
+                input.risk_rationale_file,
+                "risk rationale",
+            )?;
+            let controls = read_material_bodies(
+                input.compensating_controls,
+                input.compensating_control_files,
+                "compensating control",
+            )?;
+            if rationale.is_none() && controls.is_empty() && !has_material_recovery {
+                return Err(CliFailure::guided_verdict_input(
+                    "non-Passed Accept requires risk materials or --material-recovery",
+                ));
+            }
+            let creates_material = rationale.is_some() || !controls.is_empty();
+            if !creates_material
+                && (input.risk_category.is_some()
+                    || !input.discrepancy_ids.is_empty()
+                    || !input.unverified_item_ids.is_empty())
+            {
+                return Err(CliFailure::guided_verdict_input(
+                    "risk category and coverage apply only to newly authored materials",
+                ));
+            }
+            let risk_category = if creates_material {
+                input
+                    .risk_category
+                    .as_deref()
+                    .ok_or_else(|| {
+                        CliFailure::guided_verdict_input(
+                            "new non-Passed Accept materials require an explicit --risk-category",
+                        )
+                    })
+                    .and_then(parse_supporting_material_risk_category)?
+            } else {
+                RiskCategory::Unspecified
+            };
+            let coverage = FounderSupportingMaterialCoverage {
+                risk_category: risk_category as i32,
+                discrepancy_ids: input.discrepancy_ids,
+                unverified_item_ids: input.unverified_item_ids,
+            };
+            let mut drafts = Vec::with_capacity(controls.len() + 1);
+            if let Some(body) = rationale {
+                drafts.push(SupportingMaterialDraft {
+                    role: FounderSupportingMaterialRole::RiskRationale,
+                    body,
+                    coverage: coverage.clone(),
+                });
+            }
+            drafts.extend(controls.into_iter().map(|body| SupportingMaterialDraft {
+                role: FounderSupportingMaterialRole::CompensatingControl,
+                body,
+                coverage: coverage.clone(),
+            }));
+            Ok(drafts)
+        }
+        GuidedFounderVerdictSelection::Accept | GuidedFounderVerdictSelection::Reject => {
+            if has_material_input {
+                return Err(CliFailure::guided_verdict_input(
+                    "Passed Accept and Reject do not accept supporting-material inputs",
+                ));
+            }
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn read_exact_material_body(
+    text: Option<String>,
+    path: Option<PathBuf>,
+    label: &str,
+) -> Result<Option<String>, CliFailure> {
+    match (text, path) {
+        (Some(_), Some(_)) => Err(CliFailure::guided_verdict_input(format!(
+            "provide {label} as text or a file, not both"
+        ))),
+        (Some(text), None) => validate_material_body(text, label).map(Some),
+        (None, Some(path)) => fs::read_to_string(&path)
+            .map_err(|error| {
+                CliFailure::guided_verdict_input(format!(
+                    "could not read {label} file {} as UTF-8: {error}",
+                    path.display()
+                ))
+            })
+            .and_then(|body| validate_material_body(body, label))
+            .map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+fn read_material_bodies(
+    texts: Vec<String>,
+    paths: Vec<PathBuf>,
+    label: &str,
+) -> Result<Vec<String>, CliFailure> {
+    let mut bodies = Vec::with_capacity(texts.len() + paths.len());
+    for text in texts {
+        bodies.push(validate_material_body(text, label)?);
+    }
+    for path in paths {
+        let body = fs::read_to_string(&path).map_err(|error| {
+            CliFailure::guided_verdict_input(format!(
+                "could not read {label} file {} as UTF-8: {error}",
+                path.display()
+            ))
+        })?;
+        bodies.push(validate_material_body(body, label)?);
+    }
+    Ok(bodies)
+}
+
+fn validate_material_body(body: String, label: &str) -> Result<String, CliFailure> {
+    if body.trim().is_empty() {
+        return Err(CliFailure::guided_verdict_input(format!(
+            "{label} must not be empty"
+        )));
+    }
+    Ok(body)
+}
+
+fn parse_supporting_material_risk_category(value: &str) -> Result<RiskCategory, CliFailure> {
+    match value {
+        "quality" => Ok(RiskCategory::QualityResidual),
+        "business" => Ok(RiskCategory::BusinessResidual),
+        "operational" => Ok(RiskCategory::OperationalResidual),
+        _ => Err(CliFailure::guided_verdict_input(
+            "risk category must be quality, business, or operational",
+        )),
+    }
+}
+
+fn founder_verdict_expiry(expires_in_seconds: Option<u64>) -> Result<Duration, CliFailure> {
+    let seconds = expires_in_seconds.unwrap_or(DEFAULT_FOUNDER_VERDICT_EXPIRY_SECONDS);
+    if !(1..=DEFAULT_FOUNDER_VERDICT_EXPIRY_SECONDS).contains(&seconds) {
+        return Err(CliFailure::guided_verdict_input(
+            "expires-in-seconds must be between 1 and 240",
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn parse_founder_material_recovery_paths(
+    recovery_paths: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, CliFailure> {
+    let mut parsed = Vec::with_capacity(recovery_paths.len());
+    for path in recovery_paths {
+        let path = private_founder_verdict_recovery_path(&path)
+            .map_err(|failure| failure.with_material_recovery_paths(&parsed))?;
+        if parsed.contains(&path) {
+            return Err(CliFailure::guided_verdict_input(
+                "each --material-recovery path must be unique",
+            )
+            .with_material_recovery_paths(&parsed));
+        }
+        parsed.push(path);
+    }
+    Ok(parsed)
+}
+
+async fn create_confirmed_supporting_materials(
+    attached: &ClientAttachment,
+    review: &TaskResultReview,
+    drafts: Vec<SupportingMaterialDraft>,
+) -> Result<CreatedSupportingMaterials, CliFailure> {
+    let session = attached.kernel.session().ok_or_else(|| {
+        CliFailure::protocol("authenticated Founder session missing").for_operation("task.decide")
+    })?;
+    let mut confirmed = Vec::with_capacity(drafts.len());
+    let mut recovery_paths = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        let material_id = format!("founder-material-input:{}", Uuid::now_v7());
+        let builder = FounderSupportingMaterialBuilder::from_review(
+            review,
+            session,
+            material_id.clone(),
+            draft.role,
+            draft.body,
+            Some(draft.coverage),
+        )
+        .map_err(founder_supporting_material_failure)
+        .map_err(|failure| failure.with_material_recovery_paths(&recovery_paths))?;
+        let correlation_id = Uuid::now_v7().to_string();
+        let prepared = builder
+            .build(command_metadata(
+                &correlation_id,
+                "egopulse-cli/founder-supporting-material",
+            ))
+            .map_err(founder_supporting_material_failure)
+            .map_err(|failure| failure.with_material_recovery_paths(&recovery_paths))?;
+        let recovery_path = new_founder_material_recovery_path()
+            .map_err(|failure| failure.with_material_recovery_paths(&recovery_paths))?;
+        let attempt = match attached
+            .create_founder_supporting_material_durable(prepared, &recovery_path)
+            .await
+        {
+            Ok(receipt) => Ok(receipt),
+            Err(ClientFounderSupportingMaterialError::Unknown { .. }) => {
+                Err(durable_founder_material_unknown(
+                    "FOUNDER_SUPPORTING_MATERIAL_OUTCOME_UNKNOWN",
+                    review_task_id(review),
+                    &material_id,
+                    draft.role,
+                    &recovery_path,
+                ))
+            }
+            Err(error) => {
+                let failure = founder_supporting_material_failure(error);
+                Err(if recovery_path.is_file() {
+                    failure.with_recovery_path(&recovery_path)
+                } else {
+                    failure
+                })
+            }
+        };
+        record_supporting_material_attempt(
+            attempt,
+            recovery_path,
+            &mut confirmed,
+            &mut recovery_paths,
+        )?;
+    }
+    Ok(CreatedSupportingMaterials {
+        receipts: confirmed,
+        recovery_paths,
+    })
+}
+
+fn record_supporting_material_attempt<T>(
+    attempt: Result<T, CliFailure>,
+    recovery_path: PathBuf,
+    confirmed: &mut Vec<T>,
+    recovery_paths: &mut Vec<PathBuf>,
+) -> Result<(), CliFailure> {
+    match attempt {
+        Ok(receipt) => {
+            confirmed.push(receipt);
+            recovery_paths.push(recovery_path);
+            Ok(())
+        }
+        Err(failure) => {
+            if recovery_path.is_file() {
+                recovery_paths.push(recovery_path);
+            }
+            Err(failure.with_material_recovery_paths(recovery_paths))
+        }
+    }
+}
+
+async fn recover_confirmed_supporting_materials(
+    attached: &ClientAttachment,
+    review: &TaskResultReview,
+    selection: GuidedFounderVerdictSelection,
+    recovery_paths: &[PathBuf],
+) -> Result<Vec<ConfirmedFounderSupportingMaterialReceipt>, CliFailure> {
+    let current_task_id = review_task_id(review);
+    let mut recoveries = Vec::with_capacity(recovery_paths.len());
+    for path in recovery_paths {
+        let saved = DurableFounderMaterialRecovery::read(path)
+            .map_err(|error| durable_founder_recovery_failure(error).with_recovery_path(path))?;
+        if saved.task_id() != current_task_id
+            || !material_role_matches_selection(saved.role(), selection)
+        {
+            return Err(CliFailure::guided_verdict_input(
+                "saved supporting material does not belong to the current Task and decision",
+            ));
+        }
+        recoveries.push(saved);
+    }
+
+    let mut confirmed = Vec::with_capacity(recoveries.len());
+    for (path, saved) in recovery_paths.iter().zip(&recoveries) {
+        match attached
+            .retry_durable_founder_material(saved)
+            .await
+            .map_err(|error| durable_founder_recovery_failure(error).with_recovery_path(path))?
+        {
+            DurableFounderMaterialAttempt::Confirmed(receipt) => confirmed.push(*receipt),
+            DurableFounderMaterialAttempt::Unknown { safe_reason_code } => {
+                return Err(durable_founder_material_unknown(
+                    safe_reason_code,
+                    saved.task_id(),
+                    saved.material_id(),
+                    saved.role(),
+                    path,
+                ));
+            }
+        }
+    }
+    Ok(confirmed)
+}
+
+fn material_role_matches_selection(
+    role: FounderSupportingMaterialRole,
+    selection: GuidedFounderVerdictSelection,
+) -> bool {
+    matches!(
+        (selection, role),
+        (
+            GuidedFounderVerdictSelection::Rework,
+            FounderSupportingMaterialRole::ReworkRequiredChanges
+        ) | (
+            GuidedFounderVerdictSelection::Accept,
+            FounderSupportingMaterialRole::RiskRationale
+                | FounderSupportingMaterialRole::CompensatingControl
+        )
+    )
+}
+
+fn review_task_id(review: &TaskResultReview) -> &str {
+    review
+        .task_view
+        .task
+        .as_ref()
+        .map(|task| task.task_id.as_str())
+        .unwrap_or_default()
+}
+
+fn durable_founder_material_unknown(
+    reason_code: &'static str,
+    task_id: &str,
+    material_id: &str,
+    role: FounderSupportingMaterialRole,
+    recovery_path: &std::path::Path,
+) -> CliFailure {
+    CliFailure {
+        exit_code: 8,
+        reason_code,
+        message: format!(
+            "supporting-material outcome is unknown; Verdict was not submitted (task_id={task_id}, material_id={material_id}, role={}, recovery_path={})",
+            role.as_str_name(),
+            recovery_path.display(),
+        ),
+        category: "recovery",
+        retryable: false,
+        required_action_code: Some("RECOVER_EXISTING_SUPPORTING_MATERIAL".to_owned()),
+        safe_fingerprint: Some("founder_supporting_material_outcome_unknown".to_owned()),
+        safe_command_id: None,
+        safe_correlation_id: None,
+        safe_recovery_path: Some(recovery_path.display().to_string()),
+        safe_material_recovery_paths: Vec::new(),
+        operation: "task.decide.material",
+    }
+}
+
+fn founder_supporting_material_unknown(
+    recovery: &egopulse_client_operations::RecoverableFounderSupportingMaterial,
+) -> CliFailure {
+    let command = recovery.prepared().command();
+    let metadata = command.metadata.as_ref();
+    let command_id = metadata
+        .map(|value| value.command_id.clone())
+        .unwrap_or_default();
+    let correlation_id = metadata
+        .map(|value| value.correlation_id.clone())
+        .unwrap_or_default();
+    CliFailure {
+        exit_code: 8,
+        reason_code: "FOUNDER_SUPPORTING_MATERIAL_OUTCOME_UNKNOWN",
+        message: format!(
+            "supporting-material outcome remains unknown after one exact retry; Verdict was not submitted (material_id={}, command_id={command_id}, correlation_id={correlation_id})",
+            command.material_id
+        ),
+        category: "recovery",
+        retryable: false,
+        required_action_code: Some("VERIFY_EXISTING_SUPPORTING_MATERIAL_OUTCOME".to_owned()),
+        safe_fingerprint: Some("founder_supporting_material_outcome_unknown".to_owned()),
+        safe_command_id: (!command_id.is_empty()).then_some(command_id),
+        safe_correlation_id: (!correlation_id.is_empty()).then_some(correlation_id),
+        safe_recovery_path: None,
+        safe_material_recovery_paths: Vec::new(),
+        operation: "task.decide.material",
+    }
+}
+
+fn founder_supporting_material_failure(error: ClientFounderSupportingMaterialError) -> CliFailure {
+    match error {
+        ClientFounderSupportingMaterialError::RecoveryStorage => CliFailure::recovery_storage(
+            "task.decide.material",
+            "supporting-material recovery could not be saved; no request was sent and any existing recovery record was preserved",
+        ),
+        ClientFounderSupportingMaterialError::InvalidInput => CliFailure::guided_verdict_input(
+            "supporting material does not match the current trusted Task result review",
+        ),
+        ClientFounderSupportingMaterialError::UnconfirmedReceipt => {
+            CliFailure::guided_verdict_unavailable(
+                "FOUNDER_SUPPORTING_MATERIAL_UNCONFIRMED",
+                "supporting material was not confirmed with its exact sealed receipt; Verdict was not submitted",
+            )
+        }
+        ClientFounderSupportingMaterialError::Kernel(KernelError::PermissionDenied(permission)) => {
+            CliFailure::permission("task.decide.material", permission)
+        }
+        ClientFounderSupportingMaterialError::Kernel(error) => {
+            CliFailure::protocol(error.to_string()).for_operation("task.decide.material")
+        }
+        ClientFounderSupportingMaterialError::Transport(detail) => {
+            CliFailure::daemon_unavailable(detail).for_operation("task.decide.material")
+        }
+        ClientFounderSupportingMaterialError::Authority => CliFailure::guided_verdict_unavailable(
+            "FOUNDER_SUPPORTING_MATERIAL_REJECTED",
+            "supporting-material Authority rejected the request; Verdict was not submitted",
+        )
+        .for_operation("task.decide.material"),
+        ClientFounderSupportingMaterialError::Unknown { recovery } => {
+            founder_supporting_material_unknown(&recovery)
+        }
+    }
+}
+
+async fn task_decide_recover(recovery_path: PathBuf, json: bool) -> Result<(), CliFailure> {
+    let recovery_path = private_founder_verdict_recovery_path(&recovery_path)
+        .map_err(|failure| failure.with_recovery_path(&recovery_path))?;
+    let saved = DurableFounderVerdictRecovery::read(&recovery_path).map_err(|error| {
+        durable_founder_recovery_failure(error).with_recovery_path(&recovery_path)
+    })?;
+    let task_id = saved.task_id().to_owned();
+    let command_id = saved.command_id().to_owned();
+    let selection = saved.selection();
+    let attached = attach("task.decide-recover")
+        .await
+        .map_err(|failure| failure.with_recovery_path(&recovery_path))?;
+    match attached
+        .0
+        .retry_durable_founder_decision(&saved)
+        .await
+        .map_err(|error| {
+            durable_founder_recovery_failure(error).with_recovery_path(&recovery_path)
+        })? {
+        DurableFounderDecisionAttempt::Applied(result) => {
+            render_guided_founder_verdict_result(
+                &result,
+                &Uuid::now_v7().to_string(),
+                &recovery_path,
+                json,
+                "task.decide-recover",
+                Some((
+                    &task_id,
+                    &command_id,
+                    guided_founder_selection_name(selection),
+                )),
+            )?;
+            Ok(())
+        }
+        DurableFounderDecisionAttempt::Unknown {
+            safe_reason_code, ..
+        } => Err(CliFailure::durable_founder_verdict_outcome_unknown(
+            safe_reason_code,
+            command_id,
+            &recovery_path,
+        )
+        .for_operation("task.decide-recover")),
+    }
+}
+
+fn new_founder_verdict_recovery_path() -> Result<PathBuf, CliFailure> {
+    let directory = ensure_founder_verdict_recovery_directory()?;
+    Ok(directory.join(format!("founder-verdict-{}.json", Uuid::now_v7())))
+}
+
+fn new_founder_material_recovery_path() -> Result<PathBuf, CliFailure> {
+    let directory = ensure_founder_verdict_recovery_directory()?;
+    Ok(directory.join(format!("founder-material-{}.json", Uuid::now_v7())))
+}
+
+fn private_founder_verdict_recovery_path(path: &std::path::Path) -> Result<PathBuf, CliFailure> {
+    let directory = ensure_founder_verdict_recovery_directory()?;
+    let canonical = fs::canonicalize(path).map_err(|_| {
+        CliFailure::guided_verdict_input(
+            "Founder recovery file is unavailable in the client-private directory",
+        )
+        .for_operation("task.decide-recover")
+    })?;
+    if !canonical.starts_with(&directory) || !canonical.is_file() {
+        return Err(CliFailure::guided_verdict_input(
+            "Founder recovery path must name a file in the client-private directory",
+        )
+        .for_operation("task.decide-recover"));
+    }
+    Ok(canonical)
+}
+
+fn ensure_founder_verdict_recovery_directory() -> Result<PathBuf, CliFailure> {
+    let configured_root = client_private_state_root().ok_or_else(|| {
+        CliFailure::protocol("client-private state directory is unavailable")
+            .for_operation("task.decide")
+    })?;
+    if !configured_root.is_absolute() {
+        return Err(
+            CliFailure::protocol("client-private state directory must be absolute")
+                .for_operation("task.decide"),
+        );
+    }
+    let directory = configured_root
+        .join("egopulse")
+        .join("client")
+        .join("founder-verdict-recovery");
+    fs::create_dir_all(&directory).map_err(|error| {
+        CliFailure::protocol(format!(
+            "client-private recovery directory could not be prepared: {error}"
+        ))
+        .for_operation("task.decide")
+    })?;
+    restrict_recovery_directory_permissions(&directory)?;
+    fs::canonicalize(&directory).map_err(|error| {
+        CliFailure::protocol(format!(
+            "client-private recovery directory could not be resolved: {error}"
+        ))
+        .for_operation("task.decide")
+    })
+}
+
+#[cfg(windows)]
+fn client_private_state_root() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+}
+
+#[cfg(target_os = "macos")]
+fn client_private_state_root() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library").join("Application Support"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn client_private_state_root() -> Option<PathBuf> {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("state"))
+        })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn client_private_state_root() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn restrict_recovery_directory_permissions(path: &std::path::Path) -> Result<(), CliFailure> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        CliFailure::protocol(format!(
+            "client-private recovery directory permissions could not be applied: {error}"
+        ))
+        .for_operation("task.decide")
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_recovery_directory_permissions(_path: &std::path::Path) -> Result<(), CliFailure> {
+    Ok(())
+}
+
+fn durable_founder_recovery_failure(error: DurableFounderRecoveryError) -> CliFailure {
+    match error {
+        DurableFounderRecoveryError::InvalidRecord => CliFailure::guided_verdict_input(
+            "Founder Verdict recovery record is invalid or unsupported",
+        )
+        .for_operation("task.decide-recover"),
+        DurableFounderRecoveryError::PrincipalMismatch => CliFailure::permission(
+            "task.decide-recover",
+            "Founder Verdict recovery requires the original authenticated Founder",
+        ),
+        DurableFounderRecoveryError::StoreMismatch => CliFailure::guided_verdict_unavailable(
+            "FOUNDER_VERDICT_RECOVERY_STORE_MISMATCH",
+            "Founder Verdict recovery belongs to a different projection store epoch",
+        )
+        .for_operation("task.decide-recover"),
+        DurableFounderRecoveryError::Storage => {
+            CliFailure::protocol("Founder Verdict recovery record could not be read or persisted")
+                .for_operation("task.decide-recover")
+        }
+    }
+}
+
+fn guided_founder_selection_name(selection: GuidedFounderVerdictSelection) -> &'static str {
+    match selection {
+        GuidedFounderVerdictSelection::Accept => "accept",
+        GuidedFounderVerdictSelection::Rework => "rework",
+        GuidedFounderVerdictSelection::Reject => "reject",
+    }
+}
+
+fn guided_founder_verdict_failure(error: ClientGuidedFounderVerdictError) -> CliFailure {
+    match error {
+        ClientGuidedFounderVerdictError::RecoveryStorage => CliFailure::recovery_storage(
+            "task.decide",
+            "Founder Verdict recovery could not be saved; no request was sent and any existing recovery record was preserved",
+        ),
+        ClientGuidedFounderVerdictError::ApplyRecoveryStorage => CliFailure::recovery_storage(
+            "task.decide",
+            "Founder Verdict Issue committed, but Apply recovery could not be saved; Apply was not sent and the original recovery record was preserved",
+        ),
+        ClientGuidedFounderVerdictError::Kernel(KernelError::PermissionDenied(permission)) => {
+            CliFailure::permission("task.decide", permission)
+        }
+        ClientGuidedFounderVerdictError::Kernel(error) => {
+            CliFailure::protocol(error.to_string()).for_operation("task.decide")
+        }
+        ClientGuidedFounderVerdictError::Review(error) => {
+            task_result_review_failure(error).for_operation("task.decide")
+        }
+        ClientGuidedFounderVerdictError::InvalidInput(detail) => {
+            CliFailure::guided_verdict_input(detail)
+        }
+        ClientGuidedFounderVerdictError::NonActionable(detail)
+        | ClientGuidedFounderVerdictError::MissingMaterial(detail) => {
+            CliFailure::guided_verdict_unavailable("GUIDED_FOUNDER_VERDICT_UNAVAILABLE", detail)
+        }
+        ClientGuidedFounderVerdictError::NonPassedAcceptRequiresRiskMaterials { conclusion } => {
+            CliFailure::guided_verdict_unavailable(
+                "NON_PASSED_ACCEPT_REQUIRES_RISK_MATERIALS",
+                format!(
+                    "Accept for {conclusion:?} requires complete risk coverage plus real rationale and compensating-control Artifacts"
+                ),
+            )
+        }
+        ClientGuidedFounderVerdictError::ReworkRequiresDirectiveMaterials => {
+            CliFailure::guided_verdict_unavailable(
+                "REWORK_REQUIRES_DIRECTIVE_MATERIALS",
+                "Rework requires a real required-changes Artifact and a complete Rework directive",
+            )
+        }
+        ClientGuidedFounderVerdictError::BindingChanged => CliFailure::guided_verdict_unavailable(
+            "GUIDED_FOUNDER_VERDICT_BINDING_CHANGED",
+            "the sealed Founder Verdict no longer matches the current Task result review",
+        ),
+        ClientGuidedFounderVerdictError::RequestDigestMismatch => CliFailure::protocol(
+            "the sealed Founder Verdict request digest failed integrity validation",
+        )
+        .for_operation("task.decide"),
+        ClientGuidedFounderVerdictError::SessionChanged => CliFailure::permission(
+            "task.decide",
+            "the authenticated Founder Verdict session changed before exact retry",
+        ),
+        ClientGuidedFounderVerdictError::Authority {
+            error_code,
+            safe_error_fingerprint,
+        } => CliFailure::verdict_authority(error_code, safe_error_fingerprint, "task.decide"),
+        ClientGuidedFounderVerdictError::TaskAuthority {
+            error_code,
+            safe_detail_code,
+        } => CliFailure::task_authority(error_code, safe_detail_code, "task.decide"),
+    }
+}
+
+fn guided_founder_verdict_durable_failure(
+    error: ClientGuidedFounderVerdictError,
+    recovery_path: &std::path::Path,
+) -> CliFailure {
+    let failure = guided_founder_verdict_failure(error);
+    if recovery_path.is_file() {
+        failure.with_recovery_path(recovery_path)
+    } else {
+        failure
+    }
 }
 
 fn task_result_review_failure(error: ClientTaskResultReviewError) -> CliFailure {
@@ -4255,6 +5605,7 @@ async fn approval(command: ApprovalCommand) -> Result<(), CliFailure> {
             decision,
             reason_code,
             confirmation_proof_ref,
+            reviewed_summary_digest,
             json,
         } => {
             approval_decide(
@@ -4262,6 +5613,7 @@ async fn approval(command: ApprovalCommand) -> Result<(), CliFailure> {
                 decision,
                 reason_code,
                 confirmation_proof_ref,
+                reviewed_summary_digest,
                 json,
             )
             .await
@@ -4309,11 +5661,22 @@ async fn approval_get(approval_request_id: String, json: bool) -> Result<(), Cli
             "Approval: {} task={} lifecycle={} revision={}",
             payload["data"]["approvalRequestId"].as_str().unwrap_or(""),
             payload["data"]["taskId"].as_str().unwrap_or(""),
+            payload["data"]["requestLifecycle"]
+                .as_u64()
+                .unwrap_or_default(),
             payload["data"]["requestRevision"]
                 .as_u64()
                 .unwrap_or_default(),
-            payload["data"]["requestLifecycle"].as_str().unwrap_or(""),
         );
+        println!(
+            "{}",
+            payload["data"]["operationSummary"]["text"]
+                .as_str()
+                .unwrap_or("Operation details unavailable")
+        );
+        if let Some(digest) = payload["data"]["operationSummary"]["summaryDigestSha256"].as_str() {
+            println!("Reviewed summary: {digest}");
+        }
     }
     Ok(())
 }
@@ -4532,8 +5895,10 @@ fn guided_approval_failure(error: ClientGuidedApprovalDecisionError) -> CliFailu
         ClientGuidedApprovalDecisionError::Kernel(error) => {
             CliFailure::protocol(error.to_string()).for_operation("approval.decide")
         }
-        ClientGuidedApprovalDecisionError::InvalidInput(detail)
-        | ClientGuidedApprovalDecisionError::Protocol(detail) => {
+        ClientGuidedApprovalDecisionError::InvalidInput(detail) => {
+            CliFailure::guided_approval_input(detail)
+        }
+        ClientGuidedApprovalDecisionError::Protocol(detail) => {
             CliFailure::protocol(detail).for_operation("approval.decide")
         }
         ClientGuidedApprovalDecisionError::NotFound => CliFailure::policy_authority(
@@ -4564,6 +5929,7 @@ async fn approval_decide(
     decision: String,
     reason_code: String,
     confirmation_proof_ref: Option<String>,
+    reviewed_summary_digest: Option<String>,
     json: bool,
 ) -> Result<(), CliFailure> {
     let decision = parse_approval_decision(&decision)
@@ -4576,6 +5942,7 @@ async fn approval_decide(
             decision,
             reason_code,
             confirmation_proof_ref,
+            reviewed_summary_digest_sha256: reviewed_summary_digest,
         })
         .await
         .map_err(guided_approval_failure)?;
@@ -4743,7 +6110,9 @@ async fn verdict_issue(
                 rationale_artifact_id: None,
                 required_confirmation_class: confirmation_class,
                 confirmation_proof_ref,
-                expires_at: Some(timestamp_after(Duration::from_secs(3600))),
+                expires_at: Some(timestamp_after(Duration::from_secs(
+                    DEFAULT_FOUNDER_VERDICT_EXPIRY_SECONDS,
+                ))),
                 supersedes_founder_verdict_id: None,
             },
         )),
@@ -5177,6 +6546,15 @@ fn parse_verdict_decision(value: &str) -> Result<i32, String> {
         "accept" => Ok(FounderVerdictDecision::Accept as i32),
         "rework" => Ok(FounderVerdictDecision::Rework as i32),
         "reject" => Ok(FounderVerdictDecision::Reject as i32),
+        _ => Err("decision must be accept, rework, or reject".to_owned()),
+    }
+}
+
+fn parse_guided_verdict_selection(value: &str) -> Result<GuidedFounderVerdictSelection, String> {
+    match value {
+        "accept" => Ok(GuidedFounderVerdictSelection::Accept),
+        "rework" => Ok(GuidedFounderVerdictSelection::Rework),
+        "reject" => Ok(GuidedFounderVerdictSelection::Reject),
         _ => Err("decision must be accept, rework, or reject".to_owned()),
     }
 }
@@ -5764,6 +7142,18 @@ fn approval_json(
     view: &egopulse_domain_contracts::v01::egopulse::localapi::v1::HarnessApprovalView,
     operation: &'static str,
 ) -> serde_json::Value {
+    let reviewable = egopulse_domain_contracts::approval_display::valid_reviewable_approval_summary(
+        view.display_summary.as_ref(),
+        &view.display_summary_ref,
+        &view.action_digest_sha256,
+        view.kind,
+    );
+    let summary_text = egopulse_domain_contracts::approval_display::approval_display_text(
+        view.display_summary.as_ref(),
+        &view.display_summary_ref,
+        &view.action_digest_sha256,
+        view.kind,
+    );
     json!({
         "schemaVersion": "egopulse.cli-result/v0.1",
         "ok": true,
@@ -5776,6 +7166,15 @@ fn approval_json(
             "requestLifecycle": view.request_lifecycle,
             "requestRevision": view.request_revision,
             "actionDigestSha256": view.action_digest_sha256,
+            "kind": egopulse_domain_contracts::v01::egopulse::harness::v1::ApprovalKind::try_from(view.kind).map(|value| value.as_str_name()).unwrap_or("APPROVAL_KIND_UNSPECIFIED"),
+            "operationSummary": {
+                "reviewable": reviewable,
+                "text": summary_text,
+                "summaryDigestSha256": if reviewable { view.display_summary.as_ref().map(|value| value.summary_digest_sha256.as_str()) } else { None },
+            },
+            "policyDecision": view.policy_decision.as_ref().map(|decision| json!({
+                "state": decision.state, "revision": decision.state_revision, "decision": decision.decision,
+            })),
             "redactions": view.redactions.iter().map(|item| json!({"fieldPath": item.field_path, "reasonCode": item.reason_code})).collect::<Vec<_>>(),
         },
         "projection": projection_json(view.metadata.as_ref()),
@@ -6679,6 +8078,7 @@ mod tests {
                     decision,
                     reason_code,
                     confirmation_proof_ref,
+                    reviewed_summary_digest,
                     json,
                 },
         } = cli.command
@@ -6692,6 +8092,7 @@ mod tests {
         );
         assert_eq!(reason_code, "founder-reviewed");
         assert_eq!(confirmation_proof_ref.as_deref(), Some("proof:approval:1"));
+        assert!(reviewed_summary_digest.is_none());
         assert!(json);
 
         assert!(
@@ -6739,6 +8140,20 @@ mod tests {
             "sanitized approval result missing",
         ));
         assert_eq!(protocol.reason_code, "LOCAL_API_PROTOCOL_ERROR");
+        let invalid = guided_approval_failure(ClientGuidedApprovalDecisionError::InvalidInput(
+            "reviewed_summary_digest is required for this approval",
+        ));
+        assert_eq!(invalid.exit_code, 2);
+        assert_eq!(invalid.reason_code, "INVALID_ARGUMENT");
+        assert_eq!(invalid.category, "invalid_request");
+        assert_eq!(
+            invalid.required_action_code.as_deref(),
+            Some("READ_APPROVAL_DETAILS")
+        );
+        assert_eq!(
+            invalid.message,
+            "reviewed_summary_digest is required for this approval"
+        );
     }
 
     #[test]
@@ -6806,6 +8221,362 @@ mod tests {
         ])
         .expect_err("preview must never also execute");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn task_decide_cli_requires_explicit_decision_reason_and_proof() {
+        let cli = Cli::try_parse_from([
+            "egopulse",
+            "task",
+            "decide",
+            "task:guided:1",
+            "--decision",
+            "accept",
+            "--reason-code",
+            "founder-accepted",
+            "--confirmation-proof-ref",
+            "confirmation:founder:1",
+            "--expires-in-seconds",
+            "120",
+            "--json",
+        ])
+        .expect("guided Founder Verdict CLI");
+        assert!(command_json(&cli.command));
+        assert!(matches!(
+            cli.command,
+            Command::Task {
+                command: TaskCommandCli::Decide {
+                    task_id,
+                    decision,
+                    reason_code,
+                    confirmation_proof_ref,
+                    expires_in_seconds: Some(120),
+                    json: true,
+                    ..
+                }
+            } if task_id == "task:guided:1"
+                && decision == "accept"
+                && reason_code == "founder-accepted"
+                && confirmation_proof_ref == "confirmation:founder:1"
+        ));
+        assert_eq!(
+            parse_guided_verdict_selection("rework").unwrap(),
+            GuidedFounderVerdictSelection::Rework
+        );
+        assert!(parse_guided_verdict_selection("override").is_err());
+        assert!(
+            Cli::try_parse_from([
+                "egopulse",
+                "task",
+                "decide",
+                "task:guided:1",
+                "--decision",
+                "reject",
+                "--reason-code",
+                "founder-rejected",
+            ])
+            .is_err()
+        );
+        assert_eq!(
+            founder_verdict_expiry(None).unwrap(),
+            Duration::from_secs(240)
+        );
+        assert!(founder_verdict_expiry(None).unwrap() <= Duration::from_secs(300));
+        assert_eq!(
+            founder_verdict_expiry(Some(60)).unwrap(),
+            Duration::from_secs(60)
+        );
+        assert!(founder_verdict_expiry(Some(0)).is_err());
+        assert!(founder_verdict_expiry(Some(241)).is_err());
+    }
+
+    #[test]
+    fn task_decide_cli_accepts_authored_materials_without_artifact_ids() {
+        let rework = Cli::try_parse_from([
+            "egopulse",
+            "task",
+            "decide",
+            "task:guided:1",
+            "--decision",
+            "rework",
+            "--reason-code",
+            "changes-required",
+            "--confirmation-proof-ref",
+            "confirmation:founder:1",
+            "--required-changes",
+            "Fix the failing repository checks.",
+            "--discrepancy-id",
+            "discrepancy:tests:1",
+        ])
+        .expect("Rework material text");
+        assert!(matches!(
+            rework.command,
+            Command::Task {
+                command: TaskCommandCli::Decide {
+                    required_changes: Some(body),
+                    discrepancy_id,
+                    ..
+                }
+            } if body == "Fix the failing repository checks."
+                && discrepancy_id == vec!["discrepancy:tests:1".to_owned()]
+        ));
+
+        let risk_accept = Cli::try_parse_from([
+            "egopulse",
+            "task",
+            "decide",
+            "task:guided:2",
+            "--decision",
+            "accept",
+            "--reason-code",
+            "risk-accepted",
+            "--confirmation-proof-ref",
+            "confirmation:founder:2",
+            "--risk-rationale",
+            "The residual risk is bounded.",
+            "--compensating-control",
+            "Monitor the affected path.",
+            "--risk-category",
+            "operational",
+            "--unverified-item-id",
+            "unverified:review:1",
+        ])
+        .expect("risk-acceptance materials");
+        assert!(matches!(
+            risk_accept.command,
+            Command::Task {
+                command: TaskCommandCli::Decide {
+                    risk_rationale: Some(rationale),
+                    compensating_control,
+                    risk_category: Some(category),
+                    unverified_item_id,
+                    ..
+                }
+            } if rationale == "The residual risk is bounded."
+                && compensating_control == vec!["Monitor the affected path.".to_owned()]
+                && category == "operational"
+                && unverified_item_id == vec!["unverified:review:1".to_owned()]
+        ));
+
+        let recovered = Cli::try_parse_from([
+            "egopulse",
+            "task",
+            "decide",
+            "task:guided:3",
+            "--decision",
+            "accept",
+            "--reason-code",
+            "risk-accepted",
+            "--confirmation-proof-ref",
+            "confirmation:founder:3",
+            "--material-recovery",
+            r"C:\Users\founder\AppData\Local\egopulse\client\founder-verdict-recovery\rationale.json",
+            "--material-recovery",
+            r"C:\Users\founder\AppData\Local\egopulse\client\founder-verdict-recovery\control.json",
+        ])
+        .expect("repeatable material recovery entries");
+        assert!(matches!(
+            recovered.command,
+            Command::Task {
+                command: TaskCommandCli::Decide {
+                    material_recovery,
+                    ..
+                }
+            } if material_recovery.len() == 2
+                && material_recovery[0].ends_with("rationale.json")
+                && material_recovery[1].ends_with("control.json")
+        ));
+    }
+
+    #[test]
+    fn task_decide_recover_accepts_only_an_explicit_recovery_path() {
+        let cli = Cli::try_parse_from([
+            "egopulse",
+            "task",
+            "decide-recover",
+            r"C:\Users\founder\AppData\Local\egopulse\client\founder-verdict-recovery\pending.json",
+            "--json",
+        ])
+        .expect("explicit durable recovery entry");
+        assert!(matches!(
+            cli.command,
+            Command::Task {
+                command: TaskCommandCli::DecideRecover {
+                    recovery_path,
+                    json: true,
+                }
+            } if recovery_path.ends_with("pending.json")
+        ));
+        assert!(Cli::try_parse_from(["egopulse", "task", "decide-recover", "--json"]).is_err());
+    }
+
+    #[test]
+    fn durable_verdict_unknown_exposes_path_and_safe_summary_only() {
+        let path = std::path::Path::new(
+            r"C:\Users\founder\AppData\Local\egopulse\client\founder-verdict-recovery\pending.json",
+        );
+        let error = CliFailure::durable_founder_verdict_outcome_unknown(
+            "RECOVERY_ORIGINAL_OUTCOME_UNKNOWN",
+            "command:guided:durable".to_owned(),
+            path,
+        )
+        .with_material_recovery_paths(&[
+            PathBuf::from(
+                r"C:\Users\founder\AppData\Local\egopulse\client\founder-verdict-recovery\rationale.json",
+            ),
+            PathBuf::from(
+                r"C:\Users\founder\AppData\Local\egopulse\client\founder-verdict-recovery\control.json",
+            ),
+        ]);
+        let envelope = error.json_envelope();
+        assert_eq!(
+            envelope["error"]["recoveryPath"],
+            json!(path.display().to_string())
+        );
+        assert_eq!(
+            envelope["error"]["commandId"],
+            json!("command:guided:durable")
+        );
+        assert_eq!(
+            envelope["error"]["materialRecoveryPaths"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(!envelope.to_string().contains("confirmation-proof"));
+        assert!(!envelope.to_string().contains("material body"));
+    }
+
+    #[test]
+    fn founder_material_failure_json_exposes_only_safe_recovery_paths() {
+        let rationale = PathBuf::from(
+            r"C:\Users\founder\AppData\Local\egopulse\client\founder-verdict-recovery\rationale.json",
+        );
+        let control = PathBuf::from(
+            r"C:\Users\founder\AppData\Local\egopulse\client\founder-verdict-recovery\control.json",
+        );
+        let failure = CliFailure::guided_verdict_unavailable(
+            "FOUNDER_SUPPORTING_MATERIAL_REJECTED",
+            "supporting material was rejected",
+        )
+        .with_material_recovery_paths(&[rationale.clone(), control.clone()]);
+        let envelope = failure.json_envelope();
+
+        assert_eq!(
+            envelope["error"]["materialRecoveryPaths"],
+            json!([
+                rationale.display().to_string(),
+                control.display().to_string()
+            ])
+        );
+        assert!(envelope["error"].get("recoveryPath").is_none());
+        let rendered = envelope.to_string();
+        assert!(!rendered.contains("confirmation-proof"));
+        assert!(!rendered.contains("material body"));
+        assert!(!rendered.contains("supporting material was rejected"));
+    }
+
+    #[test]
+    fn second_material_failure_retains_first_path_and_storage_match_is_explicit() {
+        let root =
+            std::env::temp_dir().join(format!("egopulse-cli-material-paths-{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("isolated material paths");
+        let rationale = root.join("rationale.recovery");
+        let control = root.join("control.recovery");
+        fs::write(&rationale, b"protected-rationale").expect("rationale recovery");
+        fs::write(&control, b"protected-control").expect("control recovery");
+        let mut confirmed = Vec::new();
+        let mut recovery_paths = Vec::new();
+
+        record_supporting_material_attempt(
+            Ok("rationale"),
+            rationale.clone(),
+            &mut confirmed,
+            &mut recovery_paths,
+        )
+        .expect("first material confirmed");
+        let failure = durable_founder_material_unknown(
+            "FOUNDER_SUPPORTING_MATERIAL_OUTCOME_UNKNOWN",
+            "task:safe",
+            "material:safe",
+            FounderSupportingMaterialRole::CompensatingControl,
+            &control,
+        );
+        let failure = record_supporting_material_attempt(
+            Err(failure),
+            control.clone(),
+            &mut confirmed,
+            &mut recovery_paths,
+        )
+        .expect_err("second material remains unknown");
+        assert_eq!(confirmed, vec!["rationale"]);
+        assert_eq!(recovery_paths, vec![rationale.clone(), control.clone()]);
+        assert_eq!(
+            failure.json_envelope()["error"]["materialRecoveryPaths"],
+            json!([
+                rationale.display().to_string(),
+                control.display().to_string()
+            ])
+        );
+
+        let storage = founder_supporting_material_failure(
+            ClientFounderSupportingMaterialError::RecoveryStorage,
+        )
+        .with_material_recovery_paths(&[rationale]);
+        assert_eq!(storage.reason_code, "FOUNDER_RECOVERY_STORAGE_FAILED");
+        assert_eq!(storage.operation, "task.decide.material");
+        assert_eq!(
+            storage.required_action_code.as_deref(),
+            Some("PRESERVE_EXISTING_RECOVERY_RECORD")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_decide_unknown_outcome_exposes_only_safe_recovery_identifiers() {
+        let error = CliFailure::durable_founder_verdict_outcome_unknown(
+            "FOUNDER_VERDICT_OUTCOME_UNKNOWN",
+            "command:guided:1".to_owned(),
+            std::path::Path::new("pending.json"),
+        );
+        let envelope = error.json_envelope();
+        assert_eq!(error.exit_code, 8);
+        assert!(!error.retryable);
+        assert_eq!(envelope["error"]["commandId"], json!("command:guided:1"));
+        assert_eq!(envelope["error"]["outcome"], json!("unknown"));
+        assert_eq!(
+            envelope["error"]["safeInstruction"],
+            json!("do_not_issue_new_decision")
+        );
+        assert!(error.safe_correlation_id.is_none());
+        assert!(Uuid::parse_str(envelope["correlationId"].as_str().unwrap()).is_ok());
+        assert!(!envelope.to_string().contains("confirmation"));
+        assert!(error.message.contains("task decide-recover"));
+    }
+
+    #[test]
+    fn task_decide_preserves_explicit_missing_material_failures() {
+        let rework = guided_founder_verdict_failure(
+            ClientGuidedFounderVerdictError::ReworkRequiresDirectiveMaterials,
+        );
+        assert_eq!(rework.exit_code, 6);
+        assert_eq!(rework.reason_code, "REWORK_REQUIRES_DIRECTIVE_MATERIALS");
+        assert!(rework.message.contains("required-changes Artifact"));
+
+        let non_passed = guided_founder_verdict_failure(
+            ClientGuidedFounderVerdictError::NonPassedAcceptRequiresRiskMaterials {
+                conclusion: VerificationConclusion::Failed,
+            },
+        );
+        assert_eq!(
+            non_passed.reason_code,
+            "NON_PASSED_ACCEPT_REQUIRES_RISK_MATERIALS"
+        );
+        assert!(
+            non_passed
+                .message
+                .contains("compensating-control Artifacts")
+        );
     }
 
     fn guided_cli_input() -> GuidedWorkInput {
@@ -7213,6 +8984,24 @@ mod tests {
 
     #[test]
     fn work_start_failures_preserve_blocked_session_authority_and_transport_categories() {
+        let mut missing_context = guided_cli_input();
+        missing_context.sources.clear();
+        missing_context.memory_mode = GuidedWorkMemoryMode::Disabled;
+        let invalid_input = guided_work_failure(
+            validate_guided_work_input(&missing_context)
+                .expect_err("context or memory is required"),
+        );
+        assert_eq!(invalid_input.exit_code, 2);
+        assert_eq!(invalid_input.reason_code, "GUIDED_WORK_INPUT_INVALID");
+        assert_eq!(invalid_input.category, "invalid_request");
+        assert_eq!(invalid_input.operation, "work.start");
+        assert_eq!(
+            invalid_input.required_action_code.as_deref(),
+            Some("CORRECT_GUIDED_WORK_INPUT")
+        );
+        assert!(invalid_input.message.contains("context reference"));
+        assert!(invalid_input.message.contains("enable memory"));
+
         let blocked = guided_work_failure(ClientGuidedWorkError::Blocked);
         assert_eq!(blocked.operation, "work.start");
         assert!(blocked.message.contains("no Task confirmation"));
@@ -7244,6 +9033,24 @@ mod tests {
         assert_eq!(transport.reason_code, "DAEMON_UNAVAILABLE");
         assert!(transport.message.contains("confirmation outcome"));
         assert!(!transport.message.contains("private transport sentinel"));
+        let api = guided_work_failure(ClientGuidedWorkError::ApiOutcomeUnknown(Box::new(
+            LocalApiError {
+                code: LocalApiErrorCode::AuthorityUnavailable as i32,
+                safe_fingerprint: "repository_material_unavailable".to_owned(),
+                ..Default::default()
+            },
+        )));
+        assert_eq!(api.reason_code, "LOCAL_API_ERROR");
+        assert!(api.message.contains("AUTHORITY_UNAVAILABLE"));
+        assert!(api.message.contains("commit outcome remains unknown"));
+        assert_eq!(
+            api.required_action_code.as_deref(),
+            Some("RECONCILE_EXACT_WORK_REQUEST")
+        );
+        assert_eq!(
+            api.safe_fingerprint.as_deref(),
+            Some("repository_material_unavailable")
+        );
     }
 
     #[test]

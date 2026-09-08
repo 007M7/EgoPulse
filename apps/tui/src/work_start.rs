@@ -354,7 +354,9 @@ fn safe_guided_work_error(error: &ClientGuidedWorkError) -> String {
         ClientGuidedWorkError::Kernel(_) => {
             "Work Start permission or attached session was rejected".to_owned()
         }
-        ClientGuidedWorkError::InvalidInput(_) => "Work Start input is invalid".to_owned(),
+        ClientGuidedWorkError::InvalidInput(detail) => {
+            format!("Work Start input is invalid: {detail}")
+        }
         ClientGuidedWorkError::Blocked => {
             "The governed preview is blocked; Task confirmation was not sent".to_owned()
         }
@@ -370,6 +372,14 @@ fn safe_guided_work_error(error: &ClientGuidedWorkError) -> String {
         ClientGuidedWorkError::ConfirmationOutcomeUnknown(_) => {
             "Task confirmation outcome is unknown; replay exactly or open Task Watch to reconcile"
                 .to_owned()
+        }
+        ClientGuidedWorkError::ApiOutcomeUnknown(error) => {
+            let code = egopulse_domain_contracts::v01::egopulse::localapi::v1::LocalApiErrorCode::try_from(error.code)
+                .map(|code| code.as_str_name())
+                .unwrap_or("LOCAL_API_ERROR_UNKNOWN");
+            format!(
+                "{code}: the API responded but the commit outcome is unknown; replay the exact request"
+            )
         }
         ClientGuidedWorkError::Api(_) => "The Work API rejected the operation".to_owned(),
         ClientGuidedWorkError::Authority { .. } => {
@@ -1589,5 +1599,17 @@ mod tests {
         for canary in RAW_CANARIES {
             assert!(!rendered.contains(canary), "leaked raw canary {canary}");
         }
+    }
+
+    #[test]
+    fn missing_context_without_memory_shows_the_recovery_action() {
+        let message = safe_guided_work_error(&ClientGuidedWorkError::InvalidInput(
+            "add a context reference or enable memory",
+        ));
+
+        assert_eq!(
+            message,
+            "Work Start input is invalid: add a context reference or enable memory"
+        );
     }
 }

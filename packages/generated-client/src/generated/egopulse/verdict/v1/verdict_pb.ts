@@ -4,7 +4,7 @@
 
 import type { GenEnum, GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
 import { enumDesc, fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv2";
-import type { ContentAddress } from "../../artifact/v1/artifact_pb.js";
+import type { ContentAddress, LineageBinding } from "../../artifact/v1/artifact_pb.js";
 import { file_egopulse_artifact_v1_artifact } from "../../artifact/v1/artifact_pb.js";
 import type { CommandMetadata, ContractReference } from "../../common/v1/common_pb.js";
 import { file_egopulse_common_v1_common } from "../../common/v1/common_pb.js";
@@ -18,7 +18,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file egopulse/verdict/v1/verdict.proto.
  */
 export const file_egopulse_verdict_v1_verdict: GenFile = /*@__PURE__*/
-  fileDesc("CiFlZ29wdWxzZS92ZXJkaWN0L3YxL3ZlcmRpY3QucHJvdG8SE2Vnb3B1bHNlLnZlcmRpY3QudjEi2QIKDFZlcmRpY3RTY29wZRIPCgd0YXNrX2lkGAEgASgJEhUKDXRhc2tfcmV2aXNpb24YAiABKAQSFQoNd29ya19yZXZpc2lvbhgDIAEoBBIXCg9hcnRpZmFjdF9zZXRfaWQYBCABKAkSQwoVYXJ0aWZhY3Rfc2V0X21hbmlmZXN0GAUgASgLMiQuZWdvcHVsc2UuYXJ0aWZhY3QudjEuQ29udGVudEFkZHJlc3MSIAoYdmVyaWZpY2F0aW9uX2FydGlmYWN0X2lkGAYgASgJEkIKFHZlcmlmaWNhdGlvbl9wYXlsb2FkGAcgASgLMiQuZWdvcHVsc2UuYXJ0aWZhY3QudjEuQ29udGVudEFkZHJlc3MSRgoXYWNjZXB0YW5jZV9jb250cmFjdF9yZWYYCCABKAsyJS5lZ29wdWxzZS5jb21tb24udjEuQ29udHJhY3RSZWZlcmVuY2Ui5QIKFUZvdW5kZXJBdXRob3JpdHlQcm9vZhIqCiJhdXRoZW50aWNhdGVkX2ZvdW5kZXJfcHJpbmNpcGFsX2lkGAEgASgJEhUKDWF1dGhvcml0eV9yZWYYAiABKAkSQgoSY29uZmlybWF0aW9uX2NsYXNzGAMgASgOMiYuZWdvcHVsc2UudmVyZGljdC52MS5Db25maXJtYXRpb25DbGFzcxIeChZjb25maXJtYXRpb25fcHJvb2ZfcmVmGAQgASgJEi8KC3ZlcmlmaWVkX2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIvCgt2YWxpZF91bnRpbBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASQwoUYXV0aG9yaXR5X3BvbGljeV9yZWYYByABKAsyJS5lZ29wdWxzZS5jb21tb24udjEuQ29udHJhY3RSZWZlcmVuY2UimwIKDlJpc2tBY2NlcHRhbmNlEhoKEnJpc2tfYWNjZXB0YW5jZV9pZBgBIAEoCRIzCghjYXRlZ29yeRgCIAEoDjIhLmVnb3B1bHNlLnZlcmRpY3QudjEuUmlza0NhdGVnb3J5EhcKD2Rpc2NyZXBhbmN5X2lkcxgDIAMoCRIbChN1bnZlcmlmaWVkX2l0ZW1faWRzGAQgAygJEh0KFXJhdGlvbmFsZV9hcnRpZmFjdF9pZBgFIAEoCRIpCiFjb21wZW5zYXRpbmdfY29udHJvbF9hcnRpZmFjdF9pZHMYBiADKAkSIAoTcmV2aWV3X3RyaWdnZXJfY29kZRgHIAEoCUgAiAEBQhYKFF9yZXZpZXdfdHJpZ2dlcl9jb2RlIqYBCg9SZXdvcmtEaXJlY3RpdmUSFAoMZGlyZWN0aXZlX2lkGAEgASgJEhMKC3JlYXNvbl9jb2RlGAIgASgJEiQKHHJlcXVpcmVkX2NoYW5nZXNfYXJ0aWZhY3RfaWQYAyABKAkSHgoWdGFyZ2V0X2Rpc2NyZXBhbmN5X2lkcxgEIAMoCRIiChp0YXJnZXRfdW52ZXJpZmllZF9pdGVtX2lkcxgFIAMoCSK/BgoORm91bmRlclZlcmRpY3QSGgoSZm91bmRlcl92ZXJkaWN0X2lkGAEgASgJEg8KB3ZlcnNpb24YAiABKAQSPQoIZGVjaXNpb24YAyABKA4yKy5lZ29wdWxzZS52ZXJkaWN0LnYxLkZvdW5kZXJWZXJkaWN0RGVjaXNpb24SMAoFc2NvcGUYBCABKAsyIS5lZ29wdWxzZS52ZXJkaWN0LnYxLlZlcmRpY3RTY29wZRJaCiBvYnNlcnZlZF92ZXJpZmljYXRpb25fY29uY2x1c2lvbhgFIAEoDjIwLmVnb3B1bHNlLnZlcmlmaWNhdGlvbi52MS5WZXJpZmljYXRpb25Db25jbHVzaW9uEkMKD2F1dGhvcml0eV9wcm9vZhgGIAEoCzIqLmVnb3B1bHNlLnZlcmRpY3QudjEuRm91bmRlckF1dGhvcml0eVByb29mEj0KEHJpc2tfYWNjZXB0YW5jZXMYByADKAsyIy5lZ29wdWxzZS52ZXJkaWN0LnYxLlJpc2tBY2NlcHRhbmNlEj4KEHJld29ya19kaXJlY3RpdmUYCCABKAsyJC5lZ29wdWxzZS52ZXJkaWN0LnYxLlJld29ya0RpcmVjdGl2ZRITCgtyZWFzb25fY29kZRgJIAEoCRIiChVyYXRpb25hbGVfYXJ0aWZhY3RfaWQYCiABKAlIAIgBARIuCgp2YWxpZF9mcm9tGAsgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIuCgpleHBpcmVzX2F0GAwgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBItCglpc3N1ZWRfYXQYDSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEj8KEWNhbm9uaWNhbF9wYXlsb2FkGA4gASgLMiQuZWdvcHVsc2UuYXJ0aWZhY3QudjEuQ29udGVudEFkZHJlc3MSKgodc3VwZXJzZWRlc19mb3VuZGVyX3ZlcmRpY3RfaWQYDyABKAlIAYgBAUIYChZfcmF0aW9uYWxlX2FydGlmYWN0X2lkQiAKHl9zdXBlcnNlZGVzX2ZvdW5kZXJfdmVyZGljdF9pZCLwAgoTRm91bmRlclZlcmRpY3RTdGF0ZRIaChJmb3VuZGVyX3ZlcmRpY3RfaWQYASABKAkSEAoIcmV2aXNpb24YAiABKAQSOwoFc3RhdGUYAyABKA4yLC5lZ29wdWxzZS52ZXJkaWN0LnYxLkZvdW5kZXJWZXJkaWN0U3RhdGVLaW5kEiMKFmNvbnN1bXB0aW9uX3JlY2VpcHRfaWQYBCABKAlIAIgBARIlChhzdXBlcnNlZGVkX2J5X3ZlcmRpY3RfaWQYBSABKAlIAYgBARIhChR0ZXJtaW5hbF9yZWFzb25fY29kZRgGIAEoCUgCiAEBEi4KCnVwZGF0ZWRfYXQYByABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wQhkKF19jb25zdW1wdGlvbl9yZWNlaXB0X2lkQhsKGV9zdXBlcnNlZGVkX2J5X3ZlcmRpY3RfaWRCFwoVX3Rlcm1pbmFsX3JlYXNvbl9jb2RlIpACChlWZXJkaWN0Q29uc3VtcHRpb25SZWNlaXB0Eh4KFmNvbnN1bXB0aW9uX3JlY2VpcHRfaWQYASABKAkSGgoSZm91bmRlcl92ZXJkaWN0X2lkGAIgASgJEg8KB3Rhc2tfaWQYAyABKAkSHgoWY29uc3VtZWRfdGFza19yZXZpc2lvbhgEIAEoBBIfChdyZXN1bHRpbmdfdGFza19yZXZpc2lvbhgFIAEoBBIVCg10YXNrX2V2ZW50X2lkGAYgASgJEh0KFXJlc3VsdGluZ190YXNrX3N0YXR1cxgHIAEoCRIvCgtjb25zdW1lZF9hdBgIIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXAi3QUKGklzc3VlRm91bmRlclZlcmRpY3RDb21tYW5kEjUKCG1ldGFkYXRhGAEgASgLMiMuZWdvcHVsc2UuY29tbW9uLnYxLkNvbW1hbmRNZXRhZGF0YRIwCgVzY29wZRgCIAEoCzIhLmVnb3B1bHNlLnZlcmRpY3QudjEuVmVyZGljdFNjb3BlEj0KCGRlY2lzaW9uGAMgASgOMisuZWdvcHVsc2UudmVyZGljdC52MS5Gb3VuZGVyVmVyZGljdERlY2lzaW9uEloKIG9ic2VydmVkX3ZlcmlmaWNhdGlvbl9jb25jbHVzaW9uGAQgASgOMjAuZWdvcHVsc2UudmVyaWZpY2F0aW9uLnYxLlZlcmlmaWNhdGlvbkNvbmNsdXNpb24SPQoQcmlza19hY2NlcHRhbmNlcxgFIAMoCzIjLmVnb3B1bHNlLnZlcmRpY3QudjEuUmlza0FjY2VwdGFuY2USPgoQcmV3b3JrX2RpcmVjdGl2ZRgGIAEoCzIkLmVnb3B1bHNlLnZlcmRpY3QudjEuUmV3b3JrRGlyZWN0aXZlEhMKC3JlYXNvbl9jb2RlGAcgASgJEiIKFXJhdGlvbmFsZV9hcnRpZmFjdF9pZBgIIAEoCUgAiAEBEksKG3JlcXVpcmVkX2NvbmZpcm1hdGlvbl9jbGFzcxgJIAEoDjImLmVnb3B1bHNlLnZlcmRpY3QudjEuQ29uZmlybWF0aW9uQ2xhc3MSHgoWY29uZmlybWF0aW9uX3Byb29mX3JlZhgKIAEoCRIuCgpleHBpcmVzX2F0GAsgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIqCh1zdXBlcnNlZGVzX2ZvdW5kZXJfdmVyZGljdF9pZBgMIAEoCUgBiAEBQhgKFl9yYXRpb25hbGVfYXJ0aWZhY3RfaWRCIAoeX3N1cGVyc2VkZXNfZm91bmRlcl92ZXJkaWN0X2lkIqoCChxDb25zdW1lRm91bmRlclZlcmRpY3RDb21tYW5kEjUKCG1ldGFkYXRhGAEgASgLMiMuZWdvcHVsc2UuY29tbW9uLnYxLkNvbW1hbmRNZXRhZGF0YRIaChJmb3VuZGVyX3ZlcmRpY3RfaWQYAiABKAkSHwoXZXhwZWN0ZWRfc3RhdGVfcmV2aXNpb24YAyABKAQSFQoNdGFza19ldmVudF9pZBgEIAEoCRIeChZjb25zdW1lZF90YXNrX3JldmlzaW9uGAUgASgEEh8KF3Jlc3VsdGluZ190YXNrX3JldmlzaW9uGAYgASgEEh0KFXJlc3VsdGluZ190YXNrX3N0YXR1cxgHIAEoCRIfChd0YXNrX2NvbW1pdF9yZWNlaXB0X3JlZhgIIAEoCSLGAQobUmV2b2tlRm91bmRlclZlcmRpY3RDb21tYW5kEjUKCG1ldGFkYXRhGAEgASgLMiMuZWdvcHVsc2UuY29tbW9uLnYxLkNvbW1hbmRNZXRhZGF0YRIaChJmb3VuZGVyX3ZlcmRpY3RfaWQYAiABKAkSHwoXZXhwZWN0ZWRfc3RhdGVfcmV2aXNpb24YAyABKAQSEwoLcmVhc29uX2NvZGUYBCABKAkSHgoWY29uZmlybWF0aW9uX3Byb29mX3JlZhgFIAEoCSKuAQobRXhwaXJlRm91bmRlclZlcmRpY3RDb21tYW5kEjUKCG1ldGFkYXRhGAEgASgLMiMuZWdvcHVsc2UuY29tbW9uLnYxLkNvbW1hbmRNZXRhZGF0YRIaChJmb3VuZGVyX3ZlcmRpY3RfaWQYAiABKAkSHwoXZXhwZWN0ZWRfc3RhdGVfcmV2aXNpb24YAyABKAQSGwoTcG9saWN5X2RlY2lzaW9uX3JlZhgEIAEoCSLrAgoOVmVyZGljdENvbW1hbmQSUAoVaXNzdWVfZm91bmRlcl92ZXJkaWN0GAEgASgLMi8uZWdvcHVsc2UudmVyZGljdC52MS5Jc3N1ZUZvdW5kZXJWZXJkaWN0Q29tbWFuZEgAElQKF2NvbnN1bWVfZm91bmRlcl92ZXJkaWN0GAIgASgLMjEuZWdvcHVsc2UudmVyZGljdC52MS5Db25zdW1lRm91bmRlclZlcmRpY3RDb21tYW5kSAASUgoWcmV2b2tlX2ZvdW5kZXJfdmVyZGljdBgDIAEoCzIwLmVnb3B1bHNlLnZlcmRpY3QudjEuUmV2b2tlRm91bmRlclZlcmRpY3RDb21tYW5kSAASUgoWZXhwaXJlX2ZvdW5kZXJfdmVyZGljdBgEIAEoCzIwLmVnb3B1bHNlLnZlcmRpY3QudjEuRXhwaXJlRm91bmRlclZlcmRpY3RDb21tYW5kSABCCQoHY29tbWFuZCKcAgoMVmVyZGljdEV2ZW50EhAKCGV2ZW50X2lkGAEgASgJEjMKBGtpbmQYAiABKA4yJS5lZ29wdWxzZS52ZXJkaWN0LnYxLlZlcmRpY3RFdmVudEtpbmQSGgoSZm91bmRlcl92ZXJkaWN0X2lkGAMgASgJEiAKGHJlc3VsdGluZ19zdGF0ZV9yZXZpc2lvbhgEIAEoBBIiChphdXRoZW50aWNhdGVkX3ByaW5jaXBhbF9pZBgFIAEoCRISCgpjb21tYW5kX2lkGAYgASgJEh0KFWV2aWRlbmNlX2FydGlmYWN0X2lkcxgHIAMoCRIwCgxjb21taXR0ZWRfYXQYCCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIqQDChRWZXJkaWN0Q29tbWFuZFJlc3VsdBIRCgljb21taXR0ZWQYASABKAgSEAoIcmVwbGF5ZWQYAiABKAgSNAoHdmVyZGljdBgDIAEoCzIjLmVnb3B1bHNlLnZlcmRpY3QudjEuRm91bmRlclZlcmRpY3QSNwoFc3RhdGUYBCABKAsyKC5lZ29wdWxzZS52ZXJkaWN0LnYxLkZvdW5kZXJWZXJkaWN0U3RhdGUSSwoTY29uc3VtcHRpb25fcmVjZWlwdBgFIAEoCzIuLmVnb3B1bHNlLnZlcmRpY3QudjEuVmVyZGljdENvbnN1bXB0aW9uUmVjZWlwdBIwCgVldmVudBgGIAEoCzIhLmVnb3B1bHNlLnZlcmRpY3QudjEuVmVyZGljdEV2ZW50EjkKCmVycm9yX2NvZGUYByABKA4yJS5lZ29wdWxzZS52ZXJkaWN0LnYxLlZlcmRpY3RFcnJvckNvZGUSIwoWc2FmZV9lcnJvcl9maW5nZXJwcmludBgIIAEoCUgAiAEBQhkKF19zYWZlX2Vycm9yX2ZpbmdlcnByaW50KrEBChZGb3VuZGVyVmVyZGljdERlY2lzaW9uEigKJEZPVU5ERVJfVkVSRElDVF9ERUNJU0lPTl9VTlNQRUNJRklFRBAAEiMKH0ZPVU5ERVJfVkVSRElDVF9ERUNJU0lPTl9BQ0NFUFQQARIjCh9GT1VOREVSX1ZFUkRJQ1RfREVDSVNJT05fUkVXT1JLEAISIwofRk9VTkRFUl9WRVJESUNUX0RFQ0lTSU9OX1JFSkVDVBADKpACChdGb3VuZGVyVmVyZGljdFN0YXRlS2luZBIqCiZGT1VOREVSX1ZFUkRJQ1RfU1RBVEVfS0lORF9VTlNQRUNJRklFRBAAEiUKIUZPVU5ERVJfVkVSRElDVF9TVEFURV9LSU5EX0lTU1VFRBABEicKI0ZPVU5ERVJfVkVSRElDVF9TVEFURV9LSU5EX0NPTlNVTUVEEAISJgoiRk9VTkRFUl9WRVJESUNUX1NUQVRFX0tJTkRfUkVWT0tFRBADEiYKIkZPVU5ERVJfVkVSRElDVF9TVEFURV9LSU5EX0VYUElSRUQQBBIpCiVGT1VOREVSX1ZFUkRJQ1RfU1RBVEVfS0lORF9TVVBFUlNFREVEEAUqiQEKEUNvbmZpcm1hdGlvbkNsYXNzEiIKHkNPTkZJUk1BVElPTl9DTEFTU19VTlNQRUNJRklFRBAAEh8KG0NPTkZJUk1BVElPTl9DTEFTU19FWFBMSUNJVBABEi8KK0NPTkZJUk1BVElPTl9DTEFTU19FTEVWQVRFRF9SSVNLX0FDQ0VQVEFOQ0UQAiqeAQoMUmlza0NhdGVnb3J5Eh0KGVJJU0tfQ0FURUdPUllfVU5TUEVDSUZJRUQQABIiCh5SSVNLX0NBVEVHT1JZX1FVQUxJVFlfUkVTSURVQUwQARIjCh9SSVNLX0NBVEVHT1JZX0JVU0lORVNTX1JFU0lEVUFMEAISJgoiUklTS19DQVRFR09SWV9PUEVSQVRJT05BTF9SRVNJRFVBTBADKtkBChBWZXJkaWN0RXZlbnRLaW5kEiIKHlZFUkRJQ1RfRVZFTlRfS0lORF9VTlNQRUNJRklFRBAAEh0KGVZFUkRJQ1RfRVZFTlRfS0lORF9JU1NVRUQQARIfChtWRVJESUNUX0VWRU5UX0tJTkRfQ09OU1VNRUQQAhIeChpWRVJESUNUX0VWRU5UX0tJTkRfUkVWT0tFRBADEh4KGlZFUkRJQ1RfRVZFTlRfS0lORF9FWFBJUkVEEAQSIQodVkVSRElDVF9FVkVOVF9LSU5EX1NVUEVSU0VERUQQBSqKBwoQVmVyZGljdEVycm9yQ29kZRIiCh5WRVJESUNUX0VSUk9SX0NPREVfVU5TUEVDSUZJRUQQABInCiNWRVJESUNUX0VSUk9SX0NPREVfSU5WQUxJRF9BUkdVTUVOVBABEiYKIlZFUkRJQ1RfRVJST1JfQ09ERV9VTkFVVEhFTlRJQ0FURUQQAhIoCiRWRVJESUNUX0VSUk9SX0NPREVfUEVSTUlTU0lPTl9ERU5JRUQQAxIgChxWRVJESUNUX0VSUk9SX0NPREVfTk9UX0ZPVU5EEAQSKAokVkVSRElDVF9FUlJPUl9DT0RFX1JFVklTSU9OX0NPTkZMSUNUEAUSKwonVkVSRElDVF9FUlJPUl9DT0RFX0lERU1QT1RFTkNZX0NPTkZMSUNUEAYSLworVkVSRElDVF9FUlJPUl9DT0RFX1RBU0tfTk9UX1ZFUkRJQ1RfUEVORElORxAHEiIKHlZFUkRJQ1RfRVJST1JfQ09ERV9TQ09QRV9TVEFMRRAIEiwKKFZFUkRJQ1RfRVJST1JfQ09ERV9WRVJJRklDQVRJT05fTUlTTUFUQ0gQCRIsCihWRVJESUNUX0VSUk9SX0NPREVfQ09ORklSTUFUSU9OX1JFUVVJUkVEEAoSLworVkVSRElDVF9FUlJPUl9DT0RFX1JJU0tfQUNDRVBUQU5DRV9SRVFVSVJFRBALEi8KK1ZFUkRJQ1RfRVJST1JfQ09ERV9SSVNLX0NPVkVSQUdFX0lOQ09NUExFVEUQDBIrCidWRVJESUNUX0VSUk9SX0NPREVfTk9OX09WRVJSSURBQkxFX0dBVEUQDRIwCixWRVJESUNUX0VSUk9SX0NPREVfUkVXT1JLX0RJUkVDVElWRV9SRVFVSVJFRBAOEiUKIVZFUkRJQ1RfRVJST1JfQ09ERV9BTFJFQURZX0FDVElWRRAPEicKI1ZFUkRJQ1RfRVJST1JfQ09ERV9BTFJFQURZX0NPTlNVTUVEEBASHgoaVkVSRElDVF9FUlJPUl9DT0RFX0VYUElSRUQQERIeChpWRVJESUNUX0VSUk9SX0NPREVfUkVWT0tFRBASEjIKLlZFUkRJQ1RfRVJST1JfQ09ERV9UQVNLX0NPTU1JVF9SRUNFSVBUX0lOVkFMSUQQExIoCiRWRVJESUNUX0VSUk9SX0NPREVfSU5URUdSSVRZX0ZBSUxVUkUQFDJ7Ch5Gb3VuZGVyVmVyZGljdEF1dGhvcml0eVNlcnZpY2USWQoHRXhlY3V0ZRIjLmVnb3B1bHNlLnZlcmRpY3QudjEuVmVyZGljdENvbW1hbmQaKS5lZ29wdWxzZS52ZXJkaWN0LnYxLlZlcmRpY3RDb21tYW5kUmVzdWx0YgZwcm90bzM", [file_egopulse_artifact_v1_artifact, file_egopulse_common_v1_common, file_egopulse_verification_v1_verification, file_google_protobuf_timestamp]);
+  fileDesc("CiFlZ29wdWxzZS92ZXJkaWN0L3YxL3ZlcmRpY3QucHJvdG8SE2Vnb3B1bHNlLnZlcmRpY3QudjEi2QIKDFZlcmRpY3RTY29wZRIPCgd0YXNrX2lkGAEgASgJEhUKDXRhc2tfcmV2aXNpb24YAiABKAQSFQoNd29ya19yZXZpc2lvbhgDIAEoBBIXCg9hcnRpZmFjdF9zZXRfaWQYBCABKAkSQwoVYXJ0aWZhY3Rfc2V0X21hbmlmZXN0GAUgASgLMiQuZWdvcHVsc2UuYXJ0aWZhY3QudjEuQ29udGVudEFkZHJlc3MSIAoYdmVyaWZpY2F0aW9uX2FydGlmYWN0X2lkGAYgASgJEkIKFHZlcmlmaWNhdGlvbl9wYXlsb2FkGAcgASgLMiQuZWdvcHVsc2UuYXJ0aWZhY3QudjEuQ29udGVudEFkZHJlc3MSRgoXYWNjZXB0YW5jZV9jb250cmFjdF9yZWYYCCABKAsyJS5lZ29wdWxzZS5jb21tb24udjEuQ29udHJhY3RSZWZlcmVuY2Ui5QIKFUZvdW5kZXJBdXRob3JpdHlQcm9vZhIqCiJhdXRoZW50aWNhdGVkX2ZvdW5kZXJfcHJpbmNpcGFsX2lkGAEgASgJEhUKDWF1dGhvcml0eV9yZWYYAiABKAkSQgoSY29uZmlybWF0aW9uX2NsYXNzGAMgASgOMiYuZWdvcHVsc2UudmVyZGljdC52MS5Db25maXJtYXRpb25DbGFzcxIeChZjb25maXJtYXRpb25fcHJvb2ZfcmVmGAQgASgJEi8KC3ZlcmlmaWVkX2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIvCgt2YWxpZF91bnRpbBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASQwoUYXV0aG9yaXR5X3BvbGljeV9yZWYYByABKAsyJS5lZ29wdWxzZS5jb21tb24udjEuQ29udHJhY3RSZWZlcmVuY2UimwIKDlJpc2tBY2NlcHRhbmNlEhoKEnJpc2tfYWNjZXB0YW5jZV9pZBgBIAEoCRIzCghjYXRlZ29yeRgCIAEoDjIhLmVnb3B1bHNlLnZlcmRpY3QudjEuUmlza0NhdGVnb3J5EhcKD2Rpc2NyZXBhbmN5X2lkcxgDIAMoCRIbChN1bnZlcmlmaWVkX2l0ZW1faWRzGAQgAygJEh0KFXJhdGlvbmFsZV9hcnRpZmFjdF9pZBgFIAEoCRIpCiFjb21wZW5zYXRpbmdfY29udHJvbF9hcnRpZmFjdF9pZHMYBiADKAkSIAoTcmV2aWV3X3RyaWdnZXJfY29kZRgHIAEoCUgAiAEBQhYKFF9yZXZpZXdfdHJpZ2dlcl9jb2RlIqYBCg9SZXdvcmtEaXJlY3RpdmUSFAoMZGlyZWN0aXZlX2lkGAEgASgJEhMKC3JlYXNvbl9jb2RlGAIgASgJEiQKHHJlcXVpcmVkX2NoYW5nZXNfYXJ0aWZhY3RfaWQYAyABKAkSHgoWdGFyZ2V0X2Rpc2NyZXBhbmN5X2lkcxgEIAMoCRIiChp0YXJnZXRfdW52ZXJpZmllZF9pdGVtX2lkcxgFIAMoCSKTAQohRm91bmRlclN1cHBvcnRpbmdNYXRlcmlhbENvdmVyYWdlEjgKDXJpc2tfY2F0ZWdvcnkYASABKA4yIS5lZ29wdWxzZS52ZXJkaWN0LnYxLlJpc2tDYXRlZ29yeRIXCg9kaXNjcmVwYW5jeV9pZHMYAiADKAkSGwoTdW52ZXJpZmllZF9pdGVtX2lkcxgDIAMoCSL3AgoZRm91bmRlclN1cHBvcnRpbmdNYXRlcmlhbBITCgttYXRlcmlhbF9pZBgBIAEoCRIWCg5zY2hlbWFfdmVyc2lvbhgCIAEoBBJACgRyb2xlGAMgASgOMjIuZWdvcHVsc2UudmVyZGljdC52MS5Gb3VuZGVyU3VwcG9ydGluZ01hdGVyaWFsUm9sZRIwCgVzY29wZRgEIAEoCzIhLmVnb3B1bHNlLnZlcmRpY3QudjEuVmVyZGljdFNjb3BlEjUKB2xpbmVhZ2UYBSABKAsyJC5lZ29wdWxzZS5hcnRpZmFjdC52MS5MaW5lYWdlQmluZGluZxIqCiJhdXRoZW50aWNhdGVkX2ZvdW5kZXJfcHJpbmNpcGFsX2lkGAYgASgJEgwKBGJvZHkYByABKAkSSAoIY292ZXJhZ2UYCCABKAsyNi5lZ29wdWxzZS52ZXJkaWN0LnYxLkZvdW5kZXJTdXBwb3J0aW5nTWF0ZXJpYWxDb3ZlcmFnZSLAAgomQ3JlYXRlRm91bmRlclN1cHBvcnRpbmdNYXRlcmlhbENvbW1hbmQSNQoIbWV0YWRhdGEYASABKAsyIy5lZ29wdWxzZS5jb21tb24udjEuQ29tbWFuZE1ldGFkYXRhEhMKC21hdGVyaWFsX2lkGAIgASgJEjAKBXNjb3BlGAMgASgLMiEuZWdvcHVsc2UudmVyZGljdC52MS5WZXJkaWN0U2NvcGUSQAoEcm9sZRgEIAEoDjIyLmVnb3B1bHNlLnZlcmRpY3QudjEuRm91bmRlclN1cHBvcnRpbmdNYXRlcmlhbFJvbGUSDAoEYm9keRgFIAEoCRJICghjb3ZlcmFnZRgGIAEoCzI2LmVnb3B1bHNlLnZlcmRpY3QudjEuRm91bmRlclN1cHBvcnRpbmdNYXRlcmlhbENvdmVyYWdlItICCiBGb3VuZGVyU3VwcG9ydGluZ01hdGVyaWFsUmVjZWlwdBIRCgljb21taXR0ZWQYASABKAgSEAoIcmVwbGF5ZWQYAiABKAgSEwoLbWF0ZXJpYWxfaWQYAyABKAkSEwoLYXJ0aWZhY3RfaWQYBCABKAkSQAoEcm9sZRgFIAEoDjIyLmVnb3B1bHNlLnZlcmRpY3QudjEuRm91bmRlclN1cHBvcnRpbmdNYXRlcmlhbFJvbGUSMAoFc2NvcGUYBiABKAsyIS5lZ29wdWxzZS52ZXJkaWN0LnYxLlZlcmRpY3RTY29wZRI/ChFjYW5vbmljYWxfcGF5bG9hZBgHIAEoCzIkLmVnb3B1bHNlLmFydGlmYWN0LnYxLkNvbnRlbnRBZGRyZXNzEhIKCmNvbW1hbmRfaWQYCCABKAkSFgoOY29ycmVsYXRpb25faWQYCSABKAkivwYKDkZvdW5kZXJWZXJkaWN0EhoKEmZvdW5kZXJfdmVyZGljdF9pZBgBIAEoCRIPCgd2ZXJzaW9uGAIgASgEEj0KCGRlY2lzaW9uGAMgASgOMisuZWdvcHVsc2UudmVyZGljdC52MS5Gb3VuZGVyVmVyZGljdERlY2lzaW9uEjAKBXNjb3BlGAQgASgLMiEuZWdvcHVsc2UudmVyZGljdC52MS5WZXJkaWN0U2NvcGUSWgogb2JzZXJ2ZWRfdmVyaWZpY2F0aW9uX2NvbmNsdXNpb24YBSABKA4yMC5lZ29wdWxzZS52ZXJpZmljYXRpb24udjEuVmVyaWZpY2F0aW9uQ29uY2x1c2lvbhJDCg9hdXRob3JpdHlfcHJvb2YYBiABKAsyKi5lZ29wdWxzZS52ZXJkaWN0LnYxLkZvdW5kZXJBdXRob3JpdHlQcm9vZhI9ChByaXNrX2FjY2VwdGFuY2VzGAcgAygLMiMuZWdvcHVsc2UudmVyZGljdC52MS5SaXNrQWNjZXB0YW5jZRI+ChByZXdvcmtfZGlyZWN0aXZlGAggASgLMiQuZWdvcHVsc2UudmVyZGljdC52MS5SZXdvcmtEaXJlY3RpdmUSEwoLcmVhc29uX2NvZGUYCSABKAkSIgoVcmF0aW9uYWxlX2FydGlmYWN0X2lkGAogASgJSACIAQESLgoKdmFsaWRfZnJvbRgLIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKZXhwaXJlc19hdBgMIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLQoJaXNzdWVkX2F0GA0gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBI/ChFjYW5vbmljYWxfcGF5bG9hZBgOIAEoCzIkLmVnb3B1bHNlLmFydGlmYWN0LnYxLkNvbnRlbnRBZGRyZXNzEioKHXN1cGVyc2VkZXNfZm91bmRlcl92ZXJkaWN0X2lkGA8gASgJSAGIAQFCGAoWX3JhdGlvbmFsZV9hcnRpZmFjdF9pZEIgCh5fc3VwZXJzZWRlc19mb3VuZGVyX3ZlcmRpY3RfaWQi8AIKE0ZvdW5kZXJWZXJkaWN0U3RhdGUSGgoSZm91bmRlcl92ZXJkaWN0X2lkGAEgASgJEhAKCHJldmlzaW9uGAIgASgEEjsKBXN0YXRlGAMgASgOMiwuZWdvcHVsc2UudmVyZGljdC52MS5Gb3VuZGVyVmVyZGljdFN0YXRlS2luZBIjChZjb25zdW1wdGlvbl9yZWNlaXB0X2lkGAQgASgJSACIAQESJQoYc3VwZXJzZWRlZF9ieV92ZXJkaWN0X2lkGAUgASgJSAGIAQESIQoUdGVybWluYWxfcmVhc29uX2NvZGUYBiABKAlIAogBARIuCgp1cGRhdGVkX2F0GAcgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcEIZChdfY29uc3VtcHRpb25fcmVjZWlwdF9pZEIbChlfc3VwZXJzZWRlZF9ieV92ZXJkaWN0X2lkQhcKFV90ZXJtaW5hbF9yZWFzb25fY29kZSKQAgoZVmVyZGljdENvbnN1bXB0aW9uUmVjZWlwdBIeChZjb25zdW1wdGlvbl9yZWNlaXB0X2lkGAEgASgJEhoKEmZvdW5kZXJfdmVyZGljdF9pZBgCIAEoCRIPCgd0YXNrX2lkGAMgASgJEh4KFmNvbnN1bWVkX3Rhc2tfcmV2aXNpb24YBCABKAQSHwoXcmVzdWx0aW5nX3Rhc2tfcmV2aXNpb24YBSABKAQSFQoNdGFza19ldmVudF9pZBgGIAEoCRIdChVyZXN1bHRpbmdfdGFza19zdGF0dXMYByABKAkSLwoLY29uc3VtZWRfYXQYCCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIt0FChpJc3N1ZUZvdW5kZXJWZXJkaWN0Q29tbWFuZBI1CghtZXRhZGF0YRgBIAEoCzIjLmVnb3B1bHNlLmNvbW1vbi52MS5Db21tYW5kTWV0YWRhdGESMAoFc2NvcGUYAiABKAsyIS5lZ29wdWxzZS52ZXJkaWN0LnYxLlZlcmRpY3RTY29wZRI9CghkZWNpc2lvbhgDIAEoDjIrLmVnb3B1bHNlLnZlcmRpY3QudjEuRm91bmRlclZlcmRpY3REZWNpc2lvbhJaCiBvYnNlcnZlZF92ZXJpZmljYXRpb25fY29uY2x1c2lvbhgEIAEoDjIwLmVnb3B1bHNlLnZlcmlmaWNhdGlvbi52MS5WZXJpZmljYXRpb25Db25jbHVzaW9uEj0KEHJpc2tfYWNjZXB0YW5jZXMYBSADKAsyIy5lZ29wdWxzZS52ZXJkaWN0LnYxLlJpc2tBY2NlcHRhbmNlEj4KEHJld29ya19kaXJlY3RpdmUYBiABKAsyJC5lZ29wdWxzZS52ZXJkaWN0LnYxLlJld29ya0RpcmVjdGl2ZRITCgtyZWFzb25fY29kZRgHIAEoCRIiChVyYXRpb25hbGVfYXJ0aWZhY3RfaWQYCCABKAlIAIgBARJLChtyZXF1aXJlZF9jb25maXJtYXRpb25fY2xhc3MYCSABKA4yJi5lZ29wdWxzZS52ZXJkaWN0LnYxLkNvbmZpcm1hdGlvbkNsYXNzEh4KFmNvbmZpcm1hdGlvbl9wcm9vZl9yZWYYCiABKAkSLgoKZXhwaXJlc19hdBgLIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASKgodc3VwZXJzZWRlc19mb3VuZGVyX3ZlcmRpY3RfaWQYDCABKAlIAYgBAUIYChZfcmF0aW9uYWxlX2FydGlmYWN0X2lkQiAKHl9zdXBlcnNlZGVzX2ZvdW5kZXJfdmVyZGljdF9pZCKqAgocQ29uc3VtZUZvdW5kZXJWZXJkaWN0Q29tbWFuZBI1CghtZXRhZGF0YRgBIAEoCzIjLmVnb3B1bHNlLmNvbW1vbi52MS5Db21tYW5kTWV0YWRhdGESGgoSZm91bmRlcl92ZXJkaWN0X2lkGAIgASgJEh8KF2V4cGVjdGVkX3N0YXRlX3JldmlzaW9uGAMgASgEEhUKDXRhc2tfZXZlbnRfaWQYBCABKAkSHgoWY29uc3VtZWRfdGFza19yZXZpc2lvbhgFIAEoBBIfChdyZXN1bHRpbmdfdGFza19yZXZpc2lvbhgGIAEoBBIdChVyZXN1bHRpbmdfdGFza19zdGF0dXMYByABKAkSHwoXdGFza19jb21taXRfcmVjZWlwdF9yZWYYCCABKAkixgEKG1Jldm9rZUZvdW5kZXJWZXJkaWN0Q29tbWFuZBI1CghtZXRhZGF0YRgBIAEoCzIjLmVnb3B1bHNlLmNvbW1vbi52MS5Db21tYW5kTWV0YWRhdGESGgoSZm91bmRlcl92ZXJkaWN0X2lkGAIgASgJEh8KF2V4cGVjdGVkX3N0YXRlX3JldmlzaW9uGAMgASgEEhMKC3JlYXNvbl9jb2RlGAQgASgJEh4KFmNvbmZpcm1hdGlvbl9wcm9vZl9yZWYYBSABKAkirgEKG0V4cGlyZUZvdW5kZXJWZXJkaWN0Q29tbWFuZBI1CghtZXRhZGF0YRgBIAEoCzIjLmVnb3B1bHNlLmNvbW1vbi52MS5Db21tYW5kTWV0YWRhdGESGgoSZm91bmRlcl92ZXJkaWN0X2lkGAIgASgJEh8KF2V4cGVjdGVkX3N0YXRlX3JldmlzaW9uGAMgASgEEhsKE3BvbGljeV9kZWNpc2lvbl9yZWYYBCABKAki6wIKDlZlcmRpY3RDb21tYW5kElAKFWlzc3VlX2ZvdW5kZXJfdmVyZGljdBgBIAEoCzIvLmVnb3B1bHNlLnZlcmRpY3QudjEuSXNzdWVGb3VuZGVyVmVyZGljdENvbW1hbmRIABJUChdjb25zdW1lX2ZvdW5kZXJfdmVyZGljdBgCIAEoCzIxLmVnb3B1bHNlLnZlcmRpY3QudjEuQ29uc3VtZUZvdW5kZXJWZXJkaWN0Q29tbWFuZEgAElIKFnJldm9rZV9mb3VuZGVyX3ZlcmRpY3QYAyABKAsyMC5lZ29wdWxzZS52ZXJkaWN0LnYxLlJldm9rZUZvdW5kZXJWZXJkaWN0Q29tbWFuZEgAElIKFmV4cGlyZV9mb3VuZGVyX3ZlcmRpY3QYBCABKAsyMC5lZ29wdWxzZS52ZXJkaWN0LnYxLkV4cGlyZUZvdW5kZXJWZXJkaWN0Q29tbWFuZEgAQgkKB2NvbW1hbmQinAIKDFZlcmRpY3RFdmVudBIQCghldmVudF9pZBgBIAEoCRIzCgRraW5kGAIgASgOMiUuZWdvcHVsc2UudmVyZGljdC52MS5WZXJkaWN0RXZlbnRLaW5kEhoKEmZvdW5kZXJfdmVyZGljdF9pZBgDIAEoCRIgChhyZXN1bHRpbmdfc3RhdGVfcmV2aXNpb24YBCABKAQSIgoaYXV0aGVudGljYXRlZF9wcmluY2lwYWxfaWQYBSABKAkSEgoKY29tbWFuZF9pZBgGIAEoCRIdChVldmlkZW5jZV9hcnRpZmFjdF9pZHMYByADKAkSMAoMY29tbWl0dGVkX2F0GAggASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCKkAwoUVmVyZGljdENvbW1hbmRSZXN1bHQSEQoJY29tbWl0dGVkGAEgASgIEhAKCHJlcGxheWVkGAIgASgIEjQKB3ZlcmRpY3QYAyABKAsyIy5lZ29wdWxzZS52ZXJkaWN0LnYxLkZvdW5kZXJWZXJkaWN0EjcKBXN0YXRlGAQgASgLMiguZWdvcHVsc2UudmVyZGljdC52MS5Gb3VuZGVyVmVyZGljdFN0YXRlEksKE2NvbnN1bXB0aW9uX3JlY2VpcHQYBSABKAsyLi5lZ29wdWxzZS52ZXJkaWN0LnYxLlZlcmRpY3RDb25zdW1wdGlvblJlY2VpcHQSMAoFZXZlbnQYBiABKAsyIS5lZ29wdWxzZS52ZXJkaWN0LnYxLlZlcmRpY3RFdmVudBI5CgplcnJvcl9jb2RlGAcgASgOMiUuZWdvcHVsc2UudmVyZGljdC52MS5WZXJkaWN0RXJyb3JDb2RlEiMKFnNhZmVfZXJyb3JfZmluZ2VycHJpbnQYCCABKAlIAIgBAUIZChdfc2FmZV9lcnJvcl9maW5nZXJwcmludCqxAQoWRm91bmRlclZlcmRpY3REZWNpc2lvbhIoCiRGT1VOREVSX1ZFUkRJQ1RfREVDSVNJT05fVU5TUEVDSUZJRUQQABIjCh9GT1VOREVSX1ZFUkRJQ1RfREVDSVNJT05fQUNDRVBUEAESIwofRk9VTkRFUl9WRVJESUNUX0RFQ0lTSU9OX1JFV09SSxACEiMKH0ZPVU5ERVJfVkVSRElDVF9ERUNJU0lPTl9SRUpFQ1QQAyqQAgoXRm91bmRlclZlcmRpY3RTdGF0ZUtpbmQSKgomRk9VTkRFUl9WRVJESUNUX1NUQVRFX0tJTkRfVU5TUEVDSUZJRUQQABIlCiFGT1VOREVSX1ZFUkRJQ1RfU1RBVEVfS0lORF9JU1NVRUQQARInCiNGT1VOREVSX1ZFUkRJQ1RfU1RBVEVfS0lORF9DT05TVU1FRBACEiYKIkZPVU5ERVJfVkVSRElDVF9TVEFURV9LSU5EX1JFVk9LRUQQAxImCiJGT1VOREVSX1ZFUkRJQ1RfU1RBVEVfS0lORF9FWFBJUkVEEAQSKQolRk9VTkRFUl9WRVJESUNUX1NUQVRFX0tJTkRfU1VQRVJTRURFRBAFKokBChFDb25maXJtYXRpb25DbGFzcxIiCh5DT05GSVJNQVRJT05fQ0xBU1NfVU5TUEVDSUZJRUQQABIfChtDT05GSVJNQVRJT05fQ0xBU1NfRVhQTElDSVQQARIvCitDT05GSVJNQVRJT05fQ0xBU1NfRUxFVkFURURfUklTS19BQ0NFUFRBTkNFEAIqngEKDFJpc2tDYXRlZ29yeRIdChlSSVNLX0NBVEVHT1JZX1VOU1BFQ0lGSUVEEAASIgoeUklTS19DQVRFR09SWV9RVUFMSVRZX1JFU0lEVUFMEAESIwofUklTS19DQVRFR09SWV9CVVNJTkVTU19SRVNJRFVBTBACEiYKIlJJU0tfQ0FURUdPUllfT1BFUkFUSU9OQUxfUkVTSURVQUwQAyr/AQodRm91bmRlclN1cHBvcnRpbmdNYXRlcmlhbFJvbGUSMAosRk9VTkRFUl9TVVBQT1JUSU5HX01BVEVSSUFMX1JPTEVfVU5TUEVDSUZJRUQQABI8CjhGT1VOREVSX1NVUFBPUlRJTkdfTUFURVJJQUxfUk9MRV9SRVdPUktfUkVRVUlSRURfQ0hBTkdFUxABEjMKL0ZPVU5ERVJfU1VQUE9SVElOR19NQVRFUklBTF9ST0xFX1JJU0tfUkFUSU9OQUxFEAISOQo1Rk9VTkRFUl9TVVBQT1JUSU5HX01BVEVSSUFMX1JPTEVfQ09NUEVOU0FUSU5HX0NPTlRST0wQAyrZAQoQVmVyZGljdEV2ZW50S2luZBIiCh5WRVJESUNUX0VWRU5UX0tJTkRfVU5TUEVDSUZJRUQQABIdChlWRVJESUNUX0VWRU5UX0tJTkRfSVNTVUVEEAESHwobVkVSRElDVF9FVkVOVF9LSU5EX0NPTlNVTUVEEAISHgoaVkVSRElDVF9FVkVOVF9LSU5EX1JFVk9LRUQQAxIeChpWRVJESUNUX0VWRU5UX0tJTkRfRVhQSVJFRBAEEiEKHVZFUkRJQ1RfRVZFTlRfS0lORF9TVVBFUlNFREVEEAUqigcKEFZlcmRpY3RFcnJvckNvZGUSIgoeVkVSRElDVF9FUlJPUl9DT0RFX1VOU1BFQ0lGSUVEEAASJwojVkVSRElDVF9FUlJPUl9DT0RFX0lOVkFMSURfQVJHVU1FTlQQARImCiJWRVJESUNUX0VSUk9SX0NPREVfVU5BVVRIRU5USUNBVEVEEAISKAokVkVSRElDVF9FUlJPUl9DT0RFX1BFUk1JU1NJT05fREVOSUVEEAMSIAocVkVSRElDVF9FUlJPUl9DT0RFX05PVF9GT1VORBAEEigKJFZFUkRJQ1RfRVJST1JfQ09ERV9SRVZJU0lPTl9DT05GTElDVBAFEisKJ1ZFUkRJQ1RfRVJST1JfQ09ERV9JREVNUE9URU5DWV9DT05GTElDVBAGEi8KK1ZFUkRJQ1RfRVJST1JfQ09ERV9UQVNLX05PVF9WRVJESUNUX1BFTkRJTkcQBxIiCh5WRVJESUNUX0VSUk9SX0NPREVfU0NPUEVfU1RBTEUQCBIsCihWRVJESUNUX0VSUk9SX0NPREVfVkVSSUZJQ0FUSU9OX01JU01BVENIEAkSLAooVkVSRElDVF9FUlJPUl9DT0RFX0NPTkZJUk1BVElPTl9SRVFVSVJFRBAKEi8KK1ZFUkRJQ1RfRVJST1JfQ09ERV9SSVNLX0FDQ0VQVEFOQ0VfUkVRVUlSRUQQCxIvCitWRVJESUNUX0VSUk9SX0NPREVfUklTS19DT1ZFUkFHRV9JTkNPTVBMRVRFEAwSKwonVkVSRElDVF9FUlJPUl9DT0RFX05PTl9PVkVSUklEQUJMRV9HQVRFEA0SMAosVkVSRElDVF9FUlJPUl9DT0RFX1JFV09SS19ESVJFQ1RJVkVfUkVRVUlSRUQQDhIlCiFWRVJESUNUX0VSUk9SX0NPREVfQUxSRUFEWV9BQ1RJVkUQDxInCiNWRVJESUNUX0VSUk9SX0NPREVfQUxSRUFEWV9DT05TVU1FRBAQEh4KGlZFUkRJQ1RfRVJST1JfQ09ERV9FWFBJUkVEEBESHgoaVkVSRElDVF9FUlJPUl9DT0RFX1JFVk9LRUQQEhIyCi5WRVJESUNUX0VSUk9SX0NPREVfVEFTS19DT01NSVRfUkVDRUlQVF9JTlZBTElEEBMSKAokVkVSRElDVF9FUlJPUl9DT0RFX0lOVEVHUklUWV9GQUlMVVJFEBQyewoeRm91bmRlclZlcmRpY3RBdXRob3JpdHlTZXJ2aWNlElkKB0V4ZWN1dGUSIy5lZ29wdWxzZS52ZXJkaWN0LnYxLlZlcmRpY3RDb21tYW5kGikuZWdvcHVsc2UudmVyZGljdC52MS5WZXJkaWN0Q29tbWFuZFJlc3VsdGIGcHJvdG8z", [file_egopulse_artifact_v1_artifact, file_egopulse_common_v1_common, file_egopulse_verification_v1_verification, file_google_protobuf_timestamp]);
 
 /**
  * @generated from message egopulse.verdict.v1.VerdictScope
@@ -204,6 +204,192 @@ export const ReworkDirectiveSchema: GenMessage<ReworkDirective> = /*@__PURE__*/
   messageDesc(file_egopulse_verdict_v1_verdict, 3);
 
 /**
+ * @generated from message egopulse.verdict.v1.FounderSupportingMaterialCoverage
+ */
+export type FounderSupportingMaterialCoverage = Message<"egopulse.verdict.v1.FounderSupportingMaterialCoverage"> & {
+  /**
+   * @generated from field: egopulse.verdict.v1.RiskCategory risk_category = 1;
+   */
+  riskCategory: RiskCategory;
+
+  /**
+   * @generated from field: repeated string discrepancy_ids = 2;
+   */
+  discrepancyIds: string[];
+
+  /**
+   * @generated from field: repeated string unverified_item_ids = 3;
+   */
+  unverifiedItemIds: string[];
+};
+
+/**
+ * Describes the message egopulse.verdict.v1.FounderSupportingMaterialCoverage.
+ * Use `create(FounderSupportingMaterialCoverageSchema)` to create a new message.
+ */
+export const FounderSupportingMaterialCoverageSchema: GenMessage<FounderSupportingMaterialCoverage> = /*@__PURE__*/
+  messageDesc(file_egopulse_verdict_v1_verdict, 4);
+
+/**
+ * Canonical bytes sealed by the daemon-owned governed collector. Producer,
+ * workspace, lineage and Artifact contract fields remain outside client input
+ * and are bound by the Artifact descriptor.
+ *
+ * @generated from message egopulse.verdict.v1.FounderSupportingMaterial
+ */
+export type FounderSupportingMaterial = Message<"egopulse.verdict.v1.FounderSupportingMaterial"> & {
+  /**
+   * @generated from field: string material_id = 1;
+   */
+  materialId: string;
+
+  /**
+   * @generated from field: uint64 schema_version = 2;
+   */
+  schemaVersion: bigint;
+
+  /**
+   * @generated from field: egopulse.verdict.v1.FounderSupportingMaterialRole role = 3;
+   */
+  role: FounderSupportingMaterialRole;
+
+  /**
+   * @generated from field: egopulse.verdict.v1.VerdictScope scope = 4;
+   */
+  scope?: VerdictScope | undefined;
+
+  /**
+   * @generated from field: egopulse.artifact.v1.LineageBinding lineage = 5;
+   */
+  lineage?: LineageBinding | undefined;
+
+  /**
+   * @generated from field: string authenticated_founder_principal_id = 6;
+   */
+  authenticatedFounderPrincipalId: string;
+
+  /**
+   * @generated from field: string body = 7;
+   */
+  body: string;
+
+  /**
+   * @generated from field: egopulse.verdict.v1.FounderSupportingMaterialCoverage coverage = 8;
+   */
+  coverage?: FounderSupportingMaterialCoverage | undefined;
+};
+
+/**
+ * Describes the message egopulse.verdict.v1.FounderSupportingMaterial.
+ * Use `create(FounderSupportingMaterialSchema)` to create a new message.
+ */
+export const FounderSupportingMaterialSchema: GenMessage<FounderSupportingMaterial> = /*@__PURE__*/
+  messageDesc(file_egopulse_verdict_v1_verdict, 5);
+
+/**
+ * material_id is the stable identity frozen on the first attempt. All other
+ * fields are request content: changing any of them under that identity is an
+ * idempotency conflict, including scope, role, author, coverage or body.
+ *
+ * @generated from message egopulse.verdict.v1.CreateFounderSupportingMaterialCommand
+ */
+export type CreateFounderSupportingMaterialCommand = Message<"egopulse.verdict.v1.CreateFounderSupportingMaterialCommand"> & {
+  /**
+   * @generated from field: egopulse.common.v1.CommandMetadata metadata = 1;
+   */
+  metadata?: CommandMetadata | undefined;
+
+  /**
+   * @generated from field: string material_id = 2;
+   */
+  materialId: string;
+
+  /**
+   * @generated from field: egopulse.verdict.v1.VerdictScope scope = 3;
+   */
+  scope?: VerdictScope | undefined;
+
+  /**
+   * @generated from field: egopulse.verdict.v1.FounderSupportingMaterialRole role = 4;
+   */
+  role: FounderSupportingMaterialRole;
+
+  /**
+   * @generated from field: string body = 5;
+   */
+  body: string;
+
+  /**
+   * @generated from field: egopulse.verdict.v1.FounderSupportingMaterialCoverage coverage = 6;
+   */
+  coverage?: FounderSupportingMaterialCoverage | undefined;
+};
+
+/**
+ * Describes the message egopulse.verdict.v1.CreateFounderSupportingMaterialCommand.
+ * Use `create(CreateFounderSupportingMaterialCommandSchema)` to create a new message.
+ */
+export const CreateFounderSupportingMaterialCommandSchema: GenMessage<CreateFounderSupportingMaterialCommand> = /*@__PURE__*/
+  messageDesc(file_egopulse_verdict_v1_verdict, 6);
+
+/**
+ * @generated from message egopulse.verdict.v1.FounderSupportingMaterialReceipt
+ */
+export type FounderSupportingMaterialReceipt = Message<"egopulse.verdict.v1.FounderSupportingMaterialReceipt"> & {
+  /**
+   * @generated from field: bool committed = 1;
+   */
+  committed: boolean;
+
+  /**
+   * @generated from field: bool replayed = 2;
+   */
+  replayed: boolean;
+
+  /**
+   * @generated from field: string material_id = 3;
+   */
+  materialId: string;
+
+  /**
+   * @generated from field: string artifact_id = 4;
+   */
+  artifactId: string;
+
+  /**
+   * @generated from field: egopulse.verdict.v1.FounderSupportingMaterialRole role = 5;
+   */
+  role: FounderSupportingMaterialRole;
+
+  /**
+   * @generated from field: egopulse.verdict.v1.VerdictScope scope = 6;
+   */
+  scope?: VerdictScope | undefined;
+
+  /**
+   * @generated from field: egopulse.artifact.v1.ContentAddress canonical_payload = 7;
+   */
+  canonicalPayload?: ContentAddress | undefined;
+
+  /**
+   * @generated from field: string command_id = 8;
+   */
+  commandId: string;
+
+  /**
+   * @generated from field: string correlation_id = 9;
+   */
+  correlationId: string;
+};
+
+/**
+ * Describes the message egopulse.verdict.v1.FounderSupportingMaterialReceipt.
+ * Use `create(FounderSupportingMaterialReceiptSchema)` to create a new message.
+ */
+export const FounderSupportingMaterialReceiptSchema: GenMessage<FounderSupportingMaterialReceipt> = /*@__PURE__*/
+  messageDesc(file_egopulse_verdict_v1_verdict, 7);
+
+/**
  * @generated from message egopulse.verdict.v1.FounderVerdict
  */
 export type FounderVerdict = Message<"egopulse.verdict.v1.FounderVerdict"> & {
@@ -288,7 +474,7 @@ export type FounderVerdict = Message<"egopulse.verdict.v1.FounderVerdict"> & {
  * Use `create(FounderVerdictSchema)` to create a new message.
  */
 export const FounderVerdictSchema: GenMessage<FounderVerdict> = /*@__PURE__*/
-  messageDesc(file_egopulse_verdict_v1_verdict, 4);
+  messageDesc(file_egopulse_verdict_v1_verdict, 8);
 
 /**
  * @generated from message egopulse.verdict.v1.FounderVerdictState
@@ -335,7 +521,7 @@ export type FounderVerdictState = Message<"egopulse.verdict.v1.FounderVerdictSta
  * Use `create(FounderVerdictStateSchema)` to create a new message.
  */
 export const FounderVerdictStateSchema: GenMessage<FounderVerdictState> = /*@__PURE__*/
-  messageDesc(file_egopulse_verdict_v1_verdict, 5);
+  messageDesc(file_egopulse_verdict_v1_verdict, 9);
 
 /**
  * @generated from message egopulse.verdict.v1.VerdictConsumptionReceipt
@@ -387,7 +573,7 @@ export type VerdictConsumptionReceipt = Message<"egopulse.verdict.v1.VerdictCons
  * Use `create(VerdictConsumptionReceiptSchema)` to create a new message.
  */
 export const VerdictConsumptionReceiptSchema: GenMessage<VerdictConsumptionReceipt> = /*@__PURE__*/
-  messageDesc(file_egopulse_verdict_v1_verdict, 6);
+  messageDesc(file_egopulse_verdict_v1_verdict, 10);
 
 /**
  * @generated from message egopulse.verdict.v1.IssueFounderVerdictCommand
@@ -459,7 +645,7 @@ export type IssueFounderVerdictCommand = Message<"egopulse.verdict.v1.IssueFound
  * Use `create(IssueFounderVerdictCommandSchema)` to create a new message.
  */
 export const IssueFounderVerdictCommandSchema: GenMessage<IssueFounderVerdictCommand> = /*@__PURE__*/
-  messageDesc(file_egopulse_verdict_v1_verdict, 7);
+  messageDesc(file_egopulse_verdict_v1_verdict, 11);
 
 /**
  * @generated from message egopulse.verdict.v1.ConsumeFounderVerdictCommand
@@ -511,7 +697,7 @@ export type ConsumeFounderVerdictCommand = Message<"egopulse.verdict.v1.ConsumeF
  * Use `create(ConsumeFounderVerdictCommandSchema)` to create a new message.
  */
 export const ConsumeFounderVerdictCommandSchema: GenMessage<ConsumeFounderVerdictCommand> = /*@__PURE__*/
-  messageDesc(file_egopulse_verdict_v1_verdict, 8);
+  messageDesc(file_egopulse_verdict_v1_verdict, 12);
 
 /**
  * @generated from message egopulse.verdict.v1.RevokeFounderVerdictCommand
@@ -548,7 +734,7 @@ export type RevokeFounderVerdictCommand = Message<"egopulse.verdict.v1.RevokeFou
  * Use `create(RevokeFounderVerdictCommandSchema)` to create a new message.
  */
 export const RevokeFounderVerdictCommandSchema: GenMessage<RevokeFounderVerdictCommand> = /*@__PURE__*/
-  messageDesc(file_egopulse_verdict_v1_verdict, 9);
+  messageDesc(file_egopulse_verdict_v1_verdict, 13);
 
 /**
  * @generated from message egopulse.verdict.v1.ExpireFounderVerdictCommand
@@ -580,7 +766,7 @@ export type ExpireFounderVerdictCommand = Message<"egopulse.verdict.v1.ExpireFou
  * Use `create(ExpireFounderVerdictCommandSchema)` to create a new message.
  */
 export const ExpireFounderVerdictCommandSchema: GenMessage<ExpireFounderVerdictCommand> = /*@__PURE__*/
-  messageDesc(file_egopulse_verdict_v1_verdict, 10);
+  messageDesc(file_egopulse_verdict_v1_verdict, 14);
 
 /**
  * @generated from message egopulse.verdict.v1.VerdictCommand
@@ -621,7 +807,7 @@ export type VerdictCommand = Message<"egopulse.verdict.v1.VerdictCommand"> & {
  * Use `create(VerdictCommandSchema)` to create a new message.
  */
 export const VerdictCommandSchema: GenMessage<VerdictCommand> = /*@__PURE__*/
-  messageDesc(file_egopulse_verdict_v1_verdict, 11);
+  messageDesc(file_egopulse_verdict_v1_verdict, 15);
 
 /**
  * @generated from message egopulse.verdict.v1.VerdictEvent
@@ -673,7 +859,7 @@ export type VerdictEvent = Message<"egopulse.verdict.v1.VerdictEvent"> & {
  * Use `create(VerdictEventSchema)` to create a new message.
  */
 export const VerdictEventSchema: GenMessage<VerdictEvent> = /*@__PURE__*/
-  messageDesc(file_egopulse_verdict_v1_verdict, 12);
+  messageDesc(file_egopulse_verdict_v1_verdict, 16);
 
 /**
  * @generated from message egopulse.verdict.v1.VerdictCommandResult
@@ -725,7 +911,7 @@ export type VerdictCommandResult = Message<"egopulse.verdict.v1.VerdictCommandRe
  * Use `create(VerdictCommandResultSchema)` to create a new message.
  */
 export const VerdictCommandResultSchema: GenMessage<VerdictCommandResult> = /*@__PURE__*/
-  messageDesc(file_egopulse_verdict_v1_verdict, 13);
+  messageDesc(file_egopulse_verdict_v1_verdict, 17);
 
 /**
  * @generated from enum egopulse.verdict.v1.FounderVerdictDecision
@@ -857,6 +1043,40 @@ export const RiskCategorySchema: GenEnum<RiskCategory> = /*@__PURE__*/
   enumDesc(file_egopulse_verdict_v1_verdict, 3);
 
 /**
+ * Founder-authored material roles are closed so a client cannot smuggle an
+ * arbitrary Artifact through the supporting-material composition port.
+ *
+ * @generated from enum egopulse.verdict.v1.FounderSupportingMaterialRole
+ */
+export enum FounderSupportingMaterialRole {
+  /**
+   * @generated from enum value: FOUNDER_SUPPORTING_MATERIAL_ROLE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: FOUNDER_SUPPORTING_MATERIAL_ROLE_REWORK_REQUIRED_CHANGES = 1;
+   */
+  REWORK_REQUIRED_CHANGES = 1,
+
+  /**
+   * @generated from enum value: FOUNDER_SUPPORTING_MATERIAL_ROLE_RISK_RATIONALE = 2;
+   */
+  RISK_RATIONALE = 2,
+
+  /**
+   * @generated from enum value: FOUNDER_SUPPORTING_MATERIAL_ROLE_COMPENSATING_CONTROL = 3;
+   */
+  COMPENSATING_CONTROL = 3,
+}
+
+/**
+ * Describes the enum egopulse.verdict.v1.FounderSupportingMaterialRole.
+ */
+export const FounderSupportingMaterialRoleSchema: GenEnum<FounderSupportingMaterialRole> = /*@__PURE__*/
+  enumDesc(file_egopulse_verdict_v1_verdict, 4);
+
+/**
  * @generated from enum egopulse.verdict.v1.VerdictEventKind
  */
 export enum VerdictEventKind {
@@ -895,7 +1115,7 @@ export enum VerdictEventKind {
  * Describes the enum egopulse.verdict.v1.VerdictEventKind.
  */
 export const VerdictEventKindSchema: GenEnum<VerdictEventKind> = /*@__PURE__*/
-  enumDesc(file_egopulse_verdict_v1_verdict, 4);
+  enumDesc(file_egopulse_verdict_v1_verdict, 5);
 
 /**
  * @generated from enum egopulse.verdict.v1.VerdictErrorCode
@@ -1011,7 +1231,7 @@ export enum VerdictErrorCode {
  * Describes the enum egopulse.verdict.v1.VerdictErrorCode.
  */
 export const VerdictErrorCodeSchema: GenEnum<VerdictErrorCode> = /*@__PURE__*/
-  enumDesc(file_egopulse_verdict_v1_verdict, 5);
+  enumDesc(file_egopulse_verdict_v1_verdict, 6);
 
 /**
  * @generated from service egopulse.verdict.v1.FounderVerdictAuthorityService

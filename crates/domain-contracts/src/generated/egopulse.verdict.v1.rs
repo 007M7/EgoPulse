@@ -77,6 +77,78 @@ pub struct ReworkDirective {
         ::prost::alloc::string::String,
     >,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FounderSupportingMaterialCoverage {
+    #[prost(enumeration = "RiskCategory", tag = "1")]
+    pub risk_category: i32,
+    #[prost(string, repeated, tag = "2")]
+    pub discrepancy_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "3")]
+    pub unverified_item_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Canonical bytes sealed by the daemon-owned governed collector. Producer,
+/// workspace, lineage and Artifact contract fields remain outside client input
+/// and are bound by the Artifact descriptor.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FounderSupportingMaterial {
+    #[prost(string, tag = "1")]
+    pub material_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub schema_version: u64,
+    #[prost(enumeration = "FounderSupportingMaterialRole", tag = "3")]
+    pub role: i32,
+    #[prost(message, optional, tag = "4")]
+    pub scope: ::core::option::Option<VerdictScope>,
+    #[prost(message, optional, tag = "5")]
+    pub lineage: ::core::option::Option<super::super::artifact::v1::LineageBinding>,
+    #[prost(string, tag = "6")]
+    pub authenticated_founder_principal_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub body: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "8")]
+    pub coverage: ::core::option::Option<FounderSupportingMaterialCoverage>,
+}
+/// material_id is the stable identity frozen on the first attempt. All other
+/// fields are request content: changing any of them under that identity is an
+/// idempotency conflict, including scope, role, author, coverage or body.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateFounderSupportingMaterialCommand {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<super::super::common::v1::CommandMetadata>,
+    #[prost(string, tag = "2")]
+    pub material_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub scope: ::core::option::Option<VerdictScope>,
+    #[prost(enumeration = "FounderSupportingMaterialRole", tag = "4")]
+    pub role: i32,
+    #[prost(string, tag = "5")]
+    pub body: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub coverage: ::core::option::Option<FounderSupportingMaterialCoverage>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FounderSupportingMaterialReceipt {
+    #[prost(bool, tag = "1")]
+    pub committed: bool,
+    #[prost(bool, tag = "2")]
+    pub replayed: bool,
+    #[prost(string, tag = "3")]
+    pub material_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub artifact_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "FounderSupportingMaterialRole", tag = "5")]
+    pub role: i32,
+    #[prost(message, optional, tag = "6")]
+    pub scope: ::core::option::Option<VerdictScope>,
+    #[prost(message, optional, tag = "7")]
+    pub canonical_payload: ::core::option::Option<
+        super::super::artifact::v1::ContentAddress,
+    >,
+    #[prost(string, tag = "8")]
+    pub command_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub correlation_id: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FounderVerdict {
     #[prost(string, tag = "1")]
@@ -414,6 +486,50 @@ impl RiskCategory {
             "RISK_CATEGORY_QUALITY_RESIDUAL" => Some(Self::QualityResidual),
             "RISK_CATEGORY_BUSINESS_RESIDUAL" => Some(Self::BusinessResidual),
             "RISK_CATEGORY_OPERATIONAL_RESIDUAL" => Some(Self::OperationalResidual),
+            _ => None,
+        }
+    }
+}
+/// Founder-authored material roles are closed so a client cannot smuggle an
+/// arbitrary Artifact through the supporting-material composition port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FounderSupportingMaterialRole {
+    Unspecified = 0,
+    ReworkRequiredChanges = 1,
+    RiskRationale = 2,
+    CompensatingControl = 3,
+}
+impl FounderSupportingMaterialRole {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FOUNDER_SUPPORTING_MATERIAL_ROLE_UNSPECIFIED",
+            Self::ReworkRequiredChanges => {
+                "FOUNDER_SUPPORTING_MATERIAL_ROLE_REWORK_REQUIRED_CHANGES"
+            }
+            Self::RiskRationale => "FOUNDER_SUPPORTING_MATERIAL_ROLE_RISK_RATIONALE",
+            Self::CompensatingControl => {
+                "FOUNDER_SUPPORTING_MATERIAL_ROLE_COMPENSATING_CONTROL"
+            }
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FOUNDER_SUPPORTING_MATERIAL_ROLE_UNSPECIFIED" => Some(Self::Unspecified),
+            "FOUNDER_SUPPORTING_MATERIAL_ROLE_REWORK_REQUIRED_CHANGES" => {
+                Some(Self::ReworkRequiredChanges)
+            }
+            "FOUNDER_SUPPORTING_MATERIAL_ROLE_RISK_RATIONALE" => {
+                Some(Self::RiskRationale)
+            }
+            "FOUNDER_SUPPORTING_MATERIAL_ROLE_COMPENSATING_CONTROL" => {
+                Some(Self::CompensatingControl)
+            }
             _ => None,
         }
     }

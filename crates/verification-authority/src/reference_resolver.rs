@@ -1,7 +1,7 @@
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{
-        ArtifactDescriptor, ArtifactSet, ArtifactSetStatus, ArtifactStatus, Claim, ClaimStatus,
-        ContentAddress, Evidence, EvidenceStatus, IntegrityStatus,
+        ArtifactDescriptor, ArtifactSemanticClass, ArtifactSet, ArtifactSetStatus, ArtifactStatus,
+        Claim, ClaimStatus, ContentAddress, Evidence, EvidenceStatus, IntegrityStatus,
     },
     verification::v1::{CheckerProfile, VerificationBinding, VerificationRequest},
 };
@@ -56,6 +56,44 @@ pub enum ArtifactReferenceSourceError {
 pub enum ReferenceResolverConfigurationError {
     #[error("verification criterion policy set is empty or contains duplicate IDs")]
     InvalidCriteria,
+    #[error("checker output collector identity is empty")]
+    InvalidCheckerOutputCollector,
+}
+
+/// Roles are supplied by the Authority field being validated, not by the
+/// artifact producer. Evidence remains restricted to the frozen input set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckerOutputRole {
+    Detail,
+    RawOutput,
+    ToolReceipt,
+    ModelCallReceipt,
+    CostReceipt,
+}
+
+#[derive(Clone, Debug)]
+pub struct CheckerResultArtifactReference {
+    pub artifact_id: String,
+    pub role: CheckerOutputRole,
+    pub checker_profile_id: Option<String>,
+}
+
+pub struct CheckerResultReferenceContext<'a> {
+    pub binding: &'a VerificationBinding,
+    pub verification_request_id: &'a str,
+    pub verification_run_id: &'a str,
+    /// Authority-owned, attested profiles read for the stored criterion results.
+    pub checker_profiles: &'a [CheckerProfile],
+}
+
+/// The framed execution identity binds post-execution artifacts to exactly
+/// one request, run and attested profile without path/ID delimiter ambiguity.
+#[must_use]
+pub fn checker_output_execution_ref(request_id: &str, run_id: &str, profile_id: &str) -> String {
+    format!(
+        "verification-output:{}",
+        serde_json::json!([request_id, run_id, profile_id])
+    )
 }
 
 /// Resolves Verification references from immutable Artifact Authority facts.
@@ -65,6 +103,7 @@ pub enum ReferenceResolverConfigurationError {
 pub struct ArtifactBackedReferenceResolver<S> {
     source: S,
     criteria: Vec<CriterionPolicySnapshot>,
+    checker_output_collector: Option<String>,
 }
 
 impl<S> ArtifactBackedReferenceResolver<S>
@@ -86,7 +125,24 @@ where
         {
             return Err(ReferenceResolverConfigurationError::InvalidCriteria);
         }
-        Ok(Self { source, criteria })
+        Ok(Self {
+            source,
+            criteria,
+            checker_output_collector: None,
+        })
+    }
+
+    /// Enable only alongside the application's governed checker-output intake.
+    /// The legacy constructor retains the original sealed-input-set boundary.
+    pub fn with_checker_output_collector(
+        mut self,
+        principal_id: String,
+    ) -> Result<Self, ReferenceResolverConfigurationError> {
+        if principal_id.trim().is_empty() {
+            return Err(ReferenceResolverConfigurationError::InvalidCheckerOutputCollector);
+        }
+        self.checker_output_collector = Some(principal_id);
+        Ok(self)
     }
 
     fn resolve_binding(
@@ -305,6 +361,139 @@ where
             return Err(ReferenceRejection::EvidenceIncomplete);
         }
         self.validate_artifact_references(evidence_ids, artifact_ids)
+    }
+
+    fn validate_checker_result_references(
+        &self,
+        context: &CheckerResultReferenceContext<'_>,
+        evidence_ids: &[String],
+        references: &[CheckerResultArtifactReference],
+    ) -> Result<(), ReferenceRejection> {
+        let resolved = self.resolve_binding(context.binding)?;
+        if evidence_ids
+            .iter()
+            .any(|id| !resolved.evidence_ids.contains(id))
+        {
+            return Err(ReferenceRejection::EvidenceIncomplete);
+        }
+        for reference in references {
+            // Published single-checker fixtures used only input-set members.
+            // Keep that compatibility; external outputs use the narrower path.
+            if resolved.artifact_ids.contains(&reference.artifact_id) {
+                continue;
+            }
+            let collector = self
+                .checker_output_collector
+                .as_deref()
+                .ok_or(ReferenceRejection::EvidenceIncomplete)?;
+            let artifact = self
+                .source
+                .read_artifact(&reference.artifact_id)
+                .map_err(source_error)?
+                .ok_or(ReferenceRejection::NotFound)?;
+            let provenance = artifact
+                .provenance
+                .as_ref()
+                .ok_or(ReferenceRejection::IntegrityFailure)?;
+            let producer = provenance
+                .producer
+                .as_ref()
+                .ok_or(ReferenceRejection::IntegrityFailure)?;
+            let inputs = unique_nonempty(&provenance.input_artifact_ids)
+                .ok_or(ReferenceRejection::EvidenceIncomplete)?;
+            let profile = context
+                .checker_profiles
+                .iter()
+                .find(|profile| {
+                    producer.capability_profile_id.as_deref()
+                        == Some(profile.checker_profile_id.as_str())
+                        && reference
+                            .checker_profile_id
+                            .as_ref()
+                            .is_none_or(|id| id == &profile.checker_profile_id)
+                })
+                .ok_or(ReferenceRejection::IntegrityFailure)?;
+            if artifact.artifact_id != reference.artifact_id
+                || artifact.status != ArtifactStatus::Sealed as i32
+                || artifact.integrity_status != IntegrityStatus::DigestVerified as i32
+                || artifact.content.is_none()
+                || provenance.lineage.as_ref() != context.binding.lineage.as_ref()
+                || provenance.workspace_ref.trim().is_empty()
+                || !inputs.is_subset(&resolved.artifact_ids)
+                || producer.principal_kind != "governed_collector"
+                || producer.principal_id != collector
+                || producer.component_version != profile.checker_version
+                || producer.native_execution_ref.as_deref()
+                    != Some(
+                        checker_output_execution_ref(
+                            context.verification_request_id,
+                            context.verification_run_id,
+                            &profile.checker_profile_id,
+                        )
+                        .as_str(),
+                    )
+                || profile.output_contract_ref.is_none()
+                || provenance.transformation_contract_ref != profile.output_contract_ref
+                || !output_role_matches(
+                    reference.role,
+                    artifact.semantic_class,
+                    &producer.component_name,
+                )
+            {
+                return Err(ReferenceRejection::IntegrityFailure);
+            }
+            // A matching Task lineage alone must not authorize a different
+            // workspace or arbitrary artifacts from another execution.
+            for input_id in inputs {
+                let input = self
+                    .source
+                    .read_artifact(&input_id)
+                    .map_err(source_error)?
+                    .ok_or(ReferenceRejection::NotFound)?;
+                if input
+                    .provenance
+                    .as_ref()
+                    .map(|value| value.workspace_ref.as_str())
+                    != Some(provenance.workspace_ref.as_str())
+                {
+                    return Err(ReferenceRejection::IntegrityFailure);
+                }
+            }
+        }
+        self.validate_artifact_references(
+            evidence_ids,
+            &references
+                .iter()
+                .map(|value| value.artifact_id.clone())
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+fn output_role_matches(role: CheckerOutputRole, semantic_class: i32, component: &str) -> bool {
+    match role {
+        CheckerOutputRole::Detail => {
+            (semantic_class == ArtifactSemanticClass::LogBundle as i32
+                && component == "verification-raw-output")
+                || (semantic_class == ArtifactSemanticClass::TypedExtension as i32
+                    && component == "verification-finding-detail")
+        }
+        CheckerOutputRole::RawOutput => {
+            semantic_class == ArtifactSemanticClass::LogBundle as i32
+                && component == "verification-raw-output"
+        }
+        CheckerOutputRole::ToolReceipt => {
+            semantic_class == ArtifactSemanticClass::ToolReceipt as i32
+                && component == "verification-tool-receipt"
+        }
+        CheckerOutputRole::ModelCallReceipt => {
+            semantic_class == ArtifactSemanticClass::ToolReceipt as i32
+                && component == "verification-model-call-receipt"
+        }
+        CheckerOutputRole::CostReceipt => {
+            semantic_class == ArtifactSemanticClass::UsageReceipt as i32
+                && component == "verification-cost-receipt"
+        }
     }
 }
 
@@ -551,5 +740,217 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolver.validate_checker_profile(&profile), Ok(()));
+    }
+
+    fn output_profile() -> CheckerProfile {
+        CheckerProfile {
+            checker_profile_id: "checker-1".to_owned(),
+            checker_version: "1.0".to_owned(),
+            output_contract_ref: Some(reference("checker-output")),
+            ..Default::default()
+        }
+    }
+
+    fn output_resolver() -> ArtifactBackedReferenceResolver<FixtureSource> {
+        let mut resolver = resolver()
+            .with_checker_output_collector("output-collector".to_owned())
+            .expect("collector");
+        resolver
+            .source
+            .artifacts
+            .get_mut("artifact-1")
+            .expect("input")
+            .provenance
+            .as_mut()
+            .expect("provenance")
+            .workspace_ref = "workspace-1".to_owned();
+        resolver.source.artifacts.insert(
+            "output-1".to_owned(),
+            ArtifactDescriptor {
+                artifact_id: "output-1".to_owned(),
+                status: ArtifactStatus::Sealed as i32,
+                semantic_class: ArtifactSemanticClass::LogBundle as i32,
+                integrity_status: IntegrityStatus::DigestVerified as i32,
+                content: Some(ContentAddress {
+                    digest: "c".repeat(64),
+                    byte_length: 8,
+                    ..Default::default()
+                }),
+                provenance: Some(Provenance {
+                    lineage: Some(lineage()),
+                    input_artifact_ids: vec!["artifact-1".to_owned()],
+                    workspace_ref: "workspace-1".to_owned(),
+                    transformation_contract_ref: output_profile().output_contract_ref,
+                    producer: Some(ProducerIdentity {
+                        principal_kind: "governed_collector".to_owned(),
+                        principal_id: "output-collector".to_owned(),
+                        component_name: "verification-raw-output".to_owned(),
+                        component_version: "1.0".to_owned(),
+                        capability_profile_id: Some("checker-1".to_owned()),
+                        native_execution_ref: Some(checker_output_execution_ref(
+                            "request-1",
+                            "run-1",
+                            "checker-1",
+                        )),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        resolver
+    }
+
+    fn check_output(
+        resolver: &ArtifactBackedReferenceResolver<FixtureSource>,
+        role: CheckerOutputRole,
+        evidence: &[String],
+    ) -> Result<(), ReferenceRejection> {
+        resolver.validate_checker_result_references(
+            &CheckerResultReferenceContext {
+                binding: &binding(),
+                verification_request_id: "request-1",
+                verification_run_id: "run-1",
+                checker_profiles: &[output_profile()],
+            },
+            evidence,
+            &[CheckerResultArtifactReference {
+                artifact_id: "output-1".to_owned(),
+                role,
+                checker_profile_id: Some("checker-1".to_owned()),
+            }],
+        )
+    }
+
+    #[test]
+    fn checker_outputs_require_explicit_intake_and_cannot_become_input_evidence() {
+        let mut resolver = output_resolver();
+        assert_eq!(
+            check_output(
+                &resolver,
+                CheckerOutputRole::RawOutput,
+                &["evidence-1".to_owned()]
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_output(&resolver, CheckerOutputRole::Detail, &[]),
+            Ok(())
+        );
+        assert_eq!(
+            check_output(&resolver, CheckerOutputRole::ToolReceipt, &[]),
+            Err(ReferenceRejection::IntegrityFailure)
+        );
+        assert_eq!(
+            check_output(
+                &resolver,
+                CheckerOutputRole::RawOutput,
+                &["output-1".to_owned()]
+            ),
+            Err(ReferenceRejection::EvidenceIncomplete)
+        );
+        // The old API and a bootstrap without output intake both stay strict.
+        assert_eq!(
+            resolver.validate_result_references_for_binding(
+                &binding(),
+                &[],
+                &["output-1".to_owned()]
+            ),
+            Err(ReferenceRejection::EvidenceIncomplete)
+        );
+        resolver.checker_output_collector = None;
+        assert_eq!(
+            check_output(&resolver, CheckerOutputRole::RawOutput, &[]),
+            Err(ReferenceRejection::EvidenceIncomplete)
+        );
+    }
+
+    #[test]
+    fn checker_outputs_reject_profile_execution_role_workspace_and_input_substitution() {
+        let mutations: &[fn(&mut ArtifactDescriptor)] = &[
+            |a| a.status = ArtifactStatus::Staged as i32,
+            |a| a.integrity_status = IntegrityStatus::Unverified as i32,
+            |a| {
+                a.provenance
+                    .as_mut()
+                    .unwrap()
+                    .lineage
+                    .as_mut()
+                    .unwrap()
+                    .fencing_token += 1
+            },
+            |a| a.provenance.as_mut().unwrap().workspace_ref = "workspace-2".to_owned(),
+            |a| {
+                a.provenance.as_mut().unwrap().input_artifact_ids = vec!["foreign-input".to_owned()]
+            },
+            |a| a.provenance.as_mut().unwrap().input_artifact_ids.clear(),
+            |a| {
+                a.provenance.as_mut().unwrap().transformation_contract_ref =
+                    Some(reference("wrong-output"))
+            },
+            |a| {
+                a.provenance
+                    .as_mut()
+                    .unwrap()
+                    .producer
+                    .as_mut()
+                    .unwrap()
+                    .principal_id = "harness".to_owned()
+            },
+            |a| {
+                a.provenance
+                    .as_mut()
+                    .unwrap()
+                    .producer
+                    .as_mut()
+                    .unwrap()
+                    .capability_profile_id = Some("checker-2".to_owned())
+            },
+            |a| {
+                a.provenance
+                    .as_mut()
+                    .unwrap()
+                    .producer
+                    .as_mut()
+                    .unwrap()
+                    .component_version = "2.0".to_owned()
+            },
+            |a| {
+                a.provenance
+                    .as_mut()
+                    .unwrap()
+                    .producer
+                    .as_mut()
+                    .unwrap()
+                    .component_name = "verification-model-call-receipt".to_owned()
+            },
+            |a| {
+                a.provenance
+                    .as_mut()
+                    .unwrap()
+                    .producer
+                    .as_mut()
+                    .unwrap()
+                    .native_execution_ref = Some(checker_output_execution_ref(
+                    "request-2",
+                    "run-1",
+                    "checker-1",
+                ))
+            },
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut resolver = output_resolver();
+            mutate(
+                resolver
+                    .source
+                    .artifacts
+                    .get_mut("output-1")
+                    .expect("output"),
+            );
+            assert!(
+                check_output(&resolver, CheckerOutputRole::RawOutput, &[]).is_err(),
+                "substitution {index}"
+            );
+        }
     }
 }

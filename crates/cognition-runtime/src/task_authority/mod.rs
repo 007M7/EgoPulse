@@ -13,7 +13,7 @@ use egopulse_domain_contracts::v01::egopulse::task::v1::{
     task_command, task_command_result,
 };
 use egopulse_domain_contracts::v01::egopulse::verdict::v1::{
-    ConsumeFounderVerdictCommand, VerdictCommand, verdict_command,
+    ConsumeFounderVerdictCommand, VerdictCommand, VerdictScope, verdict_command,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -29,6 +29,8 @@ pub use store::{PendingTaskOutbox, TaskStoreInspection};
 
 const TASK_AUTHORITY_REF: &str = "egopulse/task-authority/v1";
 const CREATE_TASK_OPERATION: &str = "create_task";
+const COLLABORATION_CONTROL_DESTINATION: &str = "collaboration-control";
+const COLLABORATION_CANCELLATION_DESTINATION: &str = "collaboration-control-cancellation";
 
 /// SQLCipher key material. It is consumed when the Authority opens and is
 /// zeroed when dropped. Key acquisition/wrapping remains an OS integration.
@@ -190,6 +192,16 @@ pub struct PendingTaskVerification {
     pub message_id: String,
     pub payload_digest_sha256: String,
     pub event: TaskEvent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskCancellationReconciliation {
+    NeedsNativeDelivery,
+    SettledAndAcknowledged {
+        status: TaskStatus,
+        committed: bool,
+        replayed: bool,
+    },
 }
 
 impl TaskAuthority {
@@ -427,7 +439,7 @@ impl TaskAuthority {
         self.store
             .pending_cross_authority_outbox()?
             .into_iter()
-            .filter(|message| message.destination_domain == "collaboration-control")
+            .filter(|message| message.destination_domain == COLLABORATION_CONTROL_DESTINATION)
             .map(|message| {
                 let actual_digest = hex::encode(Sha256::digest(&message.payload));
                 if actual_digest != message.payload_digest_sha256 {
@@ -452,6 +464,163 @@ impl TaskAuthority {
                 })
             })
             .collect()
+    }
+
+    /// Returns a Task's durable cancellation request for the Collaboration
+    /// cancellation worker. The immutable Task event supplies the retry
+    /// identity. A Ready Task has no native run and is settled locally from
+    /// this exact event; an Active Task may be routed to its live Adapter.
+    pub fn pending_task_cancellations(
+        &self,
+    ) -> Result<Vec<PendingTaskCancellation>, TaskAuthorityFailure> {
+        self.store
+            .pending_cross_authority_outbox()?
+            .into_iter()
+            .filter(|message| message.destination_domain == COLLABORATION_CANCELLATION_DESTINATION)
+            .map(|message| {
+                let actual_digest = hex::encode(Sha256::digest(&message.payload));
+                if actual_digest != message.payload_digest_sha256 {
+                    return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+                }
+                let event = TaskEvent::decode(message.payload.as_slice())?;
+                let Some(snapshot) = event.snapshot.as_ref() else {
+                    return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+                };
+                if event.kind != TaskEventKind::CancellationRequested as i32
+                    || event.event_id.trim().is_empty()
+                    || event.task_id != snapshot.task_id
+                    || event.resulting_revision != snapshot.revision
+                    || event.work_revision != snapshot.work_revision
+                    || snapshot.status != TaskStatus::CancellationPending as i32
+                    || snapshot
+                        .current_run_id
+                        .as_deref()
+                        .is_some_and(str::is_empty)
+                {
+                    return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+                }
+                Ok(PendingTaskCancellation {
+                    message_id: message.message_id,
+                    payload_digest_sha256: message.payload_digest_sha256,
+                    event,
+                })
+            })
+            .collect()
+    }
+
+    /// Reconciles the Task-owned side of one exact cancellation handoff before
+    /// any native routing is attempted. Ready Tasks are cancelled without a
+    /// Harness call. A terminal result committed before an outbox ACK is
+    /// conditionally acknowledged on replay, so restart cannot resend a stale
+    /// native cancellation.
+    pub fn reconcile_task_cancellation(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<TaskCancellationReconciliation, TaskAuthorityFailure> {
+        if !principal.authenticated
+            || principal.kind != PrincipalKind::CollaborationControl
+            || principal.principal_id.trim().is_empty()
+        {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        let handoff = self
+            .pending_task_cancellations()?
+            .into_iter()
+            .find(|pending| {
+                pending.message_id == message_id
+                    && pending.payload_digest_sha256 == expected_payload_digest_sha256
+            })
+            .ok_or(TaskAuthorityFailure::InvalidCrossAuthorityHandoff)?;
+        let frozen = handoff
+            .event
+            .snapshot
+            .as_ref()
+            .ok_or(TaskAuthorityFailure::InvalidCrossAuthorityHandoff)?;
+        let live_bytes = self
+            .store
+            .task_snapshot(&handoff.event.task_id)?
+            .ok_or(TaskAuthorityFailure::InvalidCrossAuthorityHandoff)?;
+        let live = TaskSnapshot::decode(live_bytes.as_slice())?;
+        if live.task_id != frozen.task_id
+            || live.work_revision != frozen.work_revision
+            || live.current_run_id != frozen.current_run_id
+            || live.revision < frozen.revision
+        {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+
+        if live.status == TaskStatus::CancellationPending as i32 && live.revision == frozen.revision
+        {
+            if live.current_run_id.is_some() {
+                return Ok(TaskCancellationReconciliation::NeedsNativeDelivery);
+            }
+            let issued_at = handoff
+                .event
+                .occurred_at
+                .ok_or(TaskAuthorityFailure::InvalidCrossAuthorityHandoff)?;
+            let stable_identity = handoff.event.event_id.clone();
+            let mut command = TaskCommand {
+                command: Some(task_command::Command::RecordTaskCancellationOutcome(
+                    egopulse_domain_contracts::v01::egopulse::task::v1::RecordTaskCancellationOutcomeCommand {
+                        meta: Some(CommandMetadata {
+                            command_id: format!("settle-ready-cancellation-{stable_identity}"),
+                            idempotency_key: format!("ready-cancellation:{stable_identity}"),
+                            idempotency_scope: "task-authority/ready-cancellation/v1".to_owned(),
+                            request_digest_sha256: String::new(),
+                            issued_at: Some(issued_at),
+                            correlation_id: handoff.event.correlation_id.clone(),
+                            causation_id: Some(stable_identity.clone()),
+                        }),
+                        task_id: live.task_id.clone(),
+                        expected_revision: live.revision,
+                        outcome: TaskStatus::Cancelled as i32,
+                        cancellation_receipt_id: stable_identity,
+                    },
+                )),
+            };
+            let digest = canonical_request_digest(&command)?;
+            command_metadata_mut(&mut command)
+                .expect("constructed cancellation outcome metadata")
+                .request_digest_sha256 = digest;
+            let result = self.execute(&command, principal)?;
+            let Some(task_command_result::Outcome::Task(settled)) = result.outcome.as_ref() else {
+                return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+            };
+            if settled.status != TaskStatus::Cancelled as i32
+                || settled.task_id != live.task_id
+                || settled.current_run_id.is_some()
+            {
+                return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+            }
+            if !self
+                .acknowledge_cross_authority_outbox(message_id, expected_payload_digest_sha256)?
+            {
+                return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+            }
+            return Ok(TaskCancellationReconciliation::SettledAndAcknowledged {
+                status: TaskStatus::Cancelled,
+                committed: result.committed_event.is_some(),
+                replayed: result.replayed,
+            });
+        }
+
+        let status = TaskStatus::try_from(live.status)
+            .map_err(|_| TaskAuthorityFailure::InvalidCrossAuthorityHandoff)?;
+        if live.revision <= frozen.revision
+            || !matches!(status, TaskStatus::Cancelled | TaskStatus::Interrupted)
+        {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        if !self.acknowledge_cross_authority_outbox(message_id, expected_payload_digest_sha256)? {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        Ok(TaskCancellationReconciliation::SettledAndAcknowledged {
+            status,
+            committed: false,
+            replayed: true,
+        })
     }
 
     /// Returns only durable EvidenceSubmitted handoffs addressed to the
@@ -490,6 +659,56 @@ impl TaskAuthority {
                 })
             })
             .collect()
+    }
+
+    /// Proves an exact historical application from the owning event and durable
+    /// receipt. The current Task may have advanced after a Rework decision.
+    pub fn applied_founder_verdict(
+        &self,
+        scope: &VerdictScope,
+        founder_verdict_id: &str,
+    ) -> Result<Option<TaskEvent>, TaskAuthorityFailure> {
+        let Some(revision) = scope.task_revision.checked_add(1) else {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        };
+        let Some(committed) = self
+            .store
+            .committed_event_at_revision(&scope.task_id, revision)?
+        else {
+            return Ok(None);
+        };
+        let event = TaskEvent::decode(committed.payload.as_slice())?;
+        let Some(snapshot) = event.snapshot.as_ref() else {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        };
+        if event.kind != TaskEventKind::VerdictApplied as i32
+            || snapshot.founder_verdict_id.as_deref() != Some(founder_verdict_id)
+        {
+            return Ok(None);
+        }
+        if event.event_id != committed.event_id
+            || event.command_id != committed.command_id
+            || event.request_digest_sha256 != committed.request_digest_sha256
+            || event.idempotency_key != committed.idempotency_key
+            || event.occurred_at.as_ref().is_none_or(|at| {
+                at.seconds != committed.committed_at_seconds
+                    || !(0..1_000_000_000).contains(&at.nanos)
+            })
+            || event.task_id != scope.task_id
+            || event.expected_revision != scope.task_revision
+            || event.resulting_revision != revision
+            || event.work_revision != scope.work_revision
+            || snapshot.task_id != scope.task_id
+            || snapshot.revision != revision
+            || snapshot.work_revision != scope.work_revision
+            || snapshot.artifact_set_id.as_deref() != Some(scope.artifact_set_id.as_str())
+            || snapshot.verification_artifact_id.as_deref()
+                != Some(scope.verification_artifact_id.as_str())
+            || snapshot.acceptance_contract_ref != scope.acceptance_contract_ref
+        {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        Ok(Some(event))
     }
 
     pub fn drain_projection_outbox(
@@ -653,6 +872,9 @@ impl TaskAuthority {
             ));
         };
         let current = TaskSnapshot::decode(snapshot_bytes.as_slice())?;
+        // Bind the event and durable receipt to the instant before the guard
+        // checks expiring authority references; rejected guards still commit nothing.
+        let now = current_timestamp()?;
         let authorization = match self.transition_guard.validate(command, &current) {
             Ok(value) if !value.evidence_refs.is_empty() => value,
             Ok(_) => {
@@ -664,7 +886,6 @@ impl TaskAuthority {
             }
             Err(rejection) => return Ok(transition_guard_error(rejection, current.revision)),
         };
-        let now = current_timestamp()?;
         let mut next = current.clone();
         next.revision = current.revision + 1;
         next.updated_at = Some(now);
@@ -883,7 +1104,10 @@ impl TaskAuthority {
             }
             Some(task_command::Command::RecordTaskCancellationOutcome(value)) => {
                 if current.status != TaskStatus::CancellationPending as i32
-                    || value.outcome != TaskStatus::Cancelled as i32
+                    || !matches!(
+                        TaskStatus::try_from(value.outcome),
+                        Ok(TaskStatus::Cancelled | TaskStatus::Interrupted)
+                    )
                     || value.cancellation_receipt_id.trim().is_empty()
                 {
                     return Ok(error_result(
@@ -892,7 +1116,26 @@ impl TaskAuthority {
                         Some(current.revision),
                     ));
                 }
-                next.status = TaskStatus::Cancelled as i32;
+                if current.current_run_id.is_none()
+                    && (value.outcome != TaskStatus::Cancelled as i32
+                        || !self.pending_task_cancellations()?.iter().any(|pending| {
+                            pending.event.task_id == current.task_id
+                                && pending.event.resulting_revision == current.revision
+                                && pending.event.event_id == value.cancellation_receipt_id
+                                && pending
+                                    .event
+                                    .snapshot
+                                    .as_ref()
+                                    .is_some_and(|snapshot| snapshot.current_run_id.is_none())
+                        }))
+                {
+                    return Ok(error_result(
+                        TaskErrorCode::UnverifiedReference,
+                        "READY_CANCELLATION_EVENT_EVIDENCE_MISMATCH",
+                        Some(current.revision),
+                    ));
+                }
+                next.status = value.outcome;
                 (
                     TaskEventKind::CancellationRecorded,
                     vec![format!(
@@ -949,7 +1192,16 @@ impl TaskAuthority {
                 }
                 (Some(task_command::Command::ActivateTask(_)), None) => Some((
                     format!("task-outbox-collaboration-{}", event.event_id),
-                    "collaboration-control",
+                    COLLABORATION_CONTROL_DESTINATION,
+                    event_bytes.clone(),
+                    event_digest.clone(),
+                )),
+                // Ready cancellations use this Task-owned handoff as the exact
+                // no-run settlement evidence. Active cancellations carry the
+                // same event to the native delivery worker.
+                (Some(task_command::Command::RequestTaskCancellation(_)), None) => Some((
+                    format!("task-outbox-cancellation-{}", event.event_id),
+                    COLLABORATION_CANCELLATION_DESTINATION,
                     event_bytes.clone(),
                     event_digest.clone(),
                 )),
@@ -1001,6 +1253,13 @@ impl TaskAuthority {
         }
         Ok(result)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTaskCancellation {
+    pub message_id: String,
+    pub payload_digest_sha256: String,
+    pub event: TaskEvent,
 }
 
 pub fn canonical_request_digest(command: &TaskCommand) -> Result<String, TaskAuthorityFailure> {

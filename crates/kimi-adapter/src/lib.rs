@@ -432,6 +432,7 @@ impl NativeHarnessDriver for KimiAcpDriver {
                                 .to_owned(),
                             display_summary_ref: "adapter-edge://kimi-acp/approval/summary"
                                 .to_owned(),
+                            display_summary: None,
                             native_routing_ref: routing_ref.clone(),
                             lifecycle: ApprovalRequestLifecycleKind::Open as i32,
                             request_revision: 1,

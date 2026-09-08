@@ -39,15 +39,18 @@ use egopulse_domain_contracts::{
     context_revoke::ContextRevokeSemanticRequest,
     memory::{WORK_MEMORY_MAX_RESULTS, WORK_MEMORY_MAX_SELECTED_CONTENT_BYTES},
     v01::egopulse::{
-        artifact::v1::ArtifactSetStatus,
+        artifact::v1::{ArtifactSetStatus, ContentAddress, HashAlgorithm, LineageBinding},
         collaboration::v1::{AttemptStatus, RecoveryClass, RunStatus, StepStatus},
         common::v1::CommandMetadata,
         harness::v1::ApprovalDecision,
         localapi::v1::{
             AvailableActionKind, ClientRequestMetadata, ClientSurface, ConfirmWorkRequest,
             ConfirmWorkResponse, ContextGovernanceState, ContextMutationCommand,
-            ContextRevokeReceipt, DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
-            EvidenceGraphView, ExecuteContextMutationRequest, ExecuteContextMutationResponse,
+            ContextRevokeReceipt, CreateFounderSupportingMaterialRequest,
+            CreateFounderSupportingMaterialResponse, DecideHarnessApprovalRequest,
+            DecideHarnessApprovalResponse, EvidenceGraphView, ExecuteContextMutationRequest,
+            ExecuteContextMutationResponse, ExecuteFounderVerdictRequest,
+            ExecuteFounderVerdictResponse, ExecuteTaskCommandRequest, ExecuteTaskCommandResponse,
             GetEvidenceGraphRequest, GetEvidenceGraphResponse, GetHarnessApprovalViewRequest,
             GetHarnessApprovalViewResponse, GetProjectionStatusRequest, GetTaskViewRequest,
             GetTaskViewResponse, HarnessApprovalAuthorityResult, HarnessApprovalView,
@@ -71,10 +74,17 @@ use egopulse_domain_contracts::{
             PolicyDecisionCommand, PolicyDecisionErrorCode, policy_decision_command,
         },
         task::v1::{
-            TaskCommand, TaskStatus as DomainTaskStatus, task_command, task_command_result,
+            ApplyFounderVerdictCommand, TaskCommand, TaskCommandResult, TaskErrorCode,
+            TaskEventKind, TaskSnapshot, TaskStatus as DomainTaskStatus, task_command,
+            task_command_result,
         },
         verdict::v1::{
-            FounderVerdictDecision, FounderVerdictStateKind, VerdictCommand, verdict_command,
+            ConfirmationClass, CreateFounderSupportingMaterialCommand, FounderSupportingMaterial,
+            FounderSupportingMaterialCoverage, FounderSupportingMaterialReceipt,
+            FounderSupportingMaterialRole, FounderVerdictDecision, FounderVerdictStateKind,
+            IssueFounderVerdictCommand, ReworkDirective, RiskAcceptance, RiskCategory,
+            VerdictCommand, VerdictCommandResult, VerdictErrorCode, VerdictEventKind, VerdictScope,
+            verdict_command,
         },
         verification::v1::VerificationConclusion,
     },
@@ -115,6 +125,18 @@ const APPROVAL_WATCH_BASELINE_MAX_VIEWS: usize = 1_000;
 const GUIDED_WORK_MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const GUIDED_WORK_MAX_ROUTING_BYTES: usize = 4 * 1024;
 const GUIDED_WORK_MAX_SOURCES: usize = 256;
+const EXECUTE_FOUNDER_VERDICT_RPC: &str = "LocalCommandGatewayService/ExecuteFounderVerdict";
+const ISSUE_FOUNDER_VERDICT_COMMAND: &str = "issue_founder_verdict";
+const EXECUTE_TASK_COMMAND_RPC: &str = "LocalCommandGatewayService/ExecuteTaskCommand";
+const APPLY_FOUNDER_VERDICT_COMMAND: &str = "apply_founder_verdict";
+const GUIDED_FOUNDER_APPLY_SCOPE: &str = "guided-founder-decision/apply/v1";
+
+mod founder_recovery;
+mod recovery_store;
+pub use founder_recovery::{
+    DurableFounderDecisionAttempt, DurableFounderMaterialAttempt, DurableFounderMaterialRecovery,
+    DurableFounderRecoveryError, DurableFounderVerdictAttempt, DurableFounderVerdictRecovery,
+};
 
 /// A local client that has completed the frozen session and contract handshake.
 ///
@@ -157,6 +179,9 @@ pub struct GuidedApprovalDecisionInput {
     pub decision: GuidedApprovalDecision,
     pub reason_code: String,
     pub confirmation_proof_ref: Option<String>,
+    /// The Adapter-produced summary actually reviewed by the user. A positive
+    /// decision must not silently rebind to a changed operation after refresh.
+    pub reviewed_summary_digest_sha256: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -305,6 +330,800 @@ pub enum ClientTaskResultReviewError {
 pub struct TaskResultReview {
     pub task_view: TaskView,
     pub evidence_graph: Option<EvidenceGraphView>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuidedFounderVerdictSelection {
+    Accept,
+    Rework,
+    Reject,
+}
+
+/// Caller-owned identity and confirmation material for a verdict built from a
+/// current, trusted result-review snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GuidedFounderVerdictInput {
+    pub current_task_id: String,
+    pub metadata: CommandMetadata,
+    pub selection: GuidedFounderVerdictSelection,
+    pub reason_code: String,
+    pub confirmation_proof_ref: String,
+    pub expires_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedFounderSupportingMaterial {
+    command: CreateFounderSupportingMaterialCommand,
+    capsule: FounderSupportingMaterialTrustedCapsule,
+    session_id: String,
+    authenticated_principal_id: String,
+}
+
+impl PreparedFounderSupportingMaterial {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn authenticated_principal_id(&self) -> &str {
+        &self.authenticated_principal_id
+    }
+
+    pub fn command(&self) -> &CreateFounderSupportingMaterialCommand {
+        &self.command
+    }
+
+    pub fn capsule(&self) -> &FounderSupportingMaterialTrustedCapsule {
+        &self.capsule
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FounderSupportingMaterialTrustedCapsule {
+    pub review_lineage: LineageBinding,
+    pub verdict_scope: VerdictScope,
+    pub authenticated_founder_principal_id: String,
+    pub material_id: String,
+    pub role: FounderSupportingMaterialRole,
+    pub body: String,
+    pub coverage: Option<FounderSupportingMaterialCoverage>,
+    pub canonical_payload: Vec<u8>,
+    pub expected_payload_address: ContentAddress,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfirmedFounderSupportingMaterialReceipt {
+    receipt: FounderSupportingMaterialReceipt,
+    command: CreateFounderSupportingMaterialCommand,
+    capsule: FounderSupportingMaterialTrustedCapsule,
+}
+
+/// A collection can contain only receipts returned by the authenticated
+/// supporting-material submission path because the receipt constructor and
+/// all fields remain private to this crate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FounderSupportingMaterialCollection {
+    materials: Vec<ConfirmedFounderSupportingMaterialReceipt>,
+}
+
+impl FounderSupportingMaterialCollection {
+    pub fn from_confirmed(
+        materials: Vec<ConfirmedFounderSupportingMaterialReceipt>,
+    ) -> Result<Self, ClientGuidedFounderVerdictError> {
+        let mut material_ids = BTreeSet::new();
+        let mut artifact_ids = BTreeSet::new();
+        if materials.iter().any(|material| {
+            !material_ids.insert(material.receipt.material_id.as_str())
+                || !artifact_ids.insert(material.receipt.artifact_id.as_str())
+        }) {
+            return Err(ClientGuidedFounderVerdictError::InvalidInput(
+                "confirmed supporting materials must have unique material and Artifact identities",
+            ));
+        }
+        Ok(Self { materials })
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.materials.is_empty()
+    }
+}
+
+/// Exact caller-owned recovery state retained after a supporting-material
+/// write may have reached the Authority. Neither the request metadata nor the
+/// trusted review capsule is rebuilt on retry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoverableFounderSupportingMaterial {
+    request: CreateFounderSupportingMaterialRequest,
+    prepared: PreparedFounderSupportingMaterial,
+}
+
+impl RecoverableFounderSupportingMaterial {
+    pub fn request(&self) -> &CreateFounderSupportingMaterialRequest {
+        &self.request
+    }
+
+    pub fn prepared(&self) -> &PreparedFounderSupportingMaterial {
+        &self.prepared
+    }
+}
+
+impl ConfirmedFounderSupportingMaterialReceipt {
+    fn from_prepared(
+        receipt: FounderSupportingMaterialReceipt,
+        prepared: &PreparedFounderSupportingMaterial,
+    ) -> Result<Self, ClientFounderSupportingMaterialError> {
+        let command = &prepared.command;
+        let capsule = &prepared.capsule;
+        if receipt.canonical_payload.as_ref() != Some(&capsule.expected_payload_address) {
+            return Err(ClientFounderSupportingMaterialError::UnconfirmedReceipt);
+        }
+        if !(receipt.committed || receipt.replayed)
+            || receipt.material_id.trim().is_empty()
+            || receipt.artifact_id.trim().is_empty()
+            || receipt.command_id.trim().is_empty()
+            || receipt.canonical_payload.is_none()
+            || receipt.scope.is_none()
+            || receipt.material_id != command.material_id
+            || receipt.role != command.role
+            || receipt.scope != command.scope
+            || receipt.command_id
+                != command
+                    .metadata
+                    .as_ref()
+                    .map(|value| value.command_id.as_str())
+                    .unwrap_or_default()
+            || receipt.correlation_id
+                != command
+                    .metadata
+                    .as_ref()
+                    .map(|value| value.correlation_id.as_str())
+                    .unwrap_or_default()
+            || receipt.artifact_id != founder_supporting_material_artifact_id(&command.material_id)
+        {
+            return Err(ClientFounderSupportingMaterialError::UnconfirmedReceipt);
+        }
+        Ok(Self {
+            receipt,
+            command: command.clone(),
+            capsule: capsule.clone(),
+        })
+    }
+
+    pub fn receipt(&self) -> &FounderSupportingMaterialReceipt {
+        &self.receipt
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ClientFounderSupportingMaterialError {
+    #[error("supporting material recovery could not be saved; no request was sent")]
+    RecoveryStorage,
+    #[error("supporting material input is invalid")]
+    InvalidInput,
+    #[error("supporting material receipt is not committed or replayed with a sealed payload")]
+    UnconfirmedReceipt,
+    #[error("client kernel rejected supporting material RPC: {0}")]
+    Kernel(#[from] KernelError),
+    #[error("supporting material transport failed: {0}")]
+    Transport(String),
+    #[error("supporting material authority rejected the request")]
+    Authority,
+    #[error("supporting material write outcome is unknown")]
+    Unknown {
+        recovery: Box<RecoverableFounderSupportingMaterial>,
+    },
+}
+
+pub struct FounderSupportingMaterialBuilder {
+    capsule: FounderSupportingMaterialTrustedCapsule,
+    session_id: String,
+}
+
+fn founder_supporting_material_artifact_id(material_id: &str) -> String {
+    let mut framed = Vec::with_capacity(material_id.len() + 32);
+    framed.extend_from_slice(&("founder-supporting-material".len() as u64).to_be_bytes());
+    framed.extend_from_slice(b"founder-supporting-material");
+    framed.extend_from_slice(&(material_id.len() as u64).to_be_bytes());
+    framed.extend_from_slice(material_id.as_bytes());
+    format!("founder-material-{}", hex::encode(Sha256::digest(framed)))
+}
+
+impl FounderSupportingMaterialBuilder {
+    pub fn from_review(
+        review: &TaskResultReview,
+        session: &egopulse_client_kernel::SessionBinding,
+        material_id: String,
+        role: FounderSupportingMaterialRole,
+        body: String,
+        coverage: Option<FounderSupportingMaterialCoverage>,
+    ) -> Result<Self, ClientFounderSupportingMaterialError> {
+        if material_id.trim().is_empty()
+            || body.trim().is_empty()
+            || session.session_id.trim().is_empty()
+            || session.authenticated_principal_id.trim().is_empty()
+            || role == FounderSupportingMaterialRole::Unspecified
+            || !supporting_material_coverage_is_valid(role, coverage.as_ref())
+        {
+            return Err(ClientFounderSupportingMaterialError::InvalidInput);
+        }
+        let task = review
+            .task_view
+            .task
+            .as_ref()
+            .ok_or(ClientFounderSupportingMaterialError::InvalidInput)?;
+        let current_task_id = task.task_id.clone();
+        let (_, artifact_set_id) =
+            validate_task_result_view(&review.task_view, &current_task_id)
+                .map_err(|_| ClientFounderSupportingMaterialError::InvalidInput)?;
+        let artifact_set_id =
+            artifact_set_id.ok_or(ClientFounderSupportingMaterialError::InvalidInput)?;
+        let graph = review
+            .evidence_graph
+            .as_ref()
+            .ok_or(ClientFounderSupportingMaterialError::InvalidInput)?;
+        validate_evidence_graph(&review.task_view, graph, &current_task_id, &artifact_set_id)
+            .map_err(|_| ClientFounderSupportingMaterialError::InvalidInput)?;
+        validate_founder_verdict_action(&review.task_view)
+            .map_err(|_| ClientFounderSupportingMaterialError::InvalidInput)?;
+
+        let task = review
+            .task_view
+            .task
+            .as_ref()
+            .expect("trusted result review contains a Task");
+        let set = review
+            .task_view
+            .artifact_set
+            .as_ref()
+            .expect("trusted result review contains an ArtifactSet");
+        let verification = review
+            .task_view
+            .verification
+            .as_ref()
+            .expect("trusted result review contains a Verification");
+        if set.status != ArtifactSetStatus::Sealed as i32 {
+            return Err(ClientFounderSupportingMaterialError::InvalidInput);
+        }
+        let artifact_set_manifest = set
+            .canonical_manifest
+            .clone()
+            .filter(guided_verdict_content_address_is_complete)
+            .ok_or(ClientFounderSupportingMaterialError::InvalidInput)?;
+        let verification_payload = verification
+            .canonical_payload
+            .clone()
+            .filter(guided_verdict_content_address_is_complete)
+            .ok_or(ClientFounderSupportingMaterialError::InvalidInput)?;
+        let acceptance_contract_ref = task
+            .acceptance_contract_ref
+            .clone()
+            .filter(guided_verdict_contract_is_complete)
+            .ok_or(ClientFounderSupportingMaterialError::InvalidInput)?;
+        let lineage = set
+            .lineage
+            .clone()
+            .filter(result_lineage_is_complete)
+            .ok_or(ClientFounderSupportingMaterialError::InvalidInput)?;
+        let scope = VerdictScope {
+            task_id: task.task_id.clone(),
+            task_revision: task.revision,
+            work_revision: task.work_revision,
+            artifact_set_id,
+            artifact_set_manifest: Some(artifact_set_manifest),
+            verification_artifact_id: verification.verification_artifact_id.clone(),
+            verification_payload: Some(verification_payload),
+            acceptance_contract_ref: Some(acceptance_contract_ref),
+        };
+        let payload = FounderSupportingMaterial {
+            material_id: material_id.clone(),
+            schema_version: 1,
+            role: role as i32,
+            scope: Some(scope.clone()),
+            lineage: Some(lineage.clone()),
+            authenticated_founder_principal_id: session.authenticated_principal_id.clone(),
+            body: body.clone(),
+            coverage: coverage.clone(),
+        };
+        let canonical_payload = payload.encode_to_vec();
+        let expected_payload_address = ContentAddress {
+            algorithm: HashAlgorithm::Sha256 as i32,
+            digest: hex::encode(Sha256::digest(&canonical_payload)),
+            byte_length: canonical_payload.len() as u64,
+        };
+        Ok(Self {
+            capsule: FounderSupportingMaterialTrustedCapsule {
+                review_lineage: lineage,
+                verdict_scope: scope,
+                authenticated_founder_principal_id: session.authenticated_principal_id.clone(),
+                material_id,
+                role,
+                body,
+                coverage,
+                canonical_payload,
+                expected_payload_address,
+            },
+            session_id: session.session_id.clone(),
+        })
+    }
+
+    pub fn build(
+        self,
+        metadata: CommandMetadata,
+    ) -> Result<PreparedFounderSupportingMaterial, ClientFounderSupportingMaterialError> {
+        if !supporting_material_metadata_is_valid(&metadata, false) {
+            return Err(ClientFounderSupportingMaterialError::InvalidInput);
+        }
+        let capsule = self.capsule;
+        let authenticated_principal_id = capsule.authenticated_founder_principal_id.clone();
+        let mut command = CreateFounderSupportingMaterialCommand {
+            metadata: Some(metadata),
+            material_id: capsule.material_id.clone(),
+            scope: Some(capsule.verdict_scope.clone()),
+            role: capsule.role as i32,
+            body: capsule.body.clone(),
+            coverage: capsule.coverage.clone(),
+        };
+        let supplied_digest = command
+            .metadata
+            .as_ref()
+            .expect("metadata validated")
+            .request_digest_sha256
+            .clone();
+        let digest = canonical_founder_material_request_digest(&command)
+            .ok_or(ClientFounderSupportingMaterialError::InvalidInput)?;
+        if !supplied_digest.is_empty() && supplied_digest != digest {
+            return Err(ClientFounderSupportingMaterialError::InvalidInput);
+        }
+        command
+            .metadata
+            .as_mut()
+            .expect("metadata validated")
+            .request_digest_sha256 = digest;
+        Ok(PreparedFounderSupportingMaterial {
+            command,
+            capsule,
+            session_id: self.session_id,
+            authenticated_principal_id,
+        })
+    }
+
+    pub fn capsule(&self) -> &FounderSupportingMaterialTrustedCapsule {
+        &self.capsule
+    }
+}
+
+fn supporting_material_coverage_is_valid(
+    role: FounderSupportingMaterialRole,
+    coverage: Option<&FounderSupportingMaterialCoverage>,
+) -> bool {
+    let Some(coverage) = coverage else {
+        return false;
+    };
+    let ids_are_valid = |ids: &[String]| {
+        !ids.iter().any(|id| id.trim().is_empty())
+            && ids.iter().collect::<BTreeSet<_>>().len() == ids.len()
+    };
+    if !ids_are_valid(&coverage.discrepancy_ids) || !ids_are_valid(&coverage.unverified_item_ids) {
+        return false;
+    }
+    let Ok(risk) = RiskCategory::try_from(coverage.risk_category) else {
+        return false;
+    };
+    match role {
+        FounderSupportingMaterialRole::ReworkRequiredChanges => risk == RiskCategory::Unspecified,
+        FounderSupportingMaterialRole::RiskRationale
+        | FounderSupportingMaterialRole::CompensatingControl => {
+            risk != RiskCategory::Unspecified
+                && (!coverage.discrepancy_ids.is_empty()
+                    || !coverage.unverified_item_ids.is_empty())
+        }
+        FounderSupportingMaterialRole::Unspecified => false,
+    }
+}
+
+fn supporting_material_metadata_is_valid(metadata: &CommandMetadata, sealed: bool) -> bool {
+    !metadata.command_id.trim().is_empty()
+        && !metadata.idempotency_key.trim().is_empty()
+        && !metadata.idempotency_scope.trim().is_empty()
+        && !metadata.correlation_id.trim().is_empty()
+        && metadata
+            .issued_at
+            .as_ref()
+            .is_some_and(guided_verdict_timestamp_is_valid)
+        && if sealed {
+            guided_verdict_digest_is_complete(&metadata.request_digest_sha256)
+        } else {
+            metadata.request_digest_sha256.is_empty()
+                || guided_verdict_digest_is_complete(&metadata.request_digest_sha256)
+        }
+}
+
+fn validate_prepared_founder_supporting_material(
+    prepared: &PreparedFounderSupportingMaterial,
+) -> Result<(), ClientFounderSupportingMaterialError> {
+    let command = &prepared.command;
+    let capsule = &prepared.capsule;
+    let metadata = command
+        .metadata
+        .as_ref()
+        .ok_or(ClientFounderSupportingMaterialError::InvalidInput)?;
+    if !supporting_material_metadata_is_valid(metadata, true)
+        || canonical_founder_material_request_digest(command).as_deref()
+            != Some(metadata.request_digest_sha256.as_str())
+        || prepared.authenticated_principal_id.trim().is_empty()
+        || prepared.authenticated_principal_id != capsule.authenticated_founder_principal_id
+        || command.material_id != capsule.material_id
+        || command.scope.as_ref() != Some(&capsule.verdict_scope)
+        || command.role != capsule.role as i32
+        || command.body != capsule.body
+        || command.coverage != capsule.coverage
+        || !supporting_material_coverage_is_valid(capsule.role, capsule.coverage.as_ref())
+    {
+        return Err(ClientFounderSupportingMaterialError::InvalidInput);
+    }
+    let scope = &capsule.verdict_scope;
+    if scope.task_id != capsule.review_lineage.task_id
+        || scope.task_revision < capsule.review_lineage.task_revision
+        || scope.work_revision != capsule.review_lineage.work_revision
+        || scope.artifact_set_id.trim().is_empty()
+        || scope.verification_artifact_id.trim().is_empty()
+        || scope
+            .artifact_set_manifest
+            .as_ref()
+            .is_none_or(|address| !guided_verdict_content_address_is_complete(address))
+        || scope
+            .verification_payload
+            .as_ref()
+            .is_none_or(|address| !guided_verdict_content_address_is_complete(address))
+        || scope
+            .acceptance_contract_ref
+            .as_ref()
+            .is_none_or(|reference| !guided_verdict_contract_is_complete(reference))
+        || !result_lineage_is_complete(&capsule.review_lineage)
+    {
+        return Err(ClientFounderSupportingMaterialError::InvalidInput);
+    }
+    let payload = FounderSupportingMaterial {
+        material_id: capsule.material_id.clone(),
+        schema_version: 1,
+        role: capsule.role as i32,
+        scope: Some(capsule.verdict_scope.clone()),
+        lineage: Some(capsule.review_lineage.clone()),
+        authenticated_founder_principal_id: capsule.authenticated_founder_principal_id.clone(),
+        body: capsule.body.clone(),
+        coverage: capsule.coverage.clone(),
+    };
+    let canonical_payload = payload.encode_to_vec();
+    let expected_address = ContentAddress {
+        algorithm: HashAlgorithm::Sha256 as i32,
+        digest: hex::encode(Sha256::digest(&canonical_payload)),
+        byte_length: canonical_payload.len() as u64,
+    };
+    if capsule.canonical_payload != canonical_payload
+        || capsule.expected_payload_address != expected_address
+    {
+        return Err(ClientFounderSupportingMaterialError::InvalidInput);
+    }
+    Ok(())
+}
+
+async fn submit_founder_supporting_material_via<Send, SendFuture>(
+    kernel: &ClientKernel,
+    prepared: PreparedFounderSupportingMaterial,
+    now: SystemTime,
+    send: Send,
+) -> Result<ConfirmedFounderSupportingMaterialReceipt, ClientFounderSupportingMaterialError>
+where
+    Send: FnOnce(CreateFounderSupportingMaterialRequest) -> SendFuture,
+    SendFuture: Future<Output = Result<CreateFounderSupportingMaterialResponse, String>>,
+{
+    validate_prepared_founder_supporting_material(&prepared)?;
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    let _authorized = kernel.authorize_create_founder_supporting_material()?;
+    if session.authenticated_principal_id != prepared.authenticated_principal_id
+        || session.session_id != prepared.session_id
+    {
+        return Err(ClientFounderSupportingMaterialError::InvalidInput);
+    }
+    let metadata = prepared
+        .command
+        .metadata
+        .as_ref()
+        .expect("prepared supporting material metadata validated");
+    let request = CreateFounderSupportingMaterialRequest {
+        client: Some(kernel.request_metadata(
+            Uuid::now_v7().to_string(),
+            Some(metadata.correlation_id.clone()),
+            now,
+        )?),
+        command: Some(prepared.command.clone()),
+    };
+    let recovery = RecoverableFounderSupportingMaterial { request, prepared };
+    dispatch_founder_supporting_material(recovery, send).await
+}
+
+async fn retry_founder_supporting_material_via<Send, SendFuture>(
+    kernel: &ClientKernel,
+    recovery: &RecoverableFounderSupportingMaterial,
+    send: Send,
+) -> Result<ConfirmedFounderSupportingMaterialReceipt, ClientFounderSupportingMaterialError>
+where
+    Send: FnOnce(CreateFounderSupportingMaterialRequest) -> SendFuture,
+    SendFuture: Future<Output = Result<CreateFounderSupportingMaterialResponse, String>>,
+{
+    let frozen = recovery.clone();
+    let preflight: Result<(), ClientFounderSupportingMaterialError> = (|| {
+        validate_prepared_founder_supporting_material(&frozen.prepared)?;
+        let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+        let _authorized = kernel.authorize_create_founder_supporting_material()?;
+        let request_metadata = frozen
+            .request
+            .client
+            .as_ref()
+            .ok_or(ClientFounderSupportingMaterialError::InvalidInput)?;
+        let command_metadata = frozen
+            .prepared
+            .command
+            .metadata
+            .as_ref()
+            .ok_or(ClientFounderSupportingMaterialError::InvalidInput)?;
+        if session.authenticated_principal_id != frozen.prepared.authenticated_principal_id
+            || session.session_id != frozen.prepared.session_id
+            || request_metadata.session_id != frozen.prepared.session_id
+            || request_metadata.correlation_id.as_deref()
+                != Some(command_metadata.correlation_id.as_str())
+            || frozen.request.command.as_ref() != Some(&frozen.prepared.command)
+        {
+            return Err(ClientFounderSupportingMaterialError::InvalidInput);
+        }
+        Ok(())
+    })();
+    if preflight.is_err() {
+        return Err(ClientFounderSupportingMaterialError::Unknown {
+            recovery: Box::new(frozen),
+        });
+    }
+    dispatch_founder_supporting_material(frozen, send).await
+}
+
+async fn dispatch_founder_supporting_material<Send, SendFuture>(
+    recovery: RecoverableFounderSupportingMaterial,
+    send: Send,
+) -> Result<ConfirmedFounderSupportingMaterialReceipt, ClientFounderSupportingMaterialError>
+where
+    Send: FnOnce(CreateFounderSupportingMaterialRequest) -> SendFuture,
+    SendFuture: Future<Output = Result<CreateFounderSupportingMaterialResponse, String>>,
+{
+    let response = match send(recovery.request.clone()).await {
+        Ok(response) => response,
+        Err(_) => {
+            return Err(ClientFounderSupportingMaterialError::Unknown {
+                recovery: Box::new(recovery),
+            });
+        }
+    };
+    if response.gateway_error.is_some() || response.await_token.is_some() {
+        return Err(ClientFounderSupportingMaterialError::Unknown {
+            recovery: Box::new(recovery),
+        });
+    }
+    let Some(receipt) = response.authority_result else {
+        return Err(ClientFounderSupportingMaterialError::Unknown {
+            recovery: Box::new(recovery),
+        });
+    };
+    match ConfirmedFounderSupportingMaterialReceipt::from_prepared(receipt, &recovery.prepared) {
+        Ok(confirmed) => Ok(confirmed),
+        Err(_) => Err(ClientFounderSupportingMaterialError::Unknown {
+            recovery: Box::new(recovery),
+        }),
+    }
+}
+
+fn canonical_founder_material_request_digest(
+    command: &CreateFounderSupportingMaterialCommand,
+) -> Option<String> {
+    let mut canonical = command.clone();
+    canonical.metadata.as_mut()?.request_digest_sha256.clear();
+    Some(hex::encode(Sha256::digest(canonical.encode_to_vec())))
+}
+
+fn validate_founder_verdict_action(task_view: &TaskView) -> Result<(), &'static str> {
+    let task = task_view.task.as_ref().ok_or("Task snapshot is missing")?;
+    if task.status != DomainTaskStatus::VerdictPending as i32 {
+        return Err("Task status is not VerdictPending");
+    }
+    if task.founder_verdict_id.is_some()
+        || task_view.founder_verdict.is_some()
+        || task_view.founder_verdict_state.is_some()
+    {
+        return Err("Task already has a Founder Verdict");
+    }
+    let mut verdict_actions = task_view
+        .available_actions
+        .iter()
+        .filter(|action| action.kind == AvailableActionKind::SubmitFounderVerdict as i32);
+    let verdict_action = verdict_actions
+        .next()
+        .ok_or("SubmitFounderVerdict is not available in the current projection")?;
+    if verdict_actions.next().is_some()
+        || verdict_action.owning_authority != "FounderVerdictAuthority"
+        || verdict_action.derivation_rule_ref.trim().is_empty()
+        || !verdict_action.explicit_confirmation_required
+    {
+        return Err("SubmitFounderVerdict action binding is invalid");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum ClientGuidedFounderVerdictError {
+    #[error("Founder Verdict recovery could not be saved; no request was sent")]
+    RecoveryStorage,
+    #[error(
+        "Founder Verdict Issue committed, but Apply recovery could not be saved; Apply was not sent"
+    )]
+    ApplyRecoveryStorage,
+    #[error("client kernel rejected the guided Founder Verdict: {0}")]
+    Kernel(#[from] KernelError),
+    #[error("the current result review is invalid: {0}")]
+    Review(#[from] ClientTaskResultReviewError),
+    #[error("guided Founder Verdict input is invalid: {0}")]
+    InvalidInput(&'static str),
+    #[error("the current Task cannot accept a Founder Verdict: {0}")]
+    NonActionable(&'static str),
+    #[error("the result review is missing required real material: {0}")]
+    MissingMaterial(&'static str),
+    #[error(
+        "Accept for {conclusion:?} requires complete risk coverage plus real rationale and compensating-control Artifacts"
+    )]
+    NonPassedAcceptRequiresRiskMaterials { conclusion: VerificationConclusion },
+    #[error("Rework requires a real required-changes Artifact and a complete Rework directive")]
+    ReworkRequiresDirectiveMaterials,
+    #[error("the caller-supplied replay digest does not match the guided verdict payload")]
+    RequestDigestMismatch,
+    #[error("the sealed Founder Verdict no longer matches the current Task result review")]
+    BindingChanged,
+    #[error("authenticated Founder Verdict session changed before exact retry")]
+    SessionChanged,
+    #[error("Founder Verdict Authority rejected the guided verdict")]
+    Authority {
+        error_code: i32,
+        safe_error_fingerprint: Option<String>,
+    },
+    #[error("Task Authority rejected the explicit Founder Verdict application")]
+    TaskAuthority {
+        error_code: i32,
+        safe_detail_code: String,
+    },
+}
+
+/// An Authority-confirmed Founder Verdict result. A missing await token means
+/// the Authority commit is known but the local projection cannot yet be awaited.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GuidedFounderVerdictResult {
+    authority: VerdictCommandResult,
+    await_token: Option<ProjectionAwaitToken>,
+    projection_warning: Option<LocalApiError>,
+}
+
+impl GuidedFounderVerdictResult {
+    #[must_use]
+    pub fn committed(&self) -> bool {
+        self.authority.committed
+    }
+
+    #[must_use]
+    pub fn replayed(&self) -> bool {
+        self.authority.replayed
+    }
+
+    #[must_use]
+    pub fn founder_verdict_id(&self) -> &str {
+        self.authority
+            .verdict
+            .as_ref()
+            .expect("validated guided Founder Verdict result")
+            .founder_verdict_id
+            .as_str()
+    }
+
+    #[must_use]
+    pub fn decision(&self) -> FounderVerdictDecision {
+        FounderVerdictDecision::try_from(
+            self.authority
+                .verdict
+                .as_ref()
+                .expect("validated guided Founder Verdict result")
+                .decision,
+        )
+        .expect("validated guided Founder Verdict decision")
+    }
+
+    #[must_use]
+    pub fn await_token(&self) -> Option<&ProjectionAwaitToken> {
+        self.await_token.as_ref()
+    }
+
+    #[must_use]
+    pub fn projection_warning(&self) -> Option<&LocalApiError> {
+        self.projection_warning.as_ref()
+    }
+}
+
+/// The exact sealed command retained when the write outcome cannot be proven.
+/// Its private fields prevent a retry from changing metadata, digest, expiry or
+/// scope; retry only refreshes transport-level client request metadata.
+#[derive(Clone, Debug)]
+pub struct RecoverableGuidedFounderVerdict {
+    authenticated_principal_id: String,
+    session_id: String,
+    selection: GuidedFounderVerdictSelection,
+    command: VerdictCommand,
+}
+
+impl RecoverableGuidedFounderVerdict {
+    #[must_use]
+    pub fn sealed_command(&self) -> &VerdictCommand {
+        &self.command
+    }
+
+    #[must_use]
+    pub const fn selection(&self) -> GuidedFounderVerdictSelection {
+        self.selection
+    }
+}
+
+pub enum GuidedFounderVerdictAttempt {
+    Committed(Box<GuidedFounderVerdictResult>),
+    OutcomeUnknown(Box<RecoverableGuidedFounderVerdict>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuidedFounderDecisionStage {
+    Issue,
+    Apply,
+}
+
+/// A guided Founder decision is complete only when the issued Verdict has
+/// been applied by Task Authority. The full validated Authority results remain
+/// available to shared surfaces without exposing a second write path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GuidedFounderDecisionResult {
+    verdict: GuidedFounderVerdictResult,
+    task: TaskCommandResult,
+    await_token: Option<ProjectionAwaitToken>,
+    projection_warning: Option<LocalApiError>,
+}
+
+impl GuidedFounderDecisionResult {
+    #[must_use]
+    pub fn verdict(&self) -> &GuidedFounderVerdictResult {
+        &self.verdict
+    }
+
+    #[must_use]
+    pub fn task(&self) -> &TaskSnapshot {
+        match self.task.outcome.as_ref() {
+            Some(task_command_result::Outcome::Task(task)) => task,
+            _ => unreachable!("validated guided Founder decision result"),
+        }
+    }
+
+    #[must_use]
+    pub fn task_replayed(&self) -> bool {
+        self.task.replayed
+    }
+
+    #[must_use]
+    pub fn await_token(&self) -> Option<&ProjectionAwaitToken> {
+        self.await_token.as_ref()
+    }
+
+    #[must_use]
+    pub fn projection_warning(&self) -> Option<&LocalApiError> {
+        self.projection_warning.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1382,6 +2201,8 @@ pub enum ClientGuidedWorkError {
     PreparationOutcomeUnknown(String),
     #[error("guided work confirmation outcome is unknown: {0}")]
     ConfirmationOutcomeUnknown(String),
+    #[error("guided work returned an API error without proving the commit outcome")]
+    ApiOutcomeUnknown(Box<LocalApiError>),
     #[error("local API rejected the guided work operation: {0:?}")]
     Api(Box<LocalApiError>),
     #[error("Task Authority rejected the guided work confirmation")]
@@ -1801,6 +2622,140 @@ impl ClientAttachment {
         .await
     }
 
+    /// Validates the exact sealed command against the current result review,
+    /// then submits it through the existing Founder Verdict gateway.
+    pub async fn submit_guided_founder_verdict(
+        &self,
+        command: VerdictCommand,
+        selection: GuidedFounderVerdictSelection,
+    ) -> Result<GuidedFounderVerdictAttempt, ClientGuidedFounderVerdictError> {
+        self.submit_guided_founder_verdict_inner(command, selection, None, None)
+            .await
+    }
+
+    pub async fn submit_guided_founder_verdict_with_materials(
+        &self,
+        command: VerdictCommand,
+        selection: GuidedFounderVerdictSelection,
+        materials: &FounderSupportingMaterialCollection,
+    ) -> Result<GuidedFounderVerdictAttempt, ClientGuidedFounderVerdictError> {
+        self.submit_guided_founder_verdict_inner(command, selection, Some(materials), None)
+            .await
+    }
+
+    async fn submit_guided_founder_verdict_inner(
+        &self,
+        command: VerdictCommand,
+        selection: GuidedFounderVerdictSelection,
+        materials: Option<&FounderSupportingMaterialCollection>,
+        recovery_path: Option<&std::path::Path>,
+    ) -> Result<GuidedFounderVerdictAttempt, ClientGuidedFounderVerdictError> {
+        let read_client = self.connection.read_model_service();
+        let evidence_client = read_client.clone();
+        let mut command_client = self.connection.command_gateway_service();
+        submit_guided_founder_verdict_materials_via(
+            &self.kernel,
+            GuidedFounderVerdictSubmission {
+                command,
+                selection,
+                materials,
+                recovery_path,
+            },
+            SystemTime::now(),
+            move |request| {
+                let mut client = read_client;
+                async move {
+                    client
+                        .get_task_view(request)
+                        .await
+                        .map(|response| response.into_inner())
+                        .map_err(|error| error.to_string())
+                }
+            },
+            move |request| {
+                let mut client = evidence_client;
+                async move {
+                    client
+                        .get_evidence_graph(request)
+                        .await
+                        .map(|response| response.into_inner())
+                        .map_err(|error| error.to_string())
+                }
+            },
+            move |request| async move {
+                command_client
+                    .execute_founder_verdict(request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    /// Sends one frozen supporting-material command. The command payload is
+    /// retained verbatim by callers for an exact retry when delivery is
+    /// unknown; this method never rebuilds it from display text or an artifact
+    /// identifier.
+    pub async fn create_founder_supporting_material(
+        &self,
+        prepared: PreparedFounderSupportingMaterial,
+    ) -> Result<ConfirmedFounderSupportingMaterialReceipt, ClientFounderSupportingMaterialError>
+    {
+        let mut client = self.connection.command_gateway_service();
+        submit_founder_supporting_material_via(
+            &self.kernel,
+            prepared,
+            SystemTime::now(),
+            move |request| async move {
+                client
+                    .create_founder_supporting_material(request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
+    pub async fn retry_founder_supporting_material(
+        &self,
+        recovery: &RecoverableFounderSupportingMaterial,
+    ) -> Result<ConfirmedFounderSupportingMaterialReceipt, ClientFounderSupportingMaterialError>
+    {
+        let mut client = self.connection.command_gateway_service();
+        retry_founder_supporting_material_via(&self.kernel, recovery, move |request| async move {
+            client
+                .create_founder_supporting_material(request)
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    /// Retries only the exact command retained after an unknown write outcome.
+    /// It intentionally does not read a newer result review or rebuild scope.
+    pub async fn retry_guided_founder_verdict(
+        &self,
+        recovery: &RecoverableGuidedFounderVerdict,
+    ) -> Result<GuidedFounderVerdictAttempt, ClientGuidedFounderVerdictError> {
+        let mut command_client = self.connection.command_gateway_service();
+        retry_guided_founder_verdict_via(
+            &self.kernel,
+            recovery,
+            SystemTime::now(),
+            move |request| async move {
+                command_client
+                    .execute_founder_verdict(request)
+                    .await
+                    .map(|response| response.into_inner())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .await
+    }
+
     /// Prepares a guided work start from user-owned intent only. Both
     /// idempotency keys are generated once here and remain private.
     pub async fn prepare_guided_work(
@@ -2082,7 +3037,7 @@ where
             // committed but input-bundle persistence failed. Preserve the
             // exact request so callers can replay it instead of preparing a
             // replacement with a new idempotency key.
-            Err(ClientGuidedWorkError::PreparationOutcomeUnknown(_)) => Ok(
+            Err(ClientGuidedWorkError::ApiOutcomeUnknown(_)) => Ok(
                 GuidedWorkPreparationAttempt::OutcomeUnknown(Box::new(recovery)),
             ),
             Err(error) => Err(error),
@@ -2099,10 +3054,8 @@ fn parse_guided_work_preparation(
 ) -> Result<PreparedWork, ClientGuidedWorkError> {
     let preview = match response.outcome {
         Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::prepare_work_response::Outcome::Preview(preview)) => preview,
-        Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::prepare_work_response::Outcome::Error(_)) => {
-            return Err(ClientGuidedWorkError::PreparationOutcomeUnknown(
-                "prepare response did not prove whether Context commit completed".to_owned(),
-            ));
+        Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::prepare_work_response::Outcome::Error(error)) => {
+            return Err(ClientGuidedWorkError::ApiOutcomeUnknown(Box::new(error)));
         }
         None => return Err(ClientGuidedWorkError::Protocol("prepare outcome missing")),
     };
@@ -2181,8 +3134,12 @@ pub fn validate_guided_work_input(input: &GuidedWorkInput) -> Result<(), ClientG
             "target_scope_ref is incomplete or too large",
         ));
     }
-    if (input.sources.is_empty() && input.memory_mode == GuidedWorkMemoryMode::Disabled)
-        || input.sources.len() > GUIDED_WORK_MAX_SOURCES
+    if input.sources.is_empty() && input.memory_mode == GuidedWorkMemoryMode::Disabled {
+        return Err(ClientGuidedWorkError::InvalidInput(
+            "add a context reference or enable memory",
+        ));
+    }
+    if input.sources.len() > GUIDED_WORK_MAX_SOURCES
         || input.sources.iter().any(|source| {
             !is_guided_work_text(&source.source_ref, GUIDED_WORK_MAX_ROUTING_BYTES)
                 || !is_guided_work_text(&source.label, GUIDED_WORK_MAX_ROUTING_BYTES)
@@ -2790,7 +3747,7 @@ where
             // ConfirmWork can return a gateway error after Task Authority
             // committed but await-token creation failed. Preserve the exact
             // command; the caller must replay it, not prepare again.
-            Err(ClientGuidedWorkError::ConfirmationOutcomeUnknown(_)) => Ok(
+            Err(ClientGuidedWorkError::ApiOutcomeUnknown(_)) => Ok(
                 GuidedWorkConfirmationAttempt::OutcomeUnknown(Box::new(recovery)),
             ),
             Err(error) => Err(error),
@@ -2847,10 +3804,8 @@ fn parse_guided_work_confirmation(
 ) -> Result<ConfirmedWork, ClientGuidedWorkError> {
     let accepted = match response.outcome {
         Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Accepted(accepted)) => accepted,
-        Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Error(_)) => {
-            return Err(ClientGuidedWorkError::ConfirmationOutcomeUnknown(
-                "confirm response did not prove whether Task commit completed".to_owned(),
-            ));
+        Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Error(error)) => {
+            return Err(ClientGuidedWorkError::ApiOutcomeUnknown(Box::new(error)));
         }
         None => return Err(ClientGuidedWorkError::Protocol("confirm outcome missing")),
     };
@@ -3443,6 +4398,1261 @@ fn validate_evidence_graph(
     Ok(())
 }
 
+/// Builds the existing `ExecuteFounderVerdict` payload from a trusted result
+/// review. The caller supplies stable command/idempotency metadata and the
+/// explicit confirmation proof; this function never invents supporting
+/// Artifact identifiers for decisions that require them.
+pub fn build_guided_founder_verdict(
+    review: &TaskResultReview,
+    input: GuidedFounderVerdictInput,
+) -> Result<VerdictCommand, ClientGuidedFounderVerdictError> {
+    build_guided_founder_verdict_inner(review, input, None)
+}
+
+/// Builds Rework or risk-accepting Founder Verdicts from receipts confirmed by
+/// the supporting-material RPC. Artifact identifiers and coverage are derived
+/// from those private confirmation capsules rather than accepted as input.
+pub fn build_guided_founder_verdict_with_materials(
+    review: &TaskResultReview,
+    input: GuidedFounderVerdictInput,
+    session: &egopulse_client_kernel::SessionBinding,
+    materials: &FounderSupportingMaterialCollection,
+) -> Result<VerdictCommand, ClientGuidedFounderVerdictError> {
+    if session.authenticated_principal_id.trim().is_empty() || session.session_id.trim().is_empty()
+    {
+        return Err(ClientGuidedFounderVerdictError::InvalidInput(
+            "authenticated Founder session must be complete",
+        ));
+    }
+    build_guided_founder_verdict_inner(
+        review,
+        input,
+        Some((session.authenticated_principal_id.as_str(), materials)),
+    )
+}
+
+fn build_guided_founder_verdict_inner(
+    review: &TaskResultReview,
+    input: GuidedFounderVerdictInput,
+    confirmed_materials: Option<(&str, &FounderSupportingMaterialCollection)>,
+) -> Result<VerdictCommand, ClientGuidedFounderVerdictError> {
+    if input.current_task_id.trim().is_empty() {
+        return Err(ClientGuidedFounderVerdictError::InvalidInput(
+            "current_task_id must not be empty",
+        ));
+    }
+    validate_guided_verdict_metadata(&input.metadata)?;
+    if input.confirmation_proof_ref.trim().is_empty() {
+        return Err(ClientGuidedFounderVerdictError::InvalidInput(
+            "confirmation_proof_ref must come from an explicit user confirmation",
+        ));
+    }
+    if !guided_verdict_timestamp_is_valid(&input.expires_at)
+        || input.metadata.issued_at.as_ref().is_none_or(|issued_at| {
+            (input.expires_at.seconds, input.expires_at.nanos)
+                <= (issued_at.seconds, issued_at.nanos)
+        })
+    {
+        return Err(ClientGuidedFounderVerdictError::InvalidInput(
+            "expires_at must be later than the caller-supplied issued_at",
+        ));
+    }
+
+    let (_, artifact_set_id) =
+        validate_task_result_view(&review.task_view, &input.current_task_id)?;
+    let artifact_set_id = artifact_set_id.ok_or(
+        ClientGuidedFounderVerdictError::MissingMaterial("current ArtifactSet"),
+    )?;
+    let graph =
+        review
+            .evidence_graph
+            .as_ref()
+            .ok_or(ClientGuidedFounderVerdictError::MissingMaterial(
+                "current EvidenceGraph for the selected ArtifactSet",
+            ))?;
+    validate_evidence_graph(
+        &review.task_view,
+        graph,
+        &input.current_task_id,
+        &artifact_set_id,
+    )?;
+
+    let task = review
+        .task_view
+        .task
+        .as_ref()
+        .expect("Task result review validation requires a Task snapshot");
+    validate_founder_verdict_action(&review.task_view)
+        .map_err(ClientGuidedFounderVerdictError::NonActionable)?;
+
+    let artifact_set = review
+        .task_view
+        .artifact_set
+        .as_ref()
+        .expect("Task result review validation requires the bound ArtifactSet");
+    if artifact_set.status != ArtifactSetStatus::Sealed as i32 {
+        return Err(ClientGuidedFounderVerdictError::MissingMaterial(
+            "sealed current ArtifactSet",
+        ));
+    }
+    let artifact_set_manifest = artifact_set
+        .canonical_manifest
+        .clone()
+        .filter(guided_verdict_content_address_is_complete)
+        .ok_or(ClientGuidedFounderVerdictError::MissingMaterial(
+            "sealed ArtifactSet canonical manifest",
+        ))?;
+    let verification = review.task_view.verification.as_ref().ok_or(
+        ClientGuidedFounderVerdictError::MissingMaterial("current VerificationArtifact"),
+    )?;
+    let conclusion = VerificationConclusion::try_from(verification.conclusion).map_err(|_| {
+        ClientGuidedFounderVerdictError::MissingMaterial(
+            "recognized current Verification conclusion",
+        )
+    })?;
+    let verification_payload = verification
+        .canonical_payload
+        .clone()
+        .filter(guided_verdict_content_address_is_complete)
+        .ok_or(ClientGuidedFounderVerdictError::MissingMaterial(
+            "sealed Verification canonical payload",
+        ))?;
+    let acceptance_contract_ref = task
+        .acceptance_contract_ref
+        .clone()
+        .filter(guided_verdict_contract_is_complete)
+        .ok_or(ClientGuidedFounderVerdictError::MissingMaterial(
+            "complete frozen AcceptanceContract reference",
+        ))?;
+    let current_scope = VerdictScope {
+        task_id: task.task_id.clone(),
+        task_revision: task.revision,
+        work_revision: task.work_revision,
+        artifact_set_id,
+        artifact_set_manifest: Some(artifact_set_manifest),
+        verification_artifact_id: verification.verification_artifact_id.clone(),
+        verification_payload: Some(verification_payload),
+        acceptance_contract_ref: Some(acceptance_contract_ref),
+    };
+    let material_terms = build_guided_founder_material_terms(
+        input.selection,
+        conclusion,
+        &input.reason_code,
+        verification,
+        artifact_set
+            .lineage
+            .as_ref()
+            .expect("trusted ArtifactSet lineage"),
+        &current_scope,
+        confirmed_materials,
+    )?;
+
+    let supplied_digest = input.metadata.request_digest_sha256.clone();
+    let mut command = VerdictCommand {
+        command: Some(verdict_command::Command::IssueFounderVerdict(
+            IssueFounderVerdictCommand {
+                metadata: Some(input.metadata),
+                scope: Some(current_scope),
+                decision: material_terms.decision as i32,
+                observed_verification_conclusion: conclusion as i32,
+                risk_acceptances: material_terms.risk_acceptances,
+                rework_directive: material_terms.rework_directive,
+                reason_code: input.reason_code,
+                rationale_artifact_id: None,
+                required_confirmation_class: material_terms.confirmation_class as i32,
+                confirmation_proof_ref: input.confirmation_proof_ref,
+                expires_at: Some(input.expires_at),
+                supersedes_founder_verdict_id: None,
+            },
+        )),
+    };
+    set_verdict_digest(&mut command);
+    let sealed_digest = match command.command.as_ref() {
+        Some(verdict_command::Command::IssueFounderVerdict(issue)) => issue
+            .metadata
+            .as_ref()
+            .expect("guided verdict metadata was supplied")
+            .request_digest_sha256
+            .as_str(),
+        _ => unreachable!("guided verdict builder always emits an issue command"),
+    };
+    if !supplied_digest.is_empty() && supplied_digest != sealed_digest {
+        return Err(ClientGuidedFounderVerdictError::RequestDigestMismatch);
+    }
+    Ok(command)
+}
+
+struct GuidedFounderMaterialTerms {
+    decision: FounderVerdictDecision,
+    risk_acceptances: Vec<RiskAcceptance>,
+    rework_directive: Option<ReworkDirective>,
+    confirmation_class: ConfirmationClass,
+}
+
+#[derive(Default)]
+struct GuidedRiskMaterialGroup {
+    rationale_artifact_id: Option<String>,
+    compensating_control_artifact_ids: Vec<String>,
+}
+
+fn build_guided_founder_material_terms(
+    selection: GuidedFounderVerdictSelection,
+    conclusion: VerificationConclusion,
+    reason_code: &str,
+    verification: &egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationArtifact,
+    current_lineage: &LineageBinding,
+    current_scope: &VerdictScope,
+    confirmed: Option<(&str, &FounderSupportingMaterialCollection)>,
+) -> Result<GuidedFounderMaterialTerms, ClientGuidedFounderVerdictError> {
+    let materials = confirmed.map(|(_, materials)| materials);
+    let has_materials = materials.is_some_and(|materials| !materials.is_empty());
+    match selection {
+        GuidedFounderVerdictSelection::Accept if conclusion == VerificationConclusion::Passed => {
+            if has_materials {
+                return Err(ClientGuidedFounderVerdictError::InvalidInput(
+                    "Passed Accept does not consume risk supporting materials",
+                ));
+            }
+            Ok(GuidedFounderMaterialTerms {
+                decision: FounderVerdictDecision::Accept,
+                risk_acceptances: Vec::new(),
+                rework_directive: None,
+                confirmation_class: ConfirmationClass::Explicit,
+            })
+        }
+        GuidedFounderVerdictSelection::Accept => {
+            let Some((founder_principal_id, materials)) =
+                confirmed.filter(|(_, value)| !value.is_empty())
+            else {
+                return Err(
+                    ClientGuidedFounderVerdictError::NonPassedAcceptRequiresRiskMaterials {
+                        conclusion,
+                    },
+                );
+            };
+            let risk_acceptances = build_guided_risk_acceptances(
+                materials,
+                founder_principal_id,
+                verification,
+                current_lineage,
+                current_scope,
+            )?;
+            Ok(GuidedFounderMaterialTerms {
+                decision: FounderVerdictDecision::Accept,
+                risk_acceptances,
+                rework_directive: None,
+                confirmation_class: ConfirmationClass::ElevatedRiskAcceptance,
+            })
+        }
+        GuidedFounderVerdictSelection::Rework => {
+            if reason_code.trim().is_empty() {
+                return Err(ClientGuidedFounderVerdictError::InvalidInput(
+                    "Rework requires a non-empty reason_code",
+                ));
+            }
+            let Some((founder_principal_id, materials)) =
+                confirmed.filter(|(_, value)| !value.is_empty())
+            else {
+                return Err(ClientGuidedFounderVerdictError::ReworkRequiresDirectiveMaterials);
+            };
+            let rework_directive = build_guided_rework_directive(
+                materials,
+                founder_principal_id,
+                verification,
+                current_lineage,
+                current_scope,
+                reason_code,
+            )?;
+            Ok(GuidedFounderMaterialTerms {
+                decision: FounderVerdictDecision::Rework,
+                risk_acceptances: Vec::new(),
+                rework_directive: Some(rework_directive),
+                confirmation_class: ConfirmationClass::Explicit,
+            })
+        }
+        GuidedFounderVerdictSelection::Reject => {
+            if reason_code.trim().is_empty() {
+                return Err(ClientGuidedFounderVerdictError::InvalidInput(
+                    "Reject requires a non-empty reason_code",
+                ));
+            }
+            if has_materials {
+                return Err(ClientGuidedFounderVerdictError::InvalidInput(
+                    "Reject does not consume supporting materials",
+                ));
+            }
+            Ok(GuidedFounderMaterialTerms {
+                decision: FounderVerdictDecision::Reject,
+                risk_acceptances: Vec::new(),
+                rework_directive: None,
+                confirmation_class: ConfirmationClass::Explicit,
+            })
+        }
+    }
+}
+
+fn build_guided_rework_directive(
+    materials: &FounderSupportingMaterialCollection,
+    founder_principal_id: &str,
+    verification: &egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationArtifact,
+    current_lineage: &LineageBinding,
+    current_scope: &VerdictScope,
+    reason_code: &str,
+) -> Result<ReworkDirective, ClientGuidedFounderVerdictError> {
+    if materials.materials.len() != 1 {
+        return Err(ClientGuidedFounderVerdictError::ReworkRequiresDirectiveMaterials);
+    }
+    let material = &materials.materials[0];
+    validate_confirmed_material_binding(
+        material,
+        founder_principal_id,
+        verification,
+        current_lineage,
+        current_scope,
+    )?;
+    if material.capsule.role != FounderSupportingMaterialRole::ReworkRequiredChanges {
+        return Err(ClientGuidedFounderVerdictError::ReworkRequiresDirectiveMaterials);
+    }
+    let coverage = material
+        .capsule
+        .coverage
+        .as_ref()
+        .expect("confirmed supporting material has validated coverage");
+    Ok(ReworkDirective {
+        directive_id: derived_founder_material_identity(
+            "rework-directive",
+            coverage,
+            &[material.receipt.artifact_id.as_str()],
+        ),
+        reason_code: reason_code.to_owned(),
+        required_changes_artifact_id: material.receipt.artifact_id.clone(),
+        target_discrepancy_ids: coverage.discrepancy_ids.clone(),
+        target_unverified_item_ids: coverage.unverified_item_ids.clone(),
+    })
+}
+
+fn build_guided_risk_acceptances(
+    materials: &FounderSupportingMaterialCollection,
+    founder_principal_id: &str,
+    verification: &egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationArtifact,
+    current_lineage: &LineageBinding,
+    current_scope: &VerdictScope,
+) -> Result<Vec<RiskAcceptance>, ClientGuidedFounderVerdictError> {
+    let mut groups: BTreeMap<(i32, Vec<String>, Vec<String>), GuidedRiskMaterialGroup> =
+        BTreeMap::new();
+    for material in &materials.materials {
+        validate_confirmed_material_binding(
+            material,
+            founder_principal_id,
+            verification,
+            current_lineage,
+            current_scope,
+        )?;
+        let coverage = material
+            .capsule
+            .coverage
+            .as_ref()
+            .expect("confirmed supporting material has validated coverage");
+        let key = (
+            coverage.risk_category,
+            coverage.discrepancy_ids.clone(),
+            coverage.unverified_item_ids.clone(),
+        );
+        let group = groups.entry(key).or_default();
+        match material.capsule.role {
+            FounderSupportingMaterialRole::RiskRationale
+                if group.rationale_artifact_id.is_none() =>
+            {
+                group.rationale_artifact_id = Some(material.receipt.artifact_id.clone());
+            }
+            FounderSupportingMaterialRole::CompensatingControl => group
+                .compensating_control_artifact_ids
+                .push(material.receipt.artifact_id.clone()),
+            _ => {
+                return Err(ClientGuidedFounderVerdictError::MissingMaterial(
+                    "each risk coverage requires one rationale and one or more compensating controls",
+                ));
+            }
+        }
+    }
+
+    let expected_discrepancies = current_discrepancy_ids(verification)?;
+    let expected_unverified = current_unverified_item_ids(verification)?;
+    let mut covered_discrepancies = BTreeSet::new();
+    let mut covered_unverified = BTreeSet::new();
+    let mut risks = Vec::with_capacity(groups.len());
+    for ((category, discrepancy_ids, unverified_item_ids), mut group) in groups {
+        let Some(rationale_artifact_id) = group.rationale_artifact_id else {
+            return Err(ClientGuidedFounderVerdictError::MissingMaterial(
+                "each risk coverage requires one rationale and one or more compensating controls",
+            ));
+        };
+        if group.compensating_control_artifact_ids.is_empty()
+            || discrepancy_ids
+                .iter()
+                .any(|id| !covered_discrepancies.insert(id.clone()))
+            || unverified_item_ids
+                .iter()
+                .any(|id| !covered_unverified.insert(id.clone()))
+        {
+            return Err(ClientGuidedFounderVerdictError::MissingMaterial(
+                "risk supporting materials must cover each current discrepancy and unverified item exactly once",
+            ));
+        }
+        group.compensating_control_artifact_ids.sort();
+        let coverage = FounderSupportingMaterialCoverage {
+            risk_category: category,
+            discrepancy_ids: discrepancy_ids.clone(),
+            unverified_item_ids: unverified_item_ids.clone(),
+        };
+        let mut identity_artifacts = vec![rationale_artifact_id.as_str()];
+        identity_artifacts.extend(
+            group
+                .compensating_control_artifact_ids
+                .iter()
+                .map(String::as_str),
+        );
+        risks.push(RiskAcceptance {
+            risk_acceptance_id: derived_founder_material_identity(
+                "risk-acceptance",
+                &coverage,
+                &identity_artifacts,
+            ),
+            category,
+            discrepancy_ids,
+            unverified_item_ids,
+            rationale_artifact_id,
+            compensating_control_artifact_ids: group.compensating_control_artifact_ids,
+            review_trigger_code: None,
+        });
+    }
+    if risks.is_empty()
+        || covered_discrepancies != expected_discrepancies
+        || covered_unverified != expected_unverified
+    {
+        return Err(ClientGuidedFounderVerdictError::MissingMaterial(
+            "risk supporting materials must cover each current discrepancy and unverified item exactly once",
+        ));
+    }
+    Ok(risks)
+}
+
+fn validate_confirmed_material_binding(
+    material: &ConfirmedFounderSupportingMaterialReceipt,
+    founder_principal_id: &str,
+    verification: &egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationArtifact,
+    current_lineage: &LineageBinding,
+    current_scope: &VerdictScope,
+) -> Result<(), ClientGuidedFounderVerdictError> {
+    let capsule = &material.capsule;
+    let coverage =
+        capsule
+            .coverage
+            .as_ref()
+            .ok_or(ClientGuidedFounderVerdictError::MissingMaterial(
+                "confirmed supporting material coverage",
+            ))?;
+    if capsule.authenticated_founder_principal_id != founder_principal_id
+        || &capsule.review_lineage != current_lineage
+        || &capsule.verdict_scope != current_scope
+        || material.receipt.scope.as_ref() != Some(current_scope)
+        || material.command.scope.as_ref() != Some(current_scope)
+        || material.receipt.material_id != capsule.material_id
+        || material.receipt.artifact_id
+            != founder_supporting_material_artifact_id(&capsule.material_id)
+        || material.receipt.role != capsule.role as i32
+        || material.command.role != capsule.role as i32
+        || material.command.coverage.as_ref() != Some(coverage)
+        || material.receipt.canonical_payload.as_ref() != Some(&capsule.expected_payload_address)
+        || !coverage_ids_belong_to_verification(coverage, verification)?
+    {
+        return Err(ClientGuidedFounderVerdictError::BindingChanged);
+    }
+    Ok(())
+}
+
+fn current_discrepancy_ids(
+    verification: &egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationArtifact,
+) -> Result<BTreeSet<String>, ClientGuidedFounderVerdictError> {
+    unique_current_verification_ids(
+        verification
+            .discrepancies
+            .iter()
+            .map(|item| item.discrepancy_id.as_str()),
+    )
+}
+
+fn current_unverified_item_ids(
+    verification: &egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationArtifact,
+) -> Result<BTreeSet<String>, ClientGuidedFounderVerdictError> {
+    unique_current_verification_ids(
+        verification
+            .unverified_items
+            .iter()
+            .map(|item| item.unverified_item_id.as_str()),
+    )
+}
+
+fn unique_current_verification_ids<'a>(
+    ids: impl Iterator<Item = &'a str>,
+) -> Result<BTreeSet<String>, ClientGuidedFounderVerdictError> {
+    let mut unique = BTreeSet::new();
+    for id in ids {
+        if id.trim().is_empty() || !unique.insert(id.to_owned()) {
+            return Err(ClientGuidedFounderVerdictError::Review(
+                ClientTaskResultReviewError::Integrity {
+                    stage: TaskResultReviewStage::Task,
+                    detail: "Verification coverage identity is invalid",
+                },
+            ));
+        }
+    }
+    Ok(unique)
+}
+
+fn coverage_ids_belong_to_verification(
+    coverage: &FounderSupportingMaterialCoverage,
+    verification: &egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationArtifact,
+) -> Result<bool, ClientGuidedFounderVerdictError> {
+    let discrepancies = current_discrepancy_ids(verification)?;
+    let unverified = current_unverified_item_ids(verification)?;
+    Ok(coverage
+        .discrepancy_ids
+        .iter()
+        .all(|id| discrepancies.contains(id))
+        && coverage
+            .unverified_item_ids
+            .iter()
+            .all(|id| unverified.contains(id)))
+}
+
+fn derived_founder_material_identity(
+    domain: &str,
+    coverage: &FounderSupportingMaterialCoverage,
+    artifact_ids: &[&str],
+) -> String {
+    let mut framed = Vec::new();
+    framed.extend_from_slice(&(domain.len() as u64).to_be_bytes());
+    framed.extend_from_slice(domain.as_bytes());
+    framed.extend_from_slice(&coverage.risk_category.to_be_bytes());
+    for field in coverage
+        .discrepancy_ids
+        .iter()
+        .map(String::as_str)
+        .chain(coverage.unverified_item_ids.iter().map(String::as_str))
+        .chain(artifact_ids.iter().copied())
+    {
+        framed.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        framed.extend_from_slice(field.as_bytes());
+    }
+    format!("{domain}-{}", hex::encode(Sha256::digest(framed)))
+}
+
+struct GuidedFounderVerdictSubmission<'a> {
+    command: VerdictCommand,
+    selection: GuidedFounderVerdictSelection,
+    materials: Option<&'a FounderSupportingMaterialCollection>,
+    recovery_path: Option<&'a std::path::Path>,
+}
+
+#[cfg(test)]
+async fn submit_guided_founder_verdict_via<T, TFut, E, EFut, Send, SendFuture>(
+    kernel: &ClientKernel,
+    command: VerdictCommand,
+    selection: GuidedFounderVerdictSelection,
+    now: SystemTime,
+    get_task: T,
+    get_evidence: E,
+    send: Send,
+) -> Result<GuidedFounderVerdictAttempt, ClientGuidedFounderVerdictError>
+where
+    T: FnOnce(GetTaskViewRequest) -> TFut,
+    TFut: Future<Output = Result<GetTaskViewResponse, String>>,
+    E: FnOnce(GetEvidenceGraphRequest) -> EFut,
+    EFut: Future<Output = Result<GetEvidenceGraphResponse, String>>,
+    Send: FnOnce(ExecuteFounderVerdictRequest) -> SendFuture,
+    SendFuture: Future<Output = Result<ExecuteFounderVerdictResponse, String>>,
+{
+    submit_guided_founder_verdict_materials_via(
+        kernel,
+        GuidedFounderVerdictSubmission {
+            command,
+            selection,
+            materials: None,
+            recovery_path: None,
+        },
+        now,
+        get_task,
+        get_evidence,
+        send,
+    )
+    .await
+}
+
+async fn submit_guided_founder_verdict_materials_via<T, TFut, E, EFut, Send, SendFuture>(
+    kernel: &ClientKernel,
+    submission: GuidedFounderVerdictSubmission<'_>,
+    now: SystemTime,
+    get_task: T,
+    get_evidence: E,
+    send: Send,
+) -> Result<GuidedFounderVerdictAttempt, ClientGuidedFounderVerdictError>
+where
+    T: FnOnce(GetTaskViewRequest) -> TFut,
+    TFut: Future<Output = Result<GetTaskViewResponse, String>>,
+    E: FnOnce(GetEvidenceGraphRequest) -> EFut,
+    EFut: Future<Output = Result<GetEvidenceGraphResponse, String>>,
+    Send: FnOnce(ExecuteFounderVerdictRequest) -> SendFuture,
+    SendFuture: Future<Output = Result<ExecuteFounderVerdictResponse, String>>,
+{
+    let GuidedFounderVerdictSubmission {
+        command,
+        selection,
+        materials,
+        recovery_path,
+    } = submission;
+    let input = guided_founder_verdict_input_from_command(&command, selection)?;
+    let (authenticated_principal_id, session_id) =
+        authorize_guided_founder_verdict_submission(kernel)?;
+    let review =
+        read_task_result_review_via(kernel, &input.current_task_id, now, get_task, get_evidence)
+            .await?;
+    let rebuilt = match materials {
+        Some(materials) => build_guided_founder_verdict_with_materials(
+            &review,
+            input,
+            kernel.session().ok_or(KernelError::SessionUnavailable)?,
+            materials,
+        )?,
+        None => build_guided_founder_verdict(&review, input)?,
+    };
+    if rebuilt != command {
+        return Err(ClientGuidedFounderVerdictError::BindingChanged);
+    }
+    let recovery = RecoverableGuidedFounderVerdict {
+        authenticated_principal_id,
+        session_id,
+        selection,
+        command,
+    };
+    if let Some(path) = recovery_path {
+        let saved = DurableFounderVerdictRecovery::capture(kernel, &recovery).map_err(|_| {
+            ClientGuidedFounderVerdictError::InvalidInput("invalid recovery capsule")
+        })?;
+        saved
+            .write_new(path)
+            .map_err(|_| ClientGuidedFounderVerdictError::RecoveryStorage)?;
+    }
+    dispatch_guided_founder_verdict(kernel, recovery, now, send).await
+}
+
+async fn retry_guided_founder_verdict_via<Send, SendFuture>(
+    kernel: &ClientKernel,
+    recovery: &RecoverableGuidedFounderVerdict,
+    now: SystemTime,
+    send: Send,
+) -> Result<GuidedFounderVerdictAttempt, ClientGuidedFounderVerdictError>
+where
+    Send: FnOnce(ExecuteFounderVerdictRequest) -> SendFuture,
+    SendFuture: Future<Output = Result<ExecuteFounderVerdictResponse, String>>,
+{
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel.profiles().authorize_command(
+        EXECUTE_FOUNDER_VERDICT_RPC,
+        ISSUE_FOUNDER_VERDICT_COMMAND,
+        &session.granted_permission_codes,
+    )?;
+    if session.authenticated_principal_id != recovery.authenticated_principal_id
+        || session.session_id != recovery.session_id
+    {
+        return Err(ClientGuidedFounderVerdictError::SessionChanged);
+    }
+    validate_sealed_guided_founder_verdict(&recovery.command, recovery.selection)?;
+    // A retry-time rejection can precede Authority idempotency lookup (for
+    // example, when the current principal lost permission). It therefore
+    // cannot prove that the earlier transport-unknown submission did not
+    // commit; retain the exact caller-owned recovery capsule.
+    match dispatch_guided_founder_verdict(kernel, recovery.clone(), now, send).await {
+        Err(ClientGuidedFounderVerdictError::Authority { .. }) => Ok(
+            GuidedFounderVerdictAttempt::OutcomeUnknown(Box::new(recovery.clone())),
+        ),
+        result => result,
+    }
+}
+
+fn authorize_guided_founder_verdict_submission(
+    kernel: &ClientKernel,
+) -> Result<(String, String), ClientGuidedFounderVerdictError> {
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    for rpc in [GET_TASK_VIEW_RPC, GET_EVIDENCE_GRAPH_RPC] {
+        kernel
+            .profiles()
+            .authorize_rpc(rpc, &session.granted_permission_codes)?;
+    }
+    kernel.profiles().authorize_command(
+        EXECUTE_FOUNDER_VERDICT_RPC,
+        ISSUE_FOUNDER_VERDICT_COMMAND,
+        &session.granted_permission_codes,
+    )?;
+    Ok((
+        session.authenticated_principal_id.clone(),
+        session.session_id.clone(),
+    ))
+}
+
+fn authorize_guided_founder_decision_submission(
+    kernel: &ClientKernel,
+) -> Result<(String, String), ClientGuidedFounderVerdictError> {
+    let identity = authorize_guided_founder_verdict_submission(kernel)?;
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel.profiles().authorize_command(
+        EXECUTE_TASK_COMMAND_RPC,
+        APPLY_FOUNDER_VERDICT_COMMAND,
+        &session.granted_permission_codes,
+    )?;
+    Ok(identity)
+}
+
+fn guided_founder_verdict_input_from_command(
+    command: &VerdictCommand,
+    selection: GuidedFounderVerdictSelection,
+) -> Result<GuidedFounderVerdictInput, ClientGuidedFounderVerdictError> {
+    let issue = match command.command.as_ref() {
+        Some(verdict_command::Command::IssueFounderVerdict(issue)) => issue,
+        _ => {
+            return Err(ClientGuidedFounderVerdictError::InvalidInput(
+                "sealed command must issue a Founder Verdict",
+            ));
+        }
+    };
+    let scope = issue
+        .scope
+        .as_ref()
+        .ok_or(ClientGuidedFounderVerdictError::InvalidInput(
+            "sealed Founder Verdict scope is missing",
+        ))?;
+    let metadata = issue
+        .metadata
+        .clone()
+        .ok_or(ClientGuidedFounderVerdictError::InvalidInput(
+            "sealed Founder Verdict metadata is missing",
+        ))?;
+    let expires_at = issue
+        .expires_at
+        .ok_or(ClientGuidedFounderVerdictError::InvalidInput(
+            "sealed Founder Verdict expiry is missing",
+        ))?;
+    validate_sealed_guided_founder_verdict(command, selection)?;
+    Ok(GuidedFounderVerdictInput {
+        current_task_id: scope.task_id.clone(),
+        metadata,
+        selection,
+        reason_code: issue.reason_code.clone(),
+        confirmation_proof_ref: issue.confirmation_proof_ref.clone(),
+        expires_at,
+    })
+}
+
+fn validate_sealed_guided_founder_verdict(
+    command: &VerdictCommand,
+    selection: GuidedFounderVerdictSelection,
+) -> Result<(), ClientGuidedFounderVerdictError> {
+    let issue = match command.command.as_ref() {
+        Some(verdict_command::Command::IssueFounderVerdict(issue)) => issue,
+        _ => {
+            return Err(ClientGuidedFounderVerdictError::InvalidInput(
+                "sealed command must issue a Founder Verdict",
+            ));
+        }
+    };
+    let metadata = issue
+        .metadata
+        .as_ref()
+        .ok_or(ClientGuidedFounderVerdictError::InvalidInput(
+            "sealed Founder Verdict metadata is missing",
+        ))?;
+    if !guided_verdict_digest_is_complete(&metadata.request_digest_sha256) {
+        return Err(ClientGuidedFounderVerdictError::RequestDigestMismatch);
+    }
+    let expected_decision = match selection {
+        GuidedFounderVerdictSelection::Accept => FounderVerdictDecision::Accept,
+        GuidedFounderVerdictSelection::Reject => FounderVerdictDecision::Reject,
+        GuidedFounderVerdictSelection::Rework => {
+            if issue.rework_directive.is_none() {
+                return Err(ClientGuidedFounderVerdictError::ReworkRequiresDirectiveMaterials);
+            }
+            FounderVerdictDecision::Rework
+        }
+    };
+    if issue.decision != expected_decision as i32 {
+        return Err(ClientGuidedFounderVerdictError::BindingChanged);
+    }
+    let mut recomputed = command.clone();
+    set_verdict_digest(&mut recomputed);
+    if recomputed != *command {
+        return Err(ClientGuidedFounderVerdictError::RequestDigestMismatch);
+    }
+    Ok(())
+}
+
+async fn dispatch_guided_founder_verdict<Send, SendFuture>(
+    kernel: &ClientKernel,
+    recovery: RecoverableGuidedFounderVerdict,
+    now: SystemTime,
+    send: Send,
+) -> Result<GuidedFounderVerdictAttempt, ClientGuidedFounderVerdictError>
+where
+    Send: FnOnce(ExecuteFounderVerdictRequest) -> SendFuture,
+    SendFuture: Future<Output = Result<ExecuteFounderVerdictResponse, String>>,
+{
+    let correlation_id = guided_founder_verdict_issue(&recovery.command)?
+        .metadata
+        .as_ref()
+        .expect("sealed guided Founder Verdict metadata")
+        .correlation_id
+        .clone();
+    let request = ExecuteFounderVerdictRequest {
+        client: Some(kernel.request_metadata(
+            Uuid::now_v7().to_string(),
+            Some(correlation_id),
+            now,
+        )?),
+        command: Some(recovery.command.clone()),
+    };
+    let response = match send(request).await {
+        Ok(response) => response,
+        Err(_) => {
+            return Ok(GuidedFounderVerdictAttempt::OutcomeUnknown(Box::new(
+                recovery,
+            )));
+        }
+    };
+    match parse_guided_founder_verdict_response(
+        response,
+        &recovery.command,
+        &recovery.authenticated_principal_id,
+    )? {
+        Some(result) => Ok(GuidedFounderVerdictAttempt::Committed(Box::new(result))),
+        None => Ok(GuidedFounderVerdictAttempt::OutcomeUnknown(Box::new(
+            recovery,
+        ))),
+    }
+}
+
+fn guided_founder_verdict_issue(
+    command: &VerdictCommand,
+) -> Result<&IssueFounderVerdictCommand, ClientGuidedFounderVerdictError> {
+    match command.command.as_ref() {
+        Some(verdict_command::Command::IssueFounderVerdict(issue)) => Ok(issue),
+        _ => Err(ClientGuidedFounderVerdictError::InvalidInput(
+            "sealed command must issue a Founder Verdict",
+        )),
+    }
+}
+
+fn parse_guided_founder_verdict_response(
+    response: ExecuteFounderVerdictResponse,
+    expected_command: &VerdictCommand,
+    expected_principal_id: &str,
+) -> Result<Option<GuidedFounderVerdictResult>, ClientGuidedFounderVerdictError> {
+    let ExecuteFounderVerdictResponse {
+        authority_result,
+        await_token,
+        gateway_error,
+    } = response;
+    let Some(authority) = authority_result else {
+        return Ok(None);
+    };
+    let Ok(error_code) = VerdictErrorCode::try_from(authority.error_code) else {
+        return Ok(None);
+    };
+    if error_code != VerdictErrorCode::Unspecified {
+        if authority.committed
+            || authority.verdict.is_some()
+            || authority.state.is_some()
+            || authority.consumption_receipt.is_some()
+            || authority.event.is_some()
+        {
+            return Ok(None);
+        }
+        return Err(ClientGuidedFounderVerdictError::Authority {
+            error_code: authority.error_code,
+            safe_error_fingerprint: authority.safe_error_fingerprint,
+        });
+    }
+    if !guided_founder_verdict_result_matches(&authority, expected_command, expected_principal_id) {
+        return Ok(None);
+    }
+    let await_token =
+        await_token.filter(|token| guided_founder_verdict_await_token_matches(token, &authority));
+    Ok(Some(GuidedFounderVerdictResult {
+        authority,
+        await_token,
+        projection_warning: gateway_error,
+    }))
+}
+
+fn guided_founder_verdict_result_matches(
+    result: &VerdictCommandResult,
+    expected_command: &VerdictCommand,
+    expected_principal_id: &str,
+) -> bool {
+    let Ok(issue) = guided_founder_verdict_issue(expected_command) else {
+        return false;
+    };
+    let (Some(verdict), Some(state), Some(event), Some(metadata)) = (
+        result.verdict.as_ref(),
+        result.state.as_ref(),
+        result.event.as_ref(),
+        issue.metadata.as_ref(),
+    ) else {
+        return false;
+    };
+    let Some(proof) = verdict.authority_proof.as_ref() else {
+        return false;
+    };
+    result.committed
+        && result.consumption_receipt.is_none()
+        && result.safe_error_fingerprint.is_none()
+        && !verdict.founder_verdict_id.trim().is_empty()
+        && verdict.version > 0
+        && verdict.scope == issue.scope
+        && verdict.decision == issue.decision
+        && verdict.observed_verification_conclusion == issue.observed_verification_conclusion
+        && verdict.risk_acceptances == issue.risk_acceptances
+        && verdict.rework_directive == issue.rework_directive
+        && verdict.reason_code == issue.reason_code
+        && verdict.rationale_artifact_id == issue.rationale_artifact_id
+        && verdict.expires_at == issue.expires_at
+        && verdict.supersedes_founder_verdict_id == issue.supersedes_founder_verdict_id
+        && proof.authenticated_founder_principal_id == expected_principal_id
+        && !proof.authority_ref.trim().is_empty()
+        && proof.confirmation_class == issue.required_confirmation_class
+        && proof.confirmation_proof_ref == issue.confirmation_proof_ref
+        && verdict
+            .canonical_payload
+            .as_ref()
+            .is_some_and(guided_verdict_content_address_is_complete)
+        && state.founder_verdict_id == verdict.founder_verdict_id
+        && state.revision > 0
+        && state.state == FounderVerdictStateKind::Issued as i32
+        && event.founder_verdict_id == verdict.founder_verdict_id
+        && event.resulting_state_revision == state.revision
+        && event.kind == VerdictEventKind::Issued as i32
+        && event.authenticated_principal_id == expected_principal_id
+        && event.command_id == metadata.command_id
+        && !event.event_id.trim().is_empty()
+        && event.committed_at.is_some()
+}
+
+fn guided_founder_verdict_await_token_matches(
+    token: &ProjectionAwaitToken,
+    result: &VerdictCommandResult,
+) -> bool {
+    let (Some(source), Some(expires_at), Some(verdict), Some(state), Some(event)) = (
+        token.required_source_revision.as_ref(),
+        token.expires_at.as_ref(),
+        result.verdict.as_ref(),
+        result.state.as_ref(),
+        result.event.as_ref(),
+    ) else {
+        return false;
+    };
+    !token.token.trim().is_empty()
+        && guided_verdict_timestamp_is_valid(expires_at)
+        && source.domain == SourceDomain::FounderVerdict as i32
+        && source.aggregate_id == verdict.founder_verdict_id
+        && source.revision == state.revision
+        && source.last_event_id == event.event_id
+}
+
+fn build_guided_founder_apply_command(
+    issue_command: &VerdictCommand,
+    result: &GuidedFounderVerdictResult,
+) -> Result<TaskCommand, ClientGuidedFounderVerdictError> {
+    let issue = guided_founder_verdict_issue(issue_command)?;
+    let metadata = issue
+        .metadata
+        .as_ref()
+        .ok_or(ClientGuidedFounderVerdictError::BindingChanged)?;
+    let verdict = result
+        .authority
+        .verdict
+        .as_ref()
+        .ok_or(ClientGuidedFounderVerdictError::BindingChanged)?;
+    let event = result
+        .authority
+        .event
+        .as_ref()
+        .ok_or(ClientGuidedFounderVerdictError::BindingChanged)?;
+    let scope = verdict
+        .scope
+        .as_ref()
+        .ok_or(ClientGuidedFounderVerdictError::BindingChanged)?;
+    let issued_at = event
+        .committed_at
+        .ok_or(ClientGuidedFounderVerdictError::BindingChanged)?;
+
+    // The Apply identity is derived only from the sealed Issue and its exact
+    // immutable Authority result. Exact Issue replay therefore reconstructs
+    // byte-identical Apply metadata after a process restart.
+    let mut identity = Vec::new();
+    for field in [
+        issue_command.encode_to_vec(),
+        verdict.founder_verdict_id.as_bytes().to_vec(),
+        event.event_id.as_bytes().to_vec(),
+    ] {
+        identity.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        identity.extend_from_slice(&field);
+    }
+    let identity = hex::encode(Sha256::digest(identity));
+    let mut command = TaskCommand {
+        command: Some(task_command::Command::ApplyFounderVerdict(
+            ApplyFounderVerdictCommand {
+                meta: Some(CommandMetadata {
+                    command_id: format!("apply-founder-verdict-{identity}"),
+                    idempotency_key: format!("apply-founder-verdict:{identity}"),
+                    idempotency_scope: GUIDED_FOUNDER_APPLY_SCOPE.to_owned(),
+                    request_digest_sha256: String::new(),
+                    issued_at: Some(issued_at),
+                    correlation_id: metadata.correlation_id.clone(),
+                    causation_id: Some(event.event_id.clone()),
+                }),
+                task_id: scope.task_id.clone(),
+                expected_revision: scope.task_revision,
+                work_revision: scope.work_revision,
+                founder_verdict_id: verdict.founder_verdict_id.clone(),
+            },
+        )),
+    };
+    set_task_digest(&mut command);
+    Ok(command)
+}
+
+async fn dispatch_guided_founder_apply<Send, SendFuture>(
+    kernel: &ClientKernel,
+    command: TaskCommand,
+    verdict: GuidedFounderVerdictResult,
+    now: SystemTime,
+    send: Send,
+) -> Result<Option<GuidedFounderDecisionResult>, ClientGuidedFounderVerdictError>
+where
+    Send: FnOnce(ExecuteTaskCommandRequest) -> SendFuture,
+    SendFuture: Future<Output = Result<ExecuteTaskCommandResponse, String>>,
+{
+    let session = kernel.session().ok_or(KernelError::SessionUnavailable)?;
+    kernel.profiles().authorize_command(
+        EXECUTE_TASK_COMMAND_RPC,
+        APPLY_FOUNDER_VERDICT_COMMAND,
+        &session.granted_permission_codes,
+    )?;
+    let apply = match command.command.as_ref() {
+        Some(task_command::Command::ApplyFounderVerdict(apply)) => apply,
+        _ => unreachable!("guided Founder Apply command"),
+    };
+    let correlation_id = apply
+        .meta
+        .as_ref()
+        .expect("guided Founder Apply metadata")
+        .correlation_id
+        .clone();
+    let request = ExecuteTaskCommandRequest {
+        client: Some(kernel.request_metadata(
+            Uuid::now_v7().to_string(),
+            Some(correlation_id),
+            now,
+        )?),
+        command: Some(command.clone()),
+    };
+    let response = match send(request).await {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    parse_guided_founder_apply_response(
+        response,
+        &command,
+        &verdict,
+        &session.authenticated_principal_id,
+    )
+}
+
+fn parse_guided_founder_apply_response(
+    response: ExecuteTaskCommandResponse,
+    expected_command: &TaskCommand,
+    verdict: &GuidedFounderVerdictResult,
+    expected_principal_id: &str,
+) -> Result<Option<GuidedFounderDecisionResult>, ClientGuidedFounderVerdictError> {
+    let ExecuteTaskCommandResponse {
+        authority_result,
+        await_token,
+        gateway_error,
+    } = response;
+    let Some(authority) = authority_result else {
+        return Ok(None);
+    };
+    if let Some(task_command_result::Outcome::Error(error)) = authority.outcome.as_ref() {
+        if authority.committed_event.is_some()
+            || TaskErrorCode::try_from(error.code).is_err()
+            || error.code == TaskErrorCode::Unspecified as i32
+        {
+            return Ok(None);
+        }
+        return Err(ClientGuidedFounderVerdictError::TaskAuthority {
+            error_code: error.code,
+            safe_detail_code: error.safe_detail_code.clone(),
+        });
+    }
+    if !guided_founder_apply_result_matches(
+        &authority,
+        expected_command,
+        verdict,
+        expected_principal_id,
+    ) {
+        return Ok(None);
+    }
+    let await_token =
+        await_token.filter(|token| guided_task_await_token_matches(token, &authority));
+    Ok(Some(GuidedFounderDecisionResult {
+        verdict: verdict.clone(),
+        task: authority,
+        await_token,
+        projection_warning: gateway_error,
+    }))
+}
+
+fn guided_founder_apply_result_matches(
+    result: &TaskCommandResult,
+    expected_command: &TaskCommand,
+    verdict_result: &GuidedFounderVerdictResult,
+    expected_principal_id: &str,
+) -> bool {
+    let Some(task_command::Command::ApplyFounderVerdict(expected)) =
+        expected_command.command.as_ref()
+    else {
+        return false;
+    };
+    let (Some(metadata), Some(task), Some(event), Some(verdict)) = (
+        expected.meta.as_ref(),
+        result.outcome.as_ref().and_then(|outcome| match outcome {
+            task_command_result::Outcome::Task(task) => Some(task),
+            task_command_result::Outcome::Error(_) => None,
+        }),
+        result.committed_event.as_ref(),
+        verdict_result.authority.verdict.as_ref(),
+    ) else {
+        return false;
+    };
+    let Some(scope) = verdict.scope.as_ref() else {
+        return false;
+    };
+    let expected_status = match FounderVerdictDecision::try_from(verdict.decision) {
+        Ok(FounderVerdictDecision::Accept) => DomainTaskStatus::Completed,
+        Ok(FounderVerdictDecision::Rework) => DomainTaskStatus::Rework,
+        Ok(FounderVerdictDecision::Reject) => DomainTaskStatus::Rejected,
+        _ => return false,
+    };
+    let Some(resulting_revision) = scope.task_revision.checked_add(1) else {
+        return false;
+    };
+    task.task_id == scope.task_id
+        && task.revision == resulting_revision
+        && task.work_revision == scope.work_revision
+        && task.status == expected_status as i32
+        && task.artifact_set_id.as_deref() == Some(scope.artifact_set_id.as_str())
+        && task.verification_artifact_id.as_deref() == Some(scope.verification_artifact_id.as_str())
+        && task.founder_verdict_id.as_deref() == Some(verdict.founder_verdict_id.as_str())
+        && task.acceptance_contract_ref == scope.acceptance_contract_ref
+        && event.kind == TaskEventKind::VerdictApplied as i32
+        && !event.event_id.trim().is_empty()
+        && event.command_id == metadata.command_id
+        && event.task_id == scope.task_id
+        && event.expected_revision == scope.task_revision
+        && event.resulting_revision == resulting_revision
+        && event.work_revision == scope.work_revision
+        && event.authenticated_principal_id == expected_principal_id
+        && !event.authority_ref.trim().is_empty()
+        && event.idempotency_key == metadata.idempotency_key
+        && event.request_digest_sha256 == metadata.request_digest_sha256
+        && event.correlation_id == metadata.correlation_id
+        && event.causation_id == metadata.causation_id
+        && event
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == &verdict.founder_verdict_id)
+        && event
+            .occurred_at
+            .is_some_and(|value| guided_verdict_timestamp_is_valid(&value))
+        && event.snapshot.as_ref() == Some(task)
+}
+
+fn guided_task_await_token_matches(
+    token: &ProjectionAwaitToken,
+    result: &TaskCommandResult,
+) -> bool {
+    let (Some(source), Some(expires_at), Some(task), Some(event)) = (
+        token.required_source_revision.as_ref(),
+        token.expires_at.as_ref(),
+        result.outcome.as_ref().and_then(|outcome| match outcome {
+            task_command_result::Outcome::Task(task) => Some(task),
+            task_command_result::Outcome::Error(_) => None,
+        }),
+        result.committed_event.as_ref(),
+    ) else {
+        return false;
+    };
+    !token.token.trim().is_empty()
+        && guided_verdict_timestamp_is_valid(expires_at)
+        && source.domain == SourceDomain::Task as i32
+        && source.aggregate_id == task.task_id
+        && source.revision == task.revision
+        && source.last_event_id == event.event_id
+}
+
+fn validate_guided_verdict_metadata(
+    metadata: &CommandMetadata,
+) -> Result<(), ClientGuidedFounderVerdictError> {
+    if metadata.command_id.trim().is_empty()
+        || metadata.idempotency_key.trim().is_empty()
+        || metadata.idempotency_scope.trim().is_empty()
+        || metadata.correlation_id.trim().is_empty()
+        || metadata
+            .issued_at
+            .as_ref()
+            .is_none_or(|value| !guided_verdict_timestamp_is_valid(value))
+        || (!metadata.request_digest_sha256.is_empty()
+            && !guided_verdict_digest_is_complete(&metadata.request_digest_sha256))
+    {
+        return Err(ClientGuidedFounderVerdictError::InvalidInput(
+            "caller-supplied command metadata is incomplete",
+        ));
+    }
+    Ok(())
+}
+
+fn guided_verdict_timestamp_is_valid(value: &Timestamp) -> bool {
+    value.seconds >= 0 && (0..1_000_000_000).contains(&value.nanos)
+}
+
+fn guided_verdict_digest_is_complete(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn guided_verdict_content_address_is_complete(
+    address: &egopulse_domain_contracts::v01::egopulse::artifact::v1::ContentAddress,
+) -> bool {
+    address.algorithm == HashAlgorithm::Sha256 as i32
+        && guided_verdict_digest_is_complete(&address.digest)
+        && address.byte_length > 0
+}
+
+fn guided_verdict_contract_is_complete(
+    reference: &egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference,
+) -> bool {
+    !reference.contract_id.trim().is_empty()
+        && !reference.version.trim().is_empty()
+        && guided_verdict_digest_is_complete(&reference.sha256)
+}
+
 async fn read_governed_task_baseline_via<F, Fut>(
     kernel: &ClientKernel,
     now: SystemTime,
@@ -3642,6 +5852,22 @@ where
         return Err(ClientGuidedApprovalDecisionError::NonActionable);
     }
 
+    if input.decision == GuidedApprovalDecision::AllowOnce
+        && (!egopulse_domain_contracts::approval_display::valid_reviewable_approval_summary(
+            view.display_summary.as_ref(),
+            &view.display_summary_ref,
+            &view.action_digest_sha256,
+            view.kind,
+        ) || input.reviewed_summary_digest_sha256.as_deref()
+            != view
+                .display_summary
+                .as_ref()
+                .map(|summary| summary.summary_digest_sha256.as_str()))
+    {
+        return Err(ClientGuidedApprovalDecisionError::InvalidInput(
+            "AllowOnce requires the complete current operation summary and its reviewed digest; read approval details again",
+        ));
+    }
     let correlation_id = Uuid::now_v7().to_string();
     let mut command = PolicyDecisionCommand {
         command: Some(
@@ -4883,8 +7109,13 @@ mod tests {
         common::v1::ContractReference,
         localapi::v1::{ProjectionMetadata, RedactedField},
         task::v1::{TaskSnapshot, TaskStatus},
-        verdict::v1::{FounderVerdict, FounderVerdictState, VerdictScope},
-        verification::v1::{VerificationArtifact, VerificationBinding, VerificationConclusion},
+        verdict::v1::{
+            FounderAuthorityProof, FounderVerdict, FounderVerdictState, VerdictEvent, VerdictScope,
+        },
+        verification::v1::{
+            Discrepancy, UnverifiedItem, VerificationArtifact, VerificationBinding,
+            VerificationConclusion,
+        },
     };
 
     use super::*;
@@ -4963,6 +7194,24 @@ mod tests {
         surface: ClientSurface,
         now: SystemTime,
     ) -> ClientKernel {
+        authenticated_kernel_with_permissions_and_epoch(
+            principal_id,
+            session_id,
+            permission_codes,
+            surface,
+            now,
+            "epoch:context-revoke",
+        )
+    }
+
+    fn authenticated_kernel_with_permissions_and_epoch(
+        principal_id: &str,
+        session_id: &str,
+        permission_codes: &[&str],
+        surface: ClientSurface,
+        now: SystemTime,
+        epoch: &str,
+    ) -> ClientKernel {
         let expires_at = now
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("test clock after epoch")
@@ -4984,7 +7233,7 @@ mod tests {
                         nanos: expires_at.subsec_nanos() as i32,
                     }),
                     current_position: Some(ProjectionPosition {
-                        epoch: "epoch:context-revoke".to_owned(),
+                        epoch: epoch.to_owned(),
                         sequence: 1,
                         projected_at: Some(Timestamp {
                             seconds: 1,
@@ -5212,6 +7461,18 @@ mod tests {
                 GuidedWorkNonGoal::MemoryMutationExcluded,
             ]
         );
+
+        let missing_context = GuidedWorkInput {
+            sources: Vec::new(),
+            memory_mode: GuidedWorkMemoryMode::Disabled,
+            ..guided_work_input()
+        };
+        assert!(matches!(
+            validate_guided_work_input(&missing_context),
+            Err(ClientGuidedWorkError::InvalidInput(
+                "add a context reference or enable memory"
+            ))
+        ));
 
         for invalid in [
             GuidedWorkInput {
@@ -5656,7 +7917,7 @@ mod tests {
                     })
                 },
             )),
-            Err(ClientGuidedWorkError::PreparationOutcomeUnknown(_))
+            Err(ClientGuidedWorkError::ApiOutcomeUnknown(_))
         ));
         let prepare_error_replay_request = RefCell::new(None);
         let prepared_after_error = block_on_ready(replay_guided_work_preparation_via(
@@ -5776,7 +8037,7 @@ mod tests {
                     })
                 },
             )),
-            Err(ClientGuidedWorkError::ConfirmationOutcomeUnknown(_))
+            Err(ClientGuidedWorkError::ApiOutcomeUnknown(_))
         ));
         let replay_request = RefCell::new(None);
         let confirmed = block_on_ready(replay_guided_work_confirmation_via(
@@ -6129,6 +8390,338 @@ mod tests {
         (task_view, graph)
     }
 
+    fn verdict_pending_review(conclusion: VerificationConclusion) -> TaskResultReview {
+        let (mut task_view, evidence_graph) = task_result_fixture();
+        let task = task_view.task.as_mut().unwrap();
+        task.status = TaskStatus::VerdictPending as i32;
+        task.founder_verdict_id = None;
+        task_view.verification.as_mut().unwrap().conclusion = conclusion as i32;
+        task_view.founder_verdict = None;
+        task_view.founder_verdict_state = None;
+        task_view
+            .metadata
+            .as_mut()
+            .unwrap()
+            .source_revisions
+            .retain(|source| source.domain != SourceDomain::FounderVerdict as i32);
+        task_view.available_actions = vec![AvailableAction {
+            kind: AvailableActionKind::SubmitFounderVerdict as i32,
+            owning_authority: "FounderVerdictAuthority".to_owned(),
+            derivation_rule_ref: "rule:task-actionability:v1".to_owned(),
+            explicit_confirmation_required: true,
+            reason_code: None,
+        }];
+        TaskResultReview {
+            task_view,
+            evidence_graph: Some(evidence_graph),
+        }
+    }
+
+    fn verdict_review_with_open_items(conclusion: VerificationConclusion) -> TaskResultReview {
+        let mut review = verdict_pending_review(conclusion);
+        let verification = review
+            .task_view
+            .verification
+            .as_mut()
+            .expect("review verification");
+        verification.discrepancies = vec![Discrepancy {
+            discrepancy_id: "discrepancy:review:1".to_owned(),
+            criterion_id: "criterion:review".to_owned(),
+            ..Default::default()
+        }];
+        verification.unverified_items = vec![UnverifiedItem {
+            unverified_item_id: "unverified:review:1".to_owned(),
+            criterion_id: "criterion:review".to_owned(),
+            ..Default::default()
+        }];
+        review
+    }
+
+    fn guided_verdict_input(selection: GuidedFounderVerdictSelection) -> GuidedFounderVerdictInput {
+        GuidedFounderVerdictInput {
+            current_task_id: "task:review".to_owned(),
+            metadata: CommandMetadata {
+                command_id: "command:guided-verdict:1".to_owned(),
+                idempotency_key: "idempotency:guided-verdict:1".to_owned(),
+                idempotency_scope: "founder-verdict".to_owned(),
+                request_digest_sha256: String::new(),
+                issued_at: Some(Timestamp {
+                    seconds: 100,
+                    nanos: 0,
+                }),
+                correlation_id: "correlation:guided-verdict:1".to_owned(),
+                causation_id: Some("review:task:review".to_owned()),
+            },
+            selection,
+            reason_code: "founder-reviewed-result".to_owned(),
+            confirmation_proof_ref: "confirmation:guided-verdict:1".to_owned(),
+            expires_at: Timestamp {
+                seconds: 3_700,
+                nanos: 0,
+            },
+        }
+    }
+
+    fn sealed_guided_verdict_command(selection: GuidedFounderVerdictSelection) -> VerdictCommand {
+        build_guided_founder_verdict(
+            &verdict_pending_review(VerificationConclusion::Passed),
+            guided_verdict_input(selection),
+        )
+        .expect("sealed guided Founder Verdict command")
+    }
+
+    fn prepared_founder_supporting_material(
+        kernel: &ClientKernel,
+    ) -> PreparedFounderSupportingMaterial {
+        let review = verdict_pending_review(VerificationConclusion::Partial);
+        let builder = FounderSupportingMaterialBuilder::from_review(
+            &review,
+            kernel.session().expect("authenticated test session"),
+            "material:risk-rationale:1".to_owned(),
+            FounderSupportingMaterialRole::RiskRationale,
+            "Founder rationale for the reviewed residual risk.".to_owned(),
+            Some(FounderSupportingMaterialCoverage {
+                risk_category: RiskCategory::QualityResidual as i32,
+                discrepancy_ids: vec!["discrepancy:review:1".to_owned()],
+                unverified_item_ids: Vec::new(),
+            }),
+        )
+        .expect("trusted supporting-material builder");
+        builder
+            .build(CommandMetadata {
+                command_id: "command:founder-material:1".to_owned(),
+                idempotency_key: "idempotency:founder-material:1".to_owned(),
+                idempotency_scope: "founder-supporting-material/v1".to_owned(),
+                request_digest_sha256: String::new(),
+                issued_at: Some(Timestamp {
+                    seconds: 100,
+                    nanos: 0,
+                }),
+                correlation_id: "correlation:founder-material:1".to_owned(),
+                causation_id: Some("review:task:review".to_owned()),
+            })
+            .expect("sealed supporting-material command")
+    }
+
+    fn founder_supporting_material_response(
+        prepared: &PreparedFounderSupportingMaterial,
+        replayed: bool,
+    ) -> CreateFounderSupportingMaterialResponse {
+        let metadata = prepared
+            .command()
+            .metadata
+            .as_ref()
+            .expect("supporting-material metadata");
+        CreateFounderSupportingMaterialResponse {
+            authority_result: Some(FounderSupportingMaterialReceipt {
+                committed: true,
+                replayed,
+                material_id: prepared.command().material_id.clone(),
+                artifact_id: founder_supporting_material_artifact_id(
+                    &prepared.command().material_id,
+                ),
+                role: prepared.command().role,
+                scope: prepared.command().scope.clone(),
+                canonical_payload: Some(prepared.capsule().expected_payload_address.clone()),
+                command_id: metadata.command_id.clone(),
+                correlation_id: metadata.correlation_id.clone(),
+            }),
+            await_token: None,
+            gateway_error: None,
+        }
+    }
+
+    fn confirmed_founder_supporting_material(
+        review: &TaskResultReview,
+        kernel: &ClientKernel,
+        material_id: &str,
+        role: FounderSupportingMaterialRole,
+        coverage: FounderSupportingMaterialCoverage,
+    ) -> ConfirmedFounderSupportingMaterialReceipt {
+        let prepared = FounderSupportingMaterialBuilder::from_review(
+            review,
+            kernel.session().expect("authenticated test session"),
+            material_id.to_owned(),
+            role,
+            format!("Founder authored {material_id}"),
+            Some(coverage),
+        )
+        .expect("trusted supporting material")
+        .build(CommandMetadata {
+            command_id: format!("command:{material_id}"),
+            idempotency_key: format!("idempotency:{material_id}"),
+            idempotency_scope: "founder-supporting-material/v1".to_owned(),
+            request_digest_sha256: String::new(),
+            issued_at: Some(Timestamp {
+                seconds: 100,
+                nanos: 0,
+            }),
+            correlation_id: format!("correlation:{material_id}"),
+            causation_id: Some("review:task:review".to_owned()),
+        })
+        .expect("prepared supporting material");
+        let receipt = founder_supporting_material_response(&prepared, false)
+            .authority_result
+            .expect("confirmed supporting material receipt");
+        ConfirmedFounderSupportingMaterialReceipt::from_prepared(receipt, &prepared)
+            .expect("exact supporting material receipt")
+    }
+
+    fn guided_verdict_response(
+        command: &VerdictCommand,
+        replayed: bool,
+    ) -> ExecuteFounderVerdictResponse {
+        let issue = guided_founder_verdict_issue(command).expect("guided issue command");
+        let metadata = issue.metadata.as_ref().expect("guided issue metadata");
+        let verdict_id = "founder-verdict:guided:1".to_owned();
+        let state = FounderVerdictState {
+            founder_verdict_id: verdict_id.clone(),
+            revision: 1,
+            state: FounderVerdictStateKind::Issued as i32,
+            consumption_receipt_id: None,
+            superseded_by_verdict_id: None,
+            terminal_reason_code: None,
+            updated_at: Some(Timestamp {
+                seconds: 200,
+                nanos: 0,
+            }),
+        };
+        ExecuteFounderVerdictResponse {
+            authority_result: Some(VerdictCommandResult {
+                committed: true,
+                replayed,
+                verdict: Some(FounderVerdict {
+                    founder_verdict_id: verdict_id.clone(),
+                    version: 1,
+                    decision: issue.decision,
+                    scope: issue.scope.clone(),
+                    observed_verification_conclusion: issue.observed_verification_conclusion,
+                    authority_proof: Some(FounderAuthorityProof {
+                        authenticated_founder_principal_id: "founder:guided-verdict".to_owned(),
+                        authority_ref: "authority:founder-verdict".to_owned(),
+                        confirmation_class: issue.required_confirmation_class,
+                        confirmation_proof_ref: issue.confirmation_proof_ref.clone(),
+                        verified_at: Some(Timestamp {
+                            seconds: 200,
+                            nanos: 0,
+                        }),
+                        valid_until: issue.expires_at,
+                        authority_policy_ref: Some(ContractReference {
+                            contract_id: "founder-verdict-policy".to_owned(),
+                            version: "v1".to_owned(),
+                            sha256: "d".repeat(64),
+                        }),
+                    }),
+                    risk_acceptances: issue.risk_acceptances.clone(),
+                    rework_directive: issue.rework_directive.clone(),
+                    reason_code: issue.reason_code.clone(),
+                    rationale_artifact_id: issue.rationale_artifact_id.clone(),
+                    valid_from: Some(Timestamp {
+                        seconds: 200,
+                        nanos: 0,
+                    }),
+                    expires_at: issue.expires_at,
+                    issued_at: Some(Timestamp {
+                        seconds: 200,
+                        nanos: 0,
+                    }),
+                    canonical_payload: Some(ContentAddress {
+                        algorithm: HashAlgorithm::Sha256 as i32,
+                        digest: "e".repeat(64),
+                        byte_length: 64,
+                    }),
+                    supersedes_founder_verdict_id: issue.supersedes_founder_verdict_id.clone(),
+                }),
+                state: Some(state.clone()),
+                consumption_receipt: None,
+                event: Some(VerdictEvent {
+                    event_id: "verdict-event:guided:1".to_owned(),
+                    kind: VerdictEventKind::Issued as i32,
+                    founder_verdict_id: verdict_id,
+                    resulting_state_revision: state.revision,
+                    authenticated_principal_id: "founder:guided-verdict".to_owned(),
+                    command_id: metadata.command_id.clone(),
+                    evidence_artifact_ids: Vec::new(),
+                    committed_at: Some(Timestamp {
+                        seconds: 200,
+                        nanos: 0,
+                    }),
+                }),
+                error_code: VerdictErrorCode::Unspecified as i32,
+                safe_error_fingerprint: None,
+            }),
+            await_token: None,
+            gateway_error: None,
+        }
+    }
+
+    fn guided_apply_response(
+        issue_command: &VerdictCommand,
+        apply_command: &TaskCommand,
+        replayed: bool,
+    ) -> ExecuteTaskCommandResponse {
+        let verdict_response = guided_verdict_response(issue_command, true);
+        let verdict = verdict_response
+            .authority_result
+            .as_ref()
+            .and_then(|result| result.verdict.as_ref())
+            .expect("issued verdict");
+        let scope = verdict.scope.as_ref().expect("verdict scope");
+        let apply = match apply_command.command.as_ref() {
+            Some(task_command::Command::ApplyFounderVerdict(apply)) => apply,
+            _ => panic!("ApplyFounderVerdict command"),
+        };
+        let metadata = apply.meta.as_ref().expect("Apply metadata");
+        let status = match FounderVerdictDecision::try_from(verdict.decision) {
+            Ok(FounderVerdictDecision::Accept) => DomainTaskStatus::Completed,
+            Ok(FounderVerdictDecision::Rework) => DomainTaskStatus::Rework,
+            Ok(FounderVerdictDecision::Reject) => DomainTaskStatus::Rejected,
+            _ => panic!("valid verdict decision"),
+        };
+        let task = TaskSnapshot {
+            task_id: scope.task_id.clone(),
+            revision: scope.task_revision + 1,
+            work_revision: scope.work_revision,
+            status: status as i32,
+            artifact_set_id: Some(scope.artifact_set_id.clone()),
+            verification_artifact_id: Some(scope.verification_artifact_id.clone()),
+            founder_verdict_id: Some(verdict.founder_verdict_id.clone()),
+            acceptance_contract_ref: scope.acceptance_contract_ref.clone(),
+            ..Default::default()
+        };
+        let event = egopulse_domain_contracts::v01::egopulse::task::v1::TaskEvent {
+            event_id: "task-event:guided-verdict-applied:1".to_owned(),
+            command_id: metadata.command_id.clone(),
+            kind: TaskEventKind::VerdictApplied as i32,
+            task_id: scope.task_id.clone(),
+            expected_revision: scope.task_revision,
+            resulting_revision: task.revision,
+            work_revision: scope.work_revision,
+            authenticated_principal_id: "founder:guided-verdict".to_owned(),
+            authority_ref: "authority:task".to_owned(),
+            idempotency_key: metadata.idempotency_key.clone(),
+            request_digest_sha256: metadata.request_digest_sha256.clone(),
+            correlation_id: metadata.correlation_id.clone(),
+            causation_id: metadata.causation_id.clone(),
+            evidence_refs: vec![
+                verdict.founder_verdict_id.clone(),
+                format!("founder-verdict:{}@issued", verdict.founder_verdict_id),
+                format!("founder-verdict-state:{}@{}", verdict.founder_verdict_id, 1),
+            ],
+            occurred_at: metadata.issued_at,
+            snapshot: Some(task.clone()),
+        };
+        ExecuteTaskCommandResponse {
+            authority_result: Some(TaskCommandResult {
+                replayed,
+                outcome: Some(task_command_result::Outcome::Task(task)),
+                committed_event: Some(event),
+            }),
+            await_token: None,
+            gateway_error: None,
+        }
+    }
+
     fn approval_position(sequence: u64) -> ProjectionPosition {
         ProjectionPosition {
             epoch: "epoch:approval-watch".to_owned(),
@@ -6175,6 +8768,7 @@ mod tests {
             action_digest_sha256: "b".repeat(64),
             requested_scope_ref: "scope:test".to_owned(),
             display_summary_ref: "summary:test".to_owned(),
+            display_summary: Some(approval_test_summary()),
             request_observation_id: format!("observation:{approval_request_id}"),
             request_observation_sequence: 1,
             request_lifecycle: 1,
@@ -6207,12 +8801,29 @@ mod tests {
         }
     }
 
+    fn approval_test_summary()
+    -> egopulse_domain_contracts::v01::egopulse::harness::v1::ApprovalDisplaySummary {
+        egopulse_domain_contracts::approval_display::seal_approval_display_summary(
+            egopulse_domain_contracts::v01::egopulse::harness::v1::ApprovalDisplaySummary {
+                state: 1,
+                summary_ref: "summary:test".to_owned(),
+                action_digest_sha256: "b".repeat(64),
+                source_binding_sha256: "c".repeat(64),
+                command_preview: "cargo test".to_owned(),
+                working_directory_label: ".".to_owned(),
+                policy_code: "egopulse.approval-display/v1".to_owned(),
+                ..Default::default()
+            },
+        )
+    }
+
     fn guided_approval_input(decision: GuidedApprovalDecision) -> GuidedApprovalDecisionInput {
         GuidedApprovalDecisionInput {
             approval_request_id: "approval:guided:1".to_owned(),
             decision,
             reason_code: "  founder-reviewed  ".to_owned(),
             confirmation_proof_ref: Some("proof:approval:1".to_owned()),
+            reviewed_summary_digest_sha256: Some(approval_test_summary().summary_digest_sha256),
         }
     }
 
@@ -8151,6 +10762,102 @@ mod tests {
     }
 
     #[test]
+    fn guided_approval_requires_the_exact_reviewed_safe_summary_before_allow_once() {
+        use std::cell::Cell;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(13_000);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:summary",
+            "session:summary",
+            &["local.approval.read", "local.approval.decide"],
+            ClientSurface::Cli,
+            now,
+        );
+        for case in 0..6 {
+            let mut input = guided_approval_input(GuidedApprovalDecision::AllowOnce);
+            let mut view = approval_view(
+                "approval:guided:1",
+                &approval_position(12),
+                Some(AvailableActionKind::DecideHarnessApproval as i32),
+            );
+            match case {
+                0 => view.display_summary = None,
+                1 => input.reviewed_summary_digest_sha256 = None,
+                2 => input.reviewed_summary_digest_sha256 = Some("d".repeat(64)),
+                3 => {
+                    view.display_summary
+                        .as_mut()
+                        .expect("summary")
+                        .command_preview = "cargo clean".to_owned()
+                }
+                4 => {
+                    let mut summary = view.display_summary.take().expect("summary");
+                    summary.command_preview = "cargo clean".to_owned();
+                    view.display_summary = Some(
+                        egopulse_domain_contracts::approval_display::seal_approval_display_summary(
+                            summary,
+                        ),
+                    );
+                }
+                _ => view.action_digest_sha256 = "e".repeat(64),
+            }
+            let sends = Cell::new(0);
+            let result = block_on_ready(decide_guided_approval_via(
+                &kernel,
+                input,
+                now,
+                |_| {
+                    std::future::ready(Ok(GetHarnessApprovalViewResponse {
+                        outcome: Some(get_harness_approval_view_response::Outcome::View(view)),
+                    }))
+                },
+                |_| {
+                    sends.set(sends.get() + 1);
+                    std::future::ready(Ok(guided_approval_response(
+                        GuidedApprovalDecision::AllowOnce,
+                        false,
+                        None,
+                    )))
+                },
+            ));
+            assert!(
+                matches!(
+                    result,
+                    Err(ClientGuidedApprovalDecisionError::InvalidInput(_))
+                ),
+                "case {case}"
+            );
+            assert_eq!(sends.get(), 0);
+        }
+        let mut legacy = approval_view(
+            "approval:guided:1",
+            &approval_position(12),
+            Some(AvailableActionKind::DecideHarnessApproval as i32),
+        );
+        legacy.display_summary = None;
+        let denied = block_on_ready(decide_guided_approval_via(
+            &kernel,
+            guided_approval_input(GuidedApprovalDecision::Deny),
+            now,
+            |_| {
+                std::future::ready(Ok(GetHarnessApprovalViewResponse {
+                    outcome: Some(get_harness_approval_view_response::Outcome::View(legacy)),
+                }))
+            },
+            |_| {
+                std::future::ready(Ok(guided_approval_response(
+                    GuidedApprovalDecision::Deny,
+                    false,
+                    None,
+                )))
+            },
+        ));
+        assert!(
+            denied.is_ok(),
+            "legacy requests must still be safely deniable"
+        );
+    }
+
+    #[test]
     fn guided_approval_reads_latest_view_and_seals_all_three_decisions() {
         use std::cell::RefCell;
 
@@ -9331,6 +12038,1813 @@ mod tests {
                 Err(ClientApprovalWatchError::ResetBarrier)
             ));
         }
+    }
+
+    #[test]
+    fn guided_founder_verdict_submits_rework_and_risk_accept_through_revalidated_materials() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &[
+                "local.task.read",
+                "local.evidence.read",
+                "local.founder-verdict.issue",
+            ],
+            ClientSurface::Cli,
+            now,
+        );
+        for selection in [
+            GuidedFounderVerdictSelection::Rework,
+            GuidedFounderVerdictSelection::Accept,
+        ] {
+            let review = verdict_review_with_open_items(VerificationConclusion::Partial);
+            let coverage = FounderSupportingMaterialCoverage {
+                risk_category: if selection == GuidedFounderVerdictSelection::Rework {
+                    RiskCategory::Unspecified as i32
+                } else {
+                    RiskCategory::QualityResidual as i32
+                },
+                discrepancy_ids: vec!["discrepancy:review:1".into()],
+                unverified_item_ids: vec!["unverified:review:1".into()],
+            };
+            let roles = if selection == GuidedFounderVerdictSelection::Rework {
+                vec![FounderSupportingMaterialRole::ReworkRequiredChanges]
+            } else {
+                vec![
+                    FounderSupportingMaterialRole::RiskRationale,
+                    FounderSupportingMaterialRole::CompensatingControl,
+                ]
+            };
+            let materials = FounderSupportingMaterialCollection::from_confirmed(
+                roles
+                    .iter()
+                    .enumerate()
+                    .map(|(index, role)| {
+                        confirmed_founder_supporting_material(
+                            &review,
+                            &kernel,
+                            &format!("material:submit:{index}"),
+                            *role,
+                            coverage.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("confirmed material collection");
+            let command = build_guided_founder_verdict_with_materials(
+                &review,
+                guided_verdict_input(selection),
+                kernel.session().expect("session"),
+                &materials,
+            )
+            .expect("build complete command");
+            for omit_materials in [false, true] {
+                let task_view = review.task_view.clone();
+                let graph = review.evidence_graph.clone().expect("bound graph");
+                let sends = Cell::new(0);
+                let result = block_on_ready(submit_guided_founder_verdict_materials_via(
+                    &kernel,
+                    GuidedFounderVerdictSubmission {
+                        command: command.clone(),
+                        selection,
+                        materials: if omit_materials {
+                            None
+                        } else {
+                            Some(&materials)
+                        },
+                        recovery_path: None,
+                    },
+                    now,
+                    move |_| {
+                        std::future::ready(Ok(GetTaskViewResponse {
+                            outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                        }))
+                    },
+                    move |_| {
+                        std::future::ready(Ok(GetEvidenceGraphResponse {
+                            outcome: Some(get_evidence_graph_response::Outcome::Graph(graph)),
+                        }))
+                    },
+                    |request| {
+                        sends.set(sends.get() + 1);
+                        assert_eq!(request.command.as_ref(), Some(&command));
+                        std::future::ready(Ok(guided_verdict_response(&command, false)))
+                    },
+                ));
+                if omit_materials {
+                    assert!(
+                        result.is_err(),
+                        "a sealed command alone must not bypass confirmed material preflight"
+                    );
+                    assert_eq!(sends.get(), 0);
+                } else {
+                    assert!(matches!(
+                        result,
+                        Ok(GuidedFounderVerdictAttempt::Committed(_))
+                    ));
+                    assert_eq!(sends.get(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guided_founder_verdict_durable_record_precedes_send_and_replays_with_new_session() {
+        let root = tempfile::tempdir().expect("isolated recovery directory");
+        let path = root.path().join("pending.json");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "old-session-must-not-be-persisted",
+            &[
+                "local.task.read",
+                "local.evidence.read",
+                "local.founder-verdict.issue",
+            ],
+            ClientSurface::Cli,
+            now,
+        );
+        let review = verdict_pending_review(VerificationConclusion::Passed);
+        let command = sealed_guided_verdict_command(GuidedFounderVerdictSelection::Reject);
+        let task_view = review.task_view;
+        let graph = review.evidence_graph.expect("graph");
+        let attempt = block_on_ready(submit_guided_founder_verdict_materials_via(
+            &kernel,
+            GuidedFounderVerdictSubmission {
+                command: command.clone(),
+                selection: GuidedFounderVerdictSelection::Reject,
+                materials: None,
+                recovery_path: Some(&path),
+            },
+            now,
+            move |_| {
+                std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                }))
+            },
+            move |_| {
+                std::future::ready(Ok(GetEvidenceGraphResponse {
+                    outcome: Some(get_evidence_graph_response::Outcome::Graph(graph)),
+                }))
+            },
+            |request| {
+                let persisted = std::fs::read_to_string(&path).expect("record durable BEFORE send");
+                assert!(!persisted.contains("old-session-must-not-be-persisted"));
+                assert!(!persisted.contains("session_id"));
+                assert!(!persisted.contains("granted_permission"));
+                assert_eq!(request.command.as_ref(), Some(&command));
+                std::future::ready(Err("connection lost after Authority commit".into()))
+            },
+        ))
+        .expect("unknown result");
+        assert!(matches!(
+            attempt,
+            GuidedFounderVerdictAttempt::OutcomeUnknown(_)
+        ));
+        let before = std::fs::read(&path).expect("saved bytes");
+        drop(kernel);
+        let later = SystemTime::UNIX_EPOCH + Duration::from_secs(3600);
+        let new_kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "new-session",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Tui,
+            later,
+        );
+        let recovered =
+            DurableFounderVerdictRecovery::read(&path).expect("new process reads record");
+        assert_eq!(
+            recovered.command_id(),
+            guided_founder_verdict_issue(&command)
+                .expect("issue")
+                .metadata
+                .as_ref()
+                .expect("metadata")
+                .command_id
+        );
+        let replay = block_on_ready(founder_recovery::retry_durable_founder_verdict_via(
+            &new_kernel,
+            &recovered,
+            later,
+            |request| {
+                assert_eq!(
+                    request.client.as_ref().expect("new metadata").session_id,
+                    "new-session"
+                );
+                assert_eq!(request.command.as_ref(), Some(&command));
+                std::future::ready(Ok(guided_verdict_response(&command, true)))
+            },
+        ))
+        .expect("same principal may reconcile without an old Task action or live old proof");
+        assert!(
+            matches!(replay, DurableFounderVerdictAttempt::Committed(result) if result.replayed())
+        );
+        assert_eq!(std::fs::read(path).expect("record retained"), before);
+    }
+
+    #[test]
+    fn guided_apply_accepts_owner_evidence_refs_but_requires_exact_verdict_id() {
+        let issue = sealed_guided_verdict_command(GuidedFounderVerdictSelection::Accept);
+        let verdict_result = GuidedFounderVerdictResult {
+            authority: guided_verdict_response(&issue, false)
+                .authority_result
+                .expect("issued Founder Verdict"),
+            await_token: None,
+            projection_warning: None,
+        };
+        let apply = build_guided_founder_apply_command(&issue, &verdict_result)
+            .expect("build exact Founder Verdict Apply");
+        let mut result = guided_apply_response(&issue, &apply, false)
+            .authority_result
+            .expect("production-shaped Task Apply result");
+        let verdict_id = verdict_result
+            .authority
+            .verdict
+            .as_ref()
+            .expect("Founder Verdict")
+            .founder_verdict_id
+            .clone();
+
+        assert_eq!(
+            result
+                .committed_event
+                .as_ref()
+                .expect("VerdictApplied event")
+                .evidence_refs,
+            [
+                verdict_id.clone(),
+                format!("founder-verdict:{verdict_id}@issued"),
+                format!("founder-verdict-state:{verdict_id}@1"),
+            ]
+        );
+        assert!(guided_founder_apply_result_matches(
+            &result,
+            &apply,
+            &verdict_result,
+            "founder:guided-verdict",
+        ));
+
+        result
+            .committed_event
+            .as_mut()
+            .expect("VerdictApplied event")
+            .evidence_refs
+            .retain(|reference| reference != &verdict_id);
+        assert!(!guided_founder_apply_result_matches(
+            &result,
+            &apply,
+            &verdict_result,
+            "founder:guided-verdict",
+        ));
+
+        result
+            .committed_event
+            .as_mut()
+            .expect("VerdictApplied event")
+            .evidence_refs
+            .push("founder-verdict:wrong".to_owned());
+        assert!(!guided_founder_apply_result_matches(
+            &result,
+            &apply,
+            &verdict_result,
+            "founder:guided-verdict",
+        ));
+    }
+
+    #[test]
+    fn guided_founder_decision_persists_before_reads_then_issues_and_applies() {
+        let root = tempfile::tempdir().expect("isolated recovery directory");
+        let path = root.path().join("decision.json");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-decision",
+            &[
+                "local.task.read",
+                "local.evidence.read",
+                "local.founder-verdict.issue",
+                "local.founder-verdict.apply",
+            ],
+            ClientSurface::Cli,
+            now,
+        );
+        let review = verdict_pending_review(VerificationConclusion::Passed);
+        let task_view = review.task_view.clone();
+        let graph = review.evidence_graph.expect("evidence graph");
+        let command = sealed_guided_verdict_command(GuidedFounderVerdictSelection::Reject);
+        let issued = command.clone();
+        let applied = RefCell::new(None);
+        let attempt = block_on_ready(Box::pin(
+            founder_recovery::submit_durable_guided_founder_decision_via(
+                &kernel,
+                GuidedFounderVerdictSubmission {
+                    command: command.clone(),
+                    selection: GuidedFounderVerdictSelection::Reject,
+                    materials: None,
+                    recovery_path: None,
+                },
+                &path,
+                now,
+                |_| {
+                    assert!(path.exists(), "capsule must precede the first read RPC");
+                    std::future::ready(Ok(GetTaskViewResponse {
+                        outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                    }))
+                },
+                |_| {
+                    assert!(path.exists(), "capsule must precede evidence read");
+                    std::future::ready(Ok(GetEvidenceGraphResponse {
+                        outcome: Some(get_evidence_graph_response::Outcome::Graph(graph)),
+                    }))
+                },
+                |request| {
+                    assert_eq!(request.command.as_ref(), Some(&issued));
+                    std::future::ready(Ok(guided_verdict_response(&issued, false)))
+                },
+                |request| {
+                    assert!(
+                        founder_recovery::verdict_apply_recovery_path(&path).exists(),
+                        "exact Apply capsule must precede the Task write"
+                    );
+                    let apply = request.command.expect("explicit Task Apply command");
+                    applied.replace(Some(apply.clone()));
+                    std::future::ready(Ok(guided_apply_response(&command, &apply, false)))
+                },
+            ),
+        ))
+        .expect("guided decision");
+        let DurableFounderDecisionAttempt::Applied(result) = attempt else {
+            panic!("Issue and Apply must both be known committed");
+        };
+        assert_eq!(result.task().status, DomainTaskStatus::Rejected as i32);
+        assert_eq!(
+            result.task().founder_verdict_id.as_deref(),
+            Some(result.verdict().founder_verdict_id())
+        );
+        let saved = DurableFounderVerdictRecovery::read(&path).expect("durable Issue capsule");
+        assert_eq!(
+            saved.command_id(),
+            guided_founder_verdict_issue(&command)
+                .expect("Issue")
+                .metadata
+                .as_ref()
+                .expect("metadata")
+                .command_id
+        );
+        assert!(matches!(
+            applied
+                .borrow()
+                .as_ref()
+                .and_then(|command| command.command.as_ref()),
+            Some(task_command::Command::ApplyFounderVerdict(_))
+        ));
+    }
+
+    #[test]
+    fn guided_founder_decision_recovery_replays_same_issue_and_same_apply() {
+        let root = tempfile::tempdir().expect("isolated recovery directory");
+        let path = root.path().join("decision.json");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:first",
+            &[
+                "local.task.read",
+                "local.evidence.read",
+                "local.founder-verdict.issue",
+                "local.founder-verdict.apply",
+            ],
+            ClientSurface::Cli,
+            now,
+        );
+        let review = verdict_pending_review(VerificationConclusion::Passed);
+        let task_view = review.task_view.clone();
+        let graph = review.evidence_graph.expect("evidence graph");
+        let command = sealed_guided_verdict_command(GuidedFounderVerdictSelection::Accept);
+        let first_apply = RefCell::new(None);
+        let attempt = block_on_ready(Box::pin(
+            founder_recovery::submit_durable_guided_founder_decision_via(
+                &kernel,
+                GuidedFounderVerdictSubmission {
+                    command: command.clone(),
+                    selection: GuidedFounderVerdictSelection::Accept,
+                    materials: None,
+                    recovery_path: None,
+                },
+                &path,
+                now,
+                |_| {
+                    std::future::ready(Ok(GetTaskViewResponse {
+                        outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                    }))
+                },
+                |_| {
+                    std::future::ready(Ok(GetEvidenceGraphResponse {
+                        outcome: Some(get_evidence_graph_response::Outcome::Graph(graph)),
+                    }))
+                },
+                |request| {
+                    assert_eq!(request.command.as_ref(), Some(&command));
+                    std::future::ready(Ok(guided_verdict_response(&command, false)))
+                },
+                |request| {
+                    assert!(
+                        founder_recovery::verdict_apply_recovery_path(&path).exists(),
+                        "exact Apply capsule must precede the Task write"
+                    );
+                    first_apply.replace(request.command);
+                    std::future::ready(Err("Task response lost after commit".to_owned()))
+                },
+            ),
+        ))
+        .expect("unknown Apply remains recoverable");
+        assert!(matches!(
+            attempt,
+            DurableFounderDecisionAttempt::Unknown {
+                stage: GuidedFounderDecisionStage::Apply,
+                ..
+            }
+        ));
+        let original_bytes = std::fs::read(&path).expect("original recovery bytes");
+        let saved = DurableFounderVerdictRecovery::read(&path).expect("saved recovery");
+        let recovered_kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:recovered",
+            &["local.founder-verdict.issue", "local.founder-verdict.apply"],
+            ClientSurface::Tui,
+            now,
+        );
+        let expected_apply = first_apply.into_inner().expect("first Apply command");
+        let replay = block_on_ready(Box::pin(
+            founder_recovery::retry_durable_founder_decision_via(
+                &recovered_kernel,
+                &saved,
+                now,
+                |request| {
+                    assert_eq!(request.command.as_ref(), Some(&command));
+                    std::future::ready(Ok(guided_verdict_response(&command, true)))
+                },
+                |request| {
+                    assert_eq!(request.command.as_ref(), Some(&expected_apply));
+                    std::future::ready(Ok(guided_apply_response(&command, &expected_apply, true)))
+                },
+            ),
+        ))
+        .expect("exact decision recovery");
+        assert!(matches!(
+            replay,
+            DurableFounderDecisionAttempt::Applied(result)
+                if result.verdict().replayed() && result.task_replayed()
+        ));
+        assert_eq!(
+            std::fs::read(path).expect("recovery retained"),
+            original_bytes
+        );
+    }
+
+    #[test]
+    fn guided_founder_decision_issue_unknown_does_not_apply_until_explicit_recovery() {
+        let root = tempfile::tempdir().expect("isolated recovery directory");
+        let path = root.path().join("decision.json");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:first",
+            &[
+                "local.task.read",
+                "local.evidence.read",
+                "local.founder-verdict.issue",
+                "local.founder-verdict.apply",
+            ],
+            ClientSurface::Cli,
+            now,
+        );
+        let review = verdict_pending_review(VerificationConclusion::Passed);
+        let task_view = review.task_view.clone();
+        let graph = review.evidence_graph.expect("evidence graph");
+        let command = sealed_guided_verdict_command(GuidedFounderVerdictSelection::Reject);
+        let apply_sends = Cell::new(0_u64);
+        let attempt = block_on_ready(Box::pin(
+            founder_recovery::submit_durable_guided_founder_decision_via(
+                &kernel,
+                GuidedFounderVerdictSubmission {
+                    command: command.clone(),
+                    selection: GuidedFounderVerdictSelection::Reject,
+                    materials: None,
+                    recovery_path: None,
+                },
+                &path,
+                now,
+                |_| {
+                    std::future::ready(Ok(GetTaskViewResponse {
+                        outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                    }))
+                },
+                |_| {
+                    std::future::ready(Ok(GetEvidenceGraphResponse {
+                        outcome: Some(get_evidence_graph_response::Outcome::Graph(graph)),
+                    }))
+                },
+                |request| {
+                    assert_eq!(request.command.as_ref(), Some(&command));
+                    std::future::ready(Err("Issue response lost".to_owned()))
+                },
+                |_| {
+                    apply_sends.set(apply_sends.get() + 1);
+                    std::future::ready(Err("must not apply while Issue is unknown".to_owned()))
+                },
+            ),
+        ))
+        .expect("Issue uncertainty is durable");
+        assert!(matches!(
+            attempt,
+            DurableFounderDecisionAttempt::Unknown {
+                stage: GuidedFounderDecisionStage::Issue,
+                ..
+            }
+        ));
+        assert_eq!(apply_sends.get(), 0);
+        assert!(!founder_recovery::verdict_apply_recovery_path(&path).exists());
+
+        let saved = DurableFounderVerdictRecovery::read(&path).expect("saved Issue capsule");
+        let recovered_kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:recovered",
+            &["local.founder-verdict.issue", "local.founder-verdict.apply"],
+            ClientSurface::Tui,
+            now,
+        );
+        let recovered = block_on_ready(Box::pin(
+            founder_recovery::retry_durable_founder_decision_via(
+                &recovered_kernel,
+                &saved,
+                now,
+                |request| {
+                    assert_eq!(request.command.as_ref(), Some(&command));
+                    std::future::ready(Ok(guided_verdict_response(&command, true)))
+                },
+                |request| {
+                    assert!(founder_recovery::verdict_apply_recovery_path(&path).exists());
+                    let apply = request.command.expect("recovered Apply");
+                    std::future::ready(Ok(guided_apply_response(&command, &apply, false)))
+                },
+            ),
+        ))
+        .expect("explicit recovery finishes the same decision");
+        assert!(matches!(
+            recovered,
+            DurableFounderDecisionAttempt::Applied(_)
+        ));
+    }
+
+    #[test]
+    fn guided_founder_decision_recovery_keeps_apply_unknown_after_rejection() {
+        let root = tempfile::tempdir().expect("isolated recovery directory");
+        let path = root.path().join("decision.json");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:recovered",
+            &["local.founder-verdict.issue", "local.founder-verdict.apply"],
+            ClientSurface::Cli,
+            now,
+        );
+        let original = RecoverableGuidedFounderVerdict {
+            authenticated_principal_id: "founder:guided-verdict".to_owned(),
+            session_id: "session:recovered".to_owned(),
+            selection: GuidedFounderVerdictSelection::Reject,
+            command: sealed_guided_verdict_command(GuidedFounderVerdictSelection::Reject),
+        };
+        DurableFounderVerdictRecovery::capture(&kernel, &original)
+            .expect("capture")
+            .write_new(&path)
+            .expect("write recovery");
+        let saved = DurableFounderVerdictRecovery::read(&path).expect("read recovery");
+        let attempt = block_on_ready(Box::pin(
+            founder_recovery::retry_durable_founder_decision_via(
+                &kernel,
+                &saved,
+                now,
+                |request| {
+                    std::future::ready(Ok(guided_verdict_response(
+                        request.command.as_ref().expect("same Issue"),
+                        true,
+                    )))
+                },
+                |_| {
+                    std::future::ready(Ok(ExecuteTaskCommandResponse {
+                        authority_result: Some(TaskCommandResult {
+                            outcome: Some(task_command_result::Outcome::Error(
+                                egopulse_domain_contracts::v01::egopulse::task::v1::TaskError {
+                                    code: TaskErrorCode::PermissionDenied as i32,
+                                    safe_detail_code: "CURRENT_PERMISSION_DENIED".to_owned(),
+                                    ..Default::default()
+                                },
+                            )),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }))
+                },
+            ),
+        ))
+        .expect("previously uncertain Apply cannot become a proven rejection");
+        assert!(matches!(
+            attempt,
+            DurableFounderDecisionAttempt::Unknown {
+                stage: GuidedFounderDecisionStage::Apply,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn guided_founder_verdict_durable_recovery_retains_unknown_on_rejection_and_denies_wrong_principal()
+     {
+        let root = tempfile::tempdir().expect("isolated recovery directory");
+        let path = root.path().join("pending.json");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "original",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+        );
+        let recovery = RecoverableGuidedFounderVerdict {
+            authenticated_principal_id: "founder:guided-verdict".into(),
+            session_id: "original".into(),
+            selection: GuidedFounderVerdictSelection::Reject,
+            command: sealed_guided_verdict_command(GuidedFounderVerdictSelection::Reject),
+        };
+        DurableFounderVerdictRecovery::capture(&kernel, &recovery)
+            .expect("capture")
+            .write_new(&path)
+            .expect("write ahead");
+        let saved = DurableFounderVerdictRecovery::read(&path).expect("saved record");
+        let bytes = std::fs::read(&path).expect("original bytes");
+        for (principal, permissions, expect_send) in [
+            ("other-founder", vec!["local.founder-verdict.issue"], false),
+            ("founder:guided-verdict", vec!["local.task.read"], false),
+            (
+                "founder:guided-verdict",
+                vec!["local.founder-verdict.issue"],
+                true,
+            ),
+        ] {
+            let fresh = authenticated_kernel_with_permissions(
+                principal,
+                "fresh",
+                &permissions,
+                ClientSurface::Cli,
+                now,
+            );
+            let sends = Cell::new(0);
+            let result = block_on_ready(founder_recovery::retry_durable_founder_verdict_via(
+                &fresh,
+                &saved,
+                now,
+                |request| {
+                    sends.set(sends.get() + 1);
+                    assert_eq!(request.command, Some(recovery.command.clone()));
+                    std::future::ready(Ok(ExecuteFounderVerdictResponse {
+                        authority_result: Some(VerdictCommandResult {
+                            error_code: VerdictErrorCode::PermissionDenied as i32,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }))
+                },
+            ));
+            if principal == "other-founder" {
+                assert!(matches!(
+                    result,
+                    Err(DurableFounderRecoveryError::PrincipalMismatch)
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Ok(DurableFounderVerdictAttempt::Unknown { .. })
+                ));
+            }
+            assert_eq!(sends.get(), usize::from(expect_send));
+            assert_eq!(std::fs::read(&path).expect("retained record"), bytes);
+        }
+        let mut corrupt: serde_json::Value = serde_json::from_slice(&bytes).expect("record JSON");
+        corrupt["sealed_command_hex"] = serde_json::json!("00");
+        std::fs::write(&path, serde_json::to_vec(&corrupt).expect("corrupt JSON"))
+            .expect("write corrupt fixture");
+        assert!(matches!(
+            DurableFounderVerdictRecovery::read(path),
+            Err(DurableFounderRecoveryError::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn guided_founder_verdict_and_material_durable_recovery_reject_another_store_before_send() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let original = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "original",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+        );
+        let new_store = authenticated_kernel_with_permissions_and_epoch(
+            "founder:guided-verdict",
+            "fresh",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+            "epoch:different-store",
+        );
+        let root = tempfile::tempdir().expect("isolated recovery");
+        let verdict_path = root.path().join("verdict.json");
+        let material_path = root.path().join("material.json");
+        let recovery = RecoverableGuidedFounderVerdict {
+            authenticated_principal_id: "founder:guided-verdict".into(),
+            session_id: "original".into(),
+            selection: GuidedFounderVerdictSelection::Reject,
+            command: sealed_guided_verdict_command(GuidedFounderVerdictSelection::Reject),
+        };
+        DurableFounderVerdictRecovery::capture(&original, &recovery)
+            .expect("capture")
+            .write_new(&verdict_path)
+            .expect("save");
+        let prepared = prepared_founder_supporting_material(&original);
+        DurableFounderMaterialRecovery::capture(&original, &prepared)
+            .expect("capture")
+            .write_new(&material_path)
+            .expect("save");
+        let saved_verdict =
+            DurableFounderVerdictRecovery::read(&verdict_path).expect("read protected record");
+        let saved_material =
+            DurableFounderMaterialRecovery::read(&material_path).expect("read protected record");
+        let verdict_result = block_on_ready(founder_recovery::retry_durable_founder_verdict_via(
+            &new_store,
+            &saved_verdict,
+            now,
+            |_| async { panic!("different store must not send") },
+        ));
+        let material_result = block_on_ready(founder_recovery::retry_durable_founder_material_via(
+            &new_store,
+            &saved_material,
+            now,
+            |_| async { panic!("different store must not send") },
+        ));
+        assert!(matches!(
+            verdict_result,
+            Err(DurableFounderRecoveryError::StoreMismatch)
+        ));
+        assert!(matches!(
+            material_result,
+            Err(DurableFounderRecoveryError::StoreMismatch)
+        ));
+    }
+
+    #[test]
+    fn guided_founder_verdict_builds_rework_from_confirmed_required_changes() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+        );
+        let review = verdict_review_with_open_items(VerificationConclusion::Partial);
+        let coverage = FounderSupportingMaterialCoverage {
+            risk_category: RiskCategory::Unspecified as i32,
+            discrepancy_ids: vec!["discrepancy:review:1".to_owned()],
+            unverified_item_ids: vec!["unverified:review:1".to_owned()],
+        };
+        let required_changes = confirmed_founder_supporting_material(
+            &review,
+            &kernel,
+            "material:required-changes:1",
+            FounderSupportingMaterialRole::ReworkRequiredChanges,
+            coverage.clone(),
+        );
+        let required_changes_artifact_id = required_changes.receipt().artifact_id.clone();
+        let materials = FounderSupportingMaterialCollection::from_confirmed(vec![required_changes])
+            .expect("unique confirmed material");
+
+        let command = build_guided_founder_verdict_with_materials(
+            &review,
+            guided_verdict_input(GuidedFounderVerdictSelection::Rework),
+            kernel.session().expect("authenticated test session"),
+            &materials,
+        )
+        .expect("confirmed required changes build Rework");
+        let issue = guided_founder_verdict_issue(&command).expect("Rework issue command");
+        let directive = issue.rework_directive.as_ref().expect("Rework directive");
+        assert_eq!(issue.decision, FounderVerdictDecision::Rework as i32);
+        assert_eq!(
+            issue.required_confirmation_class,
+            ConfirmationClass::Explicit as i32
+        );
+        assert!(issue.risk_acceptances.is_empty());
+        assert_eq!(
+            directive.required_changes_artifact_id,
+            required_changes_artifact_id
+        );
+        assert_eq!(directive.target_discrepancy_ids, coverage.discrepancy_ids);
+        assert_eq!(
+            directive.target_unverified_item_ids,
+            coverage.unverified_item_ids
+        );
+        assert!(!directive.directive_id.trim().is_empty());
+    }
+
+    #[test]
+    fn guided_founder_verdict_nonpassed_accept_requires_complete_confirmed_risk_materials() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+        );
+        let review = verdict_review_with_open_items(VerificationConclusion::Partial);
+        let coverage = FounderSupportingMaterialCoverage {
+            risk_category: RiskCategory::QualityResidual as i32,
+            discrepancy_ids: vec!["discrepancy:review:1".to_owned()],
+            unverified_item_ids: vec!["unverified:review:1".to_owned()],
+        };
+        let rationale = confirmed_founder_supporting_material(
+            &review,
+            &kernel,
+            "material:risk-rationale:complete",
+            FounderSupportingMaterialRole::RiskRationale,
+            coverage.clone(),
+        );
+        let control = confirmed_founder_supporting_material(
+            &review,
+            &kernel,
+            "material:compensating-control:complete",
+            FounderSupportingMaterialRole::CompensatingControl,
+            coverage.clone(),
+        );
+        let expected_rationale = rationale.receipt().artifact_id.clone();
+        let expected_control = control.receipt().artifact_id.clone();
+        let missing_control =
+            FounderSupportingMaterialCollection::from_confirmed(vec![rationale.clone()])
+                .expect("single confirmed rationale");
+        assert!(matches!(
+            build_guided_founder_verdict_with_materials(
+                &review,
+                guided_verdict_input(GuidedFounderVerdictSelection::Accept),
+                kernel.session().expect("authenticated test session"),
+                &missing_control,
+            ),
+            Err(ClientGuidedFounderVerdictError::MissingMaterial(_))
+        ));
+
+        let complete =
+            FounderSupportingMaterialCollection::from_confirmed(vec![rationale, control])
+                .expect("complete confirmed risk materials");
+        let command = build_guided_founder_verdict_with_materials(
+            &review,
+            guided_verdict_input(GuidedFounderVerdictSelection::Accept),
+            kernel.session().expect("authenticated test session"),
+            &complete,
+        )
+        .expect("non-Passed Accept with complete risk materials");
+        let issue = guided_founder_verdict_issue(&command).expect("risk Accept command");
+        assert_eq!(issue.decision, FounderVerdictDecision::Accept as i32);
+        assert_eq!(
+            issue.required_confirmation_class,
+            ConfirmationClass::ElevatedRiskAcceptance as i32
+        );
+        assert_eq!(issue.risk_acceptances.len(), 1);
+        let risk = &issue.risk_acceptances[0];
+        assert_eq!(risk.rationale_artifact_id, expected_rationale);
+        assert_eq!(risk.compensating_control_artifact_ids, [expected_control]);
+        assert_eq!(risk.discrepancy_ids, coverage.discrepancy_ids);
+        assert_eq!(risk.unverified_item_ids, coverage.unverified_item_ids);
+        assert!(!risk.risk_acceptance_id.trim().is_empty());
+    }
+
+    #[test]
+    fn guided_founder_verdict_rejects_cross_scope_and_fabricated_coverage_materials() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+        );
+        let review = verdict_review_with_open_items(VerificationConclusion::Partial);
+        let coverage = FounderSupportingMaterialCoverage {
+            risk_category: RiskCategory::Unspecified as i32,
+            discrepancy_ids: vec!["discrepancy:review:1".to_owned()],
+            unverified_item_ids: vec!["unverified:review:1".to_owned()],
+        };
+        let old_scope = confirmed_founder_supporting_material(
+            &review,
+            &kernel,
+            "material:old-scope",
+            FounderSupportingMaterialRole::ReworkRequiredChanges,
+            coverage,
+        );
+        let old_scope = FounderSupportingMaterialCollection::from_confirmed(vec![old_scope])
+            .expect("old-scope confirmed material");
+        let mut advanced_review = review.clone();
+        advanced_review
+            .task_view
+            .task
+            .as_mut()
+            .expect("review Task")
+            .revision += 1;
+        advanced_review
+            .task_view
+            .metadata
+            .as_mut()
+            .expect("review metadata")
+            .source_revisions
+            .iter_mut()
+            .find(|source| source.domain == SourceDomain::Task as i32)
+            .expect("Task source")
+            .revision += 1;
+        assert!(matches!(
+            build_guided_founder_verdict_with_materials(
+                &advanced_review,
+                guided_verdict_input(GuidedFounderVerdictSelection::Rework),
+                kernel.session().expect("authenticated test session"),
+                &old_scope,
+            ),
+            Err(ClientGuidedFounderVerdictError::BindingChanged)
+        ));
+
+        let fabricated = confirmed_founder_supporting_material(
+            &review,
+            &kernel,
+            "material:fabricated-coverage",
+            FounderSupportingMaterialRole::ReworkRequiredChanges,
+            FounderSupportingMaterialCoverage {
+                risk_category: RiskCategory::Unspecified as i32,
+                discrepancy_ids: vec!["discrepancy:not-in-verification".to_owned()],
+                unverified_item_ids: Vec::new(),
+            },
+        );
+        let fabricated = FounderSupportingMaterialCollection::from_confirmed(vec![fabricated])
+            .expect("receipt remains structurally confirmed");
+        assert!(matches!(
+            build_guided_founder_verdict_with_materials(
+                &review,
+                guided_verdict_input(GuidedFounderVerdictSelection::Rework),
+                kernel.session().expect("authenticated test session"),
+                &fabricated,
+            ),
+            Err(ClientGuidedFounderVerdictError::BindingChanged)
+        ));
+    }
+
+    #[test]
+    fn founder_supporting_material_durable_recovery_preserves_payload_across_session_and_rejection()
+    {
+        let root = tempfile::tempdir().expect("isolated material recovery");
+        let path = root.path().join("material.json");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "material-old-session",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+        );
+        let prepared = prepared_founder_supporting_material(&kernel);
+        let original_command = prepared.command().clone();
+        let confirmed_response = founder_supporting_material_response(&prepared, true);
+        let expected_address = prepared.capsule().expected_payload_address.clone();
+        let first = block_on_ready(founder_recovery::submit_durable_founder_material_via(
+            &kernel,
+            prepared,
+            &path,
+            now,
+            |request| {
+                assert!(
+                    path.exists(),
+                    "write-ahead record must exist before sending"
+                );
+                assert_eq!(request.command.as_ref(), Some(&original_command));
+                let text = std::fs::read_to_string(&path).expect("saved record");
+                assert!(!text.contains("material-old-session"));
+                assert!(!text.contains("session_id"));
+                std::future::ready(Err("response lost after Stage/Seal".into()))
+            },
+        ));
+        assert!(matches!(
+            first,
+            Err(ClientFounderSupportingMaterialError::Unknown { .. })
+        ));
+        let original_record = std::fs::read(&path).expect("saved bytes");
+        drop(kernel);
+        let current = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "material-new-session",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Tui,
+            now,
+        );
+        let saved =
+            DurableFounderMaterialRecovery::read(&path).expect("read original frozen material");
+        for response in [
+            CreateFounderSupportingMaterialResponse {
+                gateway_error: Some(LocalApiError {
+                    code: LocalApiErrorCode::PermissionDenied as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            confirmed_response,
+        ] {
+            let should_confirm = response.authority_result.is_some();
+            let result = block_on_ready(founder_recovery::retry_durable_founder_material_via(
+                &current,
+                &saved,
+                now,
+                |request| {
+                    assert_eq!(request.command.as_ref(), Some(&original_command));
+                    assert_eq!(
+                        request
+                            .client
+                            .as_ref()
+                            .expect("current metadata")
+                            .session_id,
+                        "material-new-session"
+                    );
+                    std::future::ready(Ok(response))
+                },
+            ))
+            .expect("read-only recovery authorization");
+            match result {
+                DurableFounderMaterialAttempt::Confirmed(receipt) => {
+                    assert!(should_confirm);
+                    assert_eq!(
+                        receipt.receipt().canonical_payload.as_ref(),
+                        Some(&expected_address)
+                    );
+                }
+                DurableFounderMaterialAttempt::Unknown { .. } => assert!(!should_confirm),
+            }
+            assert_eq!(
+                std::fs::read(&path).expect("retained record"),
+                original_record
+            );
+        }
+        let other = authenticated_kernel_with_permissions(
+            "other-founder",
+            "other-session",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+        );
+        let denied = block_on_ready(founder_recovery::retry_durable_founder_material_via(
+            &other,
+            &saved,
+            now,
+            |_| async { panic!("a different principal must never send the saved material") },
+        ));
+        assert!(matches!(
+            denied,
+            Err(DurableFounderRecoveryError::PrincipalMismatch)
+        ));
+        let mut corrupt: serde_json::Value =
+            serde_json::from_slice(&original_record).expect("record JSON");
+        corrupt["canonical_payload_hex"] = serde_json::json!("00");
+        std::fs::write(&path, serde_json::to_vec(&corrupt).expect("corrupt JSON"))
+            .expect("corrupt fixture");
+        assert!(matches!(
+            DurableFounderMaterialRecovery::read(path),
+            Err(DurableFounderRecoveryError::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn founder_supporting_material_existing_durable_record_stops_a_new_send() {
+        let root = tempfile::tempdir().expect("isolated material recovery");
+        let path = root.path().join("material.json");
+        std::fs::write(&path, b"retained previous record").expect("existing record");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "original",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+        );
+        let prepared = prepared_founder_supporting_material(&kernel);
+        let sent = Cell::new(false);
+        let result = block_on_ready(founder_recovery::submit_durable_founder_material_via(
+            &kernel,
+            prepared,
+            &path,
+            now,
+            |_| {
+                sent.set(true);
+                std::future::ready(Err("must not send".into()))
+            },
+        ));
+        assert!(matches!(
+            result,
+            Err(ClientFounderSupportingMaterialError::RecoveryStorage)
+        ));
+        assert!(!sent.get());
+        assert_eq!(
+            std::fs::read(path).expect("unchanged record"),
+            b"retained previous record"
+        );
+    }
+
+    #[test]
+    fn founder_supporting_material_builder_submits_exact_trusted_capsule() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+        );
+        let prepared = prepared_founder_supporting_material(&kernel);
+        let expected_command = prepared.command().clone();
+        let expected_capsule = prepared.capsule().clone();
+        let response = founder_supporting_material_response(&prepared, false);
+        let sent = RefCell::new(None);
+        let confirmed = block_on_ready(submit_founder_supporting_material_via(
+            &kernel,
+            prepared,
+            now,
+            |request| {
+                sent.replace(Some(request.clone()));
+                std::future::ready(Ok(response))
+            },
+        ))
+        .expect("supporting material committed");
+
+        let sent = sent.into_inner().expect("request sent");
+        assert!(sent.client.is_some());
+        assert_eq!(sent.command.as_ref(), Some(&expected_command));
+        assert_eq!(
+            confirmed.receipt().canonical_payload.as_ref(),
+            Some(&expected_capsule.expected_payload_address)
+        );
+        assert_eq!(
+            confirmed.receipt().correlation_id,
+            expected_command
+                .metadata
+                .as_ref()
+                .expect("command metadata")
+                .correlation_id
+        );
+    }
+
+    #[test]
+    fn founder_supporting_material_rejects_tampered_receipt_as_unknown() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+        );
+        let prepared = prepared_founder_supporting_material(&kernel);
+        let expected_capsule = prepared.capsule().clone();
+        let mut response = founder_supporting_material_response(&prepared, false);
+        response
+            .authority_result
+            .as_mut()
+            .expect("material receipt")
+            .canonical_payload = Some(review_address('f'));
+
+        let result = block_on_ready(submit_founder_supporting_material_via(
+            &kernel,
+            prepared,
+            now,
+            move |_request| std::future::ready(Ok(response)),
+        ));
+        let Err(ClientFounderSupportingMaterialError::Unknown { recovery }) = result else {
+            panic!("tampered receipt must not confirm the write");
+        };
+        assert_eq!(recovery.prepared().capsule(), &expected_capsule);
+        assert!(recovery.request().client.is_some());
+    }
+
+    #[test]
+    fn founder_supporting_material_retry_rejection_retains_exact_unknown_capsule() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &["local.founder-verdict.issue"],
+            ClientSurface::Cli,
+            now,
+        );
+        let prepared = prepared_founder_supporting_material(&kernel);
+        let expected_capsule = prepared.capsule().clone();
+        let first_sent = RefCell::new(None);
+        let result = block_on_ready(submit_founder_supporting_material_via(
+            &kernel,
+            prepared,
+            now,
+            |request| {
+                first_sent.replace(Some(request));
+                std::future::ready(Err("response lost after write".to_owned()))
+            },
+        ));
+        let Err(ClientFounderSupportingMaterialError::Unknown { recovery }) = result else {
+            panic!("lost response must retain supporting-material recovery");
+        };
+        let frozen_request = recovery.request().clone();
+        let retry_sent = RefCell::new(None);
+        let rejected = CreateFounderSupportingMaterialResponse {
+            authority_result: None,
+            await_token: None,
+            gateway_error: Some(LocalApiError {
+                code: LocalApiErrorCode::PermissionDenied as i32,
+                safe_fingerprint: "founder-material/permission-denied/v1".to_owned(),
+                retryable: false,
+                required_action_code: None,
+                current_position: None,
+                correlation_id: "correlation:founder-material:1".to_owned(),
+            }),
+        };
+        let retried = block_on_ready(retry_founder_supporting_material_via(
+            &kernel,
+            &recovery,
+            |request| {
+                retry_sent.replace(Some(request));
+                std::future::ready(Ok(rejected))
+            },
+        ));
+        let Err(ClientFounderSupportingMaterialError::Unknown { recovery: retained }) = retried
+        else {
+            panic!("retry rejection cannot resolve the earlier unknown write");
+        };
+
+        assert_eq!(first_sent.into_inner(), Some(frozen_request.clone()));
+        assert_eq!(retry_sent.into_inner(), Some(frozen_request.clone()));
+        assert_eq!(retained.request(), &frozen_request);
+        assert_eq!(retained.prepared().capsule(), &expected_capsule);
+        assert_eq!(retained.prepared().session_id(), "session:guided-verdict");
+    }
+
+    #[test]
+    fn guided_founder_verdict_builds_passed_accept_from_current_review() {
+        let review = verdict_pending_review(VerificationConclusion::Passed);
+        let input = guided_verdict_input(GuidedFounderVerdictSelection::Accept);
+        let expected_metadata = input.metadata.clone();
+        let command = build_guided_founder_verdict(&review, input).expect("Passed Accept");
+        let issue = match command.command.as_ref().unwrap() {
+            verdict_command::Command::IssueFounderVerdict(issue) => issue,
+            _ => panic!("guided verdict must issue a Founder Verdict"),
+        };
+        let scope = issue.scope.as_ref().unwrap();
+        assert_eq!(scope.task_id, "task:review");
+        assert_eq!(scope.task_revision, 7);
+        assert_eq!(scope.work_revision, 2);
+        assert_eq!(scope.artifact_set_id, "artifact-set:review");
+        assert_eq!(scope.verification_artifact_id, "verification:review");
+        assert_eq!(
+            scope.acceptance_contract_ref,
+            review
+                .task_view
+                .task
+                .as_ref()
+                .unwrap()
+                .acceptance_contract_ref
+        );
+        assert_eq!(issue.decision, FounderVerdictDecision::Accept as i32);
+        assert_eq!(
+            issue.observed_verification_conclusion,
+            VerificationConclusion::Passed as i32
+        );
+        assert_eq!(
+            issue.required_confirmation_class,
+            ConfirmationClass::Explicit as i32
+        );
+        assert!(issue.risk_acceptances.is_empty());
+        assert!(issue.rework_directive.is_none());
+        assert!(issue.rationale_artifact_id.is_none());
+        assert!(issue.supersedes_founder_verdict_id.is_none());
+        let metadata = issue.metadata.as_ref().unwrap();
+        assert_eq!(metadata.command_id, expected_metadata.command_id);
+        assert_eq!(metadata.idempotency_key, expected_metadata.idempotency_key);
+        assert_eq!(
+            metadata.idempotency_scope,
+            expected_metadata.idempotency_scope
+        );
+        assert_eq!(metadata.issued_at, expected_metadata.issued_at);
+        assert_eq!(metadata.correlation_id, expected_metadata.correlation_id);
+        assert_eq!(metadata.causation_id, expected_metadata.causation_id);
+        assert!(guided_verdict_digest_is_complete(
+            &metadata.request_digest_sha256
+        ));
+
+        let replay = build_guided_founder_verdict(
+            &review,
+            GuidedFounderVerdictInput {
+                metadata: metadata.clone(),
+                ..guided_verdict_input(GuidedFounderVerdictSelection::Accept)
+            },
+        )
+        .expect("same metadata and review rebuild the replay payload");
+        assert_eq!(replay, command);
+    }
+
+    #[test]
+    fn guided_founder_verdict_builds_reject_without_supporting_artifact_placeholders() {
+        let review = verdict_pending_review(VerificationConclusion::Passed);
+        let command = build_guided_founder_verdict(
+            &review,
+            guided_verdict_input(GuidedFounderVerdictSelection::Reject),
+        )
+        .expect("Reject with an explicit reason");
+        let issue = match command.command.as_ref().unwrap() {
+            verdict_command::Command::IssueFounderVerdict(issue) => issue,
+            _ => panic!("guided verdict must issue a Founder Verdict"),
+        };
+        assert_eq!(issue.decision, FounderVerdictDecision::Reject as i32);
+        assert_eq!(issue.reason_code, "founder-reviewed-result");
+        assert!(issue.risk_acceptances.is_empty());
+        assert!(issue.rework_directive.is_none());
+        assert!(issue.rationale_artifact_id.is_none());
+
+        let mut missing_reason = guided_verdict_input(GuidedFounderVerdictSelection::Reject);
+        missing_reason.reason_code = "  ".to_owned();
+        assert!(matches!(
+            build_guided_founder_verdict(&review, missing_reason),
+            Err(ClientGuidedFounderVerdictError::InvalidInput(
+                "Reject requires a non-empty reason_code"
+            ))
+        ));
+    }
+
+    #[test]
+    fn guided_founder_verdict_requires_real_material_for_override_and_rework() {
+        let non_passed = verdict_pending_review(VerificationConclusion::Partial);
+        assert!(matches!(
+            build_guided_founder_verdict(
+                &non_passed,
+                guided_verdict_input(GuidedFounderVerdictSelection::Accept),
+            ),
+            Err(
+                ClientGuidedFounderVerdictError::NonPassedAcceptRequiresRiskMaterials {
+                    conclusion: VerificationConclusion::Partial,
+                }
+            )
+        ));
+
+        let passed = verdict_pending_review(VerificationConclusion::Passed);
+        assert!(matches!(
+            build_guided_founder_verdict(
+                &passed,
+                guided_verdict_input(GuidedFounderVerdictSelection::Rework),
+            ),
+            Err(ClientGuidedFounderVerdictError::ReworkRequiresDirectiveMaterials)
+        ));
+    }
+
+    #[test]
+    fn guided_founder_verdict_rejects_stale_or_non_actionable_review() {
+        let mut mismatched = verdict_pending_review(VerificationConclusion::Passed);
+        mismatched.evidence_graph.as_mut().unwrap().task_id = "task:other".to_owned();
+        assert!(matches!(
+            build_guided_founder_verdict(
+                &mismatched,
+                guided_verdict_input(GuidedFounderVerdictSelection::Accept),
+            ),
+            Err(ClientGuidedFounderVerdictError::Review(
+                ClientTaskResultReviewError::Integrity {
+                    stage: TaskResultReviewStage::Evidence,
+                    detail: "evidence graph binding mismatch",
+                }
+            ))
+        ));
+
+        let mut non_actionable = verdict_pending_review(VerificationConclusion::Passed);
+        non_actionable.task_view.available_actions.clear();
+        assert!(matches!(
+            build_guided_founder_verdict(
+                &non_actionable,
+                guided_verdict_input(GuidedFounderVerdictSelection::Accept),
+            ),
+            Err(ClientGuidedFounderVerdictError::NonActionable(
+                "SubmitFounderVerdict is not available in the current projection"
+            ))
+        ));
+    }
+
+    #[test]
+    fn guided_founder_verdict_submission_preflights_permissions_and_current_binding_before_send() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let review = verdict_pending_review(VerificationConclusion::Passed);
+        let command = sealed_guided_verdict_command(GuidedFounderVerdictSelection::Accept);
+        let denied = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &["local.task.read", "local.evidence.read"],
+            ClientSurface::Cli,
+            now,
+        );
+        let reads = Cell::new(0_u64);
+        let sends = Cell::new(0_u64);
+        let result = block_on_ready(submit_guided_founder_verdict_via(
+            &denied,
+            command.clone(),
+            GuidedFounderVerdictSelection::Accept,
+            now,
+            |_request| {
+                reads.set(reads.get() + 1);
+                std::future::ready(Err("must-not-read-task".to_owned()))
+            },
+            |_request| {
+                reads.set(reads.get() + 1);
+                std::future::ready(Err("must-not-read-evidence".to_owned()))
+            },
+            |_request| {
+                sends.set(sends.get() + 1);
+                std::future::ready(Err("must-not-send".to_owned()))
+            },
+        ));
+        assert!(matches!(
+            result,
+            Err(ClientGuidedFounderVerdictError::Kernel(
+                KernelError::PermissionDenied(_)
+            ))
+        ));
+        assert_eq!(reads.get(), 0);
+        assert_eq!(sends.get(), 0);
+
+        let allowed = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &[
+                "local.task.read",
+                "local.evidence.read",
+                "local.founder-verdict.issue",
+            ],
+            ClientSurface::Cli,
+            now,
+        );
+        let mut wrong_scope = command;
+        let issue = match wrong_scope.command.as_mut().unwrap() {
+            verdict_command::Command::IssueFounderVerdict(issue) => issue,
+            _ => unreachable!("guided command branch"),
+        };
+        issue.scope.as_mut().unwrap().task_revision += 1;
+        set_verdict_digest(&mut wrong_scope);
+        let sends = Cell::new(0_u64);
+        let task_view = review.task_view.clone();
+        let evidence_graph = review.evidence_graph.clone().unwrap();
+        let result = block_on_ready(submit_guided_founder_verdict_via(
+            &allowed,
+            wrong_scope,
+            GuidedFounderVerdictSelection::Accept,
+            now,
+            move |_request| {
+                std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                }))
+            },
+            move |_request| {
+                std::future::ready(Ok(GetEvidenceGraphResponse {
+                    outcome: Some(get_evidence_graph_response::Outcome::Graph(evidence_graph)),
+                }))
+            },
+            |_request| {
+                sends.set(sends.get() + 1);
+                std::future::ready(Err("must-not-send".to_owned()))
+            },
+        ));
+        assert!(matches!(
+            result,
+            Err(ClientGuidedFounderVerdictError::RequestDigestMismatch)
+                | Err(ClientGuidedFounderVerdictError::BindingChanged)
+        ));
+        assert_eq!(sends.get(), 0);
+    }
+
+    #[test]
+    fn guided_founder_verdict_submission_reports_authority_commit_without_inventing_projection_await()
+     {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &[
+                "local.task.read",
+                "local.evidence.read",
+                "local.founder-verdict.issue",
+            ],
+            ClientSurface::Cli,
+            now,
+        );
+        let review = verdict_pending_review(VerificationConclusion::Passed);
+        let task_view = review.task_view.clone();
+        let evidence_graph = review.evidence_graph.clone().unwrap();
+        let command = sealed_guided_verdict_command(GuidedFounderVerdictSelection::Accept);
+        let sent = RefCell::new(None);
+        let mut response = guided_verdict_response(&command, false);
+        response.await_token = Some(ProjectionAwaitToken {
+            token: "unbound-await-token".to_owned(),
+            required_source_revision: Some(SourceRevision {
+                domain: SourceDomain::Task as i32,
+                aggregate_id: "task:other".to_owned(),
+                revision: 1,
+                last_event_id: "task-event:other:1".to_owned(),
+            }),
+            expires_at: Some(Timestamp {
+                seconds: 400,
+                nanos: 0,
+            }),
+        });
+        let result = block_on_ready(submit_guided_founder_verdict_via(
+            &kernel,
+            command.clone(),
+            GuidedFounderVerdictSelection::Accept,
+            now,
+            move |_request| {
+                std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                }))
+            },
+            move |_request| {
+                std::future::ready(Ok(GetEvidenceGraphResponse {
+                    outcome: Some(get_evidence_graph_response::Outcome::Graph(evidence_graph)),
+                }))
+            },
+            |request| {
+                sent.replace(request.command.clone());
+                std::future::ready(Ok(response))
+            },
+        ))
+        .expect("guided verdict submission");
+        let GuidedFounderVerdictAttempt::Committed(result) = result else {
+            panic!("Authority result must be known");
+        };
+        assert!(result.committed());
+        assert!(!result.replayed());
+        assert_eq!(result.decision(), FounderVerdictDecision::Accept);
+        assert_eq!(result.founder_verdict_id(), "founder-verdict:guided:1");
+        assert!(result.await_token().is_none());
+        assert!(result.projection_warning().is_none());
+        assert_eq!(sent.into_inner(), Some(command));
+    }
+
+    #[test]
+    fn guided_founder_verdict_response_loss_retries_the_exact_sealed_command() {
+        let first_now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let retry_now = first_now + Duration::from_secs(10);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &[
+                "local.task.read",
+                "local.evidence.read",
+                "local.founder-verdict.issue",
+            ],
+            ClientSurface::Cli,
+            first_now,
+        );
+        let review = verdict_pending_review(VerificationConclusion::Passed);
+        let task_view = review.task_view.clone();
+        let evidence_graph = review.evidence_graph.clone().unwrap();
+        let command = sealed_guided_verdict_command(GuidedFounderVerdictSelection::Reject);
+        let first_sent = RefCell::new(None);
+        let attempt = block_on_ready(submit_guided_founder_verdict_via(
+            &kernel,
+            command.clone(),
+            GuidedFounderVerdictSelection::Reject,
+            first_now,
+            move |_request| {
+                std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                }))
+            },
+            move |_request| {
+                std::future::ready(Ok(GetEvidenceGraphResponse {
+                    outcome: Some(get_evidence_graph_response::Outcome::Graph(evidence_graph)),
+                }))
+            },
+            |request| {
+                first_sent.replace(request.command);
+                std::future::ready(Err("response-lost".to_owned()))
+            },
+        ))
+        .expect("unknown outcome is recoverable");
+        let GuidedFounderVerdictAttempt::OutcomeUnknown(recovery) = attempt else {
+            panic!("lost response must retain recovery");
+        };
+        assert_eq!(recovery.sealed_command(), &command);
+
+        let retry_sent = RefCell::new(None);
+        let retried = block_on_ready(retry_guided_founder_verdict_via(
+            &kernel,
+            &recovery,
+            retry_now,
+            |request| {
+                retry_sent.replace(request.command.clone());
+                std::future::ready(Ok(guided_verdict_response(
+                    request.command.as_ref().unwrap(),
+                    true,
+                )))
+            },
+        ))
+        .expect("exact retry");
+        let GuidedFounderVerdictAttempt::Committed(result) = retried else {
+            panic!("replayed Authority result must be known");
+        };
+        assert!(result.replayed());
+        assert_eq!(first_sent.into_inner(), Some(command.clone()));
+        assert_eq!(retry_sent.into_inner(), Some(command.clone()));
+
+        let review = verdict_pending_review(VerificationConclusion::Passed);
+        let task_view = review.task_view.clone();
+        let evidence_graph = review.evidence_graph.unwrap();
+        let attempt = block_on_ready(submit_guided_founder_verdict_via(
+            &kernel,
+            command.clone(),
+            GuidedFounderVerdictSelection::Reject,
+            first_now,
+            move |_request| {
+                std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                }))
+            },
+            move |_request| {
+                std::future::ready(Ok(GetEvidenceGraphResponse {
+                    outcome: Some(get_evidence_graph_response::Outcome::Graph(evidence_graph)),
+                }))
+            },
+            move |_request| std::future::ready(Err("response-lost".to_owned())),
+        ))
+        .expect("lost response retains the exact command");
+        let GuidedFounderVerdictAttempt::OutcomeUnknown(recovery) = attempt else {
+            panic!("lost response must retain recovery before a permission rejection");
+        };
+        let retry_sent = RefCell::new(None);
+        let retried = block_on_ready(retry_guided_founder_verdict_via(
+            &kernel,
+            &recovery,
+            retry_now,
+            |request| {
+                retry_sent.replace(request.command);
+                std::future::ready(Ok(ExecuteFounderVerdictResponse {
+                    authority_result: Some(VerdictCommandResult {
+                        error_code: VerdictErrorCode::PermissionDenied as i32,
+                        safe_error_fingerprint: Some(
+                            "verdict/retry-permission-denied/v1".to_owned(),
+                        ),
+                        ..Default::default()
+                    }),
+                    await_token: None,
+                    gateway_error: None,
+                }))
+            },
+        ))
+        .expect("a retry rejection cannot resolve the earlier unknown outcome");
+        let GuidedFounderVerdictAttempt::OutcomeUnknown(retained) = retried else {
+            panic!("non-committed retry rejection must preserve unknown outcome");
+        };
+        assert_eq!(recovery.sealed_command(), &command);
+        assert_eq!(retained.sealed_command(), &command);
+        assert_eq!(retry_sent.into_inner(), Some(command));
+    }
+
+    #[test]
+    fn guided_founder_verdict_wrong_scope_and_incomplete_responses_remain_outcome_unknown() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &[
+                "local.task.read",
+                "local.evidence.read",
+                "local.founder-verdict.issue",
+            ],
+            ClientSurface::Cli,
+            now,
+        );
+        let command = sealed_guided_verdict_command(GuidedFounderVerdictSelection::Accept);
+        let mut wrong_scope = guided_verdict_response(&command, false);
+        wrong_scope
+            .authority_result
+            .as_mut()
+            .unwrap()
+            .verdict
+            .as_mut()
+            .unwrap()
+            .scope
+            .as_mut()
+            .unwrap()
+            .task_id = "task:wrong".to_owned();
+        let mut incomplete = guided_verdict_response(&command, false);
+        incomplete.authority_result.as_mut().unwrap().state = None;
+        let mut wrong_principal = guided_verdict_response(&command, false);
+        wrong_principal
+            .authority_result
+            .as_mut()
+            .unwrap()
+            .verdict
+            .as_mut()
+            .unwrap()
+            .authority_proof
+            .as_mut()
+            .unwrap()
+            .authenticated_founder_principal_id = "founder:other".to_owned();
+
+        for response in [
+            wrong_scope,
+            wrong_principal,
+            incomplete,
+            ExecuteFounderVerdictResponse::default(),
+        ] {
+            let review = verdict_pending_review(VerificationConclusion::Passed);
+            let task_view = review.task_view.clone();
+            let evidence_graph = review.evidence_graph.unwrap();
+            let attempt = block_on_ready(submit_guided_founder_verdict_via(
+                &kernel,
+                command.clone(),
+                GuidedFounderVerdictSelection::Accept,
+                now,
+                move |_request| {
+                    std::future::ready(Ok(GetTaskViewResponse {
+                        outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                    }))
+                },
+                move |_request| {
+                    std::future::ready(Ok(GetEvidenceGraphResponse {
+                        outcome: Some(get_evidence_graph_response::Outcome::Graph(evidence_graph)),
+                    }))
+                },
+                move |_request| std::future::ready(Ok(response)),
+            ))
+            .expect("uncertain response remains recoverable");
+            let GuidedFounderVerdictAttempt::OutcomeUnknown(recovery) = attempt else {
+                panic!("mismatched response must not report success");
+            };
+            assert_eq!(recovery.sealed_command(), &command);
+        }
+    }
+
+    #[test]
+    fn guided_founder_verdict_authority_rejection_is_certain_and_not_retried_as_unknown() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let kernel = authenticated_kernel_with_permissions(
+            "founder:guided-verdict",
+            "session:guided-verdict",
+            &[
+                "local.task.read",
+                "local.evidence.read",
+                "local.founder-verdict.issue",
+            ],
+            ClientSurface::Cli,
+            now,
+        );
+        let review = verdict_pending_review(VerificationConclusion::Passed);
+        let task_view = review.task_view.clone();
+        let evidence_graph = review.evidence_graph.unwrap();
+        let command = sealed_guided_verdict_command(GuidedFounderVerdictSelection::Accept);
+        let rejection = ExecuteFounderVerdictResponse {
+            authority_result: Some(VerdictCommandResult {
+                error_code: VerdictErrorCode::ScopeStale as i32,
+                safe_error_fingerprint: Some("verdict/scope-stale/v1".to_owned()),
+                ..Default::default()
+            }),
+            await_token: None,
+            gateway_error: None,
+        };
+        let result = block_on_ready(submit_guided_founder_verdict_via(
+            &kernel,
+            command,
+            GuidedFounderVerdictSelection::Accept,
+            now,
+            move |_request| {
+                std::future::ready(Ok(GetTaskViewResponse {
+                    outcome: Some(get_task_view_response::Outcome::View(task_view)),
+                }))
+            },
+            move |_request| {
+                std::future::ready(Ok(GetEvidenceGraphResponse {
+                    outcome: Some(get_evidence_graph_response::Outcome::Graph(evidence_graph)),
+                }))
+            },
+            move |_request| std::future::ready(Ok(rejection)),
+        ));
+        assert!(matches!(
+            result,
+            Err(ClientGuidedFounderVerdictError::Authority {
+                error_code,
+                safe_error_fingerprint: Some(fingerprint),
+            }) if error_code == VerdictErrorCode::ScopeStale as i32
+                && fingerprint == "verdict/scope-stale/v1"
+        ));
     }
 
     #[test]

@@ -162,6 +162,22 @@ pub(super) struct SnapshotBlobs {
     pub attempts: Vec<Vec<u8>>,
 }
 
+/// One current Collaboration head whose latest committed event may prove a
+/// cancellation settlement. The query that constructs this record joins only
+/// the run's current revision; callers never recover from an older event.
+pub(super) struct SettledCancellationHead {
+    pub run_id: String,
+    pub run_revision: u64,
+    pub event_id: String,
+    pub event_request_digest_sha256: String,
+    pub event: Vec<u8>,
+    pub receipt_aggregate_id: String,
+    pub receipt_aggregate_revision: u64,
+    pub receipt_idempotency_key: String,
+    pub receipt_request_digest_sha256: String,
+    pub snapshots: SnapshotBlobs,
+}
+
 pub(super) struct RunWrite {
     pub run_id: String,
     pub task_id: String,
@@ -650,6 +666,126 @@ impl CollaborationStore {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    /// Reads only current-revision heads in one of the two durable
+    /// cancellation-settlement states. Missing current events or commit
+    /// receipts are integrity failures rather than silently skipped runs.
+    pub(super) fn settled_cancellation_heads(
+        &self,
+        cancelled_status: i32,
+        return_pending_status: i32,
+    ) -> Result<Vec<SettledCancellationHead>, StoreError> {
+        type HeadRow = (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        );
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT r.run_id,r.revision,
+                        e.event_id,e.request_digest_sha256,e.event,
+                        c.aggregate_id,c.aggregate_revision,c.idempotency_key,
+                        c.request_digest_sha256,c.store_epoch,
+                        c.acknowledged_after_durability_barrier
+                 FROM collaboration_runs r
+                 LEFT JOIN collaboration_events e
+                   ON e.run_id=r.run_id AND e.resulting_run_revision=r.revision
+                 LEFT JOIN collaboration_commit_receipts c ON c.event_id=e.event_id
+                 WHERE r.status IN (?1,?2)
+                 ORDER BY r.run_id",
+            )?;
+            statement
+                .query_map(params![cancelled_status, return_pending_status], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                })?
+                .collect::<Result<Vec<HeadRow>, _>>()?
+        };
+        let mut heads = Vec::with_capacity(rows.len());
+        let mut previous_run_id: Option<String> = None;
+        for (
+            run_id,
+            run_revision,
+            event_id,
+            event_request_digest_sha256,
+            event,
+            receipt_aggregate_id,
+            receipt_aggregate_revision,
+            receipt_idempotency_key,
+            receipt_request_digest_sha256,
+            receipt_store_epoch,
+            receipt_acknowledged,
+        ) in rows
+        {
+            if previous_run_id.as_deref() == Some(run_id.as_str()) {
+                return Err(StoreError::IntegrityFailure);
+            }
+            previous_run_id = Some(run_id.clone());
+            let Some(event_id) = event_id else {
+                return Err(StoreError::IntegrityFailure);
+            };
+            let Some(event_request_digest_sha256) = event_request_digest_sha256 else {
+                return Err(StoreError::IntegrityFailure);
+            };
+            let Some(event) = event else {
+                return Err(StoreError::IntegrityFailure);
+            };
+            let Some(receipt_aggregate_id) = receipt_aggregate_id else {
+                return Err(StoreError::IntegrityFailure);
+            };
+            let Some(receipt_aggregate_revision) = receipt_aggregate_revision else {
+                return Err(StoreError::IntegrityFailure);
+            };
+            let Some(receipt_idempotency_key) = receipt_idempotency_key else {
+                return Err(StoreError::IntegrityFailure);
+            };
+            let Some(receipt_request_digest_sha256) = receipt_request_digest_sha256 else {
+                return Err(StoreError::IntegrityFailure);
+            };
+            if receipt_store_epoch.as_deref() != Some(self.store_epoch.as_str())
+                || receipt_acknowledged != Some(1)
+                || run_revision < 1
+                || receipt_aggregate_revision < 1
+            {
+                return Err(StoreError::IntegrityFailure);
+            }
+            let snapshots = self
+                .snapshot_blobs(&run_id)?
+                .ok_or(StoreError::IntegrityFailure)?;
+            heads.push(SettledCancellationHead {
+                run_id,
+                run_revision: run_revision as u64,
+                event_id,
+                event_request_digest_sha256,
+                event,
+                receipt_aggregate_id,
+                receipt_aggregate_revision: receipt_aggregate_revision as u64,
+                receipt_idempotency_key,
+                receipt_request_digest_sha256,
+                snapshots,
+            });
+        }
+        Ok(heads)
     }
 
     pub fn commit(&mut self, commit: &CollaborationCommit) -> Result<(), StoreError> {

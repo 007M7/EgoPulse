@@ -9,10 +9,11 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ContentMutationOperation, DispatchContextConsumptionProof, DispatchRouteBinding,
     HarnessContentLimitKind, HarnessContentMarkerKind, HarnessContentSafetyFlag,
     HarnessContentSignalObservation, HarnessObservation, LifecycleContentCandidate, LifecycleKind,
-    SafeApprovalRequiredContent, SafeAssistantTextContent, SafeContentMarker,
-    SafeHarnessContentRecord, SafeLifecycleContent, SafeUsageContent, SideEffectCertainty,
-    UsageContentCandidate, UserVisibleContentCandidate, dispatch_context_consumption_proof,
-    dispatch_route_binding, safe_harness_content_record, user_visible_content_candidate,
+    SafeApprovalRequiredContent, SafeArtifactRelationContent, SafeAssistantTextContent,
+    SafeContentMarker, SafeHarnessContentRecord, SafeLifecycleContent, SafeUsageContent,
+    SideEffectCertainty, UsageContentCandidate, UserVisibleContentCandidate,
+    dispatch_context_consumption_proof, dispatch_route_binding, safe_harness_content_record,
+    user_visible_content_candidate,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -31,6 +32,7 @@ const SAFE_LIFECYCLE_DOMAIN: &str = "egopulse/harness-content/safe-lifecycle/v1"
 const SAFE_USAGE_DOMAIN: &str = "egopulse/harness-content/safe-usage/v1";
 const SAFE_APPROVAL_DOMAIN: &str = "egopulse/harness-content/safe-approval-required/v1";
 const SAFE_MARKER_DOMAIN: &str = "egopulse/harness-content/safe-marker/v1";
+const SAFE_ARTIFACT_DOMAIN: &str = "egopulse/harness-content/safe-artifact-relation/v1";
 const REDACTION_MARKER: &str = "[REDACTED]";
 const SAFE_TEXT_PART_BYTES: usize = 65_536;
 
@@ -1237,7 +1239,9 @@ fn safe_payload_digest(
         safe_harness_content_record::Payload::Marker(value) => {
             safe_marker_digest(value).map(|digest| ("MARKER", digest))
         }
-        safe_harness_content_record::Payload::ArtifactRelation(_) => None,
+        safe_harness_content_record::Payload::ArtifactRelation(value) => {
+            safe_artifact_relation_digest(value).map(|digest| ("ARTIFACT_RELATION", digest))
+        }
     }
 }
 
@@ -1253,6 +1257,23 @@ fn safe_assistant_digest(value: &SafeAssistantTextContent) -> Option<String> {
     frame(&mut bytes, value.safe_cumulative_digest_sha256.as_bytes());
     frame(&mut bytes, &value.part_index.to_le_bytes());
     frame(&mut bytes, &value.part_count.to_le_bytes());
+    Some(sha256(&bytes))
+}
+
+fn safe_artifact_relation_digest(value: &SafeArtifactRelationContent) -> Option<String> {
+    let artifact = value.artifact.as_ref()?;
+    if artifact.artifact_id.trim().is_empty() || !canonical_sha256(&artifact.artifact_digest_sha256)
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    frame(&mut bytes, SAFE_ARTIFACT_DOMAIN.as_bytes());
+    frame(
+        &mut bytes,
+        &u64::from(value.safe_content_differs_from_artifact).to_le_bytes(),
+    );
+    frame(&mut bytes, artifact.artifact_id.as_bytes());
+    frame(&mut bytes, artifact.artifact_digest_sha256.as_bytes());
     Some(sha256(&bytes))
 }
 

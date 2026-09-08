@@ -17,11 +17,12 @@ use crossterm::{
 };
 use egopulse_client_operations::{
     ClientAttachment, ClientContextRevokeError, ClientReadError, ClientWorkError,
-    ContextRevokeInput, GovernedHoldReason, GovernedProjectionReason, GovernedTaskState,
-    GuidedApprovalDecision, GuidedApprovalDecisionInput, GuidedWorkCapabilityChoice,
-    GuidedWorkInput, GuidedWorkMemoryMode, GuidedWorkSource, HarnessContentFilter,
-    PreparedContextRevoke, attach as attach_client, command_metadata, set_task_digest,
-    set_verdict_digest, timestamp_after,
+    ContextRevokeInput, DurableFounderVerdictRecovery, FounderSupportingMaterialCollection,
+    GovernedHoldReason, GovernedProjectionReason, GovernedTaskState, GuidedApprovalDecision,
+    GuidedApprovalDecisionInput, GuidedFounderVerdictInput, GuidedFounderVerdictSelection,
+    GuidedWorkCapabilityChoice, GuidedWorkInput, GuidedWorkMemoryMode, GuidedWorkSource,
+    HarnessContentFilter, PreparedContextRevoke, attach as attach_client, command_metadata,
+    set_task_digest, set_verdict_digest, timestamp_after,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -61,8 +62,10 @@ use egopulse_tui::governed_state::{
 };
 use egopulse_tui::harness_content::{HarnessContentController, render_harness_content_page};
 use egopulse_tui::result_review::{
-    RESULT_REVIEW_NOTICE, ResultReviewController, ResultReviewPageModel, TaskResultReviewClient,
-    TaskResultReviewFuture,
+    DurableFounderVerdictFuture, GuidedFounderVerdictFuture, RESULT_REVIEW_NOTICE,
+    ResultReviewController, ResultReviewMaterialFuture, ResultReviewMaterialInput,
+    ResultReviewMaterialPlan, ResultReviewPageModel, ResultReviewVerdictRecovery,
+    ResultReviewVerdictStage, TaskResultReviewClient, TaskResultReviewFuture,
 };
 use egopulse_tui::task_watch::{
     TaskWatchBaselineFuture, TaskWatchClient, TaskWatchController, TaskWatchOpenFuture,
@@ -211,6 +214,8 @@ enum TuiCommand {
         reason_code: String,
         #[arg(long)]
         confirmation_proof_ref: Option<String>,
+        #[arg(long)]
+        reviewed_summary_digest: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -485,7 +490,7 @@ impl CommandForm {
             CommandKind::WorkPlan => vec![
                 FormField::required("intent"),
                 FormField::required("scope-ref"),
-                FormField::required("work-type").with_value("general"),
+                FormField::required("work-type").with_value("governed_repository_change"),
                 FormField::optional("context-ref"),
             ],
             CommandKind::WorkPrepare => vec![
@@ -528,6 +533,7 @@ impl CommandForm {
                 FormField::required("decision"),
                 FormField::required("reason-code"),
                 FormField::optional("confirmation-proof-ref"),
+                FormField::optional("reviewed-summary-digest"),
             ],
             CommandKind::Await => vec![
                 FormField::required("token-json"),
@@ -785,6 +791,10 @@ impl CommandForm {
                 reason_code: next(&mut values, "reason-code")?,
                 confirmation_proof_ref: {
                     let value = next(&mut values, "confirmation-proof-ref")?;
+                    (!value.trim().is_empty()).then_some(value)
+                },
+                reviewed_summary_digest: {
+                    let value = next(&mut values, "reviewed-summary-digest")?;
                     (!value.trim().is_empty()).then_some(value)
                 },
                 json: false,
@@ -1078,6 +1088,22 @@ fn work_start_key_intent(
     }
 }
 
+const fn result_review_preserves_sent_recovery(
+    stage: ResultReviewVerdictStage,
+    key: KeyCode,
+) -> bool {
+    matches!(
+        (stage, key),
+        (
+            ResultReviewVerdictStage::CollectingMaterials
+                | ResultReviewVerdictStage::MaterialOutcomeUnknown
+                | ResultReviewVerdictStage::Submitting
+                | ResultReviewVerdictStage::OutcomeUnknown,
+            KeyCode::Esc | KeyCode::Char('r') | KeyCode::Char('q')
+        )
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApprovalModalField {
     Reason,
@@ -1091,6 +1117,10 @@ struct ApprovalDecisionModal {
     confirmation_proof_ref: String,
     active_field: ApprovalModalField,
     submitting: bool,
+    summary_text: String,
+    summary_digest: Option<String>,
+    allow_once_available: bool,
+    summary_scroll: u16,
 }
 
 impl ApprovalDecisionModal {
@@ -1102,25 +1132,36 @@ impl ApprovalDecisionModal {
             confirmation_proof_ref: String::new(),
             active_field: ApprovalModalField::Reason,
             submitting: false,
+            summary_text: "Operation details unavailable; AllowOnce is disabled".to_owned(),
+            summary_digest: None,
+            allow_once_available: false,
+            summary_scroll: 0,
         }
     }
 
     fn cycle_decision(&mut self, forward: bool) {
-        const VALUES: [GuidedApprovalDecision; 3] = [
-            GuidedApprovalDecision::AllowOnce,
-            GuidedApprovalDecision::Deny,
-            GuidedApprovalDecision::CancelAttempt,
-        ];
+        let values: &[GuidedApprovalDecision] = if self.allow_once_available {
+            &[
+                GuidedApprovalDecision::AllowOnce,
+                GuidedApprovalDecision::Deny,
+                GuidedApprovalDecision::CancelAttempt,
+            ]
+        } else {
+            &[
+                GuidedApprovalDecision::Deny,
+                GuidedApprovalDecision::CancelAttempt,
+            ]
+        };
         let index = self
             .decision
-            .and_then(|value| VALUES.iter().position(|candidate| *candidate == value));
+            .and_then(|value| values.iter().position(|candidate| *candidate == value));
         let next = match (index, forward) {
             (None, _) => 0,
-            (Some(index), true) => (index + 1) % VALUES.len(),
-            (Some(0), false) => VALUES.len() - 1,
+            (Some(index), true) => (index + 1) % values.len(),
+            (Some(0), false) => values.len() - 1,
             (Some(index), false) => index - 1,
         };
-        self.decision = Some(VALUES[next]);
+        self.decision = Some(values[next]);
     }
 
     fn active_value_mut(&mut self) -> &mut String {
@@ -1338,6 +1379,78 @@ impl ApprovalQueueClient for AttachedClient {
 impl TaskResultReviewClient for AttachedClient {
     fn read_task_result_review<'a>(&'a self, task_id: &'a str) -> TaskResultReviewFuture<'a> {
         TaskResultReviewClient::read_task_result_review(self.0.as_ref(), task_id)
+    }
+
+    fn submit_guided_founder_verdict<'a>(
+        &'a self,
+        command: VerdictCommand,
+        selection: GuidedFounderVerdictSelection,
+    ) -> GuidedFounderVerdictFuture<'a> {
+        TaskResultReviewClient::submit_guided_founder_verdict(self.0.as_ref(), command, selection)
+    }
+
+    fn retry_guided_founder_verdict<'a>(
+        &'a self,
+        recovery: &'a ResultReviewVerdictRecovery,
+    ) -> GuidedFounderVerdictFuture<'a> {
+        TaskResultReviewClient::retry_guided_founder_verdict(self.0.as_ref(), recovery)
+    }
+
+    fn collect_founder_supporting_materials<'a>(
+        &'a self,
+        plan: ResultReviewMaterialPlan,
+    ) -> ResultReviewMaterialFuture<'a> {
+        TaskResultReviewClient::collect_founder_supporting_materials(self.0.as_ref(), plan)
+    }
+
+    fn prepare_founder_supporting_materials(
+        &self,
+        review: &egopulse_client_operations::TaskResultReview,
+        input: ResultReviewMaterialInput,
+    ) -> Result<ResultReviewMaterialPlan, String> {
+        TaskResultReviewClient::prepare_founder_supporting_materials(self.0.as_ref(), review, input)
+    }
+
+    fn build_guided_founder_verdict_with_materials(
+        &self,
+        review: &egopulse_client_operations::TaskResultReview,
+        input: GuidedFounderVerdictInput,
+        materials: &FounderSupportingMaterialCollection,
+    ) -> Result<VerdictCommand, String> {
+        TaskResultReviewClient::build_guided_founder_verdict_with_materials(
+            self.0.as_ref(),
+            review,
+            input,
+            materials,
+        )
+    }
+
+    fn submit_guided_founder_verdict_durable<'a>(
+        &'a self,
+        command: VerdictCommand,
+        selection: GuidedFounderVerdictSelection,
+        materials: Option<FounderSupportingMaterialCollection>,
+        recovery_path: std::path::PathBuf,
+    ) -> GuidedFounderVerdictFuture<'a> {
+        TaskResultReviewClient::submit_guided_founder_verdict_durable(
+            self.0.as_ref(),
+            command,
+            selection,
+            materials,
+            recovery_path,
+        )
+    }
+
+    fn retry_durable_founder_verdict<'a>(
+        &'a self,
+        recovery: &'a DurableFounderVerdictRecovery,
+        recovery_path: std::path::PathBuf,
+    ) -> DurableFounderVerdictFuture<'a> {
+        TaskResultReviewClient::retry_durable_founder_verdict(
+            self.0.as_ref(),
+            recovery,
+            recovery_path,
+        )
     }
 }
 
@@ -2032,6 +2145,7 @@ async fn run_command_with_output(
             decision,
             reason_code,
             confirmation_proof_ref,
+            reviewed_summary_digest,
             json,
         } => {
             let decision = parse_approval_decision(&decision)?;
@@ -2043,6 +2157,7 @@ async fn run_command_with_output(
                     decision,
                     reason_code,
                     confirmation_proof_ref,
+                    reviewed_summary_digest_sha256: reviewed_summary_digest,
                 })
                 .await
                 .map_err(|error| error.to_string())?;
@@ -2221,7 +2336,7 @@ async fn run_command_with_output(
                         rationale_artifact_id: None,
                         required_confirmation_class: confirmation_class,
                         confirmation_proof_ref,
-                        expires_at: Some(timestamp_after(Duration::from_secs(3600))),
+                        expires_at: Some(timestamp_after(Duration::from_secs(240))),
                         supersedes_founder_verdict_id: None,
                     },
                 )),
@@ -3096,11 +3211,171 @@ impl App {
                 }
                 _ => Ok(None),
             },
-            InteractiveMode::ResultReview => match key.code {
-                KeyCode::Esc => Ok(Some(InteractiveAction::CloseResultReview)),
-                KeyCode::Char('r') => Ok(Some(InteractiveAction::RefreshResultReview)),
-                KeyCode::Char('q') => Ok(Some(InteractiveAction::Quit)),
-                KeyCode::Tab => {
+            InteractiveMode::ResultReview => match (
+                self.result_review
+                    .as_ref()
+                    .map_or(ResultReviewVerdictStage::Viewing, |controller| {
+                        controller.verdict_stage()
+                    }),
+                key.code,
+            ) {
+                (
+                    ResultReviewVerdictStage::Viewing | ResultReviewVerdictStage::Committed,
+                    KeyCode::Esc,
+                ) => Ok(Some(InteractiveAction::CloseResultReview)),
+                (
+                    ResultReviewVerdictStage::Viewing | ResultReviewVerdictStage::Committed,
+                    KeyCode::Char('r'),
+                ) => Ok(Some(InteractiveAction::RefreshResultReview)),
+                (
+                    ResultReviewVerdictStage::Viewing | ResultReviewVerdictStage::Committed,
+                    KeyCode::Char('q'),
+                ) => Ok(Some(InteractiveAction::Quit)),
+                (ResultReviewVerdictStage::Viewing, KeyCode::Char('a')) => {
+                    self.begin_result_review_verdict(GuidedFounderVerdictSelection::Accept);
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::Viewing, KeyCode::Char('x')) => {
+                    self.begin_result_review_verdict(GuidedFounderVerdictSelection::Reject);
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::Viewing, KeyCode::Char('w')) => {
+                    self.begin_result_review_verdict(GuidedFounderVerdictSelection::Rework);
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::Viewing, KeyCode::Char('v')) => {
+                    let result = self
+                        .result_review
+                        .as_mut()
+                        .ok_or_else(|| "Result review controller is unavailable".to_owned())?
+                        .begin_verdict_recovery();
+                    if let Err(error) = result {
+                        self.message = format!("Founder Verdict recovery blocked: {error}");
+                    } else {
+                        self.sync_result_review_message();
+                    }
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::Drafting, KeyCode::Tab | KeyCode::BackTab) => {
+                    if let Some(controller) = self.result_review.as_mut() {
+                        controller.toggle_verdict_field();
+                    }
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::Drafting, KeyCode::Backspace) => {
+                    if let Some(controller) = self.result_review.as_mut() {
+                        controller.pop_verdict_character();
+                    }
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::Drafting, KeyCode::Enter) => {
+                    let result = self
+                        .result_review
+                        .as_mut()
+                        .ok_or_else(|| "Result review controller is unavailable".to_owned())?
+                        .prepare_verdict_confirmation();
+                    if let Err(error) = result {
+                        self.message = format!("Founder Verdict blocked: {error}");
+                    } else {
+                        self.sync_result_review_message();
+                    }
+                    Ok(None)
+                }
+                (
+                    ResultReviewVerdictStage::Drafting
+                    | ResultReviewVerdictStage::Confirming
+                    | ResultReviewVerdictStage::RecoveryInput,
+                    KeyCode::Esc,
+                ) => {
+                    if let Some(controller) = self.result_review.as_mut() {
+                        controller.cancel_unsent_verdict();
+                    }
+                    self.sync_result_review_message();
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::Drafting, KeyCode::Char(character))
+                    if !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    if let Some(controller) = self.result_review.as_mut() {
+                        controller.push_verdict_character(character);
+                    }
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::RecoveryInput, KeyCode::Backspace) => {
+                    if let Some(controller) = self.result_review.as_mut() {
+                        controller.pop_verdict_character();
+                    }
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::RecoveryInput, KeyCode::Char(character))
+                    if !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    if let Some(controller) = self.result_review.as_mut() {
+                        controller.push_verdict_character(character);
+                    }
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::RecoveryInput, KeyCode::Enter) => {
+                    let result = self
+                        .result_review
+                        .as_mut()
+                        .ok_or_else(|| "Result review controller is unavailable".to_owned())?
+                        .recover_verdict_from_input();
+                    if let Err(error) = result {
+                        self.message = format!("Founder Verdict recovery blocked: {error}");
+                    } else {
+                        self.sync_result_review_message();
+                    }
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::Confirming, KeyCode::Enter) => {
+                    let result = self
+                        .result_review
+                        .as_mut()
+                        .ok_or_else(|| "Result review controller is unavailable".to_owned())?
+                        .submit_verdict();
+                    if let Err(error) = result {
+                        self.message = format!("Founder Verdict blocked: {error}");
+                    } else {
+                        self.sync_result_review_message();
+                    }
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::OutcomeUnknown, KeyCode::Enter) => {
+                    let result = self
+                        .result_review
+                        .as_mut()
+                        .ok_or_else(|| "Result review controller is unavailable".to_owned())?
+                        .retry_verdict();
+                    if let Err(error) = result {
+                        self.message = format!("Founder Verdict recovery blocked: {error}");
+                    } else {
+                        self.sync_result_review_message();
+                    }
+                    Ok(None)
+                }
+                (ResultReviewVerdictStage::MaterialOutcomeUnknown, KeyCode::Enter) => {
+                    let result = self
+                        .result_review
+                        .as_mut()
+                        .ok_or_else(|| "Result review controller is unavailable".to_owned())?
+                        .retry_material();
+                    if let Err(error) = result {
+                        self.message = format!("Supporting-material recovery blocked: {error}");
+                    } else {
+                        self.sync_result_review_message();
+                    }
+                    Ok(None)
+                }
+                (stage, key) if result_review_preserves_sent_recovery(stage, key) => {
+                    self.message = "A sent Founder Verdict remains unsettled; recovery is retained here and Enter exact-retries only when the outcome is unknown".to_owned();
+                    Ok(None)
+                }
+                (_, KeyCode::Tab) => {
                     if let Some(model) = self
                         .result_review
                         .as_mut()
@@ -3110,7 +3385,7 @@ impl App {
                     }
                     Ok(None)
                 }
-                KeyCode::BackTab => {
+                (_, KeyCode::BackTab) => {
                     if let Some(model) = self
                         .result_review
                         .as_mut()
@@ -3120,7 +3395,7 @@ impl App {
                     }
                     Ok(None)
                 }
-                KeyCode::Up => {
+                (_, KeyCode::Up) => {
                     if let Some(model) = self
                         .result_review
                         .as_mut()
@@ -3130,7 +3405,7 @@ impl App {
                     }
                     Ok(None)
                 }
-                KeyCode::Down => {
+                (_, KeyCode::Down) => {
                     if let Some(model) = self
                         .result_review
                         .as_mut()
@@ -3140,7 +3415,7 @@ impl App {
                     }
                     Ok(None)
                 }
-                KeyCode::PageUp => {
+                (_, KeyCode::PageUp) => {
                     if let Some(model) = self
                         .result_review
                         .as_mut()
@@ -3150,7 +3425,7 @@ impl App {
                     }
                     Ok(None)
                 }
-                KeyCode::PageDown => {
+                (_, KeyCode::PageDown) => {
                     if let Some(model) = self
                         .result_review
                         .as_mut()
@@ -3183,11 +3458,21 @@ impl App {
                         .approval_queue
                         .as_ref()
                         .and_then(|controller| controller.model())
-                        .and_then(|model| model.selected_id.clone());
+                        .and_then(|model| {
+                            model
+                                .items
+                                .iter()
+                                .find(|item| {
+                                    Some(&item.approval_request_id) == model.selected_id.as_ref()
+                                })
+                                .cloned()
+                        });
                     if let Some(selected) = selected {
-                        self.mode = InteractiveMode::ApprovalDecisionModal(
-                            ApprovalDecisionModal::new(selected),
-                        );
+                        let mut modal = ApprovalDecisionModal::new(selected.approval_request_id);
+                        modal.summary_text = selected.summary_text;
+                        modal.summary_digest = selected.summary_digest;
+                        modal.allow_once_available = selected.allow_once_available;
+                        self.mode = InteractiveMode::ApprovalDecisionModal(modal);
                         self.message = "Choose an explicit decision and enter a reason".to_owned();
                     }
                     Ok(None)
@@ -3195,6 +3480,14 @@ impl App {
                 _ => Ok(None),
             },
             InteractiveMode::ApprovalDecisionModal(modal) => match key.code {
+                KeyCode::PageDown => {
+                    modal.summary_scroll = modal.summary_scroll.saturating_add(10).min(4096);
+                    Ok(None)
+                }
+                KeyCode::PageUp => {
+                    modal.summary_scroll = modal.summary_scroll.saturating_sub(10);
+                    Ok(None)
+                }
                 KeyCode::Esc => {
                     self.mode = InteractiveMode::ApprovalQueue;
                     self.message = "Approval decision cancelled; no command was sent".to_owned();
@@ -3434,7 +3727,7 @@ impl App {
         }
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
-        self.stop_result_review().await;
+        self.stop_result_review().await?;
         self.stop_governed_state().await;
         self.ensure_task_watch_client().await?;
         let client = Arc::clone(
@@ -3481,7 +3774,7 @@ impl App {
         if self.work_start.is_some() {
             self.stop_task_watch().await;
             self.stop_approval_queue().await;
-            self.stop_result_review().await;
+            self.stop_result_review().await?;
             self.stop_governed_state().await;
             let controller = self
                 .work_start
@@ -3493,7 +3786,7 @@ impl App {
         }
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
-        self.stop_result_review().await;
+        self.stop_result_review().await?;
         self.stop_governed_state().await;
         self.ensure_task_watch_client().await?;
         let controller = self
@@ -3627,7 +3920,7 @@ impl App {
         }
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
-        self.stop_result_review().await;
+        self.stop_result_review().await?;
         self.stop_governed_state().await;
         self.ensure_task_watch_client().await?;
         let client = Arc::clone(self.client.as_ref().expect("Task watch client is attached"));
@@ -3708,7 +4001,7 @@ impl App {
         self.stop_task_watch().await;
         self.stop_harness_content().await;
         self.stop_approval_queue().await;
-        self.stop_result_review().await;
+        self.stop_result_review().await?;
         self.stop_governed_state().await;
         self.ensure_task_watch_client().await?;
         let filter = HarnessContentFilter::new(task_id.clone(), Vec::new())
@@ -3768,7 +4061,7 @@ impl App {
         }
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
-        self.stop_result_review().await;
+        self.stop_result_review().await?;
         self.stop_governed_state().await;
         self.ensure_task_watch_client().await?;
         let client = Arc::clone(
@@ -3822,7 +4115,7 @@ impl App {
             .ok_or_else(|| "Select a Task before opening result review".to_owned())?;
         self.stop_task_watch().await;
         self.stop_approval_queue().await;
-        self.stop_result_review().await;
+        self.stop_result_review().await?;
         self.stop_governed_state().await;
         self.ensure_task_watch_client().await?;
         let client = Arc::clone(
@@ -3838,10 +4131,20 @@ impl App {
         Ok(())
     }
 
-    async fn stop_result_review(&mut self) {
+    async fn stop_result_review(&mut self) -> Result<(), String> {
+        if self
+            .result_review
+            .as_ref()
+            .is_some_and(ResultReviewController::has_unsettled_sent_verdict)
+        {
+            self.message = "A sent Founder Verdict remains unsettled; remain in Result Review and exact-retry the retained command"
+                .to_owned();
+            return Err(self.message.clone());
+        }
         if let Some(mut controller) = self.result_review.take() {
             controller.stop().await;
         }
+        Ok(())
     }
 
     async fn apply_result_review_events(&mut self) -> Result<(), String> {
@@ -3856,6 +4159,29 @@ impl App {
         Ok(())
     }
 
+    fn begin_result_review_verdict(&mut self, selection: GuidedFounderVerdictSelection) {
+        let result = self
+            .result_review
+            .as_mut()
+            .ok_or_else(|| "Result review controller is unavailable".to_owned())
+            .and_then(|controller| controller.begin_verdict(selection));
+        match result {
+            Ok(()) => self.sync_result_review_message(),
+            Err(error) => self.message = format!("Founder Verdict blocked: {error}"),
+        }
+    }
+
+    fn sync_result_review_message(&mut self) {
+        if let Some(message) = self
+            .result_review
+            .as_ref()
+            .and_then(ResultReviewController::model)
+            .map(|model| model.message.clone())
+        {
+            self.message = message;
+        }
+    }
+
     async fn pump_result_review_fail_closed(&mut self) {
         if let Err(error) = self.apply_result_review_events().await {
             self.message = format!("Result review stopped fail-closed: {error}");
@@ -3867,7 +4193,7 @@ impl App {
             .result_review
             .as_ref()
             .map(|controller| controller.task_id().to_owned());
-        self.stop_result_review().await;
+        self.stop_result_review().await?;
         self.start_task_watch().await?;
         if let (Some(task_id), Some(controller)) = (task_id, self.task_watch.as_mut())
             && !controller.select_task(&task_id)
@@ -3901,6 +4227,7 @@ impl App {
                 modal.reason_code,
                 (!modal.confirmation_proof_ref.trim().is_empty())
                     .then_some(modal.confirmation_proof_ref),
+                modal.summary_digest,
             )
             .await
             .map_err(|error| error.to_string())
@@ -4026,14 +4353,28 @@ impl App {
                     body[1],
                 ),
             },
-            InteractiveMode::ResultReview => match self
-                .result_review
-                .as_ref()
-                .and_then(ResultReviewController::model)
-            {
-                Some(model) => render_result_review(frame, body[1], model),
+            InteractiveMode::ResultReview => match self.result_review.as_ref() {
+                Some(controller) => {
+                    if let Some(model) = controller.model() {
+                        render_result_review(frame, body[1], model);
+                        render_result_review_verdict_modal(frame, body[1], controller);
+                    } else {
+                        frame.render_widget(
+                            Paragraph::new(
+                                "Loading projected result metadata and governance evidence...",
+                            )
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .title("Result Review"),
+                            )
+                            .wrap(Wrap { trim: true }),
+                            body[1],
+                        );
+                    }
+                }
                 None => frame.render_widget(
-                    Paragraph::new("Loading projected result metadata and governance evidence...")
+                    Paragraph::new("Result review controller is unavailable.")
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
@@ -4102,10 +4443,49 @@ impl App {
                 "{} - Tab/BackTab field - Enter advance - Esc governed back - q bounded close",
                 self.message
             ),
-            InteractiveMode::ResultReview => format!(
-                "{} - Tab/BackTab section - Up/Down/PgUp/PgDn scroll - r refresh - Esc Task Watch - q quit",
-                self.message
-            ),
+            InteractiveMode::ResultReview => match self
+                .result_review
+                .as_ref()
+                .map(ResultReviewController::verdict_stage)
+            {
+                Some(ResultReviewVerdictStage::Viewing) => format!(
+                    "{} - a Accept - x Reject - w Rework - v recover saved Verdict - Tab section - r refresh - Esc Task Watch",
+                    self.message
+                ),
+                Some(ResultReviewVerdictStage::Drafting) => format!(
+                    "{} - Tab next field - Enter collect/review - Esc cancel",
+                    self.message
+                ),
+                Some(ResultReviewVerdictStage::CollectingMaterials) => format!(
+                    "{} - material operation in flight; Verdict has not been sent",
+                    self.message
+                ),
+                Some(ResultReviewVerdictStage::MaterialOutcomeUnknown) => format!(
+                    "{} - Enter exact material retry; Verdict remains unsent",
+                    self.message
+                ),
+                Some(ResultReviewVerdictStage::Confirming) => format!(
+                    "{} - Enter submit exact command - Esc cancel with zero sends",
+                    self.message
+                ),
+                Some(ResultReviewVerdictStage::Submitting) => format!(
+                    "{} - submission in flight; exit and refresh are blocked",
+                    self.message
+                ),
+                Some(ResultReviewVerdictStage::OutcomeUnknown) => format!(
+                    "{} - Enter exact retry; exit and refresh preserve recovery",
+                    self.message
+                ),
+                Some(ResultReviewVerdictStage::RecoveryInput) => format!(
+                    "{} - type saved Verdict recovery path - Enter recover - Esc cancel",
+                    self.message
+                ),
+                Some(ResultReviewVerdictStage::Committed) => format!(
+                    "{} - Authority committed; r refresh projection - Esc Task Watch",
+                    self.message
+                ),
+                None => self.message.clone(),
+            },
             InteractiveMode::ApprovalQueue => format!(
                 "{} - Up/Down select - Enter decide - Esc dashboard - r refetch - q quit",
                 self.message
@@ -4202,6 +4582,21 @@ fn render_approval_decision_modal(
         "<entered>"
     };
     frame.render_widget(Clear, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(7)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(modal.summary_text.as_str())
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((modal.summary_scroll, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Operation details · PgUp/PgDn"),
+            ),
+        sections[0],
+    );
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(format!("Approval: {}", modal.approval_request_id)),
@@ -4215,7 +4610,7 @@ fn render_approval_decision_modal(
                 .borders(Borders::ALL)
                 .title("Guided approval decision"),
         ),
-        area,
+        sections[1],
     );
 }
 
@@ -4656,6 +5051,64 @@ fn render_result_review(frame: &mut Frame<'_>, area: Rect, model: &ResultReviewP
     );
 }
 
+fn render_result_review_verdict_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    controller: &ResultReviewController<dyn InteractiveClient>,
+) {
+    let lines = match controller.verdict_stage() {
+        ResultReviewVerdictStage::Viewing => return,
+        ResultReviewVerdictStage::Drafting | ResultReviewVerdictStage::RecoveryInput => controller
+            .verdict_draft_lines()
+            .unwrap_or_else(|| vec!["Founder input is unavailable".to_owned()])
+            .into_iter()
+            .map(Line::from)
+            .collect(),
+        ResultReviewVerdictStage::CollectingMaterials => vec![
+            Line::from("Saving and submitting Founder supporting material."),
+            Line::from("The Founder Verdict has not been sent."),
+        ],
+        ResultReviewVerdictStage::MaterialOutcomeUnknown => controller
+            .recovery_summary()
+            .unwrap_or_else(|| vec!["Supporting-material recovery is unavailable".to_owned()])
+            .into_iter()
+            .map(Line::from)
+            .collect(),
+        ResultReviewVerdictStage::Confirming => controller
+            .confirmation_summary()
+            .unwrap_or_else(|| vec!["Trusted confirmation binding is unavailable".to_owned()])
+            .into_iter()
+            .map(Line::from)
+            .collect(),
+        ResultReviewVerdictStage::Submitting => vec![
+            Line::from("Submitting the already sealed Founder Verdict command."),
+            Line::from("Exit, refresh, and command reconstruction are disabled."),
+        ],
+        ResultReviewVerdictStage::OutcomeUnknown => controller
+            .recovery_summary()
+            .unwrap_or_else(|| vec!["Founder Verdict recovery is unavailable".to_owned()])
+            .into_iter()
+            .map(Line::from)
+            .collect(),
+        ResultReviewVerdictStage::Committed => vec![Line::from(
+            controller
+                .committed_summary()
+                .unwrap_or_else(|| "Founder Verdict committed".to_owned()),
+        )],
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Guided Founder Verdict"),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_tasks(frame: &mut Frame<'_>, area: Rect, tasks: &[TaskView]) {
     let rows = tasks.iter().map(|view| {
         let task = view.task.as_ref();
@@ -4812,7 +5265,13 @@ async fn run_interactive(args: Args) -> Result<(), String> {
     let result = loop {
         let loop_result = run_loop(&mut terminal, &mut app).await;
         let finished = finish_interactive_session(&mut app, loop_result).await;
-        if finished.is_err() && app.work_start.is_some() {
+        if finished.is_err()
+            && (app.work_start.is_some()
+                || app
+                    .result_review
+                    .as_ref()
+                    .is_some_and(ResultReviewController::has_unsettled_sent_verdict))
+        {
             continue;
         }
         break finished;
@@ -4831,7 +5290,7 @@ async fn finish_interactive_session<T>(
     app.stop_task_watch().await;
     app.stop_harness_content().await;
     app.stop_approval_queue().await;
-    app.stop_result_review().await;
+    app.stop_result_review().await?;
     app.stop_governed_state().await;
     result
 }
@@ -5024,10 +5483,12 @@ async fn execute_interactive_action(
             if !app.settle_work_start_for_quit().await {
                 return Ok(InteractiveLoopControl::Continue);
             }
+            if app.stop_result_review().await.is_err() {
+                return Ok(InteractiveLoopControl::Continue);
+            }
             app.stop_task_watch().await;
             app.stop_harness_content().await;
             app.stop_approval_queue().await;
-            app.stop_result_review().await;
             app.stop_governed_state().await;
             return Ok(InteractiveLoopControl::Quit);
         }
@@ -5185,6 +5646,18 @@ mod tests {
         ApprovalWatchClassification, ClientGovernedTaskError, ClientTaskResultReviewError,
         GovernedProjectionPosition, GovernedProjectionState, TaskResultReview,
     };
+    use egopulse_domain_contracts::v01::egopulse::{
+        artifact::v1::{
+            ArtifactDescriptor, ArtifactSet, ArtifactSetStatus, Claim, Evidence, LineageBinding,
+            Provenance,
+        },
+        common::v1::ContractReference as TestContractReference,
+        localapi::v1::{
+            AvailableAction, AvailableActionKind, EvidenceGraphView, ProjectionMetadata,
+            ProjectionPosition, SourceDomain,
+        },
+        verification::v1::{VerificationArtifact, VerificationBinding},
+    };
     use egopulse_tui::approval_queue::{
         ApprovalQueueItem, ApprovalQueueNextFuture, ApprovalQueueOpened, ApprovalQueueStream,
         ApprovalQueueStreamUpdate,
@@ -5193,6 +5666,7 @@ mod tests {
         ApprovalDomainPage, ApprovalFactView, DomainView, GovernedStateSnapshot, RecordKind,
         TaskDomainPage, TaskFactView,
     };
+    use egopulse_tui::result_review::{ResultReviewCommittedVerdict, ResultReviewVerdictAttempt};
     use egopulse_tui::task_watch::{TaskWatchBaseline, TaskWatchNextFuture, TaskWatchStream};
     use std::{
         collections::VecDeque,
@@ -5697,6 +6171,8 @@ mod tests {
         approval_streams: Mutex<VecDeque<VecDeque<MainApprovalStreamStep>>>,
         approval_next_calls: Arc<AtomicUsize>,
         approval_decide_calls: AtomicUsize,
+        approval_digest: Mutex<String>,
+        approval_inputs: Mutex<Vec<GuidedApprovalDecisionInput>>,
         task_open_calls: AtomicUsize,
         approval_open_calls: AtomicUsize,
         review_calls: AtomicUsize,
@@ -5704,6 +6180,10 @@ mod tests {
         task_stream_dropped: Arc<std::sync::atomic::AtomicBool>,
         review_started_after_task_stop: std::sync::atomic::AtomicBool,
         review_steps: Mutex<VecDeque<MainReviewStep>>,
+        verdict_steps: Mutex<VecDeque<MainVerdictStep>>,
+        verdict_commands: Mutex<Vec<VerdictCommand>>,
+        verdict_submit_calls: AtomicUsize,
+        verdict_retry_calls: AtomicUsize,
     }
 
     impl CombinedInteractiveClient {
@@ -5712,6 +6192,8 @@ mod tests {
                 approval_streams: Mutex::new(approval_streams),
                 approval_next_calls: Arc::new(AtomicUsize::new(0)),
                 approval_decide_calls: AtomicUsize::new(0),
+                approval_digest: Mutex::new("d".repeat(64)),
+                approval_inputs: Mutex::new(Vec::new()),
                 task_open_calls: AtomicUsize::new(0),
                 approval_open_calls: AtomicUsize::new(0),
                 review_calls: AtomicUsize::new(0),
@@ -5719,6 +6201,10 @@ mod tests {
                 task_stream_dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 review_started_after_task_stop: std::sync::atomic::AtomicBool::new(false),
                 review_steps: Mutex::new(VecDeque::new()),
+                verdict_steps: Mutex::new(VecDeque::new()),
+                verdict_commands: Mutex::new(Vec::new()),
+                verdict_submit_calls: AtomicUsize::new(0),
+                verdict_retry_calls: AtomicUsize::new(0),
             }
         }
 
@@ -5726,11 +6212,25 @@ mod tests {
             self.review_steps = Mutex::new(steps);
             self
         }
+
+        fn with_verdict_steps(mut self, steps: VecDeque<MainVerdictStep>) -> Self {
+            self.verdict_steps = Mutex::new(steps);
+            self
+        }
     }
 
     enum MainReviewStep {
         Success,
+        Actionable,
         Integrity,
+    }
+
+    #[derive(Clone, Copy)]
+    enum MainVerdictStep {
+        OutcomeUnknown,
+        Committed,
+        PermissionDenied,
+        LocalPreflightError,
     }
 
     struct CombinedTaskWatchStream {
@@ -5776,12 +6276,16 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| VecDeque::from([MainApprovalStreamStep::Pending]));
             let next_calls = Arc::clone(&self.approval_next_calls);
+            let summary_digest = self.approval_digest.lock().expect("summary digest").clone();
             Box::pin(async move {
                 Ok(ApprovalQueueOpened::from_safe_projection(
                     "epoch:approval:1",
                     vec![ApprovalQueueItem {
                         approval_request_id: "approval:main".to_owned(),
                         task_id: "task:main".to_owned(),
+                        summary_text: "Command: cargo test".to_owned(),
+                        summary_digest: Some(summary_digest),
+                        allow_once_available: true,
                     }],
                     Box::new(MainApprovalStream { steps, next_calls }),
                 ))
@@ -5793,7 +6297,22 @@ mod tests {
             input: GuidedApprovalDecisionInput,
         ) -> GuidedApprovalFuture<'_> {
             self.approval_decide_calls.fetch_add(1, Ordering::SeqCst);
+            self.approval_inputs
+                .lock()
+                .expect("approval inputs")
+                .push(input.clone());
+            let current_digest = self.approval_digest.lock().expect("summary digest").clone();
             Box::pin(async move {
+                if input.decision == GuidedApprovalDecision::AllowOnce
+                    && input.reviewed_summary_digest_sha256.as_deref()
+                        != Some(current_digest.as_str())
+                {
+                    return Err(
+                        egopulse_client_operations::ClientGuidedApprovalDecisionError::InvalidInput(
+                            "summary changed",
+                        ),
+                    );
+                }
                 Ok(ApprovalDecisionReceipt {
                     committed: true,
                     replayed: false,
@@ -5843,6 +6362,9 @@ mod tests {
                         detail: "scripted integrity failure",
                     });
                 }
+                if matches!(step, MainReviewStep::Actionable) {
+                    return Ok(main_actionable_result_review(task_id));
+                }
                 Ok(TaskResultReview {
                     task_view: TaskView {
                         task: Some(
@@ -5858,6 +6380,222 @@ mod tests {
                     evidence_graph: None,
                 })
             })
+        }
+
+        fn submit_guided_founder_verdict<'a>(
+            &'a self,
+            command: VerdictCommand,
+            selection: GuidedFounderVerdictSelection,
+        ) -> GuidedFounderVerdictFuture<'a> {
+            self.verdict_submit_calls.fetch_add(1, Ordering::SeqCst);
+            self.verdict_commands.lock().unwrap().push(command.clone());
+            let step = self.verdict_steps.lock().unwrap().pop_front().unwrap();
+            Box::pin(async move { main_verdict_step(step, selection, command) })
+        }
+
+        fn retry_guided_founder_verdict<'a>(
+            &'a self,
+            recovery: &'a ResultReviewVerdictRecovery,
+        ) -> GuidedFounderVerdictFuture<'a> {
+            self.verdict_retry_calls.fetch_add(1, Ordering::SeqCst);
+            self.verdict_commands
+                .lock()
+                .unwrap()
+                .push(recovery.sealed_command().clone());
+            let step = self.verdict_steps.lock().unwrap().pop_front().unwrap();
+            let selection = recovery.selection();
+            let command = recovery.sealed_command().clone();
+            Box::pin(async move { main_verdict_step(step, selection, command) })
+        }
+    }
+
+    fn main_verdict_step(
+        step: MainVerdictStep,
+        selection: GuidedFounderVerdictSelection,
+        command: VerdictCommand,
+    ) -> Result<
+        ResultReviewVerdictAttempt,
+        egopulse_client_operations::ClientGuidedFounderVerdictError,
+    > {
+        use egopulse_client_operations::ClientGuidedFounderVerdictError;
+        match step {
+            MainVerdictStep::OutcomeUnknown => {
+                Ok(ResultReviewVerdictAttempt::OutcomeUnknown(Box::new(
+                    ResultReviewVerdictRecovery::from_sealed_command_for_client_adapter(
+                        selection, command,
+                    ),
+                )))
+            }
+            MainVerdictStep::Committed => Ok(ResultReviewVerdictAttempt::Committed(
+                ResultReviewCommittedVerdict {
+                    founder_verdict_id: "verdict:tui:committed".to_owned(),
+                    decision: match selection {
+                        GuidedFounderVerdictSelection::Accept => FounderVerdictDecision::Accept,
+                        GuidedFounderVerdictSelection::Reject => FounderVerdictDecision::Reject,
+                        GuidedFounderVerdictSelection::Rework => FounderVerdictDecision::Rework,
+                    },
+                    replayed: true,
+                    projection_pending: true,
+                },
+            )),
+            MainVerdictStep::PermissionDenied => Err(ClientGuidedFounderVerdictError::Kernel(
+                egopulse_client_kernel::KernelError::PermissionDenied(
+                    "execute_founder_verdict".to_owned(),
+                ),
+            )),
+            MainVerdictStep::LocalPreflightError => {
+                Err(ClientGuidedFounderVerdictError::SessionChanged)
+            }
+        }
+    }
+
+    fn main_actionable_result_review(task_id: &str) -> TaskResultReview {
+        let lineage = LineageBinding {
+            task_id: task_id.to_owned(),
+            task_revision: 4,
+            work_revision: 2,
+            run_id: "run:tui-review".to_owned(),
+            run_revision: 2,
+            step_id: "step:tui-review".to_owned(),
+            step_revision: 2,
+            attempt_id: "attempt:tui-review".to_owned(),
+            attempt_revision: 2,
+            dispatch_id: "dispatch:tui-review".to_owned(),
+            fencing_token: 1,
+        };
+        let address = |seed: char| ContentAddress {
+            algorithm: HashAlgorithm::Sha256 as i32,
+            digest: seed.to_string().repeat(64),
+            byte_length: 12,
+        };
+        let acceptance = TestContractReference {
+            contract_id: "acceptance:tui-review".to_owned(),
+            version: "1".to_owned(),
+            sha256: "d".repeat(64),
+        };
+        let source = |domain: SourceDomain, id: &str, revision| SourceRevision {
+            domain: domain as i32,
+            aggregate_id: id.to_owned(),
+            revision,
+            last_event_id: format!("event:{id}:{revision}"),
+        };
+        let metadata = |sequence, source_revisions| ProjectionMetadata {
+            schema_ref: Some(TestContractReference {
+                contract_id: "egopulse.localapi.v1/review".to_owned(),
+                version: "0.1.0".to_owned(),
+                sha256: "a".repeat(64),
+            }),
+            position: Some(ProjectionPosition {
+                epoch: "epoch:tui-review".to_owned(),
+                sequence,
+                projected_at: Some(prost_types::Timestamp {
+                    seconds: sequence as i64,
+                    nanos: 0,
+                }),
+            }),
+            source_revisions,
+            health: ProjectionHealth::Ready as i32,
+            stale: false,
+            safe_health_reason_code: None,
+        };
+        let manifest = address('b');
+        let artifact_set = ArtifactSet {
+            artifact_set_id: "artifact-set:tui-review".to_owned(),
+            revision: 3,
+            status: ArtifactSetStatus::Sealed as i32,
+            lineage: Some(lineage.clone()),
+            artifact_ids: vec!["artifact:tui-review".to_owned()],
+            claim_ids: vec!["claim:tui-review".to_owned()],
+            evidence_ids: vec!["evidence:tui-review".to_owned()],
+            canonical_manifest: Some(manifest.clone()),
+            ..Default::default()
+        };
+        let verification = VerificationArtifact {
+            verification_artifact_id: "verification:tui-review".to_owned(),
+            version: 2,
+            binding: Some(VerificationBinding {
+                lineage: Some(lineage.clone()),
+                artifact_set_id: artifact_set.artifact_set_id.clone(),
+                artifact_set_manifest: Some(manifest),
+                claim_id: "claim:tui-review".to_owned(),
+                acceptance_contract_ref: Some(acceptance.clone()),
+                ..Default::default()
+            }),
+            conclusion: VerificationConclusion::Passed as i32,
+            canonical_payload: Some(address('c')),
+            ..Default::default()
+        };
+        TaskResultReview {
+            task_view: TaskView {
+                metadata: Some(metadata(
+                    20,
+                    vec![
+                        source(SourceDomain::Task, task_id, 7),
+                        source(SourceDomain::Artifact, "artifact-set:tui-review", 3),
+                        source(SourceDomain::Verification, "verification:tui-review", 2),
+                    ],
+                )),
+                task: Some(
+                    egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
+                        task_id: task_id.to_owned(),
+                        revision: 7,
+                        work_revision: 2,
+                        status: TaskStatus::VerdictPending as i32,
+                        artifact_set_id: Some("artifact-set:tui-review".to_owned()),
+                        verification_artifact_id: Some("verification:tui-review".to_owned()),
+                        acceptance_contract_ref: Some(acceptance),
+                        ..Default::default()
+                    },
+                ),
+                artifact_set: Some(artifact_set),
+                verification: Some(verification),
+                available_actions: vec![AvailableAction {
+                    kind: AvailableActionKind::SubmitFounderVerdict as i32,
+                    owning_authority: "FounderVerdictAuthority".to_owned(),
+                    derivation_rule_ref: "rule:task-actionability:v1".to_owned(),
+                    explicit_confirmation_required: true,
+                    reason_code: None,
+                }],
+                ..Default::default()
+            },
+            evidence_graph: Some(EvidenceGraphView {
+                metadata: Some(metadata(
+                    10,
+                    vec![
+                        source(SourceDomain::Artifact, "artifact-set:tui-review", 3),
+                        source(SourceDomain::Artifact, "artifact:tui-review", 1),
+                        source(SourceDomain::Artifact, "claim:tui-review", 1),
+                        source(SourceDomain::Artifact, "evidence:tui-review", 1),
+                    ],
+                )),
+                task_id: task_id.to_owned(),
+                artifact_set_id: "artifact-set:tui-review".to_owned(),
+                artifacts: vec![ArtifactDescriptor {
+                    artifact_id: "artifact:tui-review".to_owned(),
+                    revision: 1,
+                    provenance: Some(Provenance {
+                        lineage: Some(lineage.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                claims: vec![Claim {
+                    claim_id: "claim:tui-review".to_owned(),
+                    revision: 1,
+                    lineage: Some(lineage.clone()),
+                    subject_artifact_ids: vec!["artifact:tui-review".to_owned()],
+                    ..Default::default()
+                }],
+                evidence: vec![Evidence {
+                    evidence_id: "evidence:tui-review".to_owned(),
+                    revision: 1,
+                    claim_id: "claim:tui-review".to_owned(),
+                    artifact_ids: vec!["artifact:tui-review".to_owned()],
+                    lineage: Some(lineage),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
         }
     }
 
@@ -6111,6 +6849,140 @@ mod tests {
     }
 
     #[test]
+    fn result_review_sent_verdict_keys_preserve_in_flight_and_unknown_recovery() {
+        for stage in [
+            ResultReviewVerdictStage::Submitting,
+            ResultReviewVerdictStage::OutcomeUnknown,
+        ] {
+            for key in [KeyCode::Esc, KeyCode::Char('r'), KeyCode::Char('q')] {
+                assert!(result_review_preserves_sent_recovery(stage, key));
+            }
+        }
+        assert!(!result_review_preserves_sent_recovery(
+            ResultReviewVerdictStage::OutcomeUnknown,
+            KeyCode::Enter
+        ));
+        assert!(!result_review_preserves_sent_recovery(
+            ResultReviewVerdictStage::Viewing,
+            KeyCode::Esc
+        ));
+    }
+
+    async fn pump_result_review_to_stage(
+        controller: &mut ResultReviewController<dyn InteractiveClient>,
+        expected: ResultReviewVerdictStage,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                controller.pump().await.unwrap();
+                if controller.verdict_stage() == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("result review verdict event");
+    }
+
+    async fn start_result_review_accept_submission(
+        client: Arc<CombinedInteractiveClient>,
+    ) -> ResultReviewController<dyn InteractiveClient> {
+        let client: Arc<dyn InteractiveClient> = client;
+        let mut controller = ResultReviewController::new(client, "task:tui-review".to_owned());
+        controller.start().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while controller.model().is_none() {
+                controller.pump().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        controller
+            .begin_verdict(GuidedFounderVerdictSelection::Accept)
+            .unwrap();
+        for character in "founder-accepted".chars() {
+            controller.push_verdict_character(character);
+        }
+        controller.toggle_verdict_field();
+        for character in "proof:configured".chars() {
+            controller.push_verdict_character(character);
+        }
+        controller.prepare_verdict_confirmation().unwrap();
+        controller.submit_verdict().unwrap();
+        controller
+    }
+
+    #[tokio::test]
+    async fn result_review_async_unknown_exact_retry_commits_the_same_command() {
+        let client = Arc::new(
+            CombinedInteractiveClient::new(VecDeque::new())
+                .with_review_steps(VecDeque::from([MainReviewStep::Actionable]))
+                .with_verdict_steps(VecDeque::from([
+                    MainVerdictStep::OutcomeUnknown,
+                    MainVerdictStep::Committed,
+                ])),
+        );
+        let mut controller = start_result_review_accept_submission(Arc::clone(&client)).await;
+        pump_result_review_to_stage(&mut controller, ResultReviewVerdictStage::OutcomeUnknown)
+            .await;
+        assert!(controller.has_unsettled_sent_verdict());
+        assert!(controller.refresh().await.is_err());
+        controller.retry_verdict().unwrap();
+        pump_result_review_to_stage(&mut controller, ResultReviewVerdictStage::Committed).await;
+        assert_eq!(client.verdict_submit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(client.verdict_retry_calls.load(Ordering::SeqCst), 1);
+        let commands = client.verdict_commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], commands[1]);
+    }
+
+    #[tokio::test]
+    async fn result_review_retry_errors_and_main_exit_paths_retain_unknown_recovery() {
+        for retry_error in [
+            MainVerdictStep::PermissionDenied,
+            MainVerdictStep::LocalPreflightError,
+        ] {
+            let client = Arc::new(
+                CombinedInteractiveClient::new(VecDeque::new())
+                    .with_review_steps(VecDeque::from([MainReviewStep::Actionable]))
+                    .with_verdict_steps(VecDeque::from([
+                        MainVerdictStep::OutcomeUnknown,
+                        retry_error,
+                    ])),
+            );
+            let mut controller = start_result_review_accept_submission(Arc::clone(&client)).await;
+            pump_result_review_to_stage(&mut controller, ResultReviewVerdictStage::OutcomeUnknown)
+                .await;
+            controller.retry_verdict().unwrap();
+            pump_result_review_to_stage(&mut controller, ResultReviewVerdictStage::OutcomeUnknown)
+                .await;
+            assert!(controller.has_unsettled_sent_verdict());
+            assert!(controller.refresh().await.is_err());
+            {
+                let commands = client.verdict_commands.lock().unwrap();
+                assert_eq!(commands.len(), 2);
+                assert_eq!(commands[0], commands[1]);
+            }
+
+            let mut app = App::new("result-review-exit-guard".to_owned());
+            app.mode = InteractiveMode::ResultReview;
+            app.result_review = Some(controller);
+            assert!(app.stop_result_review().await.is_err());
+            assert!(app.result_review.is_some());
+            let mut next_refresh = tokio::time::Instant::now();
+            assert_eq!(
+                execute_interactive_action(&mut app, InteractiveAction::Quit, &mut next_refresh,)
+                    .await
+                    .unwrap(),
+                InteractiveLoopControl::Continue
+            );
+            assert!(app.result_review.is_some());
+        }
+    }
+
+    #[test]
     fn command_form_maps_optional_confirmation_and_numeric_fields() {
         let mut form = CommandForm::new(CommandKind::ApprovalDecide);
         for (field, value) in form.fields.iter_mut().zip([
@@ -6185,8 +7057,58 @@ mod tests {
         let InteractiveMode::ApprovalDecisionModal(modal) = &app.mode else {
             panic!("approval modal")
         };
-        assert_eq!(modal.decision, Some(GuidedApprovalDecision::AllowOnce));
+        assert_eq!(modal.decision, Some(GuidedApprovalDecision::Deny));
+        assert!(
+            !modal.allow_once_available,
+            "a summary-less modal must never offer AllowOnce"
+        );
         assert_eq!(modal.reason_code, "founder-reviewed");
+    }
+
+    #[tokio::test]
+    async fn approval_modal_keeps_the_reviewed_digest_when_the_same_request_refreshes() {
+        let client = Arc::new(CombinedInteractiveClient::new(VecDeque::new()));
+        let mut app = App::new("summary-refresh".to_owned());
+        app.client = Some(Arc::clone(&client) as Arc<dyn InteractiveClient>);
+        app.start_approval_queue()
+            .await
+            .expect("open approval queue");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open modal");
+        *client.approval_digest.lock().expect("new summary") = "e".repeat(64);
+        app.approval_queue
+            .as_mut()
+            .expect("queue")
+            .start()
+            .await
+            .expect("refresh same approval");
+        assert_eq!(
+            app.approval_queue
+                .as_ref()
+                .expect("queue")
+                .model()
+                .expect("model")
+                .items[0]
+                .summary_digest,
+            Some("e".repeat(64))
+        );
+        let InteractiveMode::ApprovalDecisionModal(modal) = &mut app.mode else {
+            panic!("modal must stay open")
+        };
+        assert_eq!(modal.summary_digest, Some("d".repeat(64)));
+        modal.decision = Some(GuidedApprovalDecision::AllowOnce);
+        modal.reason_code = "reviewed-earlier-summary".to_owned();
+        let error = app
+            .submit_approval_decision()
+            .await
+            .expect_err("latest summary differs");
+        assert!(error.contains("summary changed"));
+        let inputs = client.approval_inputs.lock().expect("captured inputs");
+        assert_eq!(inputs.len(), 1, "no automatic retry with the new digest");
+        assert_eq!(
+            inputs[0].reviewed_summary_digest_sha256,
+            Some("d".repeat(64))
+        );
     }
 
     #[tokio::test]

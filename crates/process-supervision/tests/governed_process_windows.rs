@@ -2,7 +2,7 @@
 
 use egopulse_process_supervision::{
     GovernedProcessBudget, GovernedProcessError, SupervisedProcess, SupervisedProcessSpec,
-    run_governed_framed_process, run_governed_process,
+    run_governed_framed_process, run_governed_process, run_governed_process_outcome,
 };
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -224,6 +224,43 @@ async fn governed_process_maps_real_child_crash() {
     .await
     .expect_err("non-zero child must fail");
     assert_eq!(error, GovernedProcessError::Crashed);
+}
+
+#[tokio::test]
+async fn governed_process_outcome_preserves_failed_command_evidence() {
+    let script = r#"[Console]::Out.Write('criterion failed'); [Console]::Error.Write('expected 3, got 2'); exit 7"#;
+    let receipt = run_governed_process_outcome(
+        &powershell_spec(script),
+        b"",
+        budget(Duration::from_secs(5), 64),
+    )
+    .await
+    .expect("normal non-zero exit retains its receipt");
+    assert_eq!(receipt.exit_code, 7);
+    assert_eq!(receipt.stdout, b"criterion failed");
+    assert_eq!(receipt.stderr, b"expected 3, got 2");
+
+    let error = run_governed_process(
+        &powershell_spec(script),
+        b"",
+        budget(Duration::from_secs(5), 64),
+    )
+    .await
+    .expect_err("existing success-only callers still reject the same command");
+    assert_eq!(error, GovernedProcessError::Crashed);
+}
+
+#[tokio::test]
+async fn governed_process_outcome_does_not_accept_oversized_failed_output() {
+    let script = r#"[Console]::Out.Write('too much evidence'); exit 7"#;
+    let error = run_governed_process_outcome(
+        &powershell_spec(script),
+        b"",
+        budget(Duration::from_secs(5), 4),
+    )
+    .await
+    .expect_err("non-zero receipts still obey the output budget");
+    assert_eq!(error, GovernedProcessError::OutputLimit);
 }
 
 #[tokio::test]

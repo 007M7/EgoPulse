@@ -12,7 +12,7 @@ use thiserror::Error;
 pub const API_CONTRACT_ID: &str = "egopulse.localapi.v1";
 pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.23";
 pub const API_CONTRACT_DIGEST_SHA256: &str =
-    "187f358851f24d61fcc92da33919f55336f30136e15b9fafc96fb2fea490a229";
+    "bfc9cb017e959457ab07259a4dfd830b03769fb65d7aeea4ab9681dc7cfbe984";
 pub const CLIENT_KERNEL_CONTRACT_ID: &str = "egopulse.client-kernel.v1";
 pub const CLIENT_KERNEL_CONTRACT_VERSION: &str = "0.1.0";
 pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =
@@ -20,7 +20,7 @@ pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =
 pub const AUTHORIZATION_CONTRACT_ID: &str = "egopulse.authorization.v1";
 pub const AUTHORIZATION_CONTRACT_VERSION: &str = "0.1.0";
 pub const AUTHORIZATION_PROFILE_DIGEST_SHA256: &str =
-    "c174126b56818b78e6588536fb0b64d570910e9212c041e888487962079b7c86";
+    "67ee9e1ca23def452b963e68584c0f6394586b033da4fd2e5e74318adfbd7e46";
 pub const HARNESS_CONTENT_DISCLOSURE_CONTRACT_ID: &str = "egopulse.harness-content-disclosure.v1";
 pub const HARNESS_CONTENT_DISCLOSURE_CONTRACT_VERSION: &str = "0.1.1";
 pub const HARNESS_CONTENT_DISCLOSURE_PROFILE_ID: &str = "harness-content-disclosure-v01-default";

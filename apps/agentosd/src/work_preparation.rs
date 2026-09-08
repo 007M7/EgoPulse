@@ -44,6 +44,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::memory_retrieval::{GovernedWorkMemoryRetrieval, WorkMemoryRetrievalPort};
+use crate::repository_material::{
+    FrozenRepositoryMaterialV1, RepositoryMaterialConfig, RepositoryMaterialError,
+    freeze_repository_material, frozen_repository_material_from_compiled_context,
+};
 use crate::work_capability::{ResolvedWorkCapability, WorkCapabilityRegistry};
 
 #[derive(Clone, Debug, Serialize)]
@@ -272,6 +276,7 @@ pub struct ConfiguredWorkPreparationPort {
     acceptance_contract_ref: ContractReference,
     budget_profile_ref: ContractReference,
     input_bundle_root: Option<PathBuf>,
+    repository_material: Option<RepositoryMaterialConfig>,
     work_capability_registry: Option<Arc<WorkCapabilityRegistry>>,
     /// Reviewed daemon-owned workflow instance used for post-confirmation
     /// activation. None is retained by foundation/unit-test compositions.
@@ -306,6 +311,7 @@ impl ConfiguredWorkPreparationPort {
             acceptance_contract_ref,
             budget_profile_ref,
             input_bundle_root: None,
+            repository_material: None,
             work_capability_registry: None,
             activation_run_id: None,
         })
@@ -324,6 +330,14 @@ impl ConfiguredWorkPreparationPort {
             return Err(CommandPortFailure::IntegrityFailure);
         }
         self.activation_run_id = Some(run_id);
+        Ok(self)
+    }
+
+    pub fn with_repository_material(
+        mut self,
+        config: RepositoryMaterialConfig,
+    ) -> Result<Self, CommandPortFailure> {
+        self.repository_material = Some(config.validate().map_err(repository_material_failure)?);
         Ok(self)
     }
 
@@ -524,10 +538,13 @@ impl ConfiguredWorkPreparationPort {
     fn compile_context(
         &self,
         request: &PrepareWorkRequest,
+        owner_principal_id: &str,
+        legacy_replay: bool,
         sources: &[ContextSourceFact],
         project_source_prompt: &str,
         memory: Option<&CompiledMemoryPack>,
         work_capability: Option<&ResolvedWorkCapability>,
+        repository_material: Option<&FrozenRepositoryMaterialV1>,
     ) -> Result<Vec<u8>, CommandPortFailure> {
         let memory_prompt = memory
             .map(|pack| {
@@ -547,7 +564,7 @@ impl ConfiguredWorkPreparationPort {
         let compiled_work_capability = work_capability
             .map(CompiledWorkCapabilityBinding::from_resolution)
             .transpose()?;
-        serde_json::to_vec(&serde_json::json!({
+        let mut compiled_context = serde_json::json!({
             "prompt": format!(
                 "{}{}{}",
                 request.intent.trim(),
@@ -560,8 +577,19 @@ impl ConfiguredWorkPreparationPort {
             "memory_pack": memory,
             "model": work_capability.map(|resolved| resolved.route.harness_model_id.as_str()),
             "work_capability": compiled_work_capability,
-        }))
-        .map_err(|_| CommandPortFailure::IntegrityFailure)
+        });
+        if !legacy_replay {
+            compiled_context["prepare_request_identity"] = serde_json::json!({
+                "owner_principal_id": owner_principal_id,
+                "idempotency_key": request.idempotency_key.trim(),
+            });
+        }
+        if let Some(material) = repository_material {
+            compiled_context["repository_material_version"] = serde_json::json!(1);
+            compiled_context["repository_material"] =
+                serde_json::to_value(material).map_err(|_| CommandPortFailure::IntegrityFailure)?;
+        }
+        serde_json::to_vec(&compiled_context).map_err(|_| CommandPortFailure::IntegrityFailure)
     }
 
     async fn issue_snapshot(
@@ -579,19 +607,75 @@ impl ConfiguredWorkPreparationPort {
         }
         let principal = AuthenticatedContextPrincipal {
             kind: ContextPrincipalKind::ContextCompiler,
+            principal_id: "agentosd:work-preparation:v2".to_owned(),
+            authenticated: true,
+        };
+        let legacy_principal = AuthenticatedContextPrincipal {
+            kind: ContextPrincipalKind::ContextCompiler,
             principal_id: "agentosd:work-preparation".to_owned(),
             authenticated: true,
         };
-        let replayed_context = self
-            .context
-            .lock()
-            .map_err(|_| CommandPortFailure::IntegrityFailure)?
-            .issued_snapshot_by_idempotency(&principal, request.idempotency_key.trim())
-            .map_err(context_failure)?;
+        let scoped_idempotency_key =
+            context_issue_idempotency_key(owner_principal_id, request.idempotency_key.trim());
+        let (replayed_context, context_idempotency_key, legacy_replay) = {
+            let context = self
+                .context
+                .lock()
+                .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+            if let Some(existing) = context
+                .issued_snapshot_by_idempotency(&principal, &scoped_idempotency_key)
+                .map_err(context_failure)?
+            {
+                (Some(existing), scoped_idempotency_key.clone(), false)
+            } else {
+                let legacy = context
+                    .issued_snapshot_by_idempotency(
+                        &legacy_principal,
+                        request.idempotency_key.trim(),
+                    )
+                    .map_err(context_failure)?;
+                match legacy {
+                    Some(existing)
+                        if existing.snapshot.owner_principal_id == owner_principal_id =>
+                    {
+                        (
+                            Some(existing),
+                            request.idempotency_key.trim().to_owned(),
+                            true,
+                        )
+                    }
+                    _ => (None, scoped_idempotency_key.clone(), false),
+                }
+            }
+        };
         let work_capability = match replayed_context.as_ref() {
             Some(existing) => self.replayed_work_capability(request, &existing.compiled_context)?,
             None => self.resolve_work_capability(request)?,
         };
+        let repository_material = match replayed_context.as_ref() {
+            Some(existing) => {
+                frozen_repository_material_from_compiled_context(&existing.compiled_context)
+                    .map_err(repository_material_failure)?
+            }
+            None => match self.repository_material.as_ref() {
+                Some(config) => Some(
+                    freeze_repository_material(config, &self.acceptance_contract_ref)
+                        .await
+                        .map_err(repository_material_failure)?,
+                ),
+                None => None,
+            },
+        };
+        if let (Some(existing), Some(material)) =
+            (replayed_context.as_ref(), repository_material.as_ref())
+        {
+            let stored_ref = material.acceptance_contract_ref();
+            if stored_ref != self.acceptance_contract_ref
+                || existing.snapshot.acceptance_contract_ref != contract_key(&stored_ref)
+            {
+                return Err(CommandPortFailure::IntegrityFailure);
+            }
+        }
         let memory = self
             .prepare_memory_pack(request, owner_principal_id)
             .await?;
@@ -602,10 +686,13 @@ impl ConfiguredWorkPreparationPort {
         }
         let compiled_context = self.compile_context(
             request,
+            owner_principal_id,
+            legacy_replay,
             &sources,
             &project_source_prompt,
             memory.as_ref().map(|memory| &memory.compiled),
             work_capability.as_ref(),
+            repository_material.as_ref(),
         )?;
         let recovery_entry = if excluded_sources.is_empty() {
             "hold-and-reconcile"
@@ -647,14 +734,21 @@ impl ConfiguredWorkPreparationPort {
             visibility: "founder-only".to_owned(),
             redactions: Vec::new(),
             expires_at_seconds,
-            idempotency_key: request.idempotency_key.trim().to_owned(),
+            idempotency_key: context_idempotency_key,
         };
         let (_receipt, snapshot, context_state_revision) = {
             let mut context = self
                 .context
                 .lock()
                 .map_err(|_| CommandPortFailure::IntegrityFailure)?;
-            let (receipt, snapshot) = context.issue(&input, &principal).map_err(context_failure)?;
+            let issue_principal = if legacy_replay {
+                &legacy_principal
+            } else {
+                &principal
+            };
+            let (receipt, snapshot) = context
+                .issue(&input, issue_principal)
+                .map_err(context_failure)?;
             let state_revision = context
                 .governance(&snapshot.snapshot_id)
                 .map_err(context_failure)?
@@ -799,11 +893,29 @@ impl WorkPreparationPort for ConfiguredWorkPreparationPort {
             .map_err(|_| CommandPortFailure::IntegrityFailure)?
             .resolve(&request.snapshot_id, &snapshot.target_scope_ref, now)
             .map_err(context_failure)?;
+        let repository_material =
+            frozen_repository_material_from_compiled_context(&resolved.compiled_context)
+                .map_err(repository_material_failure)?;
+        if let Some(material) = repository_material.as_ref() {
+            let stored_ref = material.acceptance_contract_ref();
+            if stored_ref != self.acceptance_contract_ref
+                || snapshot.acceptance_contract_ref != contract_key(&stored_ref)
+            {
+                return Err(CommandPortFailure::IntegrityFailure);
+            }
+            material
+                .validate_stored(&self.acceptance_contract_ref)
+                .map_err(repository_material_failure)?;
+        }
         if resolved.snapshot.confirmation_binding_sha256 != request.confirmation_binding_sha256 {
             return Err(CommandPortFailure::IntegrityFailure);
         }
         let work_capability_route =
             work_capability_route_from_compiled_context(&resolved.compiled_context)?;
+        let acceptance_contract_ref = repository_material
+            .as_ref()
+            .map(FrozenRepositoryMaterialV1::acceptance_contract_ref)
+            .unwrap_or_else(|| self.acceptance_contract_ref.clone());
 
         let correlation_id = request
             .client
@@ -827,7 +939,7 @@ impl WorkPreparationPort for ConfiguredWorkPreparationPort {
                 work_type: resolved.snapshot.work_type,
                 input_snapshot_id: resolved.snapshot.snapshot_id,
                 target_scope_ref: resolved.snapshot.target_scope_ref,
-                acceptance_contract_ref: Some(self.acceptance_contract_ref.clone()),
+                acceptance_contract_ref: Some(acceptance_contract_ref),
                 budget_profile_ref: Some(self.budget_profile_ref.clone()),
                 work_capability_route: work_capability_route.clone(),
             })),
@@ -1195,6 +1307,24 @@ fn contract_key(reference: &ContractReference) -> String {
     )
 }
 
+fn repository_material_failure(error: RepositoryMaterialError) -> CommandPortFailure {
+    match error {
+        RepositoryMaterialError::Unavailable => CommandPortFailure::Unavailable,
+        RepositoryMaterialError::Invalid | RepositoryMaterialError::Drift => {
+            CommandPortFailure::IntegrityFailure
+        }
+    }
+}
+
+fn context_issue_idempotency_key(owner_principal_id: &str, client_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    for value in [owner_principal_id.as_bytes(), client_key.as_bytes()] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+    format!("work-prepare:{}", hex::encode(hasher.finalize()))
+}
+
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -1256,6 +1386,7 @@ mod tests {
         memory::v1::{RetrievalCandidate, RetrievalResponse},
     };
     use egopulse_domain_contracts::work_capability::seal_work_capability_route_binding;
+    use std::process::Command;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -1537,6 +1668,166 @@ mod tests {
             version: "v1".to_owned(),
             sha256: "a".repeat(64),
         }
+    }
+
+    struct TestRepositoryMaterial {
+        repository_root: PathBuf,
+        contract_path: PathBuf,
+        git_executable: PathBuf,
+        contract_ref: ContractReference,
+    }
+
+    fn configure_repository_material(
+        fixture: &mut WorkFixture,
+        bind_contract_ref: bool,
+    ) -> TestRepositoryMaterial {
+        let git_executable = test_git_executable();
+        let repository_root = fixture.root.join("repository");
+        fs::create_dir_all(repository_root.join("src")).expect("repository source directory");
+        fs::write(
+            repository_root.join("src/lib.rs"),
+            "pub fn value() -> u8 { 1 }\n",
+        )
+        .expect("repository source");
+        test_git(&git_executable, &repository_root, &["init"]);
+        test_git(
+            &git_executable,
+            &repository_root,
+            &["config", "user.email", "egopulse-test@example.invalid"],
+        );
+        test_git(
+            &git_executable,
+            &repository_root,
+            &["config", "user.name", "EgoPulse Test"],
+        );
+        test_git(&git_executable, &repository_root, &["add", "--all"]);
+        test_git(
+            &git_executable,
+            &repository_root,
+            &["commit", "-m", "initial"],
+        );
+
+        let contract_path = fixture.root.join("repository-acceptance.json");
+        let executable = git_executable.display().to_string();
+        let contract_body = serde_json::json!({
+            "schema_version": "repository_change_acceptance/v1",
+            "contract_id": "acceptance",
+            "version": "v1",
+            "revision": 1,
+            "allowed_paths": ["src/**"],
+            "forbidden_paths": ["src/generated/**", ".github/**"],
+            "read_only_paths": ["src/contracts/**"],
+            "required_commands": [
+                {
+                    "command_id": "tests-status",
+                    "criterion_id": "tests",
+                    "requirement": "must_pass",
+                    "executable": executable,
+                    "argv": ["status", "--short"],
+                    "cwd": ".",
+                    "inherited_environment": [],
+                    "environment_overrides": {},
+                    "timeout_seconds": 30,
+                    "output_limit_bytes": 65536,
+                    "expected_exit_code": 0
+                },
+                {
+                    "command_id": "tests-diff-check",
+                    "criterion_id": "tests",
+                    "requirement": "must_pass",
+                    "executable": executable,
+                    "argv": ["diff", "--check"],
+                    "cwd": ".",
+                    "inherited_environment": [],
+                    "environment_overrides": {},
+                    "timeout_seconds": 30,
+                    "output_limit_bytes": 65536,
+                    "expected_exit_code": 0
+                }
+            ],
+            "evidence_requirements": [
+                "repository_baseline",
+                "repository_patch",
+                "workspace_manifest",
+                "command_receipt",
+                "independent_checker"
+            ]
+        });
+        fs::write(
+            &contract_path,
+            serde_json::to_vec_pretty(&contract_body).expect("contract JSON"),
+        )
+        .expect("acceptance contract");
+        let contract_ref = ContractReference {
+            contract_id: "acceptance".to_owned(),
+            version: "v1".to_owned(),
+            sha256: crate::repository_material::acceptance_contract_digest_for_test(&contract_path)
+                .expect("canonical contract digest"),
+        };
+        let config = RepositoryMaterialConfig {
+            contract_path: contract_path.clone(),
+            repository_root: repository_root.clone(),
+            git_executable: git_executable.clone(),
+        }
+        .validate()
+        .expect("repository material config");
+        fixture.port.repository_material = Some(config);
+        if bind_contract_ref {
+            fixture.port.acceptance_contract_ref = contract_ref.clone();
+        }
+        TestRepositoryMaterial {
+            repository_root,
+            contract_path,
+            git_executable,
+            contract_ref,
+        }
+    }
+
+    fn test_git_executable() -> PathBuf {
+        #[cfg(windows)]
+        let output = Command::new("where.exe")
+            .arg("git.exe")
+            .output()
+            .expect("locate Git");
+        #[cfg(not(windows))]
+        let output = Command::new("which")
+            .arg("git")
+            .output()
+            .expect("locate Git");
+        assert!(
+            output.status.success(),
+            "Git is required for this regression"
+        );
+        let first = String::from_utf8(output.stdout)
+            .expect("Git path is UTF-8")
+            .lines()
+            .next()
+            .expect("Git path")
+            .trim()
+            .to_owned();
+        PathBuf::from(first)
+            .canonicalize()
+            .expect("canonical Git executable")
+    }
+
+    fn test_git(git: &Path, repository: &Path, arguments: &[&str]) {
+        let output = Command::new(git)
+            .args(arguments)
+            .current_dir(repository)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .output()
+            .expect("run test Git command");
+        assert!(
+            output.status.success(),
+            "Git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn test_work_capability_route() -> WorkCapabilityRouteBinding {
@@ -2060,6 +2351,651 @@ mod tests {
             Some(task_command::Command::CreateTask(_))
         ));
         drop(commands);
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn repository_material_freezes_once_replays_and_separates_independent_preparations() {
+        let mut fixture = WorkFixture::open("repository-material-freeze");
+        let material = configure_repository_material(&mut fixture, true);
+        let principal = WorkFixture::founder("founder-1");
+        let request = fixture.prepare_request(
+            "update the governed source",
+            "prepare-material-replay",
+            vec![WorkSourceRequest {
+                source_ref: "intent.md".to_owned(),
+                label: "intent".to_owned(),
+            }],
+        );
+        let first = fixture
+            .port
+            .prepare(&request, &principal)
+            .await
+            .expect("first material preparation");
+        let frozen_snapshot = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .get(&first.snapshot_id)
+            .expect("read frozen snapshot")
+            .expect("frozen snapshot exists");
+        let frozen_resolved = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .resolve(
+                &first.snapshot_id,
+                &frozen_snapshot.target_scope_ref,
+                unix_seconds().expect("current time"),
+            )
+            .expect("resolve frozen Context");
+        let frozen =
+            frozen_repository_material_from_compiled_context(&frozen_resolved.compiled_context)
+                .expect("typed repository material")
+                .expect("repository material exists");
+        frozen
+            .validate_stored(&material.contract_ref)
+            .expect("stored material validates");
+        assert_eq!(frozen.acceptance_contract.required_commands.len(), 2);
+        assert!(
+            frozen
+                .acceptance_contract
+                .required_commands
+                .iter()
+                .all(|command| command.criterion_id == "tests")
+        );
+        assert_eq!(
+            frozen
+                .path_access("src/generated/code.rs")
+                .expect("forbidden path access"),
+            crate::repository_material::RepositoryPathAccess::Forbidden
+        );
+        assert_eq!(
+            frozen
+                .path_access("src/contracts/api.rs")
+                .expect("read-only path access"),
+            crate::repository_material::RepositoryPathAccess::ReadOnly
+        );
+        assert_eq!(
+            frozen
+                .path_access("src/lib.rs")
+                .expect("allowed path access"),
+            crate::repository_material::RepositoryPathAccess::Allowed
+        );
+        let compiled: serde_json::Value = serde_json::from_slice(&frozen_resolved.compiled_context)
+            .expect("compiled Context JSON");
+        let model_prompt = compiled
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .expect("model prompt");
+        assert!(!model_prompt.contains(&material.repository_root.display().to_string()));
+        assert!(!model_prompt.contains(&material.contract_path.display().to_string()));
+        let replay = fixture
+            .port
+            .prepare(&request, &principal)
+            .await
+            .expect("exact material replay");
+        assert_eq!(replay.snapshot_id, first.snapshot_id);
+        assert_eq!(
+            replay.compiled_context_sha256,
+            first.compiled_context_sha256
+        );
+
+        fs::write(
+            material.repository_root.join("src/lib.rs"),
+            "pub fn value() -> u8 { 2 }\n",
+        )
+        .expect("change repository source");
+        test_git(
+            &material.git_executable,
+            &material.repository_root,
+            &["add", "--all"],
+        );
+        test_git(
+            &material.git_executable,
+            &material.repository_root,
+            &["commit", "-m", "second"],
+        );
+        let replay_after_head_change = fixture
+            .port
+            .prepare(&request, &principal)
+            .await
+            .expect("exact replay keeps the frozen baseline");
+        assert_eq!(replay_after_head_change.snapshot_id, first.snapshot_id);
+
+        let independent = fixture
+            .port
+            .prepare(
+                &fixture.prepare_request(
+                    "update the governed source",
+                    "prepare-material-independent",
+                    request.sources.clone(),
+                ),
+                &principal,
+            )
+            .await
+            .expect("independent preparation captures the new baseline");
+        assert_ne!(independent.snapshot_id, first.snapshot_id);
+        assert_ne!(
+            independent.compiled_context_sha256,
+            first.compiled_context_sha256
+        );
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn repository_material_rejects_contract_body_and_reference_mismatch() {
+        let mut fixture = WorkFixture::open("repository-material-ref-mismatch");
+        let material = configure_repository_material(&mut fixture, false);
+        assert_ne!(fixture.port.acceptance_contract_ref, material.contract_ref);
+        let principal = WorkFixture::founder("founder-1");
+        let request = fixture.prepare_request(
+            "update the governed source",
+            "prepare-material-mismatch",
+            vec![WorkSourceRequest {
+                source_ref: "intent.md".to_owned(),
+                label: "intent".to_owned(),
+            }],
+        );
+        assert!(matches!(
+            fixture.port.prepare(&request, &principal).await,
+            Err(CommandPortFailure::IntegrityFailure)
+        ));
+        assert_eq!(fixture.delegated_command_count(), 0);
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn repository_material_confirmation_uses_stored_material_and_rejects_configured_ref_drift()
+     {
+        let mut fixture = WorkFixture::open("repository-material-confirm");
+        let material = configure_repository_material(&mut fixture, true);
+        let principal = WorkFixture::founder("founder-1");
+        let request = fixture.prepare_request(
+            "update the governed source",
+            "prepare-material-confirm",
+            vec![WorkSourceRequest {
+                source_ref: "intent.md".to_owned(),
+                label: "intent".to_owned(),
+            }],
+        );
+        let preview = fixture
+            .port
+            .prepare(&request, &principal)
+            .await
+            .expect("material preparation");
+
+        fs::write(
+            material.repository_root.join("src/lib.rs"),
+            "pub fn value() -> u8 { 9 }\n",
+        )
+        .expect("change live repository after preparation");
+        fs::write(&material.contract_path, b"{\"changed\":true}")
+            .expect("change live contract after preparation");
+        fixture
+            .port
+            .confirm(
+                &fixture.confirm_request(&preview, "confirm-material-stored"),
+                &principal,
+            )
+            .expect("confirmation consumes the stored frozen material only");
+        assert_eq!(fixture.delegated_command_count(), 1);
+
+        fixture.port.acceptance_contract_ref.sha256 = "f".repeat(64);
+        assert!(matches!(
+            fixture.port.confirm(
+                &fixture.confirm_request(&preview, "confirm-material-ref-drift"),
+                &principal,
+            ),
+            Err(CommandPortFailure::IntegrityFailure)
+        ));
+        assert_eq!(fixture.delegated_command_count(), 1);
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn independent_preparations_with_identical_content_get_distinct_snapshots() {
+        let fixture = WorkFixture::open("independent-identical");
+        let principal = WorkFixture::founder("founder-1");
+        let sources = vec![WorkSourceRequest {
+            source_ref: "intent.md".to_owned(),
+            label: "intent".to_owned(),
+        }];
+        let first = fixture
+            .port
+            .prepare(
+                &fixture.prepare_request(
+                    "update the governed source",
+                    "prepare-independent-1",
+                    sources.clone(),
+                ),
+                &principal,
+            )
+            .await
+            .expect("first independent preparation");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let second = fixture
+            .port
+            .prepare(
+                &fixture.prepare_request(
+                    "update the governed source",
+                    "prepare-independent-2",
+                    sources,
+                ),
+                &principal,
+            )
+            .await
+            .expect("second independent preparation in a later second");
+
+        assert_ne!(first.snapshot_id, second.snapshot_id);
+        assert_ne!(
+            first.compiled_context_sha256,
+            second.compiled_context_sha256
+        );
+        assert_eq!(
+            fixture
+                .context
+                .lock()
+                .expect("context lock")
+                .inspect_store()
+                .expect("context inspection")
+                .snapshot_count,
+            2
+        );
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn preparation_idempotency_is_scoped_to_the_owning_principal() {
+        let fixture = WorkFixture::open("owner-scoped-idempotency");
+        let request = fixture.prepare_request(
+            "update the governed source",
+            "prepare-shared-client-key",
+            vec![WorkSourceRequest {
+                source_ref: "intent.md".to_owned(),
+                label: "intent".to_owned(),
+            }],
+        );
+        let first = fixture
+            .port
+            .prepare(&request, &WorkFixture::founder("founder-1"))
+            .await
+            .expect("first owner's preparation");
+        let second = fixture
+            .port
+            .prepare(&request, &WorkFixture::founder("founder-2"))
+            .await
+            .expect("second owner's independent preparation");
+
+        assert_ne!(first.snapshot_id, second.snapshot_id);
+        assert_eq!(
+            fixture
+                .context
+                .lock()
+                .expect("context lock")
+                .inspect_store()
+                .expect("context inspection")
+                .snapshot_count,
+            2
+        );
+        fixture.finish();
+    }
+
+    #[test]
+    fn preparation_identity_framing_distinguishes_embedded_newlines() {
+        let first_owner = "owner\npart";
+        let first_key = "key";
+        let second_owner = "owner";
+        let second_key = "part\nkey";
+        assert_eq!(
+            format!("{first_owner}\n{first_key}"),
+            format!("{second_owner}\n{second_key}"),
+            "a delimiter-only encoding is ambiguous for these identity pairs"
+        );
+        assert_ne!(
+            context_issue_idempotency_key(first_owner, first_key),
+            context_issue_idempotency_key(second_owner, second_key),
+            "length framing must preserve the owner/key tuple boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_preparation_replays_without_growing_context_storage() {
+        let fixture = WorkFixture::open("prepare-replay");
+        let principal = WorkFixture::founder("founder-1");
+        let request = fixture.prepare_request(
+            "update the governed source",
+            "prepare-exact-replay",
+            vec![WorkSourceRequest {
+                source_ref: "intent.md".to_owned(),
+                label: "intent".to_owned(),
+            }],
+        );
+        let first = fixture
+            .port
+            .prepare(&request, &principal)
+            .await
+            .expect("first preparation");
+        let before_replay = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .inspect_store()
+            .expect("context inspection");
+        let replay = fixture
+            .port
+            .prepare(&request, &principal)
+            .await
+            .expect("exact preparation replay");
+        let after_replay = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .inspect_store()
+            .expect("context inspection");
+
+        assert_eq!(replay.snapshot_id, first.snapshot_id);
+        assert_eq!(
+            replay.compiled_context_sha256,
+            first.compiled_context_sha256
+        );
+        assert_eq!(after_replay, before_replay);
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn repeated_preparation_rejects_changed_intent_or_source_without_store_growth() {
+        let fixture = WorkFixture::open("prepare-replay-drift");
+        let principal = WorkFixture::founder("founder-1");
+        let request = fixture.prepare_request(
+            "update the governed source",
+            "prepare-replay-drift",
+            vec![WorkSourceRequest {
+                source_ref: "intent.md".to_owned(),
+                label: "intent".to_owned(),
+            }],
+        );
+        fixture
+            .port
+            .prepare(&request, &principal)
+            .await
+            .expect("first preparation");
+        let baseline = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .inspect_store()
+            .expect("context inspection");
+
+        let mut changed_intent = request.clone();
+        changed_intent.intent = "change a different governed behavior".to_owned();
+        assert!(matches!(
+            fixture.port.prepare(&changed_intent, &principal).await,
+            Err(CommandPortFailure::IntegrityFailure)
+        ));
+        assert_eq!(
+            fixture
+                .context
+                .lock()
+                .expect("context lock")
+                .inspect_store()
+                .expect("context inspection"),
+            baseline
+        );
+
+        fs::write(fixture.root.join("intent.md"), "changed source content")
+            .expect("change source content");
+        assert!(matches!(
+            fixture.port.prepare(&request, &principal).await,
+            Err(CommandPortFailure::IntegrityFailure)
+        ));
+        assert_eq!(
+            fixture
+                .context
+                .lock()
+                .expect("context lock")
+                .inspect_store()
+                .expect("context inspection"),
+            baseline
+        );
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn legacy_compiled_payload_replays_exactly_without_rewriting_storage() {
+        let mut fixture = WorkFixture::open("legacy-compiled-replay");
+        let principal = WorkFixture::founder("founder-1");
+        let request = fixture.prepare_request(
+            "update the governed source",
+            "prepare-legacy-compiled",
+            vec![WorkSourceRequest {
+                source_ref: "intent.md".to_owned(),
+                label: "intent".to_owned(),
+            }],
+        );
+        let (sources, excluded, project_source_prompt) =
+            fixture.port.compile_project_sources(&request);
+        assert!(excluded.is_empty());
+        let legacy_compiled_context = serde_json::to_vec(&serde_json::json!({
+            "prompt": format!("{}{}", request.intent.trim(), project_source_prompt),
+            "work_type": request.work_type.trim(),
+            "target_scope_ref": request.target_scope_ref.trim(),
+            "sources": sources,
+            "memory_pack": Option::<CompiledMemoryPack>::None,
+            "model": Option::<&str>::None,
+            "work_capability": Option::<CompiledWorkCapabilityBinding>::None,
+        }))
+        .expect("legacy compiled payload");
+        assert_eq!(
+            fixture
+                .port
+                .compile_context(
+                    &request,
+                    &principal.principal_id,
+                    true,
+                    &sources,
+                    &project_source_prompt,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("recompile legacy payload"),
+            legacy_compiled_context,
+            "legacy mode must preserve the previous serialized payload shape"
+        );
+        let expires_at_seconds = unix_seconds().expect("clock") + 60 * 60;
+        let legacy_input = IssueContextSnapshot {
+            owner_principal_id: principal.principal_id.clone(),
+            intent: request.intent.clone(),
+            work_type: request.work_type.clone(),
+            target_scope_ref: request.target_scope_ref.clone(),
+            compiled_context: legacy_compiled_context.clone(),
+            sources: sources.clone(),
+            memory_pack: None,
+            allowed_read_paths: vec![fixture.port.workspace_root.display().to_string()],
+            allowed_write_paths: vec![fixture.port.workspace_root.display().to_string()],
+            allowed_tools: Vec::new(),
+            external_resources: Vec::new(),
+            non_goals: vec![
+                "provider/model route cannot be selected or changed by model output".to_owned(),
+                "memory is not mutated by preparation".to_owned(),
+            ],
+            acceptance_contract_ref: contract_key(&contract("acceptance")),
+            budget_profile_ref: contract_key(&contract("budget")),
+            deadline_seconds: Some(expires_at_seconds),
+            recovery_entry: "hold-and-reconcile".to_owned(),
+            visibility: "founder-only".to_owned(),
+            redactions: Vec::new(),
+            expires_at_seconds,
+            idempotency_key: request.idempotency_key.clone(),
+        };
+        let compiler = AuthenticatedContextPrincipal {
+            kind: ContextPrincipalKind::ContextCompiler,
+            principal_id: "agentosd:work-preparation".to_owned(),
+            authenticated: true,
+        };
+        let (_, legacy_snapshot) = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .issue(&legacy_input, &compiler)
+            .expect("seed legacy preparation");
+        let before_replay = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .inspect_store()
+            .expect("context inspection");
+
+        let material = configure_repository_material(&mut fixture, false);
+        fs::write(
+            material.repository_root.join("src/lib.rs"),
+            "legacy replay must not inspect this dirty repository\n",
+        )
+        .expect("dirty repository after seeding legacy snapshot");
+
+        let replay = fixture
+            .port
+            .prepare(&request, &principal)
+            .await
+            .expect("legacy preparation replay");
+        let resolved = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .resolve(
+                &replay.snapshot_id,
+                request.target_scope_ref.trim(),
+                unix_seconds().expect("clock"),
+            )
+            .expect("resolve replayed legacy snapshot");
+        let after_replay = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .inspect_store()
+            .expect("context inspection");
+
+        assert_eq!(replay.snapshot_id, legacy_snapshot.snapshot_id);
+        assert_eq!(resolved.compiled_context, legacy_compiled_context);
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&resolved.compiled_context)
+                .expect("legacy compiled JSON")
+                .get("prepare_request_identity")
+                .is_none()
+        );
+        assert_eq!(after_replay, before_replay);
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn v2_compiler_namespace_isolated_from_colliding_legacy_raw_key() {
+        let fixture = WorkFixture::open("v2-legacy-key-collision");
+        let owner = WorkFixture::founder("founder-1");
+        let new_request = fixture.prepare_request(
+            "update the governed source",
+            "prepare-v2-collision-target",
+            vec![WorkSourceRequest {
+                source_ref: "intent.md".to_owned(),
+                label: "intent".to_owned(),
+            }],
+        );
+        let colliding_legacy_raw_key =
+            context_issue_idempotency_key(&owner.principal_id, new_request.idempotency_key.trim());
+        let legacy_request = fixture.prepare_request(
+            "update the governed source",
+            &colliding_legacy_raw_key,
+            new_request.sources.clone(),
+        );
+        let (legacy_sources, excluded, project_source_prompt) =
+            fixture.port.compile_project_sources(&legacy_request);
+        assert!(excluded.is_empty());
+        let legacy_compiled_context = fixture
+            .port
+            .compile_context(
+                &legacy_request,
+                &owner.principal_id,
+                true,
+                &legacy_sources,
+                &project_source_prompt,
+                None,
+                None,
+                None,
+            )
+            .expect("compile legacy collision payload");
+        let expires_at_seconds = unix_seconds().expect("clock") + 60 * 60;
+        let legacy_input = IssueContextSnapshot {
+            owner_principal_id: owner.principal_id.clone(),
+            intent: legacy_request.intent.clone(),
+            work_type: legacy_request.work_type.clone(),
+            target_scope_ref: legacy_request.target_scope_ref.clone(),
+            compiled_context: legacy_compiled_context,
+            sources: legacy_sources,
+            memory_pack: None,
+            allowed_read_paths: vec![fixture.port.workspace_root.display().to_string()],
+            allowed_write_paths: vec![fixture.port.workspace_root.display().to_string()],
+            allowed_tools: Vec::new(),
+            external_resources: Vec::new(),
+            non_goals: vec![
+                "provider/model route cannot be selected or changed by model output".to_owned(),
+                "memory is not mutated by preparation".to_owned(),
+            ],
+            acceptance_contract_ref: contract_key(&contract("acceptance")),
+            budget_profile_ref: contract_key(&contract("budget")),
+            deadline_seconds: Some(expires_at_seconds),
+            recovery_entry: "hold-and-reconcile".to_owned(),
+            visibility: "founder-only".to_owned(),
+            redactions: Vec::new(),
+            expires_at_seconds,
+            idempotency_key: colliding_legacy_raw_key,
+        };
+        let legacy_compiler = AuthenticatedContextPrincipal {
+            kind: ContextPrincipalKind::ContextCompiler,
+            principal_id: "agentosd:work-preparation".to_owned(),
+            authenticated: true,
+        };
+        let (_, legacy_snapshot) = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .issue(&legacy_input, &legacy_compiler)
+            .expect("seed colliding legacy preparation");
+
+        let new_snapshot = fixture
+            .port
+            .prepare(&new_request, &owner)
+            .await
+            .expect("v2 preparation must not bind the colliding legacy raw key");
+        assert_ne!(new_snapshot.snapshot_id, legacy_snapshot.snapshot_id);
+        let after_new = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .inspect_store()
+            .expect("context inspection");
+        assert_eq!(after_new.snapshot_count, 2);
+        assert_eq!(after_new.idempotency_count, 2);
+
+        let new_replay = fixture
+            .port
+            .prepare(&new_request, &owner)
+            .await
+            .expect("exact v2 replay");
+        let legacy_replay = fixture
+            .port
+            .prepare(&legacy_request, &owner)
+            .await
+            .expect("exact legacy replay");
+        let after_replays = fixture
+            .context
+            .lock()
+            .expect("context lock")
+            .inspect_store()
+            .expect("context inspection");
+
+        assert_eq!(new_replay.snapshot_id, new_snapshot.snapshot_id);
+        assert_eq!(legacy_replay.snapshot_id, legacy_snapshot.snapshot_id);
+        assert_eq!(after_replays, after_new);
         fixture.finish();
     }
 

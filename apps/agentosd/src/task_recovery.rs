@@ -42,9 +42,10 @@ pub enum TaskRecoverySettlementError {
 ///
 /// It consumes the cycle's derived recovery findings and converts only those
 /// that still match the live Task snapshot into the two existing governed Task
-/// commands: a committed collaboration `Cancelled` run records the Task
-/// cancellation outcome, and a quarantined unknown harness outcome interrupts
-/// the Task. Every settlement proves, in order: the Task exists, the finding's
+/// commands: a committed collaboration `Cancelled` run records cancellation,
+/// while a sealed return or unknown cancellation records `Interrupted`; an
+/// unknown active execution uses the existing interruption command. Every
+/// settlement proves, in order: the Task exists, the finding's
 /// run is still the Task's current run, the Task status is exactly the
 /// precondition state, and the command revision is the live revision. Any
 /// mismatch skips fail-closed; harness observations never assert completion.
@@ -98,7 +99,7 @@ impl GovernedTaskRecoveryRunner {
         }
         let now = current_timestamp();
         let (command, expected_revision) = match finding.kind {
-            TaskRecoveryKind::CancellationConfirmed => {
+            TaskRecoveryKind::CancellationConfirmed | TaskRecoveryKind::CancellationReturnFound => {
                 if snapshot.status != TaskStatus::CancellationPending as i32 {
                     return Ok(());
                 }
@@ -108,7 +109,11 @@ impl GovernedTaskRecoveryRunner {
                             meta: recovery_metadata(finding, now),
                             task_id: finding.task_id.clone(),
                             expected_revision: snapshot.revision,
-                            outcome: TaskStatus::Cancelled as i32,
+                            outcome: if finding.kind == TaskRecoveryKind::CancellationConfirmed {
+                                TaskStatus::Cancelled as i32
+                            } else {
+                                TaskStatus::Interrupted as i32
+                            },
                             cancellation_receipt_id: finding.evidence_ref.clone(),
                         },
                     ),
@@ -116,18 +121,33 @@ impl GovernedTaskRecoveryRunner {
                 )
             }
             TaskRecoveryKind::OutcomeUnknown => {
-                if snapshot.status != TaskStatus::Active as i32 {
-                    return Ok(());
+                if snapshot.status == TaskStatus::CancellationPending as i32 {
+                    (
+                        task_command::Command::RecordTaskCancellationOutcome(
+                            RecordTaskCancellationOutcomeCommand {
+                                meta: recovery_metadata(finding, now),
+                                task_id: finding.task_id.clone(),
+                                expected_revision: snapshot.revision,
+                                outcome: TaskStatus::Interrupted as i32,
+                                cancellation_receipt_id: finding.evidence_ref.clone(),
+                            },
+                        ),
+                        snapshot.revision,
+                    )
+                } else {
+                    if snapshot.status != TaskStatus::Active as i32 {
+                        return Ok(());
+                    }
+                    (
+                        task_command::Command::InterruptTask(InterruptTaskCommand {
+                            meta: recovery_metadata(finding, now),
+                            task_id: finding.task_id.clone(),
+                            expected_revision: snapshot.revision,
+                            interruption_evidence_id: finding.evidence_ref.clone(),
+                        }),
+                        snapshot.revision,
+                    )
                 }
-                (
-                    task_command::Command::InterruptTask(InterruptTaskCommand {
-                        meta: recovery_metadata(finding, now),
-                        task_id: finding.task_id.clone(),
-                        expected_revision: snapshot.revision,
-                        interruption_evidence_id: finding.evidence_ref.clone(),
-                    }),
-                    snapshot.revision,
-                )
             }
         };
         let mut command = TaskCommand {
@@ -177,6 +197,7 @@ fn recovery_metadata(
         "{}:{}:{}:{}",
         match finding.kind {
             TaskRecoveryKind::CancellationConfirmed => "cancellation-outcome",
+            TaskRecoveryKind::CancellationReturnFound => "cancellation-return-found",
             TaskRecoveryKind::OutcomeUnknown => "interrupt",
         },
         finding.task_id,
@@ -534,6 +555,91 @@ mod tests {
             TaskStatus::Completed as i32,
             "a harness observation must never complete a Task"
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_cancellation_outcome_interrupts_cancellation_pending_task() {
+        let isolated = IsolatedStore::new("recovery-cancellation-unknown");
+        let task = open_task_authority(&isolated.root);
+        let active = create_and_activate(&task);
+        let mut request = TaskCommand {
+            command: Some(task_command::Command::RequestTaskCancellation(
+                RequestTaskCancellationCommand {
+                    meta: Some(metadata("cmd-cancel-unknown", "cancel-unknown")),
+                    task_id: active.task_id.clone(),
+                    expected_revision: active.revision,
+                    reason_code: "founder_abandoned".to_owned(),
+                },
+            )),
+        };
+        seal(&mut request);
+        task.lock()
+            .expect("task lock")
+            .execute(&request, &founder_principal())
+            .expect("request cancellation");
+
+        let runner = GovernedTaskRecoveryRunner::new(
+            Arc::new(FixedRunner {
+                findings: vec![TaskRecoveryFinding {
+                    kind: TaskRecoveryKind::OutcomeUnknown,
+                    task_id: active.task_id.clone(),
+                    run_id: "run-001".to_owned(),
+                    evidence_ref: "unknown-cancellation:observation-006".to_owned(),
+                }],
+            }),
+            Arc::clone(&task),
+            "collaboration-control:task-recovery",
+        )
+        .expect("build recovery runner");
+
+        runner
+            .run_once()
+            .await
+            .expect("settle unknown cancellation");
+        let snapshot = current_snapshot(&task, &active.task_id);
+        assert_eq!(snapshot.status, TaskStatus::Interrupted as i32);
+        assert_eq!(snapshot.current_run_id.as_deref(), Some("run-001"));
+    }
+
+    #[tokio::test]
+    async fn sealed_return_interrupts_pending_cancellation_without_auto_resume() {
+        let isolated = IsolatedStore::new("recovery-cancellation-return");
+        let task = open_task_authority(&isolated.root);
+        let active = create_and_activate(&task);
+        let mut request = TaskCommand {
+            command: Some(task_command::Command::RequestTaskCancellation(
+                RequestTaskCancellationCommand {
+                    meta: Some(metadata("cmd-cancel-return", "cancel-return")),
+                    task_id: active.task_id.clone(),
+                    expected_revision: active.revision,
+                    reason_code: "founder_abandoned".to_owned(),
+                },
+            )),
+        };
+        seal(&mut request);
+        task.lock()
+            .expect("task lock")
+            .execute(&request, &founder_principal())
+            .expect("request cancellation");
+
+        let runner = GovernedTaskRecoveryRunner::new(
+            Arc::new(FixedRunner {
+                findings: vec![TaskRecoveryFinding {
+                    kind: TaskRecoveryKind::CancellationReturnFound,
+                    task_id: active.task_id.clone(),
+                    run_id: "run-001".to_owned(),
+                    evidence_ref: "sealed-return:artifact-007".to_owned(),
+                }],
+            }),
+            Arc::clone(&task),
+            "collaboration-control:task-recovery",
+        )
+        .expect("build recovery runner");
+
+        runner.run_once().await.expect("settle cancellation return");
+        let snapshot = current_snapshot(&task, &active.task_id);
+        assert_eq!(snapshot.status, TaskStatus::Interrupted as i32);
+        assert_eq!(snapshot.current_run_id.as_deref(), Some("run-001"));
     }
 
     #[tokio::test]

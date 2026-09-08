@@ -1,7 +1,8 @@
 use egopulse_cognition_runtime::task_authority::{
     AuthenticatedPrincipal, CreationAuthorization, CreationGuardRejection, PrincipalKind,
-    SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCreationGuard, TaskTransitionGuard,
-    TransitionAuthorization, TransitionGuardRejection, canonical_request_digest,
+    SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCancellationReconciliation,
+    TaskCreationGuard, TaskTransitionGuard, TransitionAuthorization, TransitionGuardRejection,
+    canonical_request_digest,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::task::v1::{
@@ -204,6 +205,34 @@ fn active_task(authority: &mut TaskAuthority) -> String {
             panic!("expected active Task, got {}", error.safe_detail_code)
         }
     }
+}
+
+fn ready_task(authority: &mut TaskAuthority, identity: &str) -> String {
+    let mut create = TaskCommand {
+        command: Some(task_command::Command::CreateTask(CreateTaskCommand {
+            meta: Some(metadata(
+                &format!("cmd-create-{identity}"),
+                &format!("create-{identity}"),
+            )),
+            work_type: "governed_repository_change".to_owned(),
+            input_snapshot_id: "input-001".to_owned(),
+            target_scope_ref: "repo-scope-001".to_owned(),
+            acceptance_contract_ref: Some(contract_ref(
+                "repository_change_acceptance",
+                "1",
+                &"a".repeat(64),
+            )),
+            budget_profile_ref: Some(contract_ref("v01-quality-budget", "0.1", &"b".repeat(64))),
+            work_capability_route: None,
+        })),
+    };
+    set_digest(&mut create);
+    snapshot_of(
+        &authority
+            .execute(&create, &founder())
+            .expect("create Ready Task"),
+    )
+    .task_id
 }
 
 fn snapshot_of(
@@ -473,4 +502,327 @@ fn cancellation_outcome_terminates_the_cancel_loop_under_collaboration_control_o
         .execute(&outcome, &collaboration_control())
         .expect("replay cancellation outcome idempotently");
     assert!(replayed.replayed);
+}
+
+#[test]
+fn active_cancellation_handoff_replays_exactly_across_authority_restart() {
+    let isolated = IsolatedStore::new("task-cancellation-handoff-recovery");
+    let mut authority = open_authority(&isolated.database_path());
+    let task_id = active_task(&mut authority);
+
+    let mut request = TaskCommand {
+        command: Some(task_command::Command::RequestTaskCancellation(
+            RequestTaskCancellationCommand {
+                meta: Some(metadata("cmd-cancel-handoff-001", "cancel-handoff-001")),
+                task_id: task_id.clone(),
+                expected_revision: 2,
+                reason_code: "founder_abandoned".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut request);
+    let requested = authority
+        .execute(&request, &founder())
+        .expect("commit active cancellation request");
+    let event_id = requested
+        .committed_event
+        .as_ref()
+        .expect("cancellation event")
+        .event_id
+        .clone();
+    let pending = authority
+        .pending_task_cancellations()
+        .expect("read cancellation handoff");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].event.event_id, event_id);
+    assert_eq!(
+        pending[0]
+            .event
+            .snapshot
+            .as_ref()
+            .expect("snapshot")
+            .task_id,
+        task_id
+    );
+    assert_eq!(
+        pending[0]
+            .event
+            .snapshot
+            .as_ref()
+            .expect("snapshot")
+            .current_run_id
+            .as_deref(),
+        Some("run-001")
+    );
+    let message_id = pending[0].message_id.clone();
+    let payload_digest = pending[0].payload_digest_sha256.clone();
+
+    drop(authority);
+    let mut recovered = open_authority(&isolated.database_path());
+    let replayed = recovered
+        .execute(&request, &founder())
+        .expect("replay cancellation request after restart");
+    assert!(replayed.replayed);
+    let recovered_pending = recovered
+        .pending_task_cancellations()
+        .expect("recover cancellation handoff");
+    assert_eq!(recovered_pending.len(), 1);
+    assert_eq!(recovered_pending[0].message_id, message_id);
+    assert_eq!(recovered_pending[0].payload_digest_sha256, payload_digest);
+    assert_eq!(recovered_pending[0].event.event_id, event_id);
+
+    assert!(
+        recovered
+            .acknowledge_cross_authority_outbox(&message_id, &payload_digest)
+            .expect("acknowledge exact cancellation handoff")
+    );
+    assert!(
+        recovered
+            .pending_task_cancellations()
+            .expect("read acknowledged cancellation handoff")
+            .is_empty()
+    );
+}
+
+#[test]
+fn ready_cancellation_settles_from_exact_task_event_without_native_run() {
+    let isolated = IsolatedStore::new("ready-task-cancellation");
+    let database_path = isolated.database_path();
+    let mut authority = open_authority(&database_path);
+    let task_id = ready_task(&mut authority, "ready-cancel");
+    let mut request = TaskCommand {
+        command: Some(task_command::Command::RequestTaskCancellation(
+            RequestTaskCancellationCommand {
+                meta: Some(metadata("cmd-cancel-ready", "cancel-ready")),
+                task_id: task_id.clone(),
+                expected_revision: 1,
+                reason_code: "founder_abandoned".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut request);
+    authority
+        .execute(&request, &founder())
+        .expect("request Ready cancellation");
+    let pending = authority
+        .pending_task_cancellations()
+        .expect("read Ready cancellation handoff");
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0]
+            .event
+            .snapshot
+            .as_ref()
+            .expect("frozen Task")
+            .current_run_id
+            .is_none()
+    );
+
+    let settled = authority
+        .reconcile_task_cancellation(
+            &pending[0].message_id,
+            &pending[0].payload_digest_sha256,
+            &collaboration_control(),
+        )
+        .expect("settle Ready cancellation");
+    assert_eq!(
+        settled,
+        TaskCancellationReconciliation::SettledAndAcknowledged {
+            status: TaskStatus::Cancelled,
+            committed: true,
+            replayed: false,
+        }
+    );
+    assert!(
+        authority
+            .pending_task_cancellations()
+            .expect("cancellation handoff consumed")
+            .is_empty()
+    );
+    let snapshot = authority.get_task(&task_id).expect("read cancelled Task");
+    let task = match snapshot.outcome.expect("Task outcome") {
+        egopulse_domain_contracts::v01::egopulse::task::v1::get_task_response::Outcome::Task(
+            task,
+        ) => task,
+        _ => panic!("expected Task snapshot"),
+    };
+    assert_eq!(task.status, TaskStatus::Cancelled as i32);
+    assert!(task.current_run_id.is_none());
+
+    drop(authority);
+    let reopened = open_authority(&database_path);
+    assert!(
+        reopened
+            .pending_task_cancellations()
+            .expect("reopen consumed cancellation")
+            .is_empty()
+    );
+}
+
+#[test]
+fn ready_cancellation_rejects_forged_evidence_and_cleans_late_ack_after_restart() {
+    let isolated = IsolatedStore::new("ready-task-cancellation-replay");
+    let database_path = isolated.database_path();
+    let mut authority = open_authority(&database_path);
+    let task_id = ready_task(&mut authority, "ready-replay");
+    let mut request = TaskCommand {
+        command: Some(task_command::Command::RequestTaskCancellation(
+            RequestTaskCancellationCommand {
+                meta: Some(metadata("cmd-cancel-ready-replay", "cancel-ready-replay")),
+                task_id: task_id.clone(),
+                expected_revision: 1,
+                reason_code: "founder_abandoned".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut request);
+    authority
+        .execute(&request, &founder())
+        .expect("request Ready cancellation");
+    let pending = authority
+        .pending_task_cancellations()
+        .expect("read Ready cancellation handoff")
+        .pop()
+        .expect("one cancellation handoff");
+
+    let mut forged = TaskCommand {
+        command: Some(task_command::Command::RecordTaskCancellationOutcome(
+            RecordTaskCancellationOutcomeCommand {
+                meta: Some(metadata("cmd-ready-forged", "ready-forged")),
+                task_id: task_id.clone(),
+                expected_revision: 2,
+                outcome: TaskStatus::Cancelled as i32,
+                cancellation_receipt_id: "task-event-forged".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut forged);
+    let rejected = authority
+        .execute(&forged, &collaboration_control())
+        .expect("reject forged Ready cancellation evidence");
+    assert_eq!(error_code_of(&rejected), TaskErrorCode::UnverifiedReference);
+
+    let mut exact = TaskCommand {
+        command: Some(task_command::Command::RecordTaskCancellationOutcome(
+            RecordTaskCancellationOutcomeCommand {
+                meta: Some(CommandMetadata {
+                    command_id: format!("settle-ready-cancellation-{}", pending.event.event_id),
+                    idempotency_key: format!("ready-cancellation:{}", pending.event.event_id),
+                    idempotency_scope: "task-authority/ready-cancellation/v1".to_owned(),
+                    request_digest_sha256: String::new(),
+                    issued_at: pending.event.occurred_at,
+                    correlation_id: pending.event.correlation_id.clone(),
+                    causation_id: Some(pending.event.event_id.clone()),
+                }),
+                task_id: task_id.clone(),
+                expected_revision: 2,
+                outcome: TaskStatus::Cancelled as i32,
+                cancellation_receipt_id: pending.event.event_id.clone(),
+            },
+        )),
+    };
+    set_digest(&mut exact);
+    let committed = authority
+        .execute(&exact, &collaboration_control())
+        .expect("commit exact Ready cancellation outcome before ACK");
+    assert!(!committed.replayed);
+    let replayed = authority
+        .execute(&exact, &collaboration_control())
+        .expect("replay exact cancellation outcome");
+    assert!(replayed.replayed);
+
+    drop(authority);
+    let mut reopened = open_authority(&database_path);
+    let reconciled = reopened
+        .reconcile_task_cancellation(
+            &pending.message_id,
+            &pending.payload_digest_sha256,
+            &collaboration_control(),
+        )
+        .expect("consume late ACK after restart");
+    assert_eq!(
+        reconciled,
+        TaskCancellationReconciliation::SettledAndAcknowledged {
+            status: TaskStatus::Cancelled,
+            committed: false,
+            replayed: true,
+        }
+    );
+    assert!(
+        reopened
+            .pending_task_cancellations()
+            .expect("late ACK consumed")
+            .is_empty()
+    );
+}
+
+#[test]
+fn terminal_active_run_consumes_late_cancellation_ack_without_redelivery() {
+    let isolated = IsolatedStore::new("active-task-cancellation-late-ack");
+    let database_path = isolated.database_path();
+    let mut authority = open_authority(&database_path);
+    let task_id = active_task(&mut authority);
+    let mut request = TaskCommand {
+        command: Some(task_command::Command::RequestTaskCancellation(
+            RequestTaskCancellationCommand {
+                meta: Some(metadata("cmd-cancel-late-ack", "cancel-late-ack")),
+                task_id: task_id.clone(),
+                expected_revision: 2,
+                reason_code: "founder_abandoned".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut request);
+    authority
+        .execute(&request, &founder())
+        .expect("request active cancellation");
+    let pending = authority
+        .pending_task_cancellations()
+        .expect("read active cancellation handoff")
+        .pop()
+        .expect("one cancellation handoff");
+
+    let mut outcome = TaskCommand {
+        command: Some(task_command::Command::RecordTaskCancellationOutcome(
+            RecordTaskCancellationOutcomeCommand {
+                meta: Some(metadata("cmd-cancel-return", "cancel-return")),
+                task_id,
+                expected_revision: 3,
+                outcome: TaskStatus::Interrupted as i32,
+                cancellation_receipt_id: "sealed-return:artifact-001".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut outcome);
+    let interrupted = authority
+        .execute(&outcome, &collaboration_control())
+        .expect("record evidence-backed interrupted outcome");
+    assert_eq!(
+        snapshot_of(&interrupted).status,
+        TaskStatus::Interrupted as i32
+    );
+
+    drop(authority);
+    let mut reopened = open_authority(&database_path);
+    let reconciled = reopened
+        .reconcile_task_cancellation(
+            &pending.message_id,
+            &pending.payload_digest_sha256,
+            &collaboration_control(),
+        )
+        .expect("consume terminal active-run cancellation ACK");
+    assert_eq!(
+        reconciled,
+        TaskCancellationReconciliation::SettledAndAcknowledged {
+            status: TaskStatus::Interrupted,
+            committed: false,
+            replayed: true,
+        }
+    );
+    assert!(
+        reopened
+            .pending_task_cancellations()
+            .expect("late active-run ACK consumed")
+            .is_empty()
+    );
 }

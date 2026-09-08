@@ -521,6 +521,13 @@ pub struct HarnessApprovalView {
     pub available_actions: ::prost::alloc::vec::Vec<AvailableAction>,
     #[prost(message, repeated, tag = "19")]
     pub redactions: ::prost::alloc::vec::Vec<RedactedField>,
+    /// Rebuildable copy of the adapter-owned safe summary. It remains subject to
+    /// egopulse.approval-display/v1 validation; absence is legacy-compatible and
+    /// must be displayed as unavailable rather than inferred from native data.
+    #[prost(message, optional, tag = "20")]
+    pub display_summary: ::core::option::Option<
+        super::super::harness::v1::ApprovalDisplaySummary,
+    >,
 }
 /// Independent content-domain position. It must not be compared with the Task,
 /// Approval or OpenSession projection position even when values happen to match.
@@ -1097,6 +1104,29 @@ pub struct ExecuteFounderVerdictResponse {
     #[prost(message, optional, tag = "1")]
     pub authority_result: ::core::option::Option<
         super::super::verdict::v1::VerdictCommandResult,
+    >,
+    #[prost(message, optional, tag = "2")]
+    pub await_token: ::core::option::Option<ProjectionAwaitToken>,
+    #[prost(message, optional, tag = "3")]
+    pub gateway_error: ::core::option::Option<LocalApiError>,
+}
+/// This is a narrow authenticated composition command, not an Artifact write
+/// API. The daemon derives Artifact identity, producer, lineage, workspace and
+/// contract profiles after revalidating the trusted Verdict scope.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateFounderSupportingMaterialRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(message, optional, tag = "2")]
+    pub command: ::core::option::Option<
+        super::super::verdict::v1::CreateFounderSupportingMaterialCommand,
+    >,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateFounderSupportingMaterialResponse {
+    #[prost(message, optional, tag = "1")]
+    pub authority_result: ::core::option::Option<
+        super::super::verdict::v1::FounderSupportingMaterialReceipt,
     >,
     #[prost(message, optional, tag = "2")]
     pub await_token: ::core::option::Option<ProjectionAwaitToken>,
@@ -3643,6 +3673,37 @@ pub mod local_command_gateway_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn create_founder_supporting_material(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::CreateFounderSupportingMaterialRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::CreateFounderSupportingMaterialResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalCommandGatewayService/CreateFounderSupportingMaterial",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalCommandGatewayService",
+                        "CreateFounderSupportingMaterial",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn execute_memory_mutation(
             &mut self,
             request: impl tonic::IntoRequest<super::ExecuteMemoryMutationRequest>,
@@ -3763,6 +3824,13 @@ pub mod local_command_gateway_service_server {
             request: tonic::Request<super::ExecuteFounderVerdictRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ExecuteFounderVerdictResponse>,
+            tonic::Status,
+        >;
+        async fn create_founder_supporting_material(
+            &self,
+            request: tonic::Request<super::CreateFounderSupportingMaterialRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CreateFounderSupportingMaterialResponse>,
             tonic::Status,
         >;
         async fn execute_memory_mutation(
@@ -4197,6 +4265,62 @@ pub mod local_command_gateway_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ExecuteFounderVerdictSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/egopulse.localapi.v1.LocalCommandGatewayService/CreateFounderSupportingMaterial" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateFounderSupportingMaterialSvc<
+                        T: LocalCommandGatewayService,
+                    >(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: LocalCommandGatewayService,
+                    > tonic::server::UnaryService<
+                        super::CreateFounderSupportingMaterialRequest,
+                    > for CreateFounderSupportingMaterialSvc<T> {
+                        type Response = super::CreateFounderSupportingMaterialResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::CreateFounderSupportingMaterialRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalCommandGatewayService>::create_founder_supporting_material(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateFounderSupportingMaterialSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

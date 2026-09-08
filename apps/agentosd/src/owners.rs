@@ -1,6 +1,14 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::SharedFounderVerdictAuthority;
+use crate::approval_delivery::{
+    ApprovalDeliveryCycleError, ApprovalDeliverySource, ApprovalPolicyEvidence,
+    PendingApprovalDelivery,
+};
+use crate::cancellation_delivery::TaskCancellationReconciler;
 use crate::projections::{OwnerProjectionSource, PendingOwnerProjection, ProjectionSourceFailure};
 use egopulse_cognition_runtime::context_authority::ContextPrincipalKind;
 use egopulse_cognition_runtime::memory_authority::MemoryPrincipalKind;
@@ -8,10 +16,16 @@ use egopulse_cognition_runtime::task_authority::{
     AuthenticatedPrincipal, PrincipalKind as TaskPrincipalKind, TaskAuthority, TaskAuthorityFailure,
 };
 use egopulse_domain_contracts::v01::egopulse::{
+    common::v1::CommandMetadata,
+    harness::v1::{ApprovalDecisionEnvelope, ApprovalDecisionReceipt},
     localapi::v1::{SourceDomain, SourceRevision},
-    policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
+    policy::v1::{
+        ConsumeHarnessApprovalDecisionCommand, HarnessApprovalDecisionStateKind,
+        IssueHarnessApprovalDecisionCommand, PolicyDecisionCommand, PolicyDecisionCommandResult,
+        policy_decision_command,
+    },
     task::v1::{TaskCommand, TaskCommandResult, task_command},
-    verdict::v1::{VerdictCommand, VerdictCommandResult},
+    verdict::v1::{VerdictCommand, VerdictCommandResult, verdict_command},
 };
 use egopulse_founder_verdict_authority::{
     AuthenticatedVerdictPrincipal, FounderVerdictAuthority, VerdictAuthorityFailure,
@@ -24,11 +38,15 @@ use egopulse_local_api::command_gateway::{
 use egopulse_local_api::read_tokens::AwaitTarget;
 use egopulse_local_ide_control::collaboration_control::{
     TaskActivationHandoff, TaskActivationSource, TaskActivationSourceError,
+    TaskCancellationHandoff, TaskCancellationSource, TaskCancellationSourceError,
 };
 use egopulse_policy_decision_authority::{
     AuthenticatedPolicyPrincipal, PolicyAuthorityFailure, PolicyDecisionAuthority,
-    PolicyPrincipalKind,
+    PolicyPrincipalKind, canonical_request_digest,
 };
+use prost::Message;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 /// The local API session authenticates an OS peer, but it does not by itself
 /// establish an Authority principal kind. This provider is the explicit
@@ -110,8 +128,9 @@ impl AuthorityPrincipalResolver for DenyAllAuthorityPrincipalResolver {
 /// second source of business facts.
 pub struct AuthorityCommandPorts {
     task: Arc<Mutex<TaskAuthority>>,
-    policy: Mutex<PolicyDecisionAuthority>,
+    policy: Arc<Mutex<PolicyDecisionAuthority>>,
     verdict: SharedFounderVerdictAuthority,
+    cross_authority_operation_gate: Arc<Mutex<()>>,
     principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
 }
 
@@ -159,10 +178,51 @@ impl AuthorityCommandPorts {
         verdict: SharedFounderVerdictAuthority,
         principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
     ) -> Self {
+        Self::new_shared_handles_with_operation_gate(
+            task,
+            policy,
+            verdict,
+            principal_resolver,
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    /// Uses the composition-owned gate for the only two operations that cross
+    /// the Task/Founder Verdict boundary. Ordinary owner commands do not take
+    /// this gate.
+    #[must_use]
+    pub fn new_shared_handles_with_operation_gate(
+        task: Arc<Mutex<TaskAuthority>>,
+        policy: PolicyDecisionAuthority,
+        verdict: SharedFounderVerdictAuthority,
+        principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
+        cross_authority_operation_gate: Arc<Mutex<()>>,
+    ) -> Self {
+        Self::new_shared_authority_handles_with_operation_gate(
+            task,
+            Arc::new(Mutex::new(policy)),
+            verdict,
+            principal_resolver,
+            cross_authority_operation_gate,
+        )
+    }
+
+    /// Composes all cross-Authority owner handles and their shared operation
+    /// gate. Production background workers must receive clones of these same
+    /// handles rather than opening a second Policy owner.
+    #[must_use]
+    pub fn new_shared_authority_handles_with_operation_gate(
+        task: Arc<Mutex<TaskAuthority>>,
+        policy: Arc<Mutex<PolicyDecisionAuthority>>,
+        verdict: SharedFounderVerdictAuthority,
+        principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
+        cross_authority_operation_gate: Arc<Mutex<()>>,
+    ) -> Self {
         Self {
             task,
-            policy: Mutex::new(policy),
+            policy,
             verdict,
+            cross_authority_operation_gate,
             principal_resolver,
         }
     }
@@ -269,6 +329,18 @@ impl AuthorityCommandPorts {
         command: &TaskCommand,
         owner_principal: AuthenticatedPrincipal,
     ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        let _cross_authority_guard = if matches!(
+            command.command,
+            Some(task_command::Command::ApplyFounderVerdict(_))
+        ) {
+            Some(
+                self.cross_authority_operation_gate
+                    .lock()
+                    .map_err(|_| CommandPortFailure::IntegrityFailure)?,
+            )
+        } else {
+            None
+        };
         let mut authority = self
             .task
             .lock()
@@ -347,6 +419,79 @@ impl TaskActivationSource for AuthorityCommandPorts {
     }
 }
 
+impl TaskCancellationSource for AuthorityCommandPorts {
+    fn pending_task_cancellations(
+        &self,
+    ) -> Result<Vec<TaskCancellationHandoff>, TaskCancellationSourceError> {
+        let authority = self
+            .task
+            .lock()
+            .map_err(|_| TaskCancellationSourceError::Unavailable)?;
+        authority
+            .pending_task_cancellations()
+            .map_err(task_cancellation_source_error)
+            .and_then(|messages| {
+                messages
+                    .into_iter()
+                    .map(|message| {
+                        let requested_at = message
+                            .event
+                            .occurred_at
+                            .ok_or(TaskCancellationSourceError::Integrity)?;
+                        let task = message
+                            .event
+                            .snapshot
+                            .clone()
+                            .ok_or(TaskCancellationSourceError::Integrity)?;
+                        Ok(TaskCancellationHandoff {
+                            message_id: message.message_id,
+                            payload_digest_sha256: message.payload_digest_sha256,
+                            cancellation_request_id: message.event.event_id,
+                            requested_at,
+                            task,
+                        })
+                    })
+                    .collect()
+            })
+    }
+
+    fn acknowledge_task_cancellation(
+        &self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, TaskCancellationSourceError> {
+        self.task
+            .lock()
+            .map_err(|_| TaskCancellationSourceError::Unavailable)?
+            .acknowledge_cross_authority_outbox(message_id, payload_digest_sha256)
+            .map_err(|_| TaskCancellationSourceError::Integrity)
+    }
+}
+
+impl TaskCancellationReconciler for AuthorityCommandPorts {
+    fn reconcile_task_cancellation(
+        &self,
+        handoff: &TaskCancellationHandoff,
+    ) -> Result<
+        egopulse_cognition_runtime::task_authority::TaskCancellationReconciliation,
+        TaskCancellationSourceError,
+    > {
+        self.task
+            .lock()
+            .map_err(|_| TaskCancellationSourceError::Unavailable)?
+            .reconcile_task_cancellation(
+                &handoff.message_id,
+                &handoff.payload_digest_sha256,
+                &AuthenticatedPrincipal {
+                    kind: TaskPrincipalKind::CollaborationControl,
+                    principal_id: "collaboration-control:task-cancellation".to_owned(),
+                    authenticated: true,
+                },
+            )
+            .map_err(task_cancellation_source_error)
+    }
+}
+
 impl PolicyCommandPort for AuthorityCommandPorts {
     fn execute(
         &self,
@@ -400,6 +545,195 @@ impl PolicyCommandPort for AuthorityCommandPorts {
     }
 }
 
+impl ApprovalDeliverySource for AuthorityCommandPorts {
+    fn approval_policy_evidence(
+        &self,
+        authority_decision_ref: &str,
+    ) -> Result<Option<ApprovalPolicyEvidence>, ApprovalDeliveryCycleError> {
+        let authority = self
+            .policy
+            .lock()
+            .map_err(|_| ApprovalDeliveryCycleError::OwnerUnavailable)?;
+        let Some((record, state)) = authority
+            .get(authority_decision_ref)
+            .map_err(|_| ApprovalDeliveryCycleError::OwnerUnavailable)?
+        else {
+            return Ok(None);
+        };
+        if HarnessApprovalDecisionStateKind::try_from(state.state)
+            != Ok(HarnessApprovalDecisionStateKind::Issued)
+        {
+            return Ok(None);
+        }
+        let mut matched = None;
+        // All Policy writes use this same owner lock. Unknown deliveries retain
+        // their pending envelope until the existing Consume transition commits.
+        for message in authority
+            .pending_outbox()
+            .map_err(|_| ApprovalDeliveryCycleError::OwnerUnavailable)?
+            .into_iter()
+            .filter(|message| {
+                message.destination_domain == "harness-adapter"
+                    && message.payload_kind == "approval-decision-envelope-v1"
+            })
+        {
+            if hex::encode(Sha256::digest(&message.payload)) != message.payload_digest_sha256 {
+                return Err(ApprovalDeliveryCycleError::OwnerIntegrity);
+            }
+            let envelope = ApprovalDecisionEnvelope::decode(message.payload.as_slice())
+                .map_err(|_| ApprovalDeliveryCycleError::OwnerIntegrity)?;
+            if envelope.authority_decision_ref != authority_decision_ref {
+                continue;
+            }
+            if matched.is_some() || state.revision == 0 || state.revision != message.source_revision
+            {
+                return Err(ApprovalDeliveryCycleError::OwnerIntegrity);
+            }
+            matched = Some(envelope);
+        }
+        let envelope = matched.ok_or(ApprovalDeliveryCycleError::OwnerIntegrity)?;
+        Ok(Some((record, state, envelope)))
+    }
+
+    fn pending_approval_deliveries(
+        &self,
+    ) -> Result<Vec<PendingApprovalDelivery>, ApprovalDeliveryCycleError> {
+        let authority = self
+            .policy
+            .lock()
+            .map_err(|_| ApprovalDeliveryCycleError::OwnerUnavailable)?;
+        let outbox = authority
+            .pending_outbox()
+            .map_err(|_| ApprovalDeliveryCycleError::OwnerUnavailable)?;
+        let mut pending = Vec::new();
+        for message in outbox.into_iter().filter(|message| {
+            message.destination_domain == "harness-adapter"
+                && message.payload_kind == "approval-decision-envelope-v1"
+        }) {
+            if hex::encode(Sha256::digest(&message.payload)) != message.payload_digest_sha256 {
+                return Err(ApprovalDeliveryCycleError::OwnerIntegrity);
+            }
+            let envelope = ApprovalDecisionEnvelope::decode(message.payload.as_slice())
+                .map_err(|_| ApprovalDeliveryCycleError::OwnerIntegrity)?;
+            let Some((record, state)) = authority
+                .get(&envelope.authority_decision_ref)
+                .map_err(|_| ApprovalDeliveryCycleError::OwnerUnavailable)?
+            else {
+                return Err(ApprovalDeliveryCycleError::OwnerIntegrity);
+            };
+            if HarnessApprovalDecisionStateKind::try_from(state.state)
+                != Ok(HarnessApprovalDecisionStateKind::Issued)
+            {
+                continue;
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ApprovalDeliveryCycleError::OwnerUnavailable)?;
+            let expired = record.expires_at.as_ref().is_none_or(|expires_at| {
+                expires_at.seconds < i64::try_from(now.as_secs()).unwrap_or(i64::MAX)
+                    || (expires_at.seconds == i64::try_from(now.as_secs()).unwrap_or(i64::MAX)
+                        && expires_at.nanos
+                            <= i32::try_from(now.subsec_nanos()).unwrap_or(i32::MAX))
+            });
+            let request = record
+                .request
+                .ok_or(ApprovalDeliveryCycleError::OwnerIntegrity)?;
+            if state.revision == 0
+                || state.revision != message.source_revision
+                || envelope.meta.as_ref().is_none_or(|metadata| {
+                    metadata.request_digest_sha256 != record.canonical_payload_digest_sha256
+                        || metadata.idempotency_key != record.authority_decision_ref
+                        || metadata.idempotency_scope != "policy-decision-to-harness-adapter"
+                })
+                || envelope.attempt_id != request.attempt_id
+                || envelope.dispatch_id != request.dispatch_id
+                || envelope.fencing_token != request.fencing_token
+                || envelope.approval_request_id != request.approval_request_id
+                || envelope.action_digest_sha256 != request.action_digest_sha256
+                || envelope.native_routing_ref != request.native_routing_ref
+                || envelope.authority_decision_ref != record.authority_decision_ref
+                || envelope.decision != record.decision
+            {
+                return Err(ApprovalDeliveryCycleError::OwnerIntegrity);
+            }
+            pending.push(PendingApprovalDelivery {
+                source_event_id: message.source_event_id,
+                envelope,
+                request,
+                expected_state_revision: state.revision,
+                expired,
+            });
+        }
+        Ok(pending)
+    }
+
+    fn consume_delivered_approval(
+        &self,
+        delivery: &PendingApprovalDelivery,
+        receipt: ApprovalDecisionReceipt,
+        harness_adapter_principal_id: &str,
+    ) -> Result<PolicyDecisionCommandResult, ApprovalDeliveryCycleError> {
+        if harness_adapter_principal_id.trim().is_empty() {
+            return Err(ApprovalDeliveryCycleError::OwnerIntegrity);
+        }
+        let issued_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ApprovalDeliveryCycleError::OwnerUnavailable)?;
+        let stable_identity = format!(
+            "{}:{}",
+            delivery.envelope.authority_decision_ref, receipt.receipt_id
+        );
+        let mut command = PolicyDecisionCommand {
+            command: Some(
+                policy_decision_command::Command::ConsumeHarnessApprovalDecision(
+                    ConsumeHarnessApprovalDecisionCommand {
+                        metadata: Some(CommandMetadata {
+                            command_id: format!("approval-consume-{stable_identity}"),
+                            idempotency_key: stable_identity,
+                            idempotency_scope: "policy-approval-delivery-consume-v1".to_owned(),
+                            request_digest_sha256: String::new(),
+                            issued_at: Some(prost_types::Timestamp {
+                                seconds: i64::try_from(issued_at.as_secs())
+                                    .map_err(|_| ApprovalDeliveryCycleError::OwnerUnavailable)?,
+                                nanos: i32::try_from(issued_at.subsec_nanos())
+                                    .expect("subsecond nanoseconds fit i32"),
+                            }),
+                            correlation_id: Uuid::now_v7().to_string(),
+                            causation_id: Some(delivery.source_event_id.clone()),
+                        }),
+                        authority_decision_ref: delivery.envelope.authority_decision_ref.clone(),
+                        expected_state_revision: delivery.expected_state_revision,
+                        adapter_receipt: Some(receipt),
+                    },
+                ),
+            ),
+        };
+        let digest = canonical_request_digest(&command);
+        let Some(policy_decision_command::Command::ConsumeHarnessApprovalDecision(consume)) =
+            command.command.as_mut()
+        else {
+            return Err(ApprovalDeliveryCycleError::OwnerIntegrity);
+        };
+        consume
+            .metadata
+            .as_mut()
+            .ok_or(ApprovalDeliveryCycleError::OwnerIntegrity)?
+            .request_digest_sha256 = digest;
+        self.policy
+            .lock()
+            .map_err(|_| ApprovalDeliveryCycleError::OwnerUnavailable)?
+            .execute(
+                &command,
+                &AuthenticatedPolicyPrincipal {
+                    kind: PolicyPrincipalKind::HarnessAdapter,
+                    principal_id: harness_adapter_principal_id.to_owned(),
+                    authenticated: true,
+                },
+            )
+            .map_err(|_| ApprovalDeliveryCycleError::OwnerUnavailable)
+    }
+}
+
 impl VerdictCommandPort for AuthorityCommandPorts {
     fn execute(
         &self,
@@ -407,6 +741,15 @@ impl VerdictCommandPort for AuthorityCommandPorts {
         principal: &CommandPrincipal,
     ) -> Result<CommandPortResult<VerdictCommandResult>, CommandPortFailure> {
         let owner_principal = self.verdict_principal(principal)?;
+        let _cross_authority_guard = if verdict_command_changes_issued_state(command) {
+            Some(
+                self.cross_authority_operation_gate
+                    .lock()
+                    .map_err(|_| CommandPortFailure::IntegrityFailure)?,
+            )
+        } else {
+            None
+        };
         let mut verdict_handle = self
             .verdict
             .lock()
@@ -424,6 +767,19 @@ impl VerdictCommandPort for AuthorityCommandPorts {
             source_revision: None,
             await_target: None,
         })
+    }
+}
+
+fn verdict_command_changes_issued_state(command: &VerdictCommand) -> bool {
+    match command.command.as_ref() {
+        Some(verdict_command::Command::ConsumeFounderVerdict(_))
+        | Some(verdict_command::Command::RevokeFounderVerdict(_))
+        | Some(verdict_command::Command::ExpireFounderVerdict(_)) => true,
+        Some(verdict_command::Command::IssueFounderVerdict(issue)) => issue
+            .supersedes_founder_verdict_id
+            .as_ref()
+            .is_some_and(|verdict_id| !verdict_id.trim().is_empty()),
+        None => false,
     }
 }
 
@@ -563,6 +919,17 @@ fn task_activation_source_error(error: TaskAuthorityFailure) -> TaskActivationSo
         }
         TaskAuthorityFailure::Storage | TaskAuthorityFailure::Clock => {
             TaskActivationSourceError::Unavailable
+        }
+    }
+}
+
+fn task_cancellation_source_error(error: TaskAuthorityFailure) -> TaskCancellationSourceError {
+    match error {
+        TaskAuthorityFailure::Decode(_) | TaskAuthorityFailure::InvalidCrossAuthorityHandoff => {
+            TaskCancellationSourceError::Integrity
+        }
+        TaskAuthorityFailure::Storage | TaskAuthorityFailure::Clock => {
+            TaskCancellationSourceError::Unavailable
         }
     }
 }

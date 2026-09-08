@@ -6,8 +6,9 @@ use egopulse_cognition_runtime::task_authority::{
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::task::v1::{
     ActivateTaskCommand, ApplyFounderVerdictCommand, CreateTaskCommand, FounderDecision,
-    RecordTaskVerificationCommand, ReviseTaskCommand, SubmitTaskEvidenceCommand, TaskCommand,
-    TaskErrorCode, TaskSnapshot, TaskStatus, task_command, task_command_result,
+    RecordTaskVerificationCommand, RequestTaskCancellationCommand, ReviseTaskCommand,
+    SubmitTaskEvidenceCommand, TaskCommand, TaskErrorCode, TaskSnapshot, TaskStatus, task_command,
+    task_command_result,
 };
 use egopulse_domain_contracts::v01::egopulse::verdict::v1::{VerdictCommand, verdict_command};
 use prost::Message;
@@ -165,6 +166,29 @@ fn accept_drives_one_terminal_task_commit_and_durable_verdict_consume_outbox() {
             .expect("task")
             .revision,
         completed.revision
+    );
+
+    // The Task Authority is the single writer: if the terminal verdict wins
+    // the race, a later cancellation cannot claim an interrupt or create a
+    // native handoff.
+    let before_cancel = authority.inspect_store().expect("inspect completed Task");
+    let cancellation = execute(
+        &mut authority,
+        cancellation_command(&completed),
+        principal(PrincipalKind::Founder),
+    );
+    assert_eq!(error_code(cancellation), TaskErrorCode::StateConflict);
+    assert_eq!(
+        authority
+            .inspect_store()
+            .expect("inspect rejected cancellation"),
+        before_cancel
+    );
+    assert!(
+        authority
+            .pending_task_cancellations()
+            .expect("terminal Task has no cancellation handoff")
+            .is_empty()
     );
 }
 
@@ -353,6 +377,7 @@ fn resign(command: &mut TaskCommand) {
         task_command::Command::SubmitTaskEvidence(v) => v.meta.as_mut(),
         task_command::Command::RecordTaskVerification(v) => v.meta.as_mut(),
         task_command::Command::ApplyFounderVerdict(v) => v.meta.as_mut(),
+        task_command::Command::RequestTaskCancellation(v) => v.meta.as_mut(),
         task_command::Command::ReviseTask(v) => v.meta.as_mut(),
         _ => unreachable!(),
     }
@@ -420,6 +445,18 @@ fn apply_command(task: &TaskSnapshot, verdict_id: &str) -> TaskCommand {
                 expected_revision: task.revision,
                 work_revision: task.work_revision,
                 founder_verdict_id: verdict_id.to_owned(),
+            },
+        )),
+    }
+}
+fn cancellation_command(task: &TaskSnapshot) -> TaskCommand {
+    TaskCommand {
+        command: Some(task_command::Command::RequestTaskCancellation(
+            RequestTaskCancellationCommand {
+                meta: Some(meta("cancel-after-complete")),
+                task_id: task.task_id.clone(),
+                expected_revision: task.revision,
+                reason_code: "late-cancel".to_owned(),
             },
         )),
     }

@@ -25,8 +25,9 @@ use egopulse_domain_contracts::v01::egopulse::task::v1::{TaskSnapshot, TaskStatu
 use egopulse_harness_adapter::{
     AdapterClock, AdapterEdge, AdapterEdgeConfig, AdapterEdgeKey, DispatchMaterialResolver,
     DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, GovernedHarnessAdapter,
-    NativeHarnessDriver, NativeHarnessFuture, ReconciliationContext, ReconciliationFinding,
-    ResolvedDispatchMaterial,
+    LegacyExecutionStartRawClassification, LegacyExecutionStartRawContext, NativeHarnessDriver,
+    NativeHarnessFuture, ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
+    TerminalOutputCandidate,
 };
 use egopulse_local_ide_control::collaboration_control::{
     AdapterBackedHarnessEvidenceResolver, ArtifactReturnSource,
@@ -35,14 +36,15 @@ use egopulse_local_ide_control::collaboration_control::{
     CollaborationLineageReaderConfig, CollaborationPrincipalKind, CollaborationReferenceGuard,
     CollaborationSqlCipherKey, CompositeCollaborationGuard, DELIVERY_OUTCOME_UNKNOWN_REASON_CODE,
     DispatchMaterial, GovernedHarnessDispatchRunner, GovernedTaskActivationRunner,
-    HarnessDispatchRunner, HarnessEvidenceResolver, HarnessFactIngestionDisposition,
-    HeldDispatchRecoveryState, LeaseAuthorization, PendingArtifactReturn, ReferenceAuthorization,
-    ReferenceGuardRejection, ResolvedArtifactReturn, ResolvedHarnessEvidence, ResolvedStepReturn,
-    SingleHarnessWorkConfig, SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
+    HarnessDispatchCycleError, HarnessDispatchRunner, HarnessEvidenceResolver,
+    HarnessFactIngestionDisposition, HeldDispatchRecoveryState, LeaseAuthorization,
+    PendingArtifactReturn, ReferenceAuthorization, ReferenceGuardRejection, ResolvedArtifactReturn,
+    ResolvedHarnessEvidence, ResolvedStepReturn, SingleHarnessWorkConfig,
+    SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
     SingleHarnessWorkflowResolverError, TaskActivationGuardSet, TaskActivationHandoff,
     TaskActivationReferenceGuard, TaskActivationSource, TaskActivationSourceError,
-    canonical_dispatch_fingerprint, canonical_request_digest, dispatch_pending, pump_observations,
-    start_single_harness_workflow,
+    TaskRecoveryKind, canonical_dispatch_fingerprint, canonical_request_digest, dispatch_pending,
+    pump_observations, start_single_harness_workflow,
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -106,6 +108,24 @@ struct ScriptedCountingDriver {
     events: VecDeque<DriverEvent>,
     required_consumed: Option<(PathBuf, String, String)>,
     reconciliation_finding: ReconciliationFinding,
+}
+
+struct DelayedCancellationDriver {
+    counts: DriverCallCounts,
+    cancel_count: Arc<AtomicU64>,
+    events: VecDeque<DriverEvent>,
+    defer_interruption_once: bool,
+}
+
+impl DelayedCancellationDriver {
+    fn new(counts: DriverCallCounts, cancel_count: Arc<AtomicU64>) -> Self {
+        Self {
+            counts,
+            cancel_count,
+            events: VecDeque::new(),
+            defer_interruption_once: false,
+        }
+    }
 }
 
 impl ScriptedCountingDriver {
@@ -245,6 +265,111 @@ impl NativeHarnessDriver for ScriptedCountingDriver {
             .push("reconcile".to_owned());
         let finding = self.reconciliation_finding.clone();
         Box::pin(async move { Ok(finding) })
+    }
+
+    fn classify_legacy_execution_start(
+        &self,
+        context: &LegacyExecutionStartRawContext,
+    ) -> LegacyExecutionStartRawClassification {
+        let expected_prior = format!(
+            r#"{{"fixtureEvent":"active","session":"{}"}}"#,
+            context.native_session_ref
+        );
+        let expected_pending = format!(
+            r#"{{"fixtureEvent":"execution-started","session":"{}","execution":"{}"}}"#,
+            context.native_session_ref, context.native_execution_ref
+        );
+        if context.prior_raw_event == expected_prior.as_bytes()
+            && context.pending_raw_event == expected_pending.as_bytes()
+        {
+            LegacyExecutionStartRawClassification::ExactDuplicate {
+                durable_terminal_handoff: context.terminal_raw_event.is_some()
+                    && context.terminal_native_completion_ref.is_some(),
+            }
+        } else {
+            LegacyExecutionStartRawClassification::Conflict
+        }
+    }
+}
+
+impl NativeHarnessDriver for DelayedCancellationDriver {
+    fn probe<'a>(
+        &'a mut self,
+        _request: &'a ProbeHarnessRequest,
+    ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+        Box::pin(async { panic!("probe not expected") })
+    }
+
+    fn send_dispatch<'a>(
+        &'a mut self,
+        envelope: &'a DispatchEnvelope,
+        _material: &'a ResolvedDispatchMaterial,
+    ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+        self.counts.send.fetch_add(1, Ordering::SeqCst);
+        self.events.push_back(scripted_ack_event_for(
+            "resident-cancellation-ack",
+            &envelope.dispatch_id,
+        ));
+        self.events.push_back(scripted_lifecycle_event(
+            "resident-cancellation-running",
+            ObservationCriticality::Control,
+            LifecycleKind::ExecutionStarted,
+        ));
+        let dispatch_id = envelope.dispatch_id.clone();
+        Box::pin(async move {
+            Ok(DriverDelivery {
+                native_request_ref: format!("resident-request:{dispatch_id}"),
+                native_session_ref: format!("scripted-session:{dispatch_id}"),
+                native_execution_ref: Some(format!("scripted-execution:{dispatch_id}")),
+                raw_evidence: format!("resident-delivery:{dispatch_id}").into_bytes(),
+            })
+        })
+    }
+
+    fn next_event<'a>(
+        &'a mut self,
+        _envelope: &'a DispatchEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+        self.counts.next.fetch_add(1, Ordering::SeqCst);
+        if self.defer_interruption_once {
+            self.defer_interruption_once = false;
+            return Box::pin(async { Ok(None) });
+        }
+        let event = self.events.pop_front();
+        Box::pin(async move { Ok(event) })
+    }
+
+    fn decide_approval<'a>(
+        &'a mut self,
+        _envelope: &'a ApprovalDecisionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        Box::pin(async { panic!("approval not expected") })
+    }
+
+    fn cancel<'a>(
+        &'a mut self,
+        _envelope: &'a CancelExecutionEnvelope,
+    ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+        self.cancel_count.fetch_add(1, Ordering::SeqCst);
+        self.defer_interruption_once = true;
+        self.events.push_back(scripted_lifecycle_event(
+            "resident-cancellation-interrupted",
+            ObservationCriticality::Terminal,
+            LifecycleKind::ExecutionInterrupted,
+        ));
+        Box::pin(async { Ok(b"resident-cancel-delivered".to_vec()) })
+    }
+
+    fn reconcile<'a>(
+        &'a mut self,
+        _context: &'a ReconciliationContext,
+    ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+        self.counts.reconcile.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Ok(ReconciliationFinding::OutcomeUnknown {
+                evidence_ref: "fixture://unexpected-reconciliation".to_owned(),
+            })
+        })
     }
 }
 
@@ -455,6 +580,34 @@ impl HarnessEvidenceResolver for FixtureReturnEvidence {
         snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
         self.adapter.validate_reconciliation(command, snapshot)
+    }
+
+    fn resolve_cancellation_return(
+        &self,
+        command: &RecordAttemptCancellationOutcomeCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
+        if command.disposition != AttemptCancellationDisposition::ReturnFound as i32
+            || command.cancellation_receipt_id != "return-receipt-runner-001"
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ResolvedArtifactReturn {
+            artifact_set_id: "artifact-set-runner-001".to_owned(),
+            return_handoff_id: "return-handoff-runner-001".to_owned(),
+            dispatch_id: snapshot
+                .attempts
+                .iter()
+                .find_map(|attempt| attempt.dispatch_id.clone())
+                .ok_or(ReferenceGuardRejection::UnverifiedReference)?,
+            evidence_refs: vec![
+                format!(
+                    "artifact-return-receipt:{}@durable",
+                    command.cancellation_receipt_id
+                ),
+                "adapter-terminal-observation:terminal-return-found-001@durable".to_owned(),
+            ],
+        })
     }
 
     fn resolve_attempt_return(
@@ -1207,6 +1360,27 @@ fn scripted_lifecycle_event(
     )
 }
 
+fn legacy_execution_started_event(native_key: &str, raw_event: Vec<u8>) -> DriverEvent {
+    DriverEvent {
+        native_key: native_key.to_owned(),
+        native_event_id: Some(format!("native:{native_key}")),
+        native_sequence: None,
+        native_observed_at: Timestamp {
+            seconds: FIXED_TIME,
+            nanos: 0,
+        },
+        criticality: ObservationCriticality::Control,
+        payload: harness_observation::Payload::Lifecycle(LifecycleObservation {
+            kind: LifecycleKind::ExecutionStarted as i32,
+            native_item_ref: None,
+            safe_status_code: Some("inProgress".to_owned()),
+            side_effect_certainty: SideEffectCertainty::Unknown as i32,
+            native_will_retry: None,
+        }),
+        raw_event,
+    }
+}
+
 fn adapter_observation(
     envelope: &DispatchEnvelope,
     criticality: ObservationCriticality,
@@ -1287,6 +1461,114 @@ async fn persist_scripted_delivered_dispatch(
         );
     }
     (envelope, observations, bundle)
+}
+
+async fn persist_legacy_running_with_pending_duplicate(
+    label: &str,
+    pending_turn_id: &str,
+) -> (
+    IsolatedStore,
+    IsolatedStore,
+    DispatchEnvelope,
+    Vec<u8>,
+    HarnessObservation,
+) {
+    let collaboration_store = IsolatedStore::new(&format!("{label}-collaboration"));
+    let adapter_store = IsolatedStore::new(&format!("{label}-adapter"));
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let session_ref = "scripted-session:dispatch-001";
+    let (envelope, observations, bundle) = persist_scripted_delivered_dispatch(
+        &collaboration_store.database_path(),
+        &adapter_database,
+        &adapter_store.root,
+        vec![
+            scripted_ack_event("v02-legacy-ack"),
+            legacy_execution_started_event(
+                "v02-legacy-thread-active",
+                format!(r#"{{"fixtureEvent":"active","session":"{session_ref}"}}"#).into_bytes(),
+            ),
+        ],
+        2,
+    )
+    .await;
+    assert_eq!(observations.len(), 2);
+
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+    };
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let initial_counts = DriverCallCounts::default();
+    let mut adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle: bundle.clone(),
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(initial_counts.clone(), Vec::new()),
+        clock.clone(),
+    );
+    let initial = pump_observations(&mut control, &mut adapter, &envelope, &harness_adapter())
+        .await
+        .expect("ingest legacy ACK and first ExecutionStarted");
+    assert_eq!(initial.observations_seen, 2);
+    assert_eq!(initial.observations_consumed, 2);
+    assert_eq!(initial_counts.send.load(Ordering::SeqCst), 0);
+    assert_eq!(initial_counts.next.load(Ordering::SeqCst), 1);
+    assert_eq!(initial_counts.reconcile.load(Ordering::SeqCst), 0);
+    let running = load_snapshot(&control);
+    assert_eq!(running.attempts[0].status, AttemptStatus::Running as i32);
+    assert_eq!(
+        running.attempts[0].last_harness_sequence,
+        observations[1].observation_sequence
+    );
+    drop(control);
+    drop(adapter);
+
+    let mut append_adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle: bundle.clone(),
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(
+            DriverCallCounts::default(),
+            vec![legacy_execution_started_event(
+                "v02-persisted-turn-start",
+                format!(
+                    r#"{{"fixtureEvent":"execution-started","session":"{session_ref}","execution":"{pending_turn_id}"}}"#
+                )
+                .into_bytes(),
+            )],
+        ),
+        clock,
+    );
+    let pending = append_adapter
+        .pump_one(&envelope)
+        .await
+        .expect("persist historical duplicate start")
+        .expect("historical duplicate observation");
+    assert_eq!(
+        pending.observation_sequence,
+        observations[1].observation_sequence + 1
+    );
+    drop(append_adapter);
+
+    (
+        collaboration_store,
+        adapter_store,
+        envelope,
+        bundle,
+        pending,
+    )
 }
 
 fn run_plan() -> RunPlan {
@@ -2070,6 +2352,133 @@ fn advance_through_running(
     )
 }
 
+fn persist_cancellation_pending_terminal_return(
+    collaboration_database: &Path,
+    adapter_database: &Path,
+    message_id: &str,
+) -> (CollaborationSnapshot, PendingArtifactReturn) {
+    let clock = FixedClock::new(FIXED_TIME);
+    let mut control = open_control(collaboration_database, clock);
+    let running = advance_through_running(&mut control);
+    let envelope = control
+        .delivered_dispatches_for_observation(&harness_adapter())
+        .expect("read delivered dispatch")
+        .into_iter()
+        .next()
+        .expect("delivered dispatch")
+        .envelope;
+    let cancellation_pending = committed_snapshot(
+        &control
+            .execute(&cancellation_request(&running), &attempt_supervisor())
+            .expect("request cancellation"),
+    );
+    assert_eq!(
+        cancellation_pending.attempts[0].status,
+        AttemptStatus::CancellationPending as i32
+    );
+    drop(control);
+
+    let run = running.run.as_ref().expect("running run");
+    let mut terminal = unknown_terminal_observation(&running);
+    terminal.observation_id = "terminal-return-found-001".to_owned();
+    terminal.criticality = ObservationCriticality::Terminal as i32;
+    terminal.raw_evidence_ref = "adapter-edge://terminal-return-found-001".to_owned();
+    terminal.payload = Some(harness_observation::Payload::Lifecycle(
+        LifecycleObservation {
+            kind: LifecycleKind::ExecutionCompleted as i32,
+            side_effect_certainty: SideEffectCertainty::Unknown as i32,
+            ..LifecycleObservation::default()
+        },
+    ));
+    let terminal_output = TerminalOutputCandidate {
+        dispatch_id: envelope.dispatch_id.clone(),
+        native_completion_ref: "native-completion:return-found-001".to_owned(),
+        media_type: "text/plain; charset=utf-8".to_owned(),
+        content: b"sealed cancellation return fixture".to_vec(),
+    };
+    let mut edge = open_loop_adapter_edge(adapter_database);
+    edge.prepare_dispatch(&envelope, FIXED_TIME)
+        .expect("prepare terminal return dispatch");
+    edge.begin_delivery(&envelope.dispatch_id, FIXED_TIME)
+        .expect("begin terminal return delivery");
+    edge.bind_dispatch_task_lineage(
+        &envelope.dispatch_id,
+        &run.task_id,
+        run.task_revision_at_creation,
+        run.work_revision,
+        FIXED_TIME,
+    )
+    .expect("bind terminal return task lineage");
+    edge.append_observation_with_terminal_output(
+        &envelope.dispatch_id,
+        "native:terminal:return-found-001",
+        b"terminal-return-found-event",
+        terminal,
+        Some(&terminal_output),
+        FIXED_TIME,
+    )
+    .expect("persist terminal return candidate");
+    let candidate = edge
+        .terminal_output_candidate_for_dispatch(&envelope.dispatch_id)
+        .expect("read terminal return candidate")
+        .expect("terminal return candidate");
+    drop(edge);
+
+    let receipt = ReturnReceipt {
+        receipt_id: "return-receipt-runner-001".to_owned(),
+        artifact_set_id: "artifact-set-runner-001".to_owned(),
+        return_handoff_id: "return-handoff-runner-001".to_owned(),
+        accepted_for_evidence_intake: true,
+        verification_performed: false,
+        task_completion_decided: false,
+        committed_at: Some(Timestamp {
+            seconds: FIXED_TIME,
+            nanos: 0,
+        }),
+        lineage: Some(LineageBinding {
+            task_id: candidate.task_id,
+            task_revision: candidate.task_revision,
+            work_revision: candidate.work_revision,
+            run_id: candidate.run_id,
+            run_revision: candidate.run_revision,
+            step_id: candidate.step_id,
+            step_revision: candidate.step_revision,
+            attempt_id: candidate.attempt_id,
+            attempt_revision: candidate.attempt_revision,
+            dispatch_id: candidate.dispatch_id,
+            fencing_token: candidate.fencing_token,
+        }),
+        ..ReturnReceipt::default()
+    };
+    (
+        cancellation_pending,
+        PendingArtifactReturn {
+            message_id: message_id.to_owned(),
+            payload_digest_sha256: hex::encode(Sha256::digest(receipt.encode_to_vec())),
+            receipt,
+        },
+    )
+}
+
+fn dormant_return_workflow_config() -> SingleHarnessWorkConfig {
+    SingleHarnessWorkConfig {
+        run_id: "run-dormant-return-001".to_owned(),
+        attempt_id: "attempt-dormant-return-001".to_owned(),
+        dispatch_id: "dispatch-dormant-return-001".to_owned(),
+        plan: run_plan(),
+        harness_id: "codex".to_owned(),
+        capability_profile_ref: contract_ref("single-harness-capability", '3'),
+        workspace_ref: "workspace-001".to_owned(),
+        lease_policy_ref: contract_ref("v01-attempt-lease", 'a'),
+        owner_instance_id: "attempt-supervisor:test".to_owned(),
+        material: dispatch_material(),
+        task_authority_principal_id: "task-authority:test".to_owned(),
+        collaboration_principal_id: "collaboration-control:test".to_owned(),
+        attempt_supervisor_principal_id: "attempt-supervisor:test".to_owned(),
+        harness_adapter_principal_id: "adapter:codex".to_owned(),
+    }
+}
+
 fn advance_unique_run_through_delivery(
     control: &mut CollaborationControl<FixtureGuard, FixedClock>,
     run_id: &str,
@@ -2484,6 +2893,178 @@ fn single_harness_workflow_builds_run_attempt_lease_and_dispatch_outbox() {
 }
 
 #[test]
+fn single_harness_workflow_isolates_command_identity_across_runs_and_replays_exact_request() {
+    let collaboration_store = IsolatedStore::new("collaboration-two-single-harness-workflows");
+    let adapter_store = IsolatedStore::new("collaboration-two-single-harness-workflows-edge");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: "5".repeat(64),
+    };
+    let mut control = open_control_with_guard(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+        guard,
+    );
+    let first_task = TaskSnapshot {
+        task_id: "task-001".to_owned(),
+        revision: 2,
+        work_revision: 1,
+        ..Default::default()
+    };
+    let first_config = SingleHarnessWorkConfig {
+        run_id: "run-command-identity-001".to_owned(),
+        attempt_id: "attempt-command-identity-001".to_owned(),
+        dispatch_id: "dispatch-command-identity-001".to_owned(),
+        plan: run_plan(),
+        harness_id: "codex".to_owned(),
+        capability_profile_ref: contract_ref("single-harness-capability", '3'),
+        workspace_ref: "workspace-001".to_owned(),
+        lease_policy_ref: contract_ref("v01-attempt-lease", 'a'),
+        owner_instance_id: "attempt-supervisor-001".to_owned(),
+        material: dispatch_material(),
+        task_authority_principal_id: "task-authority:command-identity".to_owned(),
+        collaboration_principal_id: "collaboration-control:command-identity".to_owned(),
+        attempt_supervisor_principal_id: "attempt-supervisor:command-identity".to_owned(),
+        harness_adapter_principal_id: "adapter:codex".to_owned(),
+    };
+
+    let first = start_single_harness_workflow(&mut control, &first_task, &first_config)
+        .expect("start first governed single harness workflow");
+    let after_first = control.inspect_store().expect("inspect first workflow");
+    let replay = start_single_harness_workflow(&mut control, &first_task, &first_config)
+        .expect("replay exact first workflow request");
+    assert_eq!(replay, first);
+    assert_eq!(
+        control.inspect_store().expect("inspect exact replay"),
+        after_first,
+        "an exact workflow replay must not append authority facts or outbox work"
+    );
+
+    let second_task = first_task.clone();
+    let mut second_config = first_config.clone();
+    second_config.run_id = "run-command-identity-002".to_owned();
+    second_config.attempt_id = "attempt-command-identity-002".to_owned();
+    second_config.dispatch_id = "dispatch-command-identity-002".to_owned();
+    second_config.plan.plan_id = "plan-command-identity-002".to_owned();
+    second_config.plan.steps[0].step_id = "step-command-identity-002".to_owned();
+
+    let second = start_single_harness_workflow(&mut control, &second_task, &second_config)
+        .expect("start second governed workflow in the same Collaboration store");
+    assert_eq!(second.run_id, second_config.run_id);
+    let counts = control.inspect_store().expect("inspect two workflows");
+    assert_eq!(counts.run_count, 2);
+    assert_eq!(counts.step_count, 2);
+    assert_eq!(counts.attempt_count, 2);
+    assert_eq!(counts.event_count, 10);
+    assert_eq!(counts.idempotency_count, 10);
+    assert_eq!(counts.outbox_count, 12);
+    assert_eq!(counts.pending_dispatch_count, 2);
+    assert_eq!(counts.commit_receipt_count, 10);
+}
+
+#[test]
+fn single_harness_workflow_restarts_from_legacy_partial_commit_without_duplicate_facts() {
+    let collaboration_store = IsolatedStore::new("collaboration-legacy-workflow-restart");
+    let adapter_store = IsolatedStore::new("collaboration-legacy-workflow-restart-edge");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let database_path = collaboration_store.database_path();
+    let task = TaskSnapshot {
+        task_id: "task-001".to_owned(),
+        revision: 2,
+        work_revision: 1,
+        ..Default::default()
+    };
+    let config = SingleHarnessWorkConfig {
+        run_id: "run-legacy-restart-001".to_owned(),
+        attempt_id: "attempt-legacy-restart-001".to_owned(),
+        dispatch_id: "dispatch-legacy-restart-001".to_owned(),
+        plan: run_plan(),
+        harness_id: "codex".to_owned(),
+        capability_profile_ref: contract_ref("single-harness-capability", '3'),
+        workspace_ref: "workspace-001".to_owned(),
+        lease_policy_ref: contract_ref("v01-attempt-lease", 'a'),
+        owner_instance_id: "attempt-supervisor-001".to_owned(),
+        material: dispatch_material(),
+        task_authority_principal_id: "task-authority:legacy-restart".to_owned(),
+        collaboration_principal_id: "collaboration-control:legacy-restart".to_owned(),
+        attempt_supervisor_principal_id: "attempt-supervisor:legacy-restart".to_owned(),
+        harness_adapter_principal_id: "adapter:codex".to_owned(),
+    };
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: "5".repeat(64),
+    };
+    let mut control = open_control_with_guard(&database_path, FixedClock::new(FIXED_TIME), guard);
+    let mut legacy_create = CollaborationCommand {
+        command: Some(collaboration_command::Command::CreateRun(
+            CreateRunCommand {
+                meta: Some(metadata(
+                    "egopulse-create-run",
+                    "egopulse-create-run",
+                    &config.run_id,
+                )),
+                run_id: config.run_id.clone(),
+                task_id: task.task_id.clone(),
+                task_revision: task.revision,
+                work_revision: task.work_revision,
+                plan: Some(config.plan.clone()),
+            },
+        )),
+    };
+    set_digest(&mut legacy_create);
+    control
+        .execute(
+            &legacy_create,
+            &AuthenticatedCollaborationPrincipal {
+                kind: CollaborationPrincipalKind::TaskAuthority,
+                principal_id: config.task_authority_principal_id.clone(),
+                authenticated: true,
+            },
+        )
+        .expect("commit legacy create-run prefix before restart");
+    let partial = control.inspect_store().expect("inspect legacy prefix");
+    assert_eq!(partial.run_count, 1);
+    assert_eq!(partial.event_count, 1);
+    assert_eq!(partial.idempotency_count, 1);
+    assert_eq!(partial.commit_receipt_count, 1);
+    drop(control);
+
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: "5".repeat(64),
+    };
+    let mut reopened =
+        open_control_with_guard(&database_path, FixedClock::new(FIXED_TIME + 1), guard);
+    let result = start_single_harness_workflow(&mut reopened, &task, &config)
+        .expect("replay legacy prefix and finish workflow after restart");
+    assert_eq!(result.run_id, config.run_id);
+    assert_eq!(result.dispatch_id, config.dispatch_id);
+    let completed = reopened
+        .inspect_store()
+        .expect("inspect recovered workflow");
+    assert_eq!(completed.run_count, 1);
+    assert_eq!(completed.step_count, 1);
+    assert_eq!(completed.attempt_count, 1);
+    assert_eq!(completed.event_count, 5);
+    assert_eq!(completed.idempotency_count, 5);
+    assert_eq!(completed.outbox_count, 6);
+    assert_eq!(completed.pending_dispatch_count, 1);
+    assert_eq!(completed.commit_receipt_count, 5);
+
+    let replay = start_single_harness_workflow(&mut reopened, &task, &config)
+        .expect("replay recovered workflow exactly");
+    assert_eq!(replay, result);
+    assert_eq!(
+        reopened
+            .inspect_store()
+            .expect("inspect recovered workflow replay"),
+        completed,
+        "restart recovery and later exact replay must not append duplicate facts"
+    );
+}
+
+#[test]
 fn single_harness_workflow_accepts_only_task_activation_guard_evidence() {
     let collaboration_store = IsolatedStore::new("collaboration-task-activation-guard");
     let adapter_store = IsolatedStore::new("collaboration-task-activation-guard-edge");
@@ -2603,7 +3184,7 @@ async fn task_activation_runner_leaves_other_routes_pending_and_dispatches_its_m
         codex_protocol_fingerprint(),
         open_loop_adapter_edge(&adapter_database),
         LoopMaterialResolver {
-            bundle,
+            bundle: bundle.clone(),
             workspace_root: adapter_store.root.clone(),
         },
         FakeCodexDriver::default().with_deferred_terminal(),
@@ -3017,6 +3598,265 @@ async fn task_activation_runner_retries_verification_gated_return_before_ack() {
 }
 
 #[tokio::test]
+async fn cancellation_return_found_preserves_return_binding_across_replay_and_reopen() {
+    let collaboration_store = IsolatedStore::new("cancellation-return-found-collaboration");
+    let adapter_store = IsolatedStore::new("cancellation-return-found-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let (_, pending_return) = persist_cancellation_pending_terminal_return(
+        &collaboration_store.database_path(),
+        &adapter_database,
+        "artifact-outbox-cancellation-return-001",
+    );
+    let artifact_source = Arc::new(FixtureArtifactReturnSource {
+        pending: Mutex::new(vec![pending_return]),
+        acknowledged: Mutex::new(Vec::new()),
+    });
+    let build_runner = || {
+        let (guard, binding) = TaskActivationGuardSet::new(FixtureReturnEvidence {
+            adapter: AdapterBackedHarnessEvidenceResolver::new(open_loop_adapter_edge(
+                &adapter_database,
+            )),
+            verification_available: Arc::new(Mutex::new(false)),
+        });
+        let clock = FixedClock::new(FIXED_TIME);
+        let control =
+            open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+        let adapter = GovernedHarnessAdapter::new(
+            "adapter:codex",
+            "single-harness-capability",
+            codex_protocol_fingerprint(),
+            open_loop_adapter_edge(&adapter_database),
+            LoopMaterialResolver {
+                bundle: Vec::new(),
+                workspace_root: adapter_store.root.clone(),
+            },
+            FakeCodexDriver::default().with_deferred_terminal(),
+            clock,
+        );
+        GovernedTaskActivationRunner::new(
+            control,
+            adapter,
+            Arc::new(FixtureActivationSource {
+                pending: Mutex::new(Vec::new()),
+                acknowledged: Mutex::new(Vec::new()),
+            }),
+            FixtureWorkflowResolver(dormant_return_workflow_config()),
+            harness_adapter(),
+            binding,
+            30,
+        )
+        .with_artifact_return_source(
+            Arc::clone(&artifact_source) as Arc<dyn ArtifactReturnSource>,
+            artifact_authority(),
+        )
+        .with_capability_profile_ref(contract_ref("single-harness-capability", '3'))
+    };
+
+    let runner = build_runner();
+    let first = runner
+        .run_once()
+        .await
+        .expect("consume sealed cancellation return receipt");
+    assert_eq!(first.task_recovery_findings.len(), 1);
+    assert_eq!(
+        first.task_recovery_findings[0].kind,
+        TaskRecoveryKind::CancellationReturnFound
+    );
+    assert_eq!(first.task_recovery_findings[0].task_id, "task-001");
+    assert_eq!(first.task_recovery_findings[0].run_id, "run-001");
+    assert_eq!(
+        first.task_recovery_findings[0].evidence_ref,
+        "return-receipt-runner-001"
+    );
+    assert_eq!(
+        artifact_source
+            .acknowledged
+            .lock()
+            .expect("return acknowledgement mutex")
+            .as_slice(),
+        ["artifact-outbox-cancellation-return-001"]
+    );
+    assert!(
+        artifact_source
+            .pending
+            .lock()
+            .expect("return source mutex")
+            .is_empty(),
+        "persistent recovery must start after the Artifact outbox entry is acknowledged"
+    );
+
+    let after_first = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    );
+    let returned = load_snapshot(&after_first);
+    assert_eq!(
+        returned.run.as_ref().expect("returned run").status,
+        RunStatus::ReturnPending as i32
+    );
+    assert_eq!(returned.steps[0].status, StepStatus::ReturnPending as i32);
+    assert_eq!(
+        returned.steps[0].artifact_set_id.as_deref(),
+        Some("artifact-set-runner-001")
+    );
+    assert_eq!(
+        returned.steps[0].return_handoff_id.as_deref(),
+        Some("return-handoff-runner-001")
+    );
+    assert_eq!(returned.attempts[0].status, AttemptStatus::Returned as i32);
+    let committed_counts = after_first
+        .inspect_store()
+        .expect("inspect committed cancellation return");
+    drop(after_first);
+
+    let repeated = runner
+        .run_once()
+        .await
+        .expect("rebuild cancellation return finding without pending receipt");
+    assert_eq!(
+        repeated.task_recovery_findings[0].kind,
+        TaskRecoveryKind::CancellationReturnFound
+    );
+    assert_eq!(
+        open_control(
+            &collaboration_store.database_path(),
+            FixedClock::new(FIXED_TIME),
+        )
+        .inspect_store()
+        .expect("inspect repeated cancellation return"),
+        committed_counts,
+        "persistent finding replay must not append a second technical return event"
+    );
+    drop(runner);
+
+    let reopened = build_runner();
+    let replayed_after_reopen = reopened
+        .run_once()
+        .await
+        .expect("rebuild cancellation return finding after reopen");
+    assert_eq!(
+        replayed_after_reopen.task_recovery_findings[0].kind,
+        TaskRecoveryKind::CancellationReturnFound
+    );
+    assert_eq!(
+        open_control(
+            &collaboration_store.database_path(),
+            FixedClock::new(FIXED_TIME),
+        )
+        .inspect_store()
+        .expect("inspect reopened cancellation return"),
+        committed_counts,
+        "reopen replay must not append a second technical return event"
+    );
+    assert_eq!(
+        artifact_source
+            .acknowledged
+            .lock()
+            .expect("return acknowledgement mutex")
+            .as_slice(),
+        ["artifact-outbox-cancellation-return-001"],
+        "persistent replay must not acknowledge or require a second Artifact outbox entry"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_return_guard_rejection_preserves_snapshot_and_store() {
+    let collaboration_store = IsolatedStore::new("cancellation-return-rejected-collaboration");
+    let adapter_store = IsolatedStore::new("cancellation-return-rejected-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let (before_snapshot, mut pending_return) = persist_cancellation_pending_terminal_return(
+        &collaboration_store.database_path(),
+        &adapter_database,
+        "artifact-outbox-cancellation-return-rejected",
+    );
+    pending_return.receipt.receipt_id = "return-receipt-unverified".to_owned();
+    pending_return.payload_digest_sha256 =
+        hex::encode(Sha256::digest(pending_return.receipt.encode_to_vec()));
+    let artifact_source = Arc::new(FixtureArtifactReturnSource {
+        pending: Mutex::new(vec![pending_return]),
+        acknowledged: Mutex::new(Vec::new()),
+    });
+    let before_counts = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    )
+    .inspect_store()
+    .expect("inspect before rejected cancellation return");
+
+    let (guard, binding) = TaskActivationGuardSet::new(FixtureReturnEvidence {
+        adapter: AdapterBackedHarnessEvidenceResolver::new(open_loop_adapter_edge(
+            &adapter_database,
+        )),
+        verification_available: Arc::new(Mutex::new(false)),
+    });
+    let clock = FixedClock::new(FIXED_TIME);
+    let control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle: Vec::new(),
+            workspace_root: adapter_store.root.clone(),
+        },
+        FakeCodexDriver::default().with_deferred_terminal(),
+        clock,
+    );
+    let runner = GovernedTaskActivationRunner::new(
+        control,
+        adapter,
+        Arc::new(FixtureActivationSource {
+            pending: Mutex::new(Vec::new()),
+            acknowledged: Mutex::new(Vec::new()),
+        }),
+        FixtureWorkflowResolver(dormant_return_workflow_config()),
+        harness_adapter(),
+        binding,
+        30,
+    )
+    .with_artifact_return_source(
+        Arc::clone(&artifact_source) as Arc<dyn ArtifactReturnSource>,
+        artifact_authority(),
+    );
+
+    let rejected = runner
+        .run_once()
+        .await
+        .expect_err("unverified cancellation return must fail closed");
+    assert!(
+        matches!(
+            rejected,
+            HarnessDispatchCycleError::ReturnCollector(ref detail)
+                if detail.contains("Collaboration rejected Artifact return")
+        ),
+        "unexpected rejection: {rejected:?}"
+    );
+    assert!(
+        artifact_source
+            .acknowledged
+            .lock()
+            .expect("return acknowledgement mutex")
+            .is_empty()
+    );
+    drop(runner);
+
+    let reopened = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    );
+    assert_eq!(load_snapshot(&reopened), before_snapshot);
+    assert_eq!(
+        reopened
+            .inspect_store()
+            .expect("inspect after rejected cancellation return"),
+        before_counts,
+        "guard rejection must perform zero Collaboration writes"
+    );
+}
+
+#[tokio::test]
 async fn c2b_generic_restart_drains_durable_ack_before_native_poll_without_resend() {
     let collaboration_store = IsolatedStore::new("c2b-generic-restart-collaboration");
     let adapter_store = IsolatedStore::new("c2b-generic-restart-adapter");
@@ -3086,6 +3926,246 @@ async fn c2b_generic_restart_drains_durable_ack_before_native_poll_without_resen
         .normal_observation_recovery_view(&envelope.dispatch_id, "single-harness-capability")
         .expect("reopen consumed ACK view");
     assert!(view.pending.is_empty());
+}
+
+#[tokio::test]
+async fn v02_restart_holds_then_consumes_exact_legacy_execution_start_without_resend() {
+    let (collaboration_store, adapter_store, envelope, bundle, duplicate) =
+        persist_legacy_running_with_pending_duplicate(
+            "v02-exact-duplicate",
+            "scripted-execution:dispatch-001",
+        )
+        .await;
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let before = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    )
+    .inspect_store()
+    .expect("inspect legacy recovery baseline");
+
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+    };
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let counts = DriverCallCounts::default();
+    let mut adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle: bundle.clone(),
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(counts.clone(), Vec::new()),
+        clock,
+    );
+    let recovered = pump_observations(&mut control, &mut adapter, &envelope, &harness_adapter())
+        .await
+        .expect("recover exact historical duplicate");
+    assert_eq!(recovered.observations_seen, 1);
+    assert_eq!(recovered.observations_consumed, 1);
+    assert_eq!(recovered.observations_quarantined, 0);
+    assert_eq!(
+        recovered.held_dispatch_ids,
+        vec![envelope.dispatch_id.clone()]
+    );
+    assert_eq!(counts.send.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.next.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.reconcile.load(Ordering::SeqCst), 0);
+
+    let held = load_snapshot(&control);
+    assert_eq!(
+        held.run.as_ref().expect("held run").status,
+        RunStatus::Held as i32
+    );
+    assert_eq!(held.steps[0].status, StepStatus::Held as i32);
+    assert_eq!(
+        held.attempts[0].status,
+        AttemptStatus::OutcomeUnknown as i32
+    );
+    assert_eq!(
+        held.attempts[0].hold_reason_code.as_deref(),
+        Some("LEGACY_DUPLICATE_EXECUTION_START_OUTCOME_UNKNOWN")
+    );
+    assert_eq!(
+        held.attempts[0].last_harness_sequence,
+        duplicate.observation_sequence - 1,
+        "duplicate start must not create a second RunningObserved fact"
+    );
+    let after = control
+        .inspect_store()
+        .expect("inspect committed legacy recovery hold");
+    assert_eq!(after.event_count, before.event_count + 1);
+    assert_eq!(after.idempotency_count, before.idempotency_count + 1);
+    assert_eq!(after.outbox_count, before.outbox_count + 1);
+    let edge_after = open_loop_adapter_edge(&adapter_database)
+        .inspect()
+        .expect("inspect consumed legacy duplicate");
+    assert_eq!(edge_after.observation_count, 3);
+    assert_eq!(edge_after.pending_observation_count, 0);
+    assert_eq!(edge_after.quarantine_count, 0);
+    drop(control);
+    drop(adapter);
+
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+    };
+    let mut reopened =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let replay_counts = DriverCallCounts::default();
+    let mut replay_adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(replay_counts.clone(), Vec::new()),
+        clock,
+    );
+    let replay = pump_observations(
+        &mut reopened,
+        &mut replay_adapter,
+        &envelope,
+        &harness_adapter(),
+    )
+    .await
+    .expect("reopen settled historical duplicate");
+    assert_eq!(replay.observations_seen, 0);
+    assert_eq!(replay_counts.send.load(Ordering::SeqCst), 0);
+    assert_eq!(replay_counts.next.load(Ordering::SeqCst), 0);
+    assert_eq!(replay_counts.reconcile.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        reopened.inspect_store().expect("inspect recovery replay"),
+        after
+    );
+}
+
+#[tokio::test]
+async fn v02_conflicting_turn_holds_and_quarantines_without_resend() {
+    let (collaboration_store, adapter_store, envelope, bundle, _) =
+        persist_legacy_running_with_pending_duplicate("v02-turn-conflict", "different-turn").await;
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+    };
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let counts = DriverCallCounts::default();
+    let mut adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(counts.clone(), Vec::new()),
+        clock,
+    );
+    let recovered = pump_observations(&mut control, &mut adapter, &envelope, &harness_adapter())
+        .await
+        .expect("hold conflicting historical start");
+    assert_eq!(recovered.observations_seen, 1);
+    assert_eq!(recovered.observations_consumed, 0);
+    assert_eq!(recovered.observations_quarantined, 1);
+    assert_eq!(
+        recovered.held_dispatch_ids,
+        vec![envelope.dispatch_id.clone()]
+    );
+    assert_eq!(counts.send.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.next.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.reconcile.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        load_snapshot(&control).attempts[0].status,
+        AttemptStatus::OutcomeUnknown as i32
+    );
+    let edge = open_loop_adapter_edge(&adapter_database)
+        .inspect()
+        .expect("inspect quarantined legacy conflict");
+    assert_eq!(edge.pending_observation_count, 0);
+    assert_eq!(edge.quarantine_count, 1);
+    let reason: String = open_raw_adapter_store(&adapter_database)
+        .query_row(
+            "SELECT reason_code FROM adapter_quarantine ORDER BY created_at_seconds DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read safe legacy conflict reason");
+    assert_eq!(reason, "LEGACY_EXECUTION_START_RAW_IDENTITY_CONFLICT");
+}
+
+#[tokio::test]
+async fn v02_non_running_owner_quarantines_without_holding_current_state() {
+    let (collaboration_store, adapter_store, envelope, bundle, _) =
+        persist_legacy_running_with_pending_duplicate(
+            "v02-owner-mismatch",
+            "scripted-execution:dispatch-001",
+        )
+        .await;
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: hex::encode(Sha256::digest(&bundle)),
+    };
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let cancellation_pending = committed_snapshot(
+        &control
+            .execute(
+                &cancellation_request(&load_snapshot(&control)),
+                &attempt_supervisor(),
+            )
+            .expect("move current attempt beyond Running before stale replay"),
+    );
+    let before = control
+        .inspect_store()
+        .expect("inspect current cancellation state");
+    let counts = DriverCallCounts::default();
+    let mut adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(counts.clone(), Vec::new()),
+        clock,
+    );
+    let recovered = pump_observations(&mut control, &mut adapter, &envelope, &harness_adapter())
+        .await
+        .expect("quarantine start owned by non-running state");
+    assert_eq!(recovered.observations_seen, 1);
+    assert_eq!(recovered.observations_quarantined, 1);
+    assert!(recovered.held_dispatch_ids.is_empty());
+    assert_eq!(counts.send.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.next.load(Ordering::SeqCst), 0);
+    assert_eq!(counts.reconcile.load(Ordering::SeqCst), 0);
+    assert_eq!(load_snapshot(&control), cancellation_pending);
+    assert_eq!(
+        control.inspect_store().expect("inspect owner mismatch"),
+        before
+    );
+    let edge = open_loop_adapter_edge(&adapter_database)
+        .inspect()
+        .expect("inspect owner mismatch quarantine");
+    assert_eq!(edge.pending_observation_count, 0);
+    assert_eq!(edge.quarantine_count, 1);
 }
 
 #[tokio::test]
@@ -3501,6 +4581,124 @@ async fn fake_adapter_consumes_collaboration_outbox_and_settles_durable_candidat
 }
 
 #[tokio::test]
+async fn resident_cancellation_stream_drains_late_interruption_without_resend() {
+    let collaboration_store = IsolatedStore::new("resident-cancellation-collaboration");
+    let adapter_store = IsolatedStore::new("resident-cancellation-adapter");
+    let adapter_database = adapter_store.root.join("adapter-edge.sqlcipher");
+    let bundle = br#"{"input":"resident-cancellation"}"#.to_vec();
+    let bundle_sha256 = hex::encode(Sha256::digest(&bundle));
+    let clock = FixedClock::new(FIXED_TIME);
+    let guard = AdapterBackedFixtureGuard {
+        edge: open_loop_adapter_edge(&adapter_database),
+        input_bundle_sha256: bundle_sha256.clone(),
+    };
+    let mut control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let leased = advance_through_lease(&mut control);
+    let dispatch = dispatch_command_with_bundle(&leased, &bundle_sha256);
+    control
+        .execute(&dispatch, &attempt_supervisor())
+        .expect("commit resident cancellation dispatch intent");
+    let envelope = control
+        .pending_dispatches(&harness_adapter())
+        .expect("read resident cancellation dispatch")
+        .into_iter()
+        .next()
+        .expect("resident cancellation dispatch")
+        .envelope;
+    let counts = DriverCallCounts::default();
+    let cancel_count = Arc::new(AtomicU64::new(0));
+    let mut adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        DelayedCancellationDriver::new(counts.clone(), Arc::clone(&cancel_count)),
+        clock.clone(),
+    );
+
+    let sent = dispatch_pending(&mut control, &mut adapter, &harness_adapter())
+        .await
+        .expect("send resident cancellation dispatch");
+    assert_eq!(sent.dispatches_delivered, 1);
+    let started = pump_observations(&mut control, &mut adapter, &envelope, &harness_adapter())
+        .await
+        .expect("consume resident ACK and Running");
+    assert_eq!(started.observations_seen, 2);
+    assert_eq!(started.observations_consumed, 2);
+    let running = load_snapshot(&control);
+    assert_eq!(running.attempts[0].status, AttemptStatus::Running as i32);
+
+    let cancellation_pending = committed_snapshot(
+        &control
+            .execute(&cancellation_request(&running), &attempt_supervisor())
+            .expect("commit resident cancellation request"),
+    );
+    assert_eq!(
+        cancellation_pending.attempts[0].status,
+        AttemptStatus::CancellationPending as i32
+    );
+    adapter
+        .cancel_dispatch(
+            "task-cancel-001",
+            &envelope.dispatch_id,
+            Timestamp {
+                seconds: FIXED_TIME + 30,
+                nanos: 0,
+            },
+        )
+        .await
+        .expect("deliver resident native cancellation");
+    assert_eq!(counts.send.load(Ordering::SeqCst), 1);
+    assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+
+    let runner = GovernedHarnessDispatchRunner::new(control, adapter, harness_adapter());
+    let idle = runner
+        .run_once()
+        .await
+        .expect("resident stream may remain idle after cancel acknowledgement");
+    assert_eq!(idle.observations_seen, 0);
+    assert_eq!(counts.send.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.reconcile.load(Ordering::SeqCst), 0);
+    let still_pending = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    );
+    assert_eq!(
+        load_snapshot(&still_pending).attempts[0].status,
+        AttemptStatus::CancellationPending as i32
+    );
+    drop(still_pending);
+
+    let interrupted = runner
+        .run_once()
+        .await
+        .expect("drain late resident interruption");
+    assert_eq!(interrupted.observations_seen, 1);
+    assert_eq!(interrupted.observations_consumed, 1);
+    assert_eq!(counts.send.load(Ordering::SeqCst), 1);
+    assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+    assert_eq!(counts.reconcile.load(Ordering::SeqCst), 0);
+    drop(runner);
+
+    let settled = open_control(
+        &collaboration_store.database_path(),
+        FixedClock::new(FIXED_TIME),
+    );
+    let snapshot = load_snapshot(&settled);
+    assert_eq!(
+        snapshot.run.as_ref().expect("cancelled run").status,
+        RunStatus::Cancelled as i32
+    );
+    assert_eq!(snapshot.steps[0].status, StepStatus::Cancelled as i32);
+    assert_eq!(snapshot.attempts[0].status, AttemptStatus::Cancelled as i32);
+}
+
+#[tokio::test]
 async fn c2b_cancellation_held_is_drain_only_and_interruption_disappears_after_settlement() {
     let collaboration_store = IsolatedStore::new("c2b-cancellation-collaboration");
     let adapter_store = IsolatedStore::new("c2b-cancellation-adapter");
@@ -3620,7 +4818,7 @@ async fn c2b_cancellation_held_is_drain_only_and_interruption_disappears_after_s
         codex_protocol_fingerprint(),
         open_loop_adapter_edge(&adapter_database),
         LoopMaterialResolver {
-            bundle,
+            bundle: bundle.clone(),
             workspace_root: adapter_store.root.clone(),
         },
         ScriptedCountingDriver::new(drain_counts.clone(), Vec::new()),
@@ -3651,6 +4849,54 @@ async fn c2b_cancellation_held_is_drain_only_and_interruption_disappears_after_s
             .expect("cancellation candidate disappeared")
             .is_empty()
     );
+    drop(control);
+
+    let (guard, binding) = TaskActivationGuardSet::new(AdapterBackedHarnessEvidenceResolver::new(
+        open_loop_adapter_edge(&adapter_database),
+    ));
+    let clock = FixedClock::new(FIXED_TIME);
+    let control =
+        open_control_with_guard(&collaboration_store.database_path(), clock.clone(), guard);
+    let reopen_counts = DriverCallCounts::default();
+    let adapter = GovernedHarnessAdapter::new(
+        "adapter:codex",
+        "single-harness-capability",
+        codex_protocol_fingerprint(),
+        open_loop_adapter_edge(&adapter_database),
+        LoopMaterialResolver {
+            bundle,
+            workspace_root: adapter_store.root.clone(),
+        },
+        ScriptedCountingDriver::new(reopen_counts.clone(), Vec::new()),
+        clock,
+    );
+    let reopened = GovernedTaskActivationRunner::new(
+        control,
+        adapter,
+        Arc::new(FixtureActivationSource {
+            pending: Mutex::new(Vec::new()),
+            acknowledged: Mutex::new(Vec::new()),
+        }),
+        FixtureWorkflowResolver(dormant_return_workflow_config()),
+        harness_adapter(),
+        binding,
+        30,
+    )
+    .with_capability_profile_ref(contract_ref("single-harness-capability", '3'));
+    let recovered = reopened
+        .run_once()
+        .await
+        .expect("rebuild committed cancellation after runner reopen");
+    assert_eq!(recovered.task_recovery_findings.len(), 1);
+    assert_eq!(
+        recovered.task_recovery_findings[0].kind,
+        TaskRecoveryKind::CancellationConfirmed
+    );
+    assert_eq!(recovered.task_recovery_findings[0].task_id, "task-001");
+    assert_eq!(recovered.task_recovery_findings[0].run_id, "run-001");
+    assert_eq!(reopen_counts.send.load(Ordering::SeqCst), 0);
+    assert_eq!(reopen_counts.next.load(Ordering::SeqCst), 0);
+    assert_eq!(reopen_counts.reconcile.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -3915,7 +5161,7 @@ async fn durable_adapter_reconciliation_evidence_recovers_outcome_unknown_author
 }
 
 fn unknown_dispatch_receipt(envelope: &DispatchEnvelope, receipt_id: &str) -> DispatchReceipt {
-    DispatchReceipt {
+    let mut receipt = DispatchReceipt {
         receipt_id: receipt_id.to_owned(),
         disposition: DeliveryDisposition::Unknown as i32,
         attempt_id: envelope.attempt_id.clone(),
@@ -3924,14 +5170,16 @@ fn unknown_dispatch_receipt(envelope: &DispatchEnvelope, receipt_id: &str) -> Di
         adapter_id: "adapter:codex".to_owned(),
         capability_profile_id: "single-harness-capability".to_owned(),
         observed_protocol: Some(codex_protocol_fingerprint()),
-        receipt_digest_sha256: "9".repeat(64),
+        receipt_digest_sha256: String::new(),
         evidence_ref: "fixture://delivery-unknown".to_owned(),
         delivered_at: Some(Timestamp {
             seconds: FIXED_TIME,
             nanos: 0,
         }),
         ..Default::default()
-    }
+    };
+    receipt.receipt_digest_sha256 = hex::encode(Sha256::digest(receipt.encode_to_vec()));
+    receipt
 }
 
 async fn assert_runner_recovers_held_dispatch(

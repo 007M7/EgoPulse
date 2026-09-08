@@ -71,7 +71,7 @@
     "authorization_policy_ref": {
       "contract_id": "egopulse.authorization.v1",
       "version": "0.1.0",
-      "sha256": "948c2abb84cf7249dcff23213772cbc7aa136630a3b254aa592f8099223e58d2"
+      "sha256": "67ee9e1ca23def452b963e68584c0f6394586b033da4fd2e5e74318adfbd7e46"
     },
     "task_kind": "Founder",
     "policy_kind": "LocalUser",
@@ -176,7 +176,7 @@
     "authorization_policy_ref": {
       "contract_id": "egopulse.authorization.v1",
       "version": "0.1.0",
-      "sha256": "948c2abb84cf7249dcff23213772cbc7aa136630a3b254aa592f8099223e58d2"
+      "sha256": "67ee9e1ca23def452b963e68584c0f6394586b033da4fd2e5e74318adfbd7e46"
     },
     "allowed_scope_refs": ["adapter-edge://codex/approval/scope"],
     "decision_ttl_seconds": 300
@@ -190,7 +190,8 @@
       "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
     },
     "allowed_confirmation_proof_refs": ["confirmation://replace-me"],
-    "non_overridable_gate_ids": ["G0", "G1", "G2", "G3"],
+    "non_overridable_gate_ids": [],
+    "non_overridable_criterion_ids": ["scope"],
     "confirmation_ttl_seconds": 300
   },
   "provider_profiles": [

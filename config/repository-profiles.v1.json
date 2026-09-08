@@ -1,0 +1,96 @@
+{
+  "repository_change_acceptance": {
+    "version": "v1",
+    "claim": "The sealed repository change satisfies its frozen per-Task acceptance contract.",
+    "criteria": ["scope", "tests", "review"],
+    "exclusions": ["general code correctness", "release approval", "automatic Founder acceptance"],
+    "model_review": "Findings may identify discrepancies; zero findings leave the review unverified."
+  },
+  "repository_material": {
+    "version": "v1",
+    "content": ["frozen baseline and acceptance contract", "initial manifest", "patch", "final manifest", "Claim statement"],
+    "binding": "Exact Task, work revision, run, dispatch, attempt and sealed ArtifactSet."
+  },
+  "repository_capture": {
+    "version": "v1",
+    "producer": "agentosd repository dispatcher and return collector",
+    "operation": "Capture real bytes and full lineage through the Artifact Authority; seal before evidence handoff."
+  },
+  "repository_evidence": {
+    "version": "v1",
+    "independent_producers": ["AttemptSupervisor", "SupervisedRunner"],
+    "binding": "Evidence is verified against its sealed Artifact and the exact Task lineage. Model text is not independent evidence."
+  },
+  "local_retention": {
+    "version": "v1",
+    "policy": "Preserve governed Artifact bytes and provenance in the configured local store; this profile schedules no automatic deletion or external export."
+  },
+  "repository_command_intent": {
+    "version": "v1",
+    "content": "Exact command id, criterion, executable, ordered argv, working directory, inherited environment names, environment overrides, expected exit, time and output budget from the frozen contract."
+  },
+  "repository_command_receipt": {
+    "version": "v1",
+    "content": "Real supervised process result, observed exit or safe failure, captured stdout/stderr and truncation status, bound to the sealed command intent."
+  },
+  "repository_command_capture": {
+    "version": "v1",
+    "producer": "agentosd repository command runner",
+    "operation": "Execute the frozen command under process supervision and seal the actual outcome; a failed process is not converted to a passed receipt."
+  },
+  "repository_checker_input": {
+    "version": "v1",
+    "content": "Owner-validated sealed Claim, ArtifactSet, Context snapshot, repository manifests, patch, command receipts, independent evidence and exact Verification request binding."
+  },
+  "repository_checker_output": {
+    "version": "v1",
+    "content": "Criterion outcome and limitations bound to the real request, run, checker profile, execution and source lineage; missing evidence remains unverified."
+  },
+  "repository_checker_readonly": {
+    "version": "v1",
+    "sandbox": "readOnly",
+    "approval_policy": "never",
+    "network_access": false,
+    "effective_native_policy_checked": true
+  },
+  "repository_checker_tools": {
+    "version": "v1",
+    "scope_and_tests": "Read sealed independent receipts without re-executing acceptance commands.",
+    "review": "One supervised Codex read-only turn after durable Verification Start; unknown delivery is held without replay."
+  },
+  "repository_checker_egress": {
+    "version": "v1",
+    "review_prompt": "Frozen acceptance contract and selected repository material are sent to the explicitly configured model provider.",
+    "agent_tool_network_access": false,
+    "automatic_publication": false
+  },
+  "repository_checker_budget": {
+    "version": "v1",
+    "timeout_ms": 120000,
+    "max_prompt_bytes": 1048576,
+    "max_output_bytes": 1048576,
+    "automatic_model_retry": false
+  },
+  "repository_checker_deployment": {
+    "version": "v1",
+    "declaration": "Compiled implementation and validated configuration, not a claim that a native probe has run.",
+    "reuse": "Immutable checker identity may be reused across Tasks; each request and output retains its own Task lineage."
+  },
+  "repository_checker_capture": {
+    "version": "v1",
+    "operation": "Seal actual checker deployment or output through the same Artifact Authority and independently validate the producer, role, request, run, profile and source binding."
+  },
+  "repository_checker_raw_output": { "version": "v1", "content": "Actual bounded checker output bytes." },
+  "repository_checker_detail": { "version": "v1", "content": "Structured criterion evaluation with observed limitations and evidence references." },
+  "repository_checker_tool_receipt": { "version": "v1", "content": "Actual native probe or tool execution and delivery outcome." },
+  "repository_checker_model_receipt": { "version": "v1", "content": "Actual model identity, native thread and turn, output binding and reported usage when available." },
+  "repository_checker_cost_receipt": { "version": "v1", "content": "Observed cost metadata only; absent provider cost is never fabricated." },
+  "founder_supporting_material": {
+    "version": "v1",
+    "content": "Canonical FounderSupportingMaterial protobuf: authenticated author, role, explicit user body, coverage, current Verdict scope and original Artifact lineage."
+  },
+  "founder_supporting_material_capture": {
+    "version": "v1",
+    "operation": "Stage and seal only after the current Task and Verification binding and Founder allowlist have been validated by their real owners; exact material replay creates no new Artifact."
+  }
+}

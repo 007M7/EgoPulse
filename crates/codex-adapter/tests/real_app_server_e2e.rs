@@ -11,6 +11,46 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the authenticated pinned Codex and an explicit read-only fixture root"]
+async fn real_codex_read_only_review_returns_bound_visible_output() {
+    use egopulse_codex_adapter::{CodexReadOnlyReviewRequest, CodexReadOnlyReviewTerminalStatus};
+    let executable = PathBuf::from(
+        std::env::var_os("EGOPULSE_CODEX_EXECUTABLE").expect("explicit pinned Codex"),
+    );
+    let working_directory = PathBuf::from(
+        std::env::var_os("EGOPULSE_CODEX_REVIEW_ROOT").expect("explicit isolated fixture root"),
+    );
+    assert!(executable.is_file() && working_directory.is_dir());
+    let model = std::env::var("EGOPULSE_CODEX_REVIEW_MODEL").expect("explicit review model");
+    let execution_id = format!("readonly-review-test:{}", uuid::Uuid::now_v7());
+    let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new(executable));
+    let result = driver.run_read_only_review(CodexReadOnlyReviewRequest {
+        execution_id: execution_id.clone(), working_directory, model: model.clone(),
+        prompt: "Reply exactly with EGOPULSE_READ_ONLY_REVIEW_OK. Do not call tools or change files.".into(),
+        timeout: Duration::from_secs(120), output_limit_bytes: 64 * 1024,
+    }).await.unwrap_or_else(|error| {
+        let method = serde_json::from_slice::<serde_json::Value>(&error.raw_evidence)
+            .ok().and_then(|value| value.get("method").and_then(serde_json::Value::as_str).map(str::to_owned));
+        panic!("native review failed: {:?} {:?} {} method={method:?}", error.certainty, error.code, error.safe_detail_code)
+    });
+    assert_eq!(
+        result.terminal_status,
+        CodexReadOnlyReviewTerminalStatus::Completed
+    );
+    assert_eq!(result.assistant_output, b"EGOPULSE_READ_ONLY_REVIEW_OK");
+    assert!(result.delivery_started && !result.thread_id.is_empty() && !result.turn_id.is_empty());
+    assert_eq!(result.receipt.execution_id, execution_id);
+    assert_eq!(result.receipt.model, model);
+    assert_eq!(result.receipt.thread_id, result.thread_id);
+    assert_eq!(result.receipt.turn_id, result.turn_id);
+    assert_eq!(result.receipt.output_bytes, result.assistant_output.len());
+    assert_eq!(
+        result.receipt.output_sha256,
+        hex::encode(Sha256::digest(&result.assistant_output))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_codex_app_server_dispatch_round_trips_when_configured() {
     let Some(executable) = std::env::var_os("EGOPULSE_CODEX_EXECUTABLE") else {
         eprintln!("skipping real Codex app-server E2E; set EGOPULSE_CODEX_EXECUTABLE to run it");

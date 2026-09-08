@@ -7,7 +7,8 @@ use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ProbeHarnessResult, SideEffectCertainty, UsageObservation, harness_observation,
 };
 use egopulse_harness_adapter::{
-    DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, NativeHarnessDriver,
+    DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent,
+    LegacyExecutionStartRawClassification, LegacyExecutionStartRawContext, NativeHarnessDriver,
     NativeHarnessFuture, ReconciliationContext, ReconciliationFinding, ResolvedDispatchMaterial,
     TerminalOutputCandidate, assistant_text_content_candidate, assistant_text_mutation_candidate,
 };
@@ -18,9 +19,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 use uuid::Uuid;
+
+use crate::review::{
+    CodexReadOnlyReviewOutcome, CodexReadOnlyReviewRequest, ReviewExchange, ReviewMessageAction,
+};
 
 pub const CODEX_ADAPTER_ID: &str = "codex-adapter";
 pub const CODEX_CAPABILITY_PROFILE_ID: &str = "codex-app-server-v2-0.148.0-alpha.15";
@@ -57,6 +62,7 @@ pub fn codex_user_visible_content_candidate(
 }
 
 const CODEX_CONTENT_CANDIDATE_BYTES: usize = 65_536;
+const CODEX_PENDING_NATIVE_POLL_TIMEOUT: Duration = Duration::from_millis(5);
 
 #[must_use]
 pub fn codex_user_visible_content_mutations(
@@ -164,6 +170,7 @@ fn apply_environment_overrides(
 ) -> SupervisedProcessSpec {
     let mut spec = spec
         .with_minimal_user_environment()
+        .with_desktop_shell_path()
         .with_inherited_environment("CODEX_HOME");
     for (name, value) in overrides {
         spec = spec.with_environment_override(name.clone(), value.clone());
@@ -176,6 +183,7 @@ struct ActiveDispatch {
     thread_id: String,
     turn_id: Option<String>,
     turn_request_id: u64,
+    workspace_root: PathBuf,
 }
 
 struct PendingApproval {
@@ -196,6 +204,7 @@ struct CodexSession {
     process: SupervisedProcess,
     next_request_id: u64,
     pending_messages: VecDeque<(Value, Vec<u8>)>,
+    partial_frame: Vec<u8>,
 }
 
 pub struct CodexAppServerDriver {
@@ -209,7 +218,9 @@ pub struct CodexAppServerDriver {
     responded_approvals: HashMap<String, ApprovalRequestObservation>,
     queued_events: VecDeque<DriverEvent>,
     pending_control_requests: HashMap<u64, &'static str>,
+    deferred_terminal_event: Option<DriverEvent>,
     last_protocol_diagnostic: Option<String>,
+    approval_items: crate::approval_display::ApprovalItemCache,
 }
 
 impl CodexAppServerDriver {
@@ -226,13 +237,194 @@ impl CodexAppServerDriver {
             responded_approvals: HashMap::new(),
             queued_events: VecDeque::new(),
             pending_control_requests: HashMap::new(),
+            deferred_terminal_event: None,
             last_protocol_diagnostic: None,
+            approval_items: crate::approval_display::ApprovalItemCache::default(),
         }
     }
 
     #[must_use]
     pub fn last_protocol_diagnostic(&self) -> Option<&str> {
         self.last_protocol_diagnostic.as_deref()
+    }
+
+    /// Runs one provider-native review on a fresh app-server session and a new
+    /// read-only thread. The caller owns durable Start/hold semantics; this
+    /// method only reports the real native exchange and never retries it.
+    pub async fn run_read_only_review(
+        &mut self,
+        request: CodexReadOnlyReviewRequest,
+    ) -> Result<CodexReadOnlyReviewOutcome, DriverError> {
+        if request.execution_id.trim().is_empty()
+            || request.model.trim().is_empty()
+            || request.prompt.trim().is_empty()
+            || !request.working_directory.is_absolute()
+            || !request.working_directory.is_dir()
+            || request.timeout.is_zero()
+            || request.output_limit_bytes == 0
+        {
+            return Err(driver_error(
+                DriverErrorCertainty::ProvenNotSent,
+                HarnessErrorCode::InvalidArgument,
+                "CODEX_REVIEW_REQUEST_INVALID",
+                &[],
+            ));
+        }
+        if self.session.is_some() || self.active.is_some() {
+            return Err(driver_error(
+                DriverErrorCertainty::ProvenNotSent,
+                HarnessErrorCode::InvalidArgument,
+                "CODEX_REVIEW_DRIVER_NOT_FRESH",
+                &[],
+            ));
+        }
+        let result = match timeout(request.timeout, self.run_read_only_review_inner(&request)).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(driver_error(
+                DriverErrorCertainty::DeliveryUnknown,
+                HarnessErrorCode::DependencyUnavailable,
+                "CODEX_REVIEW_TIMEOUT",
+                request.execution_id.as_bytes(),
+            )),
+        };
+        self.shutdown_review_session().await;
+        result
+    }
+
+    async fn run_read_only_review_inner(
+        &mut self,
+        request: &CodexReadOnlyReviewRequest,
+    ) -> Result<CodexReadOnlyReviewOutcome, DriverError> {
+        let started = std::time::Instant::now();
+        self.ensure_session(&request.working_directory).await?;
+        let session = self.session.as_mut().expect("review session initialized");
+
+        let thread_request_id = session.next_id();
+        session
+            .write_value(&json!({
+                "id": thread_request_id,
+                "method": "thread/start",
+                "params": {
+                    "cwd": request.working_directory,
+                    "approvalPolicy": "never",
+                    "sandbox": "read-only",
+                    "experimentalRawEvents": false,
+                    "model": request.model,
+                }
+            }))
+            .await?;
+        let (thread_response, thread_raw) = session
+            .read_response(
+                thread_request_id,
+                remaining_review_time(started, request.timeout)?,
+            )
+            .await?;
+        if !review_thread_configuration_matches(&thread_response, &request.model) {
+            return Err(driver_error(
+                DriverErrorCertainty::DeliveryUnknown,
+                HarnessErrorCode::ProtocolMismatch,
+                "CODEX_REVIEW_THREAD_POLICY_MISMATCH",
+                &thread_raw,
+            ));
+        }
+        let thread_id = thread_response
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                driver_error(
+                    DriverErrorCertainty::DeliveryUnknown,
+                    HarnessErrorCode::ProtocolMismatch,
+                    "CODEX_REVIEW_THREAD_RESPONSE_INVALID",
+                    &thread_raw,
+                )
+            })?;
+
+        let turn_request_id = session.next_id();
+        session
+            .write_value(&json!({
+                "id": turn_request_id,
+                "method": "turn/start",
+                "params": {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": request.prompt}],
+                    "cwd": request.working_directory,
+                    "approvalPolicy": "never",
+                    "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
+                    "model": request.model,
+                }
+            }))
+            .await?;
+        let (turn_response, turn_raw) = session
+            .read_response(
+                turn_request_id,
+                remaining_review_time(started, request.timeout)?,
+            )
+            .await?;
+        let turn_id = turn_response
+            .pointer("/result/turn/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                driver_error(
+                    DriverErrorCertainty::DeliveryUnknown,
+                    HarnessErrorCode::ProtocolMismatch,
+                    "CODEX_REVIEW_TURN_RESPONSE_INVALID",
+                    &turn_raw,
+                )
+            })?;
+
+        let mut exchange = ReviewExchange::new(thread_id, turn_id);
+        let terminal_status = loop {
+            let session = self.session.as_mut().expect("review session initialized");
+            let (value, raw) = session
+                .read_next_value(remaining_review_time(started, request.timeout)?)
+                .await?;
+            if value.get("id").is_some() {
+                return Err(driver_error(
+                    DriverErrorCertainty::DeliveryUnknown,
+                    HarnessErrorCode::ProtocolMismatch,
+                    "CODEX_REVIEW_UNEXPECTED_RESPONSE",
+                    &raw,
+                ));
+            }
+            let action = exchange
+                .accept_notification(&value, request.output_limit_bytes)
+                .map_err(|detail| {
+                    driver_error(
+                        DriverErrorCertainty::DeliveryUnknown,
+                        HarnessErrorCode::ProtocolMismatch,
+                        detail,
+                        &raw,
+                    )
+                })?;
+            if let ReviewMessageAction::Terminal(status) = action {
+                break status;
+            }
+        };
+        exchange
+            .finish(
+                request.execution_id.clone(),
+                request.model.clone(),
+                terminal_status,
+                started.elapsed(),
+            )
+            .map_err(|detail| {
+                driver_error(
+                    DriverErrorCertainty::DeliveryUnknown,
+                    HarnessErrorCode::ProtocolMismatch,
+                    detail,
+                    request.execution_id.as_bytes(),
+                )
+            })
+    }
+
+    async fn shutdown_review_session(&mut self) {
+        if let Some(mut session) = self.session.take() {
+            let _ = session.process.terminate().await;
+            let _ = session.process.wait().await;
+        }
     }
 
     fn queue_agent_message_candidates(
@@ -317,6 +509,7 @@ impl CodexAppServerDriver {
             process,
             next_request_id: 1,
             pending_messages: VecDeque::new(),
+            partial_frame: Vec::new(),
         };
         let initialize_id = session.next_id();
         session
@@ -483,6 +676,18 @@ impl CodexAppServerDriver {
                     &raw,
                 )
             })?;
+        if active
+            .turn_id
+            .as_ref()
+            .is_some_and(|observed| observed != &turn_id)
+        {
+            return Err(driver_error(
+                DriverErrorCertainty::DeliveryUnknown,
+                HarnessErrorCode::ProtocolMismatch,
+                "CODEX_TURN_START_IDENTITY_CONFLICT",
+                &raw,
+            ));
+        }
         active.turn_id = Some(turn_id.clone());
         Ok(Some(DriverEvent {
             native_key: format!("response:{}:ack", active.turn_request_id),
@@ -534,12 +739,38 @@ impl CodexAppServerDriver {
             )
         })?;
         let params = value.get("params").cloned().unwrap_or(Value::Null);
+        let approval_request_id = Uuid::now_v7().to_string();
+        let action_digest_sha256 = sha256(params.to_string().as_bytes());
+        let context = self
+            .active
+            .as_ref()
+            .map(|active| crate::approval_display::ApprovalContext {
+                dispatch_id: &active.dispatch_id,
+                thread_id: &active.thread_id,
+                turn_id: active.turn_id.as_deref(),
+                workspace_root: &active.workspace_root,
+            });
+        let credentials = self
+            .config
+            .environment_overrides
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        let summary = self.approval_items.summarize(
+            context.as_ref(),
+            &params,
+            &approval_request_id,
+            &action_digest_sha256,
+            kind,
+            &credentials,
+        );
         let observation = ApprovalRequestObservation {
-            approval_request_id: Uuid::now_v7().to_string(),
+            approval_request_id,
             kind: kind as i32,
-            action_digest_sha256: sha256(params.to_string().as_bytes()),
+            action_digest_sha256,
             requested_scope_ref: "adapter-edge://codex/approval/scope".to_owned(),
-            display_summary_ref: "adapter-edge://codex/approval/summary".to_owned(),
+            display_summary_ref: summary.summary_ref.clone(),
+            display_summary: Some(summary),
             native_routing_ref: routing_ref.clone(),
             lifecycle: ApprovalRequestLifecycleKind::Open as i32,
             request_revision: 1,
@@ -581,28 +812,45 @@ impl CodexAppServerDriver {
                 None,
                 raw,
             ),
-            "turn/started" => lifecycle_event(
-                method,
-                LifecycleKind::ExecutionStarted,
-                None,
-                "inProgress",
-                None,
-                raw,
-            ),
+            "turn/started" => {
+                // Native notifications may precede the turn/start response.
+                // Capture only the exact active thread and reject a later
+                // response that tries to replace this observed turn identity.
+                if let (Some(active), Some(thread), Some(turn)) = (
+                    self.active.as_mut(),
+                    params.get("threadId").and_then(Value::as_str),
+                    params.pointer("/turn/id").and_then(Value::as_str),
+                ) {
+                    if thread != active.thread_id {
+                        return Ok(None);
+                    }
+                    if turn.is_empty()
+                        || active.turn_id.as_deref().is_some_and(|known| known != turn)
+                    {
+                        return Err(driver_error(
+                            DriverErrorCertainty::DeliveryUnknown,
+                            HarnessErrorCode::ProtocolMismatch,
+                            "CODEX_TURN_START_IDENTITY_CONFLICT",
+                            &raw,
+                        ));
+                    }
+                    active.turn_id = Some(turn.to_owned());
+                }
+                lifecycle_event(
+                    method,
+                    LifecycleKind::ExecutionStarted,
+                    None,
+                    "inProgress",
+                    None,
+                    raw,
+                )
+            }
             "thread/status/changed" => {
                 let status = params
                     .pointer("/status/type")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
                 match status {
-                    "active" => lifecycle_event(
-                        method,
-                        LifecycleKind::ExecutionStarted,
-                        None,
-                        status,
-                        None,
-                        raw,
-                    ),
                     "systemError" => lifecycle_event(
                         method,
                         LifecycleKind::ExecutionFailed,
@@ -611,7 +859,7 @@ impl CodexAppServerDriver {
                         None,
                         raw,
                     ),
-                    "idle" | "notLoaded" => DriverEvent {
+                    "active" | "idle" | "notLoaded" => DriverEvent {
                         native_key: native_key(method, &raw),
                         native_event_id: None,
                         native_sequence: None,
@@ -625,6 +873,10 @@ impl CodexAppServerDriver {
                             egopulse_domain_contracts::v01::egopulse::harness::v1::DiagnosticObservation {
                                 safe_diagnostic_code: if status == "notLoaded" {
                                     "CODEX_THREAD_NOT_LOADED"
+                                } else if status == "active" {
+                                    // Thread activity is a session-level hint;
+                                    // turn/started owns ExecutionStarted.
+                                    "CODEX_THREAD_ACTIVE"
                                 } else {
                                     "CODEX_THREAD_IDLE"
                                 }
@@ -693,14 +945,27 @@ impl CodexAppServerDriver {
                     raw,
                 )
             }
-            "item/started" => lifecycle_event(
-                method,
-                LifecycleKind::ItemStarted,
-                params.pointer("/item/id").and_then(Value::as_str),
-                "started",
-                None,
-                raw,
-            ),
+            "item/started" => {
+                if let Some(active) = self.active.as_ref() {
+                    self.approval_items.record_started(
+                        &crate::approval_display::ApprovalContext {
+                            dispatch_id: &active.dispatch_id,
+                            thread_id: &active.thread_id,
+                            turn_id: active.turn_id.as_deref(),
+                            workspace_root: &active.workspace_root,
+                        },
+                        &params,
+                    );
+                }
+                lifecycle_event(
+                    method,
+                    LifecycleKind::ItemStarted,
+                    params.pointer("/item/id").and_then(Value::as_str),
+                    "started",
+                    None,
+                    raw,
+                )
+            }
             "item/completed" => {
                 if params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") {
                     let final_text = params
@@ -917,17 +1182,7 @@ impl CodexAppServerDriver {
                 }
             }
             "account/rateLimits/updated" => {
-                let reached = params
-                    .pointer("/rateLimits/rateLimitReachedType")
-                    .is_some_and(|value| !value.is_null())
-                    || params
-                        .pointer("/rateLimits/spendControlReached")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                    || params
-                        .pointer("/rateLimits/primary/usedPercent")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|used| used >= 100);
+                let reached = native_rate_limit_reached(&params);
                 DriverEvent {
                     native_key: native_key(method, &raw),
                     native_event_id: None,
@@ -1086,10 +1341,38 @@ impl CodexAppServerDriver {
             }
         };
         if event.criticality == ObservationCriticality::Terminal {
+            if self.has_pending_native_exchange() {
+                if self.deferred_terminal_event.is_some() {
+                    return Err(driver_error(
+                        DriverErrorCertainty::DeliveryUnknown,
+                        HarnessErrorCode::ProtocolMismatch,
+                        "CODEX_TERMINAL_EVENT_CONFLICT",
+                        &event.raw_event,
+                    ));
+                }
+                self.deferred_terminal_event = Some(event);
+                return Ok(None);
+            }
             self.completed_dispatch_id = Some(envelope.dispatch_id.clone());
             self.active = None;
         }
         Ok(Some(event))
+    }
+
+    fn has_pending_native_exchange(&self) -> bool {
+        !self.pending_approvals.is_empty()
+            || !self.responded_approvals.is_empty()
+            || !self.pending_control_requests.is_empty()
+    }
+
+    fn take_ready_deferred_terminal(&mut self, envelope: &DispatchEnvelope) -> Option<DriverEvent> {
+        if self.has_pending_native_exchange() {
+            return None;
+        }
+        let event = self.deferred_terminal_event.take()?;
+        self.completed_dispatch_id = Some(envelope.dispatch_id.clone());
+        self.active = None;
+        Some(event)
     }
 
     async fn send_approval_response(
@@ -1098,7 +1381,7 @@ impl CodexAppServerDriver {
     ) -> Result<Vec<u8>, DriverError> {
         let pending = self
             .pending_approvals
-            .remove(&envelope.native_routing_ref)
+            .get(&envelope.native_routing_ref)
             .ok_or_else(|| {
                 driver_error(
                     DriverErrorCertainty::ProvenNotSent,
@@ -1115,6 +1398,30 @@ impl CodexAppServerDriver {
                 &[],
             )
         })?;
+        if decision == ApprovalDecision::AllowOnce
+            && (pending.observation.approval_request_id != envelope.approval_request_id
+                || pending.observation.action_digest_sha256 != envelope.action_digest_sha256
+                || self.active.as_ref().is_none_or(|active| {
+                    active.dispatch_id != envelope.dispatch_id
+                        || pending.params.get("threadId").and_then(Value::as_str)
+                            != Some(active.thread_id.as_str())
+                        || pending.params.get("turnId").and_then(Value::as_str)
+                            != active.turn_id.as_deref()
+                })
+                || !egopulse_domain_contracts::approval_display::valid_reviewable_approval_summary(
+                    pending.observation.display_summary.as_ref(),
+                    &pending.observation.display_summary_ref,
+                    &pending.observation.action_digest_sha256,
+                    pending.observation.kind,
+                ))
+        {
+            return Err(driver_error(
+                DriverErrorCertainty::ProvenNotSent,
+                HarnessErrorCode::InvalidArgument,
+                "CODEX_APPROVAL_DISPLAY_NOT_REVIEWABLE",
+                &[],
+            ));
+        }
         let result = match pending.method.as_str() {
             "item/commandExecution/requestApproval" | "execCommandApproval" => {
                 json!({ "decision": approval_word(decision) })
@@ -1144,6 +1451,13 @@ impl CodexAppServerDriver {
             }
         };
         let response = json!({ "id": pending.request_id, "result": result });
+        // Retain proven-unsent validation failures. Once writing starts, a
+        // partial response can be unknown, so the durable adapter receipt owns
+        // reconciliation and this pending request must not be sent again.
+        let pending = self
+            .pending_approvals
+            .remove(&envelope.native_routing_ref)
+            .ok_or_else(|| dependency_error("CODEX_APPROVAL_ROUTING_NOT_FOUND"))?;
         let raw = serde_json::to_vec(&response).unwrap_or_default();
         self.session
             .as_mut()
@@ -1222,7 +1536,9 @@ impl NativeHarnessDriver for CodexAppServerDriver {
                 thread_id: thread_id.clone(),
                 turn_id: None,
                 turn_request_id: request_id,
+                workspace_root: material.workspace_root.clone(),
             });
+            self.approval_items = crate::approval_display::ApprovalItemCache::default();
             self.completed_dispatch_id = None;
             self.pending_agent_message = None;
             self.terminal_output_candidate = None;
@@ -1246,12 +1562,8 @@ impl NativeHarnessDriver for CodexAppServerDriver {
             if let Some(event) = self.queued_events.pop_front() {
                 return Ok(Some(event));
             }
-            // An unresolved server request is an explicit handoff to the
-            // approval authority. Do not block the governed dispatch worker
-            // waiting for a native response that requires a separate
-            // decide_approval call.
-            if !self.pending_approvals.is_empty() {
-                return Ok(None);
+            if let Some(event) = self.take_ready_deferred_terminal(envelope) {
+                return Ok(Some(event));
             }
             if self
                 .active
@@ -1260,11 +1572,27 @@ impl NativeHarnessDriver for CodexAppServerDriver {
             {
                 return Err(dependency_error("CODEX_ACTIVE_DISPATCH_NOT_FOUND"));
             }
+            let bounded_poll =
+                self.has_pending_native_exchange() || self.deferred_terminal_event.is_some();
             let session = self
                 .session
                 .as_mut()
                 .ok_or_else(|| dependency_error("CODEX_SESSION_NOT_RUNNING"))?;
-            let (value, raw) = session.read_next_value(self.config.request_timeout).await?;
+            // An unresolved native request remains an approval/control handoff,
+            // but it cannot stop the single framed reader: Codex may withdraw
+            // it or finish the turn without a local approval decision. Keep
+            // this poll short so the runner releases its mutex for the separate
+            // approval/cancellation delivery worker.
+            let next = if bounded_poll {
+                session
+                    .poll_next_value(CODEX_PENDING_NATIVE_POLL_TIMEOUT)
+                    .await?
+            } else {
+                Some(session.read_next_value(self.config.request_timeout).await?)
+            };
+            let Some((value, raw)) = next else {
+                return Ok(None);
+            };
             self.map_value(envelope, value, raw)
         })
     }
@@ -1363,33 +1691,23 @@ impl NativeHarnessDriver for CodexAppServerDriver {
                 .read_response(request_id, self.config.request_timeout)
                 .await?;
             let evidence_ref = format!("codex-thread-read-sha256:{}", sha256(&raw));
-            let status = response
-                .pointer("/result/thread/status/type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
             let turns = response
                 .pointer("/result/thread/turns")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let turn = expected_turn_id
-                .as_ref()
-                .and_then(|expected| {
-                    turns
-                        .iter()
-                        .find(|turn| turn.get("id").and_then(Value::as_str) == Some(expected))
-                })
-                .or_else(|| {
-                    (context.envelope.native_session_ref.is_none() && turns.len() == 1)
-                        .then(|| turns.first())
-                        .flatten()
-                });
-            if status == "active" {
-                return Ok(ReconciliationFinding::NativeExecutionActive { evidence_ref });
-            }
+            let Some(expected_turn_id) = expected_turn_id else {
+                return Ok(ReconciliationFinding::OutcomeUnknown { evidence_ref });
+            };
+            let Some(turn) = turns.iter().find(|turn| {
+                turn.get("id").and_then(Value::as_str) == Some(expected_turn_id.as_str())
+            }) else {
+                return Ok(ReconciliationFinding::OutcomeUnknown { evidence_ref });
+            };
             if let Some(turn_status) = turn
-                .and_then(|turn| turn.get("status"))
+                .get("status")
                 .and_then(Value::as_str)
+                .or_else(|| turn.pointer("/status/type").and_then(Value::as_str))
             {
                 if matches!(turn_status, "completed" | "interrupted" | "failed") {
                     return Ok(ReconciliationFinding::TerminalObservationRecovered {
@@ -1402,6 +1720,13 @@ impl NativeHarnessDriver for CodexAppServerDriver {
             }
             Ok(ReconciliationFinding::OutcomeUnknown { evidence_ref })
         })
+    }
+
+    fn classify_legacy_execution_start(
+        &self,
+        context: &LegacyExecutionStartRawContext,
+    ) -> LegacyExecutionStartRawClassification {
+        classify_codex_legacy_execution_start(context)
     }
 }
 
@@ -1445,21 +1770,30 @@ impl CodexSession {
     }
 
     async fn read_value(&mut self, deadline: Duration) -> Result<(Value, Vec<u8>), DriverError> {
-        let mut raw = Vec::new();
-        let read = timeout(deadline, self.process.stdout.read_until(b'\n', &mut raw))
-            .await
-            .map_err(|_| dependency_error("CODEX_RESPONSE_TIMEOUT"))?
-            .map_err(|error| {
-                driver_error(
-                    DriverErrorCertainty::DeliveryUnknown,
-                    HarnessErrorCode::DependencyUnavailable,
-                    "CODEX_STDOUT_READ_FAILED",
-                    format!("{error:?}").as_bytes(),
-                )
-            })?;
-        if read == 0 {
-            return Err(dependency_error("CODEX_APP_SERVER_EOF"));
-        }
+        self.poll_value(deadline)
+            .await?
+            .ok_or_else(|| dependency_error("CODEX_RESPONSE_TIMEOUT"))
+    }
+
+    async fn poll_value(
+        &mut self,
+        deadline: Duration,
+    ) -> Result<Option<(Value, Vec<u8>)>, DriverError> {
+        let raw =
+            match poll_jsonl_frame(&mut self.process.stdout, &mut self.partial_frame, deadline)
+                .await
+                .map_err(|error| {
+                    driver_error(
+                        DriverErrorCertainty::DeliveryUnknown,
+                        HarnessErrorCode::DependencyUnavailable,
+                        "CODEX_STDOUT_READ_FAILED",
+                        format!("{error:?}").as_bytes(),
+                    )
+                })? {
+                JsonlFramePoll::Idle => return Ok(None),
+                JsonlFramePoll::Eof => return Err(dependency_error("CODEX_APP_SERVER_EOF")),
+                JsonlFramePoll::Frame(raw) => raw,
+            };
         let value = serde_json::from_slice(&raw).map_err(|error| {
             driver_error(
                 DriverErrorCertainty::DeliveryUnknown,
@@ -1468,7 +1802,7 @@ impl CodexSession {
                 format!("{error:?}").as_bytes(),
             )
         })?;
-        Ok((value, raw))
+        Ok(Some((value, raw)))
     }
 
     async fn read_next_value(
@@ -1479,6 +1813,16 @@ impl CodexSession {
             return Ok(message);
         }
         self.read_value(deadline).await
+    }
+
+    async fn poll_next_value(
+        &mut self,
+        deadline: Duration,
+    ) -> Result<Option<(Value, Vec<u8>)>, DriverError> {
+        if let Some(message) = self.pending_messages.pop_front() {
+            return Ok(Some(message));
+        }
+        self.poll_value(deadline).await
     }
 
     async fn read_response(
@@ -1503,6 +1847,32 @@ impl CodexSession {
             }
             self.pending_messages.push_back((value, raw));
         }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum JsonlFramePoll {
+    Idle,
+    Eof,
+    Frame(Vec<u8>),
+}
+
+async fn poll_jsonl_frame<R>(
+    reader: &mut R,
+    partial_frame: &mut Vec<u8>,
+    deadline: Duration,
+) -> std::io::Result<JsonlFramePoll>
+where
+    R: AsyncBufRead + Unpin,
+{
+    if partial_frame.last() == Some(&b'\n') {
+        return Ok(JsonlFramePoll::Frame(std::mem::take(partial_frame)));
+    }
+    match timeout(deadline, reader.read_until(b'\n', partial_frame)).await {
+        Err(_) => Ok(JsonlFramePoll::Idle),
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(0)) if partial_frame.is_empty() => Ok(JsonlFramePoll::Eof),
+        Ok(Ok(_)) => Ok(JsonlFramePoll::Frame(std::mem::take(partial_frame))),
     }
 }
 
@@ -1639,6 +2009,20 @@ fn now() -> Timestamp {
     }
 }
 
+fn remaining_review_time(
+    started: std::time::Instant,
+    total: Duration,
+) -> Result<Duration, DriverError> {
+    total.checked_sub(started.elapsed()).ok_or_else(|| {
+        driver_error(
+            DriverErrorCertainty::DeliveryUnknown,
+            HarnessErrorCode::DependencyUnavailable,
+            "CODEX_REVIEW_TIMEOUT",
+            &[],
+        )
+    })
+}
+
 fn driver_error(
     certainty: DriverErrorCertainty,
     code: HarnessErrorCode,
@@ -1663,12 +2047,211 @@ fn dependency_error(detail: &str) -> DriverError {
     )
 }
 
+fn classify_codex_legacy_execution_start(
+    context: &LegacyExecutionStartRawContext,
+) -> LegacyExecutionStartRawClassification {
+    let Ok(prior) = serde_json::from_slice::<Value>(&context.prior_raw_event) else {
+        return LegacyExecutionStartRawClassification::Conflict;
+    };
+    let Ok(pending) = serde_json::from_slice::<Value>(&context.pending_raw_event) else {
+        return LegacyExecutionStartRawClassification::Conflict;
+    };
+    let prior_is_legacy_active = prior.get("method").and_then(Value::as_str)
+        == Some("thread/status/changed")
+        && prior.pointer("/params/status/type").and_then(Value::as_str) == Some("active");
+    let pending_is_turn_start =
+        pending.get("method").and_then(Value::as_str) == Some("turn/started");
+    let pending_turn_id = pending.pointer("/params/turn/id").and_then(Value::as_str);
+    let session_refs_match = [
+        prior.pointer("/params/threadId").and_then(Value::as_str),
+        pending.pointer("/params/threadId").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|session_ref| session_ref == context.native_session_ref);
+    if prior_is_legacy_active
+        && pending_is_turn_start
+        && pending_turn_id == Some(context.native_execution_ref.as_str())
+        && session_refs_match
+    {
+        let durable_terminal_handoff = context
+            .terminal_raw_event
+            .as_ref()
+            .zip(context.terminal_native_completion_ref.as_ref())
+            .is_some_and(|(raw, item_ref)| {
+                let Ok(terminal) = serde_json::from_slice::<Value>(raw) else {
+                    return false;
+                };
+                !item_ref.trim().is_empty()
+                    && terminal.get("method").and_then(Value::as_str) == Some("turn/completed")
+                    && terminal.pointer("/params/turn/id").and_then(Value::as_str)
+                        == Some(context.native_execution_ref.as_str())
+                    && terminal
+                        .pointer("/params/threadId")
+                        .and_then(Value::as_str)
+                        .is_none_or(|session_ref| session_ref == context.native_session_ref)
+            });
+        LegacyExecutionStartRawClassification::ExactDuplicate {
+            durable_terminal_handoff,
+        }
+    } else {
+        LegacyExecutionStartRawClassification::Conflict
+    }
+}
+
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn review_thread_configuration_matches(response: &Value, model: &str) -> bool {
+    response.pointer("/result/model").and_then(Value::as_str) == Some(model)
+        && response
+            .pointer("/result/approvalPolicy")
+            .and_then(Value::as_str)
+            == Some("never")
+        && response
+            .pointer("/result/sandbox/type")
+            .and_then(Value::as_str)
+            == Some("readOnly")
+        && response
+            .pointer("/result/sandbox/networkAccess")
+            .and_then(Value::as_bool)
+            == Some(false)
+}
+
+pub(crate) fn native_rate_limit_reached(params: &Value) -> bool {
+    params
+        .pointer("/rateLimits/rateLimitReachedType")
+        .is_some_and(|value| !value.is_null())
+        || params
+            .pointer("/rateLimits/spendControlReached")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || params
+            .pointer("/rateLimits/primary/usedPercent")
+            .and_then(Value::as_u64)
+            .is_some_and(|used| used >= 100)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_checks_effective_read_only_policy_and_exact_model_before_turn() {
+        use super::*;
+        let expected = json!({"result": {"model": "configured-model", "approvalPolicy": "never",
+            "sandbox": {"type": "readOnly", "networkAccess": false}}});
+        assert!(review_thread_configuration_matches(
+            &expected,
+            "configured-model"
+        ));
+        for (path, replacement) in [
+            ("/result/model", json!("fallback-model")),
+            ("/result/approvalPolicy", json!("on-request")),
+            ("/result/sandbox/type", json!("workspaceWrite")),
+            ("/result/sandbox/networkAccess", json!(true)),
+            ("/result/sandbox/networkAccess", json!(null)),
+        ] {
+            let mut changed = expected.clone();
+            *changed.pointer_mut(path).expect("fixture field") = replacement;
+            assert!(!review_thread_configuration_matches(
+                &changed,
+                "configured-model"
+            ));
+        }
+    }
+
+    #[test]
+    fn thread_activity_and_turn_started_emit_only_one_execution_start() {
+        use super::*;
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope::default();
+        let values = [
+            json!({"method":"thread/status/changed","params":{"status":{"type":"active"}}}),
+            json!({"method":"turn/started","params":{"turn":{"id":"turn-one"}}}),
+        ];
+        let events: Vec<_> = values
+            .into_iter()
+            .map(|value| {
+                let raw = serde_json::to_vec(&value).unwrap();
+                driver.map_value(&envelope, value, raw).unwrap().unwrap()
+            })
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.payload,
+                    harness_observation::Payload::Lifecycle(lifecycle)
+                        if lifecycle.kind == LifecycleKind::ExecutionStarted as i32
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(events[0].criticality, ObservationCriticality::Informational);
+    }
+
+    #[test]
+    fn legacy_execution_start_requires_exact_old_shape_and_ack_turn() {
+        let exact = LegacyExecutionStartRawContext {
+            prior_raw_event: serde_json::to_vec(&json!({
+                "method":"thread/status/changed",
+                "params":{"threadId":"thread-one","status":{"type":"active"}}
+            }))
+            .expect("legacy active raw"),
+            pending_raw_event: serde_json::to_vec(&json!({
+                "method":"turn/started",
+                "params":{"threadId":"thread-one","turn":{"id":"turn-one"}}
+            }))
+            .expect("turn start raw"),
+            native_session_ref: "thread-one".to_owned(),
+            native_execution_ref: "turn-one".to_owned(),
+            terminal_raw_event: None,
+            terminal_native_completion_ref: None,
+        };
+        assert_eq!(
+            classify_codex_legacy_execution_start(&exact),
+            LegacyExecutionStartRawClassification::ExactDuplicate {
+                durable_terminal_handoff: false
+            }
+        );
+
+        let mut item_output_terminal = exact.clone();
+        item_output_terminal.terminal_raw_event = Some(
+            serde_json::to_vec(&json!({
+                "method":"turn/completed",
+                "params": {
+                    "threadId":"thread-one",
+                    "turn":{"id":"turn-one","status":"completed"}
+                }
+            }))
+            .expect("terminal turn raw"),
+        );
+        item_output_terminal.terminal_native_completion_ref = Some("item-output".to_owned());
+        assert_eq!(
+            classify_codex_legacy_execution_start(&item_output_terminal),
+            LegacyExecutionStartRawClassification::ExactDuplicate {
+                durable_terminal_handoff: true
+            },
+            "item identity differs from turn identity while the terminal source stays bound to the exact ACK turn"
+        );
+
+        let mut wrong_turn = exact.clone();
+        wrong_turn.native_execution_ref = "turn-two".to_owned();
+        assert_eq!(
+            classify_codex_legacy_execution_start(&wrong_turn),
+            LegacyExecutionStartRawClassification::Conflict
+        );
+        let mut wrong_prior = exact;
+        wrong_prior.prior_raw_event = serde_json::to_vec(&json!({
+            "method":"turn/started",
+            "params":{"turn":{"id":"turn-one"}}
+        }))
+        .expect("non-legacy prior raw");
+        assert_eq!(
+            classify_codex_legacy_execution_start(&wrong_prior),
+            LegacyExecutionStartRawClassification::Conflict
+        );
+    }
     use super::*;
 
     #[test]
@@ -1685,8 +2268,17 @@ mod tests {
                 .all(|name| !name.starts_with("EGOPULSE_") && !name.ends_with("_API_KEY"))
         );
         assert_eq!(
-            spec.environment_overrides,
+            spec.environment_overrides
+                .iter()
+                .filter(|(name, _)| name != "PATH")
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![("OPENAI_API_KEY".to_owned(), "managed-secret".to_owned())]
+        );
+        assert!(
+            spec.environment_overrides
+                .iter()
+                .all(|(name, _)| name == "PATH" || name == "OPENAI_API_KEY")
         );
     }
     use egopulse_domain_contracts::v01::egopulse::harness::v1::{
@@ -1706,6 +2298,99 @@ mod tests {
             harness_observation::Payload::ApprovalRequest(value) => value,
             _ => panic!("expected approval request lifecycle observation"),
         }
+    }
+
+    #[tokio::test]
+    async fn native_allow_once_rejects_unreviewable_details_without_consuming_pending_request() {
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let request = approval_request(71);
+        let event = driver
+            .map_server_request(
+                "item/commandExecution/requestApproval",
+                request.clone(),
+                serde_json::to_vec(&request).expect("request bytes"),
+            )
+            .expect("map approval")
+            .expect("approval event");
+        let observation = approval_payload(event);
+        let envelope = ApprovalDecisionEnvelope {
+            approval_request_id: observation.approval_request_id,
+            native_routing_ref: observation.native_routing_ref.clone(),
+            action_digest_sha256: observation.action_digest_sha256,
+            decision: ApprovalDecision::AllowOnce as i32,
+            ..Default::default()
+        };
+        let error = driver
+            .send_approval_response(&envelope)
+            .await
+            .expect_err("summary missing");
+        assert_eq!(error.certainty, DriverErrorCertainty::ProvenNotSent);
+        assert_eq!(
+            error.safe_detail_code,
+            "CODEX_APPROVAL_DISPLAY_NOT_REVIEWABLE"
+        );
+        assert!(
+            driver
+                .pending_approvals
+                .contains_key(&observation.native_routing_ref)
+        );
+        assert!(driver.responded_approvals.is_empty());
+    }
+
+    #[test]
+    fn approval_summary_can_join_started_items_before_the_turn_start_response() {
+        let root = std::env::current_dir().expect("workspace");
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch:order".to_owned(),
+            ..Default::default()
+        };
+        driver.active = Some(ActiveDispatch {
+            dispatch_id: envelope.dispatch_id.clone(),
+            thread_id: "thread:order".to_owned(),
+            turn_id: None,
+            turn_request_id: 1,
+            workspace_root: root.clone(),
+        });
+        for (method, params) in [
+            (
+                "turn/started",
+                json!({"threadId":"thread:order", "turn":{"id":"turn:order"}}),
+            ),
+            (
+                "item/started",
+                json!({"threadId":"thread:order", "turnId":"turn:order", "item":{"id":"item:order", "type":"commandExecution", "command":"cargo test", "cwd":root}}),
+            ),
+        ] {
+            let value = json!({"method":method, "params":params});
+            driver
+                .map_notification(
+                    &envelope,
+                    method,
+                    value.clone(),
+                    serde_json::to_vec(&value).expect("notification bytes"),
+                )
+                .expect("map notification");
+        }
+        let request = json!({"id":72, "params":{"threadId":"thread:order", "turnId":"turn:order", "itemId":"item:order", "command":"cargo test", "cwd":root}});
+        let observation = approval_payload(
+            driver
+                .map_server_request(
+                    "item/commandExecution/requestApproval",
+                    request.clone(),
+                    serde_json::to_vec(&request).expect("request bytes"),
+                )
+                .expect("request")
+                .expect("approval"),
+        );
+        assert!(
+            egopulse_domain_contracts::approval_display::valid_reviewable_approval_summary(
+                observation.display_summary.as_ref(),
+                &observation.display_summary_ref,
+                &observation.action_digest_sha256,
+                observation.kind,
+            )
+        );
     }
 
     #[test]
@@ -1829,6 +2514,7 @@ mod tests {
             thread_id: "thread-output".to_owned(),
             turn_id: Some("turn-output".to_owned()),
             turn_request_id: 1,
+            workspace_root: std::env::current_dir().expect("test workspace"),
         });
         let item = json!({
             "method": "item/completed",
@@ -2051,17 +2737,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresolved_approval_pauses_dispatch_observation_stream() {
+    async fn bounded_jsonl_poll_preserves_a_partial_frame_and_returns_complete_frames_in_order() {
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let mut reader = BufReader::new(reader);
+        let mut partial = Vec::new();
+        writer
+            .write_all(br#"{"method":"serverRequest/res"#)
+            .await
+            .expect("write partial frame");
+
+        assert_eq!(
+            poll_jsonl_frame(&mut reader, &mut partial, Duration::from_millis(1))
+                .await
+                .expect("bounded partial read"),
+            JsonlFramePoll::Idle
+        );
+        assert!(
+            !partial.is_empty(),
+            "partial frame must survive the idle poll"
+        );
+
+        writer
+            .write_all(
+                b"olved\",\"params\":{\"requestId\":9}}\n{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"status\":\"interrupted\"}}}\n",
+            )
+            .await
+            .expect("finish framed sequence");
+        let first = poll_jsonl_frame(&mut reader, &mut partial, Duration::from_secs(1))
+            .await
+            .expect("read resolution frame");
+        let JsonlFramePoll::Frame(first) = first else {
+            panic!("resolution frame")
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&first)
+                .expect("resolution json")
+                .get("method")
+                .and_then(Value::as_str),
+            Some("serverRequest/resolved")
+        );
+        let second = poll_jsonl_frame(&mut reader, &mut partial, Duration::from_secs(1))
+            .await
+            .expect("read terminal frame");
+        let JsonlFramePoll::Frame(second) = second else {
+            panic!("terminal frame")
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&second)
+                .expect("terminal json")
+                .get("method")
+                .and_then(Value::as_str),
+            Some("turn/completed")
+        );
+        assert!(partial.is_empty());
+    }
+
+    #[test]
+    fn terminal_waits_for_pending_control_ack_and_approval_resolution() {
         let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
         let envelope = DispatchEnvelope {
-            dispatch_id: "dispatch-approval-pause".to_owned(),
+            dispatch_id: "dispatch-approval-liveness".to_owned(),
             ..Default::default()
         };
         driver.active = Some(ActiveDispatch {
             dispatch_id: envelope.dispatch_id.clone(),
-            thread_id: "thread-approval-pause".to_owned(),
-            turn_id: Some("turn-approval-pause".to_owned()),
+            thread_id: "thread-approval-liveness".to_owned(),
+            turn_id: Some("turn-approval-liveness".to_owned()),
             turn_request_id: 1,
+            workspace_root: std::env::current_dir().expect("test workspace"),
         });
         let request = approval_request(9);
         let raw = serde_json::to_vec(&request).expect("request bytes");
@@ -2069,13 +2812,79 @@ mod tests {
             .map_server_request("item/commandExecution/requestApproval", request, raw)
             .expect("map request")
             .expect("approval event");
+        driver.pending_control_requests.insert(44, "turn-interrupt");
 
+        let terminal = json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-approval-liveness",
+                "turn": {"id": "turn-approval-liveness", "status": "interrupted"}
+            }
+        });
         assert!(
             driver
-                .next_event(&envelope)
-                .await
-                .expect("approval pause must be a clean boundary")
-                .is_none()
+                .map_value(
+                    &envelope,
+                    terminal.clone(),
+                    serde_json::to_vec(&terminal).expect("terminal bytes"),
+                )
+                .expect("defer terminal")
+                .is_none(),
+            "terminal must wait until the native request lifecycle is drained"
+        );
+        assert!(driver.active.is_some());
+        assert!(driver.deferred_terminal_event.is_some());
+
+        let control_ack = json!({"id": 44, "result": {}});
+        let diagnostic = driver
+            .map_value(
+                &envelope,
+                control_ack.clone(),
+                serde_json::to_vec(&control_ack).expect("control ACK bytes"),
+            )
+            .expect("map control ACK")
+            .expect("control ACK diagnostic");
+        assert!(matches!(
+            diagnostic.payload,
+            harness_observation::Payload::Diagnostic(ref value)
+                if value.safe_diagnostic_code == "CODEX_CONTROL_REQUEST_ACKNOWLEDGED"
+        ));
+        assert!(driver.pending_control_requests.is_empty());
+        assert_eq!(driver.pending_approvals.len(), 1);
+
+        let resolved = json!({
+            "method": "serverRequest/resolved",
+            "params": {"requestId": 9}
+        });
+        let withdrawn = driver
+            .map_value(
+                &envelope,
+                resolved.clone(),
+                serde_json::to_vec(&resolved).expect("resolution bytes"),
+            )
+            .expect("map resolution")
+            .expect("withdrawal event");
+        assert!(matches!(
+            withdrawn.payload,
+            harness_observation::Payload::ApprovalRequest(ref value)
+                if value.lifecycle == ApprovalRequestLifecycleKind::Withdrawn as i32
+                    && value.request_revision == 2
+        ));
+        assert!(driver.pending_approvals.is_empty());
+        assert!(driver.responded_approvals.is_empty());
+
+        let terminal = driver
+            .take_ready_deferred_terminal(&envelope)
+            .expect("terminal after native requests drain");
+        assert!(matches!(
+            terminal.payload,
+            harness_observation::Payload::Lifecycle(ref value)
+                if value.kind == LifecycleKind::ExecutionInterrupted as i32
+        ));
+        assert!(driver.active.is_none());
+        assert_eq!(
+            driver.completed_dispatch_id.as_deref(),
+            Some(envelope.dispatch_id.as_str())
         );
     }
 

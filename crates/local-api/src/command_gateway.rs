@@ -7,24 +7,28 @@ use egopulse_domain_contracts::{
         common::v1::CommandMetadata,
         localapi::v1::{
             ClientRequestMetadata, ConfirmWorkRequest, ConfirmWorkResponse, ContextMutationCommand,
-            ContextRevokeReceipt, DecideHarnessApprovalRequest, DecideHarnessApprovalResponse,
-            ExecuteContextMutationRequest, ExecuteContextMutationResponse,
-            ExecuteFounderVerdictRequest, ExecuteFounderVerdictResponse,
-            ExecuteMemoryMutationRequest, ExecuteMemoryMutationResponse, ExecuteTaskCommandRequest,
-            ExecuteTaskCommandResponse, HarnessApprovalAuthorityResult,
-            ListWorkCapabilitiesRequest, ListWorkCapabilitiesResponse, ListWorkCapabilitiesResult,
-            LocalApiError, LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt,
-            PrepareWorkRequest, PrepareWorkResponse, ProjectionAwaitToken,
-            SetDefaultWorkCapabilityRequest, SetDefaultWorkCapabilityResponse, SourceRevision,
-            WorkCapabilityPreferenceReceipt, WorkPreparationPreview, confirm_work_response,
-            context_mutation_command, execute_context_mutation_response,
-            list_work_capabilities_response,
+            ContextRevokeReceipt, CreateFounderSupportingMaterialRequest,
+            CreateFounderSupportingMaterialResponse, DecideHarnessApprovalRequest,
+            DecideHarnessApprovalResponse, ExecuteContextMutationRequest,
+            ExecuteContextMutationResponse, ExecuteFounderVerdictRequest,
+            ExecuteFounderVerdictResponse, ExecuteMemoryMutationRequest,
+            ExecuteMemoryMutationResponse, ExecuteTaskCommandRequest, ExecuteTaskCommandResponse,
+            HarnessApprovalAuthorityResult, ListWorkCapabilitiesRequest,
+            ListWorkCapabilitiesResponse, ListWorkCapabilitiesResult, LocalApiError,
+            LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt, PrepareWorkRequest,
+            PrepareWorkResponse, ProjectionAwaitToken, SetDefaultWorkCapabilityRequest,
+            SetDefaultWorkCapabilityResponse, SourceRevision, WorkCapabilityPreferenceReceipt,
+            WorkPreparationPreview, confirm_work_response, context_mutation_command,
+            execute_context_mutation_response, list_work_capabilities_response,
             local_command_gateway_service_server::LocalCommandGatewayService,
             prepare_work_response, set_default_work_capability_response,
         },
         policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
         task::v1::{TaskCommand, TaskCommandResult, task_command},
-        verdict::v1::{VerdictCommand, VerdictCommandResult, verdict_command},
+        verdict::v1::{
+            CreateFounderSupportingMaterialCommand, FounderSupportingMaterialReceipt,
+            VerdictCommand, VerdictCommandResult, verdict_command,
+        },
     },
 };
 use egopulse_local_ipc_platform::PeerConnectionInfo;
@@ -39,6 +43,8 @@ use crate::{
 const RPC_EXECUTE_TASK: &str = "LocalCommandGatewayService/ExecuteTaskCommand";
 const RPC_DECIDE_APPROVAL: &str = "LocalCommandGatewayService/DecideHarnessApproval";
 const RPC_EXECUTE_VERDICT: &str = "LocalCommandGatewayService/ExecuteFounderVerdict";
+const RPC_CREATE_FOUNDER_MATERIAL: &str =
+    "LocalCommandGatewayService/CreateFounderSupportingMaterial";
 const RPC_EXECUTE_MEMORY: &str = "LocalCommandGatewayService/ExecuteMemoryMutation";
 const RPC_EXECUTE_CONTEXT: &str = "LocalCommandGatewayService/ExecuteContextMutation";
 const RPC_LIST_WORK_CAPABILITIES: &str = "LocalCommandGatewayService/ListWorkCapabilities";
@@ -125,6 +131,30 @@ pub trait VerdictCommandPort: Send + Sync + 'static {
         command: &VerdictCommand,
         principal: &CommandPrincipal,
     ) -> Result<CommandPortResult<VerdictCommandResult>, CommandPortFailure>;
+}
+
+/// Narrow composition boundary for Founder-authored supporting material. The
+/// caller cannot provide Artifact principal, descriptor, identity or contract
+/// fields; the daemon-owned implementation derives and revalidates them.
+pub trait FounderSupportingMaterialPort: Send + Sync + 'static {
+    fn create(
+        &self,
+        command: &CreateFounderSupportingMaterialCommand,
+        principal: &CommandPrincipal,
+    ) -> Result<CommandPortResult<FounderSupportingMaterialReceipt>, CommandPortFailure>;
+}
+
+#[derive(Default)]
+pub struct FailClosedFounderSupportingMaterialPort;
+
+impl FounderSupportingMaterialPort for FailClosedFounderSupportingMaterialPort {
+    fn create(
+        &self,
+        _command: &CreateFounderSupportingMaterialCommand,
+        _principal: &CommandPrincipal,
+    ) -> Result<CommandPortResult<FounderSupportingMaterialReceipt>, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
 }
 
 /// The gateway passes an explicit Memory command to its owning Authority
@@ -352,6 +382,7 @@ pub struct CommandGatewayApplication {
     task_port: Arc<dyn TaskCommandPort>,
     policy_port: Arc<dyn PolicyCommandPort>,
     verdict_port: Arc<dyn VerdictCommandPort>,
+    founder_material_port: Arc<dyn FounderSupportingMaterialPort>,
     memory_port: Arc<dyn MemoryMutationPort>,
     context_port: Arc<dyn ContextMutationPort>,
     work_capability_port: Arc<dyn WorkCapabilityPort>,
@@ -363,6 +394,7 @@ pub struct CommandExtensionPorts {
     context: Arc<dyn ContextMutationPort>,
     work_capability: Arc<dyn WorkCapabilityPort>,
     work: Arc<dyn WorkPreparationPort>,
+    founder_material: Arc<dyn FounderSupportingMaterialPort>,
 }
 
 impl CommandExtensionPorts {
@@ -373,6 +405,7 @@ impl CommandExtensionPorts {
             context: Arc::new(FailClosedContextMutationPort),
             work_capability: Arc::new(FailClosedWorkCapabilityPort),
             work,
+            founder_material: Arc::new(FailClosedFounderSupportingMaterialPort),
         }
     }
 
@@ -385,6 +418,15 @@ impl CommandExtensionPorts {
     #[must_use]
     pub fn with_work_capability(mut self, work_capability: Arc<dyn WorkCapabilityPort>) -> Self {
         self.work_capability = work_capability;
+        self
+    }
+
+    #[must_use]
+    pub fn with_founder_supporting_material(
+        mut self,
+        founder_material: Arc<dyn FounderSupportingMaterialPort>,
+    ) -> Self {
+        self.founder_material = founder_material;
         self
     }
 }
@@ -448,6 +490,7 @@ impl CommandGatewayApplication {
             task_port,
             policy_port,
             verdict_port,
+            founder_material_port: extensions.founder_material,
             memory_port: extensions.memory,
             context_port: extensions.context,
             work_capability_port: extensions.work_capability,
@@ -751,6 +794,72 @@ impl CommandGatewayApplication {
                 gateway_error: None,
             },
             Err(error) => ExecuteFounderVerdictResponse {
+                authority_result: None,
+                await_token: None,
+                gateway_error: Some(port_error(error, correlation_id)),
+            },
+        }
+    }
+
+    pub fn create_founder_supporting_material(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: CreateFounderSupportingMaterialRequest,
+    ) -> CreateFounderSupportingMaterialResponse {
+        let correlation_id =
+            command_correlation_id(request.client.as_ref(), request.command.as_ref());
+        let context = match self.authorize(
+            peer,
+            request.client.as_ref(),
+            RPC_CREATE_FOUNDER_MATERIAL,
+            request
+                .command
+                .as_ref()
+                .map(|_| "create_founder_supporting_material"),
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return CreateFounderSupportingMaterialResponse {
+                    authority_result: None,
+                    await_token: None,
+                    gateway_error: Some((*error).with_correlation(correlation_id)),
+                };
+            }
+        };
+        let Some(command) = request.command else {
+            return CreateFounderSupportingMaterialResponse {
+                authority_result: None,
+                await_token: None,
+                gateway_error: Some(invalid_error("command_missing", correlation_id)),
+            };
+        };
+        if let Err(error) =
+            validate_command_metadata(request.client.as_ref(), command.metadata.as_ref())
+        {
+            return CreateFounderSupportingMaterialResponse {
+                authority_result: None,
+                await_token: None,
+                gateway_error: Some((*error).with_correlation(correlation_id)),
+            };
+        }
+        match self
+            .founder_material_port
+            .create(&command, &context.principal)
+        {
+            Ok(port_result) => {
+                let (await_token, gateway_error) = self.issue_await_token(
+                    &context.session,
+                    port_result.source_revision,
+                    port_result.await_target,
+                    correlation_id,
+                );
+                CreateFounderSupportingMaterialResponse {
+                    authority_result: Some(port_result.result),
+                    await_token,
+                    gateway_error,
+                }
+            }
+            Err(error) => CreateFounderSupportingMaterialResponse {
                 authority_result: None,
                 await_token: None,
                 gateway_error: Some(port_error(error, correlation_id)),
@@ -1153,6 +1262,17 @@ impl LocalCommandGatewayService for LocalCommandGatewayEndpoint {
         )))
     }
 
+    async fn create_founder_supporting_material(
+        &self,
+        request: Request<CreateFounderSupportingMaterialRequest>,
+    ) -> Result<Response<CreateFounderSupportingMaterialResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(
+            self.application
+                .create_founder_supporting_material(peer.as_ref(), request.into_inner()),
+        ))
+    }
+
     async fn execute_memory_mutation(
         &self,
         request: Request<ExecuteMemoryMutationRequest>,
@@ -1305,6 +1425,14 @@ impl CommandCorrelation for IssueHarnessApprovalDecisionCommand {
 impl CommandCorrelation for VerdictCommand {
     fn correlation_id(&self) -> Option<String> {
         verdict_metadata(self).map(|value| value.correlation_id.clone())
+    }
+}
+
+impl CommandCorrelation for CreateFounderSupportingMaterialCommand {
+    fn correlation_id(&self) -> Option<String> {
+        self.metadata
+            .as_ref()
+            .map(|value| value.correlation_id.clone())
     }
 }
 

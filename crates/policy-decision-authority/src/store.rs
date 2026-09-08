@@ -113,6 +113,20 @@ INSERT INTO policy_projection_migrations(migration_id,state)
 VALUES('g4-08a-bootstrap-v1','pending');
 "#;
 
+// FounderVerdict expiry is an independent policy authorization. It must never
+// share the Harness approval lifecycle or its idempotency ledger.
+const SCHEMA_V3: &str = r#"
+CREATE TABLE founder_verdict_expiry_authorizations (
+  authorization_id TEXT PRIMARY KEY,
+  verdict_id TEXT NOT NULL,
+  issued_state_revision INTEGER NOT NULL CHECK (issued_state_revision > 0),
+  identity_digest_sha256 TEXT NOT NULL UNIQUE,
+  authorization BLOB NOT NULL,
+  committed_at_seconds INTEGER NOT NULL,
+  UNIQUE(verdict_id, issued_state_revision)
+) STRICT;
+"#;
+
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
     #[error("policy decision storage operation failed")]
@@ -137,6 +151,17 @@ pub(crate) struct IdempotencyRecord {
 pub(crate) struct StoredDecision {
     pub decision_record: Vec<u8>,
     pub state: Vec<u8>,
+}
+
+pub(crate) struct StoredFounderVerdictExpiryAuthorization {
+    pub identity_digest_sha256: String,
+    pub authorization: Vec<u8>,
+}
+
+pub(crate) enum FounderVerdictExpiryAuthorizationCommit {
+    Committed,
+    Existing(StoredFounderVerdictExpiryAuthorization),
+    Conflict,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,11 +307,15 @@ impl PolicyStore {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "secure_delete", "ON")?;
-        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2)]).to_latest(&mut connection)?;
+        Migrations::new(vec![M::up(SCHEMA_V1), M::up(SCHEMA_V2), M::up(SCHEMA_V3)])
+            .to_latest(&mut connection)?;
         let digest = hex::encode(Sha256::digest(
+            format!("{SCHEMA_V1}\n{SCHEMA_V2}\n{SCHEMA_V3}").as_bytes(),
+        ));
+        let prior_v1_digest = hex::encode(Sha256::digest(SCHEMA_V1.as_bytes()));
+        let prior_v2_digest = hex::encode(Sha256::digest(
             format!("{SCHEMA_V1}\n{SCHEMA_V2}").as_bytes(),
         ));
-        let prior_digest = hex::encode(Sha256::digest(SCHEMA_V1.as_bytes()));
         connection.execute(
             "INSERT OR IGNORE INTO policy_store_metadata(singleton,store_epoch,schema_profile_id,schema_profile_sha256) VALUES(1,?1,?2,?3)",
             params![store_epoch, SCHEMA_PROFILE_ID, digest],
@@ -296,12 +325,9 @@ impl PolicyStore {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        if actual
-            == (
-                store_epoch.to_owned(),
-                SCHEMA_PROFILE_ID.to_owned(),
-                prior_digest,
-            )
+        if actual.0 == store_epoch
+            && actual.1 == SCHEMA_PROFILE_ID
+            && (actual.2 == prior_v1_digest || actual.2 == prior_v2_digest)
         {
             connection.execute(
                 "UPDATE policy_store_metadata SET schema_profile_sha256=?1 WHERE singleton=1",
@@ -485,6 +511,78 @@ impl PolicyStore {
             [decision_ref],
             |row| Ok(StoredDecision { decision_record: row.get(0)?, state: row.get(1)? }),
         ).optional().map_err(StoreError::from)
+    }
+
+    pub fn founder_verdict_expiry_authorization(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<StoredFounderVerdictExpiryAuthorization>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT identity_digest_sha256,authorization
+                 FROM founder_verdict_expiry_authorizations
+                 WHERE authorization_id=?1",
+                [authorization_id],
+                |row| {
+                    Ok(StoredFounderVerdictExpiryAuthorization {
+                        identity_digest_sha256: row.get(0)?,
+                        authorization: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn commit_founder_verdict_expiry_authorization(
+        &mut self,
+        authorization_id: &str,
+        verdict_id: &str,
+        issued_state_revision: u64,
+        identity_digest_sha256: &str,
+        authorization: &[u8],
+        committed_at_seconds: i64,
+    ) -> Result<FounderVerdictExpiryAuthorizationCommit, StoreError> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, Vec<u8>)> = tx
+            .query_row(
+                "SELECT identity_digest_sha256,authorization
+                 FROM founder_verdict_expiry_authorizations
+                 WHERE verdict_id=?1 AND issued_state_revision=?2",
+                params![verdict_id, issued_state_revision as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored_identity_digest_sha256, authorization)) = existing {
+            return Ok(if stored_identity_digest_sha256 == identity_digest_sha256 {
+                FounderVerdictExpiryAuthorizationCommit::Existing(
+                    StoredFounderVerdictExpiryAuthorization {
+                        identity_digest_sha256: stored_identity_digest_sha256,
+                        authorization,
+                    },
+                )
+            } else {
+                FounderVerdictExpiryAuthorizationCommit::Conflict
+            });
+        }
+        tx.execute(
+            "INSERT INTO founder_verdict_expiry_authorizations(
+               authorization_id,verdict_id,issued_state_revision,identity_digest_sha256,
+               authorization,committed_at_seconds
+             ) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                authorization_id,
+                verdict_id,
+                issued_state_revision as i64,
+                identity_digest_sha256,
+                authorization,
+                committed_at_seconds,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(FounderVerdictExpiryAuthorizationCommit::Committed)
     }
 
     pub fn issue(&mut self, c: &IssueCommit<'_>) -> Result<bool, StoreError> {

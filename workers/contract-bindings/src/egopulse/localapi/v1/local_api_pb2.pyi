@@ -613,7 +613,7 @@ class HarnessApprovalDecisionView(_message.Message):
     def __init__(self, authority_decision_ref: _Optional[str] = ..., decision: _Optional[_Union[_harness_pb2.ApprovalDecision, str]] = ..., reason_code: _Optional[str] = ..., state: _Optional[_Union[_policy_pb2.HarnessApprovalDecisionStateKind, str]] = ..., state_revision: _Optional[int] = ..., issued_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., updated_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
 
 class HarnessApprovalView(_message.Message):
-    __slots__ = ("metadata", "approval_request_id", "task_id", "run_id", "step_id", "attempt_id", "dispatch_id", "fencing_token", "kind", "action_digest_sha256", "requested_scope_ref", "display_summary_ref", "request_observation_id", "request_observation_sequence", "request_lifecycle", "request_revision", "policy_decision", "available_actions", "redactions")
+    __slots__ = ("metadata", "approval_request_id", "task_id", "run_id", "step_id", "attempt_id", "dispatch_id", "fencing_token", "kind", "action_digest_sha256", "requested_scope_ref", "display_summary_ref", "request_observation_id", "request_observation_sequence", "request_lifecycle", "request_revision", "policy_decision", "available_actions", "redactions", "display_summary")
     METADATA_FIELD_NUMBER: _ClassVar[int]
     APPROVAL_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     TASK_ID_FIELD_NUMBER: _ClassVar[int]
@@ -633,6 +633,7 @@ class HarnessApprovalView(_message.Message):
     POLICY_DECISION_FIELD_NUMBER: _ClassVar[int]
     AVAILABLE_ACTIONS_FIELD_NUMBER: _ClassVar[int]
     REDACTIONS_FIELD_NUMBER: _ClassVar[int]
+    DISPLAY_SUMMARY_FIELD_NUMBER: _ClassVar[int]
     metadata: ProjectionMetadata
     approval_request_id: str
     task_id: str
@@ -652,7 +653,8 @@ class HarnessApprovalView(_message.Message):
     policy_decision: HarnessApprovalDecisionView
     available_actions: _containers.RepeatedCompositeFieldContainer[AvailableAction]
     redactions: _containers.RepeatedCompositeFieldContainer[RedactedField]
-    def __init__(self, metadata: _Optional[_Union[ProjectionMetadata, _Mapping]] = ..., approval_request_id: _Optional[str] = ..., task_id: _Optional[str] = ..., run_id: _Optional[str] = ..., step_id: _Optional[str] = ..., attempt_id: _Optional[str] = ..., dispatch_id: _Optional[str] = ..., fencing_token: _Optional[int] = ..., kind: _Optional[_Union[_harness_pb2.ApprovalKind, str]] = ..., action_digest_sha256: _Optional[str] = ..., requested_scope_ref: _Optional[str] = ..., display_summary_ref: _Optional[str] = ..., request_observation_id: _Optional[str] = ..., request_observation_sequence: _Optional[int] = ..., request_lifecycle: _Optional[_Union[_harness_pb2.ApprovalRequestLifecycleKind, str]] = ..., request_revision: _Optional[int] = ..., policy_decision: _Optional[_Union[HarnessApprovalDecisionView, _Mapping]] = ..., available_actions: _Optional[_Iterable[_Union[AvailableAction, _Mapping]]] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ...) -> None: ...
+    display_summary: _harness_pb2.ApprovalDisplaySummary
+    def __init__(self, metadata: _Optional[_Union[ProjectionMetadata, _Mapping]] = ..., approval_request_id: _Optional[str] = ..., task_id: _Optional[str] = ..., run_id: _Optional[str] = ..., step_id: _Optional[str] = ..., attempt_id: _Optional[str] = ..., dispatch_id: _Optional[str] = ..., fencing_token: _Optional[int] = ..., kind: _Optional[_Union[_harness_pb2.ApprovalKind, str]] = ..., action_digest_sha256: _Optional[str] = ..., requested_scope_ref: _Optional[str] = ..., display_summary_ref: _Optional[str] = ..., request_observation_id: _Optional[str] = ..., request_observation_sequence: _Optional[int] = ..., request_lifecycle: _Optional[_Union[_harness_pb2.ApprovalRequestLifecycleKind, str]] = ..., request_revision: _Optional[int] = ..., policy_decision: _Optional[_Union[HarnessApprovalDecisionView, _Mapping]] = ..., available_actions: _Optional[_Iterable[_Union[AvailableAction, _Mapping]]] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ..., display_summary: _Optional[_Union[_harness_pb2.ApprovalDisplaySummary, _Mapping]] = ...) -> None: ...
 
 class HarnessContentPosition(_message.Message):
     __slots__ = ("epoch", "sequence", "projected_at")
@@ -1155,6 +1157,24 @@ class ExecuteFounderVerdictResponse(_message.Message):
     await_token: ProjectionAwaitToken
     gateway_error: LocalApiError
     def __init__(self, authority_result: _Optional[_Union[_verdict_pb2.VerdictCommandResult, _Mapping]] = ..., await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ..., gateway_error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class CreateFounderSupportingMaterialRequest(_message.Message):
+    __slots__ = ("client", "command")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    command: _verdict_pb2.CreateFounderSupportingMaterialCommand
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., command: _Optional[_Union[_verdict_pb2.CreateFounderSupportingMaterialCommand, _Mapping]] = ...) -> None: ...
+
+class CreateFounderSupportingMaterialResponse(_message.Message):
+    __slots__ = ("authority_result", "await_token", "gateway_error")
+    AUTHORITY_RESULT_FIELD_NUMBER: _ClassVar[int]
+    AWAIT_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    GATEWAY_ERROR_FIELD_NUMBER: _ClassVar[int]
+    authority_result: _verdict_pb2.FounderSupportingMaterialReceipt
+    await_token: ProjectionAwaitToken
+    gateway_error: LocalApiError
+    def __init__(self, authority_result: _Optional[_Union[_verdict_pb2.FounderSupportingMaterialReceipt, _Mapping]] = ..., await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ..., gateway_error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
 
 class SubmitMemoryCandidateCommand(_message.Message):
     __slots__ = ("metadata", "memory_id", "content", "source_ref", "scope_ref", "idempotency_key")

@@ -124,7 +124,7 @@ pub fn canonical_route_binding_digest(
 
 #[derive(Debug, Error)]
 pub enum SingleHarnessWorkError {
-    #[error("collaboration control operation failed")]
+    #[error("collaboration control operation failed: {0}")]
     Control(#[from] CollaborationControlError),
     #[error("single harness workflow command was rejected: {0}")]
     CommandRejected(String),
@@ -525,11 +525,13 @@ fn metadata(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| SingleHarnessWorkError::Clock)?;
     Ok(CommandMetadata {
-        // A workflow retry must address the same command identity. The
-        // request timestamp is deliberately volatile and is removed by
-        // `seal_request_digest`, but command/idempotency/correlation IDs are
-        // durable protocol identity and therefore must not be regenerated.
-        command_id: format!("egopulse-{command_id}"),
+        // A workflow retry must address the same command identity, while the
+        // same operation in another Run or Attempt must not collide with the
+        // store-wide command ID constraint. The request timestamp is
+        // deliberately volatile and is removed by `seal_request_digest`, but
+        // command/idempotency/correlation IDs are durable protocol identity
+        // and therefore must not be regenerated.
+        command_id: format!("egopulse-{command_id}:{scope}"),
         idempotency_key: format!("egopulse-{idempotency_key}"),
         idempotency_scope: scope.to_owned(),
         request_digest_sha256: String::new(),
@@ -540,4 +542,19 @@ fn metadata(
         correlation_id: format!("egopulse-correlation-{scope}"),
         causation_id: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_failure_display_preserves_the_safe_collaboration_cause() {
+        let error = SingleHarnessWorkError::Control(CollaborationControlError::Persistence);
+
+        assert_eq!(
+            error.to_string(),
+            "collaboration control operation failed: collaboration control persistence failed"
+        );
+    }
 }

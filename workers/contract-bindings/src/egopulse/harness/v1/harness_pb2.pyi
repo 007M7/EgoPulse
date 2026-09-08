@@ -151,6 +151,14 @@ class ApprovalRequestLifecycleKind(int, metaclass=_enum_type_wrapper.EnumTypeWra
     APPROVAL_REQUEST_LIFECYCLE_KIND_WITHDRAWN: _ClassVar[ApprovalRequestLifecycleKind]
     APPROVAL_REQUEST_LIFECYCLE_KIND_RESOLVED: _ClassVar[ApprovalRequestLifecycleKind]
 
+class ApprovalDisplaySummaryState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    APPROVAL_DISPLAY_SUMMARY_STATE_UNSPECIFIED: _ClassVar[ApprovalDisplaySummaryState]
+    APPROVAL_DISPLAY_SUMMARY_STATE_REVIEWABLE: _ClassVar[ApprovalDisplaySummaryState]
+    APPROVAL_DISPLAY_SUMMARY_STATE_UNAVAILABLE: _ClassVar[ApprovalDisplaySummaryState]
+    APPROVAL_DISPLAY_SUMMARY_STATE_REDACTED: _ClassVar[ApprovalDisplaySummaryState]
+    APPROVAL_DISPLAY_SUMMARY_STATE_CONFLICT: _ClassVar[ApprovalDisplaySummaryState]
+
 class CancellationDeliveryDisposition(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     CANCELLATION_DELIVERY_DISPOSITION_UNSPECIFIED: _ClassVar[CancellationDeliveryDisposition]
@@ -328,6 +336,11 @@ APPROVAL_REQUEST_LIFECYCLE_KIND_UNSPECIFIED: ApprovalRequestLifecycleKind
 APPROVAL_REQUEST_LIFECYCLE_KIND_OPEN: ApprovalRequestLifecycleKind
 APPROVAL_REQUEST_LIFECYCLE_KIND_WITHDRAWN: ApprovalRequestLifecycleKind
 APPROVAL_REQUEST_LIFECYCLE_KIND_RESOLVED: ApprovalRequestLifecycleKind
+APPROVAL_DISPLAY_SUMMARY_STATE_UNSPECIFIED: ApprovalDisplaySummaryState
+APPROVAL_DISPLAY_SUMMARY_STATE_REVIEWABLE: ApprovalDisplaySummaryState
+APPROVAL_DISPLAY_SUMMARY_STATE_UNAVAILABLE: ApprovalDisplaySummaryState
+APPROVAL_DISPLAY_SUMMARY_STATE_REDACTED: ApprovalDisplaySummaryState
+APPROVAL_DISPLAY_SUMMARY_STATE_CONFLICT: ApprovalDisplaySummaryState
 CANCELLATION_DELIVERY_DISPOSITION_UNSPECIFIED: CancellationDeliveryDisposition
 CANCELLATION_DELIVERY_DISPOSITION_DELIVERED: CancellationDeliveryDisposition
 CANCELLATION_DELIVERY_DISPOSITION_REJECTED: CancellationDeliveryDisposition
@@ -390,6 +403,40 @@ HARNESS_CONTENT_COMPACTION_REASON_UNSPECIFIED: HarnessContentCompactionReason
 HARNESS_CONTENT_COMPACTION_REASON_OWNER_HISTORY_FLOOR_ADVANCED: HarnessContentCompactionReason
 HARNESS_CONTENT_RETENTION_REASON_UNSPECIFIED: HarnessContentRetentionReason
 HARNESS_CONTENT_RETENTION_REASON_TERMINAL_MINIMUM_EXPIRED: HarnessContentRetentionReason
+
+class ApprovalDisplayFileChange(_message.Message):
+    __slots__ = ("relative_path", "change_kind")
+    RELATIVE_PATH_FIELD_NUMBER: _ClassVar[int]
+    CHANGE_KIND_FIELD_NUMBER: _ClassVar[int]
+    relative_path: str
+    change_kind: str
+    def __init__(self, relative_path: _Optional[str] = ..., change_kind: _Optional[str] = ...) -> None: ...
+
+class ApprovalDisplaySummary(_message.Message):
+    __slots__ = ("state", "summary_ref", "summary_digest_sha256", "action_digest_sha256", "source_binding_sha256", "command_preview", "working_directory_label", "files", "redaction_reason_codes", "truncated", "policy_code")
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    SUMMARY_REF_FIELD_NUMBER: _ClassVar[int]
+    SUMMARY_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    ACTION_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_BINDING_SHA256_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_PREVIEW_FIELD_NUMBER: _ClassVar[int]
+    WORKING_DIRECTORY_LABEL_FIELD_NUMBER: _ClassVar[int]
+    FILES_FIELD_NUMBER: _ClassVar[int]
+    REDACTION_REASON_CODES_FIELD_NUMBER: _ClassVar[int]
+    TRUNCATED_FIELD_NUMBER: _ClassVar[int]
+    POLICY_CODE_FIELD_NUMBER: _ClassVar[int]
+    state: ApprovalDisplaySummaryState
+    summary_ref: str
+    summary_digest_sha256: str
+    action_digest_sha256: str
+    source_binding_sha256: str
+    command_preview: str
+    working_directory_label: str
+    files: _containers.RepeatedCompositeFieldContainer[ApprovalDisplayFileChange]
+    redaction_reason_codes: _containers.RepeatedScalarFieldContainer[str]
+    truncated: bool
+    policy_code: str
+    def __init__(self, state: _Optional[_Union[ApprovalDisplaySummaryState, str]] = ..., summary_ref: _Optional[str] = ..., summary_digest_sha256: _Optional[str] = ..., action_digest_sha256: _Optional[str] = ..., source_binding_sha256: _Optional[str] = ..., command_preview: _Optional[str] = ..., working_directory_label: _Optional[str] = ..., files: _Optional[_Iterable[_Union[ApprovalDisplayFileChange, _Mapping]]] = ..., redaction_reason_codes: _Optional[_Iterable[str]] = ..., truncated: _Optional[bool] = ..., policy_code: _Optional[str] = ...) -> None: ...
 
 class NativeProtocolFingerprint(_message.Message):
     __slots__ = ("protocol_name", "protocol_version", "schema_sha256", "adapter_version", "native_executable_version", "native_binary_sha256")
@@ -720,7 +767,7 @@ class LifecycleObservation(_message.Message):
     def __init__(self, kind: _Optional[_Union[LifecycleKind, str]] = ..., native_item_ref: _Optional[str] = ..., safe_status_code: _Optional[str] = ..., side_effect_certainty: _Optional[_Union[SideEffectCertainty, str]] = ..., native_will_retry: _Optional[bool] = ...) -> None: ...
 
 class ApprovalRequestObservation(_message.Message):
-    __slots__ = ("approval_request_id", "kind", "action_digest_sha256", "requested_scope_ref", "display_summary_ref", "native_routing_ref", "lifecycle", "request_revision")
+    __slots__ = ("approval_request_id", "kind", "action_digest_sha256", "requested_scope_ref", "display_summary_ref", "native_routing_ref", "lifecycle", "request_revision", "display_summary")
     APPROVAL_REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     KIND_FIELD_NUMBER: _ClassVar[int]
     ACTION_DIGEST_SHA256_FIELD_NUMBER: _ClassVar[int]
@@ -729,6 +776,7 @@ class ApprovalRequestObservation(_message.Message):
     NATIVE_ROUTING_REF_FIELD_NUMBER: _ClassVar[int]
     LIFECYCLE_FIELD_NUMBER: _ClassVar[int]
     REQUEST_REVISION_FIELD_NUMBER: _ClassVar[int]
+    DISPLAY_SUMMARY_FIELD_NUMBER: _ClassVar[int]
     approval_request_id: str
     kind: ApprovalKind
     action_digest_sha256: str
@@ -737,7 +785,8 @@ class ApprovalRequestObservation(_message.Message):
     native_routing_ref: str
     lifecycle: ApprovalRequestLifecycleKind
     request_revision: int
-    def __init__(self, approval_request_id: _Optional[str] = ..., kind: _Optional[_Union[ApprovalKind, str]] = ..., action_digest_sha256: _Optional[str] = ..., requested_scope_ref: _Optional[str] = ..., display_summary_ref: _Optional[str] = ..., native_routing_ref: _Optional[str] = ..., lifecycle: _Optional[_Union[ApprovalRequestLifecycleKind, str]] = ..., request_revision: _Optional[int] = ...) -> None: ...
+    display_summary: ApprovalDisplaySummary
+    def __init__(self, approval_request_id: _Optional[str] = ..., kind: _Optional[_Union[ApprovalKind, str]] = ..., action_digest_sha256: _Optional[str] = ..., requested_scope_ref: _Optional[str] = ..., display_summary_ref: _Optional[str] = ..., native_routing_ref: _Optional[str] = ..., lifecycle: _Optional[_Union[ApprovalRequestLifecycleKind, str]] = ..., request_revision: _Optional[int] = ..., display_summary: _Optional[_Union[ApprovalDisplaySummary, _Mapping]] = ...) -> None: ...
 
 class UsageObservation(_message.Message):
     __slots__ = ("usage_receipt_ref", "input_tokens", "output_tokens", "cached_input_tokens", "cost_receipt_ref")

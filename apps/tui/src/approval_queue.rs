@@ -43,6 +43,9 @@ type ApprovalQueueSleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub struct ApprovalQueueItem {
     pub approval_request_id: String,
     pub task_id: String,
+    pub summary_text: String,
+    pub summary_digest: Option<String>,
+    pub allow_once_available: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -201,6 +204,24 @@ fn safe_items(
         .map(|value| ApprovalQueueItem {
             approval_request_id: value.approval_request_id().to_owned(),
             task_id: value.task_id().to_owned(),
+            summary_text: egopulse_domain_contracts::approval_display::approval_display_text(
+                value.view().display_summary.as_ref(),
+                &value.view().display_summary_ref,
+                value.action_digest_sha256(),
+                value.view().kind,
+            ),
+            summary_digest: value
+                .view()
+                .display_summary
+                .as_ref()
+                .map(|summary| summary.summary_digest_sha256.clone()),
+            allow_once_available:
+                egopulse_domain_contracts::approval_display::valid_reviewable_approval_summary(
+                    value.view().display_summary.as_ref(),
+                    &value.view().display_summary_ref,
+                    value.action_digest_sha256(),
+                    value.view().kind,
+                ),
         })
         .collect::<Vec<_>>();
     items.sort_by(|left, right| left.approval_request_id.cmp(&right.approval_request_id));
@@ -486,6 +507,7 @@ impl<C: ApprovalQueueClient + ?Sized + 'static> ApprovalQueueController<C> {
         decision: GuidedApprovalDecision,
         reason_code: String,
         confirmation_proof_ref: Option<String>,
+        reviewed_summary_digest_sha256: Option<String>,
     ) -> Result<ApprovalDecisionReceipt, ClientGuidedApprovalDecisionError> {
         let selected = self
             .model
@@ -506,6 +528,7 @@ impl<C: ApprovalQueueClient + ?Sized + 'static> ApprovalQueueController<C> {
                 decision,
                 reason_code,
                 confirmation_proof_ref,
+                reviewed_summary_digest_sha256,
             })
             .await
     }
@@ -891,6 +914,9 @@ mod tests {
         ApprovalQueueItem {
             approval_request_id: id.to_owned(),
             task_id: format!("task:{id}"),
+            summary_text: "Command: cargo test".to_owned(),
+            summary_digest: Some("d".repeat(64)),
+            allow_once_available: true,
         }
     }
 
@@ -1190,6 +1216,7 @@ mod tests {
                     GuidedApprovalDecision::Deny,
                     "founder-reviewed".to_owned(),
                     None,
+                    None,
                 )
                 .await,
             Err(ClientGuidedApprovalDecisionError::NonActionable)
@@ -1221,6 +1248,7 @@ mod tests {
                 GuidedApprovalDecision::Deny,
                 "founder-denied".to_owned(),
                 Some("proof:1".to_owned()),
+                None,
             )
             .await
             .unwrap();
@@ -1228,7 +1256,12 @@ mod tests {
         assert_eq!(controller.model().unwrap().items, [item("approval:a")]);
         assert!(matches!(
             controller
-                .decide_selected(GuidedApprovalDecision::AllowOnce, "again".to_owned(), None)
+                .decide_selected(
+                    GuidedApprovalDecision::AllowOnce,
+                    "again".to_owned(),
+                    None,
+                    Some("d".repeat(64))
+                )
                 .await,
             Err(ClientGuidedApprovalDecisionError::Authority { .. })
         ));

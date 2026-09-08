@@ -5,21 +5,22 @@ use egopulse_cognition_runtime::task_authority::{
     TaskAuthority, TaskAuthorityFailure, canonical_request_digest as task_canonical_request_digest,
 };
 use egopulse_domain_contracts::v01::egopulse::{
-    artifact::v1::{ArtifactSet, ArtifactSetStatus, ContentAddress, HashAlgorithm},
+    artifact::v1::{ArtifactSet, ArtifactSetStatus, ClaimStatus, ContentAddress, HashAlgorithm},
     common::v1::{CommandMetadata, ContractReference},
     task::v1::{
-        RecordTaskVerificationCommand, TaskCommand, TaskEventKind, TaskStatus, get_task_response,
-        task_command,
+        RecordTaskVerificationCommand, TaskCommand, TaskEventKind, TaskSnapshot, TaskStatus,
+        get_task_response, task_command,
     },
     verification::v1::{
         AttestCheckerProfileCommand, CheckerAssuranceClass, CheckerProfile, CheckerProfileStatus,
         CreateVerificationRequestCommand, VerificationBinding, VerificationCommand,
-        VerificationRequest, verification_command,
+        VerificationRequest, VerificationStatus, verification_command,
     },
 };
 use egopulse_verification_authority::{
     ArtifactReferenceSource, ArtifactReferenceSourceError, AuthenticatedVerificationPrincipal,
-    GovernedCheckerSupervisor, GovernedSegoRunner, GovernedVerificationExecutionCoordinator,
+    GovernedCheckerSupervisor, GovernedSegoRunner, GovernedVerificationBatchPlan,
+    GovernedVerificationChecker, GovernedVerificationExecutionCoordinator,
     GovernedVerificationExecutionError, GovernedVerificationExecutionPlan, SegoMapperPolicy,
     SystemVerificationClock, VerificationAuthority, VerificationAuthorityFailure,
     VerificationClock, VerificationPrincipalKind, canonical_request_digest,
@@ -47,6 +48,15 @@ pub struct VerificationBindingTemplate {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VerificationHandoffPlan {
     pub binding: VerificationBindingTemplate,
+    pub criterion_ids: Vec<String>,
+    pub checker_profile_refs: Vec<ContractReference>,
+}
+
+/// Reviewed Verification policy whose primary Claim identity is resolved from
+/// the current Artifact Set at handoff consumption time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DynamicPrimaryClaimHandoffPlan {
+    pub claim_semantic_profile_ref: ContractReference,
     pub criterion_ids: Vec<String>,
     pub checker_profile_refs: Vec<ContractReference>,
 }
@@ -203,6 +213,27 @@ impl SystemTaskVerificationWriteBack {
         verification: Arc<Mutex<VerificationAuthority>>,
     ) -> Self {
         Self { task, verification }
+    }
+
+    fn needs_processing(
+        &self,
+        request: &VerificationRequest,
+        artifact_id: &str,
+    ) -> Result<bool, TaskVerificationWriteBackError> {
+        let lineage = request
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.lineage.as_ref())
+            .ok_or(TaskVerificationWriteBackError::ArtifactBindingMismatch)?;
+        let task = self
+            .task
+            .lock()
+            .map_err(|_| TaskVerificationWriteBackError::TaskLock)?;
+        let snapshot = match task.get_task(&lineage.task_id)?.outcome {
+            Some(get_task_response::Outcome::Task(snapshot)) => snapshot,
+            _ => return Err(TaskVerificationWriteBackError::TaskSnapshotMismatch),
+        };
+        request_needs_processing(request, &snapshot, artifact_id)
     }
 
     pub fn record_one(
@@ -390,6 +421,8 @@ pub enum VerificationHandoffPlanError {
     AcceptanceContractMissing,
     #[error("Artifact set is missing, unsealed, or does not belong to the handoff")]
     ArtifactSetInvalid,
+    #[error("Artifact set primary Claim is missing, ambiguous, or invalid")]
+    PrimaryClaimInvalid,
     #[error("Task handoff and configured lineage do not match")]
     LineageMismatch,
 }
@@ -539,8 +572,77 @@ impl VerificationHandoffPlan {
     }
 }
 
+impl DynamicPrimaryClaimHandoffPlan {
+    pub fn validate(&self) -> Result<(), VerificationHandoffPlanError> {
+        if !contract_reference_valid(&self.claim_semantic_profile_ref)
+            || !unique_nonempty(&self.criterion_ids)
+            || self.checker_profile_refs.is_empty()
+            || !self
+                .checker_profile_refs
+                .iter()
+                .all(contract_reference_valid)
+            || !unique_contract_references(&self.checker_profile_refs)
+        {
+            return Err(VerificationHandoffPlanError::Invalid);
+        }
+        Ok(())
+    }
+
+    /// Resolves the sole current Artifact Set Claim and converts this dynamic
+    /// policy into the existing explicit binding plan. The Claim ID always
+    /// comes from Artifact Authority; configuration cannot substitute one.
+    pub fn resolve(
+        &self,
+        handoff: &PendingTaskVerification,
+        artifact_set: &ArtifactSet,
+        artifact: &dyn ArtifactReferenceSource,
+    ) -> Result<VerificationHandoffPlan, VerificationHandoffIntakeError> {
+        self.validate()?;
+        let [claim_id] = artifact_set.claim_ids.as_slice() else {
+            return Err(VerificationHandoffPlanError::PrimaryClaimInvalid.into());
+        };
+        if claim_id.trim().is_empty() || !unique_nonempty(&artifact_set.artifact_ids) {
+            return Err(VerificationHandoffPlanError::PrimaryClaimInvalid.into());
+        }
+
+        let resolved = VerificationHandoffPlan {
+            binding: VerificationBindingTemplate {
+                claim_id: claim_id.clone(),
+                claim_semantic_profile_ref: self.claim_semantic_profile_ref.clone(),
+            },
+            criterion_ids: self.criterion_ids.clone(),
+            checker_profile_refs: self.checker_profile_refs.clone(),
+        };
+        let prepared = resolved.request_for(handoff, artifact_set)?;
+        let binding = prepared
+            .request
+            .binding
+            .as_ref()
+            .ok_or(VerificationHandoffPlanError::PrimaryClaimInvalid)?;
+        let claim = artifact
+            .read_claim(claim_id)?
+            .ok_or(VerificationHandoffPlanError::PrimaryClaimInvalid)?;
+        if claim.claim_id.as_str() != claim_id.as_str()
+            || claim.status != ClaimStatus::Proposed as i32
+            || claim.semantic_profile_ref.as_ref() != Some(&self.claim_semantic_profile_ref)
+            || claim.acceptance_contract_ref.as_ref() != binding.acceptance_contract_ref.as_ref()
+            || claim.lineage.as_ref() != artifact_set.lineage.as_ref()
+            || !unique_nonempty(&claim.subject_artifact_ids)
+            || claim
+                .subject_artifact_ids
+                .iter()
+                .any(|id| !artifact_set.artifact_ids.contains(id))
+        {
+            return Err(VerificationHandoffPlanError::PrimaryClaimInvalid.into());
+        }
+        Ok(resolved)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum VerificationHandoffIntakeError {
+    #[error("Task handoff preparation is blocked: {0}")]
+    PreparationBlocked(&'static str),
     #[error("Task Authority handoff read failed: {0}")]
     Task(#[from] TaskAuthorityFailure),
     #[error("Verification Authority command failed: {0}")]
@@ -565,6 +667,18 @@ pub struct VerificationHandoffConsumeResult {
     pub task_outbox_acknowledged: bool,
     pub error_code: i32,
     pub safe_error_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerificationHandoffBlockage {
+    pub(crate) task_id: String,
+    pub(crate) message_id: String,
+    pub(crate) reason_code: &'static str,
+}
+
+pub(crate) struct VerificationHandoffIntakeReport {
+    pub(crate) consumed: Option<VerificationHandoffConsumeResult>,
+    pub(crate) blockages: Vec<VerificationHandoffBlockage>,
 }
 
 /// Explicit reviewed composition for the first single-checker Verification
@@ -633,6 +747,12 @@ impl VerificationWorkerConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerificationWorkerCycleResult {
     Idle,
+    Held {
+        verification_request_id: String,
+        task_id: String,
+        verification_run_id: String,
+        reason_code: String,
+    },
     Completed {
         verification_request_id: String,
         task_id: String,
@@ -669,6 +789,55 @@ pub enum VerificationWorkerCycleError {
     WriteBack(#[from] TaskVerificationWriteBackError),
 }
 
+fn request_needs_processing(
+    request: &VerificationRequest,
+    task: &TaskSnapshot,
+    artifact_id: &str,
+) -> Result<bool, TaskVerificationWriteBackError> {
+    let binding = request
+        .binding
+        .as_ref()
+        .ok_or(TaskVerificationWriteBackError::ArtifactBindingMismatch)?;
+    let lineage = binding
+        .lineage
+        .as_ref()
+        .ok_or(TaskVerificationWriteBackError::ArtifactBindingMismatch)?;
+    let expected_revision = lineage
+        .task_revision
+        .checked_add(1)
+        .ok_or(TaskVerificationWriteBackError::ArtifactBindingMismatch)?;
+    if !lineage_valid(lineage)
+        || artifact_id.trim().is_empty()
+        || task.task_id != lineage.task_id
+        || task.revision < expected_revision
+        || task.work_revision < lineage.work_revision
+    {
+        return Err(TaskVerificationWriteBackError::TaskSnapshotMismatch);
+    }
+    // A later work revision is authoritative supersession, not permission to
+    // execute an old checker again or write its result over the revised Task.
+    if task.work_revision > lineage.work_revision {
+        return Ok(false);
+    }
+    if task.status == TaskStatus::VerificationPending as i32
+        && task.revision == expected_revision
+        && task.artifact_set_id.as_deref() == Some(binding.artifact_set_id.as_str())
+        && task.acceptance_contract_ref == binding.acceptance_contract_ref
+    {
+        // This includes Completed after a crash before its Task write-back.
+        return Ok(true);
+    }
+    if request.status == VerificationStatus::Completed as i32
+        && task.revision > expected_revision
+        && task.verification_artifact_id.as_deref() == Some(artifact_id)
+        && task.artifact_set_id.as_deref() == Some(binding.artifact_set_id.as_str())
+        && task.acceptance_contract_ref == binding.acceptance_contract_ref
+    {
+        return Ok(false);
+    }
+    Err(TaskVerificationWriteBackError::TaskSnapshotMismatch)
+}
+
 /// The daemon's one durable Verification worker boundary. A cycle first
 /// attests the configured profile, consumes at most one new Task handoff, then
 /// scans Verification-owned queued/running/completed requests so a crash after
@@ -686,12 +855,63 @@ pub trait VerificationWorker: Send + Sync + 'static {
 }
 
 pub struct ConfiguredVerificationWorker {
-    config: VerificationWorkerConfig,
+    execution: ConfiguredVerificationExecution,
     verification: Arc<Mutex<VerificationAuthority>>,
     attestation: SystemCheckerProfileAttestation,
     intake: VerificationHandoffIntake,
     coordinator: GovernedVerificationExecutionCoordinator<SystemVerificationClock>,
     write_back: SystemTaskVerificationWriteBack,
+}
+
+/// The production repository path changes only preparation and execution;
+/// durable request intake, scheduling, recovery and Task write-back remain shared.
+enum ConfiguredVerificationExecution {
+    Legacy(Box<VerificationWorkerConfig>),
+    Prepared {
+        criterion_ids: Vec<String>,
+        checker_profile_ids: Vec<String>,
+        checker: Arc<dyn GovernedVerificationChecker>,
+    },
+}
+
+impl ConfiguredVerificationExecution {
+    fn owns(&self, request: &VerificationRequest) -> bool {
+        match self {
+            Self::Legacy(config) => {
+                request.criterion_ids == config.handoff_plan.criterion_ids
+                    && request.checker_profile_refs == config.handoff_plan.checker_profile_refs
+            }
+            Self::Prepared {
+                criterion_ids,
+                checker_profile_ids,
+                ..
+            } => {
+                request.criterion_ids == *criterion_ids
+                    && request.checker_profile_refs.len() == checker_profile_ids.len()
+                    && request
+                        .checker_profile_refs
+                        .iter()
+                        .zip(checker_profile_ids)
+                        .all(|(reference, id)| reference.contract_id == *id)
+            }
+        }
+    }
+
+    fn artifact_id(&self, request_id: &str) -> String {
+        let prefix = match self {
+            Self::Legacy(config) => &config.verification_artifact_id_prefix,
+            Self::Prepared { .. } => "verification-artifact:",
+        };
+        format!("{prefix}{request_id}")
+    }
+
+    fn run_id(&self, request_id: &str) -> String {
+        let prefix = match self {
+            Self::Legacy(config) => &config.verification_run_id_prefix,
+            Self::Prepared { .. } => "verification-run:",
+        };
+        format!("{prefix}{request_id}")
+    }
 }
 
 impl ConfiguredVerificationWorker {
@@ -726,7 +946,7 @@ impl ConfiguredVerificationWorker {
             GovernedSegoRunner::new(supervisor),
         );
         Ok(Self {
-            config,
+            execution: ConfiguredVerificationExecution::Legacy(Box::new(config)),
             verification: Arc::clone(&verification),
             attestation: SystemCheckerProfileAttestation::new(Arc::clone(&verification)),
             intake,
@@ -735,12 +955,53 @@ impl ConfiguredVerificationWorker {
         })
     }
 
+    pub(crate) fn new_prepared(
+        task: Arc<Mutex<TaskAuthority>>,
+        artifact: Box<dyn ArtifactReferenceSource>,
+        verification: Arc<Mutex<VerificationAuthority>>,
+        preparation: Arc<dyn VerificationHandoffPreparation>,
+        criterion_ids: Vec<String>,
+        checker_profile_ids: Vec<String>,
+        checker: Arc<dyn GovernedVerificationChecker>,
+    ) -> Result<Self, VerificationWorkerConfigurationError> {
+        if !unique_nonempty(&criterion_ids) || !unique_nonempty(&checker_profile_ids) {
+            return Err(VerificationHandoffPlanError::Invalid.into());
+        }
+        Ok(Self {
+            execution: ConfiguredVerificationExecution::Prepared {
+                criterion_ids,
+                checker_profile_ids,
+                checker,
+            },
+            verification: Arc::clone(&verification),
+            attestation: SystemCheckerProfileAttestation::new(Arc::clone(&verification)),
+            intake: VerificationHandoffIntake {
+                task: Arc::clone(&task),
+                artifact,
+                verification: Arc::clone(&verification),
+                plan: VerificationHandoffPlanSource::Prepared(preparation),
+                principal: AuthenticatedVerificationPrincipal {
+                    kind: VerificationPrincipalKind::TaskAuthority,
+                    principal_id: "task-authority:verification-worker".to_owned(),
+                    authenticated: true,
+                    checker_profile_id: None,
+                },
+            },
+            coordinator: GovernedVerificationExecutionCoordinator::from_authority(Arc::clone(
+                &verification,
+            )),
+            write_back: SystemTaskVerificationWriteBack::new(task, verification),
+        })
+    }
+
     async fn run_cycle(
         &self,
     ) -> Result<VerificationWorkerCycleResult, VerificationWorkerCycleError> {
         let issued_at = VerificationClock::now(&SystemVerificationClock);
-        self.attestation
-            .attest_one(self.config.checker_profile.clone(), issued_at)?;
+        if let ConfiguredVerificationExecution::Legacy(config) = &self.execution {
+            self.attestation
+                .attest_one(config.checker_profile.clone(), issued_at)?;
+        }
         if let Some(handoff) = self.intake.consume_one(issued_at)?
             && !handoff.committed
             && !handoff.replayed
@@ -750,20 +1011,29 @@ impl ConfiguredVerificationWorker {
                 safe_error_fingerprint: handoff.safe_error_fingerprint,
             });
         }
-        let request = {
+        let requests = {
             let verification = self
                 .verification
                 .lock()
                 .map_err(|_| VerificationWorkerCycleError::AuthorityLock)?;
-            verification
-                .execution_requests()?
-                .into_iter()
-                .find(|request| {
-                    request.criterion_ids == self.config.handoff_plan.criterion_ids
-                        && request.checker_profile_refs
-                            == self.config.handoff_plan.checker_profile_refs
-                })
+            verification.execution_requests()?
         };
+        // Completed requests remain durable Verification facts. Only requests
+        // still needing execution or Task write-back belong in this work queue.
+        // Consult the Task owner after releasing the Verification lock.
+        let mut request = None;
+        for candidate in requests {
+            if !self.execution.owns(&candidate) {
+                continue;
+            }
+            let artifact_id = self
+                .execution
+                .artifact_id(&candidate.verification_request_id);
+            if self.write_back.needs_processing(&candidate, &artifact_id)? {
+                request = Some(candidate);
+                break;
+            }
+        }
         let Some(request) = request else {
             return Ok(VerificationWorkerCycleResult::Idle);
         };
@@ -778,36 +1048,60 @@ impl ConfiguredVerificationWorker {
         {
             return Err(VerificationWorkerCycleError::RequestLineage);
         }
-        let verification_run_id = format!(
-            "{}{}",
-            self.config.verification_run_id_prefix, request.verification_request_id
-        );
-        let verification_artifact_id = format!(
-            "{}{}",
-            self.config.verification_artifact_id_prefix, request.verification_request_id
-        );
-        let execution_id = format!(
-            "{}{}",
-            self.config.execution_id_prefix, request.verification_request_id
-        );
-        let outcome = self
-            .coordinator
-            .execute_one(GovernedVerificationExecutionPlan {
-                verification_request_id: request.verification_request_id.clone(),
+        let verification_run_id = self.execution.run_id(&request.verification_request_id);
+        let verification_artifact_id = self.execution.artifact_id(&request.verification_request_id);
+        let outcome = match &self.execution {
+            ConfiguredVerificationExecution::Legacy(config) => {
+                self.coordinator
+                    .execute_one(GovernedVerificationExecutionPlan {
+                        verification_request_id: request.verification_request_id.clone(),
+                        verification_run_id,
+                        execution_id: format!(
+                            "{}{}",
+                            config.execution_id_prefix, request.verification_request_id
+                        ),
+                        working_directory: config.working_directory.clone(),
+                        checker_request: config.checker_request.clone(),
+                        mapper_policy: config.mapper_policy.clone(),
+                        verification_artifact_id: verification_artifact_id.clone(),
+                        tool_receipt_artifact_ids: config.tool_receipt_artifact_ids.clone(),
+                        model_call_receipt_artifact_ids: config
+                            .model_call_receipt_artifact_ids
+                            .clone(),
+                        issued_at,
+                    })
+                    .await
+            }
+            ConfiguredVerificationExecution::Prepared { checker, .. } => {
+                self.coordinator
+                    .execute_prepared(
+                        GovernedVerificationBatchPlan {
+                            verification_request_id: request.verification_request_id.clone(),
+                            verification_run_id,
+                            verification_artifact_id: verification_artifact_id.clone(),
+                            issued_at,
+                        },
+                        checker.as_ref(),
+                    )
+                    .await
+            }
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(GovernedVerificationExecutionError::HeldForRecovery {
                 verification_run_id,
-                execution_id,
-                working_directory: self.config.working_directory.clone(),
-                checker_request: self.config.checker_request.clone(),
-                mapper_policy: self.config.mapper_policy.clone(),
-                verification_artifact_id: verification_artifact_id.clone(),
-                tool_receipt_artifact_ids: self.config.tool_receipt_artifact_ids.clone(),
-                model_call_receipt_artifact_ids: self
-                    .config
-                    .model_call_receipt_artifact_ids
-                    .clone(),
-                issued_at,
-            })
-            .await?;
+                reason_code,
+            }) => {
+                tracing::warn!(safe_reason_code = %reason_code, "verification held without re-executing its checker");
+                return Ok(VerificationWorkerCycleResult::Held {
+                    verification_request_id: request.verification_request_id.clone(),
+                    task_id: lineage.task_id.clone(),
+                    verification_run_id,
+                    reason_code,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
         let write_back = self.write_back.record_one(
             &lineage.task_id,
             lineage
@@ -849,8 +1143,23 @@ pub struct VerificationHandoffIntake {
     task: Arc<Mutex<TaskAuthority>>,
     artifact: Box<dyn ArtifactReferenceSource>,
     verification: Arc<Mutex<VerificationAuthority>>,
-    plan: VerificationHandoffPlan,
+    plan: VerificationHandoffPlanSource,
     principal: AuthenticatedVerificationPrincipal,
+}
+
+enum VerificationHandoffPlanSource {
+    Explicit(VerificationHandoffPlan),
+    DynamicPrimaryClaim(DynamicPrimaryClaimHandoffPlan),
+    Prepared(Arc<dyn VerificationHandoffPreparation>),
+}
+
+pub(crate) trait VerificationHandoffPreparation: Send + Sync {
+    fn prepare(
+        &self,
+        handoff: &PendingTaskVerification,
+        artifact_set: &ArtifactSet,
+        artifact: &dyn ArtifactReferenceSource,
+    ) -> Result<VerificationHandoffPlan, VerificationHandoffIntakeError>;
 }
 
 impl VerificationHandoffIntake {
@@ -866,7 +1175,24 @@ impl VerificationHandoffIntake {
             task,
             artifact,
             verification,
-            plan,
+            plan: VerificationHandoffPlanSource::Explicit(plan),
+            principal,
+        })
+    }
+
+    pub fn new_dynamic_primary_claim(
+        task: Arc<Mutex<TaskAuthority>>,
+        artifact: Box<dyn ArtifactReferenceSource>,
+        verification: Arc<Mutex<VerificationAuthority>>,
+        plan: DynamicPrimaryClaimHandoffPlan,
+        principal: AuthenticatedVerificationPrincipal,
+    ) -> Result<Self, VerificationHandoffPlanError> {
+        plan.validate()?;
+        Ok(Self {
+            task,
+            artifact,
+            verification,
+            plan: VerificationHandoffPlanSource::DynamicPrimaryClaim(plan),
             principal,
         })
     }
@@ -875,16 +1201,75 @@ impl VerificationHandoffIntake {
         &self,
         issued_at: Timestamp,
     ) -> Result<Option<VerificationHandoffConsumeResult>, VerificationHandoffIntakeError> {
-        let handoff = {
+        let report = self.consume_one_with_report(issued_at)?;
+        for blocked in report.blockages {
+            tracing::warn!(task_id = %blocked.task_id, message_id = %blocked.message_id,
+                safe_reason_code = blocked.reason_code, "Task verification handoff remains pending; later Tasks may proceed");
+        }
+        Ok(report.consumed)
+    }
+
+    pub(crate) fn consume_one_with_report(
+        &self,
+        issued_at: Timestamp,
+    ) -> Result<VerificationHandoffIntakeReport, VerificationHandoffIntakeError> {
+        let pending = {
             let task = self
                 .task
                 .lock()
                 .map_err(|_| VerificationHandoffIntakeError::TaskLock)?;
-            task.pending_task_verifications()?.into_iter().next()
+            task.pending_task_verifications()?
         };
-        let Some(handoff) = handoff else {
-            return Ok(None);
-        };
+        let mut blockages = Vec::new();
+        for handoff in pending {
+            let resolved = self.prepare_handoff(&handoff, issued_at);
+            let (command, expected_request_id) = match resolved {
+                Ok(prepared) => prepared,
+                Err(error) if matches!(self.plan, VerificationHandoffPlanSource::Prepared(_)) => {
+                    let reason_code = match error {
+                        VerificationHandoffIntakeError::PreparationBlocked(reason) => reason,
+                        VerificationHandoffIntakeError::Plan(
+                            VerificationHandoffPlanError::LineageMismatch,
+                        ) => "VERIFICATION_HANDOFF_LINEAGE_MISMATCH",
+                        VerificationHandoffIntakeError::Plan(_) => "VERIFICATION_MATERIAL_INVALID",
+                        VerificationHandoffIntakeError::Artifact(_) => {
+                            "VERIFICATION_MATERIAL_UNAVAILABLE"
+                        }
+                        fatal => return Err(fatal),
+                    };
+                    blockages.push(VerificationHandoffBlockage {
+                        task_id: handoff
+                            .event
+                            .snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.task_id.clone())
+                            .unwrap_or_default(),
+                        message_id: handoff.message_id.clone(),
+                        reason_code,
+                    });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            // Once the owning Authority sees a command, preserve its existing
+            // rejection/error and ACK ordering. Only preparation is task-local.
+            let consumed = self.commit_handoff(handoff, command, expected_request_id)?;
+            return Ok(VerificationHandoffIntakeReport {
+                consumed: Some(consumed),
+                blockages,
+            });
+        }
+        Ok(VerificationHandoffIntakeReport {
+            consumed: None,
+            blockages,
+        })
+    }
+
+    fn prepare_handoff(
+        &self,
+        handoff: &PendingTaskVerification,
+        issued_at: Timestamp,
+    ) -> Result<(VerificationCommand, String), VerificationHandoffIntakeError> {
         let artifact_set_id = handoff
             .event
             .snapshot
@@ -895,13 +1280,28 @@ impl VerificationHandoffIntake {
             .artifact
             .read_artifact_set(artifact_set_id)?
             .ok_or(VerificationHandoffPlanError::ArtifactSetInvalid)?;
-        let command = self
-            .plan
-            .create_command(&handoff, &artifact_set, issued_at)?;
-        let expected_request_id = self
-            .plan
-            .request_for(&handoff, &artifact_set)?
+        let plan = match &self.plan {
+            VerificationHandoffPlanSource::Explicit(plan) => plan.clone(),
+            VerificationHandoffPlanSource::DynamicPrimaryClaim(plan) => {
+                plan.resolve(handoff, &artifact_set, self.artifact.as_ref())?
+            }
+            VerificationHandoffPlanSource::Prepared(preparation) => {
+                preparation.prepare(handoff, &artifact_set, self.artifact.as_ref())?
+            }
+        };
+        let command = plan.create_command(handoff, &artifact_set, issued_at)?;
+        let expected_request_id = plan
+            .request_for(handoff, &artifact_set)?
             .verification_request_id;
+        Ok((command, expected_request_id))
+    }
+
+    fn commit_handoff(
+        &self,
+        handoff: PendingTaskVerification,
+        command: VerificationCommand,
+        expected_request_id: String,
+    ) -> Result<VerificationHandoffConsumeResult, VerificationHandoffIntakeError> {
         let result = {
             let mut verification = self
                 .verification
@@ -910,7 +1310,7 @@ impl VerificationHandoffIntake {
             verification.execute(&command, &self.principal)?
         };
         if !result.committed && !result.replayed {
-            return Ok(Some(VerificationHandoffConsumeResult {
+            return Ok(VerificationHandoffConsumeResult {
                 message_id: handoff.message_id,
                 payload_digest_sha256: handoff.payload_digest_sha256,
                 verification_request_id: expected_request_id,
@@ -919,7 +1319,7 @@ impl VerificationHandoffIntake {
                 task_outbox_acknowledged: false,
                 error_code: result.error_code,
                 safe_error_fingerprint: result.safe_error_fingerprint,
-            }));
+            });
         }
         let acknowledged = {
             let mut task = self
@@ -931,7 +1331,7 @@ impl VerificationHandoffIntake {
                 &handoff.payload_digest_sha256,
             )?
         };
-        Ok(Some(VerificationHandoffConsumeResult {
+        Ok(VerificationHandoffConsumeResult {
             message_id: handoff.message_id,
             payload_digest_sha256: handoff.payload_digest_sha256,
             verification_request_id: expected_request_id,
@@ -940,7 +1340,7 @@ impl VerificationHandoffIntake {
             task_outbox_acknowledged: acknowledged,
             error_code: result.error_code,
             safe_error_fingerprint: result.safe_error_fingerprint,
-        }))
+        })
     }
 }
 
@@ -1008,14 +1408,53 @@ fn content_address_valid(value: &ContentAddress) -> bool {
 }
 
 #[cfg(test)]
+#[path = "verification_handoff_tests.rs"]
+mod handoff_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use egopulse_domain_contracts::v01::egopulse::{
         artifact::v1::{
-            ArtifactSet, ArtifactSetStatus, ContentAddress, HashAlgorithm, LineageBinding,
+            ArtifactDescriptor, ArtifactSet, ArtifactSetStatus, Claim, ClaimStatus, ContentAddress,
+            Evidence, HashAlgorithm, LineageBinding,
         },
         task::v1::{TaskEvent, TaskEventKind, TaskSnapshot},
     };
+
+    struct ClaimOnlySource {
+        claim: Claim,
+    }
+
+    impl ArtifactReferenceSource for ClaimOnlySource {
+        fn read_artifact(
+            &self,
+            _artifact_id: &str,
+        ) -> Result<Option<ArtifactDescriptor>, ArtifactReferenceSourceError> {
+            Ok(None)
+        }
+
+        fn read_claim(
+            &self,
+            claim_id: &str,
+        ) -> Result<Option<Claim>, ArtifactReferenceSourceError> {
+            Ok((self.claim.claim_id == claim_id).then(|| self.claim.clone()))
+        }
+
+        fn read_evidence(
+            &self,
+            _evidence_id: &str,
+        ) -> Result<Option<Evidence>, ArtifactReferenceSourceError> {
+            Ok(None)
+        }
+
+        fn read_artifact_set(
+            &self,
+            _artifact_set_id: &str,
+        ) -> Result<Option<ArtifactSet>, ArtifactReferenceSourceError> {
+            Ok(None)
+        }
+    }
 
     fn contract(seed: &str) -> ContractReference {
         ContractReference {
@@ -1090,6 +1529,82 @@ mod tests {
         }
     }
 
+    fn dynamic_plan() -> DynamicPrimaryClaimHandoffPlan {
+        DynamicPrimaryClaimHandoffPlan {
+            claim_semantic_profile_ref: contract("semantic"),
+            criterion_ids: vec!["criterion-1".to_owned()],
+            checker_profile_refs: vec![contract("checker")],
+        }
+    }
+
+    #[test]
+    fn worker_skips_written_completion_but_keeps_unwritten_completion_after_restart() {
+        let handoff = handoff();
+        let mut request = plan()
+            .request_for(&handoff, &artifact_set())
+            .expect("request")
+            .request;
+        request.status = VerificationStatus::Completed as i32;
+        let pending = handoff.event.snapshot.expect("Task snapshot");
+        let mut written = pending.clone();
+        written.revision += 1;
+        written.status = TaskStatus::VerdictPending as i32;
+        written.verification_artifact_id = Some("verification-artifact-1".to_owned());
+        // Same durable Verification status, different owner write-back facts.
+        // The first must not mask the second in an ordered request scan.
+        let needs = [&written, &pending].map(|task| {
+            request_needs_processing(&request, task, "verification-artifact-1")
+                .expect("consistent snapshots")
+        });
+        assert_eq!(needs, [false, true]);
+        assert_eq!(needs.into_iter().position(|value| value), Some(1));
+        written.verification_artifact_id = Some("unrelated-artifact".to_owned());
+        assert!(matches!(
+            request_needs_processing(&request, &written, "verification-artifact-1"),
+            Err(TaskVerificationWriteBackError::TaskSnapshotMismatch)
+        ));
+    }
+
+    #[test]
+    fn worker_does_not_reexecute_an_old_work_revision_or_accept_foreign_task_state() {
+        let handoff = handoff();
+        let request = plan()
+            .request_for(&handoff, &artifact_set())
+            .expect("request")
+            .request;
+        let mut revised = handoff.event.snapshot.expect("Task snapshot");
+        revised.revision += 3;
+        revised.work_revision += 1;
+        revised.status = TaskStatus::Ready as i32;
+        revised.artifact_set_id = None;
+        revised.verification_artifact_id = None;
+        assert!(
+            !request_needs_processing(&request, &revised, "verification-artifact-1")
+                .expect("old work is superseded")
+        );
+        revised.task_id = "another-task".to_owned();
+        assert!(matches!(
+            request_needs_processing(&request, &revised, "verification-artifact-1"),
+            Err(TaskVerificationWriteBackError::TaskSnapshotMismatch)
+        ));
+    }
+
+    fn dynamic_artifact_set_and_claim() -> (ArtifactSet, Claim) {
+        let mut artifact_set = artifact_set();
+        artifact_set.claim_ids = vec!["claim-runtime-42".to_owned()];
+        artifact_set.artifact_ids = vec!["artifact-1".to_owned()];
+        let claim = Claim {
+            claim_id: "claim-runtime-42".to_owned(),
+            status: ClaimStatus::Proposed as i32,
+            semantic_profile_ref: Some(contract("semantic")),
+            lineage: artifact_set.lineage.clone(),
+            subject_artifact_ids: vec!["artifact-1".to_owned()],
+            acceptance_contract_ref: Some(contract("acceptance")),
+            ..Claim::default()
+        };
+        (artifact_set, claim)
+    }
+
     #[test]
     fn explicit_plan_binds_task_facts_without_deriving_verification_policy() {
         let request = plan()
@@ -1114,6 +1629,100 @@ mod tests {
         );
         assert_eq!(request.request.criterion_ids, vec!["criterion-1"]);
         assert_eq!(request.request.checker_profile_refs.len(), 1);
+    }
+
+    #[test]
+    fn dynamic_plan_binds_the_current_artifact_set_primary_claim() {
+        let (artifact_set, claim) = dynamic_artifact_set_and_claim();
+        let source = ClaimOnlySource { claim };
+        let resolved = dynamic_plan()
+            .resolve(&handoff(), &artifact_set, &source)
+            .expect("current primary Claim should resolve");
+        let request = resolved
+            .request_for(&handoff(), &artifact_set)
+            .expect("resolved plan should create a request");
+
+        assert_eq!(resolved.binding.claim_id, "claim-runtime-42");
+        assert_eq!(
+            request.request.binding.as_ref().unwrap().claim_id,
+            "claim-runtime-42"
+        );
+    }
+
+    #[test]
+    fn dynamic_plan_rejects_claim_contract_and_lineage_mismatches() {
+        let (artifact_set, claim) = dynamic_artifact_set_and_claim();
+        let mut semantic_mismatch = claim.clone();
+        semantic_mismatch.semantic_profile_ref = Some(contract("other-semantic"));
+        assert!(matches!(
+            dynamic_plan().resolve(
+                &handoff(),
+                &artifact_set,
+                &ClaimOnlySource {
+                    claim: semantic_mismatch
+                }
+            ),
+            Err(VerificationHandoffIntakeError::Plan(
+                VerificationHandoffPlanError::PrimaryClaimInvalid
+            ))
+        ));
+
+        let mut acceptance_mismatch = claim.clone();
+        acceptance_mismatch.acceptance_contract_ref = Some(contract("other-acceptance"));
+        assert!(matches!(
+            dynamic_plan().resolve(
+                &handoff(),
+                &artifact_set,
+                &ClaimOnlySource {
+                    claim: acceptance_mismatch
+                }
+            ),
+            Err(VerificationHandoffIntakeError::Plan(
+                VerificationHandoffPlanError::PrimaryClaimInvalid
+            ))
+        ));
+
+        let mut lineage_mismatch = claim;
+        lineage_mismatch.lineage.as_mut().unwrap().dispatch_id = "other-dispatch".to_owned();
+        assert!(matches!(
+            dynamic_plan().resolve(
+                &handoff(),
+                &artifact_set,
+                &ClaimOnlySource {
+                    claim: lineage_mismatch
+                }
+            ),
+            Err(VerificationHandoffIntakeError::Plan(
+                VerificationHandoffPlanError::PrimaryClaimInvalid
+            ))
+        ));
+    }
+
+    #[test]
+    fn dynamic_plan_rejects_ambiguous_or_out_of_set_primary_claims() {
+        let (mut artifact_set, mut claim) = dynamic_artifact_set_and_claim();
+        artifact_set.claim_ids.push("claim-runtime-43".to_owned());
+        assert!(matches!(
+            dynamic_plan().resolve(
+                &handoff(),
+                &artifact_set,
+                &ClaimOnlySource {
+                    claim: claim.clone()
+                }
+            ),
+            Err(VerificationHandoffIntakeError::Plan(
+                VerificationHandoffPlanError::PrimaryClaimInvalid
+            ))
+        ));
+
+        artifact_set.claim_ids.pop();
+        claim.subject_artifact_ids = vec!["artifact-outside-set".to_owned()];
+        assert!(matches!(
+            dynamic_plan().resolve(&handoff(), &artifact_set, &ClaimOnlySource { claim }),
+            Err(VerificationHandoffIntakeError::Plan(
+                VerificationHandoffPlanError::PrimaryClaimInvalid
+            ))
+        ));
     }
 
     #[test]

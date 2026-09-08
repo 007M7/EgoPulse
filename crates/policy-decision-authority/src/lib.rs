@@ -7,6 +7,7 @@
 
 mod store;
 
+use egopulse_domain_contracts::v01::egopulse::artifact::v1::{ContentAddress, HashAlgorithm};
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     ApprovalDecision, ApprovalDecisionEnvelope, ApprovalDecisionReceipt, ApprovalKind,
@@ -20,6 +21,9 @@ use egopulse_domain_contracts::v01::egopulse::policy::v1::{
     PolicyDecisionCommandResult, PolicyDecisionErrorCode, PolicyDecisionEvent,
     PolicyDecisionEventKind, RevokeHarnessApprovalDecisionCommand, policy_decision_command,
 };
+use egopulse_domain_contracts::v01::egopulse::verdict::v1::{
+    FounderVerdict, FounderVerdictState, FounderVerdictStateKind, VerdictScope,
+};
 use prost::Message;
 use prost_types::Timestamp;
 use sha2::{Digest, Sha256};
@@ -30,8 +34,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use store::{
-    ConsumeCommit, IssueCommit, PolicyStore, ProjectionBootstrapCandidate,
-    ProjectionBootstrapWrite, StateCommit, StoreError,
+    ConsumeCommit, FounderVerdictExpiryAuthorizationCommit, IssueCommit, PolicyStore,
+    ProjectionBootstrapCandidate, ProjectionBootstrapWrite, StateCommit, StoreError,
 };
 pub use store::{PendingPolicyOutbox, PolicyStoreInspection};
 
@@ -39,6 +43,7 @@ const ISSUE_OPERATION: &str = "issue_harness_approval_decision";
 const CONSUME_OPERATION: &str = "consume_harness_approval_decision";
 const REVOKE_OPERATION: &str = "revoke_harness_approval_decision";
 const EXPIRE_OPERATION: &str = "expire_harness_approval_decision";
+const FOUNDER_VERDICT_EXPIRY_PRINCIPAL_KIND: &str = "policy_authority";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingPolicyProjection {
@@ -74,6 +79,62 @@ pub struct ResolvedApprovalAuthorization {
     pub authority_proof: PolicyAuthorityProof,
     pub evidence_refs: Vec<String>,
     pub expires_at: Timestamp,
+}
+
+/// Trusted composition supplies this snapshot. The request has no task-applied
+/// boolean because only the owner-side resolver may establish that fact.
+#[derive(Clone)]
+pub struct ResolvedFounderVerdictExpiry {
+    pub verdict: FounderVerdict,
+    pub state: FounderVerdictState,
+    pub policy_ref: ContractReference,
+    pub evidence_refs: Vec<String>,
+}
+
+/// Authority-private durable expiry authorization. This is intentionally not a
+/// domain-contract message and is independent of Harness approval receipts.
+#[derive(Clone, PartialEq, Message)]
+pub struct FounderVerdictExpiryAuthorization {
+    #[prost(string, tag = "1")]
+    pub authorization_id: String,
+    #[prost(message, optional, tag = "2")]
+    pub verdict: Option<FounderVerdict>,
+    #[prost(message, optional, tag = "3")]
+    pub state: Option<FounderVerdictState>,
+    #[prost(message, optional, tag = "4")]
+    pub policy_ref: Option<ContractReference>,
+    #[prost(string, tag = "5")]
+    pub authenticated_principal_id: String,
+    #[prost(message, optional, tag = "6")]
+    pub evaluated_at: Option<Timestamp>,
+    #[prost(string, repeated, tag = "7")]
+    pub evidence_refs: Vec<String>,
+    #[prost(string, tag = "8")]
+    pub identity_digest_sha256: String,
+    #[prost(string, tag = "9")]
+    pub authenticated_principal_kind: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum FounderVerdictExpiryAuthorizationError {
+    #[error("founder verdict expiry authorization input is invalid")]
+    InvalidInput,
+    #[error("founder verdict expiry authorization principal is not authenticated")]
+    Unauthenticated,
+    #[error("founder verdict expiry authorization principal is not permitted")]
+    PermissionDenied,
+    #[error("founder verdict has not reached its original expiry")]
+    NotExpired,
+    #[error("trusted founder verdict expiry reference was rejected")]
+    ReferenceRejected(PolicyReferenceRejection),
+    #[error("founder verdict expiry authorization conflicts with the durable identity")]
+    Conflict,
+    #[error("founder verdict expiry authorization integrity check failed")]
+    IntegrityFailure,
+    #[error("founder verdict expiry authorization storage is unavailable")]
+    Storage,
+    #[error("founder verdict expiry authorization clock is unavailable")]
+    Clock,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,6 +176,18 @@ pub trait PolicyReferenceResolver: Send + Sync + 'static {
         _command: &ExpireHarnessApprovalDecisionCommand,
         _principal: &AuthenticatedPolicyPrincipal,
     ) -> Result<Vec<String>, PolicyReferenceRejection> {
+        Err(PolicyReferenceRejection::PermissionDenied)
+    }
+
+    /// Resolves a FounderVerdict expiry only from owner-held state: the exact
+    /// Verdict and Issued revision, a proof that its Task was never applied,
+    /// and the versioned policy reference that authorized expiry.
+    fn resolve_founder_verdict_expiry(
+        &self,
+        _verdict_id: &str,
+        _expected_state_revision: u64,
+        _principal: &AuthenticatedPolicyPrincipal,
+    ) -> Result<ResolvedFounderVerdictExpiry, PolicyReferenceRejection> {
         Err(PolicyReferenceRejection::PermissionDenied)
     }
 }
@@ -306,6 +379,122 @@ impl<C: PolicyClock> PolicyDecisionAuthority<C> {
                     HarnessApprovalDecisionRecord::decode(stored.decision_record.as_slice())?,
                     HarnessApprovalDecisionState::decode(stored.state.as_slice())?,
                 ))
+            })
+            .transpose()
+    }
+
+    /// Persists one owner-resolved expiry authorization. The resolver, rather
+    /// than this API's caller, establishes the complete Issued snapshot and
+    /// that no Task application exists.
+    pub fn issue_founder_verdict_expiry(
+        &mut self,
+        verdict_id: &str,
+        expected_state_revision: u64,
+        principal: &AuthenticatedPolicyPrincipal,
+    ) -> Result<FounderVerdictExpiryAuthorization, FounderVerdictExpiryAuthorizationError> {
+        if verdict_id.trim().is_empty()
+            || expected_state_revision == 0
+            || expected_state_revision > i64::MAX as u64
+        {
+            return Err(FounderVerdictExpiryAuthorizationError::InvalidInput);
+        }
+        if !principal.authenticated || principal.principal_id.trim().is_empty() {
+            return Err(FounderVerdictExpiryAuthorizationError::Unauthenticated);
+        }
+        if principal.kind != PolicyPrincipalKind::PolicyAuthority {
+            return Err(FounderVerdictExpiryAuthorizationError::PermissionDenied);
+        }
+        let resolved = self
+            .resolver
+            .resolve_founder_verdict_expiry(verdict_id, expected_state_revision, principal)
+            .map_err(FounderVerdictExpiryAuthorizationError::ReferenceRejected)?;
+        if !resolved_founder_verdict_expiry_complete(&resolved, verdict_id, expected_state_revision)
+        {
+            return Err(FounderVerdictExpiryAuthorizationError::IntegrityFailure);
+        }
+        let now = self
+            .clock
+            .now()
+            .map_err(expiry_authorization_failure_from_authority)?;
+        if !timestamp_after_or_equal(&now, resolved.verdict.expires_at) {
+            return Err(FounderVerdictExpiryAuthorizationError::NotExpired);
+        }
+        let evidence_refs = normalize_evidence(resolved.evidence_refs);
+        if evidence_refs.is_empty() {
+            return Err(FounderVerdictExpiryAuthorizationError::IntegrityFailure);
+        }
+        let mut authorization = FounderVerdictExpiryAuthorization {
+            authorization_id: String::new(),
+            verdict: Some(resolved.verdict),
+            state: Some(resolved.state),
+            policy_ref: Some(resolved.policy_ref),
+            authenticated_principal_id: principal.principal_id.clone(),
+            evaluated_at: Some(now),
+            evidence_refs,
+            identity_digest_sha256: String::new(),
+            authenticated_principal_kind: FOUNDER_VERDICT_EXPIRY_PRINCIPAL_KIND.to_owned(),
+        };
+        let identity_digest_sha256 = founder_verdict_expiry_identity_digest(&authorization);
+        authorization.authorization_id =
+            format!("founder-verdict-expiry-v1-{identity_digest_sha256}");
+        authorization.identity_digest_sha256 = identity_digest_sha256.clone();
+        if !founder_verdict_expiry_authorization_complete(&authorization) {
+            return Err(FounderVerdictExpiryAuthorizationError::IntegrityFailure);
+        }
+        let encoded = authorization.encode_to_vec();
+        let evaluated_at_seconds = authorization
+            .evaluated_at
+            .as_ref()
+            .map(|evaluated_at| evaluated_at.seconds)
+            .ok_or(FounderVerdictExpiryAuthorizationError::IntegrityFailure)?;
+        match self
+            .store
+            .commit_founder_verdict_expiry_authorization(
+                &authorization.authorization_id,
+                verdict_id,
+                expected_state_revision,
+                &identity_digest_sha256,
+                &encoded,
+                evaluated_at_seconds,
+            )
+            .map_err(|error| {
+                expiry_authorization_failure_from_authority(PolicyAuthorityFailure::from(error))
+            })? {
+            FounderVerdictExpiryAuthorizationCommit::Committed => Ok(authorization),
+            FounderVerdictExpiryAuthorizationCommit::Existing(stored) => {
+                let existing = decode_founder_verdict_expiry_authorization(stored.authorization)
+                    .map_err(expiry_authorization_failure_from_authority)?;
+                if stored.identity_digest_sha256 != identity_digest_sha256
+                    || existing.identity_digest_sha256 != identity_digest_sha256
+                {
+                    return Err(FounderVerdictExpiryAuthorizationError::IntegrityFailure);
+                }
+                Ok(existing)
+            }
+            FounderVerdictExpiryAuthorizationCommit::Conflict => {
+                Err(FounderVerdictExpiryAuthorizationError::Conflict)
+            }
+        }
+    }
+
+    /// Reads an immutable, verified FounderVerdict expiry authorization for
+    /// owner composition. A corrupt or mismatched record is never returned.
+    pub fn founder_verdict_expiry_authorization(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<FounderVerdictExpiryAuthorization>, PolicyAuthorityFailure> {
+        if authorization_id.trim().is_empty() {
+            return Ok(None);
+        }
+        self.store
+            .founder_verdict_expiry_authorization(authorization_id)?
+            .map(|stored| {
+                let authorization =
+                    decode_founder_verdict_expiry_authorization(stored.authorization)?;
+                if stored.identity_digest_sha256 != authorization.identity_digest_sha256 {
+                    return Err(PolicyAuthorityFailure::Storage);
+                }
+                Ok(authorization)
             })
             .transpose()
     }
@@ -990,6 +1179,154 @@ fn contract_complete(reference: &ContractReference) -> bool {
         && sha256_is_valid(&reference.sha256)
 }
 
+fn resolved_founder_verdict_expiry_complete(
+    resolved: &ResolvedFounderVerdictExpiry,
+    expected_verdict_id: &str,
+    expected_state_revision: u64,
+) -> bool {
+    let state_kind = FounderVerdictStateKind::try_from(resolved.state.state)
+        .unwrap_or(FounderVerdictStateKind::Unspecified);
+    resolved.verdict.founder_verdict_id == expected_verdict_id
+        && resolved.state.founder_verdict_id == expected_verdict_id
+        && resolved.state.revision == expected_state_revision
+        && state_kind == FounderVerdictStateKind::Issued
+        && resolved.state.consumption_receipt_id.is_none()
+        && resolved.state.superseded_by_verdict_id.is_none()
+        && resolved.state.terminal_reason_code.is_none()
+        && resolved.state.updated_at.is_some()
+        && verdict_scope_complete(resolved.verdict.scope.as_ref())
+        && resolved.verdict.version > 0
+        && resolved.verdict.valid_from.is_some()
+        && resolved.verdict.issued_at.is_some()
+        && resolved.verdict.expires_at.is_some()
+        && founder_verdict_payload_matches(&resolved.verdict)
+        && contract_complete(&resolved.policy_ref)
+}
+
+fn founder_verdict_expiry_authorization_complete(
+    authorization: &FounderVerdictExpiryAuthorization,
+) -> bool {
+    let Some(verdict) = authorization.verdict.as_ref() else {
+        return false;
+    };
+    let Some(state) = authorization.state.as_ref() else {
+        return false;
+    };
+    let Some(policy_ref) = authorization.policy_ref.as_ref() else {
+        return false;
+    };
+    if authorization.authorization_id.trim().is_empty()
+        || authorization.authenticated_principal_id.trim().is_empty()
+        || authorization.authenticated_principal_kind != FOUNDER_VERDICT_EXPIRY_PRINCIPAL_KIND
+        || verdict
+            .expires_at
+            .as_ref()
+            .is_none_or(|at| !(0..1_000_000_000).contains(&at.nanos))
+        || authorization.evaluated_at.as_ref().is_none_or(|at| {
+            !(0..1_000_000_000).contains(&at.nanos)
+                || !timestamp_after_or_equal(at, verdict.expires_at)
+        })
+        || authorization.evidence_refs.is_empty()
+        || authorization.evidence_refs != normalize_evidence(authorization.evidence_refs.clone())
+        || !sha256_is_valid(&authorization.identity_digest_sha256)
+        || authorization.authorization_id
+            != format!(
+                "founder-verdict-expiry-v1-{}",
+                authorization.identity_digest_sha256
+            )
+        || authorization.identity_digest_sha256
+            != founder_verdict_expiry_identity_digest(authorization)
+    {
+        return false;
+    }
+    resolved_founder_verdict_expiry_complete(
+        &ResolvedFounderVerdictExpiry {
+            verdict: verdict.clone(),
+            state: state.clone(),
+            policy_ref: policy_ref.clone(),
+            evidence_refs: authorization.evidence_refs.clone(),
+        },
+        &verdict.founder_verdict_id,
+        state.revision,
+    )
+}
+
+fn founder_verdict_expiry_identity_digest(
+    authorization: &FounderVerdictExpiryAuthorization,
+) -> String {
+    let canonical = FounderVerdictExpiryAuthorization {
+        authorization_id: String::new(),
+        verdict: authorization.verdict.clone(),
+        state: authorization.state.clone(),
+        policy_ref: authorization.policy_ref.clone(),
+        authenticated_principal_id: authorization.authenticated_principal_id.clone(),
+        evaluated_at: None,
+        evidence_refs: Vec::new(),
+        identity_digest_sha256: String::new(),
+        authenticated_principal_kind: authorization.authenticated_principal_kind.clone(),
+    };
+    sha256(&canonical.encode_to_vec())
+}
+
+fn decode_founder_verdict_expiry_authorization(
+    encoded: Vec<u8>,
+) -> Result<FounderVerdictExpiryAuthorization, PolicyAuthorityFailure> {
+    let authorization = FounderVerdictExpiryAuthorization::decode(encoded.as_slice())?;
+    if !founder_verdict_expiry_authorization_complete(&authorization) {
+        return Err(PolicyAuthorityFailure::Storage);
+    }
+    Ok(authorization)
+}
+
+fn verdict_scope_complete(scope: Option<&VerdictScope>) -> bool {
+    scope.is_some_and(|scope| {
+        !scope.task_id.trim().is_empty()
+            && scope.task_revision > 0
+            && scope.work_revision > 0
+            && !scope.artifact_set_id.trim().is_empty()
+            && content_address_complete(scope.artifact_set_manifest.as_ref())
+            && !scope.verification_artifact_id.trim().is_empty()
+            && content_address_complete(scope.verification_payload.as_ref())
+            && scope
+                .acceptance_contract_ref
+                .as_ref()
+                .is_some_and(contract_complete)
+    })
+}
+
+fn content_address_complete(address: Option<&ContentAddress>) -> bool {
+    address.is_some_and(|address| {
+        address.algorithm == HashAlgorithm::Sha256 as i32
+            && sha256_is_valid(&address.digest)
+            && address.byte_length > 0
+    })
+}
+
+fn founder_verdict_payload_matches(verdict: &FounderVerdict) -> bool {
+    let Some(address) = verdict.canonical_payload.as_ref() else {
+        return false;
+    };
+    let mut canonical = verdict.clone();
+    canonical.canonical_payload = None;
+    let bytes = canonical.encode_to_vec();
+    address.algorithm == HashAlgorithm::Sha256 as i32
+        && sha256_is_valid(&address.digest)
+        && address.digest == sha256(&bytes)
+        && address.byte_length == bytes.len() as u64
+}
+
+fn expiry_authorization_failure_from_authority(
+    failure: PolicyAuthorityFailure,
+) -> FounderVerdictExpiryAuthorizationError {
+    match failure {
+        PolicyAuthorityFailure::Clock => FounderVerdictExpiryAuthorizationError::Clock,
+        PolicyAuthorityFailure::Decode(_) => {
+            FounderVerdictExpiryAuthorizationError::IntegrityFailure
+        }
+        PolicyAuthorityFailure::Storage => FounderVerdictExpiryAuthorizationError::Storage,
+    }
+}
+
 fn receipt_complete(receipt: &ApprovalDecisionReceipt) -> bool {
     !receipt.receipt_id.trim().is_empty()
         && !receipt.approval_request_id.trim().is_empty()
@@ -1185,4 +1522,325 @@ fn timestamp_after_or_equal(left: &Timestamp, right: Option<Timestamp>) -> bool 
     right
         .as_ref()
         .is_none_or(|value| (left.seconds, left.nanos) >= (value.seconds, value.nanos))
+}
+
+#[cfg(test)]
+mod founder_verdict_expiry_tests {
+    use super::*;
+    use std::fs;
+
+    const NOW: i64 = 200;
+
+    #[derive(Clone, Copy)]
+    struct FixedClock(i64);
+
+    impl PolicyClock for FixedClock {
+        fn now(&self) -> Result<Timestamp, PolicyAuthorityFailure> {
+            Ok(Timestamp {
+                seconds: self.0,
+                nanos: 0,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    enum ExpiryResolution {
+        Resolved(Box<ResolvedFounderVerdictExpiry>),
+        Rejected(PolicyReferenceRejection),
+    }
+
+    #[derive(Clone)]
+    struct ExpiryResolver {
+        resolution: ExpiryResolution,
+    }
+
+    impl PolicyReferenceResolver for ExpiryResolver {
+        fn resolve_issue(
+            &self,
+            _command: &IssueHarnessApprovalDecisionCommand,
+            _principal: &AuthenticatedPolicyPrincipal,
+        ) -> Result<ResolvedApprovalAuthorization, PolicyReferenceRejection> {
+            Err(PolicyReferenceRejection::PermissionDenied)
+        }
+
+        fn validate_adapter_receipt(
+            &self,
+            _command: &ConsumeHarnessApprovalDecisionCommand,
+            _record: &HarnessApprovalDecisionRecord,
+            _principal: &AuthenticatedPolicyPrincipal,
+        ) -> Result<Vec<String>, PolicyReferenceRejection> {
+            Err(PolicyReferenceRejection::PermissionDenied)
+        }
+
+        fn resolve_founder_verdict_expiry(
+            &self,
+            _verdict_id: &str,
+            _expected_state_revision: u64,
+            _principal: &AuthenticatedPolicyPrincipal,
+        ) -> Result<ResolvedFounderVerdictExpiry, PolicyReferenceRejection> {
+            match &self.resolution {
+                ExpiryResolution::Resolved(resolved) => Ok(resolved.as_ref().clone()),
+                ExpiryResolution::Rejected(rejection) => Err(*rejection),
+            }
+        }
+    }
+
+    struct TempStore {
+        root: PathBuf,
+        database: PathBuf,
+    }
+
+    impl TempStore {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "egopulse-policy-founder-expiry-{name}-{}",
+                Uuid::now_v7()
+            ));
+            fs::create_dir_all(&root).expect("create isolated policy store root");
+            let database = root.join("policy.db");
+            Self { root, database }
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn timestamp(seconds: i64) -> Timestamp {
+        Timestamp { seconds, nanos: 0 }
+    }
+
+    fn digest(value: char) -> String {
+        value.to_string().repeat(64)
+    }
+
+    fn contract_ref(id: &str, digest_char: char) -> ContractReference {
+        ContractReference {
+            contract_id: id.to_owned(),
+            version: "v1".to_owned(),
+            sha256: digest(digest_char),
+        }
+    }
+
+    fn content_address(digest_char: char) -> ContentAddress {
+        ContentAddress {
+            algorithm: HashAlgorithm::Sha256 as i32,
+            digest: digest(digest_char),
+            byte_length: 1,
+        }
+    }
+
+    fn verdict_scope() -> VerdictScope {
+        VerdictScope {
+            task_id: "task-expiry-01".to_owned(),
+            task_revision: 7,
+            work_revision: 3,
+            artifact_set_id: "artifact-set-expiry-01".to_owned(),
+            artifact_set_manifest: Some(content_address('a')),
+            verification_artifact_id: "verification-expiry-01".to_owned(),
+            verification_payload: Some(content_address('b')),
+            acceptance_contract_ref: Some(contract_ref("acceptance-contract", 'c')),
+        }
+    }
+
+    fn founder_verdict() -> FounderVerdict {
+        let mut verdict = FounderVerdict {
+            founder_verdict_id: "verdict-expiry-01".to_owned(),
+            version: 1,
+            decision: 1,
+            scope: Some(verdict_scope()),
+            observed_verification_conclusion: 1,
+            authority_proof: None,
+            risk_acceptances: Vec::new(),
+            rework_directive: None,
+            reason_code: "FOUNDER_DECISION".to_owned(),
+            rationale_artifact_id: None,
+            valid_from: Some(timestamp(10)),
+            expires_at: Some(timestamp(100)),
+            issued_at: Some(timestamp(10)),
+            canonical_payload: None,
+            supersedes_founder_verdict_id: None,
+        };
+        let bytes = verdict.encode_to_vec();
+        verdict.canonical_payload = Some(ContentAddress {
+            algorithm: HashAlgorithm::Sha256 as i32,
+            digest: sha256(&bytes),
+            byte_length: bytes.len() as u64,
+        });
+        verdict
+    }
+
+    fn resolved(policy_ref: ContractReference) -> Box<ResolvedFounderVerdictExpiry> {
+        Box::new(ResolvedFounderVerdictExpiry {
+            verdict: founder_verdict(),
+            state: FounderVerdictState {
+                founder_verdict_id: "verdict-expiry-01".to_owned(),
+                revision: 5,
+                state: FounderVerdictStateKind::Issued as i32,
+                consumption_receipt_id: None,
+                superseded_by_verdict_id: None,
+                terminal_reason_code: None,
+                updated_at: Some(timestamp(20)),
+            },
+            policy_ref,
+            evidence_refs: vec!["policy-evaluation:expiry-01".to_owned()],
+        })
+    }
+
+    fn principal() -> AuthenticatedPolicyPrincipal {
+        AuthenticatedPolicyPrincipal {
+            kind: PolicyPrincipalKind::PolicyAuthority,
+            principal_id: "policy-authority:expiry-worker".to_owned(),
+            authenticated: true,
+        }
+    }
+
+    fn authority(
+        path: PathBuf,
+        resolver: ExpiryResolver,
+        now: i64,
+    ) -> PolicyDecisionAuthority<FixedClock> {
+        PolicyDecisionAuthority::open_with_clock(
+            PolicyAuthorityConfig {
+                database_path: path,
+                store_epoch: "founder-expiry-test-v1".to_owned(),
+                key: PolicySqlCipherKey::new([31; 32]),
+            },
+            resolver,
+            FixedClock(now),
+        )
+        .expect("open policy authority")
+    }
+
+    #[test]
+    fn founder_verdict_expiry_authorization_is_durable_and_replays_exactly_after_reopen() {
+        let store = TempStore::new("durable-replay");
+        let resolver = ExpiryResolver {
+            resolution: ExpiryResolution::Resolved(resolved(contract_ref("policy-expiry", 'd'))),
+        };
+        let mut first_owner = authority(store.database.clone(), resolver.clone(), NOW);
+        let first = first_owner
+            .issue_founder_verdict_expiry("verdict-expiry-01", 5, &principal())
+            .expect("persist expiry authorization");
+        let read_back = first_owner
+            .founder_verdict_expiry_authorization(&first.authorization_id)
+            .expect("read authorization");
+        assert!(read_back.as_ref().is_some_and(|stored| stored == &first));
+        for invalid_nanos in [-1, 1_000_000_000] {
+            let mut invalid = first.clone();
+            invalid
+                .verdict
+                .as_mut()
+                .expect("Verdict")
+                .expires_at
+                .as_mut()
+                .expect("expiry")
+                .nanos = invalid_nanos;
+            // Even a self-consistent digest cannot make an invalid original
+            // timestamp into valid Policy proof at the durable read boundary.
+            invalid.identity_digest_sha256 = founder_verdict_expiry_identity_digest(&invalid);
+            invalid.authorization_id = format!(
+                "founder-verdict-expiry-v1-{}",
+                invalid.identity_digest_sha256
+            );
+            assert!(decode_founder_verdict_expiry_authorization(invalid.encode_to_vec()).is_err());
+        }
+        drop(first_owner);
+
+        let mut reopened = authority(store.database.clone(), resolver, NOW + 10);
+        let replayed = reopened
+            .issue_founder_verdict_expiry("verdict-expiry-01", 5, &principal())
+            .expect("exact durable replay");
+        assert!(replayed == first);
+    }
+
+    #[test]
+    fn founder_verdict_expiry_rejects_wrong_principal_before_owner_resolution() {
+        let store = TempStore::new("wrong-principal");
+        let mut owner = authority(
+            store.database.clone(),
+            ExpiryResolver {
+                resolution: ExpiryResolution::Resolved(resolved(contract_ref(
+                    "policy-expiry",
+                    'd',
+                ))),
+            },
+            NOW,
+        );
+        let wrong = AuthenticatedPolicyPrincipal {
+            kind: PolicyPrincipalKind::FounderPolicy,
+            principal_id: "founder:01".to_owned(),
+            authenticated: true,
+        };
+        assert!(matches!(
+            owner.issue_founder_verdict_expiry("verdict-expiry-01", 5, &wrong),
+            Err(FounderVerdictExpiryAuthorizationError::PermissionDenied)
+        ));
+    }
+
+    #[test]
+    fn founder_verdict_expiry_rejects_default_deny_not_expired_and_conflicting_identity() {
+        let default_deny = TempStore::new("default-deny");
+        let mut denied = authority(
+            default_deny.database.clone(),
+            ExpiryResolver {
+                resolution: ExpiryResolution::Rejected(PolicyReferenceRejection::PermissionDenied),
+            },
+            NOW,
+        );
+        assert!(matches!(
+            denied.issue_founder_verdict_expiry("verdict-expiry-01", 5, &principal()),
+            Err(FounderVerdictExpiryAuthorizationError::ReferenceRejected(
+                PolicyReferenceRejection::PermissionDenied
+            ))
+        ));
+
+        let not_expired = TempStore::new("not-expired");
+        let mut early = authority(
+            not_expired.database.clone(),
+            ExpiryResolver {
+                resolution: ExpiryResolution::Resolved(resolved(contract_ref(
+                    "policy-expiry",
+                    'd',
+                ))),
+            },
+            99,
+        );
+        assert!(matches!(
+            early.issue_founder_verdict_expiry("verdict-expiry-01", 5, &principal()),
+            Err(FounderVerdictExpiryAuthorizationError::NotExpired)
+        ));
+
+        let conflict = TempStore::new("conflict");
+        let mut first = authority(
+            conflict.database.clone(),
+            ExpiryResolver {
+                resolution: ExpiryResolution::Resolved(resolved(contract_ref(
+                    "policy-expiry",
+                    'd',
+                ))),
+            },
+            NOW,
+        );
+        first
+            .issue_founder_verdict_expiry("verdict-expiry-01", 5, &principal())
+            .expect("persist first authorization");
+        drop(first);
+        let mut different_identity = authority(
+            conflict.database.clone(),
+            ExpiryResolver {
+                resolution: ExpiryResolution::Resolved(resolved(contract_ref(
+                    "policy-expiry",
+                    'e',
+                ))),
+            },
+            NOW,
+        );
+        assert!(matches!(
+            different_identity.issue_founder_verdict_expiry("verdict-expiry-01", 5, &principal()),
+            Err(FounderVerdictExpiryAuthorizationError::Conflict)
+        ));
+    }
 }

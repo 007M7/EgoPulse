@@ -36,6 +36,15 @@ enum RiskCategory {
   RISK_CATEGORY_OPERATIONAL_RESIDUAL = 3;
 }
 
+// Founder-authored material roles are closed so a client cannot smuggle an
+// arbitrary Artifact through the supporting-material composition port.
+enum FounderSupportingMaterialRole {
+  FOUNDER_SUPPORTING_MATERIAL_ROLE_UNSPECIFIED = 0;
+  FOUNDER_SUPPORTING_MATERIAL_ROLE_REWORK_REQUIRED_CHANGES = 1;
+  FOUNDER_SUPPORTING_MATERIAL_ROLE_RISK_RATIONALE = 2;
+  FOUNDER_SUPPORTING_MATERIAL_ROLE_COMPENSATING_CONTROL = 3;
+}
+
 enum VerdictEventKind {
   VERDICT_EVENT_KIND_UNSPECIFIED = 0;
   VERDICT_EVENT_KIND_ISSUED = 1;
@@ -106,6 +115,50 @@ message ReworkDirective {
   string required_changes_artifact_id = 3;
   repeated string target_discrepancy_ids = 4;
   repeated string target_unverified_item_ids = 5;
+}
+
+message FounderSupportingMaterialCoverage {
+  RiskCategory risk_category = 1;
+  repeated string discrepancy_ids = 2;
+  repeated string unverified_item_ids = 3;
+}
+
+// Canonical bytes sealed by the daemon-owned governed collector. Producer,
+// workspace, lineage and Artifact contract fields remain outside client input
+// and are bound by the Artifact descriptor.
+message FounderSupportingMaterial {
+  string material_id = 1;
+  uint64 schema_version = 2;
+  FounderSupportingMaterialRole role = 3;
+  VerdictScope scope = 4;
+  egopulse.artifact.v1.LineageBinding lineage = 5;
+  string authenticated_founder_principal_id = 6;
+  string body = 7;
+  FounderSupportingMaterialCoverage coverage = 8;
+}
+
+// material_id is the stable identity frozen on the first attempt. All other
+// fields are request content: changing any of them under that identity is an
+// idempotency conflict, including scope, role, author, coverage or body.
+message CreateFounderSupportingMaterialCommand {
+  egopulse.common.v1.CommandMetadata metadata = 1;
+  string material_id = 2;
+  VerdictScope scope = 3;
+  FounderSupportingMaterialRole role = 4;
+  string body = 5;
+  FounderSupportingMaterialCoverage coverage = 6;
+}
+
+message FounderSupportingMaterialReceipt {
+  bool committed = 1;
+  bool replayed = 2;
+  string material_id = 3;
+  string artifact_id = 4;
+  FounderSupportingMaterialRole role = 5;
+  VerdictScope scope = 6;
+  egopulse.artifact.v1.ContentAddress canonical_payload = 7;
+  string command_id = 8;
+  string correlation_id = 9;
 }
 
 message FounderVerdict {

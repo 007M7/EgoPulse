@@ -366,7 +366,10 @@ impl TaskTransitionGuard for ConfiguredTaskTransitionGuard {
                 if current.status == TaskStatus::CancellationPending as i32
                     && value.task_id == current.task_id
                     && value.expected_revision == current.revision
-                    && value.outcome == TaskStatus::Cancelled as i32
+                    && matches!(
+                        TaskStatus::try_from(value.outcome),
+                        Ok(TaskStatus::Cancelled | TaskStatus::Interrupted)
+                    )
                     && !value.cancellation_receipt_id.trim().is_empty() =>
             {
                 Ok(TransitionAuthorization {
@@ -399,7 +402,7 @@ impl TaskTransitionGuard for ConfiguredTaskTransitionGuard {
                     return Err(TransitionGuardRejection::UnverifiedReference);
                 };
                 let Some((verdict, state)) = authority
-                    .get(&value.founder_verdict_id)
+                    .get_for_task_application(&value.founder_verdict_id)
                     .map_err(|_| TransitionGuardRejection::IntegrityFailure)?
                 else {
                     return Err(TransitionGuardRejection::StaleReference);

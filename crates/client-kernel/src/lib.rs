@@ -1,7 +1,12 @@
 #![forbid(unsafe_code)]
 
+mod founder_material;
 mod harness_content;
 
+pub use founder_material::{
+    CreateFounderSupportingMaterialRpc, FakeCreateFounderSupportingMaterialRpc,
+    FounderMaterialRpcFuture,
+};
 pub use harness_content::{
     HarnessAssistantMessage, HarnessContentFrameApply, HarnessContentStreamTracker,
 };

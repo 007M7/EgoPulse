@@ -173,7 +173,7 @@
     },
     {
       "path": "authorization-capability-profile.schema.json",
-      "sha256": "8302bda9d15418d4d03c0da565fff9b981c28637622d878bfda8ae8b03f49868"
+      "sha256": "bec708d112c111cba3393aaa1d2ed84b9cca03b5cab08c2a868b691f3be59a02"
     },
     {
       "path": "baselines/v01-gate3-draft11.binpb",
@@ -1057,7 +1057,7 @@
     },
     {
       "path": "profiles/authorization/v1/v01-default.json",
-      "sha256": "c174126b56818b78e6588536fb0b64d570910e9212c041e888487962079b7c86"
+      "sha256": "67ee9e1ca23def452b963e68584c0f6394586b033da4fd2e5e74318adfbd7e46"
     },
     {
       "path": "profiles/client-kernel/v1/v01-default.json",
@@ -1093,11 +1093,11 @@
     },
     {
       "path": "proto/egopulse/harness/v1/harness.proto",
-      "sha256": "4b02839c5b33edae2b203b730c0cc8c44c270329a0f79480b6fc24fc30faf1dd"
+      "sha256": "165386ed4699443e2057a1f63b5df81dd77205b7e468a2135a4b06e38a598d05"
     },
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
-      "sha256": "187f358851f24d61fcc92da33919f55336f30136e15b9fafc96fb2fea490a229"
+      "sha256": "c538920c3bd5b779ac79afefeea91403e266210501cdd4284389329f79174524"
     },
     {
       "path": "proto/egopulse/memory/v1/memory.proto",
@@ -1117,7 +1117,7 @@
     },
     {
       "path": "proto/egopulse/verdict/v1/verdict.proto",
-      "sha256": "f392b06e6e1c3f16fc5fc0bc3794ef8a5027fac8c7f232dcc75da0364e5fbb8b"
+      "sha256": "35fac36a5ec7cb9a0e81c480e6fc955a0e6bec948f8b09853eef8c63411e135e"
     },
     {
       "path": "proto/egopulse/verification/v1/verification.proto",
@@ -1137,7 +1137,7 @@
     },
     {
       "path": "scripts/validate-candidate.js",
-      "sha256": "0e73488b2104d45b1a87e6ef3018fd852b9758f1c19be8a55170902a17656d39"
+      "sha256": "546d26f1acac9432860ef9300f89092c63025ff3a9a824c02afffc1d6995bc41"
     },
     {
       "path": "scripts/verify-faults.ps1",
@@ -1181,7 +1181,7 @@
     },
     {
       "path": "toolchain/fault-conformance/src/r9b_governed_state.rs",
-      "sha256": "2b258d20f922de2c74b0e2dffc76c66cd279a613617d55d8fe60899fe5f78193"
+      "sha256": "f0a53b4b81fb40b42dba334a78f6cdb9e80b800376b84fee3959a847a57c8280"
     },
     {
       "path": "toolchain/fault-conformance/src/u03c_result_review.rs",

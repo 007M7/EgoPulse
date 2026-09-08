@@ -2,6 +2,10 @@ param(
     [string]$PackageRoot = (Split-Path -Parent $MyInvocation.MyCommand.Path),
     [string]$DataRoot = (Join-Path $env:LOCALAPPDATA 'EgoPulse'),
     [string]$IpcInstance = 'default',
+    [string]$RepositoryRoot,
+    [string]$AcceptanceContractPath,
+    [string]$GitExecutable,
+    [string]$ReviewModel,
     [switch]$Force,
     [switch]$SkipMemoryWorker,
     [switch]$Launch,
@@ -89,6 +93,24 @@ $data = (New-Item -ItemType Directory -Force -Path $DataRoot).FullName
 $configPath = Join-Path $data 'agentos-config.json'
 $templatePath = Join-Path $root 'config/agentos-config.example.json'
 $requiresFreshV3Migration = $false
+$configureRepository = -not [string]::IsNullOrWhiteSpace($RepositoryRoot) -or
+    -not [string]::IsNullOrWhiteSpace($AcceptanceContractPath) -or
+    -not [string]::IsNullOrWhiteSpace($GitExecutable) -or
+    -not [string]::IsNullOrWhiteSpace($ReviewModel)
+if ($configureRepository) {
+    if ([string]::IsNullOrWhiteSpace($RepositoryRoot) -or [string]::IsNullOrWhiteSpace($AcceptanceContractPath)) {
+        throw 'Repository setup requires both -RepositoryRoot and -AcceptanceContractPath. The acceptance contract must explicitly define allowed paths and commands.'
+    }
+    if ((Test-Path -LiteralPath $configPath -PathType Leaf) -and -not $Force) {
+        throw 'The existing configuration is preserved. Use agentosd --prepare-repository-config to prepare a separate candidate, or explicitly reinstall with -Force and a retained backup.'
+    }
+    $RepositoryRoot = (Resolve-Path -LiteralPath $RepositoryRoot).Path
+    $AcceptanceContractPath = (Resolve-Path -LiteralPath $AcceptanceContractPath).Path
+    if ([string]::IsNullOrWhiteSpace($GitExecutable)) {
+        $GitExecutable = (Get-Command git -CommandType Application -ErrorAction Stop).Source
+    }
+    $GitExecutable = (Resolve-Path -LiteralPath $GitExecutable).Path
+}
 if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) {
     throw "Configuration template is missing: $templatePath"
 }
@@ -121,6 +143,13 @@ else {
     $config.identity.os_fingerprint_hex = Get-WindowsPrincipalFingerprint
     $config.identity.principal_id = $principalId
     $config.founder.allowed_founder_principal_ids = @($principalId)
+    $config.task_guard.allowed_target_scope_refs = @('scope:founder')
+    # Dispatch material resolves workspace_ref as a relative directory below
+    # workspace_root. Logical IDs containing ':' are not Windows directories.
+    $config.codex.workspace_root = Join-Path $data 'workspaces'
+    $config.codex.workflow.workspace_ref = 'default'
+    $config.artifact.allowed_workspace_refs = @('default')
+    $null = New-Item -ItemType Directory -Force -Path (Join-Path $config.codex.workspace_root 'default')
     $config.memory_retrieval.principal_scope_allowlist = [pscustomobject]@{}
     $config.memory_retrieval.principal_scope_allowlist | Add-Member -NotePropertyName $principalId -NotePropertyValue @('scope:founder')
 
@@ -202,6 +231,40 @@ if (-not $SkipMemoryWorker) {
 }
 
 $daemon = Join-Path $root 'bin/agentosd.exe'
+if ($configureRepository) {
+    $setupToken = [Guid]::NewGuid().ToString('N')
+    $setupSourceJson = [IO.File]::ReadAllText($configPath, [Text.Encoding]::UTF8)
+    $setupRequestPath = Join-Path $data "repository-setup-$setupToken.json"
+    $candidatePath = Join-Path $data "agentos-config.repository-$setupToken.json"
+    $setupRequest = [ordered]@{
+        config_path = $configPath
+        candidate_path = $candidatePath
+        repository_root = $RepositoryRoot
+        acceptance_contract_path = $AcceptanceContractPath
+        git_executable = $GitExecutable
+        review_model = $(if ([string]::IsNullOrWhiteSpace($ReviewModel)) { $null } else { $ReviewModel })
+    }
+    [IO.File]::WriteAllText($setupRequestPath, ($setupRequest | ConvertTo-Json -Depth 10), (New-Object Text.UTF8Encoding($false)))
+    & $daemon --prepare-repository-config $setupRequestPath --json
+    if ($LASTEXITCODE -ne 0) {
+        throw "Repository configuration preparation failed with exit code $LASTEXITCODE. The base configuration and candidate evidence are retained."
+    }
+    try {
+        $env:EGOPULSE_USER_CONFIG = $candidatePath
+        & $daemon --check-config
+        if ($LASTEXITCODE -ne 0) {
+            throw "Repository candidate validation failed with exit code $LASTEXITCODE. The candidate is retained without promotion."
+        }
+    }
+    finally {
+        $env:EGOPULSE_USER_CONFIG = $configPath
+    }
+    if ([IO.File]::ReadAllText($configPath, [Text.Encoding]::UTF8) -cne $setupSourceJson) {
+        throw 'The base configuration changed while the repository candidate was being prepared. Both files are retained; promotion was refused.'
+    }
+    Copy-Item -LiteralPath $candidatePath -Destination $configPath
+    Write-Output "repository_setup=prepared candidate=$candidatePath"
+}
 if ($requiresFreshV3Migration) {
     & $daemon --migrate-to-v3
     if ($LASTEXITCODE -ne 0) {
@@ -221,6 +284,16 @@ if ($LASTEXITCODE -ne 0) {
     throw "EgoPulse Provider preflight failed with exit code $LASTEXITCODE"
 }
 $providerReport = ($providerReportLines -join [Environment]::NewLine) | ConvertFrom-Json
+if ($null -ne $providerReport.PSObject.Properties['verification_worker_configured'] -and
+    -not [bool]$providerReport.verification_worker_configured) {
+    Write-Output 'verification_preflight=not_configured'
+    Write-Output 'verification_next=Configure a reviewed Verification worker before expecting tasks to leave VerificationPending. Configuration validation alone does not verify the full task lifecycle.'
+}
+elseif ($null -ne $providerReport.PSObject.Properties['repository_verification_configured'] -and
+    [bool]$providerReport.repository_verification_configured) {
+    Write-Output 'verification_preflight=repository_configured'
+    Write-Output 'verification_next=Run a governed repository task, inspect its actual evidence and Verification, then explicitly submit a Founder verdict.'
+}
 foreach ($profile in @($providerReport.provider_profiles)) {
     Write-Output (
         'provider_preflight=profile:{0} executable_available:{1} credential_status:{2} admission:{3}' -f

@@ -91,22 +91,29 @@ fn check_config_json_emits_redacted_provider_catalog_without_secret_values() {
         .canonicalize()
         .expect("packaged example config exists");
     let key = "66".repeat(32);
+    let run_check = |credential: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agentosd"));
+        command
+            .args(["--check-config", "--json"])
+            .env("EGOPULSE_USER_CONFIG", &config_path)
+            .env("EGOPULSE_READ_MODEL_KEY_HEX", &key)
+            .env("EGOPULSE_TOKEN_MAC_KEY_HEX", &key)
+            .env("EGOPULSE_TASK_KEY_HEX", &key)
+            .env("EGOPULSE_MEMORY_KEY_HEX", &key)
+            .env("EGOPULSE_ARTIFACT_KEY_HEX", &key)
+            .env("EGOPULSE_VERIFICATION_KEY_HEX", &key)
+            .env("EGOPULSE_POLICY_KEY_HEX", &key)
+            .env("EGOPULSE_VERDICT_KEY_HEX", &key)
+            .env("EGOPULSE_ADAPTER_KEY_HEX", &key)
+            .env("EGOPULSE_COLLABORATION_KEY_HEX", &key)
+            .env_remove("DEEPSEEK_API_KEY");
+        if let Some(credential) = credential {
+            command.env("DEEPSEEK_API_KEY", credential);
+        }
+        command.output().expect("run agentosd JSON config check")
+    };
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agentosd"))
-        .args(["--check-config", "--json"])
-        .env("EGOPULSE_USER_CONFIG", config_path)
-        .env("EGOPULSE_READ_MODEL_KEY_HEX", &key)
-        .env("EGOPULSE_TOKEN_MAC_KEY_HEX", &key)
-        .env("EGOPULSE_TASK_KEY_HEX", &key)
-        .env("EGOPULSE_MEMORY_KEY_HEX", &key)
-        .env("EGOPULSE_ARTIFACT_KEY_HEX", &key)
-        .env("EGOPULSE_VERIFICATION_KEY_HEX", &key)
-        .env("EGOPULSE_POLICY_KEY_HEX", &key)
-        .env("EGOPULSE_VERDICT_KEY_HEX", &key)
-        .env("EGOPULSE_ADAPTER_KEY_HEX", &key)
-        .env("EGOPULSE_COLLABORATION_KEY_HEX", &key)
-        .output()
-        .expect("run agentosd JSON config check");
+    let output = run_check(None);
 
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
@@ -114,6 +121,7 @@ fn check_config_json_emits_redacted_provider_catalog_without_secret_values() {
         serde_json::from_slice(&output.stdout).expect("JSON provider report");
     assert_eq!(report["configuration"], "passed");
     assert_eq!(report["stores_opened"], false);
+    assert_eq!(report["verification_worker_configured"], false);
     assert_eq!(report["provider_profiles"].as_array().unwrap().len(), 4);
     assert_eq!(report["provider_profiles"][1]["provider"], "deepseek");
     assert_eq!(
@@ -137,6 +145,21 @@ fn check_config_json_emits_redacted_provider_catalog_without_secret_values() {
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains(&key),
         "authority key must never appear in provider report"
+    );
+
+    let test_credential = "deepseek-test-credential-never-render";
+    let present_output = run_check(Some(test_credential));
+    assert_eq!(present_output.status.code(), Some(0));
+    assert!(present_output.stderr.is_empty());
+    let present_report: serde_json::Value =
+        serde_json::from_slice(&present_output.stdout).expect("JSON provider report");
+    assert_eq!(
+        present_report["provider_profiles"][1]["credential_status"],
+        "present"
+    );
+    assert!(
+        !String::from_utf8_lossy(&present_output.stdout).contains(test_credential),
+        "provider credential must never appear in provider report"
     );
 }
 

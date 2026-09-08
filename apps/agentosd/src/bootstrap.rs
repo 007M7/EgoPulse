@@ -50,7 +50,6 @@ use prost_types::Timestamp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::ConfiguredWorkPreparationPort;
 use crate::work_capability::{
     WorkCapabilityRegistry, WorkCapabilityRegistryError, persist_explicit_config_transition,
 };
@@ -65,9 +64,14 @@ use crate::{
     DaemonProviders, FounderVerdictConfigurationError, GovernedReturnCollectorConfig,
     LocalUserPolicyResolver, LocalUserPolicyResolverConfig, MemoryCandidateProducerBinding,
     MemoryRetrievalCompositionConfig, NativeHarnessCompositionConfig,
-    SharedAuthorityCompositionInputs, TaskAuthorityCommitReceiptSource,
+    SharedAuthorityHandlesCompositionInputs, TaskAuthorityCommitReceiptSource,
     VerificationAuthorityArtifactSource, VerificationProjectionSource, VerificationWorkerConfig,
 };
+use crate::{ConfiguredWorkPreparationPort, RepositoryMaterialConfig};
+
+#[path = "bootstrap_repository.rs"]
+mod repository;
+pub use repository::{FounderSupportingMaterialConfig, RepositoryVerificationConfig};
 
 const PRODUCTION_BOOTSTRAP_V2: &str = "egopulse.production-bootstrap/v2";
 const PRODUCTION_BOOTSTRAP_V3: &str = "egopulse.production-bootstrap/v3";
@@ -437,6 +441,12 @@ pub struct ProductionBootstrapConfig {
     pub memory_retrieval: Option<MemoryRetrievalCompositionConfig>,
     pub memory_candidate_producers: Vec<MemoryCandidateProducerBinding>,
     pub task_guard: ConfiguredTaskCreationGuardConfig,
+    /// Optional D-02 repository material source. Absence preserves the legacy
+    /// work-preparation and snapshot behavior.
+    pub repository_material: Option<RepositoryMaterialConfig>,
+    /// Explicit Artifact contracts for governed repository command intents and
+    /// receipts. This is present exactly when repository material is enabled.
+    pub repository_command_artifacts: Option<RepositoryCommandArtifactPolicyConfig>,
     pub artifact: ArtifactAuthorityConfig,
     pub artifact_guard: ConfiguredArtifactAdmissionGuardConfig,
     pub verification: VerificationAuthorityConfig,
@@ -448,6 +458,10 @@ pub struct ProductionBootstrapConfig {
     /// file, every execution field is decoded from an explicit reviewed
     /// configuration object and validated before daemon construction.
     pub verification_worker: Option<VerificationWorkerConfig>,
+    /// Per-task frozen repository checking, composed with the same authorities
+    /// as dispatch and return collection. Mutually exclusive with the legacy worker.
+    pub repository_verification: Option<RepositoryVerificationConfig>,
+    pub founder_supporting_material: Option<FounderSupportingMaterialConfig>,
     pub policy: PolicyAuthorityConfig,
     pub policy_resolver: LocalUserPolicyBootstrapConfig,
     pub verdict: VerdictAuthorityConfig,
@@ -456,6 +470,7 @@ pub struct ProductionBootstrapConfig {
     pub founder_authority_policy_ref: ContractReference,
     pub allowed_confirmation_proof_refs: BTreeSet<String>,
     pub non_overridable_gate_ids: BTreeSet<String>,
+    pub non_overridable_criterion_ids: BTreeSet<String>,
     pub founder_confirmation_ttl: Duration,
     pub os_principal: AllowlistedPrincipal,
     pub authority_binding: AuthorityPrincipalBinding,
@@ -549,6 +564,46 @@ impl ProductionBootstrapConfig {
         self.provider_profiles[codex_profile_index].executable = profile_executable;
         self.codex.codex_executable = runtime_executable;
 
+        if let Some(material) = &self.repository_material {
+            repository::validate_repository_claim_binding(
+                &self.artifact_guard,
+                &self.task_guard.acceptance_contract_ref,
+                &self.codex.native.return_collector,
+            )?;
+            material
+                .validate_acceptance_contract_ref(&self.task_guard.acceptance_contract_ref)
+                .map_err(|_| {
+                    ProductionBootstrapError::InvalidConfiguration(
+                        "repository frozen acceptance contract reference",
+                    )
+                })?;
+        }
+
+        if let Some(config) = &self.repository_verification {
+            config.validate_model(&self.provider_profiles[codex_profile_index])?;
+            if self.repository_material.is_none()
+                || self.repository_command_artifacts.is_none()
+                || self.verification_worker.is_some()
+            {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "repository Verification composition",
+                ));
+            }
+            config.validate(
+                &self.artifact_guard,
+                &self
+                    .verification_references
+                    .as_ref()
+                    .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                        "verification.criteria",
+                    ))?
+                    .criteria,
+            )?;
+        }
+        if let Some(config) = &self.founder_supporting_material {
+            config.validate(&self.artifact_guard)?;
+        }
+
         let context_database_path = self
             .memory
             .database_path
@@ -577,7 +632,13 @@ impl ProductionBootstrapConfig {
         )?));
         let memory = Arc::new(Mutex::new(MemoryAuthority::open(self.memory)?));
 
+        let repository_material = self
+            .repository_material
+            .map(RepositoryMaterialConfig::validate)
+            .transpose()
+            .map_err(|_| ProductionBootstrapError::WorkPreparation)?;
         let artifact_guard = ConfiguredArtifactAdmissionGuard::new(self.artifact_guard)?;
+        let derived_workspace_admission = artifact_guard.derived_workspace_admission_handle();
         let artifact = Arc::new(Mutex::new(ArtifactAuthority::open(
             self.artifact,
             artifact_guard,
@@ -585,15 +646,27 @@ impl ProductionBootstrapConfig {
 
         let verification_resolver: Box<dyn VerificationReferenceResolver> =
             match self.verification_references {
-                Some(config) => Box::new(
-                    ArtifactBackedReferenceResolver::new(
+                Some(config) => {
+                    let mut resolver = ArtifactBackedReferenceResolver::new(
                         ArtifactAuthorityReferenceSource::new_shared(Arc::clone(&artifact)),
                         config.criteria,
                     )
                     .map_err(|_| {
                         ProductionBootstrapError::InvalidConfiguration("verification.criteria")
-                    })?,
-                ),
+                    })?;
+                    if let Some(repository) = &self.repository_verification {
+                        resolver = resolver
+                            .with_checker_output_collector(
+                                repository.collector_principal_id().to_owned(),
+                            )
+                            .map_err(|_| {
+                                ProductionBootstrapError::InvalidConfiguration(
+                                    "Verification output collector",
+                                )
+                            })?;
+                    }
+                    Box::new(resolver)
+                }
                 None => Box::new(DenyVerificationReferences),
             };
 
@@ -617,9 +690,59 @@ impl ProductionBootstrapConfig {
             allowed_scope_refs: self.policy_resolver.allowed_scope_refs,
             decision_ttl: self.policy_resolver.decision_ttl,
         })?;
-        let policy = PolicyDecisionAuthority::open(self.policy, policy_resolver)?;
+        let policy = Arc::new(Mutex::new(PolicyDecisionAuthority::open(
+            self.policy,
+            crate::verdict_expiry::FounderExpiryPolicyResolver {
+                approval: Box::new(policy_resolver),
+                task: Arc::clone(&task),
+                verdict: Arc::clone(&founder_verdict_handle),
+                policy_ref: self.founder_authority_policy_ref.clone(),
+            },
+        )?));
 
-        let founder_resolver =
+        let founder_policy = self
+            .founder_supporting_material
+            .as_ref()
+            .map(|config| {
+                config.policy(
+                    &self
+                        .codex
+                        .native
+                        .return_collector
+                        .artifact_authority_principal_id,
+                )
+            })
+            .transpose()?;
+        let founder_material_port = founder_policy
+            .as_ref()
+            .map(|policy| {
+                let source =
+                    crate::founder_material::OwnerBoundFounderSupportingMaterialSource::new(
+                        Arc::clone(&task),
+                        Arc::new(VerificationAuthorityArtifactSource::new_shared(Arc::clone(
+                            &verification,
+                        ))),
+                        Arc::clone(&artifact),
+                        self.allowed_founder_principal_ids.clone(),
+                    )
+                    .map_err(|_| {
+                        ProductionBootstrapError::InvalidConfiguration(
+                            "Founder material owner binding",
+                        )
+                    })?;
+                crate::founder_material::GovernedFounderSupportingMaterialPort::new(
+                    Arc::clone(&artifact),
+                    Arc::new(source),
+                    policy.clone(),
+                    derived_workspace_admission.clone(),
+                )
+                .map_err(|_| {
+                    ProductionBootstrapError::InvalidConfiguration("Founder material intake")
+                })
+            })
+            .transpose()?;
+        let non_overridable_criterion_ids = self.non_overridable_criterion_ids;
+        let mut founder_resolver =
             ConfiguredFounderVerdictResolver::new(ConfiguredFounderVerdictResolverConfig {
                 verification_source: Box::new(VerificationAuthorityArtifactSource::new_shared(
                     Arc::clone(&verification),
@@ -629,11 +752,29 @@ impl ProductionBootstrapConfig {
                 ))),
                 allowed_founder_principal_ids: self.allowed_founder_principal_ids,
                 authority_ref: self.founder_authority_ref,
-                authority_policy_ref: self.founder_authority_policy_ref,
+                authority_policy_ref: self.founder_authority_policy_ref.clone(),
                 allowed_confirmation_proof_refs: self.allowed_confirmation_proof_refs,
                 non_overridable_gate_ids: self.non_overridable_gate_ids,
                 confirmation_ttl: self.founder_confirmation_ttl,
-            })?;
+            })?
+            .with_non_overridable_criterion_ids(non_overridable_criterion_ids)?
+            .with_expiry_source(
+                crate::verdict_expiry::FounderVerdictExpiryProofSource {
+                    policy: Arc::clone(&policy),
+                    task: Arc::clone(&task),
+                    policy_ref: self.founder_authority_policy_ref,
+                },
+            );
+        if let Some(policy) = founder_policy {
+            founder_resolver = founder_resolver.with_supporting_material_source(
+                Box::new(
+                    crate::founder_material::ArtifactAuthorityFounderSupportingMaterialSource::new(
+                        Arc::clone(&artifact),
+                    ),
+                ),
+                policy,
+            )?;
+        }
         let verdict = FounderVerdictAuthority::open(self.verdict, founder_resolver)?;
         *founder_verdict_handle
             .lock()
@@ -647,11 +788,28 @@ impl ProductionBootstrapConfig {
         let context_principal_resolver = Arc::clone(&principal_resolver);
         let session_principal_resolver =
             Arc::new(AllowlistedPrincipalResolver::new([self.os_principal])?);
-        let mut providers =
-            DaemonProviders::from_shared_authority_inputs(SharedAuthorityCompositionInputs {
+        let cross_authority_operation_gate = Arc::new(Mutex::new(()));
+        let expiry_worker = crate::verdict_expiry::ExpiryRecoveringVerdictWorker {
+            consumer: crate::ConfiguredFounderVerdictConsumeWorker::new_with_operation_gate(
+                Arc::clone(&task),
+                Arc::clone(&founder_verdict_handle),
+                "task-authority:founder-verdict-consumer",
+                Arc::clone(&cross_authority_operation_gate),
+            )
+            .map_err(|_| {
+                ProductionBootstrapError::InvalidConfiguration("Founder Verdict recovery worker")
+            })?,
+            task: Arc::clone(&task),
+            verdict: Arc::clone(&founder_verdict_handle),
+            policy: Arc::clone(&policy),
+            operation_gate: Arc::clone(&cross_authority_operation_gate),
+        };
+        let mut providers = DaemonProviders::from_shared_authority_handles(
+            SharedAuthorityHandlesCompositionInputs {
                 task: Arc::clone(&task),
-                policy,
+                policy: Arc::clone(&policy),
                 verdict: founder_verdict_handle,
+                cross_authority_operation_gate: Arc::clone(&cross_authority_operation_gate),
                 principal_resolver,
                 session_principal_resolver,
                 session_clock: Arc::new(SystemSessionClock),
@@ -662,13 +820,34 @@ impl ProductionBootstrapConfig {
                         &verification,
                     ))),
                 ],
-            })
-            .with_context_authority(Arc::clone(&context))
-            .with_context_mutation(Arc::new(ContextMutationPortAdapter::new(
-                Arc::clone(&context),
-                context_principal_resolver,
-            )))
-            .with_work_capability_port(self.work_capability_registry.clone());
+            },
+        )
+        .with_founder_verdict_consume_worker(Arc::new(expiry_worker))
+        .with_context_authority(Arc::clone(&context))
+        .with_context_mutation(Arc::new(ContextMutationPortAdapter::new(
+            Arc::clone(&context),
+            context_principal_resolver,
+        )))
+        .with_work_capability_port(self.work_capability_registry.clone());
+        if let Some(port) = founder_material_port {
+            providers = providers.with_founder_supporting_material_port(Arc::new(port));
+        }
+        if let Some(repository_material) = repository_material.as_ref() {
+            let command_artifacts = self.repository_command_artifacts.clone().ok_or(
+                ProductionBootstrapError::InvalidConfiguration(
+                    "repository command Artifact policy",
+                ),
+            )?;
+            providers = providers.with_repository_dispatch(
+                repository_material.clone(),
+                derived_workspace_admission.clone(),
+                command_artifacts,
+            );
+        } else if self.repository_command_artifacts.is_some() {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "repository command Artifact policy without repository material",
+            ));
+        }
         if let Some(worker_config) = self.verification_worker {
             let worker = ConfiguredVerificationWorker::new(
                 Arc::clone(&task),
@@ -681,11 +860,30 @@ impl ProductionBootstrapConfig {
             .map_err(ProductionBootstrapError::VerificationWorker)?;
             providers = providers.with_verification_worker(Arc::new(worker));
         }
+        if let Some(config) = self.repository_verification {
+            let commands = self.repository_command_artifacts.as_ref().ok_or(
+                ProductionBootstrapError::InvalidConfiguration(
+                    "repository command Artifact policy",
+                ),
+            )?;
+            let worker = config.compose(
+                repository::RepositoryVerificationOwners {
+                    context: Arc::clone(&context),
+                    task: Arc::clone(&task),
+                    artifact: Arc::clone(&artifact),
+                    verification: Arc::clone(&verification),
+                    admission: derived_workspace_admission,
+                },
+                &self.codex,
+                commands,
+            )?;
+            providers = providers.with_verification_worker(Arc::new(worker));
+        }
         if let Some(memory_retrieval) = self.memory_retrieval {
             providers = providers.with_memory_retrieval(Arc::clone(&memory), memory_retrieval)?;
         }
         providers = providers.with_memory_mutation(Arc::clone(&memory), memory_principal_resolver);
-        let work_port = ConfiguredWorkPreparationPort::new(
+        let mut work_port = ConfiguredWorkPreparationPort::new(
             Arc::clone(&context),
             Arc::clone(&providers.task_port),
             Arc::clone(&providers.work_memory_retrieval_port),
@@ -698,6 +896,11 @@ impl ProductionBootstrapConfig {
         .and_then(|port| port.with_activation_run_id(self.codex.native.workflow.run_id.clone()))
         .map(|port| port.with_work_capability_registry(Arc::clone(&self.work_capability_registry)))
         .map_err(|_| ProductionBootstrapError::WorkPreparation)?;
+        if let Some(repository_material) = repository_material {
+            work_port = work_port
+                .with_repository_material(repository_material)
+                .map_err(|_| ProductionBootstrapError::WorkPreparation)?;
+        }
         providers = providers.with_work_preparation_port(Arc::new(work_port));
         if !self.memory_candidate_producers.is_empty() {
             providers = providers.with_memory_candidate_producers(
@@ -738,11 +941,17 @@ struct UserOwnedBootstrapFile {
     stores: StoreFiles,
     identity: IdentityFile,
     task_guard: TaskGuardFile,
+    #[serde(default)]
+    repository_material: Option<RepositoryMaterialFile>,
     artifact: ArtifactPolicyFile,
     #[serde(default)]
     verification: Option<VerificationFile>,
     #[serde(default)]
     verification_worker: Option<VerificationWorkerFile>,
+    #[serde(default)]
+    repository_verification: Option<RepositoryVerificationConfig>,
+    #[serde(default)]
+    founder_supporting_material: Option<FounderSupportingMaterialConfig>,
     #[serde(default)]
     memory_retrieval: Option<MemoryRetrievalFile>,
     #[serde(default)]
@@ -885,6 +1094,43 @@ struct TaskGuardFile {
     allowed_target_scope_refs: Vec<String>,
     acceptance_contract_ref: ReferenceFile,
     budget_profile_ref: ReferenceFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryMaterialFile {
+    acceptance_contract_path: String,
+    repository_root: String,
+    git_executable: String,
+    artifact_type_ref: ReferenceFile,
+    transformation_contract_ref: ReferenceFile,
+    retention_profile_ref: ReferenceFile,
+    evidence_profile_ref: ReferenceFile,
+    claim_semantic_profile_ref: ReferenceFile,
+    command_intent_type_ref: ReferenceFile,
+    command_intent_transformation_ref: ReferenceFile,
+    command_receipt_type_ref: ReferenceFile,
+    command_receipt_transformation_ref: ReferenceFile,
+}
+
+struct RepositoryArtifactSelection {
+    artifact_type_ref: ContractReference,
+    transformation_contract_ref: ContractReference,
+    retention_profile_ref: ContractReference,
+    evidence_profile_ref: ContractReference,
+    claim_semantic_profile_ref: ContractReference,
+    command_intent_type_ref: ContractReference,
+    command_intent_transformation_ref: ContractReference,
+    command_receipt_type_ref: ContractReference,
+    command_receipt_transformation_ref: ContractReference,
+}
+
+#[derive(Clone, Debug)]
+pub struct RepositoryCommandArtifactPolicyConfig {
+    pub intent_type_ref: ContractReference,
+    pub intent_transformation_ref: ContractReference,
+    pub receipt_type_ref: ContractReference,
+    pub receipt_transformation_ref: ContractReference,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1059,6 +1305,8 @@ struct FounderFile {
     authority_policy_ref: ReferenceFile,
     allowed_confirmation_proof_refs: Vec<String>,
     non_overridable_gate_ids: Vec<String>,
+    #[serde(default)]
+    non_overridable_criterion_ids: Vec<String>,
     confirmation_ttl_seconds: u64,
 }
 
@@ -1935,6 +2183,14 @@ impl UserOwnedBootstrapFile {
             budget_profile_ref: self.task_guard.budget_profile_ref.into_typed(),
         };
 
+        let (repository_material, repository_artifact_selection) = match self.repository_material {
+            Some(repository) => {
+                let (material, selection) = repository.into_typed()?;
+                (Some(material), Some(selection))
+            }
+            None => (None, None),
+        };
+
         let artifact_guard = ConfiguredArtifactAdmissionGuardConfig {
             allowed_workspace_refs: non_empty_set(
                 self.artifact.allowed_workspace_refs,
@@ -2000,6 +2256,25 @@ impl UserOwnedBootstrapFile {
                 "verification_worker requires verification criteria",
             ));
         }
+        if let Some(config) = &self.repository_verification {
+            if repository_material.is_none() || verification_worker.is_some() {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "repository Verification composition",
+                ));
+            }
+            config.validate(
+                &artifact_guard,
+                &verification_references
+                    .as_ref()
+                    .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                        "verification.criteria",
+                    ))?
+                    .criteria,
+            )?;
+        }
+        if let Some(config) = &self.founder_supporting_material {
+            config.validate(&artifact_guard)?;
+        }
 
         let workflow = self.codex.workflow.into_typed()?;
         if !artifact_guard
@@ -2010,46 +2285,102 @@ impl UserOwnedBootstrapFile {
                 "artifact.allowed_workspace_refs must include codex.workflow.workspace_ref",
             ));
         }
-        let return_collector = GovernedReturnCollectorConfig {
-            artifact_type_ref: artifact_guard
+        if let Some(selection) = repository_artifact_selection.as_ref()
+            && (!artifact_guard
                 .allowed_artifact_type_refs
-                .first()
-                .cloned()
+                .contains(&selection.artifact_type_ref)
+                || !artifact_guard
+                    .allowed_transformation_contract_refs
+                    .contains(&selection.transformation_contract_ref)
+                || !artifact_guard
+                    .allowed_retention_profile_refs
+                    .contains(&selection.retention_profile_ref)
+                || !artifact_guard
+                    .allowed_evidence_profile_refs
+                    .contains(&selection.evidence_profile_ref)
+                || !artifact_guard
+                    .allowed_artifact_type_refs
+                    .contains(&selection.command_intent_type_ref)
+                || !artifact_guard
+                    .allowed_transformation_contract_refs
+                    .contains(&selection.command_intent_transformation_ref)
+                || !artifact_guard
+                    .allowed_artifact_type_refs
+                    .contains(&selection.command_receipt_type_ref)
+                || !artifact_guard
+                    .allowed_transformation_contract_refs
+                    .contains(&selection.command_receipt_transformation_ref)
+                || selection.command_intent_type_ref == selection.command_receipt_type_ref)
+        {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "repository_material Artifact references must be explicitly allowed",
+            ));
+        }
+        let return_collector = GovernedReturnCollectorConfig {
+            artifact_type_ref: repository_artifact_selection
+                .as_ref()
+                .map(|selection| selection.artifact_type_ref.clone())
+                .or_else(|| artifact_guard.allowed_artifact_type_refs.first().cloned())
                 .ok_or(ProductionBootstrapError::InvalidConfiguration(
                     "artifact.allowed_artifact_type_refs",
                 ))?,
-            transformation_contract_ref: artifact_guard
-                .allowed_transformation_contract_refs
-                .first()
-                .cloned()
+            transformation_contract_ref: repository_artifact_selection
+                .as_ref()
+                .map(|selection| selection.transformation_contract_ref.clone())
+                .or_else(|| {
+                    artifact_guard
+                        .allowed_transformation_contract_refs
+                        .first()
+                        .cloned()
+                })
                 .ok_or(ProductionBootstrapError::InvalidConfiguration(
                     "artifact.allowed_transformation_contract_refs",
                 ))?,
-            retention_profile_ref: artifact_guard
-                .allowed_retention_profile_refs
-                .first()
-                .cloned()
+            retention_profile_ref: repository_artifact_selection
+                .as_ref()
+                .map(|selection| selection.retention_profile_ref.clone())
+                .or_else(|| {
+                    artifact_guard
+                        .allowed_retention_profile_refs
+                        .first()
+                        .cloned()
+                })
                 .ok_or(ProductionBootstrapError::InvalidConfiguration(
                     "artifact.allowed_retention_profile_refs",
                 ))?,
-            claim_semantic_profile_ref: artifact_guard
-                .allowed_claim_semantic_profile_refs
-                .first()
-                .cloned()
+            claim_semantic_profile_ref: repository_artifact_selection
+                .as_ref()
+                .map(|selection| selection.claim_semantic_profile_ref.clone())
+                .or_else(|| {
+                    artifact_guard
+                        .allowed_claim_semantic_profile_refs
+                        .first()
+                        .cloned()
+                })
                 .ok_or(ProductionBootstrapError::InvalidConfiguration(
                     "artifact.allowed_claim_semantic_profile_refs",
                 ))?,
-            claim_acceptance_contract_ref: artifact_guard
-                .allowed_claim_acceptance_contract_refs
-                .first()
-                .cloned()
+            claim_acceptance_contract_ref: repository_artifact_selection
+                .as_ref()
+                .map(|_| task_guard.acceptance_contract_ref.clone())
+                .or_else(|| {
+                    artifact_guard
+                        .allowed_claim_acceptance_contract_refs
+                        .first()
+                        .cloned()
+                })
                 .ok_or(ProductionBootstrapError::InvalidConfiguration(
                     "artifact.allowed_claim_acceptance_contract_refs",
                 ))?,
-            evidence_profile_ref: artifact_guard
-                .allowed_evidence_profile_refs
-                .first()
-                .cloned()
+            evidence_profile_ref: repository_artifact_selection
+                .as_ref()
+                .map(|selection| selection.evidence_profile_ref.clone())
+                .or_else(|| {
+                    artifact_guard
+                        .allowed_evidence_profile_refs
+                        .first()
+                        .cloned()
+                })
                 .ok_or(ProductionBootstrapError::InvalidConfiguration(
                     "artifact.allowed_evidence_profile_refs",
                 ))?,
@@ -2057,6 +2388,20 @@ impl UserOwnedBootstrapFile {
             collector_principal_id: "collector:terminal-output".to_owned(),
             artifact_authority_principal_id: "authority:artifact".to_owned(),
         };
+        if let Some(material) = &repository_material {
+            repository::validate_repository_claim_binding(
+                &artifact_guard,
+                &task_guard.acceptance_contract_ref,
+                &return_collector,
+            )?;
+            material
+                .validate_acceptance_contract_ref(&task_guard.acceptance_contract_ref)
+                .map_err(|_| {
+                    ProductionBootstrapError::InvalidConfiguration(
+                        "repository frozen acceptance contract reference",
+                    )
+                })?;
+        }
         let mut codex = CodexHarnessCompositionConfig {
             native: NativeHarnessCompositionConfig {
                 collaboration_database_path: collaboration_store.database_path,
@@ -2109,6 +2454,9 @@ impl UserOwnedBootstrapFile {
             .ok_or(ProductionBootstrapError::InvalidConfiguration(
                 "provider_profiles.production_codex_route_binding",
             ))?;
+        if let Some(config) = &self.repository_verification {
+            config.validate_model(production_codex_profile)?;
+        }
         let (admitted_route, default_choice_id, preference_revision) = if migration_required {
             let route = compatibility_codex_route(production_codex_profile, &codex)?;
             let choice_id = format!("compat-codex:{}", &route.route_binding_sha256[..16]);
@@ -2144,6 +2492,17 @@ impl UserOwnedBootstrapFile {
             memory_retrieval,
             memory_candidate_producers,
             task_guard,
+            repository_material,
+            repository_command_artifacts: repository_artifact_selection.as_ref().map(|selection| {
+                RepositoryCommandArtifactPolicyConfig {
+                    intent_type_ref: selection.command_intent_type_ref.clone(),
+                    intent_transformation_ref: selection.command_intent_transformation_ref.clone(),
+                    receipt_type_ref: selection.command_receipt_type_ref.clone(),
+                    receipt_transformation_ref: selection
+                        .command_receipt_transformation_ref
+                        .clone(),
+                }
+            }),
             artifact: ArtifactAuthorityConfig {
                 database_path: artifact_store.database_path,
                 blob_root: artifact_store.blob_root,
@@ -2158,6 +2517,8 @@ impl UserOwnedBootstrapFile {
             },
             verification_references,
             verification_worker,
+            repository_verification: self.repository_verification,
+            founder_supporting_material: self.founder_supporting_material,
             policy: PolicyAuthorityConfig {
                 database_path: policy_store.database_path,
                 store_epoch: policy_store.store_epoch,
@@ -2200,6 +2561,7 @@ impl UserOwnedBootstrapFile {
                 "founder.allowed_confirmation_proof_refs",
             )?,
             non_overridable_gate_ids: set(self.founder.non_overridable_gate_ids),
+            non_overridable_criterion_ids: set(self.founder.non_overridable_criterion_ids),
             founder_confirmation_ttl: seconds(
                 self.founder.confirmation_ttl_seconds,
                 "founder.confirmation_ttl_seconds",
@@ -2330,6 +2692,45 @@ impl ReferenceFile {
             version: self.version,
             sha256: self.sha256,
         }
+    }
+}
+
+impl RepositoryMaterialFile {
+    fn into_typed(
+        self,
+    ) -> Result<(RepositoryMaterialConfig, RepositoryArtifactSelection), ProductionBootstrapError>
+    {
+        Ok((
+            RepositoryMaterialConfig {
+                contract_path: PathBuf::from(required(
+                    self.acceptance_contract_path,
+                    "repository_material.acceptance_contract_path",
+                )?),
+                repository_root: PathBuf::from(required(
+                    self.repository_root,
+                    "repository_material.repository_root",
+                )?),
+                git_executable: PathBuf::from(required(
+                    self.git_executable,
+                    "repository_material.git_executable",
+                )?),
+            },
+            RepositoryArtifactSelection {
+                artifact_type_ref: self.artifact_type_ref.into_typed(),
+                transformation_contract_ref: self.transformation_contract_ref.into_typed(),
+                retention_profile_ref: self.retention_profile_ref.into_typed(),
+                evidence_profile_ref: self.evidence_profile_ref.into_typed(),
+                claim_semantic_profile_ref: self.claim_semantic_profile_ref.into_typed(),
+                command_intent_type_ref: self.command_intent_type_ref.into_typed(),
+                command_intent_transformation_ref: self
+                    .command_intent_transformation_ref
+                    .into_typed(),
+                command_receipt_type_ref: self.command_receipt_type_ref.into_typed(),
+                command_receipt_transformation_ref: self
+                    .command_receipt_transformation_ref
+                    .into_typed(),
+            },
+        ))
     }
 }
 
@@ -2854,6 +3255,16 @@ struct ComposedVerificationReferenceResolver {
 }
 
 impl VerificationReferenceResolver for ComposedVerificationReferenceResolver {
+    fn validate_checker_result_references(
+        &self,
+        context: &egopulse_verification_authority::CheckerResultReferenceContext<'_>,
+        evidence_ids: &[String],
+        references: &[egopulse_verification_authority::CheckerResultArtifactReference],
+    ) -> Result<(), ReferenceRejection> {
+        self.inner
+            .validate_checker_result_references(context, evidence_ids, references)
+    }
+
     fn validate_checker_profile(&self, profile: &CheckerProfile) -> Result<(), ReferenceRejection> {
         self.inner.validate_checker_profile(profile)
     }

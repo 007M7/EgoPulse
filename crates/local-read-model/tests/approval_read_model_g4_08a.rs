@@ -141,6 +141,7 @@ fn adapter_input(
                 action_digest_sha256: ACTION_DIGEST.to_owned(),
                 requested_scope_ref: "safe://scope/01".to_owned(),
                 display_summary_ref: "safe://summary/01".to_owned(),
+                display_summary: None,
                 native_routing_ref: String::new(),
                 lifecycle: lifecycle as i32,
                 request_revision,
@@ -447,6 +448,347 @@ fn stale_lifecycle_and_old_epoch_resume_fail_closed() {
         ProjectionHealth::Rebuilding
     );
     model.mark_rebuild_ready().expect("finish rebuild");
+}
+
+#[test]
+fn issued_policy_remains_joined_when_native_approval_resolves() {
+    let root = TempRoot::new("policy-native-resolution");
+    let mut model = open(&root, "epoch-01");
+    model
+        .apply_collaboration(&collaboration_input())
+        .expect("run");
+    model
+        .apply_adapter_approval(&adapter_input(ApprovalRequestLifecycleKind::Open, 1, 11))
+        .expect("open");
+    model.apply_policy_approval(&policy_input()).expect("issue");
+    model
+        .apply_adapter_approval(&adapter_input(
+            ApprovalRequestLifecycleKind::Resolved,
+            2,
+            12,
+        ))
+        .expect("native resolution keeps original Policy binding");
+    let view = model
+        .get_harness_approval_view("approval-01", founder_access())
+        .expect("read")
+        .expect("view");
+    assert_eq!(
+        view.request_lifecycle,
+        ApprovalRequestLifecycleKind::Resolved as i32
+    );
+    assert!(view.policy_decision.is_some());
+    assert!(view.available_actions.is_empty());
+    assert_eq!(model.health().expect("health"), ProjectionHealth::Ready);
+}
+
+#[test]
+fn late_policy_joins_closed_request_after_compaction_and_reopen() {
+    for lifecycle in [
+        ApprovalRequestLifecycleKind::Resolved,
+        ApprovalRequestLifecycleKind::Withdrawn,
+    ] {
+        let root = TempRoot::new("late-policy-closed-request");
+        let mut model = open(&root, "epoch-01");
+        model
+            .apply_collaboration(&collaboration_input())
+            .expect("run");
+        model
+            .apply_adapter_approval(&adapter_input(ApprovalRequestLifecycleKind::Open, 1, 11))
+            .expect("open");
+        let old_position = model.position().expect("open position");
+        model
+            .apply_adapter_approval(&adapter_input(lifecycle, 2, 12))
+            .expect("close before Policy projection");
+        model
+            .compact_history(model.position().expect("position").sequence)
+            .expect("compact closed request");
+        drop(model);
+        let mut model = open(&root, "epoch-01");
+        model
+            .apply_policy_approval(&policy_input())
+            .expect("late original Issue still has exact proof");
+        let mut consumed = policy_at_revision(2, ProjectionMessageMode::Incremental);
+        consumed.result.state.as_mut().expect("state").state =
+            HarnessApprovalDecisionStateKind::Consumed as i32;
+        consumed.metadata.payload_digest_sha256 = digest(&consumed.result);
+        model
+            .apply_policy_approval(&consumed)
+            .expect("consume after closure");
+        let view = model
+            .get_harness_approval_view("approval-01", founder_access())
+            .expect("read")
+            .expect("view");
+        assert_eq!(view.request_lifecycle, lifecycle as i32);
+        assert_eq!(
+            view.policy_decision.expect("decision").state,
+            HarnessApprovalDecisionStateKind::Consumed as i32
+        );
+        assert!(view.available_actions.is_empty());
+        assert_eq!(
+            model
+                .approval_frames_after(&old_position, founder_access())
+                .expect("retention still enforced")[0]
+                .kind,
+            StreamFrameKind::ResetRequired as i32
+        );
+        assert_eq!(model.health().expect("health"), ProjectionHealth::Ready);
+    }
+}
+
+#[test]
+fn consumed_policy_cannot_replace_the_issued_decision_record() {
+    for mutation in 0..3 {
+        let root = TempRoot::new("consumed-policy-record-drift");
+        let mut model = open(&root, "epoch-01");
+        model
+            .apply_adapter_approval(&adapter_input(ApprovalRequestLifecycleKind::Open, 1, 11))
+            .expect("open");
+        model.apply_policy_approval(&policy_input()).expect("issue");
+
+        let mut consumed = policy_at_revision(2, ProjectionMessageMode::Incremental);
+        consumed.result.state.as_mut().expect("state").state =
+            HarnessApprovalDecisionStateKind::Consumed as i32;
+        match mutation {
+            0 => {
+                let replacement = "policy-decision-replacement".to_owned();
+                consumed
+                    .result
+                    .decision_record
+                    .as_mut()
+                    .expect("record")
+                    .authority_decision_ref
+                    .clone_from(&replacement);
+                consumed
+                    .result
+                    .state
+                    .as_mut()
+                    .expect("state")
+                    .authority_decision_ref
+                    .clone_from(&replacement);
+                consumed
+                    .result
+                    .event
+                    .as_mut()
+                    .expect("event")
+                    .authority_decision_ref = replacement;
+            }
+            1 => {
+                consumed
+                    .result
+                    .decision_record
+                    .as_mut()
+                    .expect("record")
+                    .decision = ApprovalDecision::Deny as i32;
+            }
+            _ => {
+                consumed
+                    .result
+                    .decision_record
+                    .as_mut()
+                    .expect("record")
+                    .request
+                    .as_mut()
+                    .expect("binding")
+                    .requested_scope_ref = "safe://scope/replacement".to_owned();
+            }
+        }
+        consumed.metadata.payload_digest_sha256 = digest(&consumed.result);
+
+        assert!(
+            matches!(
+                model.apply_policy_approval(&consumed),
+                Err(ProjectionFailure::IntegrityFailure)
+            ),
+            "mutation {mutation}"
+        );
+        let retained = model
+            .get_harness_approval_view("approval-01", founder_access())
+            .expect("read retained decision")
+            .expect("view");
+        let decision = retained.policy_decision.expect("issued decision retained");
+        assert_eq!(decision.authority_decision_ref, "policy-decision-01");
+        assert_eq!(decision.decision, ApprovalDecision::AllowOnce as i32);
+        assert_eq!(
+            decision.state,
+            HarnessApprovalDecisionStateKind::Issued as i32
+        );
+    }
+}
+
+#[test]
+fn rebuilt_terminal_request_accepts_late_policy_and_consumption() {
+    let root = TempRoot::new("terminal-policy-rebuild");
+    let mut model = open(&root, "epoch-01");
+    let collaboration = collaboration_input();
+    let open_request = adapter_input(ApprovalRequestLifecycleKind::Open, 1, 11);
+    let terminal_request = adapter_input(ApprovalRequestLifecycleKind::Resolved, 2, 12);
+
+    model
+        .apply_collaboration(&collaboration)
+        .expect("project run");
+    model
+        .apply_adapter_approval(&open_request)
+        .expect("project retained Open request");
+    model
+        .apply_adapter_approval(&terminal_request)
+        .expect("project retained terminal request");
+    let old_position = model.position().expect("old epoch position");
+
+    model
+        .reset_for_rebuild("epoch-02")
+        .expect("start new epoch rebuild");
+    model
+        .apply_collaboration(&collaboration)
+        .expect("replay retained Collaboration feed");
+    model
+        .apply_adapter_approval(&open_request)
+        .expect("replay retained Open request");
+    model
+        .apply_adapter_approval(&terminal_request)
+        .expect("replay retained terminal request");
+    model
+        .apply_policy_approval(&policy_input())
+        .expect("join late Policy to rebuilt Open evidence");
+    let mut consumed = policy_at_revision(2, ProjectionMessageMode::Incremental);
+    consumed.result.state.as_mut().expect("state").state =
+        HarnessApprovalDecisionStateKind::Consumed as i32;
+    consumed.metadata.payload_digest_sha256 = digest(&consumed.result);
+    model
+        .apply_policy_approval(&consumed)
+        .expect("consume rebuilt decision");
+    model.mark_rebuild_ready().expect("publish rebuilt epoch");
+
+    let rebuilt = model
+        .get_harness_approval_view("approval-01", founder_access())
+        .expect("read rebuilt view")
+        .expect("rebuilt approval exists");
+    assert_eq!(
+        rebuilt.request_lifecycle,
+        ApprovalRequestLifecycleKind::Resolved as i32
+    );
+    assert_eq!(
+        rebuilt.policy_decision.expect("decision").state,
+        HarnessApprovalDecisionStateKind::Consumed as i32
+    );
+    assert!(rebuilt.available_actions.is_empty());
+    assert_eq!(
+        rebuilt
+            .metadata
+            .expect("metadata")
+            .position
+            .expect("position")
+            .epoch,
+        "epoch-02"
+    );
+    assert_eq!(
+        model
+            .approval_frames_after(&old_position, founder_access())
+            .expect("old epoch reset")[0]
+            .kind,
+        StreamFrameKind::ResetRequired as i32
+    );
+    assert_eq!(model.health().expect("health"), ProjectionHealth::Ready);
+}
+
+#[test]
+fn closed_request_rejects_forged_original_observation_and_action_drift() {
+    let root = TempRoot::new("late-forged-policy");
+    let mut model = open(&root, "epoch-01");
+    model
+        .apply_adapter_approval(&adapter_input(ApprovalRequestLifecycleKind::Open, 1, 11))
+        .expect("open");
+    model
+        .apply_adapter_approval(&adapter_input(
+            ApprovalRequestLifecycleKind::Resolved,
+            2,
+            12,
+        ))
+        .expect("close");
+    let mut forged = policy_input();
+    forged
+        .result
+        .decision_record
+        .as_mut()
+        .expect("record")
+        .request
+        .as_mut()
+        .expect("binding")
+        .request_observation_id = "another-open-observation".to_owned();
+    forged.metadata.payload_digest_sha256 = digest(&forged.result);
+    assert!(matches!(
+        model.apply_policy_approval(&forged),
+        Err(ProjectionFailure::IntegrityFailure)
+    ));
+
+    let root = TempRoot::new("cross-approval-observation");
+    let mut model = open(&root, "epoch-01");
+    model
+        .apply_adapter_approval(&adapter_input(ApprovalRequestLifecycleKind::Open, 1, 11))
+        .expect("open target approval");
+    model
+        .apply_adapter_approval(&adapter_input(
+            ApprovalRequestLifecycleKind::Resolved,
+            2,
+            12,
+        ))
+        .expect("close target approval");
+    let mut other = adapter_input(ApprovalRequestLifecycleKind::Open, 1, 21);
+    let Some(harness_observation::Payload::ApprovalRequest(other_request)) =
+        other.observation.payload.as_mut()
+    else {
+        panic!("approval request")
+    };
+    other_request.approval_request_id = "approval-02".to_owned();
+    other.metadata.payload_digest_sha256 = digest(&other.observation);
+    model
+        .apply_adapter_approval(&other)
+        .expect("project another approval's real Open observation");
+    let mut cross_approval = policy_input();
+    let binding = cross_approval
+        .result
+        .decision_record
+        .as_mut()
+        .expect("record")
+        .request
+        .as_mut()
+        .expect("binding");
+    binding.request_observation_id = other.observation.observation_id.clone();
+    binding.request_observation_sequence = other.observation.observation_sequence;
+    cross_approval.metadata.payload_digest_sha256 = digest(&cross_approval.result);
+    assert!(matches!(
+        model.apply_policy_approval(&cross_approval),
+        Err(ProjectionFailure::IntegrityFailure)
+    ));
+
+    for mutation in 0..4 {
+        let root = TempRoot::new("closed-request-binding-drift");
+        let mut model = open(&root, "epoch-01");
+        model
+            .apply_adapter_approval(&adapter_input(ApprovalRequestLifecycleKind::Open, 1, 11))
+            .expect("open");
+        let mut changed = adapter_input(ApprovalRequestLifecycleKind::Resolved, 2, 12);
+        match mutation {
+            0 => {
+                let Some(harness_observation::Payload::ApprovalRequest(request)) =
+                    changed.observation.payload.as_mut()
+                else {
+                    panic!("request")
+                };
+                request.action_digest_sha256 = "b".repeat(64);
+            }
+            1 => changed.observation.adapter_id = "another-adapter".to_owned(),
+            2 => changed.run_id = "another-run".to_owned(),
+            _ => changed.observation.capability_profile_id = "another-profile".to_owned(),
+        }
+        changed.metadata.payload_digest_sha256 = digest(&changed.observation);
+        assert!(
+            matches!(
+                model.apply_adapter_approval(&changed),
+                Err(ProjectionFailure::IntegrityFailure)
+            ),
+            "mutation {mutation}"
+        );
+    }
 }
 
 #[test]

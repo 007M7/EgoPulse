@@ -416,6 +416,10 @@ message HarnessApprovalView {
   HarnessApprovalDecisionView policy_decision = 17;
   repeated AvailableAction available_actions = 18;
   repeated RedactedField redactions = 19;
+  // Rebuildable copy of the adapter-owned safe summary. It remains subject to
+  // egopulse.approval-display/v1 validation; absence is legacy-compatible and
+  // must be displayed as unavailable rather than inferred from native data.
+  optional egopulse.harness.v1.ApprovalDisplaySummary display_summary = 20;
 }
 
 // Independent content-domain position. It must not be compared with the Task,
@@ -741,6 +745,20 @@ message ExecuteFounderVerdictResponse {
   LocalApiError gateway_error = 3;
 }
 
+// This is a narrow authenticated composition command, not an Artifact write
+// API. The daemon derives Artifact identity, producer, lineage, workspace and
+// contract profiles after revalidating the trusted Verdict scope.
+message CreateFounderSupportingMaterialRequest {
+  ClientRequestMetadata client = 1;
+  egopulse.verdict.v1.CreateFounderSupportingMaterialCommand command = 2;
+}
+
+message CreateFounderSupportingMaterialResponse {
+  egopulse.verdict.v1.FounderSupportingMaterialReceipt authority_result = 1;
+  ProjectionAwaitToken await_token = 2;
+  LocalApiError gateway_error = 3;
+}
+
 // Memory writes cross the Local API only as explicit, owner-checked commands.
 // A candidate submission never makes a record authoritative; accept and revoke
 // remain separate Founder-governed operations in the Memory Authority.
@@ -905,6 +923,7 @@ service LocalCommandGatewayService {
   rpc ExecuteTaskCommand(ExecuteTaskCommandRequest) returns (ExecuteTaskCommandResponse);
   rpc DecideHarnessApproval(DecideHarnessApprovalRequest) returns (DecideHarnessApprovalResponse);
   rpc ExecuteFounderVerdict(ExecuteFounderVerdictRequest) returns (ExecuteFounderVerdictResponse);
+  rpc CreateFounderSupportingMaterial(CreateFounderSupportingMaterialRequest) returns (CreateFounderSupportingMaterialResponse);
   rpc ExecuteMemoryMutation(ExecuteMemoryMutationRequest) returns (ExecuteMemoryMutationResponse);
   rpc ExecuteContextMutation(ExecuteContextMutationRequest) returns (ExecuteContextMutationResponse);
 }

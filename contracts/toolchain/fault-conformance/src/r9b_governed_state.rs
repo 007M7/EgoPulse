@@ -22,7 +22,7 @@ pub const R9B_TASK_SCHEMA_PROFILE_SHA256: &str =
 pub const R9B_POLICY_STORE_EPOCH: &str = "c5-00-policy-epoch";
 pub const R9B_POLICY_SCHEMA_PROFILE_ID: &str = "egopulse/policy-decision-authority-store/v1";
 pub const R9B_POLICY_SCHEMA_PROFILE_SHA256: &str =
-    "b3179c4c1d7497b052059c7469aac3952262f6f70572f77b8813f74af86b6bca";
+    "095d6c3142cf03ac08c9297d3ed72ef67dc21f8d73be746ff17555914b8d004d";
 
 const TASK_TABLES: &[&str] = &[
     "sqlite_sequence",
@@ -47,6 +47,7 @@ const POLICY_TABLES: &[&str] = &[
     "policy_consumption_receipts",
     "policy_commit_receipts",
     "policy_projection_migrations",
+    "founder_verdict_expiry_authorizations",
 ];
 
 const TASK_KEY: [u8; 32] = [0x11; 32];
@@ -483,6 +484,15 @@ mod tests {
                 CREATE TABLE policy_consumption_receipts (id TEXT PRIMARY KEY, payload BLOB NOT NULL);
                 CREATE TABLE policy_commit_receipts (id TEXT PRIMARY KEY, payload BLOB NOT NULL);
                 CREATE TABLE policy_projection_migrations (id TEXT PRIMARY KEY, payload BLOB NOT NULL);
+                CREATE TABLE founder_verdict_expiry_authorizations (
+                    authorization_id TEXT PRIMARY KEY,
+                    verdict_id TEXT NOT NULL,
+                    issued_state_revision INTEGER NOT NULL,
+                    identity_digest_sha256 TEXT NOT NULL UNIQUE,
+                    authorization BLOB NOT NULL,
+                    committed_at_seconds INTEGER NOT NULL,
+                    UNIQUE(verdict_id, issued_state_revision)
+                );
                 ",
             )
             .expect("create Policy fixture schema");
@@ -556,6 +566,10 @@ mod tests {
         assert_eq!(first.policy.last_event_sequence, 1);
         assert_eq!(first.policy.tables.len(), POLICY_TABLES.len());
         assert_eq!(table(&first.policy, "policy_decisions").row_count, 1);
+        assert_eq!(
+            table(&first.policy, "founder_verdict_expiry_authorizations").row_count,
+            0
+        );
 
         for digest in first.task.tables.iter().chain(&first.policy.tables) {
             assert!(is_sha256(&digest.canonical_sha256));
@@ -573,6 +587,19 @@ mod tests {
         );
         let error = read_r9b_governed_state_authorities(identity.path())
             .expect_err("forged identity must fail closed");
+        assert!(error.to_string().contains("fixed fixture identity"));
+
+        let policy_identity = TestRoot::new("policy-v2-identity-drift");
+        create_fixture(policy_identity.path());
+        update(
+            policy_identity.path(),
+            &POLICY_STORE,
+            "UPDATE policy_store_metadata
+             SET schema_profile_sha256='b3179c4c1d7497b052059c7469aac3952262f6f70572f77b8813f74af86b6bca'
+             WHERE singleton=1",
+        );
+        let error = read_r9b_governed_state_authorities(policy_identity.path())
+            .expect_err("V2 Policy identity must fail closed after the V3 migration");
         assert!(error.to_string().contains("fixed fixture identity"));
 
         let sequence = TestRoot::new("sequence-drift");

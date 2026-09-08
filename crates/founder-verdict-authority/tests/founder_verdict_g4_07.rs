@@ -4,7 +4,7 @@ use egopulse_domain_contracts::v01::egopulse::verdict::v1::{
     ConfirmationClass, ConsumeFounderVerdictCommand, ExpireFounderVerdictCommand, FounderVerdict,
     FounderVerdictDecision, FounderVerdictStateKind, IssueFounderVerdictCommand,
     RevokeFounderVerdictCommand, RiskAcceptance, RiskCategory, VerdictCommand, VerdictErrorCode,
-    VerdictScope, verdict_command,
+    VerdictEventKind, VerdictScope, verdict_command,
 };
 use egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationConclusion;
 use egopulse_founder_verdict_authority::{
@@ -16,6 +16,8 @@ use egopulse_founder_verdict_authority::{
 use prost_types::Timestamp;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use uuid::Uuid;
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -28,6 +30,28 @@ impl VerdictClock for FixedClock {
     fn now(&self) -> Result<Timestamp, VerdictAuthorityFailure> {
         Ok(Timestamp {
             seconds: 1_782_000_000,
+            nanos: 0,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct AdjustableClock(Arc<AtomicI64>);
+
+impl AdjustableClock {
+    fn new(seconds: i64) -> Self {
+        Self(Arc::new(AtomicI64::new(seconds)))
+    }
+
+    fn set(&self, seconds: i64) {
+        self.0.store(seconds, Ordering::SeqCst);
+    }
+}
+
+impl VerdictClock for AdjustableClock {
+    fn now(&self) -> Result<Timestamp, VerdictAuthorityFailure> {
+        Ok(Timestamp {
+            seconds: self.0.load(Ordering::SeqCst),
             nanos: 0,
         })
     }
@@ -326,6 +350,155 @@ fn verdict_projection_feed_carries_verdict_and_state_and_acks_by_digest() {
     assert_eq!(baselines.len(), 1);
     assert_eq!(baselines[0].result.verdict, committed.verdict);
     assert_eq!(baselines[0].result.state, committed.state);
+}
+
+#[test]
+fn task_handoff_is_bound_to_durable_issue_and_acks_exact_digest() {
+    let (_root, mut authority, founder, task) = authority_fixture(
+        "task-handoff",
+        VerificationConclusion::Passed,
+        vec![],
+        vec![],
+        vec![],
+        true,
+    );
+    let mut command = issue_command(
+        FounderVerdictDecision::Accept,
+        VerificationConclusion::Passed,
+        vec![],
+    );
+    sign(&mut command);
+    let issued = authority
+        .execute(&command, &founder)
+        .expect("issue verdict");
+    let verdict_id = issued.verdict.expect("verdict").founder_verdict_id;
+
+    let mut consume = consume_command(&verdict_id);
+    sign(&mut consume);
+    authority.execute(&consume, &task).expect("consume verdict");
+
+    let pending = authority
+        .pending_task_handoffs()
+        .expect("read durable Task handoff");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].verdict.founder_verdict_id, verdict_id);
+    assert_eq!(pending[0].event.kind, VerdictEventKind::Issued as i32);
+    assert_eq!(
+        pending[0].state.state,
+        FounderVerdictStateKind::Consumed as i32
+    );
+    assert!(
+        !authority
+            .acknowledge_task_handoff(&pending[0].message_id, &"0".repeat(64))
+            .expect("reject wrong Task handoff digest")
+    );
+    assert!(
+        authority
+            .acknowledge_task_handoff(&pending[0].message_id, &pending[0].payload_digest_sha256,)
+            .expect("ack Task handoff")
+    );
+    assert!(
+        authority
+            .pending_task_handoffs()
+            .expect("Task handoff after ACK")
+            .is_empty()
+    );
+}
+
+#[test]
+fn task_handoff_hold_preserves_row_outside_pending_delivery() {
+    let (_root, mut authority, founder, _) = authority_fixture(
+        "task-handoff-hold",
+        VerificationConclusion::Passed,
+        vec![],
+        vec![],
+        vec![],
+        true,
+    );
+    let mut command = issue_command(
+        FounderVerdictDecision::Accept,
+        VerificationConclusion::Passed,
+        vec![],
+    );
+    sign(&mut command);
+    authority
+        .execute(&command, &founder)
+        .expect("issue verdict");
+    let pending = authority.pending_task_handoffs().expect("Task handoff");
+    assert_eq!(pending.len(), 1);
+    assert!(
+        !authority
+            .hold_task_handoff(&pending[0].message_id, &"f".repeat(64))
+            .expect("reject wrong hold digest")
+    );
+    assert!(
+        authority
+            .hold_task_handoff(&pending[0].message_id, &pending[0].payload_digest_sha256)
+            .expect("hold Task handoff")
+    );
+    assert!(
+        authority
+            .pending_task_handoffs()
+            .expect("pending Task handoffs after hold")
+            .is_empty()
+    );
+}
+
+#[test]
+fn task_application_requires_current_issued_verdict_before_strict_expiry() {
+    let root = TempRoot::new("task-application-expiry");
+    let context = ResolvedVerdictContext {
+        scope: scope(),
+        verification_conclusion: VerificationConclusion::Passed,
+        open_discrepancy_ids: vec![],
+        open_unverified_item_ids: vec![],
+        non_overridable_gate_ids: vec![],
+    };
+    let clock = AdjustableClock::new(1_782_000_000);
+    let mut authority = FounderVerdictAuthority::open_with_clock(
+        VerdictAuthorityConfig {
+            database_path: root.path().join("verdict.db"),
+            store_epoch: "epoch-task-application-expiry".to_owned(),
+            key: VerdictSqlCipherKey::new([71; 32]),
+        },
+        StaticResolver {
+            context,
+            task_commit_valid: true,
+        },
+        clock.clone(),
+    )
+    .expect("open authority");
+    let founder = AuthenticatedVerdictPrincipal {
+        kind: VerdictPrincipalKind::FounderAuthority,
+        principal_id: "founder-authority:local".to_owned(),
+        authenticated: true,
+    };
+    let mut command = issue_command(
+        FounderVerdictDecision::Accept,
+        VerificationConclusion::Passed,
+        vec![],
+    );
+    sign(&mut command);
+    let verdict_id = authority
+        .execute(&command, &founder)
+        .expect("issue verdict")
+        .verdict
+        .expect("verdict")
+        .founder_verdict_id;
+    assert!(
+        authority
+            .get_for_task_application(&verdict_id)
+            .expect("application lookup before expiry")
+            .is_some()
+    );
+
+    clock.set(1_782_003_600);
+    assert!(
+        authority
+            .get_for_task_application(&verdict_id)
+            .expect("application lookup at expiry")
+            .is_none()
+    );
 }
 
 #[test]

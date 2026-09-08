@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
@@ -7,7 +7,7 @@ use egopulse_artifact_authority::{
     ArtifactAdmissionGuard, ArtifactAuthority, ArtifactAuthorityFailure, ArtifactClock,
 };
 use egopulse_domain_contracts::v01::egopulse::artifact::v1::{
-    ArtifactDescriptor, ArtifactSet, Claim, ContentAddress, Evidence, ReturnHandoff,
+    ArtifactDescriptor, ArtifactSet, Claim, ContentAddress, Evidence, LineageBinding, ReturnHandoff,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
 use egopulse_verification_authority::{
@@ -47,12 +47,122 @@ pub enum ArtifactAdmissionGuardConfigurationError {
     InvalidConfiguration,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DerivedWorkspaceAdmissionBinding {
+    pub workspace_ref: String,
+    pub lineage: LineageBinding,
+    pub source_binding_ref: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum DerivedWorkspaceAdmissionError {
+    #[error("derived workspace binding is invalid or conflicts with an active exact binding")]
+    Rejected,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct DerivedWorkspaceAdmissionHandle {
+    bindings: Arc<Mutex<BTreeMap<String, ActiveDerivedWorkspaceBinding>>>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveDerivedWorkspaceBinding {
+    binding: DerivedWorkspaceAdmissionBinding,
+    leases: u64,
+}
+
+pub(crate) struct DerivedWorkspaceAdmissionLease {
+    handle: DerivedWorkspaceAdmissionHandle,
+    binding: DerivedWorkspaceAdmissionBinding,
+}
+
+impl DerivedWorkspaceAdmissionHandle {
+    pub(crate) fn register(
+        &self,
+        binding: DerivedWorkspaceAdmissionBinding,
+    ) -> Result<DerivedWorkspaceAdmissionLease, DerivedWorkspaceAdmissionError> {
+        if binding.workspace_ref.trim().is_empty()
+            || binding.source_binding_ref.trim().is_empty()
+            || !lineage_complete(&binding.lineage)
+        {
+            return Err(DerivedWorkspaceAdmissionError::Rejected);
+        }
+        let mut bindings = self
+            .bindings
+            .lock()
+            .map_err(|_| DerivedWorkspaceAdmissionError::Rejected)?;
+        match bindings.get_mut(&binding.workspace_ref) {
+            Some(active) if active.binding == binding => {
+                active.leases = active
+                    .leases
+                    .checked_add(1)
+                    .ok_or(DerivedWorkspaceAdmissionError::Rejected)?;
+            }
+            Some(_) => return Err(DerivedWorkspaceAdmissionError::Rejected),
+            None => {
+                bindings.insert(
+                    binding.workspace_ref.clone(),
+                    ActiveDerivedWorkspaceBinding {
+                        binding: binding.clone(),
+                        leases: 1,
+                    },
+                );
+            }
+        }
+        drop(bindings);
+        Ok(DerivedWorkspaceAdmissionLease {
+            handle: self.clone(),
+            binding,
+        })
+    }
+
+    fn admits(&self, artifact: &ArtifactDescriptor) -> bool {
+        let Some(provenance) = artifact.provenance.as_ref() else {
+            return false;
+        };
+        let Some(lineage) = provenance.lineage.as_ref() else {
+            return false;
+        };
+        let Some(source_binding_ref) = provenance.raw_source_ref.as_ref() else {
+            return false;
+        };
+        self.bindings.lock().is_ok_and(|bindings| {
+            bindings
+                .get(&provenance.workspace_ref)
+                .is_some_and(|active| {
+                    active.binding.lineage == *lineage
+                        && active.binding.source_binding_ref == *source_binding_ref
+                })
+        })
+    }
+}
+
+impl Drop for DerivedWorkspaceAdmissionLease {
+    fn drop(&mut self) {
+        let Ok(mut bindings) = self.handle.bindings.lock() else {
+            return;
+        };
+        let should_remove = match bindings.get_mut(&self.binding.workspace_ref) {
+            Some(active) if active.binding == self.binding && active.leases > 1 => {
+                active.leases -= 1;
+                false
+            }
+            Some(active) if active.binding == self.binding => true,
+            _ => false,
+        };
+        if should_remove {
+            bindings.remove(&self.binding.workspace_ref);
+        }
+    }
+}
+
 /// Admission guard used by the production Artifact Authority composition.
 /// Artifact Authority still performs structural, producer and content-address
 /// checks; this guard adds the installation-specific policy checks without
 /// opening a second store or granting Verification write access.
 pub struct ConfiguredArtifactAdmissionGuard {
     config: ConfiguredArtifactAdmissionGuardConfig,
+    derived_workspace_admission: DerivedWorkspaceAdmissionHandle,
 }
 
 impl ConfiguredArtifactAdmissionGuard {
@@ -73,11 +183,18 @@ impl ConfiguredArtifactAdmissionGuard {
         {
             return Err(ArtifactAdmissionGuardConfigurationError::InvalidConfiguration);
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            derived_workspace_admission: DerivedWorkspaceAdmissionHandle::default(),
+        })
     }
 
     fn allows(refs: &[ContractReference], candidate: Option<&ContractReference>) -> bool {
         candidate.is_some_and(|candidate| refs.iter().any(|allowed| allowed == candidate))
+    }
+
+    pub(crate) fn derived_workspace_admission_handle(&self) -> DerivedWorkspaceAdmissionHandle {
+        self.derived_workspace_admission.clone()
     }
 }
 
@@ -95,10 +212,11 @@ impl egopulse_artifact_authority::ArtifactAdmissionGuard for ConfiguredArtifactA
         if bytes.is_empty()
             || !principal.authenticated
             || principal.principal_id.trim().is_empty()
-            || !self
+            || (!self
                 .config
                 .allowed_workspace_refs
                 .contains(&provenance.workspace_ref)
+                && !self.derived_workspace_admission.admits(artifact))
             || !Self::allows(
                 &self.config.allowed_artifact_type_refs,
                 artifact.type_contract_ref.as_ref(),
@@ -292,6 +410,20 @@ fn unique_nonempty(values: &[String]) -> bool {
             .all(|value| !value.trim().is_empty() && unique.insert(value))
 }
 
+fn lineage_complete(lineage: &LineageBinding) -> bool {
+    !lineage.task_id.trim().is_empty()
+        && lineage.task_revision > 0
+        && lineage.work_revision > 0
+        && !lineage.run_id.trim().is_empty()
+        && lineage.run_revision > 0
+        && !lineage.step_id.trim().is_empty()
+        && lineage.step_revision > 0
+        && !lineage.attempt_id.trim().is_empty()
+        && lineage.attempt_revision > 0
+        && !lineage.dispatch_id.trim().is_empty()
+        && lineage.fencing_token > 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +529,47 @@ mod tests {
         );
         let mut candidate = artifact();
         candidate.type_contract_ref = Some(reference("forged-type"));
+        assert_eq!(
+            guard.validate_artifact(&candidate, b"{}", &principal()),
+            Err(AdmissionRejection::ScopeViolation)
+        );
+    }
+
+    #[test]
+    fn derived_workspace_admission_is_exact_and_lease_scoped() {
+        let guard = ConfiguredArtifactAdmissionGuard::new(config()).expect("valid guard");
+        let admission = guard.derived_workspace_admission_handle();
+        let mut candidate = artifact();
+        let provenance = candidate.provenance.as_mut().expect("provenance");
+        provenance.workspace_ref = "repository-task-derived".to_owned();
+        provenance.raw_source_ref = Some("repository-binding:1".to_owned());
+        let binding = DerivedWorkspaceAdmissionBinding {
+            workspace_ref: provenance.workspace_ref.clone(),
+            lineage: provenance.lineage.clone().expect("lineage"),
+            source_binding_ref: provenance.raw_source_ref.clone().expect("source binding"),
+        };
+
+        assert_eq!(
+            guard.validate_artifact(&candidate, b"{}", &principal()),
+            Err(AdmissionRejection::ScopeViolation)
+        );
+        let lease = admission.register(binding).expect("exact binding lease");
+        guard
+            .validate_artifact(&candidate, b"{}", &principal())
+            .expect("exact derived workspace should be admitted");
+
+        let mut forged = candidate.clone();
+        forged
+            .provenance
+            .as_mut()
+            .expect("provenance")
+            .raw_source_ref = Some("repository-binding:forged".to_owned());
+        assert_eq!(
+            guard.validate_artifact(&forged, b"{}", &principal()),
+            Err(AdmissionRejection::ScopeViolation)
+        );
+
+        drop(lease);
         assert_eq!(
             guard.validate_artifact(&candidate, b"{}", &principal()),
             Err(AdmissionRejection::ScopeViolation)

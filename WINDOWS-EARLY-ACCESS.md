@@ -1,6 +1,9 @@
 # Windows x64 early access
 
 This package is the Windows x64 CLI/TUI early-access candidate of EgoPulse.
+These instructions apply to the matching phase-one repair candidate. Check
+`BUILD-METADATA.json` for its commit; the previous published
+`v0.1.0-early-access.1` archive predates this repository work-loop repair.
 CLI, TUI and `agentosd.exe` use the same Rust Client Kernel and local IPC
 transport. Desktop is implemented as a separate shared-kernel candidate, but
 is intentionally excluded from this first CLI/TUI package until native GUI
@@ -12,12 +15,14 @@ unknown-publisher warning. Verify the downloaded archive with the adjacent
 for per-file verification. Do not treat an unsigned candidate as a production
 release.
 
-## One-click installation
+## Install for repository work
 
 After extracting the archive to a short path such as `C:\EgoPulse`, run:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install-egopulse.ps1 -Launch
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-egopulse.ps1 `
+  -RepositoryRoot 'D:\work\project' `
+  -AcceptanceContractPath 'D:\work\project-acceptance.json' -Launch
 ```
 
 The installer creates a user-owned configuration under
@@ -28,15 +33,22 @@ Provider API keys to the package or configuration. A pre-existing
 configuration is preserved unless `-Force` is explicitly supplied; forced
 replacement creates a timestamped backup.
 
+Keep the reviewed acceptance contract outside the execution checkout and
+follow [repository setup](config/README.md#governed-repository-setup).
+Require `verification_preflight=repository_configured` before starting work.
+Without the repository parameters, installation sets up only the base product;
+`verification_preflight=not_configured` means the real repository checker
+path still needs configuration.
+
 After configuration validation, the installer prints one redacted preflight
 line per configured Provider. `executable_available` checks only the configured
 path/PATH entry, while `credential_status` reports API-key environment presence
 or Harness-owned delegated login. These are local readiness hints, not
 authenticated lifecycle or production-admission evidence.
 
-The installer requires Windows x64, Python/uv-compatible Memory Worker setup,
-an installed `uv` command, and the configured production Harness. The current
-production profile uses Codex app-server, so `codex` must resolve to a local
+The installer requires Windows x64, CPython 3.14.x, an installed `uv` command,
+and Codex 0.148.0-alpha.15 with an authenticated account for the exact selected
+model. The current production profile uses Codex app-server, so `codex` must resolve to a local
 application before installation can complete. If `uv` is absent, install it
 from `https://docs.astral.sh/uv/` first. A configured command is resolved to an
 absolute executable before daemon process supervision; an unavailable
@@ -64,8 +76,21 @@ routes. To start a natural-language work request with the governed default and
 Memory retrieval, use:
 
 ```powershell
-.\bin\egopulse.exe work start --intent 'Summarize this project and propose the next safe change' --scope 'scope:founder' --work-type 'general' --confirm
+.\bin\egopulse.exe work start --intent 'Summarize this project and propose the next safe change' --scope 'scope:founder' --work-type 'governed_repository_change' --context-ref 'default/README.md' --confirm
 ```
+
+Place the project's actual `README.md` under
+`%LOCALAPPDATA%\EgoPulse\workspaces\default` for this example. A fresh installer
+creates this directory and aligns the allowed scope and workspace. Context
+references are relative to `codex.workspace_root`; execution takes place under
+an isolated detached worktree of the configured repository. Accepting the
+result does not merge its patch into the source repository. Existing
+configurations are preserved, so use repository setup when upgrading an older
+preview rather than changing internal identifiers by hand.
+
+Follow the bundled [repository work loop](docs/engineering/repository-work-loop.md)
+to inspect execution approvals, criteria, evidence, explicit Founder decisions
+and interrupted submissions.
 
 The TUI exposes the same kernel operation: press `n` to open Work Start, review
 the resolved capability and Memory-bound preview, then confirm. Provider output
@@ -74,6 +99,19 @@ is projected as a governed stream; CLI and TUI do not call a Harness directly.
 The current CLI/TUI package does not contain `egopulse-desktop.exe`. A Desktop
 candidate must be built with the explicit `-IncludeDesktop` packaging option
 after its native GUI acceptance gate is closed.
+
+## Upgrade and rollback
+
+Before upgrading an existing installation, stop the daemon and preserve its
+Authority keys and complete data root (normally `%LOCALAPPDATA%\EgoPulse`) in
+an operator-controlled backup. The installer backs up a replaced configuration;
+it does not create a complete database/key backup for you.
+
+Configuration v2/v3 migration commands affect JSON only. Authority stores can
+migrate when the new daemon opens them, including the Policy V3 expiry ledger.
+To return to an older binary, restore its matching pre-upgrade data-root backup
+and original keys. Do not open an already migrated store with the old binary
+or delete tables to force compatibility.
 
 ## Manual first-run setup
 

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod approval_display;
 pub mod context_revoke;
 pub mod harness_content;
 pub mod memory;

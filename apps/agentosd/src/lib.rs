@@ -17,7 +17,7 @@ use egopulse_cognition_runtime::{
 };
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::ContractReference,
-    harness::v1::{CapabilityProfile, NativeProtocolFingerprint},
+    harness::v1::{CapabilityProfile, NativeProtocolFingerprint, SupportLevel},
     policy::v1::{IssueHarnessApprovalDecisionCommand, PolicyDecisionCommandResult},
     task::v1::{TaskCommand, TaskCommandResult, WorkCapabilityRouteBinding},
     verdict::v1::{VerdictCommand, VerdictCommandResult},
@@ -32,9 +32,9 @@ use egopulse_domain_contracts::{
     },
 };
 use egopulse_harness_adapter::{
-    AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeKey, GovernedHarnessAdapter,
-    GovernedHarnessContentProjector, HarnessContentDrain, NativeHarnessDriver, SystemAdapterClock,
-    validate_capability_binding,
+    AdapterEdge, AdapterEdgeConfig, AdapterEdgeError, AdapterEdgeKey, FinalArtifactRelationPolicy,
+    GovernedHarnessAdapter, GovernedHarnessContentProjector, HarnessContentDrain,
+    NativeHarnessDriver, SystemAdapterClock, validate_capability_binding,
 };
 use egopulse_local_api::{
     cognition_gateway::{
@@ -44,7 +44,8 @@ use egopulse_local_api::{
     command_gateway::{
         CommandExtensionPorts, CommandGatewayApplication, CommandPortFailure, CommandPortResult,
         CommandPrincipal, ContextMutationPort, FailClosedContextMutationPort,
-        FailClosedMemoryMutationPort, FailClosedWorkCapabilityPort, LocalCommandGatewayEndpoint,
+        FailClosedFounderSupportingMaterialPort, FailClosedMemoryMutationPort,
+        FailClosedWorkCapabilityPort, FounderSupportingMaterialPort, LocalCommandGatewayEndpoint,
         MemoryMutationPort, PolicyCommandPort, TaskCommandPort, VerdictCommandPort,
         WorkCapabilityPort, WorkPreparationPort,
     },
@@ -67,25 +68,39 @@ use egopulse_local_ide_control::collaboration_control::{
     ArtifactReturnSource, AuthenticatedCollaborationPrincipal, CollaborationControl,
     CollaborationControlConfig, CollaborationControlError, CollaborationLineageReader,
     CollaborationLineageReaderConfig, CollaborationPrincipalKind, CollaborationSqlCipherKey,
-    CompositeHarnessDispatchRunner, GovernedTaskActivationRunner, HarnessDispatchCycleError,
-    HarnessDispatchRunner, SingleHarnessWorkConfig, SingleHarnessWorkflowResolution,
-    SingleHarnessWorkflowResolver, SingleHarnessWorkflowResolverError, SystemAuthorityClock,
-    TaskActivationGuardSet, TaskActivationSource, TrustedDispatchRouteProfile,
+    CompositeHarnessDispatchRunner, GovernedTaskActivationRunner, HarnessApprovalDeliveryTarget,
+    HarnessCancellationDeliveryTarget, HarnessDispatchCycleError, HarnessDispatchRunner,
+    SingleHarnessWorkConfig, SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
+    SingleHarnessWorkflowResolverError, SystemAuthorityClock, TaskActivationGuardSet,
+    TaskActivationSource, TaskCancellationSource, TrustedDispatchRouteProfile,
     build_dispatch_route_binding,
 };
 use egopulse_local_ipc_platform::{LocalIpcAddress, LocalIpcListener};
 use egopulse_local_read_model::{LocalReadModel, LocalReadModelConfig, LocalReadModelKey};
 use tonic::transport::Server;
 
+mod approval_delivery;
+#[cfg(test)]
+mod approval_delivery_tests;
+#[cfg(test)]
+mod approval_recovery_tests;
 mod artifact;
 mod bootstrap;
+mod cancellation_delivery;
 mod context_material;
 mod context_mutation;
+mod founder_material;
+#[cfg(test)]
+mod founder_material_tests;
 mod memory_mutation;
 mod memory_retrieval;
 mod owners;
 mod policy;
 mod projections;
+mod repository_command;
+mod repository_dispatch;
+mod repository_material;
+mod repository_setup;
 mod return_collector;
 mod return_projection;
 mod security;
@@ -94,7 +109,17 @@ mod task_evidence;
 mod task_recovery;
 mod verdict;
 mod verdict_consumer;
+mod verdict_expiry;
 mod verification;
+mod verification_material;
+#[cfg(test)]
+mod verification_material_tests;
+mod verification_output;
+mod verification_profile;
+#[cfg(test)]
+mod verification_profile_tests;
+mod verification_repository;
+mod verification_repository_handoff;
 mod work_capability;
 mod work_preparation;
 
@@ -103,13 +128,15 @@ pub use artifact::{
     ConfiguredArtifactAdmissionGuard, ConfiguredArtifactAdmissionGuardConfig,
 };
 pub use bootstrap::{
-    DenyVerificationReferences, LocalUserPolicyBootstrapConfig, ProductionBootstrapConfig,
-    ProductionBootstrapError, ProviderAdmission, ProviderBootstrapProfile,
-    ProviderCatalogModelView, ProviderCatalogProfileView, ProviderCatalogRefreshError,
-    ProviderCatalogRefreshPreview, ProviderCatalogSnapshot, ProviderCredentialReference,
-    ProviderHarnessKind, ProviderId, ProviderModelBinding, WorkCapabilityConfigTransitionReport,
-    apply_work_capability_config_migration, preview_work_capability_config_migration,
-    preview_work_capability_config_rollback, rollback_work_capability_config_to_v2,
+    DenyVerificationReferences, FounderSupportingMaterialConfig, LocalUserPolicyBootstrapConfig,
+    ProductionBootstrapConfig, ProductionBootstrapError, ProviderAdmission,
+    ProviderBootstrapProfile, ProviderCatalogModelView, ProviderCatalogProfileView,
+    ProviderCatalogRefreshError, ProviderCatalogRefreshPreview, ProviderCatalogSnapshot,
+    ProviderCredentialReference, ProviderHarnessKind, ProviderId, ProviderModelBinding,
+    RepositoryCommandArtifactPolicyConfig, RepositoryVerificationConfig,
+    WorkCapabilityConfigTransitionReport, apply_work_capability_config_migration,
+    preview_work_capability_config_migration, preview_work_capability_config_rollback,
+    rollback_work_capability_config_to_v2,
 };
 pub use context_mutation::ContextMutationPortAdapter;
 pub use memory_mutation::{
@@ -130,9 +157,14 @@ pub use policy::{
     LocalUserPolicyResolverConfig, LocalUserPolicyResolverMultiConfig,
 };
 pub use projections::{
-    AdapterApprovalProjectionSource, ArtifactProjectionSource, CollaborationProjectionSource,
-    CompositeOwnerProjectionSource, OwnerProjectionSource, PendingOwnerProjection, ProjectionPump,
-    ProjectionPumpFailure, ProjectionSourceFailure, VerificationProjectionSource,
+    AdapterApprovalProjectionSource, AdapterEdgeApprovalProjectionSource, ArtifactProjectionSource,
+    CollaborationProjectionSource, CompositeOwnerProjectionSource, OwnerProjectionSource,
+    PendingOwnerProjection, ProjectionPump, ProjectionPumpFailure, ProjectionSourceFailure,
+    VerificationProjectionSource,
+};
+pub use repository_material::RepositoryMaterialConfig;
+pub use repository_setup::{
+    RepositorySetupError, RepositorySetupReport, prepare_repository_configuration,
 };
 pub use return_collector::{GovernedReturnCollectorConfig, GovernedReturnCollectorRunner};
 pub use return_projection::{ArtifactAuthorityReturnSource, GovernedReturnEvidenceResolver};
@@ -158,12 +190,13 @@ pub use verdict_consumer::{
 };
 pub use verification::{
     CheckerProfileAttestationError, CheckerProfileAttestationResult, ConfiguredVerificationWorker,
-    SystemCheckerProfileAttestation, SystemTaskVerificationWriteBack,
-    TaskVerificationWriteBackError, TaskVerificationWriteBackResult, VerificationBindingTemplate,
-    VerificationHandoffConsumeResult, VerificationHandoffIntake, VerificationHandoffIntakeError,
-    VerificationHandoffPlan, VerificationHandoffPlanError, VerificationHandoffRequest,
-    VerificationWorker, VerificationWorkerConfig, VerificationWorkerConfigurationError,
-    VerificationWorkerCycleError, VerificationWorkerCycleResult,
+    DynamicPrimaryClaimHandoffPlan, SystemCheckerProfileAttestation,
+    SystemTaskVerificationWriteBack, TaskVerificationWriteBackError,
+    TaskVerificationWriteBackResult, VerificationBindingTemplate, VerificationHandoffConsumeResult,
+    VerificationHandoffIntake, VerificationHandoffIntakeError, VerificationHandoffPlan,
+    VerificationHandoffPlanError, VerificationHandoffRequest, VerificationWorker,
+    VerificationWorkerConfig, VerificationWorkerConfigurationError, VerificationWorkerCycleError,
+    VerificationWorkerCycleResult,
 };
 pub use work_capability::{
     ResolvedWorkCapability, WorkCapabilityRegistry, WorkCapabilityRegistryError,
@@ -345,8 +378,15 @@ pub struct DaemonProviders {
     pub task_port: Arc<dyn TaskCommandPort>,
     pub policy_port: Arc<dyn PolicyCommandPort>,
     pub verdict_port: Arc<dyn VerdictCommandPort>,
+    pub founder_supporting_material_port: Arc<dyn FounderSupportingMaterialPort>,
     pub projection_source: Option<Arc<dyn OwnerProjectionSource>>,
     pub harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
+    approval_delivery_source: Option<Arc<dyn approval_delivery::ApprovalDeliverySource>>,
+    approval_delivery_worker: Option<Arc<approval_delivery::ApprovalDeliveryWorker>>,
+    cancellation_delivery_source: Option<Arc<dyn TaskCancellationSource>>,
+    task_cancellation_reconciler:
+        Option<Arc<dyn cancellation_delivery::TaskCancellationReconciler>>,
+    cancellation_delivery_worker: Option<Arc<cancellation_delivery::CancellationDeliveryWorker>>,
     pub verification_worker: Option<Arc<dyn VerificationWorker>>,
     pub founder_verdict_consume_worker: Option<Arc<dyn FounderVerdictConsumeWorker>>,
     pub task_activation_source: Option<Arc<dyn TaskActivationSource>>,
@@ -364,9 +404,16 @@ pub struct DaemonProviders {
     pub memory_candidate_producers: Arc<MemoryCandidateProducerRegistry>,
     pub work_preparation_port: Arc<dyn WorkPreparationPort>,
     context_authority: Option<Arc<Mutex<ContextAuthority>>>,
+    repository_dispatch: Option<RepositoryDispatchComposition>,
     harness_content_workers: Vec<HarnessContentWorker>,
     harness_content_task_authority: Option<Arc<Mutex<TaskAuthority>>>,
     harness_content_lineage_readers: Vec<Arc<Mutex<CollaborationLineageReader>>>,
+}
+
+struct RepositoryDispatchComposition {
+    material: RepositoryMaterialConfig,
+    admission: artifact::DerivedWorkspaceAdmissionHandle,
+    command_artifacts: RepositoryCommandArtifactPolicyConfig,
 }
 
 struct HarnessContentWorker {
@@ -498,6 +545,19 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
                 );
                 config.dispatch_id = format!(
                     "dispatch:work:{}:{}",
+                    activation.task.task_id, route.route_binding_sha256
+                );
+                // Step identities are global in Collaboration storage, just
+                // like Attempt identities. Instantiate the single-step
+                // template per task instead of reusing its storage key.
+                if config.plan.steps.len() != 1
+                    || config.plan.steps[0].step_id.trim().is_empty()
+                    || !config.plan.steps[0].depends_on_step_ids.is_empty()
+                {
+                    return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+                }
+                config.plan.steps[0].step_id = format!(
+                    "step:work:{}:{}",
                     activation.task.task_id, route.route_binding_sha256
                 );
                 if route.capability_profile_ref.as_ref() != Some(&config.capability_profile_ref)
@@ -709,6 +769,7 @@ pub struct NativeHarnessCompositionProfile {
     capability_profile_id: String,
     capability_profile_ref: ContractReference,
     observed_protocol: NativeProtocolFingerprint,
+    final_artifact_relation_policy: FinalArtifactRelationPolicy,
 }
 
 impl NativeHarnessCompositionProfile {
@@ -749,11 +810,36 @@ impl NativeHarnessCompositionProfile {
                 "native Harness capability profile protocol drift",
             ));
         }
+        let final_artifact_relation_policy = match declaration.semantics.as_ref() {
+            None => FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
+            Some(semantics) => {
+                let governed_content = SupportLevel::try_from(
+                    semantics.governed_user_visible_content,
+                )
+                .map_err(|_| {
+                    DaemonCompositionError::InvalidConfiguration(
+                        "native Harness governed content capability",
+                    )
+                })?;
+                match governed_content {
+                    SupportLevel::NativeStructured | SupportLevel::AdapterEmulated => {
+                        FinalArtifactRelationPolicy::RequiredGovernedContent
+                    }
+                    SupportLevel::Unspecified
+                    | SupportLevel::Unknown
+                    | SupportLevel::ProcessOnly
+                    | SupportLevel::Unsupported => {
+                        FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly
+                    }
+                }
+            }
+        };
         let profile = Self {
             adapter_id: declaration.adapter_id.clone(),
             capability_profile_id: capability_profile.profile_id.clone(),
             capability_profile_ref: required_profile_ref.clone(),
             observed_protocol,
+            final_artifact_relation_policy,
         };
         profile.validate()?;
         Ok(profile)
@@ -942,6 +1028,21 @@ pub struct SharedAuthorityCompositionInputs {
     pub additional_projection_sources: Vec<Arc<dyn OwnerProjectionSource>>,
 }
 
+/// Fully shared owner handles used by production workers that must coordinate
+/// cross-Authority operations with command handling under one process-local
+/// lock order.
+pub struct SharedAuthorityHandlesCompositionInputs {
+    pub task: Arc<Mutex<egopulse_cognition_runtime::task_authority::TaskAuthority>>,
+    pub policy: Arc<Mutex<egopulse_policy_decision_authority::PolicyDecisionAuthority>>,
+    pub verdict: SharedFounderVerdictAuthority,
+    pub cross_authority_operation_gate: Arc<Mutex<()>>,
+    pub principal_resolver: Arc<dyn AuthorityPrincipalResolver>,
+    pub session_principal_resolver: Arc<dyn TrustedPrincipalResolver>,
+    pub session_clock: Arc<dyn SessionClock>,
+    pub session_audit: Arc<dyn SessionAuditSink>,
+    pub additional_projection_sources: Vec<Arc<dyn OwnerProjectionSource>>,
+}
+
 impl DaemonProviders {
     /// The default is deliberately non-serving from an authorization point of
     /// view. Production startup must inject a real trusted resolver and owner
@@ -958,6 +1059,11 @@ impl DaemonProviders {
             verdict_port: Arc::new(FailClosedVerdictPort),
             projection_source: None,
             harness_dispatch_runner: None,
+            approval_delivery_source: None,
+            approval_delivery_worker: None,
+            cancellation_delivery_source: None,
+            task_cancellation_reconciler: None,
+            cancellation_delivery_worker: None,
             verification_worker: None,
             founder_verdict_consume_worker: None,
             task_activation_source: None,
@@ -966,12 +1072,14 @@ impl DaemonProviders {
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             context_mutation_port: Arc::new(FailClosedContextMutationPort),
+            founder_supporting_material_port: Arc::new(FailClosedFounderSupportingMaterialPort),
             work_capability_port: Arc::new(FailClosedWorkCapabilityPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
             context_authority: None,
+            repository_dispatch: None,
             harness_content_workers: Vec::new(),
             harness_content_task_authority: None,
             harness_content_lineage_readers: Vec::new(),
@@ -1010,17 +1118,22 @@ impl DaemonProviders {
         let task = Arc::new(Mutex::new(inputs.task));
         let harness_content_task_authority = Arc::clone(&task);
         let verdict = Arc::new(Mutex::new(Some(inputs.verdict)));
-        let ports = Arc::new(AuthorityCommandPorts::new_shared_handles(
-            Arc::clone(&task),
-            inputs.policy,
-            Arc::clone(&verdict),
-            inputs.principal_resolver,
-        ));
+        let cross_authority_operation_gate = Arc::new(Mutex::new(()));
+        let ports = Arc::new(
+            AuthorityCommandPorts::new_shared_handles_with_operation_gate(
+                Arc::clone(&task),
+                inputs.policy,
+                Arc::clone(&verdict),
+                inputs.principal_resolver,
+                Arc::clone(&cross_authority_operation_gate),
+            ),
+        );
         let founder_verdict_consume_worker = Some(Arc::new(
-            ConfiguredFounderVerdictConsumeWorker::new(
+            ConfiguredFounderVerdictConsumeWorker::new_with_operation_gate(
                 task,
                 verdict,
                 "task-authority:founder-verdict-consumer",
+                cross_authority_operation_gate,
             )
             .expect("static Founder Verdict consume worker principal"),
         )
@@ -1040,6 +1153,17 @@ impl DaemonProviders {
                 projection_sources,
             ))),
             harness_dispatch_runner: None,
+            approval_delivery_source: Some(
+                Arc::clone(&ports) as Arc<dyn approval_delivery::ApprovalDeliverySource>
+            ),
+            approval_delivery_worker: None,
+            cancellation_delivery_source: Some(
+                Arc::clone(&ports) as Arc<dyn TaskCancellationSource>
+            ),
+            task_cancellation_reconciler: Some(
+                Arc::clone(&ports) as Arc<dyn cancellation_delivery::TaskCancellationReconciler>
+            ),
+            cancellation_delivery_worker: None,
             verification_worker: None,
             founder_verdict_consume_worker,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
@@ -1048,12 +1172,14 @@ impl DaemonProviders {
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             context_mutation_port: Arc::new(FailClosedContextMutationPort),
+            founder_supporting_material_port: Arc::new(FailClosedFounderSupportingMaterialPort),
             work_capability_port: Arc::new(FailClosedWorkCapabilityPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
             context_authority: None,
+            repository_dispatch: None,
             harness_content_workers: Vec::new(),
             harness_content_task_authority: Some(harness_content_task_authority),
             harness_content_lineage_readers: Vec::new(),
@@ -1065,22 +1191,43 @@ impl DaemonProviders {
     /// command handling must observe the same owner instance.
     #[must_use]
     pub fn from_shared_authority_inputs(inputs: SharedAuthorityCompositionInputs) -> Self {
+        Self::from_shared_authority_handles(SharedAuthorityHandlesCompositionInputs {
+            task: inputs.task,
+            policy: Arc::new(Mutex::new(inputs.policy)),
+            verdict: inputs.verdict,
+            cross_authority_operation_gate: Arc::new(Mutex::new(())),
+            principal_resolver: inputs.principal_resolver,
+            session_principal_resolver: inputs.session_principal_resolver,
+            session_clock: inputs.session_clock,
+            session_audit: inputs.session_audit,
+            additional_projection_sources: inputs.additional_projection_sources,
+        })
+    }
+
+    /// Builds daemon providers around already shared Authority owners and the
+    /// one gate used by every Task/Founder Verdict cross-owner operation.
+    #[must_use]
+    pub fn from_shared_authority_handles(inputs: SharedAuthorityHandlesCompositionInputs) -> Self {
         let harness_content_task_authority = Arc::clone(&inputs.task);
         let founder_verdict_consume_worker = Some(Arc::new(
-            ConfiguredFounderVerdictConsumeWorker::new(
+            ConfiguredFounderVerdictConsumeWorker::new_with_operation_gate(
                 Arc::clone(&inputs.task),
                 Arc::clone(&inputs.verdict),
                 "task-authority:founder-verdict-consumer",
+                Arc::clone(&inputs.cross_authority_operation_gate),
             )
             .expect("static Founder Verdict consume worker principal"),
         )
             as Arc<dyn FounderVerdictConsumeWorker>);
-        let ports = Arc::new(AuthorityCommandPorts::new_shared_handles(
-            inputs.task,
-            inputs.policy,
-            inputs.verdict,
-            inputs.principal_resolver,
-        ));
+        let ports = Arc::new(
+            AuthorityCommandPorts::new_shared_authority_handles_with_operation_gate(
+                inputs.task,
+                inputs.policy,
+                inputs.verdict,
+                inputs.principal_resolver,
+                inputs.cross_authority_operation_gate,
+            ),
+        );
         let mut projection_sources =
             Vec::with_capacity(1 + inputs.additional_projection_sources.len());
         projection_sources.push(Arc::clone(&ports) as Arc<dyn OwnerProjectionSource>);
@@ -1096,6 +1243,17 @@ impl DaemonProviders {
                 projection_sources,
             ))),
             harness_dispatch_runner: None,
+            approval_delivery_source: Some(
+                Arc::clone(&ports) as Arc<dyn approval_delivery::ApprovalDeliverySource>
+            ),
+            approval_delivery_worker: None,
+            cancellation_delivery_source: Some(
+                Arc::clone(&ports) as Arc<dyn TaskCancellationSource>
+            ),
+            task_cancellation_reconciler: Some(
+                Arc::clone(&ports) as Arc<dyn cancellation_delivery::TaskCancellationReconciler>
+            ),
+            cancellation_delivery_worker: None,
             verification_worker: None,
             founder_verdict_consume_worker,
             task_activation_source: Some(Arc::clone(&ports) as Arc<dyn TaskActivationSource>),
@@ -1104,12 +1262,14 @@ impl DaemonProviders {
             memory_retrieval_audit: Arc::new(TracingMemoryRetrievalAuditSink),
             memory_mutation_port: Arc::new(FailClosedMemoryMutationPort),
             context_mutation_port: Arc::new(FailClosedContextMutationPort),
+            founder_supporting_material_port: Arc::new(FailClosedFounderSupportingMaterialPort),
             work_capability_port: Arc::new(FailClosedWorkCapabilityPort),
             memory_candidate_producers: Arc::new(MemoryCandidateProducerRegistry::empty()),
             work_preparation_port: Arc::new(
                 egopulse_local_api::command_gateway::FailClosedWorkPreparationPort,
             ),
             context_authority: None,
+            repository_dispatch: None,
             harness_content_workers: Vec::new(),
             harness_content_task_authority: Some(harness_content_task_authority),
             harness_content_lineage_readers: Vec::new(),
@@ -1119,6 +1279,20 @@ impl DaemonProviders {
     #[must_use]
     pub fn with_context_authority(mut self, context: Arc<Mutex<ContextAuthority>>) -> Self {
         self.context_authority = Some(context);
+        self
+    }
+
+    pub(crate) fn with_repository_dispatch(
+        mut self,
+        material: RepositoryMaterialConfig,
+        admission: artifact::DerivedWorkspaceAdmissionHandle,
+        command_artifacts: RepositoryCommandArtifactPolicyConfig,
+    ) -> Self {
+        self.repository_dispatch = Some(RepositoryDispatchComposition {
+            material,
+            admission,
+            command_artifacts,
+        });
         self
     }
 
@@ -1193,6 +1367,15 @@ impl DaemonProviders {
     #[must_use]
     pub fn with_verification_worker(mut self, worker: Arc<dyn VerificationWorker>) -> Self {
         self.verification_worker = Some(worker);
+        self
+    }
+
+    #[must_use]
+    pub fn with_founder_supporting_material_port(
+        mut self,
+        port: Arc<dyn FounderSupportingMaterialPort>,
+    ) -> Self {
+        self.founder_supporting_material_port = port;
         self
     }
 
@@ -1297,6 +1480,8 @@ impl DaemonProviders {
                     capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
                     capability_profile_ref,
                     observed_protocol: codex_protocol_fingerprint(),
+                    final_artifact_relation_policy:
+                        FinalArtifactRelationPolicy::RequiredGovernedContent,
                 },
                 driver: Box::new(CodexAppServerDriver::new(process)),
                 route_profile: Some(route_profile),
@@ -1335,6 +1520,8 @@ impl DaemonProviders {
                 capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
                 capability_profile_ref,
                 observed_protocol: codex_protocol_fingerprint(),
+                final_artifact_relation_policy:
+                    FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
             },
             driver,
         )
@@ -1420,10 +1607,14 @@ impl DaemonProviders {
         let source = self.task_activation_source.take().ok_or(
             DaemonCompositionError::InvalidConfiguration("Task activation source"),
         )?;
+        let approval_delivery_source = self.approval_delivery_source.clone();
+        let cancellation_delivery_source = self.cancellation_delivery_source.clone();
         let artifact_return_source: Arc<dyn ArtifactReturnSource> = Arc::new(
             ArtifactAuthorityReturnSource::new(Arc::clone(&artifact_authority)),
         );
         let mut runners = Vec::with_capacity(compositions.len());
+        let mut approval_routes = Vec::with_capacity(compositions.len());
+        let mut cancellation_routes = Vec::with_capacity(compositions.len());
         for composition in compositions {
             let ProfiledNativeHarnessComposition {
                 config,
@@ -1438,7 +1629,102 @@ impl DaemonProviders {
                 capability_profile_id,
                 capability_profile_ref: _,
                 observed_protocol,
+                final_artifact_relation_policy,
             } = profile;
+            let repository_dispatch = match self.repository_dispatch.as_ref() {
+                Some(repository) => {
+                    let context = self.context_authority.as_ref().ok_or(
+                        DaemonCompositionError::InvalidConfiguration(
+                            "repository dispatch Context Authority",
+                        ),
+                    )?;
+                    Some(Arc::new(
+                        repository_dispatch::RepositoryDispatchCoordinator::new(
+                            Arc::clone(context),
+                            Arc::clone(&artifact_authority),
+                            repository.admission.clone(),
+                            repository.material.clone(),
+                            config.workspace_root.clone(),
+                            repository_dispatch::RepositoryDispatchArtifactPolicy {
+                                artifact_type_ref: config
+                                    .return_collector
+                                    .artifact_type_ref
+                                    .clone(),
+                                transformation_contract_ref: config
+                                    .return_collector
+                                    .transformation_contract_ref
+                                    .clone(),
+                                retention_profile_ref: config
+                                    .return_collector
+                                    .retention_profile_ref
+                                    .clone(),
+                                artifact_authority_principal_id: config
+                                    .return_collector
+                                    .artifact_authority_principal_id
+                                    .clone(),
+                                attempt_supervisor_principal_id: config
+                                    .workflow
+                                    .attempt_supervisor_principal_id
+                                    .clone(),
+                                evidence_profile_ref: config
+                                    .return_collector
+                                    .evidence_profile_ref
+                                    .clone(),
+                            },
+                        )
+                        .map_err(DaemonCompositionError::InvalidConfiguration)?,
+                    ))
+                }
+                None => None,
+            };
+            let repository_commands = match (
+                repository_dispatch.as_ref(),
+                self.repository_dispatch.as_ref(),
+            ) {
+                (Some(_), Some(repository)) => Some(Arc::new(
+                    repository_command::RepositoryCommandArtifactRunner::new(
+                        Arc::clone(&artifact_authority),
+                        repository_command::RepositoryCommandArtifactConfig {
+                            intent_type_ref: repository.command_artifacts.intent_type_ref.clone(),
+                            intent_transformation_ref: repository
+                                .command_artifacts
+                                .intent_transformation_ref
+                                .clone(),
+                            receipt_type_ref: repository.command_artifacts.receipt_type_ref.clone(),
+                            receipt_transformation_ref: repository
+                                .command_artifacts
+                                .receipt_transformation_ref
+                                .clone(),
+                            retention_profile_ref: config
+                                .return_collector
+                                .retention_profile_ref
+                                .clone(),
+                            supervised_runner_principal_id: config
+                                .workflow
+                                .attempt_supervisor_principal_id
+                                .clone(),
+                            artifact_authority_principal_id: config
+                                .return_collector
+                                .artifact_authority_principal_id
+                                .clone(),
+                            component_name: "agentosd-repository-command-runner".to_owned(),
+                            component_version: env!("CARGO_PKG_VERSION").to_owned(),
+                            sensitivity_class: "local-user-data".to_owned(),
+                        },
+                    )
+                    .map_err(|_| {
+                        DaemonCompositionError::InvalidConfiguration(
+                            "repository command Artifact policy",
+                        )
+                    })?,
+                )),
+                (None, None) => None,
+                _ => {
+                    return Err(DaemonCompositionError::InvalidConfiguration(
+                        "repository return composition",
+                    ));
+                }
+            };
             let reader_edge = AdapterEdge::open(AdapterEdgeConfig {
                 database_path: config.adapter_database_path.clone(),
                 adapter_id: adapter_id.clone(),
@@ -1467,10 +1753,24 @@ impl DaemonProviders {
                 key: AdapterEdgeKey::new(config.adapter_key),
             })
             .map_err(DaemonCompositionError::AdapterEdge)?;
-            let writer_edge = AdapterEdge::open(AdapterEdgeConfig {
-                database_path: config.adapter_database_path,
+            let approval_projection_edge = AdapterEdge::open(AdapterEdgeConfig {
+                database_path: config.adapter_database_path.clone(),
                 adapter_id: adapter_id.clone(),
-                store_epoch: config.adapter_store_epoch,
+                store_epoch: config.adapter_store_epoch.clone(),
+                key: AdapterEdgeKey::new(config.adapter_key),
+            })
+            .map_err(DaemonCompositionError::AdapterEdge)?;
+            let approval_route_edge = AdapterEdge::open(AdapterEdgeConfig {
+                database_path: config.adapter_database_path.clone(),
+                adapter_id: adapter_id.clone(),
+                store_epoch: config.adapter_store_epoch.clone(),
+                key: AdapterEdgeKey::new(config.adapter_key),
+            })
+            .map_err(DaemonCompositionError::AdapterEdge)?;
+            let writer_edge = AdapterEdge::open(AdapterEdgeConfig {
+                database_path: config.adapter_database_path.clone(),
+                adapter_id: adapter_id.clone(),
+                store_epoch: config.adapter_store_epoch.clone(),
                 key: AdapterEdgeKey::new(config.adapter_key),
             })
             .map_err(DaemonCompositionError::AdapterEdge)?;
@@ -1479,7 +1779,46 @@ impl DaemonProviders {
                 Arc::clone(&artifact_authority),
                 Arc::clone(&verification),
             );
+            let evidence = match approval_delivery_source.as_ref() {
+                Some(source) => evidence.with_approval_delivery_source(Arc::clone(source)),
+                None => evidence,
+            };
             let (guard, reference) = TaskActivationGuardSet::new(evidence);
+            // The dispatch owner emits durable Collaboration projections;
+            // attach its outbox to the same projector as the Task owner.
+            // This separate owner handle exposes only projection read/ACK.
+            let projection_edge = AdapterEdge::open(AdapterEdgeConfig {
+                database_path: config.adapter_database_path.clone(),
+                adapter_id: adapter_id.clone(),
+                store_epoch: config.adapter_store_epoch.clone(),
+                key: AdapterEdgeKey::new(config.adapter_key),
+            })
+            .map_err(DaemonCompositionError::AdapterEdge)?;
+            let (projection_guard, _) = TaskActivationGuardSet::new(
+                egopulse_local_ide_control::collaboration_control::AdapterBackedHarnessEvidenceResolver::new(projection_edge),
+            );
+            let projection_owner = CollaborationControl::open(
+                CollaborationControlConfig {
+                    database_path: config.collaboration_database_path.clone(),
+                    store_epoch: config.collaboration_store_epoch.clone(),
+                    key: CollaborationSqlCipherKey::new(config.collaboration_key),
+                },
+                projection_guard,
+                SystemAuthorityClock,
+            )
+            .map_err(DaemonCompositionError::Collaboration)?;
+            let mut sources = self
+                .projection_source
+                .take()
+                .into_iter()
+                .collect::<Vec<_>>();
+            sources.push(Arc::new(CollaborationProjectionSource::new(
+                projection_owner,
+            )));
+            sources.push(Arc::new(AdapterEdgeApprovalProjectionSource::new(
+                approval_projection_edge,
+            )));
+            self.projection_source = Some(Arc::new(CompositeOwnerProjectionSource::new(sources)));
             let lineage_reader_config = CollaborationLineageReaderConfig {
                 database_path: config.collaboration_database_path.clone(),
                 store_epoch: config.collaboration_store_epoch.clone(),
@@ -1511,6 +1850,9 @@ impl DaemonProviders {
                     config.workspace_root,
                 ),
             };
+            let approval_route_adapter_id = adapter_id.clone();
+            let approval_route_profile_id = capability_profile_id.clone();
+            let approval_route_principal_id = config.workflow.harness_adapter_principal_id.clone();
             let mut adapter = GovernedHarnessAdapter::new(
                 adapter_id,
                 capability_profile_id,
@@ -1519,7 +1861,8 @@ impl DaemonProviders {
                 file_material,
                 driver,
                 SystemAdapterClock,
-            );
+            )
+            .with_final_artifact_relation_policy(final_artifact_relation_policy);
             self.harness_content_workers.push(HarnessContentWorker {
                 projector: Arc::new(Mutex::new(GovernedHarnessContentProjector::new(
                     content_edge,
@@ -1542,7 +1885,7 @@ impl DaemonProviders {
                     )?,
                 );
             }
-            let adapter = match self.context_authority.as_ref() {
+            let mut adapter = match self.context_authority.as_ref() {
                 Some(context) => adapter
                     .with_dispatch_context_authorization_gate(
                         context_material::ContextDispatchAuthorizationGate::new(Arc::clone(
@@ -1554,6 +1897,9 @@ impl DaemonProviders {
                     ),
                 None => adapter,
             };
+            if let Some(repository_dispatch) = repository_dispatch.as_ref() {
+                adapter = adapter.with_ready_dispatch_material_guard(repository_dispatch.clone());
+            }
             let principal = AuthenticatedCollaborationPrincipal {
                 kind: CollaborationPrincipalKind::HarnessAdapter,
                 principal_id: config.workflow.harness_adapter_principal_id.clone(),
@@ -1581,7 +1927,7 @@ impl DaemonProviders {
                     .clone(),
                 authenticated: true,
             };
-            let runner = GovernedTaskActivationRunner::new(
+            let mut runner = GovernedTaskActivationRunner::new(
                 control,
                 adapter,
                 Arc::clone(&source),
@@ -1600,14 +1946,41 @@ impl DaemonProviders {
                 principal_id: "collaboration-control:return-settlement".to_owned(),
                 authenticated: true,
             });
-            let harness: Arc<dyn HarnessDispatchRunner> = Arc::new(runner);
-            let collector = GovernedReturnCollectorRunner::new(
+            if let Some(repository_dispatch) = repository_dispatch.as_ref() {
+                runner = runner.with_task_dispatch_material_preparer(repository_dispatch.clone());
+            }
+            let runner = Arc::new(runner);
+            let approval_target: Arc<dyn HarnessApprovalDeliveryTarget> = runner.clone();
+            let cancellation_target: Arc<dyn HarnessCancellationDeliveryTarget> = runner.clone();
+            approval_routes.push(
+                approval_delivery::ApprovalDeliveryRoute::new(
+                    approval_route_adapter_id,
+                    approval_route_profile_id,
+                    approval_route_principal_id,
+                    approval_route_edge,
+                    approval_target,
+                )
+                .map_err(|_| {
+                    DaemonCompositionError::InvalidConfiguration("approval delivery route")
+                })?,
+            );
+            cancellation_routes.push(cancellation_delivery::CancellationDeliveryRoute::new(
+                cancellation_target,
+            ));
+            let harness: Arc<dyn HarnessDispatchRunner> = runner;
+            let mut collector = GovernedReturnCollectorRunner::new(
                 harness,
                 collector_edge,
                 Arc::clone(&artifact_authority),
                 config.return_collector,
             )
             .map_err(DaemonCompositionError::InvalidConfiguration)?;
+            if let (Some(repository_dispatch), Some(repository_commands)) =
+                (repository_dispatch, repository_commands)
+            {
+                collector =
+                    collector.with_repository_return(repository_dispatch, repository_commands);
+            }
             runners.push(Arc::new(collector) as Arc<dyn HarnessDispatchRunner>);
         }
         let composite = CompositeHarnessDispatchRunner::new(runners)
@@ -1618,6 +1991,32 @@ impl DaemonProviders {
             Arc::clone(&self.task_port),
         );
         self.harness_dispatch_runner = Some(Arc::new(evidence_intake));
+        if let Some(approval_delivery_source) = approval_delivery_source {
+            self.approval_delivery_worker = Some(Arc::new(
+                approval_delivery::ApprovalDeliveryWorker::new(
+                    approval_delivery_source,
+                    approval_routes,
+                )
+                .map_err(|_| {
+                    DaemonCompositionError::InvalidConfiguration("approval delivery worker")
+                })?,
+            ));
+        }
+        if let Some(cancellation_delivery_source) = cancellation_delivery_source {
+            let reconciler = self.task_cancellation_reconciler.clone().ok_or(
+                DaemonCompositionError::InvalidConfiguration("Task cancellation reconciler"),
+            )?;
+            self.cancellation_delivery_worker = Some(Arc::new(
+                cancellation_delivery::CancellationDeliveryWorker::new(
+                    cancellation_delivery_source,
+                    cancellation_routes,
+                )
+                .map_err(|_| {
+                    DaemonCompositionError::InvalidConfiguration("cancellation delivery worker")
+                })?
+                .with_task_reconciliation(reconciler),
+            ));
+        }
         Ok(self)
     }
 }
@@ -1668,6 +2067,10 @@ pub enum DaemonServeError {
     Projection(#[from] ProjectionPumpFailure),
     #[error("harness dispatch runner failed")]
     Dispatch(#[from] HarnessDispatchCycleError),
+    #[error("approval delivery worker failed")]
+    ApprovalDelivery,
+    #[error("cancellation delivery worker failed")]
+    CancellationDelivery,
     #[error("verification worker failed")]
     Verification(#[from] VerificationWorkerCycleError),
     #[error("Founder Verdict consume worker failed")]
@@ -1685,6 +2088,8 @@ pub struct DaemonComposition {
     cognition: LocalCognitionEndpoint,
     projection_pump: Option<ProjectionPump>,
     harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
+    approval_delivery_worker: Option<Arc<approval_delivery::ApprovalDeliveryWorker>>,
+    cancellation_delivery_worker: Option<Arc<cancellation_delivery::CancellationDeliveryWorker>>,
     harness_dispatch_interval: Duration,
     verification_worker: Option<Arc<dyn VerificationWorker>>,
     verification_interval: Duration,
@@ -1780,7 +2185,8 @@ impl DaemonComposition {
                 providers.work_preparation_port,
             )
             .with_context(providers.context_mutation_port)
-            .with_work_capability(providers.work_capability_port),
+            .with_work_capability(providers.work_capability_port)
+            .with_founder_supporting_material(providers.founder_supporting_material_port),
         ));
         let command = LocalCommandGatewayEndpoint::new(command_application);
         let cognition_application = Arc::new(CognitionGatewayApplication::new(
@@ -1794,6 +2200,8 @@ impl DaemonComposition {
             .projection_source
             .map(|source| ProjectionPump::new(Arc::clone(&model), notifier, source));
         let harness_dispatch_runner = providers.harness_dispatch_runner;
+        let approval_delivery_worker = providers.approval_delivery_worker;
+        let cancellation_delivery_worker = providers.cancellation_delivery_worker;
         let verification_worker = providers.verification_worker;
         let founder_verdict_consume_worker = providers.founder_verdict_consume_worker;
         let harness_content_workers = providers.harness_content_workers;
@@ -1807,6 +2215,8 @@ impl DaemonComposition {
             cognition,
             projection_pump,
             harness_dispatch_runner,
+            approval_delivery_worker,
+            cancellation_delivery_worker,
             harness_dispatch_interval: config.harness_dispatch_interval,
             verification_worker,
             verification_interval: config.verification_interval,
@@ -1835,6 +2245,8 @@ impl DaemonComposition {
             cognition,
             projection_pump,
             harness_dispatch_runner,
+            approval_delivery_worker,
+            cancellation_delivery_worker,
             harness_dispatch_interval,
             verification_worker,
             verification_interval,
@@ -1865,6 +2277,8 @@ impl DaemonComposition {
             projection_pump,
             harness_dispatch_runner,
             harness_dispatch_interval,
+            approval_delivery_worker,
+            cancellation_delivery_worker,
             verification_worker,
             verification_interval,
             founder_verdict_consume_worker,
@@ -1896,6 +2310,8 @@ struct BackgroundWorkerInputs {
     projection_pump: Option<ProjectionPump>,
     harness_dispatch_runner: Option<Arc<dyn HarnessDispatchRunner>>,
     harness_dispatch_interval: Duration,
+    approval_delivery_worker: Option<Arc<approval_delivery::ApprovalDeliveryWorker>>,
+    cancellation_delivery_worker: Option<Arc<cancellation_delivery::CancellationDeliveryWorker>>,
     verification_worker: Option<Arc<dyn VerificationWorker>>,
     verification_interval: Duration,
     founder_verdict_consume_worker: Option<Arc<dyn FounderVerdictConsumeWorker>>,
@@ -1911,6 +2327,8 @@ async fn run_background_workers(inputs: BackgroundWorkerInputs) -> Result<(), Da
         projection_pump,
         harness_dispatch_runner,
         harness_dispatch_interval,
+        approval_delivery_worker,
+        cancellation_delivery_worker,
         verification_worker,
         verification_interval,
         founder_verdict_consume_worker,
@@ -1936,6 +2354,22 @@ async fn run_background_workers(inputs: BackgroundWorkerInputs) -> Result<(), Da
             run_harness_dispatch_worker(runner, harness_dispatch_interval, stop)
                 .await
                 .map_err(DaemonServeError::Dispatch)
+        });
+    }
+    if let Some(worker) = approval_delivery_worker {
+        let stop = stop.clone();
+        workers.spawn(async move {
+            run_approval_delivery_worker(worker, harness_dispatch_interval, stop)
+                .await
+                .map_err(|_| DaemonServeError::ApprovalDelivery)
+        });
+    }
+    if let Some(worker) = cancellation_delivery_worker {
+        let stop = stop.clone();
+        workers.spawn(async move {
+            run_cancellation_delivery_worker(worker, harness_dispatch_interval, stop)
+                .await
+                .map_err(|_| DaemonServeError::CancellationDelivery)
         });
     }
     if let Some(worker) = verification_worker {
@@ -2015,9 +2449,13 @@ async fn run_harness_content_worker(
                 }
             };
             let projector_idle = match projection_result {
-                Ok(HarnessContentDrain::Idle) => true,
+                Ok(
+                    HarnessContentDrain::Idle | HarnessContentDrain::FinalArtifactRelationPending,
+                ) => true,
                 Ok(
                     HarnessContentDrain::Committed(_)
+                    | HarnessContentDrain::FinalArtifactRelationCommitted
+                    | HarnessContentDrain::FinalArtifactRelationSkipped
                     | HarnessContentDrain::Replayed
                     | HarnessContentDrain::Quarantined { .. },
                 ) => false,
@@ -2140,11 +2578,34 @@ async fn run_harness_dispatch_worker(
 ) -> Result<(), HarnessDispatchCycleError> {
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
+    let mut previous_blockages = std::collections::BTreeSet::new();
     loop {
         if *stop.borrow() {
             return Ok(());
         }
-        runner.run_once().await?;
+        let report = runner.run_once().await?;
+        let mut current_blockages = std::collections::BTreeSet::new();
+        for blockage in report.activation_blockages {
+            let key = (
+                blockage.task_id.clone(),
+                blockage.dispatch_id.clone(),
+                blockage.safe_detail_code.clone(),
+            );
+            current_blockages.insert(key.clone());
+            if previous_blockages.contains(&key) {
+                continue;
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "task_activation_blocked",
+                    "task_id": blockage.task_id,
+                    "dispatch_id": blockage.dispatch_id,
+                    "safe_detail_code": blockage.safe_detail_code,
+                })
+            );
+        }
+        previous_blockages = current_blockages;
         tokio::select! {
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
@@ -2153,6 +2614,94 @@ async fn run_harness_dispatch_worker(
             }
             _ = ticker.tick() => {
             }
+        }
+    }
+}
+
+async fn run_approval_delivery_worker(
+    worker: Arc<approval_delivery::ApprovalDeliveryWorker>,
+    interval: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), approval_delivery::ApprovalDeliveryCycleError> {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
+    let mut previous_holds = std::collections::BTreeSet::new();
+    loop {
+        if *stop.borrow() {
+            return Ok(());
+        }
+        let report = worker.run_once().await?;
+        let mut current_holds = std::collections::BTreeSet::new();
+        for held in report.held {
+            let key = (held.authority_decision_ref.clone(), held.safe_reason_code);
+            current_holds.insert(key.clone());
+            if previous_holds.contains(&key) {
+                continue;
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "approval_delivery_held",
+                    "authority_decision_ref": held.authority_decision_ref,
+                    "approval_request_id": held.approval_request_id,
+                    "safe_reason_code": held.safe_reason_code,
+                })
+            );
+        }
+        previous_holds = current_holds;
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = ticker.tick() => {}
+        }
+    }
+}
+
+async fn run_cancellation_delivery_worker(
+    worker: Arc<cancellation_delivery::CancellationDeliveryWorker>,
+    interval: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), cancellation_delivery::CancellationDeliveryCycleError> {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await;
+    let mut previous_holds = std::collections::BTreeSet::new();
+    loop {
+        if *stop.borrow() {
+            return Ok(());
+        }
+        let report = worker.run_once().await?;
+        let mut current_holds = std::collections::BTreeSet::new();
+        for held in report.held {
+            let key = (
+                held.task_id.clone(),
+                held.cancellation_request_id.clone(),
+                held.safe_reason_code,
+            );
+            current_holds.insert(key.clone());
+            if previous_holds.contains(&key) {
+                continue;
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "task_cancellation_delivery_held",
+                    "task_id": held.task_id,
+                    "cancellation_request_id": held.cancellation_request_id,
+                    "safe_reason_code": held.safe_reason_code,
+                })
+            );
+        }
+        previous_holds = current_holds;
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = ticker.tick() => {}
         }
     }
 }
@@ -2187,11 +2736,80 @@ async fn run_founder_verdict_consume_worker(
 ) -> Result<(), FounderVerdictConsumeCycleError> {
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
+    let mut last_failure = None;
     loop {
         if *stop.borrow() {
             return Ok(());
         }
-        worker.run_once().await?;
+        let result = match worker.run_once().await {
+            Ok(result) => {
+                last_failure = None;
+                result
+            }
+            Err(error) => {
+                // Owner writes remain rejected and their durable outbox stays
+                // pending. A held handoff must not stop unrelated workers.
+                let reason = error.to_string();
+                if last_failure.as_ref() != Some(&reason) {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "founder_verdict_recovery_held", "reason": reason,
+                        })
+                    );
+                    last_failure = Some(reason);
+                }
+                tokio::select! {
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() { return Ok(()); }
+                    }
+                    _ = ticker.tick() => {}
+                }
+                continue;
+            }
+        };
+        match result {
+            FounderVerdictConsumeCycleResult::Idle => {}
+            FounderVerdictConsumeCycleResult::Expired {
+                founder_verdict_id,
+                task_id,
+            } => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "unapplied_founder_verdict_expired",
+                        "founder_verdict_id": founder_verdict_id, "task_id": task_id,
+                    })
+                );
+            }
+            FounderVerdictConsumeCycleResult::Consumed {
+                message_id,
+                founder_verdict_id,
+                replayed,
+            } => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "founder_verdict_consumed", "message_id": message_id,
+                        "founder_verdict_id": founder_verdict_id, "replayed": replayed,
+                    })
+                );
+            }
+            FounderVerdictConsumeCycleResult::ApplicationAcknowledged {
+                message_id,
+                founder_verdict_id,
+                task_id,
+                replayed,
+            } => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "founder_verdict_application_acknowledged", "message_id": message_id,
+                        "founder_verdict_id": founder_verdict_id, "task_id": task_id, "replayed": replayed,
+                    })
+                );
+            }
+        }
         tokio::select! {
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
@@ -2495,6 +3113,70 @@ mod tests {
         runs: Arc<AtomicUsize>,
     }
 
+    struct HeldFounderVerdictWorker(Arc<AtomicUsize>);
+
+    impl FounderVerdictConsumeWorker for HeldFounderVerdictWorker {
+        fn run_once<'a>(
+            &'a self,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            FounderVerdictConsumeCycleResult,
+                            FounderVerdictConsumeCycleError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(FounderVerdictConsumeCycleError::ExpiryAuthorizationRejected) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_founder_expiry_keeps_daemon_and_unrelated_dispatch_running() {
+        let instance = format!("g4-verdict-held-worker-{}", Uuid::now_v7());
+        let (config, root) = config(&instance);
+        let held_runs = Arc::new(AtomicUsize::new(0));
+        let dispatch_runs = Arc::new(AtomicUsize::new(0));
+        let providers = DaemonProviders::fail_closed()
+            .with_founder_verdict_consume_worker(Arc::new(HeldFounderVerdictWorker(Arc::clone(
+                &held_runs,
+            ))))
+            .with_harness_dispatch_runner(Arc::new(CountingDispatchRunner {
+                runs: Arc::clone(&dispatch_runs),
+            }));
+        let daemon = DaemonComposition::build(config, providers).expect("daemon composition");
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            daemon
+                .serve(async {
+                    let _ = shutdown_receiver.await;
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while held_runs.load(Ordering::SeqCst) < 2 || dispatch_runs.load(Ordering::SeqCst) < 2 {
+                assert!(
+                    !server.is_finished(),
+                    "one held expiry must not stop the daemon"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("both workers keep polling");
+        shutdown_sender
+            .send(())
+            .expect("daemon still accepts shutdown");
+        server
+            .await
+            .expect("daemon joined")
+            .expect("normal shutdown");
+        let _ = fs::remove_dir_all(root);
+    }
+
     impl FounderVerdictConsumeWorker for CountingFounderVerdictConsumeWorker {
         fn run_once<'a>(
             &'a self,
@@ -2637,6 +3319,26 @@ mod tests {
 
     #[test]
     fn native_harness_profile_requires_explicit_identity_and_protocol_evidence() {
+        fn composition_profile(
+            capability: &CapabilityProfile,
+        ) -> Result<NativeHarnessCompositionProfile, DaemonCompositionError> {
+            NativeHarnessCompositionProfile::from_attested_capability(
+                &ContractReference {
+                    contract_id: "profile".to_owned(),
+                    version: "v1".to_owned(),
+                    sha256: "ab".repeat(32),
+                },
+                "family",
+                capability,
+                capability
+                    .declaration
+                    .as_ref()
+                    .and_then(|declaration| declaration.native_protocol.clone())
+                    .expect("test capability protocol"),
+                &prost_types::Timestamp::default(),
+            )
+        }
+
         let capability = CapabilityProfile {
             profile_id: "profile".to_owned(),
             revision: 1,
@@ -2656,6 +3358,12 @@ mod tests {
                         native_executable_version: "native-version".to_owned(),
                         native_binary_sha256: None,
                     }),
+                    semantics: Some(
+                        egopulse_domain_contracts::v01::egopulse::harness::v1::CapabilitySemantics {
+                            governed_user_visible_content: SupportLevel::AdapterEmulated as i32,
+                            ..Default::default()
+                        },
+                    ),
                     ..Default::default()
                 },
             ),
@@ -2665,24 +3373,14 @@ mod tests {
             attestation_evidence_refs: vec!["probe://harness/1".to_owned()],
             ..Default::default()
         };
-        let bound = NativeHarnessCompositionProfile::from_attested_capability(
-            &ContractReference {
-                contract_id: "profile".to_owned(),
-                version: "v1".to_owned(),
-                sha256: "ab".repeat(32),
-            },
-            "family",
-            &capability,
-            capability
-                .declaration
-                .as_ref()
-                .and_then(|declaration| declaration.native_protocol.clone())
-                .expect("test capability protocol"),
-            &prost_types::Timestamp::default(),
-        )
-        .expect("attested capability should produce a composition profile");
+        let bound = composition_profile(&capability)
+            .expect("attested capability should produce a composition profile");
         assert_eq!(bound.adapter_id, "adapter");
         assert_eq!(bound.capability_profile_id, "profile");
+        assert_eq!(
+            bound.final_artifact_relation_policy,
+            FinalArtifactRelationPolicy::RequiredGovernedContent
+        );
         assert_eq!(
             bound.capability_profile_ref,
             ContractReference {
@@ -2691,6 +3389,60 @@ mod tests {
                 sha256: "ab".repeat(32),
             }
         );
+
+        let mut missing_semantics = capability.clone();
+        missing_semantics
+            .declaration
+            .as_mut()
+            .expect("test capability declaration")
+            .semantics = None;
+        assert_eq!(
+            composition_profile(&missing_semantics)
+                .expect("legacy capability without semantics")
+                .final_artifact_relation_policy,
+            FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly
+        );
+
+        let mut unspecified_content = capability.clone();
+        unspecified_content
+            .declaration
+            .as_mut()
+            .expect("test capability declaration")
+            .semantics = Some(Default::default());
+        assert_eq!(
+            composition_profile(&unspecified_content)
+                .expect("legacy capability with default content support")
+                .final_artifact_relation_policy,
+            FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly
+        );
+
+        let mut unknown_content = capability.clone();
+        unknown_content
+            .declaration
+            .as_mut()
+            .and_then(|declaration| declaration.semantics.as_mut())
+            .expect("test capability semantics")
+            .governed_user_visible_content = SupportLevel::Unknown as i32;
+        assert_eq!(
+            composition_profile(&unknown_content)
+                .expect("unknown support must remain conservative")
+                .final_artifact_relation_policy,
+            FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly
+        );
+
+        let mut malformed_content = capability.clone();
+        malformed_content
+            .declaration
+            .as_mut()
+            .and_then(|declaration| declaration.semantics.as_mut())
+            .expect("test capability semantics")
+            .governed_user_visible_content = i32::MAX;
+        assert!(matches!(
+            composition_profile(&malformed_content),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness governed content capability"
+            ))
+        ));
 
         let mut drifted_protocol = bound.observed_protocol.clone();
         drifted_protocol.protocol_version.push_str("-drift");
@@ -2727,6 +3479,8 @@ mod tests {
                 native_executable_version: "native-version".to_owned(),
                 native_binary_sha256: None,
             },
+            final_artifact_relation_policy:
+                FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
         };
         assert!(profile.validate().is_ok());
 
@@ -3126,6 +3880,21 @@ mod tests {
             panic!("route-aware workflow must carry dispatch route binding");
         };
         assert_eq!(resolved.run_id, run_id);
+        let mut second_activation = activation.clone();
+        second_activation.task.task_id = "task:route-aware-second".to_owned();
+        second_activation.task.current_run_id = Some(
+            work_preparation::work_capability_run_id(&second_activation.task.task_id, &route)
+                .expect("second route-bound run ID"),
+        );
+        let second = ConfiguredSingleHarnessWorkflow::new(config.clone())
+            .with_context_authority(Arc::clone(&context))
+            .with_work_capability_route(route.clone())
+            .resolve(&second_activation)
+            .expect("resolve second task");
+        let SingleHarnessWorkflowResolution::Resolved(second) = second else {
+            panic!("second workflow configuration");
+        };
+        assert_ne!(resolved.plan.steps[0].step_id, second.plan.steps[0].step_id);
         assert_eq!(
             resolved.attempt_id,
             format!("attempt:work:{task_id}:{}", route.route_binding_sha256)
@@ -3503,6 +4272,17 @@ mod tests {
         );
 
         assert_eq!(providers.harness_content_lineage_readers.len(), 2);
+        let pending = providers
+            .projection_source
+            .as_ref()
+            .expect("native projections")
+            .pending()
+            .expect("read native projections");
+        assert!(
+            pending
+                .iter()
+                .any(|message| matches!(message, PendingOwnerProjection::Collaboration(_)))
+        );
         assert_eq!(
             providers.harness_content_lineage_readers[0]
                 .lock()
@@ -3702,6 +4482,8 @@ mod tests {
                 native_executable_version: "native-v1".to_owned(),
                 native_binary_sha256: None,
             },
+            final_artifact_relation_policy:
+                FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
         }
     }
 
@@ -4225,6 +5007,8 @@ mod tests {
             projection_pump: None,
             harness_dispatch_runner: None,
             harness_dispatch_interval: Duration::from_millis(25),
+            approval_delivery_worker: None,
+            cancellation_delivery_worker: None,
             verification_worker: None,
             verification_interval: Duration::from_millis(25),
             founder_verdict_consume_worker: None,

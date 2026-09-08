@@ -13,8 +13,10 @@ use egopulse_domain_contracts::v01::egopulse::verification::v1::{
 use egopulse_verification_authority::{
     AuthenticatedVerificationPrincipal, CheckerExecutionError, CheckerProcessFailure,
     CriterionPolicySnapshot, GovernedCheckerSupervisor, GovernedSegoRunner,
-    GovernedVerificationExecutionCoordinator, GovernedVerificationExecutionPlan,
-    ReferenceRejection, ResolvedVerificationInput, SegoFindingEvidenceBinding, SegoMapError,
+    GovernedVerificationBatchPlan, GovernedVerificationCheckOutput, GovernedVerificationChecker,
+    GovernedVerificationCheckerError, GovernedVerificationExecutionCoordinator,
+    GovernedVerificationExecutionError, GovernedVerificationExecutionPlan, ReferenceRejection,
+    ResolvedVerificationInput, SegoFindingEvidenceBinding, SegoMapError, SegoMappedResult,
     SegoMapperPolicy, VerificationAuthority, VerificationAuthorityConfig, VerificationClock,
     VerificationPrincipalKind, VerificationReferenceResolver, VerificationSqlCipherKey,
     canonical_checker_profile_digest, canonical_request_digest, checker_failure_result,
@@ -741,10 +743,490 @@ fn checker_timeout_probe() {
     }
 }
 
+#[derive(Default)]
+struct BatchChecker {
+    calls: std::sync::atomic::AtomicUsize,
+    unavailable: bool,
+    invalid_results: bool,
+    invalid_completion_reference: bool,
+}
+
+impl GovernedVerificationChecker for BatchChecker {
+    fn check<'a>(
+        &'a self,
+        request: &'a VerificationRequest,
+        _run_id: &'a str,
+        profiles: &'a [CheckerProfile],
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        GovernedVerificationCheckOutput,
+                        GovernedVerificationCheckerError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.unavailable {
+                return Err(GovernedVerificationCheckerError);
+            }
+            let mut results = request
+                .criterion_ids
+                .iter()
+                .map(|criterion| {
+                    let profile = profiles
+                        .iter()
+                        .find(|profile| profile.supported_criterion_types.contains(criterion))
+                        .expect("attested profile for criterion");
+                    if criterion == "review" {
+                        let mut policy = mapper_policy();
+                        policy.checker_profile_ref = profile_ref(profile);
+                        let mut mapped =
+                            map_sego_review(&sego_review_with_zero_findings(), &policy)
+                                .expect("map model review");
+                        mapped.criterion_result.duration_ms = 1;
+                        mapped
+                    } else {
+                        SegoMappedResult {
+                            review_id: format!(
+                                "check-{}-{criterion}",
+                                request.verification_request_id
+                            ),
+                            criterion_result: CriterionResult {
+                                criterion_result_id: format!(
+                                    "result-{}-{criterion}",
+                                    request.verification_request_id
+                                ),
+                                criterion_id: criterion.clone(),
+                                requirement: CriterionRequirement::MustPass as i32,
+                                outcome: CriterionOutcome::Passed as i32,
+                                evidence_coverage: EvidenceCoverage::Complete as i32,
+                                checker_profile_ref: Some(profile_ref(profile)),
+                                assurance_class: CheckerAssuranceClass::Deterministic as i32,
+                                evidence_ids: vec!["evidence-review".to_owned()],
+                                safe_detail_artifact_id: Some("raw-sego-output".to_owned()),
+                                duration_ms: 1,
+                                ..Default::default()
+                            },
+                            discrepancies: vec![],
+                            unverified_items: vec![],
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            if self.invalid_results {
+                results.pop();
+            }
+            Ok(GovernedVerificationCheckOutput {
+                results,
+                tool_receipt_artifact_ids: vec![],
+                model_call_receipt_artifact_ids: vec![if self.invalid_completion_reference {
+                    "not-a-sealed-model-receipt".to_owned()
+                } else {
+                    "model-call-receipt".to_owned()
+                }],
+                raw_output_artifact_ids: vec!["raw-sego-output".to_owned()],
+            })
+        })
+    }
+}
+
+fn batch_fixture(
+    name: &str,
+) -> (
+    TempRoot,
+    StaticResolver,
+    Arc<Mutex<VerificationAuthority<FixedClock>>>,
+    GovernedVerificationBatchPlan,
+) {
+    let root = TempRoot::new(name);
+    let profiles = ["scope", "tests", "review"].map(|criterion| {
+        let mut profile = checker_profile(if criterion == "review" {
+            CheckerAssuranceClass::ModelAssisted
+        } else {
+            CheckerAssuranceClass::Deterministic
+        });
+        profile.checker_profile_id = format!("checker-{criterion}");
+        profile.supported_criterion_types = vec![criterion.to_owned()];
+        profile.profile_digest_sha256 = canonical_checker_profile_digest(&profile);
+        profile
+    });
+    let resolver = StaticResolver {
+        binding: binding(),
+        criteria: profiles
+            .iter()
+            .map(|profile| CriterionPolicySnapshot {
+                criterion_id: profile.supported_criterion_types[0].clone(),
+                requirement: CriterionRequirement::MustPass as i32,
+                minimum_assurance: profile.assurance_class,
+                not_applicable_allowed: false,
+                checker_profile_ids: vec![profile.checker_profile_id.clone()],
+            })
+            .collect(),
+        evidence_ids: ["attest-evidence", "evidence-review"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        artifact_ids: ["raw-sego-output", "model-call-receipt"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    };
+    let mut authority = VerificationAuthority::open_with_clock(
+        VerificationAuthorityConfig {
+            database_path: root.path().join("verification.db"),
+            store_epoch: "batch-test".to_owned(),
+            key: VerificationSqlCipherKey::new([0x46; 32]),
+        },
+        resolver.clone(),
+        FixedClock,
+    )
+    .expect("open batch authority");
+    for profile in &profiles {
+        let id = format!("attest-{}", profile.checker_profile_id);
+        let command = seal_command(
+            VerificationCommand {
+                command: Some(verification_command::Command::AttestCheckerProfile(
+                    AttestCheckerProfileCommand {
+                        metadata: Some(metadata(&id)),
+                        profile: Some(profile.clone()),
+                    },
+                )),
+            },
+            &id,
+        );
+        assert!(
+            authority
+                .execute(
+                    &command,
+                    &principal(
+                        VerificationPrincipalKind::VerificationAuthority,
+                        "profile-authority",
+                        None
+                    )
+                )
+                .expect("attest batch profile")
+                .committed
+        );
+    }
+    let request = VerificationRequest {
+        verification_request_id: "batch-request".to_owned(),
+        revision: 1,
+        status: VerificationStatus::Queued as i32,
+        verification_type: "task_acceptance".to_owned(),
+        binding: Some(binding()),
+        criterion_ids: vec!["scope".to_owned(), "tests".to_owned(), "review".to_owned()],
+        checker_profile_refs: profiles.iter().map(profile_ref).collect(),
+        ..Default::default()
+    };
+    let command = seal_command(
+        VerificationCommand {
+            command: Some(verification_command::Command::CreateVerificationRequest(
+                CreateVerificationRequestCommand {
+                    metadata: Some(metadata("batch-create")),
+                    request: Some(request),
+                },
+            )),
+        },
+        "batch-create",
+    );
+    let created = authority
+        .execute(
+            &command,
+            &principal(
+                VerificationPrincipalKind::TaskAuthority,
+                "task-authority",
+                None,
+            ),
+        )
+        .expect("create batch request");
+    assert!(created.committed, "{created:?}");
+    let plan = GovernedVerificationBatchPlan {
+        verification_request_id: "batch-request".to_owned(),
+        verification_run_id: "batch-run".to_owned(),
+        verification_artifact_id: "batch-artifact".to_owned(),
+        issued_at: FixedClock.now(),
+    };
+    (root, resolver, Arc::new(Mutex::new(authority)), plan)
+}
+
+#[tokio::test]
+async fn governed_batch_combines_three_criteria_and_replays_after_sqlcipher_reopen() {
+    let (root, resolver, authority, plan) = batch_fixture("batch-complete");
+    let checker = BatchChecker {
+        unavailable: false,
+        ..Default::default()
+    };
+    let coordinator =
+        GovernedVerificationExecutionCoordinator::from_authority(Arc::clone(&authority));
+    let outcome = coordinator
+        .execute_prepared(plan.clone(), &checker)
+        .await
+        .expect("complete batch");
+    assert_eq!(outcome.verification_artifact.criterion_results.len(), 3);
+    assert_eq!(
+        outcome.verification_artifact.conclusion,
+        VerificationConclusion::Indeterminate as i32
+    );
+    assert_eq!(
+        outcome
+            .verification_artifact
+            .criterion_results
+            .iter()
+            .filter(|result| result.outcome == CriterionOutcome::Passed as i32)
+            .count(),
+        2
+    );
+    let before = authority
+        .lock()
+        .expect("authority")
+        .inspect_store()
+        .expect("inspection");
+    drop(coordinator);
+    drop(authority);
+    let authority = Arc::new(Mutex::new(
+        VerificationAuthority::open_with_clock(
+            VerificationAuthorityConfig {
+                database_path: root.path().join("verification.db"),
+                store_epoch: "batch-test".to_owned(),
+                key: VerificationSqlCipherKey::new([0x46; 32]),
+            },
+            resolver,
+            FixedClock,
+        )
+        .expect("reopen batch authority"),
+    ));
+    let coordinator =
+        GovernedVerificationExecutionCoordinator::from_authority(Arc::clone(&authority));
+    let replay = coordinator
+        .execute_prepared(plan, &checker)
+        .await
+        .expect("replay completed batch");
+    assert!(replay.replayed);
+    assert_eq!(replay.verification_artifact, outcome.verification_artifact);
+    assert_eq!(checker.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        authority
+            .lock()
+            .expect("authority")
+            .inspect_store()
+            .expect("inspection"),
+        before
+    );
+}
+
+#[tokio::test]
+async fn governed_batch_holds_when_output_capture_is_unavailable_without_retrying_checker() {
+    let (_root, _resolver, authority, plan) = batch_fixture("batch-output-unknown");
+    let checker = BatchChecker {
+        unavailable: true,
+        ..Default::default()
+    };
+    let coordinator =
+        GovernedVerificationExecutionCoordinator::from_authority(Arc::clone(&authority));
+    for _ in 0..2 {
+        assert!(
+            matches!(coordinator.execute_prepared(plan.clone(), &checker).await,
+            Err(GovernedVerificationExecutionError::HeldForRecovery { reason_code, .. })
+                if reason_code == "CHECKER_OUTPUT_CAPTURE_INCOMPLETE")
+        );
+    }
+    assert_eq!(checker.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        authority
+            .lock()
+            .expect("authority")
+            .inspect_store()
+            .expect("inspection")
+            .verification_artifact_count,
+        0
+    );
+}
+
+#[tokio::test]
+async fn coordinator_holds_unfinished_durable_runs_without_invoking_checker() {
+    for has_criterion in [false, true] {
+        let mut fixture =
+            running_fixture("coordinator-recovery", CheckerAssuranceClass::ModelAssisted);
+        if has_criterion {
+            let result = map_sego_review(&sego_review_with_verified_major(), &mapper_policy())
+                .expect("valid result")
+                .criterion_result;
+            let command = record_command(&fixture, result, "before-crash-result");
+            assert!(
+                fixture
+                    .authority
+                    .execute(&command, &fixture.checker_principal)
+                    .expect("record before crash")
+                    .committed
+            );
+        }
+        let RunningFixture {
+            _root: root,
+            authority,
+            request,
+            run_id,
+            ..
+        } = fixture;
+        drop(authority);
+        let resolver = StaticResolver {
+            binding: request.binding.clone().expect("binding"),
+            criteria: vec![CriterionPolicySnapshot {
+                criterion_id: "review".to_owned(),
+                requirement: CriterionRequirement::MustPass as i32,
+                minimum_assurance: CheckerAssuranceClass::ModelAssisted as i32,
+                not_applicable_allowed: false,
+                checker_profile_ids: request
+                    .checker_profile_refs
+                    .iter()
+                    .map(|p| p.contract_id.clone())
+                    .collect(),
+            }],
+            evidence_ids: ["attest-evidence", "evidence-review"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            artifact_ids: [
+                "raw-sego-output",
+                "finding-description",
+                "finding-fix",
+                "model-call-receipt",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        };
+        let open = || {
+            VerificationAuthority::open_with_clock(
+                VerificationAuthorityConfig {
+                    database_path: root.path().join("verification.db"),
+                    store_epoch: "g4-06-test-epoch".to_owned(),
+                    key: VerificationSqlCipherKey::new([0x46; 32]),
+                },
+                resolver.clone(),
+                FixedClock,
+            )
+            .expect("reopen durable authority")
+        };
+        fs::write(root.path().join("reexecution.marker"), b"armed").expect("arm probe");
+        let plan = GovernedVerificationExecutionPlan {
+            verification_request_id: request.verification_request_id.clone(),
+            verification_run_id: run_id.clone(),
+            execution_id: "execution-recovery".to_owned(),
+            working_directory: root.path().to_owned(),
+            checker_request: b"{}".to_vec(),
+            mapper_policy: mapper_policy(),
+            verification_artifact_id: "verification-artifact-recovery".to_owned(),
+            tool_receipt_artifact_ids: vec![],
+            model_call_receipt_artifact_ids: vec![],
+            issued_at: FixedClock.now(),
+        };
+        let mut held_inspection = None;
+        for _ in 0..2 {
+            let authority = Arc::new(Mutex::new(open()));
+            let before = authority
+                .lock()
+                .expect("lock")
+                .inspect_store()
+                .expect("inspection");
+            let runner = GovernedSegoRunner::new(
+                GovernedCheckerSupervisor::new(
+                    std::env::current_exe().expect("test executable"),
+                    vec![
+                        "--exact".to_owned(),
+                        "checker_reexecution_probe".to_owned(),
+                        "--nocapture".to_owned(),
+                    ],
+                    Duration::from_secs(2),
+                    64 * 1024,
+                )
+                .expect("supervisor"),
+            );
+            let coordinator =
+                GovernedVerificationExecutionCoordinator::new(Arc::clone(&authority), runner);
+            let outcome = coordinator.execute_one(plan.clone()).await;
+            assert!(
+                !root.path().join("checker-was-reexecuted.marker").exists(),
+                "an unfinished durable run must never blindly execute its checker again"
+            );
+            assert!(
+                matches!(outcome, Err(GovernedVerificationExecutionError::HeldForRecovery {
+                verification_run_id, reason_code,
+            }) if verification_run_id == run_id && reason_code == "CHECKER_EXECUTION_OUTCOME_UNKNOWN_AFTER_RESTART"),
+                "held recovery must return the nonfatal application outcome"
+            );
+            let authority = authority.lock().expect("lock");
+            let run = authority
+                .verification_run(&run_id)
+                .expect("run read")
+                .expect("run");
+            assert_eq!(run.status, VerificationStatus::Held as i32);
+            assert_eq!(run.criterion_results.len(), usize::from(has_criterion));
+            let after = authority.inspect_store().expect("inspection");
+            assert_eq!(after.verification_artifact_count, 0);
+            if let Some(previous) = held_inspection.as_ref() {
+                assert_eq!(&after, previous, "restart must not add another hold");
+            } else {
+                assert_eq!(after.event_count, before.event_count + 1);
+            }
+            held_inspection = Some(after);
+        }
+    }
+}
+
+#[test]
+fn checker_reexecution_probe() {
+    if Path::new("reexecution.marker").exists() {
+        fs::write("checker-was-reexecuted.marker", b"invoked").expect("record invocation");
+    }
+}
+
 #[test]
 fn checker_crash_probe() {
     if Path::new("crash.marker").exists() {
         panic!("intentional checker crash probe");
+    }
+}
+
+#[tokio::test]
+async fn governed_batch_persists_hold_after_invalid_results_or_completion_rejection() {
+    for invalid_results in [true, false] {
+        let (_root, _resolver, authority, plan) = batch_fixture("batch-commit-failed");
+        let checker = BatchChecker {
+            invalid_results,
+            invalid_completion_reference: !invalid_results,
+            ..Default::default()
+        };
+        let coordinator =
+            GovernedVerificationExecutionCoordinator::from_authority(Arc::clone(&authority));
+        for _ in 0..2 {
+            assert!(
+                matches!(coordinator.execute_prepared(plan.clone(), &checker).await,
+                Err(GovernedVerificationExecutionError::HeldForRecovery { reason_code, .. })
+                    if reason_code == "CHECKER_RESULT_COMMIT_INCOMPLETE")
+            );
+        }
+        assert_eq!(checker.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let authority = authority.lock().expect("authority");
+        let run = authority
+            .verification_run(&plan.verification_run_id)
+            .expect("read run")
+            .expect("run");
+        assert_eq!(run.status, VerificationStatus::Held as i32);
+        assert_eq!(
+            run.criterion_results.len(),
+            if invalid_results { 0 } else { 3 }
+        );
+        assert_eq!(
+            authority
+                .inspect_store()
+                .expect("inspection")
+                .verification_artifact_count,
+            0
+        );
     }
 }
 

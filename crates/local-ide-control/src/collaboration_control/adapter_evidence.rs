@@ -1,3 +1,6 @@
+#[path = "approval_evidence.rs"]
+mod approval_evidence;
+
 use super::{
     DELIVERY_OUTCOME_UNKNOWN_REASON_CODE, HarnessEvidenceResolver, ReferenceAuthorization,
     ReferenceGuardRejection, ResolvedHarnessEvidence,
@@ -8,9 +11,27 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     RecordDeliveryReceiptCommand, RecordHarnessAckCommand, RecordRunningObservationCommand,
 };
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    DeliveryDisposition, LifecycleKind, harness_observation,
+    ApprovalDecisionEnvelope, DeliveryDisposition, LifecycleKind, harness_observation,
+};
+use egopulse_domain_contracts::v01::egopulse::policy::v1::{
+    HarnessApprovalDecisionRecord, HarnessApprovalDecisionState,
 };
 use egopulse_harness_adapter::AdapterEdge;
+use std::sync::Arc;
+
+type ApprovalPolicyEvidenceReader = Arc<
+    dyn Fn(
+            &str,
+        ) -> Result<
+            Option<(
+                HarnessApprovalDecisionRecord,
+                HarnessApprovalDecisionState,
+                ApprovalDecisionEnvelope,
+            )>,
+            (),
+        > + Send
+        + Sync,
+>;
 
 /// Provider-neutral read port backed by the Adapter's durable edge.
 ///
@@ -19,12 +40,36 @@ use egopulse_harness_adapter::AdapterEdge;
 /// durable Adapter record with the expected digest, fence and payload shape.
 pub struct AdapterBackedHarnessEvidenceResolver {
     edge: AdapterEdge,
+    approval_policy_evidence: Option<ApprovalPolicyEvidenceReader>,
 }
 
 impl AdapterBackedHarnessEvidenceResolver {
     #[must_use]
     pub fn new(edge: AdapterEdge) -> Self {
-        Self { edge }
+        Self {
+            edge,
+            approval_policy_evidence: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_approval_policy_evidence<F>(mut self, reader: F) -> Self
+    where
+        F: Fn(
+                &str,
+            ) -> Result<
+                Option<(
+                    HarnessApprovalDecisionRecord,
+                    HarnessApprovalDecisionState,
+                    ApprovalDecisionEnvelope,
+                )>,
+                (),
+            > + Send
+            + Sync
+            + 'static,
+    {
+        self.approval_policy_evidence = Some(Arc::new(reader));
+        self
     }
 
     #[must_use]
@@ -63,52 +108,61 @@ impl HarnessEvidenceResolver for AdapterBackedHarnessEvidenceResolver {
         let receipt = self
             .edge
             .dispatch_receipt(dispatch_id)
-            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
-            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
-        let envelope = self
-            .edge
-            .dispatch_envelope(dispatch_id)
-            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
-            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
-        let lineage = self
-            .edge
-            .dispatch_task_lineage(dispatch_id)
-            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
-            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
-        let capability = attempt
-            .capability_profile_ref
-            .as_ref()
-            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
-        let fencing_token = attempt
-            .lease
-            .as_ref()
-            .map(|lease| lease.fencing_token)
-            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
-        if DeliveryDisposition::try_from(receipt.disposition) != Ok(DeliveryDisposition::Unknown)
-            || receipt.receipt_id != command.uncertainty_evidence_id
-            || receipt.adapter_id != self.edge.adapter_id()
-            || receipt.dispatch_id != dispatch_id
-            || receipt.attempt_id != attempt.attempt_id
-            || receipt.fencing_token != fencing_token
-            || receipt.fencing_token != envelope.fencing_token
-            || receipt.capability_profile_id != capability.contract_id
-            || envelope.dispatch_id != dispatch_id
-            || envelope.run_id != run.run_id
-            || envelope.step_id != attempt.step_id
-            || envelope.attempt_id != attempt.attempt_id
-            || envelope.capability_profile_ref.as_ref() != Some(capability)
-            || lineage.task_id != run.task_id
-            || lineage.task_revision != run.task_revision_at_creation
-            || lineage.work_revision != run.work_revision
-        {
-            return Err(ReferenceGuardRejection::UnverifiedReference);
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?;
+        if let Some(receipt) = receipt.filter(|receipt| {
+            receipt.receipt_id == command.uncertainty_evidence_id
+                && DeliveryDisposition::try_from(receipt.disposition)
+                    == Ok(DeliveryDisposition::Unknown)
+        }) {
+            let envelope = self
+                .edge
+                .dispatch_envelope(dispatch_id)
+                .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+                .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+            let lineage = self
+                .edge
+                .dispatch_task_lineage(dispatch_id)
+                .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+                .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+            let capability = attempt
+                .capability_profile_ref
+                .as_ref()
+                .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+            let fencing_token = attempt
+                .lease
+                .as_ref()
+                .map(|lease| lease.fencing_token)
+                .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+            if receipt.adapter_id != self.edge.adapter_id()
+                || receipt.dispatch_id != dispatch_id
+                || receipt.attempt_id != attempt.attempt_id
+                || receipt.fencing_token != fencing_token
+                || receipt.fencing_token != envelope.fencing_token
+                || receipt.capability_profile_id != capability.contract_id
+                || envelope.dispatch_id != dispatch_id
+                || envelope.run_id != run.run_id
+                || envelope.step_id != attempt.step_id
+                || envelope.attempt_id != attempt.attempt_id
+                || envelope.capability_profile_ref.as_ref() != Some(capability)
+                || lineage.task_id != run.task_id
+                || lineage.task_revision != run.task_revision_at_creation
+                || lineage.work_revision != run.work_revision
+            {
+                return Err(ReferenceGuardRejection::UnverifiedReference);
+            }
+            return Ok(ReferenceAuthorization {
+                evidence_refs: vec![format!(
+                    "adapter-delivery-unknown:{}:{}@durable",
+                    receipt.receipt_id, receipt.receipt_digest_sha256
+                )],
+            });
         }
-        Ok(ReferenceAuthorization {
-            evidence_refs: vec![format!(
-                "adapter-delivery-unknown:{}:{}@durable",
-                receipt.receipt_id, receipt.receipt_digest_sha256
-            )],
-        })
+        approval_evidence::validate_approval_delivery_unknown(
+            &self.edge,
+            self.approval_policy_evidence.as_ref(),
+            command,
+            snapshot,
+        )
     }
 
     fn resolve_delivery_receipt(

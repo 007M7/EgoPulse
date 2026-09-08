@@ -6,6 +6,8 @@ EgoPulse is not another model wrapper or an unconstrained tool-running Agent. It
 
 The first release slice is an unsigned Windows x64 engineering preview containing the CLI, TUI and `agentosd` daemon. GPT through the Codex app-server Harness is the only production-admitted model route. Desktop, additional Providers and semantic/vector RAG remain explicitly gated.
 
+This checkout includes the September 2026 phase-one work-loop repairs. Use the matching local candidate and its `BUILD-METADATA.json`; the previous published `v0.1.0-early-access.1` archive does not contain these repairs.
+
 - [Windows early-access guide](WINDOWS-EARLY-ACCESS.md)
 - [Implementation architecture](ARCHITECTURE.md)
 - [Current release evidence](docs/release/windows-candidate-20260905.md)
@@ -72,7 +74,7 @@ User / Founder
         +--------------------+--------------------+
         |                    |                    |
  deterministic          collaboration        evidence path
- Authorities             and recovery       Artifact -> Sego
+ Authorities             and recovery       Artifact evidence ->
  Task / Policy /         leases, dispatch,   Verification ->
  Memory / Verdict        cancellation        Founder Verdict
         |                    |                    |
@@ -94,7 +96,8 @@ natural-language intent
   -> Task activation and supervised Harness dispatch
   -> source-labelled streamed content
   -> immutable Artifact/evidence intake
-  -> Sego/checker verification
+  -> deterministic scope/tests checks and model-assisted review
+  -> task-bound Verification
   -> Founder verdict
   -> projected result, audit trail and recovery state
 ```
@@ -170,19 +173,13 @@ EgoPulse does not place Provider credentials in the repository or ordinary JSON 
 
 ### 2. Download and verify
 
-Download [`v0.1.0-early-access.1`](https://github.com/007M7/EgoPulse/releases/tag/v0.1.0-early-access.1), including the ZIP and adjacent `.sha256` file. The repository and release are currently private, so the GitHub account must have access.
+Use the local Windows candidate supplied with this revision, including its ZIP and adjacent `.sha256` file. Its exact source commit is recorded in `BUILD-METADATA.json`. The earlier [`v0.1.0-early-access.1`](https://github.com/007M7/EgoPulse/releases/tag/v0.1.0-early-access.1) remains historical release evidence, not the package for the repaired workflow below.
 
 Verify the downloaded archive before extracting it:
 
 ```powershell
 Get-FileHash .\egopulse-*.zip -Algorithm SHA256
 Get-Content .\egopulse-*.zip.sha256
-```
-
-The published candidate SHA-256 is:
-
-```text
-cf85884e0572a30e5e350c17ec09941f844dba78209e42f0f05bb8dac9bbb5c3
 ```
 
 The archive is unsigned. A SmartScreen warning is therefore possible; a hash mismatch is a reason to stop, not bypass the warning.
@@ -193,26 +190,22 @@ Extract to a short path such as `C:\EgoPulse`, then run the installer without la
 
 ```powershell
 cd C:\EgoPulse
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install-egopulse.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-egopulse.ps1 `
+  -RepositoryRoot 'D:\work\project' `
+  -AcceptanceContractPath 'D:\work\project-acceptance.json'
 ```
 
 The installer creates a user-owned data root under `%LOCALAPPDATA%\EgoPulse`, generates local Authority/session keys as user environment variables, installs the locked Memory Worker, migrates the configuration to the current schema, validates it and checks that the production Harness executable exists.
 
-### 4. Align the current early-access configuration
+Keep the reviewed acceptance contract outside the execution checkout. Follow [repository setup](config/README.md#governed-repository-setup) and require `verification_preflight=repository_configured` before starting repository work. Omitting both repository parameters installs the base product only and reports `verification_preflight=not_configured`; it does not configure the real repository checkers.
 
-`v0.1.0-early-access.1` is an engineering preview and still has three first-run defaults that must be aligned manually before the first real work request. Open:
+### 4. Choose the work directory
 
-```text
-%LOCALAPPDATA%\EgoPulse\agentos-config.json
-```
+A fresh installation creates `%LOCALAPPDATA%\EgoPulse\workspaces\default`, allows `scope:founder`, and uses `governed_repository_change` in the TUI. Place an actual context source such as the project's `README.md` in this directory for `--context-ref default/README.md`. Repository execution uses a detached worktree of the repository selected during setup; accepting a result preserves its governed artifacts and does not merge them into the source repository.
 
-Then:
+Existing installations retain their configuration. If upgrading an older preview, also check `task_guard.allowed_target_scope_refs` includes `scope:founder`; use `governed_repository_change` as the Work Type. Do not replace an existing configuration or its Authority keys to recover an unfinished task.
 
-1. Set `task_guard.allowed_target_scope_refs` to `["scope:founder"]`.
-2. Set `codex.workspace_root` to an existing absolute project directory, for example `D:\Projects\my-project`, or create the configured directory before starting the daemon.
-3. Use `governed_repository_change` as the Work Type. The current TUI form displays `general` as a placeholder; replace it before confirmation.
-
-These are packaging/default-alignment limitations, not alternate architecture rules. They are expected to be removed in the next package refresh.
+Before upgrading an existing data root, follow [upgrade and rollback](WINDOWS-EARLY-ACCESS.md#upgrade-and-rollback). A configuration backup is not an Authority database backup.
 
 ### 5. Start the governed local daemon
 
@@ -236,18 +229,18 @@ Only a capability marked `admitted` and carrying a public choice ID can start go
 
 ### 6. Start a natural-language work request
 
-The following example assumes the configured workspace contains `README.md`:
+The following example assumes the default project directory contains `README.md`:
 
 ```powershell
 .\bin\egopulse.exe work start `
   --intent "Inspect this repository and propose one safe documentation improvement" `
   --scope "scope:founder" `
   --work-type "governed_repository_change" `
-  --context-ref "README.md" `
+  --context-ref "default/README.md" `
   --confirm
 ```
 
-`--context-ref` is resolved beneath `codex.workspace_root`. Memory retrieval is enabled by default; add `--no-memory` when the task must not consume accepted Memory. In a non-interactive shell, `--confirm` is required.
+`--context-ref` is resolved beneath `codex.workspace_root`, so include the project directory name. Memory retrieval is enabled by default; add `--no-memory` when the task must not consume accepted Memory. With `--no-memory`, supply at least one real context source. In a non-interactive shell, `--confirm` is required.
 
 The command returns a Task ID. Use it to inspect the governed projections and streamed Harness output:
 
@@ -457,7 +450,7 @@ Do not edit generated Rust, TypeScript or Python bindings as the source of truth
 
 ## Quality and release evidence
 
-The current Windows candidate is bound to commit `5c8a1e8` and tag `v0.1.0-early-access.1`. Its recorded local gate includes:
+The previous published Windows candidate was bound to commit `5c8a1e8` and tag `v0.1.0-early-access.1`. Its historical local gate included:
 
 - contract, repository-boundary and TypeScript checks;
 - the complete Rust workspace;
@@ -468,7 +461,7 @@ The current Windows candidate is bound to commit `5c8a1e8` and tag `v0.1.0-early
 - CLI, TUI and daemon startup probes;
 - archive and per-file SHA-256 verification for 55 packaged files.
 
-The package is suitable for local/manual early-access testing. It is not a signed production release or evidence that held Provider routes have been admitted.
+Current phase-one repair evidence includes two real repository tasks, CLI Accept/Rework, 24 TUI checkpoints including Reject, cancellation and same-database recovery. The new candidate's exact commit and clean local CI evidence are packaged under `BUILD-METADATA.json` and `manifests/local-ci-evidence.json`. Candidates are for local early-access testing, not signed production releases or admission of held Provider routes.
 
 The repository retains GitHub Actions CI/CD definitions, but the current operational gate is the recorded local Windows CI/CD path while Actions capacity is unavailable. See [local CI/CD policy](docs/engineering/local-ci-cd.md).
 

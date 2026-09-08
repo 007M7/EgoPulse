@@ -1,31 +1,36 @@
 use super::{
     ArtifactReturnSource, AuthenticatedCollaborationPrincipal, AuthorityClock,
     CollaborationControl, CollaborationControlError, CollaborationPrincipalKind,
-    CollaborationReferenceGuard, DeliveredDispatchForObservation, HarnessEvidenceResolver,
-    HarnessFactIngestionDisposition, HarnessFactIngestionResult, HeldDispatchRecoveryState,
-    SingleHarnessWorkConfig, SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver,
-    TaskActivationGuardSet, TaskActivationReferenceHandle, TaskActivationSource,
+    CollaborationReferenceGuard, DELIVERY_OUTCOME_UNKNOWN_REASON_CODE,
+    DeliveredDispatchForObservation, HarnessEvidenceResolver, HarnessFactIngestionDisposition,
+    HarnessFactIngestionResult, HeldDispatchRecoveryState, SingleHarnessWorkConfig,
+    SingleHarnessWorkflowResolution, SingleHarnessWorkflowResolver, TaskActivationGuardSet,
+    TaskActivationReferenceHandle, TaskActivationSource, TaskCancellationHandoff,
     seal_request_digest,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::get_collaboration_response;
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
-    AttemptCommandBase, AttemptStatus, BeginAttemptReconciliationCommand, CollaborationCommand,
-    CollaborationSnapshot, CommitStepReturnCommand, ReconciliationDisposition,
-    RecordAttemptReconciliationCommand, RecordAttemptReturnCommand, RunCommandBase, RunStatus,
-    StepStatus, collaboration_command, collaboration_command_result,
+    AttemptCancellationDisposition, AttemptCommandBase, AttemptStatus,
+    BeginAttemptReconciliationCommand, CollaborationCommand, CollaborationErrorCode,
+    CollaborationSnapshot, CommitStepReturnCommand, MarkAttemptOutcomeUnknownCommand,
+    ReconciliationDisposition, RecordAttemptCancellationOutcomeCommand,
+    RecordAttemptReconciliationCommand, RecordAttemptReturnCommand,
+    RequestAttemptCancellationCommand, RunCommandBase, RunStatus, StepStatus,
+    collaboration_command, collaboration_command_result,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    DeliveryDisposition, DispatchEnvelope, HarnessObservation, LifecycleKind,
-    ObservationCriticality, dispatch_result, harness_observation,
+    ApprovalDecisionEnvelope, ApprovalDecisionResult, CancelExecutionResult, DeliveryDisposition,
+    DispatchEnvelope, HarnessObservation, LifecycleKind, ObservationCriticality, dispatch_result,
+    harness_observation,
 };
 use egopulse_harness_adapter::{
     AdapterClock, DispatchMaterialResolver, GovernedAdapterError, GovernedHarnessAdapter,
-    NativeHarnessDriver, ReconciliationFinding,
+    LegacyExecutionStartRecovery, NativeHarnessDriver, ReconciliationFinding,
 };
 use prost::Message;
 use sha2::Digest;
-use std::{future::Future, pin::Pin};
+use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +38,10 @@ pub enum TaskRecoveryKind {
     /// The Collaboration run reached a committed Cancelled outcome. The owning
     /// Task may record its cancellation outcome if it is still pending.
     CancellationConfirmed,
+    /// Cancellation lost to an independently sealed technical return. The
+    /// Task owner must arbitrate the return from its Artifact proof; a native
+    /// interrupt delivery receipt cannot promote this finding.
+    CancellationReturnFound,
     /// The Harness terminal outcome is unknown or unproven (quarantined run).
     /// The owning Task may need an interruption record if it is still Active.
     OutcomeUnknown,
@@ -48,6 +57,45 @@ pub struct TaskRecoveryFinding {
     pub task_id: String,
     pub run_id: String,
     pub evidence_ref: String,
+}
+
+/// Task-local activation material failure observed before the activation
+/// outbox can be acknowledged. This is cycle telemetry, not a durable Task or
+/// Attempt state transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskActivationBlockage {
+    pub task_id: String,
+    pub dispatch_id: String,
+    pub safe_detail_code: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskDispatchMaterialRejection {
+    pub safe_detail_code: String,
+}
+
+/// Optional Task-scoped material boundary around the durable Collaboration
+/// workflow. Implementations may prepare immutable dispatch material before
+/// the Run exists and must seal it before the Task activation is acknowledged.
+pub trait TaskDispatchMaterialPreparer: Send + Sync {
+    fn prepare<'a>(
+        &'a self,
+        activation: &'a super::TaskActivationHandoff,
+        config: SingleHarnessWorkConfig,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<SingleHarnessWorkConfig, TaskDispatchMaterialRejection>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    fn seal_before_activation_ack<'a>(
+        &'a self,
+        activation: &'a super::TaskActivationHandoff,
+        config: &'a SingleHarnessWorkConfig,
+        result: &'a super::SingleHarnessWorkResult,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TaskDispatchMaterialRejection>> + Send + 'a>>;
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -73,6 +121,7 @@ pub struct HarnessDispatchCycleReport {
     pub activations_seen: u64,
     pub activations_started: u64,
     pub activations_acknowledged: u64,
+    pub activation_blockages: Vec<TaskActivationBlockage>,
     pub terminal_dispatch_ids: Vec<String>,
     /// Dispatches held by Collaboration recovery. This is deliberately
     /// separate from terminal observations: a hold proves no terminal fact.
@@ -113,6 +162,65 @@ pub trait HarnessDispatchRunner: Send + Sync {
                 + '_,
         >,
     >;
+}
+
+/// Delivers an Authority-issued approval through the exact live adapter that
+/// owns the matching native dispatch. Implementations retain the adapter's
+/// durable delivery receipt boundary, including unknown-outcome replay.
+pub trait HarnessApprovalDeliveryTarget: Send + Sync {
+    fn deliver_approval<'a>(
+        &'a self,
+        envelope: &'a ApprovalDecisionEnvelope,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ApprovalDecisionResult, GovernedAdapterError>> + Send + 'a>,
+    >;
+
+    /// Records uncertainty through Collaboration's evidence guard. This never
+    /// resends the native approval or consumes an unconfirmed Policy decision.
+    fn recover_unknown_approval<'a>(
+        &'a self,
+        _envelope: &'a ApprovalDecisionEnvelope,
+    ) -> Pin<Box<dyn Future<Output = Result<(), HarnessDispatchCycleError>> + Send + 'a>> {
+        Box::pin(async {
+            Err(HarnessDispatchCycleError::Recovery(
+                "approval outcome recovery is not configured".to_owned(),
+            ))
+        })
+    }
+}
+
+/// Thin delivery port over the already-live Adapter held by a governed task
+/// runner. It deliberately exposes no driver construction or session access.
+pub trait HarnessCancellationDeliveryTarget: Send + Sync {
+    fn owns_task_cancellation<'a>(
+        &'a self,
+        handoff: &'a TaskCancellationHandoff,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, HarnessCancellationDeliveryError>> + Send + 'a>>;
+
+    fn deliver_task_cancellation<'a>(
+        &'a self,
+        handoff: &'a TaskCancellationHandoff,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<CancelExecutionResult, HarnessCancellationDeliveryError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
+#[derive(Debug, Error)]
+pub enum HarnessCancellationDeliveryError {
+    #[error("collaboration cancellation state could not be read")]
+    DispatchState(#[from] HarnessDispatchCycleError),
+    #[error("collaboration control operation failed")]
+    Collaboration(#[from] CollaborationControlError),
+    #[error("harness adapter operation failed")]
+    Adapter(#[from] GovernedAdapterError),
+    #[error("Task cancellation does not match one live dispatch")]
+    LiveBinding,
+    #[error("Task cancellation deadline is invalid")]
+    Deadline,
 }
 
 /// Runs multiple provider-specific dispatch workers through one daemon
@@ -253,6 +361,11 @@ where
                 active_envelopes,
             } = &mut *runtime;
             let mut report = HarnessDispatchCycleReport::default();
+            record_settled_cancellation_findings(
+                control,
+                self.capability_profile_filter.as_ref(),
+                &mut report,
+            )?;
             recover_held_dispatches(
                 control,
                 adapter,
@@ -289,6 +402,7 @@ where
                 adapter,
                 &self.principal,
                 self.capability_profile_filter.as_ref(),
+                &BTreeSet::new(),
             )
             .await?;
             merge_report(&mut report, dispatched);
@@ -309,6 +423,7 @@ struct GovernedTaskActivationRuntime<S, W, E, C, R, D, A> {
     artifact_return_source: Option<std::sync::Arc<dyn ArtifactReturnSource>>,
     artifact_return_principal: Option<AuthenticatedCollaborationPrincipal>,
     step_return_principal: Option<AuthenticatedCollaborationPrincipal>,
+    task_dispatch_material_preparer: Option<Arc<dyn TaskDispatchMaterialPreparer>>,
 }
 
 /// The production single-writer worker for the first vertical. It consumes
@@ -354,6 +469,7 @@ where
                 artifact_return_source: None,
                 artifact_return_principal: None,
                 step_return_principal: None,
+                task_dispatch_material_preparer: None,
             }),
             principal,
             capability_profile_filter: None,
@@ -393,6 +509,388 @@ where
         self.runtime.get_mut().step_return_principal = Some(principal);
         self
     }
+
+    #[must_use]
+    pub fn with_task_dispatch_material_preparer(
+        mut self,
+        preparer: Arc<dyn TaskDispatchMaterialPreparer>,
+    ) -> Self {
+        self.runtime.get_mut().task_dispatch_material_preparer = Some(preparer);
+        self
+    }
+}
+
+impl<S, W, E, C, R, D, A> HarnessApprovalDeliveryTarget
+    for GovernedTaskActivationRunner<S, W, E, C, R, D, A>
+where
+    S: TaskActivationSource + Send,
+    W: SingleHarnessWorkflowResolver + Send,
+    E: HarnessEvidenceResolver + Send,
+    C: AuthorityClock + Send,
+    R: DispatchMaterialResolver + Send,
+    D: NativeHarnessDriver + Send,
+    A: AdapterClock + Send,
+{
+    fn deliver_approval<'a>(
+        &'a self,
+        envelope: &'a ApprovalDecisionEnvelope,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ApprovalDecisionResult, GovernedAdapterError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut runtime = self.runtime.lock().await;
+            runtime.adapter.decide_approval(envelope).await
+        })
+    }
+
+    fn recover_unknown_approval<'a>(
+        &'a self,
+        envelope: &'a ApprovalDecisionEnvelope,
+    ) -> Pin<Box<dyn Future<Output = Result<(), HarnessDispatchCycleError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut runtime = self.runtime.lock().await;
+            let dispatch = runtime
+                .adapter
+                .edge()
+                .dispatch_envelope(&envelope.dispatch_id)
+                .map_err(GovernedAdapterError::from)?
+                .ok_or_else(|| {
+                    HarnessDispatchCycleError::Recovery(
+                        "approval recovery dispatch is not durable".to_owned(),
+                    )
+                })?;
+            if self.capability_profile_filter.is_none()
+                || !envelope_matches_profile(&dispatch, self.capability_profile_filter.as_ref())
+                || dispatch.attempt_id != envelope.attempt_id
+                || dispatch.fencing_token != envelope.fencing_token
+            {
+                return Err(HarnessDispatchCycleError::Recovery(
+                    "approval recovery does not match the adapter route".to_owned(),
+                ));
+            }
+            let snapshot = collaboration_snapshot(&runtime.control, &dispatch.run_id)?;
+            let attempt = snapshot
+                .attempts
+                .iter()
+                .find(|attempt| attempt.attempt_id == envelope.attempt_id)
+                .filter(|attempt| {
+                    attempt.dispatch_id.as_deref() == Some(envelope.dispatch_id.as_str())
+                        && attempt
+                            .lease
+                            .as_ref()
+                            .is_some_and(|lease| lease.fencing_token == envelope.fencing_token)
+                        && attempt.capability_profile_ref == dispatch.capability_profile_ref
+                })
+                .ok_or_else(|| {
+                    HarnessDispatchCycleError::Recovery(
+                        "approval recovery attempt binding changed".to_owned(),
+                    )
+                })?;
+            // A previous cycle may already have committed the hold and begun
+            // reconciliation. Do not rebuild the same command with a different
+            // revision/digest; the normal recovery runner owns its continuation.
+            if snapshot
+                .run
+                .as_ref()
+                .is_some_and(|run| run.status == RunStatus::Held as i32)
+                && matches!(
+                    AttemptStatus::try_from(attempt.status),
+                    Ok(AttemptStatus::OutcomeUnknown
+                        | AttemptStatus::Reconciling
+                        | AttemptStatus::Held)
+                )
+            {
+                return Ok(());
+            }
+            let mut command = CollaborationCommand {
+                command: Some(collaboration_command::Command::MarkAttemptOutcomeUnknown(
+                    MarkAttemptOutcomeUnknownCommand {
+                        base: Some(recovery_attempt_base(
+                            &snapshot,
+                            &envelope.attempt_id,
+                            &envelope.authority_decision_ref,
+                            "approval-outcome-unknown",
+                        )?),
+                        reason_code: DELIVERY_OUTCOME_UNKNOWN_REASON_CODE.to_owned(),
+                        uncertainty_evidence_id: envelope.authority_decision_ref.clone(),
+                    },
+                )),
+            };
+            seal_request_digest(&mut command).ok_or_else(|| {
+                HarnessDispatchCycleError::Recovery(
+                    "approval recovery command could not be sealed".to_owned(),
+                )
+            })?;
+            require_recovery_commit(
+                runtime.control.execute(&command, &recovery_principal())?,
+                "approval-outcome-unknown",
+            )
+        })
+    }
+}
+
+impl<S, W, E, C, R, D, A> HarnessCancellationDeliveryTarget
+    for GovernedTaskActivationRunner<S, W, E, C, R, D, A>
+where
+    S: TaskActivationSource + Send,
+    W: SingleHarnessWorkflowResolver + Send,
+    E: HarnessEvidenceResolver + Send,
+    C: AuthorityClock + Send,
+    R: DispatchMaterialResolver + Send,
+    D: NativeHarnessDriver + Send,
+    A: AdapterClock + Send,
+{
+    fn owns_task_cancellation<'a>(
+        &'a self,
+        handoff: &'a TaskCancellationHandoff,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, HarnessCancellationDeliveryError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let runtime = self.runtime.lock().await;
+            Ok(cancellation_attempt(
+                &runtime.control,
+                handoff,
+                self.capability_profile_filter.as_ref(),
+            )?
+            .is_some())
+        })
+    }
+
+    fn deliver_task_cancellation<'a>(
+        &'a self,
+        handoff: &'a TaskCancellationHandoff,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<CancelExecutionResult, HarnessCancellationDeliveryError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let mut runtime = self.runtime.lock().await;
+            let attempt = cancellation_attempt(
+                &runtime.control,
+                handoff,
+                self.capability_profile_filter.as_ref(),
+            )?
+            .ok_or(HarnessCancellationDeliveryError::LiveBinding)?;
+            if attempt.status != AttemptStatus::CancellationPending as i32 {
+                let snapshot = collaboration_snapshot(
+                    &runtime.control,
+                    handoff
+                        .task
+                        .current_run_id
+                        .as_deref()
+                        .ok_or(HarnessCancellationDeliveryError::LiveBinding)?,
+                )?;
+                runtime
+                    .reference
+                    .bind_cancellation(handoff.clone(), &snapshot, &attempt)
+                    .map_err(|_| HarnessCancellationDeliveryError::LiveBinding)?;
+                let mut command = CollaborationCommand {
+                    command: Some(collaboration_command::Command::RequestAttemptCancellation(
+                        RequestAttemptCancellationCommand {
+                            base: Some(cancellation_attempt_base(&snapshot, &attempt, handoff)?),
+                            task_cancellation_request_id: handoff.cancellation_request_id.clone(),
+                        },
+                    )),
+                };
+                if seal_request_digest(&mut command).is_none() {
+                    runtime
+                        .reference
+                        .clear_cancellation()
+                        .map_err(|_| HarnessCancellationDeliveryError::LiveBinding)?;
+                    return Err(HarnessCancellationDeliveryError::LiveBinding);
+                }
+                // The cancellation proof is one-shot. Clear it even when the
+                // Collaboration write rejects or fails, so a later handoff
+                // cannot inherit this Task/Attempt authorization.
+                let result = runtime.control.execute(&command, &cancellation_principal());
+                runtime
+                    .reference
+                    .clear_cancellation()
+                    .map_err(|_| HarnessCancellationDeliveryError::LiveBinding)?;
+                require_cancellation_commit(result?)?;
+            }
+
+            // Re-read after the Collaboration commit/replay. The dispatch id
+            // and state must still be the same live Attempt before the single
+            // resident Adapter is allowed to write the native interrupt.
+            let attempt = cancellation_attempt(
+                &runtime.control,
+                handoff,
+                self.capability_profile_filter.as_ref(),
+            )?
+            .ok_or(HarnessCancellationDeliveryError::LiveBinding)?;
+            if attempt.status != AttemptStatus::CancellationPending as i32 {
+                return Err(HarnessCancellationDeliveryError::LiveBinding);
+            }
+            runtime
+                .adapter
+                .cancel_dispatch(
+                    &handoff.cancellation_request_id,
+                    attempt
+                        .dispatch_id
+                        .as_deref()
+                        .ok_or(HarnessCancellationDeliveryError::LiveBinding)?,
+                    cancellation_deadline(handoff)?,
+                )
+                .await
+                .map_err(Into::into)
+        })
+    }
+}
+
+fn cancellation_attempt<G, C>(
+    control: &CollaborationControl<G, C>,
+    handoff: &TaskCancellationHandoff,
+    capability_profile_filter: Option<&CapabilityProfileFilter>,
+) -> Result<
+    Option<egopulse_domain_contracts::v01::egopulse::collaboration::v1::AttemptSnapshot>,
+    HarnessCancellationDeliveryError,
+>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+{
+    // Cancellation may be delivered only by a runner whose reviewed profile
+    // exactly owns this Attempt. A missing profile is insufficient evidence to
+    // select a live native adapter.
+    let capability_profile_filter =
+        capability_profile_filter.ok_or(HarnessCancellationDeliveryError::LiveBinding)?;
+    let Some(run_id) = handoff.task.current_run_id.as_deref() else {
+        return Ok(None);
+    };
+    let snapshot = match control.get_collaboration(run_id)?.outcome {
+        Some(get_collaboration_response::Outcome::Snapshot(snapshot)) => snapshot,
+        _ => return Ok(None),
+    };
+    let Some(run) = snapshot.run.as_ref() else {
+        return Err(HarnessCancellationDeliveryError::LiveBinding);
+    };
+    if handoff.cancellation_request_id.trim().is_empty()
+        || handoff.task.task_id.trim().is_empty()
+        || handoff.task.status
+            != egopulse_domain_contracts::v01::egopulse::task::v1::TaskStatus::CancellationPending
+                as i32
+        || run.run_id != run_id
+        || run.task_id != handoff.task.task_id
+        || run.work_revision != handoff.task.work_revision
+    {
+        return Err(HarnessCancellationDeliveryError::LiveBinding);
+    }
+    let matches = snapshot
+        .attempts
+        .iter()
+        .filter(|attempt| {
+            attempt_matches_capability_profile(attempt, capability_profile_filter)
+                && has_cancellable_dispatch_id(attempt)
+                && matches!(
+                    AttemptStatus::try_from(attempt.status),
+                    Ok(AttemptStatus::DispatchPending
+                        | AttemptStatus::Dispatched
+                        | AttemptStatus::Acknowledged
+                        | AttemptStatus::Running
+                        | AttemptStatus::CancellationPending)
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [attempt] => Ok(Some(attempt.clone())),
+        [] => Ok(None),
+        _ => Err(HarnessCancellationDeliveryError::LiveBinding),
+    }
+}
+
+fn attempt_matches_capability_profile(
+    attempt: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::AttemptSnapshot,
+    capability_profile_filter: &CapabilityProfileFilter,
+) -> bool {
+    attempt
+        .capability_profile_ref
+        .as_ref()
+        .is_some_and(|reference| match capability_profile_filter {
+            CapabilityProfileFilter::Exact(expected) => reference == expected,
+        })
+}
+
+fn has_cancellable_dispatch_id(
+    attempt: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::AttemptSnapshot,
+) -> bool {
+    attempt
+        .dispatch_id
+        .as_deref()
+        .is_some_and(|dispatch_id| !dispatch_id.trim().is_empty())
+}
+
+fn cancellation_attempt_base(
+    snapshot: &CollaborationSnapshot,
+    attempt: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::AttemptSnapshot,
+    handoff: &TaskCancellationHandoff,
+) -> Result<AttemptCommandBase, HarnessCancellationDeliveryError> {
+    let run = snapshot
+        .run
+        .as_ref()
+        .ok_or(HarnessCancellationDeliveryError::LiveBinding)?;
+    let step = snapshot
+        .steps
+        .iter()
+        .find(|step| step.step_id == attempt.step_id)
+        .ok_or(HarnessCancellationDeliveryError::LiveBinding)?;
+    Ok(AttemptCommandBase {
+        meta: Some(CommandMetadata {
+            command_id: format!(
+                "task-cancellation-delivery:{}",
+                handoff.cancellation_request_id
+            ),
+            idempotency_key: handoff.cancellation_request_id.clone(),
+            idempotency_scope: attempt.attempt_id.clone(),
+            request_digest_sha256: String::new(),
+            issued_at: Some(handoff.requested_at),
+            correlation_id: handoff.task.task_id.clone(),
+            causation_id: Some(handoff.cancellation_request_id.clone()),
+        }),
+        run_id: run.run_id.clone(),
+        expected_run_revision: run.revision,
+        step_id: step.step_id.clone(),
+        expected_step_revision: step.revision,
+        attempt_id: attempt.attempt_id.clone(),
+        expected_attempt_revision: attempt.revision,
+    })
+}
+
+fn cancellation_deadline(
+    handoff: &TaskCancellationHandoff,
+) -> Result<prost_types::Timestamp, HarnessCancellationDeliveryError> {
+    if handoff.requested_at.nanos < 0 || handoff.requested_at.nanos >= 1_000_000_000 {
+        return Err(HarnessCancellationDeliveryError::Deadline);
+    }
+    Ok(prost_types::Timestamp {
+        seconds: handoff
+            .requested_at
+            .seconds
+            .checked_add(300)
+            .ok_or(HarnessCancellationDeliveryError::Deadline)?,
+        nanos: handoff.requested_at.nanos,
+    })
+}
+
+fn cancellation_principal() -> AuthenticatedCollaborationPrincipal {
+    AuthenticatedCollaborationPrincipal {
+        kind: CollaborationPrincipalKind::CollaborationControl,
+        principal_id: "collaboration-control:task-cancellation".to_owned(),
+        authenticated: true,
+    }
+}
+
+fn require_cancellation_commit(
+    result: egopulse_domain_contracts::v01::egopulse::collaboration::v1::CollaborationCommandResult,
+) -> Result<(), HarnessCancellationDeliveryError> {
+    if result.committed_event.is_some() || result.replayed {
+        return Ok(());
+    }
+    Err(HarnessCancellationDeliveryError::LiveBinding)
 }
 
 impl<S, W, E, C, R, D, A> HarnessDispatchRunner
@@ -428,13 +926,16 @@ where
                 artifact_return_source,
                 artifact_return_principal,
                 step_return_principal,
+                task_dispatch_material_preparer,
             } = &mut *runtime;
+            let mut recovery_findings = Vec::new();
             let return_settlements = consume_artifact_returns(
                 control,
                 adapter,
                 artifact_return_source.as_ref(),
                 artifact_return_principal.as_ref(),
                 step_return_principal.as_ref(),
+                &mut recovery_findings,
             )?;
             let activations = source
                 .pending_task_activations()
@@ -442,8 +943,14 @@ where
             let mut report = HarnessDispatchCycleReport {
                 activations_seen: activations.len() as u64,
                 return_settlements,
+                task_recovery_findings: recovery_findings,
                 ..HarnessDispatchCycleReport::default()
             };
+            record_settled_cancellation_findings(
+                control,
+                self.capability_profile_filter.as_ref(),
+                &mut report,
+            )?;
             recover_held_dispatches(
                 control,
                 adapter,
@@ -475,6 +982,7 @@ where
                 &mut report,
             )
             .await?;
+            let mut blocked_dispatch_ids = BTreeSet::new();
             for activation in activations {
                 let config = match resolver
                     .resolve(&activation)
@@ -487,9 +995,24 @@ where
                         route_binding,
                     } => (*config, Some(*route_binding)),
                 };
-                let (config, route_binding) = config;
+                let (mut config, route_binding) = config;
                 if !workflow_matches_profile(&config, self.capability_profile_filter.as_ref()) {
                     continue;
+                }
+                if let Some(preparer) = task_dispatch_material_preparer.as_ref() {
+                    let dispatch_id = config.dispatch_id.clone();
+                    match preparer.prepare(&activation, config).await {
+                        Ok(prepared) => config = prepared,
+                        Err(rejection) => {
+                            blocked_dispatch_ids.insert(dispatch_id.clone());
+                            report.activation_blockages.push(TaskActivationBlockage {
+                                task_id: activation.task.task_id.clone(),
+                                dispatch_id,
+                                safe_detail_code: rejection.safe_detail_code,
+                            });
+                            continue;
+                        }
+                    }
                 }
                 reference
                     .bind(activation.task.clone(), &config, *lease_ttl_seconds)
@@ -498,7 +1021,7 @@ where
                             "activation reference binding failed".to_owned(),
                         )
                     })?;
-                super::single_harness_workflow::start_single_harness_workflow_with_route_binding(
+                let result = super::single_harness_workflow::start_single_harness_workflow_with_route_binding(
                     control,
                     &activation.task,
                     &config,
@@ -507,6 +1030,19 @@ where
                 .map_err(|error| {
                     HarnessDispatchCycleError::TaskActivationWorkflow(error.to_string())
                 })?;
+                if let Some(preparer) = task_dispatch_material_preparer.as_ref()
+                    && let Err(rejection) = preparer
+                        .seal_before_activation_ack(&activation, &config, &result)
+                        .await
+                {
+                    blocked_dispatch_ids.insert(result.dispatch_id.clone());
+                    report.activation_blockages.push(TaskActivationBlockage {
+                        task_id: activation.task.task_id.clone(),
+                        dispatch_id: result.dispatch_id,
+                        safe_detail_code: rejection.safe_detail_code,
+                    });
+                    continue;
+                }
                 if !source
                     .acknowledge_task_activation(
                         &activation.message_id,
@@ -524,6 +1060,7 @@ where
                 adapter,
                 &self.principal,
                 self.capability_profile_filter.as_ref(),
+                &blocked_dispatch_ids,
             )
             .await?;
             merge_report(&mut report, dispatched);
@@ -539,6 +1076,7 @@ fn consume_artifact_returns<G, C, R, D, A>(
     source: Option<&std::sync::Arc<dyn ArtifactReturnSource>>,
     principal: Option<&AuthenticatedCollaborationPrincipal>,
     step_return_principal: Option<&AuthenticatedCollaborationPrincipal>,
+    recovery_findings: &mut Vec<TaskRecoveryFinding>,
 ) -> Result<u64, HarnessDispatchCycleError>
 where
     G: CollaborationReferenceGuard + HarnessEvidenceResolver,
@@ -601,7 +1139,17 @@ where
         let technical_return_already_recorded = attempt.status == AttemptStatus::Returned as i32
             && step.status == StepStatus::ReturnPending as i32
             && run.status == RunStatus::ReturnPending as i32;
+        if technical_return_already_recorded
+            && (step.artifact_set_id.as_deref() != Some(pending.receipt.artifact_set_id.as_str())
+                || step.return_handoff_id.as_deref()
+                    != Some(pending.receipt.return_handoff_id.as_str()))
+        {
+            return Err(HarnessDispatchCycleError::ReturnCollector(
+                "recorded technical return does not match the Artifact receipt".to_owned(),
+            ));
+        }
         if !technical_return_already_recorded {
+            let cancellation_pending = attempt.status == AttemptStatus::CancellationPending as i32;
             let mut command = CollaborationCommand {
                 command: Some(collaboration_command::Command::RecordAttemptReturn(
                     RecordAttemptReturnCommand {
@@ -634,12 +1182,36 @@ where
                     },
                 )),
             };
+            if cancellation_pending {
+                let Some(collaboration_command::Command::RecordAttemptReturn(value)) =
+                    command.command.take()
+                else {
+                    unreachable!("constructed Artifact return command")
+                };
+                command.command = Some(
+                    collaboration_command::Command::RecordAttemptCancellationOutcome(
+                        RecordAttemptCancellationOutcomeCommand {
+                            base: value.base,
+                            disposition: AttemptCancellationDisposition::ReturnFound as i32,
+                            cancellation_receipt_id: pending.receipt.receipt_id.clone(),
+                        },
+                    ),
+                );
+            }
             seal_request_digest(&mut command).ok_or_else(|| {
                 HarnessDispatchCycleError::ReturnCollector(
                     "Artifact return command could not be sealed".to_owned(),
                 )
             })?;
-            let result = control.execute(&command, principal)?;
+            let recovery = recovery_principal();
+            let result = control.execute(
+                &command,
+                if cancellation_pending {
+                    &recovery
+                } else {
+                    principal
+                },
+            )?;
             if result.committed_event.is_none() && !result.replayed {
                 let detail = match result.outcome.as_ref() {
                     Some(collaboration_command_result::Outcome::Error(error)) => {
@@ -652,6 +1224,16 @@ where
                 )));
             }
         }
+
+        // The receipt remains in the Artifact outbox until step settlement, so
+        // this fact can be derived again after a process restart. Only the Task
+        // owner may apply it, and only to CancellationPending on this exact run.
+        recovery_findings.push(TaskRecoveryFinding {
+            kind: TaskRecoveryKind::CancellationReturnFound,
+            task_id: run.task_id.clone(),
+            run_id: run.run_id.clone(),
+            evidence_ref: pending.receipt.receipt_id.clone(),
+        });
 
         let Some(step_return_principal) = step_return_principal else {
             if !source
@@ -769,7 +1351,7 @@ where
     D: NativeHarnessDriver,
     A: AdapterClock,
 {
-    dispatch_pending_for_profile(control, adapter, principal, None).await
+    dispatch_pending_for_profile(control, adapter, principal, None, &BTreeSet::new()).await
 }
 
 async fn recover_held_dispatches<G, C, R, D, A>(
@@ -831,6 +1413,26 @@ where
             ));
         }
         if barrier != DurableReplayBarrier::Clear {
+            record_task_recovery_finding_if_still_held(control, &candidate.envelope, report)?;
+            continue;
+        }
+        if current.state == HeldDispatchRecoveryState::CancellationPending
+            && adapter.has_resident_dispatch(&candidate.envelope.dispatch_id)
+        {
+            // Only the Adapter which actually sent this dispatch still owns
+            // its live output stream. Cancellation stops further dispatches,
+            // not reads of the eventual native interruption or sealed return.
+            // A reopened Adapter stays drain-only until durable evidence exists.
+            adapter.verify_delivered_recovery_candidate(&candidate.envelope)?;
+            if adapter.pump_one(&candidate.envelope).await?.is_some() {
+                drain_durable_normal_observations(
+                    control,
+                    adapter,
+                    &candidate.envelope,
+                    harness_principal,
+                    report,
+                )?;
+            }
             record_task_recovery_finding_if_still_held(control, &candidate.envelope, report)?;
             continue;
         }
@@ -907,6 +1509,22 @@ where
         }
 
         record_task_recovery_finding_if_still_held(control, &candidate.envelope, report)?;
+    }
+    Ok(())
+}
+
+fn record_settled_cancellation_findings<G, C>(
+    control: &CollaborationControl<G, C>,
+    profile_filter: Option<&CapabilityProfileFilter>,
+    report: &mut HarnessDispatchCycleReport,
+) -> Result<(), HarnessDispatchCycleError> {
+    for (finding, profile) in control.settled_cancellation_findings()? {
+        let matches_profile = profile_filter.is_none_or(|filter| match filter {
+            CapabilityProfileFilter::Exact(expected) => &profile == expected,
+        });
+        if matches_profile && !report.task_recovery_findings.contains(&finding) {
+            report.task_recovery_findings.push(finding);
+        }
     }
     Ok(())
 }
@@ -1026,6 +1644,7 @@ async fn dispatch_pending_for_profile<G, C, R, D, A>(
     adapter: &mut GovernedHarnessAdapter<R, D, A>,
     principal: &AuthenticatedCollaborationPrincipal,
     capability_profile_filter: Option<&CapabilityProfileFilter>,
+    blocked_dispatch_ids: &BTreeSet<String>,
 ) -> Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>
 where
     G: CollaborationReferenceGuard + HarnessEvidenceResolver,
@@ -1038,6 +1657,7 @@ where
         .pending_dispatches(principal)?
         .into_iter()
         .filter(|dispatch| envelope_matches_profile(&dispatch.envelope, capability_profile_filter))
+        .filter(|dispatch| !blocked_dispatch_ids.contains(&dispatch.envelope.dispatch_id))
         .collect::<Vec<_>>();
     let mut report = HarnessDispatchCycleReport {
         dispatches_seen: pending.len() as u64,
@@ -1443,6 +2063,17 @@ where
         let terminal = observation.criticality == ObservationCriticality::Terminal as i32;
         report.observations_seen += 1;
         let ingested = control.ingest_harness_observation(&observation, principal)?;
+        if legacy_execution_start_requires_recovery(&observation, &ingested) {
+            let settlement =
+                settle_legacy_execution_start(control, adapter, envelope, &observation, report)?;
+            if settlement == ObservationSettlement::PendingBlocked {
+                pending_blocked = true;
+            }
+            if pending_blocked || report.held_dispatch_ids.contains(&envelope.dispatch_id) {
+                break;
+            }
+            continue;
+        }
         let stop_after_settlement = matches!(
             &ingested.disposition,
             HarnessFactIngestionDisposition::DeferredToArtifactAuthority
@@ -1467,6 +2098,140 @@ where
     }
 }
 
+fn legacy_execution_start_requires_recovery(
+    observation: &HarnessObservation,
+    result: &HarnessFactIngestionResult,
+) -> bool {
+    let is_execution_started = matches!(
+        observation.payload.as_ref(),
+        Some(harness_observation::Payload::Lifecycle(lifecycle))
+            if lifecycle.kind == LifecycleKind::ExecutionStarted as i32
+    );
+    let is_ack_required = matches!(
+        result
+            .authority_result
+            .as_ref()
+            .and_then(|result| result.outcome.as_ref()),
+        Some(collaboration_command_result::Outcome::Error(error))
+            if CollaborationErrorCode::try_from(error.code)
+                == Ok(CollaborationErrorCode::StateConflict)
+                && error.safe_detail_code == "HARNESS_ACK_REQUIRED"
+    );
+    is_execution_started && is_ack_required
+}
+
+fn settle_legacy_execution_start<G, C, R, D, A>(
+    control: &mut CollaborationControl<G, C>,
+    adapter: &mut GovernedHarnessAdapter<R, D, A>,
+    envelope: &DispatchEnvelope,
+    observation: &HarnessObservation,
+    report: &mut HarnessDispatchCycleReport,
+) -> Result<ObservationSettlement, HarnessDispatchCycleError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+    R: DispatchMaterialResolver,
+    D: NativeHarnessDriver,
+    A: AdapterClock,
+{
+    let snapshot = collaboration_snapshot(control, &envelope.run_id)?;
+    let current_attempt = snapshot
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_id == envelope.attempt_id);
+    let Some(current_attempt) = current_attempt else {
+        adapter.quarantine_observation(
+            &observation.observation_id,
+            "LEGACY_EXECUTION_START_OWNER_MISMATCH",
+        )?;
+        report.observations_quarantined += 1;
+        return Ok(ObservationSettlement::Settled);
+    };
+    let current_fence = current_attempt
+        .lease
+        .as_ref()
+        .map(|lease| lease.fencing_token);
+    if AttemptStatus::try_from(current_attempt.status) != Ok(AttemptStatus::Running)
+        || current_attempt.dispatch_id.as_deref() != Some(envelope.dispatch_id.as_str())
+        || current_fence != Some(envelope.fencing_token)
+        || observation.attempt_id != current_attempt.attempt_id
+        || observation.dispatch_id != envelope.dispatch_id
+        || observation.fencing_token != envelope.fencing_token
+        || observation.observation_sequence <= current_attempt.last_harness_sequence
+    {
+        adapter.quarantine_observation(
+            &observation.observation_id,
+            "LEGACY_EXECUTION_START_OWNER_MISMATCH",
+        )?;
+        report.observations_quarantined += 1;
+        return Ok(ObservationSettlement::Settled);
+    }
+
+    let recovery = adapter.classify_legacy_execution_start(
+        envelope,
+        &observation.observation_id,
+        current_attempt.last_harness_sequence,
+    )?;
+    match recovery {
+        LegacyExecutionStartRecovery::Unsupported => {
+            report.observations_retained += 1;
+            Ok(ObservationSettlement::PendingBlocked)
+        }
+        LegacyExecutionStartRecovery::OwnerMismatch => {
+            adapter.quarantine_observation(
+                &observation.observation_id,
+                "LEGACY_EXECUTION_START_OWNER_MISMATCH",
+            )?;
+            report.observations_quarantined += 1;
+            Ok(ObservationSettlement::Settled)
+        }
+        LegacyExecutionStartRecovery::Unverified { reason_code } => {
+            let held = control.mark_legacy_execution_start_outcome_unknown(observation)?;
+            require_recovery_commit(held.clone(), "legacy execution start hold")?;
+            record_task_recovery_finding(
+                report,
+                observation,
+                &HarnessFactIngestionResult {
+                    disposition: HarnessFactIngestionDisposition::QuarantineRequired {
+                        reason_code: reason_code.to_owned(),
+                    },
+                    authority_result: Some(held),
+                },
+            );
+            adapter.quarantine_observation(&observation.observation_id, reason_code)?;
+            report.observations_quarantined += 1;
+            if !report.held_dispatch_ids.contains(&envelope.dispatch_id) {
+                report.held_dispatch_ids.push(envelope.dispatch_id.clone());
+            }
+            Ok(ObservationSettlement::Settled)
+        }
+        LegacyExecutionStartRecovery::ExactDuplicate(evidence) => {
+            if !evidence.durable_terminal_handoff {
+                let held = control.mark_legacy_execution_start_outcome_unknown(observation)?;
+                require_recovery_commit(held.clone(), "legacy execution start hold")?;
+                record_task_recovery_finding(
+                    report,
+                    observation,
+                    &HarnessFactIngestionResult {
+                        disposition: HarnessFactIngestionDisposition::Consumed,
+                        authority_result: Some(held),
+                    },
+                );
+                if !report.held_dispatch_ids.contains(&envelope.dispatch_id) {
+                    report.held_dispatch_ids.push(envelope.dispatch_id.clone());
+                }
+            }
+            if !adapter.consume_legacy_execution_start_duplicate(&evidence)? {
+                return Err(HarnessDispatchCycleError::Recovery(
+                    "legacy execution start duplicate acknowledgement was not persisted".to_owned(),
+                ));
+            }
+            report.observations_consumed += 1;
+            Ok(ObservationSettlement::Settled)
+        }
+    }
+}
+
 fn merge_report(target: &mut HarnessDispatchCycleReport, source: HarnessDispatchCycleReport) {
     target.dispatches_seen += source.dispatches_seen;
     target.dispatches_delivered += source.dispatches_delivered;
@@ -1485,6 +2250,11 @@ fn merge_report(target: &mut HarnessDispatchCycleReport, source: HarnessDispatch
     target.activations_seen += source.activations_seen;
     target.activations_started += source.activations_started;
     target.activations_acknowledged += source.activations_acknowledged;
+    for blockage in source.activation_blockages {
+        if !target.activation_blockages.contains(&blockage) {
+            target.activation_blockages.push(blockage);
+        }
+    }
     for dispatch_id in source.terminal_dispatch_ids {
         if !target
             .terminal_dispatch_ids
@@ -1790,6 +2560,47 @@ mod tests {
         assert!(matches!(
             CompositeHarnessDispatchRunner::new(Vec::new()),
             Err("at least one Harness dispatch runner is required")
+        ));
+    }
+
+    #[test]
+    fn cancellation_requires_a_present_nonblank_dispatch_id() {
+        let mut attempt =
+            egopulse_domain_contracts::v01::egopulse::collaboration::v1::AttemptSnapshot::default();
+        assert!(!has_cancellable_dispatch_id(&attempt));
+
+        attempt.dispatch_id = Some("   ".to_owned());
+        assert!(!has_cancellable_dispatch_id(&attempt));
+
+        attempt.dispatch_id = Some("dispatch-live-001".to_owned());
+        assert!(has_cancellable_dispatch_id(&attempt));
+    }
+
+    #[test]
+    fn cancellation_requires_the_live_runner_capability_profile() {
+        let profile_a = ContractReference {
+            contract_id: "profile:a".to_owned(),
+            version: "v1".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let profile_b = ContractReference {
+            contract_id: "profile:b".to_owned(),
+            version: "v1".to_owned(),
+            sha256: "b".repeat(64),
+        };
+        let attempt =
+            egopulse_domain_contracts::v01::egopulse::collaboration::v1::AttemptSnapshot {
+                capability_profile_ref: Some(profile_a.clone()),
+                ..Default::default()
+            };
+
+        assert!(attempt_matches_capability_profile(
+            &attempt,
+            &CapabilityProfileFilter::Exact(profile_a)
+        ));
+        assert!(!attempt_matches_capability_profile(
+            &attempt,
+            &CapabilityProfileFilter::Exact(profile_b)
         ));
     }
 }

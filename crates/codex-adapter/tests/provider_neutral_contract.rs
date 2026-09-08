@@ -372,34 +372,15 @@ async fn live_codex_app_server_emits_contract_valid_ack_running_and_terminal_obs
                         | LifecycleKind::ExecutionFailed)
                 );
             }
-            Some(harness_observation::Payload::ApprovalRequest(value)) => {
+            Some(harness_observation::Payload::ApprovalRequest(_)) => {
                 eprintln!("live-codex-observation=approval-request");
-                let decision = adapter
-                    .decide_approval(&ApprovalDecisionEnvelope {
-                        attempt_id: dispatch.attempt_id.clone(),
-                        dispatch_id: dispatch.dispatch_id.clone(),
-                        fencing_token: dispatch.fencing_token,
-                        approval_request_id: value.approval_request_id,
-                        action_digest_sha256: value.action_digest_sha256,
-                        decision: ApprovalDecision::Deny as i32,
-                        authority_decision_ref: "live-test-policy:deny".to_owned(),
-                        native_routing_ref: value.native_routing_ref,
-                        ..ApprovalDecisionEnvelope::default()
-                    })
-                    .await
-                    .expect("deny unexpected live approval request");
-                assert!(matches!(
-                    decision.outcome,
-                    Some(approval_decision_result::Outcome::Receipt(ref receipt))
-                        if receipt.disposition == DeliveryDisposition::Delivered as i32
-                ));
                 if !cancel_sent {
                     let cancellation = adapter
                         .cancel(&CancelExecutionEnvelope {
                             attempt_id: dispatch.attempt_id.clone(),
                             dispatch_id: dispatch.dispatch_id.clone(),
                             fencing_token: dispatch.fencing_token,
-                            cancellation_request_id: "live-cancel-after-denial".to_owned(),
+                            cancellation_request_id: "live-cancel-with-approval-pending".to_owned(),
                             native_session_ref: native_session_ref
                                 .clone()
                                 .expect("ACK native session ref before approval"),
@@ -413,7 +394,7 @@ async fn live_codex_app_server_emits_contract_valid_ack_running_and_terminal_obs
                             ..CancelExecutionEnvelope::default()
                         })
                         .await
-                        .expect("deliver live cancellation after approval denial");
+                        .expect("deliver live cancellation while approval remains pending");
                     assert!(matches!(
                         cancellation.outcome,
                         Some(cancel_execution_result::Outcome::Receipt(ref receipt))

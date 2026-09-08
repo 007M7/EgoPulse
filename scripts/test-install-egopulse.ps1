@@ -171,6 +171,12 @@ try {
 
     $configPath = Join-Path $dataRoot 'agentos-config.json'
     Assert-Condition (Test-Path -LiteralPath $configPath -PathType Leaf) 'generated configuration is missing from DataRoot'
+    $installedConfig = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Condition (@($installedConfig.founder.non_overridable_gate_ids).Count -eq 0) 'new installation retained development-stage gates as permanent task blockers'
+    Assert-Condition (@($installedConfig.founder.non_overridable_criterion_ids).Count -eq 1 -and $installedConfig.founder.non_overridable_criterion_ids[0] -eq 'scope') 'new installation omitted the evidence-based scope gate'
+    Assert-Condition ($installedConfig.task_guard.allowed_target_scope_refs -contains 'scope:founder') 'installed task scope is not available to the Founder'
+    Assert-Condition ($installedConfig.artifact.allowed_workspace_refs -contains $installedConfig.codex.workflow.workspace_ref) 'Artifact and Harness workspace bindings differ'
+    Assert-Condition (Test-Path -LiteralPath (Join-Path $installedConfig.codex.workspace_root $installedConfig.codex.workflow.workspace_ref) -PathType Container) 'installed Harness workspace does not resolve to an existing directory'
     $generatedConfigs = @(Get-ChildItem -LiteralPath $sandbox -Recurse -File -Filter 'agentos-config.json')
     Assert-Condition ($generatedConfigs.Count -eq 1) 'generated configuration exists outside the unique DataRoot'
     Assert-Condition ($generatedConfigs[0].FullName -eq (Get-Item -LiteralPath $configPath).FullName) 'generated configuration path is not the unique DataRoot'

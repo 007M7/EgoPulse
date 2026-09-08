@@ -25,6 +25,8 @@ $requiredFiles = @(
     'setup-memory-worker.ps1',
     'install-egopulse.ps1',
     'config/agentos-config.example.json',
+    'config/README.md',
+    'docs/engineering/repository-work-loop.md',
     'workers/memory-rag/pyproject.toml',
     'workers/memory-rag/uv.lock',
     'workers/contract-bindings/pyproject.toml',
@@ -71,12 +73,38 @@ try {
 
     Invoke-EgoPulseRestoredEnvironment {
         foreach ($executable in @('egopulse.exe', 'egopulse-tui.exe', 'agentosd.exe')) {
-            & (Join-Path $executionRoot "bin/$executable") --help *> $null
+            $helpOutput = @(& (Join-Path $executionRoot "bin/$executable") --help 2>&1)
             if ($LASTEXITCODE -ne 0) {
                 throw "$executable --help failed with exit code $LASTEXITCODE"
             }
+            if ($executable -eq 'agentosd.exe' -and (($helpOutput -join [Environment]::NewLine) -notmatch [regex]::Escape('--prepare-repository-config'))) {
+                throw 'agentosd.exe does not expose the packaged repository configuration candidate command'
+            }
             Write-Output "${executable}_help=passed"
         }
+
+        $installerPath = Join-Path $executionRoot 'install-egopulse.ps1'
+        $installerTokens = $null
+        $installerParseErrors = $null
+        $installerAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $installerPath,
+            [ref]$installerTokens,
+            [ref]$installerParseErrors
+        )
+        if ($installerParseErrors.Count -gt 0) {
+            throw "Packaged installer has PowerShell parse errors: $($installerParseErrors[0].Message)"
+        }
+        $installerParameters = @($installerAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+        foreach ($parameterName in @('RepositoryRoot', 'AcceptanceContractPath', 'GitExecutable', 'ReviewModel')) {
+            if ($installerParameters -notcontains $parameterName) {
+                throw "Packaged installer is missing repository setup parameter: $parameterName"
+            }
+        }
+        $installerSource = Get-Content -LiteralPath $installerPath -Raw -Encoding utf8
+        if ($installerSource -notmatch [regex]::Escape('--prepare-repository-config')) {
+            throw 'Packaged installer does not prepare repository configuration candidates'
+        }
+        Write-Output 'repository_setup_package_surface=passed'
 
         & (Join-Path $executionRoot 'bin/egopulse-tui.exe') --foundation-check *> $null
         if ($LASTEXITCODE -ne 0) {

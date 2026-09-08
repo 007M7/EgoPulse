@@ -1,6 +1,8 @@
 use crate::{
     AdapterEdge, AdapterEdgeError, AdapterObservationEvidence, ContentDisclosureError,
     ContentDisclosureMode, DispatchPreparation, DurableWritePreparation,
+    FinalArtifactRelationPolicy, LegacyExecutionStartEvidence,
+    LegacyExecutionStartEvidenceRejection, LegacyExecutionStartEvidenceResolution,
     NormalObservationRecoveryView, PendingAdapterApprovalProjection, SafeContentCommit,
     TrustedContentLineage, bind_content_signal, canonical_safe_record_digest, project_safe_content,
     project_structured_only_content,
@@ -21,7 +23,7 @@ use prost::Message;
 use prost_types::Timestamp;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{future::Future, path::PathBuf, pin::Pin};
+use std::{collections::HashSet, future::Future, path::PathBuf, pin::Pin};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -58,6 +60,17 @@ pub trait DispatchMaterialResolver {
         &self,
         envelope: &DispatchEnvelope,
     ) -> Result<ResolvedDispatchMaterial, HarnessError>;
+}
+
+/// Optional, read-only material check for a dispatch that Adapter Edge has
+/// proven has never crossed the native delivery boundary. Replay and
+/// DeliveryUnknown bypass this hook by construction.
+pub trait ReadyDispatchMaterialGuard: Send + Sync {
+    fn validate_ready_dispatch<'a>(
+        &'a self,
+        envelope: &'a DispatchEnvelope,
+        material: &'a ResolvedDispatchMaterial,
+    ) -> Pin<Box<dyn Future<Output = Result<(), HarnessError>> + Send + 'a>>;
 }
 
 /// Canonical classification of the dispatch input reference at the Adapter
@@ -337,6 +350,31 @@ pub struct ReconciliationContext {
     pub material: ResolvedDispatchMaterial,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyExecutionStartRawContext {
+    pub prior_raw_event: Vec<u8>,
+    pub pending_raw_event: Vec<u8>,
+    pub native_session_ref: String,
+    pub native_execution_ref: String,
+    pub terminal_raw_event: Option<Vec<u8>>,
+    pub terminal_native_completion_ref: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyExecutionStartRawClassification {
+    ExactDuplicate { durable_terminal_handoff: bool },
+    Conflict,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LegacyExecutionStartRecovery {
+    ExactDuplicate(Box<LegacyExecutionStartEvidence>),
+    OwnerMismatch,
+    Unverified { reason_code: &'static str },
+    Unsupported,
+}
+
 pub type NativeHarnessFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait NativeHarnessDriver {
@@ -380,6 +418,13 @@ pub trait NativeHarnessDriver {
         &'a mut self,
         context: &'a ReconciliationContext,
     ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>>;
+
+    fn classify_legacy_execution_start(
+        &self,
+        _context: &LegacyExecutionStartRawContext,
+    ) -> LegacyExecutionStartRawClassification {
+        LegacyExecutionStartRawClassification::Unsupported
+    }
 }
 
 // A daemon that composes more than one provider needs to hold heterogeneous
@@ -436,6 +481,13 @@ impl NativeHarnessDriver for Box<dyn NativeHarnessDriver + Send> {
     ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
         (**self).reconcile(context)
     }
+
+    fn classify_legacy_execution_start(
+        &self,
+        context: &LegacyExecutionStartRawContext,
+    ) -> LegacyExecutionStartRawClassification {
+        (**self).classify_legacy_execution_start(context)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
@@ -491,6 +543,12 @@ pub struct GovernedHarnessAdapter<R, D, C> {
     context_recovery_gate: Box<dyn DispatchContextRecoveryGate>,
     expected_route_binding: Option<ExpectedDispatchRouteBinding>,
     disclosure_credentials: ManagedDisclosureCredentials,
+    final_artifact_relation_policy: FinalArtifactRelationPolicy,
+    ready_dispatch_material_guard: Option<std::sync::Arc<dyn ReadyDispatchMaterialGuard>>,
+    // This is intentionally process-local. A persisted Delivered receipt only
+    // proves a prior native side effect; it cannot prove a restarted adapter
+    // still owns a live native session that may be polled for terminal events.
+    resident_dispatches: HashSet<String>,
 }
 
 pub enum ManagedDisclosureCredentials {
@@ -504,6 +562,9 @@ pub enum ManagedDisclosureCredentials {
 pub enum HarnessContentDrain {
     Idle,
     Committed(crate::SafeContentCommit),
+    FinalArtifactRelationCommitted,
+    FinalArtifactRelationPending,
+    FinalArtifactRelationSkipped,
     Replayed,
     Quarantined { reason_code: &'static str },
 }
@@ -541,7 +602,34 @@ where
 
     pub fn drain_once(&mut self) -> Result<HarnessContentDrain, GovernedAdapterError> {
         let Some(pending) = self.edge.pending_content_candidates()?.into_iter().next() else {
-            return Ok(HarnessContentDrain::Idle);
+            let Some(intent) = self.edge.pending_final_artifact_relation_intent()? else {
+                return Ok(HarnessContentDrain::Idle);
+            };
+            return match self
+                .edge
+                .commit_final_artifact_relation(&intent, self.clock.now().seconds)?
+            {
+                crate::FinalArtifactRelationCommit::Committed(_)
+                | crate::FinalArtifactRelationCommit::Replay(_) => {
+                    Ok(HarnessContentDrain::FinalArtifactRelationCommitted)
+                }
+                crate::FinalArtifactRelationCommit::PendingContent => {
+                    Ok(HarnessContentDrain::FinalArtifactRelationPending)
+                }
+                crate::FinalArtifactRelationCommit::Ambiguous => {
+                    Ok(HarnessContentDrain::Quarantined {
+                        reason_code: "FINAL_ARTIFACT_RELATION_AMBIGUOUS",
+                    })
+                }
+                crate::FinalArtifactRelationCommit::RawMismatch => {
+                    Ok(HarnessContentDrain::Quarantined {
+                        reason_code: "FINAL_ARTIFACT_RELATION_RAW_MISMATCH",
+                    })
+                }
+                crate::FinalArtifactRelationCommit::Skipped(_) => {
+                    Ok(HarnessContentDrain::FinalArtifactRelationSkipped)
+                }
+            };
         };
         let now_seconds = self.clock.now().seconds;
         let dispatch_id = pending.observation.dispatch_id.as_str();
@@ -761,6 +849,10 @@ where
             context_recovery_gate: Box::new(RejectContextRecoveryGate),
             expected_route_binding: None,
             disclosure_credentials: ManagedDisclosureCredentials::ManagedUnavailable,
+            final_artifact_relation_policy:
+                FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
+            ready_dispatch_material_guard: None,
+            resident_dispatches: HashSet::new(),
         }
     }
 
@@ -799,6 +891,26 @@ where
         credentials: ManagedDisclosureCredentials,
     ) -> Self {
         self.disclosure_credentials = credentials;
+        self
+    }
+
+    /// Persists the capability-attested return/content relation contract with
+    /// every new dispatch. Existing dispatches must replay their stored policy.
+    #[must_use]
+    pub fn with_final_artifact_relation_policy(
+        mut self,
+        policy: FinalArtifactRelationPolicy,
+    ) -> Self {
+        self.final_artifact_relation_policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub fn with_ready_dispatch_material_guard(
+        mut self,
+        guard: std::sync::Arc<dyn ReadyDispatchMaterialGuard>,
+    ) -> Self {
+        self.ready_dispatch_material_guard = Some(guard);
         self
     }
 
@@ -867,7 +979,11 @@ where
             return Ok(dispatch_error(error));
         }
         let now = self.clock.now();
-        match self.edge.prepare_dispatch(envelope, now.seconds)? {
+        match self.edge.prepare_dispatch_with_relation_policy(
+            envelope,
+            self.final_artifact_relation_policy,
+            now.seconds,
+        )? {
             DispatchPreparation::Replay(receipt) => {
                 if let Err(error) = self.verify_existing_context_authorization(envelope) {
                     return Ok(dispatch_error(error));
@@ -942,6 +1058,14 @@ where
             Err(error) => return Ok(dispatch_error(error)),
         };
 
+        if let Some(guard) = self.ready_dispatch_material_guard.as_ref()
+            && let Err(error) = guard
+                .validate_ready_dispatch(envelope, material.material())
+                .await
+        {
+            return Ok(dispatch_error(error));
+        }
+
         self.edge
             .begin_delivery(&envelope.dispatch_id, now.seconds)?;
         let (receipt, raw_evidence) = match self
@@ -975,7 +1099,20 @@ where
         };
         self.edge
             .record_dispatch_receipt(&receipt, raw_evidence, now.seconds)?;
+        if receipt.disposition == DeliveryDisposition::Delivered as i32 {
+            self.resident_dispatches
+                .insert(envelope.dispatch_id.clone());
+        }
         Ok(dispatch_receipt(receipt))
+    }
+
+    /// Returns whether this Adapter instance itself sent and durably recorded
+    /// the current dispatch. Persisted receipt replay and restart recovery are
+    /// deliberately excluded because they cannot establish a live native
+    /// session for polling.
+    #[must_use]
+    pub fn has_resident_dispatch(&self, dispatch_id: &str) -> bool {
+        self.resident_dispatches.contains(dispatch_id)
     }
 
     pub async fn pump_one(
@@ -990,6 +1127,7 @@ where
             return Ok(None);
         };
         let received_at = self.clock.now();
+        let terminal = event.criticality == ObservationCriticality::Terminal;
         let completed = event.criticality == ObservationCriticality::Terminal
             && matches!(
                 &event.payload,
@@ -1036,6 +1174,9 @@ where
             terminal_output.as_ref(),
             received_at.seconds,
         )?;
+        if terminal {
+            self.resident_dispatches.remove(&envelope.dispatch_id);
+        }
         Ok(Some(match appended {
             crate::ObservationAppend::Committed(value)
             | crate::ObservationAppend::Replay(value) => value,
@@ -1286,7 +1427,13 @@ where
             .edge
             .dispatch_envelope(dispatch_id)?
             .ok_or(GovernedAdapterError::DispatchNotFound)?;
-        let delivery_receipt = self.edge.dispatch_receipt(dispatch_id)?;
+        let native_binding = self.edge.resolve_native_execution_binding(dispatch_id)?;
+        let mut delivery_receipt = self.edge.dispatch_receipt(dispatch_id)?;
+        if let (Some(binding), Some(receipt)) = (native_binding.as_ref(), delivery_receipt.as_mut())
+        {
+            receipt.native_session_ref = Some(binding.native_session_ref.clone());
+            receipt.native_execution_ref = Some(binding.native_execution_ref.clone());
+        }
         let now = self.clock.now();
         let reference = classify_dispatch_context_reference(&envelope.input_bundle_ref);
         let recovered_material = match reference {
@@ -1429,6 +1576,76 @@ where
         self.edge
             .normal_observation_recovery_view(dispatch_id, &self.capability_profile_id)
             .map_err(Into::into)
+    }
+
+    pub fn classify_legacy_execution_start(
+        &self,
+        envelope: &DispatchEnvelope,
+        pending_observation_id: &str,
+        prior_start_sequence: u64,
+    ) -> Result<LegacyExecutionStartRecovery, GovernedAdapterError> {
+        let evidence = self.edge.legacy_execution_start_recovery_evidence(
+            &envelope.dispatch_id,
+            &envelope.attempt_id,
+            envelope.fencing_token,
+            &self.capability_profile_id,
+            pending_observation_id,
+            prior_start_sequence,
+        )?;
+        let evidence = match evidence {
+            LegacyExecutionStartEvidenceResolution::Verified(evidence) => evidence,
+            LegacyExecutionStartEvidenceResolution::Rejected(
+                LegacyExecutionStartEvidenceRejection::OwnerMismatch,
+            ) => return Ok(LegacyExecutionStartRecovery::OwnerMismatch),
+            LegacyExecutionStartEvidenceResolution::Rejected(
+                LegacyExecutionStartEvidenceRejection::PriorStartMissing,
+            ) => {
+                return Ok(LegacyExecutionStartRecovery::Unverified {
+                    reason_code: "LEGACY_EXECUTION_START_PRIOR_EVIDENCE_MISSING",
+                });
+            }
+            LegacyExecutionStartEvidenceResolution::Rejected(
+                LegacyExecutionStartEvidenceRejection::NativeBindingMissing,
+            ) => {
+                return Ok(LegacyExecutionStartRecovery::Unverified {
+                    reason_code: "LEGACY_EXECUTION_START_NATIVE_BINDING_MISSING",
+                });
+            }
+            LegacyExecutionStartEvidenceResolution::Rejected(
+                LegacyExecutionStartEvidenceRejection::NativeBindingConflict,
+            ) => {
+                return Ok(LegacyExecutionStartRecovery::Unverified {
+                    reason_code: "LEGACY_EXECUTION_START_NATIVE_BINDING_CONFLICT",
+                });
+            }
+        };
+        let context = LegacyExecutionStartRawContext {
+            prior_raw_event: evidence.prior_start.raw_event.clone(),
+            pending_raw_event: evidence.pending_start.raw_event.clone(),
+            native_session_ref: evidence.native_binding.native_session_ref.clone(),
+            native_execution_ref: evidence.native_binding.native_execution_ref.clone(),
+            terminal_raw_event: evidence.terminal_raw_event.clone(),
+            terminal_native_completion_ref: evidence.terminal_native_completion_ref.clone(),
+        };
+        Ok(
+            match self.driver.classify_legacy_execution_start(&context) {
+                LegacyExecutionStartRawClassification::ExactDuplicate {
+                    durable_terminal_handoff,
+                } => {
+                    let mut evidence = evidence;
+                    evidence.durable_terminal_handoff &= durable_terminal_handoff;
+                    LegacyExecutionStartRecovery::ExactDuplicate(evidence)
+                }
+                LegacyExecutionStartRawClassification::Conflict => {
+                    LegacyExecutionStartRecovery::Unverified {
+                        reason_code: "LEGACY_EXECUTION_START_RAW_IDENTITY_CONFLICT",
+                    }
+                }
+                LegacyExecutionStartRawClassification::Unsupported => {
+                    LegacyExecutionStartRecovery::Unsupported
+                }
+            },
+        )
     }
 
     /// Verifies the Adapter-owned transport evidence for a delivered dispatch.
@@ -1603,6 +1820,15 @@ where
     ) -> Result<(), GovernedAdapterError> {
         self.edge
             .mark_observation_consumed(observation_id)
+            .map_err(Into::into)
+    }
+
+    pub fn consume_legacy_execution_start_duplicate(
+        &mut self,
+        evidence: &LegacyExecutionStartEvidence,
+    ) -> Result<bool, GovernedAdapterError> {
+        self.edge
+            .consume_legacy_execution_start_duplicate(evidence)
             .map_err(Into::into)
     }
 
@@ -2713,6 +2939,65 @@ mod dispatch_context_gate_tests {
         }
     }
 
+    struct ResidentDriver {
+        sends: Arc<AtomicUsize>,
+        terminal: Option<DriverEvent>,
+    }
+
+    impl NativeHarnessDriver for ResidentDriver {
+        fn probe<'a>(
+            &'a mut self,
+            _request: &'a ProbeHarnessRequest,
+        ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+            Box::pin(async { panic!("probe is not used") })
+        }
+
+        fn send_dispatch<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+            _material: &'a ResolvedDispatchMaterial,
+        ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(DriverDelivery {
+                    native_request_ref: "native-request:resident-test".to_owned(),
+                    native_session_ref: "native-session:resident-test".to_owned(),
+                    native_execution_ref: Some("native-execution:resident-test".to_owned()),
+                    raw_evidence: b"resident-dispatch-delivered".to_vec(),
+                })
+            })
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+            let event = self.terminal.take();
+            Box::pin(async move { Ok(event) })
+        }
+
+        fn decide_approval<'a>(
+            &'a mut self,
+            _envelope: &'a ApprovalDecisionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            Box::pin(async { panic!("approval is not used") })
+        }
+
+        fn cancel<'a>(
+            &'a mut self,
+            _envelope: &'a CancelExecutionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            Box::pin(async { panic!("cancel is not used") })
+        }
+
+        fn reconcile<'a>(
+            &'a mut self,
+            _context: &'a ReconciliationContext,
+        ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+            Box::pin(async { panic!("reconcile is not used") })
+        }
+    }
+
     #[derive(Clone)]
     struct CountingGate {
         authorization: DispatchContextAuthorization,
@@ -2738,6 +3023,21 @@ mod dispatch_context_gate_tests {
         }
     }
 
+    struct CountingMaterialGuard {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ReadyDispatchMaterialGuard for CountingMaterialGuard {
+        fn validate_ready_dispatch<'a>(
+            &'a self,
+            _envelope: &'a DispatchEnvelope,
+            _material: &'a ResolvedDispatchMaterial,
+        ) -> Pin<Box<dyn Future<Output = Result<(), HarnessError>> + Send + 'a>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     #[derive(Clone)]
     struct CountingRecoveryGate {
         recovery: DispatchContextRecovery,
@@ -2756,6 +3056,7 @@ mod dispatch_context_gate_tests {
 
     struct RecoveryDriver {
         reconciles: Arc<AtomicUsize>,
+        finding: ReconciliationFinding,
     }
 
     impl NativeHarnessDriver for RecoveryDriver {
@@ -2800,11 +3101,8 @@ mod dispatch_context_gate_tests {
             _context: &'a ReconciliationContext,
         ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
             self.reconciles.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {
-                Ok(ReconciliationFinding::NoEffectProven {
-                    evidence_ref: "recovery:no-effect".to_owned(),
-                })
-            })
+            let finding = self.finding.clone();
+            Box::pin(async move { Ok(finding) })
         }
     }
 
@@ -3018,11 +3316,59 @@ mod dispatch_context_gate_tests {
         );
     }
 
+    fn seed_non_delivered_reconciliation_receipt(
+        path: &Path,
+        envelope: &DispatchEnvelope,
+        disposition: DeliveryDisposition,
+        mutate: impl FnOnce(&mut DispatchReceipt),
+        corrupt_digest: bool,
+    ) {
+        let mut edge = open_edge(path);
+        edge.begin_delivery(&envelope.dispatch_id, 1_787_488_002)
+            .expect("begin non-delivered reconciliation receipt");
+        let mut receipt = DispatchReceipt {
+            receipt_id: format!("receipt:reconciliation:{}", envelope.dispatch_id),
+            disposition: disposition as i32,
+            attempt_id: envelope.attempt_id.clone(),
+            dispatch_id: envelope.dispatch_id.clone(),
+            fencing_token: envelope.fencing_token,
+            adapter_id: ADAPTER_ID.to_owned(),
+            capability_profile_id: PROFILE_ID.to_owned(),
+            evidence_ref: format!("fixture:reconciliation:{}", envelope.dispatch_id),
+            ..DispatchReceipt::default()
+        };
+        mutate(&mut receipt);
+        receipt.receipt_digest_sha256 = canonical_digest(&receipt);
+        if corrupt_digest {
+            receipt.receipt_digest_sha256 = "0".repeat(64);
+        }
+        edge.record_dispatch_receipt(&receipt, b"non-delivered-reconciliation", 1_787_488_003)
+            .expect("record non-delivered reconciliation receipt");
+    }
+
     fn recovery_adapter(
         path: &Path,
         material: ResolvedDispatchMaterial,
         resolver_calls: Arc<AtomicUsize>,
         reconciles: Arc<AtomicUsize>,
+    ) -> GovernedHarnessAdapter<FixtureResolver, RecoveryDriver, FixedClock> {
+        recovery_adapter_with_finding(
+            path,
+            material,
+            resolver_calls,
+            reconciles,
+            ReconciliationFinding::NoEffectProven {
+                evidence_ref: "recovery:no-effect".to_owned(),
+            },
+        )
+    }
+
+    fn recovery_adapter_with_finding(
+        path: &Path,
+        material: ResolvedDispatchMaterial,
+        resolver_calls: Arc<AtomicUsize>,
+        reconciles: Arc<AtomicUsize>,
+        finding: ReconciliationFinding,
     ) -> GovernedHarnessAdapter<FixtureResolver, RecoveryDriver, FixedClock> {
         GovernedHarnessAdapter::new(
             ADAPTER_ID,
@@ -3034,7 +3380,10 @@ mod dispatch_context_gate_tests {
                 calls: resolver_calls,
                 fail: false,
             },
-            RecoveryDriver { reconciles },
+            RecoveryDriver {
+                reconciles,
+                finding,
+            },
             FixedClock,
         )
     }
@@ -3429,13 +3778,17 @@ mod dispatch_context_gate_tests {
 
             let ready_calls = Arc::new(AtomicUsize::new(0));
             let existing_calls = Arc::new(AtomicUsize::new(0));
+            let material_calls = Arc::new(AtomicUsize::new(0));
             let sends = Arc::new(AtomicUsize::new(0));
             let mut governed = adapter(&root.database(), resolved, Arc::clone(&sends))
                 .with_dispatch_context_authorization_gate(CountingGate {
                     authorization: authorization(&dispatch),
                     ready_calls: Arc::clone(&ready_calls),
                     existing_calls: Arc::clone(&existing_calls),
-                });
+                })
+                .with_ready_dispatch_material_guard(Arc::new(CountingMaterialGuard {
+                    calls: Arc::clone(&material_calls),
+                }));
             let result = governed
                 .dispatch(&dispatch)
                 .await
@@ -3446,6 +3799,7 @@ mod dispatch_context_gate_tests {
             ));
             assert_eq!(ready_calls.load(Ordering::SeqCst), 0);
             assert_eq!(existing_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(material_calls.load(Ordering::SeqCst), 0);
             assert_eq!(sends.load(Ordering::SeqCst), 0);
         }
     }
@@ -3456,8 +3810,12 @@ mod dispatch_context_gate_tests {
         let resolved = material();
         let mut dispatch = envelope(&resolved, "dispatch-static");
         dispatch.input_bundle_ref = "static-bundle.json".to_owned();
+        let material_calls = Arc::new(AtomicUsize::new(0));
         let sends = Arc::new(AtomicUsize::new(0));
-        let mut governed = adapter(&root.database(), resolved, Arc::clone(&sends));
+        let mut governed = adapter(&root.database(), resolved, Arc::clone(&sends))
+            .with_ready_dispatch_material_guard(Arc::new(CountingMaterialGuard {
+                calls: Arc::clone(&material_calls),
+            }));
 
         let result = governed.dispatch(&dispatch).await.expect("static dispatch");
         assert!(matches!(
@@ -3465,6 +3823,85 @@ mod dispatch_context_gate_tests {
             Some(dispatch_result::Outcome::Receipt(receipt))
                 if receipt.disposition == DeliveryDisposition::Delivered as i32
         ));
+        assert_eq!(material_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resident_dispatch_is_current_process_only_and_clears_after_terminal_pump() {
+        let root = FixtureRoot::new("resident-dispatch");
+        let resolved = material();
+        let mut dispatch = envelope(&resolved, "dispatch-resident");
+        dispatch.input_bundle_ref = "static-resident-bundle.json".to_owned();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let terminal = DriverEvent {
+            native_key: "native:resident:interrupted".to_owned(),
+            native_event_id: Some("native-event:resident:interrupted".to_owned()),
+            native_sequence: Some(2),
+            native_observed_at: Timestamp {
+                seconds: 10,
+                nanos: 0,
+            },
+            criticality: ObservationCriticality::Terminal,
+            payload: harness_observation::Payload::Lifecycle(
+                egopulse_domain_contracts::v01::egopulse::harness::v1::LifecycleObservation {
+                    kind: LifecycleKind::ExecutionInterrupted as i32,
+                    ..Default::default()
+                },
+            ),
+            raw_event: b"resident-interrupted".to_vec(),
+        };
+        let mut governed = GovernedHarnessAdapter::new(
+            ADAPTER_ID,
+            PROFILE_ID,
+            protocol(),
+            open_edge(&root.database()),
+            FixtureResolver {
+                material: resolved.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            },
+            ResidentDriver {
+                sends: Arc::clone(&sends),
+                terminal: Some(terminal),
+            },
+            FixedClock,
+        );
+
+        let delivered = governed
+            .dispatch(&dispatch)
+            .await
+            .expect("real native send");
+        assert!(matches!(
+            delivered.outcome,
+            Some(dispatch_result::Outcome::Receipt(receipt))
+                if receipt.disposition == DeliveryDisposition::Delivered as i32
+        ));
+        assert!(governed.has_resident_dispatch(&dispatch.dispatch_id));
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+
+        governed.dispatch(&dispatch).await.expect("durable replay");
+        assert!(governed.has_resident_dispatch(&dispatch.dispatch_id));
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+
+        let terminal = governed
+            .pump_one(&dispatch)
+            .await
+            .expect("terminal pump")
+            .expect("interrupted terminal observation");
+        assert_eq!(
+            terminal.criticality,
+            ObservationCriticality::Terminal as i32
+        );
+        assert!(!governed.has_resident_dispatch(&dispatch.dispatch_id));
+        drop(governed);
+
+        let mut reopened = adapter(&root.database(), resolved, Arc::clone(&sends));
+        reopened
+            .dispatch(&dispatch)
+            .await
+            .expect("persisted delivered replay after reopen");
+        assert!(!reopened.has_resident_dispatch(&dispatch.dispatch_id));
         assert_eq!(sends.load(Ordering::SeqCst), 1);
     }
 
@@ -3526,6 +3963,107 @@ mod dispatch_context_gate_tests {
         ));
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
         assert_eq!(reconciles.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_without_delivery_binding_defers_to_driver_after_owner_validation() {
+        for (label, disposition, driver_finding) in [
+            (
+                "intent-no-receipt",
+                None,
+                ReconciliationFinding::NoEffectProven {
+                    evidence_ref: "recovery:no-effect:no-receipt".to_owned(),
+                },
+            ),
+            (
+                "rejected-receipt",
+                Some(DeliveryDisposition::Rejected),
+                ReconciliationFinding::NoEffectProven {
+                    evidence_ref: "recovery:no-effect:rejected".to_owned(),
+                },
+            ),
+            (
+                "unknown-receipt",
+                Some(DeliveryDisposition::Unknown),
+                ReconciliationFinding::OutcomeUnknown {
+                    evidence_ref: "recovery:outcome-unknown".to_owned(),
+                },
+            ),
+        ] {
+            let root = FixtureRoot::new(&format!("recovery-{label}"));
+            let resolved = material();
+            let mut dispatch = envelope(&resolved, &format!("dispatch-recovery-{label}"));
+            dispatch.input_bundle_ref = "static-bundle.json".to_owned();
+            seed_reconciliation_dispatch(&root.database(), &dispatch);
+            if let Some(disposition) = disposition {
+                seed_non_delivered_reconciliation_receipt(
+                    &root.database(),
+                    &dispatch,
+                    disposition,
+                    |_| {},
+                    false,
+                );
+            }
+            let expected_finding = driver_finding.clone();
+            let resolver_calls = Arc::new(AtomicUsize::new(0));
+            let reconciles = Arc::new(AtomicUsize::new(0));
+            let mut governed = recovery_adapter_with_finding(
+                &root.database(),
+                resolved,
+                Arc::clone(&resolver_calls),
+                Arc::clone(&reconciles),
+                driver_finding,
+            );
+
+            let evidence = governed
+                .reconcile_dispatch(&format!("reconciliation-{label}"), &dispatch.dispatch_id)
+                .await
+                .expect("reconcile without a confirmed delivery binding");
+            assert_eq!(evidence.finding, expected_finding);
+            assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(reconciles.load(Ordering::SeqCst), 1);
+        }
+
+        for tamper in ["owner", "digest"] {
+            let root = FixtureRoot::new(&format!("recovery-non-delivered-{tamper}"));
+            let resolved = material();
+            let mut dispatch = envelope(
+                &resolved,
+                &format!("dispatch-recovery-non-delivered-{tamper}"),
+            );
+            dispatch.input_bundle_ref = "static-bundle.json".to_owned();
+            seed_reconciliation_dispatch(&root.database(), &dispatch);
+            seed_non_delivered_reconciliation_receipt(
+                &root.database(),
+                &dispatch,
+                DeliveryDisposition::Rejected,
+                |receipt| {
+                    if tamper == "owner" {
+                        receipt.attempt_id = "attempt:other".to_owned();
+                    }
+                },
+                tamper == "digest",
+            );
+            let reconciles = Arc::new(AtomicUsize::new(0));
+            let mut governed = recovery_adapter(
+                &root.database(),
+                resolved,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::clone(&reconciles),
+            );
+            assert!(matches!(
+                governed
+                    .reconcile_dispatch(
+                        &format!("reconciliation-non-delivered-{tamper}"),
+                        &dispatch.dispatch_id,
+                    )
+                    .await,
+                Err(GovernedAdapterError::Edge(
+                    AdapterEdgeError::IntegrityFailure
+                ))
+            ));
+            assert_eq!(reconciles.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]

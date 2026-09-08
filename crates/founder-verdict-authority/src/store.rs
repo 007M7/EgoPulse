@@ -251,6 +251,27 @@ pub(crate) struct PendingProjectionOutbox {
     pub payload: Vec<u8>,
 }
 
+pub(crate) struct PendingTaskVerdictOutbox {
+    pub message_id: String,
+    pub source_event_id: String,
+    pub payload_digest_sha256: String,
+    pub payload: Vec<u8>,
+    pub stored_event: Vec<u8>,
+    pub event_verdict_id: String,
+    pub event_revision: u64,
+    pub event_request_digest_sha256: String,
+    pub verdict_payload_digest_sha256: String,
+    pub verdict: Vec<u8>,
+    pub stored_state_revision: u64,
+    pub stored_state_kind: i32,
+    pub state: Vec<u8>,
+    pub receipt_aggregate_id: String,
+    pub receipt_aggregate_revision: u64,
+    pub receipt_request_digest_sha256: String,
+    pub receipt_store_epoch: String,
+    pub receipt_acknowledged_after_durability_barrier: bool,
+}
+
 pub(crate) struct VerdictProjectionBaseline {
     pub source_event_id: String,
     pub source_revision: u64,
@@ -684,6 +705,85 @@ impl VerdictStore {
         let changed = self.connection.execute(
             "UPDATE verdict_projection_outbox SET delivery_state='consumed'
              WHERE message_id=?1 AND payload_digest_sha256=?2 AND delivery_state='pending'",
+            params![message_id, expected_payload_digest_sha256],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn pending_task_verdict_outbox(&self) -> Result<Vec<PendingTaskVerdictOutbox>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT o.message_id,o.source_event_id,o.payload_digest_sha256,o.payload,
+                    e.event,e.founder_verdict_id,e.resulting_state_revision,
+                    e.request_digest_sha256,v.payload_digest_sha256,v.verdict,
+                    s.revision,s.state,s.state_blob,
+                    r.aggregate_id,r.aggregate_revision,r.request_digest_sha256,r.store_epoch,
+                    r.acknowledged_after_durability_barrier
+             FROM verdict_outbox o
+             LEFT JOIN verdict_events e ON e.event_id=o.source_event_id
+             LEFT JOIN founder_verdicts v ON v.founder_verdict_id=e.founder_verdict_id
+             LEFT JOIN founder_verdict_states s ON s.founder_verdict_id=v.founder_verdict_id
+             LEFT JOIN verdict_commit_receipts r ON r.event_id=e.event_id
+             WHERE o.destination_domain='task-authority' AND o.delivery_state='pending'
+             ORDER BY o.created_at_seconds,o.message_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let event_revision: i64 = row.get(6)?;
+            let state_revision: i64 = row.get(10)?;
+            let state_kind: i32 = row.get(11)?;
+            let receipt_revision: i64 = row.get(14)?;
+            let receipt_acknowledged: i64 = row.get(17)?;
+            Ok(PendingTaskVerdictOutbox {
+                message_id: row.get(0)?,
+                source_event_id: row.get(1)?,
+                payload_digest_sha256: row.get(2)?,
+                payload: row.get(3)?,
+                stored_event: row.get(4)?,
+                event_verdict_id: row.get(5)?,
+                event_revision: event_revision as u64,
+                event_request_digest_sha256: row.get(7)?,
+                verdict_payload_digest_sha256: row.get(8)?,
+                verdict: row.get(9)?,
+                stored_state_revision: state_revision as u64,
+                stored_state_kind: state_kind,
+                state: row.get(12)?,
+                receipt_aggregate_id: row.get(13)?,
+                receipt_aggregate_revision: receipt_revision as u64,
+                receipt_request_digest_sha256: row.get(15)?,
+                receipt_store_epoch: row.get(16)?,
+                receipt_acknowledged_after_durability_barrier: receipt_acknowledged == 1,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn store_epoch(&self) -> &str {
+        &self.store_epoch
+    }
+
+    pub fn acknowledge_task_verdict_outbox(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE verdict_outbox SET delivery_state='consumed'
+             WHERE message_id=?1 AND destination_domain='task-authority'
+               AND payload_digest_sha256=?2 AND delivery_state='pending'",
+            params![message_id, expected_payload_digest_sha256],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn hold_task_verdict_outbox(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE verdict_outbox SET delivery_state='held'
+             WHERE message_id=?1 AND destination_domain='task-authority'
+               AND payload_digest_sha256=?2 AND delivery_state='pending'",
             params![message_id, expected_payload_digest_sha256],
         )?;
         Ok(changed == 1)

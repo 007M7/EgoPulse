@@ -436,6 +436,81 @@ where
         })
     }
 
+    pub(crate) fn mark_legacy_execution_start_outcome_unknown(
+        &mut self,
+        observation: &HarnessObservation,
+    ) -> Result<CollaborationCommandResult, CollaborationControlError> {
+        const REASON_CODE: &str = "LEGACY_DUPLICATE_EXECUTION_START_OUTCOME_UNKNOWN";
+        let recovery_principal = harness_recovery_principal();
+        let evidence = format!("uncertainty-evidence:{}", observation.observation_id);
+        if let Some(result) = self.replay_harness_source(
+            &recovery_principal,
+            "mark_attempt_outcome_unknown",
+            &observation.attempt_id,
+            &observation.observation_id,
+            &evidence,
+        )? {
+            return Ok(result);
+        }
+        let snapshot = self.snapshot_for_attempt(&observation.attempt_id)?;
+        let base = ingestion_base(
+            &snapshot,
+            &observation.attempt_id,
+            &observation.observation_id,
+            "legacy-execution-start-outcome-unknown",
+            self.clock.now(),
+        )?;
+        let (step_index, attempt_index) = match validate_attempt_preconditions(&snapshot, &base) {
+            Ok(indexes) => indexes,
+            Err(result) => return Ok(*result),
+        };
+        let attempt = &snapshot.attempts[attempt_index];
+        if AttemptStatus::try_from(attempt.status) != Ok(AttemptStatus::Running)
+            || attempt.dispatch_id.as_deref() != Some(observation.dispatch_id.as_str())
+            || !current_fence_matches(attempt, observation.fencing_token)
+            || observation.observation_sequence <= attempt.last_harness_sequence
+        {
+            return Ok(state_conflict("LEGACY_EXECUTION_START_OWNER_MISMATCH"));
+        }
+        let authorization = match self.guard.validate_running_observation(
+            &RecordRunningObservationCommand {
+                base: Some(base.clone()),
+                fencing_token: observation.fencing_token,
+                harness_sequence: observation.observation_sequence,
+                lifecycle_event_id: observation.observation_id.clone(),
+                event_digest_sha256: observation.native_event_digest_sha256.clone(),
+            },
+            &snapshot,
+        ) {
+            Ok(value) => value,
+            Err(rejection) => return Ok(guard_error(rejection)),
+        };
+        let mut command = CollaborationCommand {
+            command: Some(collaboration_command::Command::MarkAttemptOutcomeUnknown(
+                MarkAttemptOutcomeUnknownCommand {
+                    base: Some(base),
+                    reason_code: REASON_CODE.to_owned(),
+                    uncertainty_evidence_id: observation.observation_id.clone(),
+                },
+            )),
+        };
+        seal_ingestion_command(&mut command);
+        let collaboration_command::Command::MarkAttemptOutcomeUnknown(value) =
+            command.command.as_ref().expect("legacy recovery command")
+        else {
+            unreachable!();
+        };
+        self.persist_outcome_unknown(
+            value,
+            &command,
+            &recovery_principal,
+            snapshot,
+            step_index,
+            attempt_index,
+            authorization,
+        )
+    }
+
     fn snapshot_for_attempt(
         &self,
         attempt_id: &str,

@@ -8,12 +8,16 @@ mod store;
 mod supervisor;
 
 pub use execution::{
-    GovernedVerificationExecutionCoordinator, GovernedVerificationExecutionError,
-    GovernedVerificationExecutionOutcome, GovernedVerificationExecutionPlan,
+    GovernedVerificationBatchPlan, GovernedVerificationCheckOutput, GovernedVerificationChecker,
+    GovernedVerificationCheckerError, GovernedVerificationExecutionCoordinator,
+    GovernedVerificationExecutionError, GovernedVerificationExecutionOutcome,
+    GovernedVerificationExecutionPlan,
 };
 pub use reference_resolver::{
     ArtifactBackedReferenceResolver, ArtifactContentSource, ArtifactReferenceSource,
-    ArtifactReferenceSourceError, ReferenceResolverConfigurationError,
+    ArtifactReferenceSourceError, CheckerOutputRole, CheckerResultArtifactReference,
+    CheckerResultReferenceContext, ReferenceResolverConfigurationError,
+    checker_output_execution_ref,
 };
 pub use sego::{
     CheckerProcessFailure, SegoFindingEvidenceBinding, SegoMapError, SegoMappedResult,
@@ -132,6 +136,22 @@ pub trait VerificationReferenceResolver: Send + Sync + 'static {
     ) -> Result<(), ReferenceRejection> {
         let _ = binding;
         self.validate_result_references(evidence_ids, artifact_ids)
+    }
+
+    fn validate_checker_result_references(
+        &self,
+        context: &CheckerResultReferenceContext<'_>,
+        evidence_ids: &[String],
+        references: &[CheckerResultArtifactReference],
+    ) -> Result<(), ReferenceRejection> {
+        self.validate_result_references_for_binding(
+            context.binding,
+            evidence_ids,
+            &references
+                .iter()
+                .map(|value| value.artifact_id.clone())
+                .collect::<Vec<_>>(),
+        )
     }
 }
 
@@ -764,10 +784,19 @@ where
         let artifact_ids = candidate
             .safe_detail_artifact_id
             .iter()
-            .cloned()
+            .map(|id| CheckerResultArtifactReference {
+                artifact_id: id.clone(),
+                role: CheckerOutputRole::Detail,
+                checker_profile_id: Some(profile.checker_profile_id.clone()),
+            })
             .collect::<Vec<_>>();
-        if let Err(rejection) = self.resolver.validate_result_references_for_binding(
-            binding,
+        if let Err(rejection) = self.resolver.validate_checker_result_references(
+            &CheckerResultReferenceContext {
+                binding,
+                verification_request_id: &request.verification_request_id,
+                verification_run_id: &run.verification_run_id,
+                checker_profiles: &[profile],
+            },
             &candidate.evidence_ids,
             &artifact_ids,
         ) {
@@ -879,9 +908,41 @@ where
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let referenced_artifacts = artifact_reference_ids(candidate);
-        if let Err(rejection) = self.resolver.validate_result_references_for_binding(
-            request.binding.as_ref().expect("validated request"),
+        let mut profiles = Vec::new();
+        for profile_ref in stored_results
+            .iter()
+            .filter_map(|result| result.checker_profile_ref.as_ref())
+        {
+            if profiles.iter().any(|profile: &CheckerProfile| {
+                profile.checker_profile_id == profile_ref.contract_id
+            }) {
+                continue;
+            }
+            let Some(bytes) = self.store.profile(&profile_ref.contract_id)? else {
+                return Ok(Prepared::reject(
+                    VerificationErrorCode::CheckerProfileMismatch,
+                    "CHECKER_PROFILE_NOT_ATTESTED",
+                ));
+            };
+            let profile = CheckerProfile::decode(bytes.as_slice())?;
+            if profile.status != CheckerProfileStatus::Active as i32
+                || !profile_ref_matches(profile_ref, &profile)
+            {
+                return Ok(Prepared::reject(
+                    VerificationErrorCode::CheckerProfileMismatch,
+                    "CHECKER_PROFILE_BINDING_MISMATCH",
+                ));
+            }
+            profiles.push(profile);
+        }
+        let referenced_artifacts = artifact_references(candidate);
+        if let Err(rejection) = self.resolver.validate_checker_result_references(
+            &CheckerResultReferenceContext {
+                binding: request.binding.as_ref().expect("validated request"),
+                verification_request_id: &request.verification_request_id,
+                verification_run_id: &run.verification_run_id,
+                checker_profiles: &profiles,
+            },
             &referenced_evidence,
             &referenced_artifacts,
         ) {
@@ -1422,25 +1483,79 @@ fn all_result_detail_ids_resolved(candidate: &VerificationArtifact) -> bool {
     referenced_discrepancies == discrepancy_ids && referenced_unverified == unverified_ids
 }
 
-fn artifact_reference_ids(candidate: &VerificationArtifact) -> Vec<String> {
-    let mut ids = BTreeSet::new();
+fn artifact_references(candidate: &VerificationArtifact) -> Vec<CheckerResultArtifactReference> {
+    let mut references = Vec::new();
+    let profile_for = |criterion: &str| {
+        candidate
+            .criterion_results
+            .iter()
+            .find(|result| result.criterion_id == criterion)
+            .and_then(|result| result.checker_profile_ref.as_ref())
+            .map(|profile| profile.contract_id.clone())
+    };
+    let mut add = |id: &String, role, profile| {
+        references.push(CheckerResultArtifactReference {
+            artifact_id: id.clone(),
+            role,
+            checker_profile_id: profile,
+        })
+    };
     for result in &candidate.criterion_results {
-        ids.extend(result.safe_detail_artifact_id.iter().cloned());
+        if let Some(id) = &result.safe_detail_artifact_id {
+            add(
+                id,
+                CheckerOutputRole::Detail,
+                profile_for(&result.criterion_id),
+            );
+        }
     }
     for discrepancy in &candidate.discrepancies {
-        ids.insert(discrepancy.description_artifact_id.clone());
-        ids.extend(discrepancy.suggested_fix_artifact_id.iter().cloned());
+        add(
+            &discrepancy.description_artifact_id,
+            CheckerOutputRole::Detail,
+            profile_for(&discrepancy.criterion_id),
+        );
+        if let Some(id) = &discrepancy.suggested_fix_artifact_id {
+            add(
+                id,
+                CheckerOutputRole::Detail,
+                profile_for(&discrepancy.criterion_id),
+            );
+        }
     }
     for item in &candidate.unverified_items {
-        ids.extend(item.context_artifact_id.iter().cloned());
+        if let Some(id) = &item.context_artifact_id {
+            add(
+                id,
+                CheckerOutputRole::Detail,
+                profile_for(&item.criterion_id),
+            );
+        }
     }
     if let Some(provenance) = candidate.provenance.as_ref() {
-        ids.extend(provenance.tool_receipt_artifact_ids.iter().cloned());
-        ids.extend(provenance.model_call_receipt_artifact_ids.iter().cloned());
-        ids.extend(provenance.raw_output_artifact_ids.iter().cloned());
-        ids.extend(provenance.cost_receipt_artifact_id.iter().cloned());
+        for (ids, role) in [
+            (
+                &provenance.tool_receipt_artifact_ids,
+                CheckerOutputRole::ToolReceipt,
+            ),
+            (
+                &provenance.model_call_receipt_artifact_ids,
+                CheckerOutputRole::ModelCallReceipt,
+            ),
+            (
+                &provenance.raw_output_artifact_ids,
+                CheckerOutputRole::RawOutput,
+            ),
+        ] {
+            for id in ids {
+                add(id, role, None);
+            }
+        }
+        if let Some(id) = &provenance.cost_receipt_artifact_id {
+            add(id, CheckerOutputRole::CostReceipt, None);
+        }
     }
-    ids.into_iter().collect()
+    references
 }
 
 #[must_use]

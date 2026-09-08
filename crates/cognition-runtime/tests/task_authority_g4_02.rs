@@ -329,6 +329,22 @@ fn founder_cancellation_request_commits_pending_state_and_replays_idempotently()
             .iter()
             .any(|reference| reference == "cancellation-reason:founder-requested-stop")
     );
+    // Ready Tasks have no Collaboration run. Their exact Task event is still
+    // handed to the daemon for Task-owned settlement, never as a native
+    // Harness cancellation request.
+    let handoffs = authority
+        .pending_task_cancellations()
+        .expect("read Ready cancellation handoff");
+    assert_eq!(handoffs.len(), 1);
+    assert!(
+        handoffs[0]
+            .event
+            .snapshot
+            .as_ref()
+            .expect("cancellation snapshot")
+            .current_run_id
+            .is_none()
+    );
 
     let replayed = authority
         .execute(&cancellation, &founder())

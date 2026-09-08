@@ -5,7 +5,7 @@ use egopulse_domain_contracts::v01::egopulse::artifact::v1::{
     ArtifactSetStatus, HashAlgorithm, LineageBinding, ReturnHandoffStatus,
 };
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
-    CollaborationSnapshot, MarkAttemptOutcomeUnknownCommand,
+    AttemptCancellationDisposition, CollaborationSnapshot, MarkAttemptOutcomeUnknownCommand,
     RecordAttemptCancellationOutcomeCommand, RecordAttemptReconciliationCommand,
     RecordAttemptReturnCommand, RecordDeliveryReceiptCommand, RecordHarnessAckCommand,
     RecordRunningObservationCommand,
@@ -136,6 +136,20 @@ pub struct GovernedReturnEvidenceResolver<G, C> {
 }
 
 impl<G, C> GovernedReturnEvidenceResolver<G, C> {
+    pub(crate) fn with_approval_delivery_source(
+        mut self,
+        source: Arc<dyn crate::approval_delivery::ApprovalDeliverySource>,
+    ) -> Self {
+        self.harness = self
+            .harness
+            .with_approval_policy_evidence(move |decision_ref| {
+                source
+                    .approval_policy_evidence(decision_ref)
+                    .map_err(|_| ())
+            });
+        self
+    }
+
     #[must_use]
     pub fn new(
         edge: AdapterEdge,
@@ -196,6 +210,66 @@ where
             .validate_cancellation_outcome(command, snapshot)
     }
 
+    fn resolve_cancellation_return(
+        &self,
+        command: &RecordAttemptCancellationOutcomeCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
+        if command.disposition != AttemptCancellationDisposition::ReturnFound as i32 {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        let (receipt, handoff, artifact_set) = {
+            let authority = self
+                .authority
+                .lock()
+                .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?;
+            let receipt = authority
+                .read_return_receipt(&command.cancellation_receipt_id)
+                .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+                .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+            let handoff = authority
+                .read_return_handoff(&receipt.return_handoff_id)
+                .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+                .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+            let artifact_set = authority
+                .read_artifact_set(&receipt.artifact_set_id)
+                .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+                .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+            (receipt, handoff, artifact_set)
+        };
+        let lineage = receipt
+            .lineage
+            .as_ref()
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        if artifact_set.status != ArtifactSetStatus::Sealed as i32
+            || handoff.status != ReturnHandoffStatus::Receipted as i32
+            || handoff.return_handoff_id != receipt.return_handoff_id
+            || artifact_set.artifact_set_id != receipt.artifact_set_id
+            || handoff.artifact_set_id != artifact_set.artifact_set_id
+            || handoff.artifact_set_manifest != artifact_set.canonical_manifest
+            || artifact_set.lineage.as_ref() != Some(lineage)
+            || handoff.lineage.as_ref() != Some(lineage)
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        let candidate = self
+            .harness
+            .edge()
+            .terminal_output_candidate_for_dispatch(&lineage.dispatch_id)
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        self.resolve_attempt_return(
+            &RecordAttemptReturnCommand {
+                base: command.base.clone(),
+                fencing_token: lineage.fencing_token,
+                harness_sequence: candidate.source_revision,
+                artifact_return_receipt_id: receipt.receipt_id.clone(),
+                receipt_digest_sha256: hex::encode(Sha256::digest(receipt.encode_to_vec())),
+            },
+            snapshot,
+        )
+    }
+
     fn validate_reconciliation(
         &self,
         command: &RecordAttemptReconciliationCommand,
@@ -209,6 +283,10 @@ where
         command: &RecordAttemptReturnCommand,
         snapshot: &CollaborationSnapshot,
     ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
+        let base = command
+            .base
+            .as_ref()
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
         let receipt = self
             .authority
             .lock()
@@ -243,6 +321,9 @@ where
             .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
 
         if receipt.receipt_id != command.artifact_return_receipt_id
+            || base.run_id != run.run_id
+            || base.step_id != lineage.step_id
+            || base.attempt_id != lineage.attempt_id
             || receipt_digest != command.receipt_digest_sha256
             || !receipt.accepted_for_evidence_intake
             || receipt.verification_performed
@@ -263,6 +344,10 @@ where
             || lineage.attempt_revision > attempt.revision
             || attempt.dispatch_id.as_deref() != Some(lineage.dispatch_id.as_str())
             || lineage.fencing_token != command.fencing_token
+            || attempt
+                .lease
+                .as_ref()
+                .is_none_or(|lease| lease.fencing_token != command.fencing_token)
             || candidate.fencing_token != command.fencing_token
             || candidate.source_revision != command.harness_sequence
             || candidate.run_id != lineage.run_id

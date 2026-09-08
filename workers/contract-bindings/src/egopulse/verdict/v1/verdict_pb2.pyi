@@ -42,6 +42,13 @@ class RiskCategory(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     RISK_CATEGORY_BUSINESS_RESIDUAL: _ClassVar[RiskCategory]
     RISK_CATEGORY_OPERATIONAL_RESIDUAL: _ClassVar[RiskCategory]
 
+class FounderSupportingMaterialRole(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    FOUNDER_SUPPORTING_MATERIAL_ROLE_UNSPECIFIED: _ClassVar[FounderSupportingMaterialRole]
+    FOUNDER_SUPPORTING_MATERIAL_ROLE_REWORK_REQUIRED_CHANGES: _ClassVar[FounderSupportingMaterialRole]
+    FOUNDER_SUPPORTING_MATERIAL_ROLE_RISK_RATIONALE: _ClassVar[FounderSupportingMaterialRole]
+    FOUNDER_SUPPORTING_MATERIAL_ROLE_COMPENSATING_CONTROL: _ClassVar[FounderSupportingMaterialRole]
+
 class VerdictEventKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     VERDICT_EVENT_KIND_UNSPECIFIED: _ClassVar[VerdictEventKind]
@@ -91,6 +98,10 @@ RISK_CATEGORY_UNSPECIFIED: RiskCategory
 RISK_CATEGORY_QUALITY_RESIDUAL: RiskCategory
 RISK_CATEGORY_BUSINESS_RESIDUAL: RiskCategory
 RISK_CATEGORY_OPERATIONAL_RESIDUAL: RiskCategory
+FOUNDER_SUPPORTING_MATERIAL_ROLE_UNSPECIFIED: FounderSupportingMaterialRole
+FOUNDER_SUPPORTING_MATERIAL_ROLE_REWORK_REQUIRED_CHANGES: FounderSupportingMaterialRole
+FOUNDER_SUPPORTING_MATERIAL_ROLE_RISK_RATIONALE: FounderSupportingMaterialRole
+FOUNDER_SUPPORTING_MATERIAL_ROLE_COMPENSATING_CONTROL: FounderSupportingMaterialRole
 VERDICT_EVENT_KIND_UNSPECIFIED: VerdictEventKind
 VERDICT_EVENT_KIND_ISSUED: VerdictEventKind
 VERDICT_EVENT_KIND_CONSUMED: VerdictEventKind
@@ -188,6 +199,74 @@ class ReworkDirective(_message.Message):
     target_discrepancy_ids: _containers.RepeatedScalarFieldContainer[str]
     target_unverified_item_ids: _containers.RepeatedScalarFieldContainer[str]
     def __init__(self, directive_id: _Optional[str] = ..., reason_code: _Optional[str] = ..., required_changes_artifact_id: _Optional[str] = ..., target_discrepancy_ids: _Optional[_Iterable[str]] = ..., target_unverified_item_ids: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class FounderSupportingMaterialCoverage(_message.Message):
+    __slots__ = ("risk_category", "discrepancy_ids", "unverified_item_ids")
+    RISK_CATEGORY_FIELD_NUMBER: _ClassVar[int]
+    DISCREPANCY_IDS_FIELD_NUMBER: _ClassVar[int]
+    UNVERIFIED_ITEM_IDS_FIELD_NUMBER: _ClassVar[int]
+    risk_category: RiskCategory
+    discrepancy_ids: _containers.RepeatedScalarFieldContainer[str]
+    unverified_item_ids: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, risk_category: _Optional[_Union[RiskCategory, str]] = ..., discrepancy_ids: _Optional[_Iterable[str]] = ..., unverified_item_ids: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class FounderSupportingMaterial(_message.Message):
+    __slots__ = ("material_id", "schema_version", "role", "scope", "lineage", "authenticated_founder_principal_id", "body", "coverage")
+    MATERIAL_ID_FIELD_NUMBER: _ClassVar[int]
+    SCHEMA_VERSION_FIELD_NUMBER: _ClassVar[int]
+    ROLE_FIELD_NUMBER: _ClassVar[int]
+    SCOPE_FIELD_NUMBER: _ClassVar[int]
+    LINEAGE_FIELD_NUMBER: _ClassVar[int]
+    AUTHENTICATED_FOUNDER_PRINCIPAL_ID_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    COVERAGE_FIELD_NUMBER: _ClassVar[int]
+    material_id: str
+    schema_version: int
+    role: FounderSupportingMaterialRole
+    scope: VerdictScope
+    lineage: _artifact_pb2.LineageBinding
+    authenticated_founder_principal_id: str
+    body: str
+    coverage: FounderSupportingMaterialCoverage
+    def __init__(self, material_id: _Optional[str] = ..., schema_version: _Optional[int] = ..., role: _Optional[_Union[FounderSupportingMaterialRole, str]] = ..., scope: _Optional[_Union[VerdictScope, _Mapping]] = ..., lineage: _Optional[_Union[_artifact_pb2.LineageBinding, _Mapping]] = ..., authenticated_founder_principal_id: _Optional[str] = ..., body: _Optional[str] = ..., coverage: _Optional[_Union[FounderSupportingMaterialCoverage, _Mapping]] = ...) -> None: ...
+
+class CreateFounderSupportingMaterialCommand(_message.Message):
+    __slots__ = ("metadata", "material_id", "scope", "role", "body", "coverage")
+    METADATA_FIELD_NUMBER: _ClassVar[int]
+    MATERIAL_ID_FIELD_NUMBER: _ClassVar[int]
+    SCOPE_FIELD_NUMBER: _ClassVar[int]
+    ROLE_FIELD_NUMBER: _ClassVar[int]
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    COVERAGE_FIELD_NUMBER: _ClassVar[int]
+    metadata: _common_pb2.CommandMetadata
+    material_id: str
+    scope: VerdictScope
+    role: FounderSupportingMaterialRole
+    body: str
+    coverage: FounderSupportingMaterialCoverage
+    def __init__(self, metadata: _Optional[_Union[_common_pb2.CommandMetadata, _Mapping]] = ..., material_id: _Optional[str] = ..., scope: _Optional[_Union[VerdictScope, _Mapping]] = ..., role: _Optional[_Union[FounderSupportingMaterialRole, str]] = ..., body: _Optional[str] = ..., coverage: _Optional[_Union[FounderSupportingMaterialCoverage, _Mapping]] = ...) -> None: ...
+
+class FounderSupportingMaterialReceipt(_message.Message):
+    __slots__ = ("committed", "replayed", "material_id", "artifact_id", "role", "scope", "canonical_payload", "command_id", "correlation_id")
+    COMMITTED_FIELD_NUMBER: _ClassVar[int]
+    REPLAYED_FIELD_NUMBER: _ClassVar[int]
+    MATERIAL_ID_FIELD_NUMBER: _ClassVar[int]
+    ARTIFACT_ID_FIELD_NUMBER: _ClassVar[int]
+    ROLE_FIELD_NUMBER: _ClassVar[int]
+    SCOPE_FIELD_NUMBER: _ClassVar[int]
+    CANONICAL_PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_ID_FIELD_NUMBER: _ClassVar[int]
+    CORRELATION_ID_FIELD_NUMBER: _ClassVar[int]
+    committed: bool
+    replayed: bool
+    material_id: str
+    artifact_id: str
+    role: FounderSupportingMaterialRole
+    scope: VerdictScope
+    canonical_payload: _artifact_pb2.ContentAddress
+    command_id: str
+    correlation_id: str
+    def __init__(self, committed: _Optional[bool] = ..., replayed: _Optional[bool] = ..., material_id: _Optional[str] = ..., artifact_id: _Optional[str] = ..., role: _Optional[_Union[FounderSupportingMaterialRole, str]] = ..., scope: _Optional[_Union[VerdictScope, _Mapping]] = ..., canonical_payload: _Optional[_Union[_artifact_pb2.ContentAddress, _Mapping]] = ..., command_id: _Optional[str] = ..., correlation_id: _Optional[str] = ...) -> None: ...
 
 class FounderVerdict(_message.Message):
     __slots__ = ("founder_verdict_id", "version", "decision", "scope", "observed_verification_conclusion", "authority_proof", "risk_acceptances", "rework_directive", "reason_code", "rationale_artifact_id", "valid_from", "expires_at", "issued_at", "canonical_payload", "supersedes_founder_verdict_id")

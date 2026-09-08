@@ -18,6 +18,7 @@ pub use task_evidence::{
     TaskProjectionInput, TaskViewAccess, VerdictProjectionInput, VerificationProjectionInput,
 };
 
+use egopulse_domain_contracts::approval_display::valid_approval_display_summary;
 use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     CollaborationCommandResult, CollaborationSnapshot, collaboration_command_result,
 };
@@ -588,6 +589,14 @@ impl LocalReadModel {
             || request.approval_request_id.trim().is_empty()
             || request.request_revision == 0
             || !request.native_routing_ref.is_empty()
+            || request.display_summary.as_ref().is_some_and(|summary| {
+                !valid_approval_display_summary(
+                    Some(summary),
+                    &request.display_summary_ref,
+                    &request.action_digest_sha256,
+                    request.kind,
+                )
+            })
             || input.run_id.trim().is_empty()
             || input.step_id.trim().is_empty()
         {
@@ -638,6 +647,7 @@ impl LocalReadModel {
             || event.resulting_state_revision != input.metadata.source_revision
             || state.revision != input.metadata.source_revision
             || state.authority_decision_ref != record.authority_decision_ref
+            || event.authority_decision_ref != record.authority_decision_ref
             || request.approval_request_id.trim().is_empty()
             || !request.native_routing_ref.is_empty()
         {
@@ -935,6 +945,10 @@ impl LocalReadModel {
                SELECT 1 FROM harness_approval_frames AS baseline
                WHERE baseline.approval_request_id=old.approval_request_id
                  AND baseline.sequence<=?1 AND baseline.sequence>old.sequence
+             ) AND EXISTS (
+               SELECT 1 FROM harness_approval_frames AS origin
+               WHERE origin.approval_request_id=old.approval_request_id
+                 AND origin.sequence<old.sequence
              )",
             [retain_from_sequence as i64],
         )?;
@@ -1241,15 +1255,16 @@ fn upsert_approval_request(
     if lifecycle == ApprovalRequestLifecycleKind::Unspecified {
         return Err(ProjectionFailure::InvalidMessage);
     }
-    let existing: Option<(i64, i32, String)> = transaction
+    let existing: Option<(i64, i32, String, Vec<u8>, String, String)> = transaction
         .query_row(
-            "SELECT request_revision,request_lifecycle,payload_digest_sha256
+            "SELECT request_revision,request_lifecycle,payload_digest_sha256,observation,run_id,step_id
              FROM approval_request_projections WHERE approval_request_id=?1",
             [&request.approval_request_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         )
         .optional()?;
-    if let Some((revision, prior_lifecycle, digest)) = existing {
+    if let Some((revision, prior_lifecycle, digest, prior_bytes, prior_run, prior_step)) = existing
+    {
         if request_revision < revision as u64 {
             return Err(ProjectionFailure::StaleSourceRevision);
         }
@@ -1265,6 +1280,26 @@ fn upsert_approval_request(
             || lifecycle == ApprovalRequestLifecycleKind::Open
         {
             return Err(ProjectionFailure::StaleSourceRevision);
+        }
+        let prior = HarnessObservation::decode(prior_bytes.as_slice())?;
+        let Some(harness_observation::Payload::ApprovalRequest(mut expected_request)) =
+            prior.payload
+        else {
+            return Err(ProjectionFailure::IntegrityFailure);
+        };
+        expected_request.request_revision = request.request_revision;
+        expected_request.lifecycle = request.lifecycle;
+        if prior_run != input.run_id
+            || prior_step != input.step_id
+            || prior.adapter_id != input.observation.adapter_id
+            || prior.capability_profile_id != input.observation.capability_profile_id
+            || prior.attempt_id != input.attempt_id
+            || prior.dispatch_id != input.dispatch_id
+            || prior.fencing_token != input.fencing_token
+            || prior.observation_sequence >= input.observation.observation_sequence
+            || &expected_request != request
+        {
+            return Err(ProjectionFailure::IntegrityFailure);
         }
     } else if request_revision != 1 || lifecycle != ApprovalRequestLifecycleKind::Open {
         return Err(ProjectionFailure::StaleSourceRevision);
@@ -1307,15 +1342,15 @@ fn upsert_policy_decision(
     approval_id: &str,
     input: &PolicyApprovalProjectionInput,
 ) -> Result<bool, ProjectionFailure> {
-    let existing: Option<(i64, String)> = transaction
+    let existing: Option<(i64, String, Vec<u8>)> = transaction
         .query_row(
-            "SELECT source_revision,payload_digest_sha256 FROM policy_decision_projections
+            "SELECT source_revision,payload_digest_sha256,result FROM policy_decision_projections
              WHERE approval_request_id=?1",
             [approval_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    if let Some((revision, digest)) = existing {
+    if let Some((revision, digest, prior_payload)) = existing {
         if input.metadata.mode == ProjectionMessageMode::RebuildBaseline {
             return Err(ProjectionFailure::RebuildBaselineNotAllowed);
         }
@@ -1331,6 +1366,10 @@ fn upsert_policy_decision(
         }
         if input.metadata.source_revision != revision as u64 + 1 {
             return Err(ProjectionFailure::StaleSourceRevision);
+        }
+        let prior = PolicyDecisionCommandResult::decode(prior_payload.as_slice())?;
+        if prior.decision_record != input.result.decision_record {
+            return Err(ProjectionFailure::IntegrityFailure);
         }
     } else {
         validate_initial_projection(transaction, &input.metadata)?;
@@ -1538,11 +1577,11 @@ fn recompute_approval_view(
             || binding.attempt_id != attempt_id
             || binding.dispatch_id != dispatch_id
             || binding.fencing_token != fence
+            || binding.adapter_id != observation.adapter_id
+            || binding.kind != request.kind
+            || binding.requested_scope_ref != request.requested_scope_ref
             || binding.action_digest_sha256 != request.action_digest_sha256
-            || binding.request_observation_id != observation.observation_id
-            || binding.request_observation_sequence != observation.observation_sequence
-            || binding.request_revision != request.request_revision
-            || binding.request_lifecycle != request.lifecycle
+            || !policy_request_version_matches(transaction, binding, &observation, request)?
             || state.revision != revision
         {
             return Err(ProjectionFailure::IntegrityFailure);
@@ -1607,6 +1646,7 @@ fn recompute_approval_view(
             field_path: "harness_approval.native_routing_ref".to_owned(),
             reason_code: "ADAPTER_PRIVATE_ROUTING".to_owned(),
         }],
+        display_summary: request.display_summary.clone(),
     };
     if !binding_complete {
         view.metadata
@@ -1634,6 +1674,68 @@ fn recompute_approval_view(
         params![sequence as i64, approval_id, frame.encode_to_vec()],
     )?;
     Ok(())
+}
+
+/// Policy binds the Open observation it authorized, while the Adapter may
+/// subsequently close that request. Retain the first safe frame as evidence
+/// of that exact original binding; lifecycle changes cannot rewrite its action
+/// or route. Historical API reads still enforce the normal retention floor.
+fn policy_request_version_matches(
+    transaction: &Transaction<'_>,
+    binding: &egopulse_domain_contracts::v01::egopulse::policy::v1::HarnessApprovalRequestBinding,
+    observation: &HarnessObservation,
+    request: &egopulse_domain_contracts::v01::egopulse::harness::v1::ApprovalRequestObservation,
+) -> Result<bool, ProjectionFailure> {
+    if binding.request_lifecycle != ApprovalRequestLifecycleKind::Open as i32
+        || binding.request_revision != 1
+    {
+        return Ok(false);
+    }
+    if request.lifecycle == ApprovalRequestLifecycleKind::Open as i32 {
+        return Ok(binding.request_observation_id == observation.observation_id
+            && binding.request_observation_sequence == observation.observation_sequence
+            && binding.request_revision == request.request_revision);
+    }
+    if request.request_revision != 2
+        || binding.request_observation_sequence >= observation.observation_sequence
+    {
+        return Ok(false);
+    }
+    let origin: Option<(u64, Vec<u8>)> = transaction
+        .query_row(
+            "SELECT sequence,frame FROM harness_approval_frames
+             WHERE approval_request_id=?1 ORDER BY sequence LIMIT 1",
+            [&binding.approval_request_id],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((sequence, origin)) = origin else {
+        return Ok(false);
+    };
+    let frame = HarnessApprovalViewStreamFrame::decode(origin.as_slice())?;
+    let epoch = projection_epoch(transaction)?;
+    if frame.kind != StreamFrameKind::Snapshot as i32
+        || frame
+            .position
+            .as_ref()
+            .is_none_or(|position| position.epoch != epoch || position.sequence != sequence)
+    {
+        return Err(ProjectionFailure::IntegrityFailure);
+    }
+    let Some(view) = frame.snapshot else {
+        return Err(ProjectionFailure::IntegrityFailure);
+    };
+    Ok(view.approval_request_id == binding.approval_request_id
+        && view.attempt_id == binding.attempt_id
+        && view.dispatch_id == binding.dispatch_id
+        && view.fencing_token == binding.fencing_token
+        && view.kind == binding.kind
+        && view.action_digest_sha256 == binding.action_digest_sha256
+        && view.requested_scope_ref == binding.requested_scope_ref
+        && view.request_observation_id == binding.request_observation_id
+        && view.request_observation_sequence == binding.request_observation_sequence
+        && view.request_revision == binding.request_revision
+        && view.request_lifecycle == binding.request_lifecycle)
 }
 
 fn apply_access(
@@ -1712,6 +1814,13 @@ fn _assert_path_is_scoped(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egopulse_domain_contracts::approval_display::{
+        APPROVAL_DISPLAY_POLICY_CODE, seal_approval_display_summary,
+    };
+    use egopulse_domain_contracts::v01::egopulse::harness::v1::{
+        ApprovalDisplaySummary, ApprovalDisplaySummaryState, ApprovalKind,
+        ApprovalRequestObservation,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1768,5 +1877,130 @@ mod tests {
         assert!(model.integrity_is_ok().expect("integrity"));
         drop(model);
         fs::remove_dir_all(root).expect("remove migration root");
+    }
+
+    #[test]
+    fn approval_projection_rebuild_preserves_sealed_display_summary() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "egopulse-read-model-approval-display-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("create projection root");
+        let database_path = root.join("read-model.db");
+        let rebuilt_database_path = root.join("rebuilt-read-model.db");
+        let action_digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let summary = seal_approval_display_summary(ApprovalDisplaySummary {
+            state: ApprovalDisplaySummaryState::Reviewable as i32,
+            summary_ref: "adapter-edge://codex/approval/summary".to_owned(),
+            summary_digest_sha256: String::new(),
+            action_digest_sha256: action_digest.to_owned(),
+            source_binding_sha256:
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            command_preview: "git status --short".to_owned(),
+            working_directory_label: "repository root".to_owned(),
+            files: Vec::new(),
+            redaction_reason_codes: Vec::new(),
+            truncated: false,
+            policy_code: APPROVAL_DISPLAY_POLICY_CODE.to_owned(),
+        });
+        let observation = HarnessObservation {
+            observation_id: "approval-display-observation-1".to_owned(),
+            adapter_id: "codex-adapter".to_owned(),
+            attempt_id: "attempt-1".to_owned(),
+            dispatch_id: "dispatch-1".to_owned(),
+            fencing_token: 1,
+            observation_sequence: 1,
+            payload: Some(harness_observation::Payload::ApprovalRequest(
+                ApprovalRequestObservation {
+                    approval_request_id: "approval-1".to_owned(),
+                    kind: ApprovalKind::Command as i32,
+                    action_digest_sha256: action_digest.to_owned(),
+                    requested_scope_ref: "safe://scope/1".to_owned(),
+                    display_summary_ref: summary.summary_ref.clone(),
+                    native_routing_ref: String::new(),
+                    lifecycle: ApprovalRequestLifecycleKind::Open as i32,
+                    request_revision: 1,
+                    display_summary: Some(summary.clone()),
+                },
+            )),
+            ..Default::default()
+        };
+        let input = AdapterApprovalProjectionInput {
+            metadata: ProjectionMessageMetadata {
+                message_id: "approval-display-message-1".to_owned(),
+                source_event_id: observation.observation_id.clone(),
+                source_revision: 1,
+                mode: ProjectionMessageMode::Incremental,
+                payload_digest_sha256: sha256(&observation.encode_to_vec()),
+                projected_at: Timestamp {
+                    seconds: 1_800_000_000,
+                    nanos: 0,
+                },
+            },
+            run_id: "run-1".to_owned(),
+            step_id: "step-1".to_owned(),
+            attempt_id: observation.attempt_id.clone(),
+            dispatch_id: observation.dispatch_id.clone(),
+            fencing_token: observation.fencing_token,
+            observation,
+        };
+
+        {
+            let mut model = LocalReadModel::open(LocalReadModelConfig {
+                database_path: database_path.clone(),
+                epoch: "epoch-1".to_owned(),
+                key: LocalReadModelKey::new([0x3a; 32]),
+            })
+            .expect("open projection");
+            model
+                .apply_adapter_approval(&input)
+                .expect("project safe summary");
+        }
+
+        let model = LocalReadModel::open(LocalReadModelConfig {
+            database_path,
+            epoch: "epoch-1".to_owned(),
+            key: LocalReadModelKey::new([0x3a; 32]),
+        })
+        .expect("reopen projection");
+        let view = model
+            .get_harness_approval_view(
+                "approval-1",
+                ApprovalViewAccess {
+                    can_read: true,
+                    can_decide: false,
+                },
+            )
+            .expect("read projected view")
+            .expect("approval view exists");
+        assert_eq!(view.display_summary, Some(summary.clone()));
+        drop(model);
+
+        let mut rebuilt = LocalReadModel::open(LocalReadModelConfig {
+            database_path: rebuilt_database_path,
+            epoch: "epoch-rebuilt".to_owned(),
+            key: LocalReadModelKey::new([0x4b; 32]),
+        })
+        .expect("open rebuilt projection");
+        rebuilt
+            .apply_adapter_approval(&input)
+            .expect("replay retained observation into rebuilt projection");
+        let rebuilt_view = rebuilt
+            .get_harness_approval_view(
+                "approval-1",
+                ApprovalViewAccess {
+                    can_read: true,
+                    can_decide: false,
+                },
+            )
+            .expect("read rebuilt view")
+            .expect("rebuilt approval view exists");
+        assert_eq!(rebuilt_view.display_summary, Some(summary));
+        drop(rebuilt);
+        fs::remove_dir_all(root).expect("remove projection root");
     }
 }

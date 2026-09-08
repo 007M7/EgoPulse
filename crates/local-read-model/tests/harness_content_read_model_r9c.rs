@@ -195,6 +195,7 @@ fn approval_input() -> AdapterApprovalProjectionInput {
                 action_digest_sha256: "a".repeat(64),
                 requested_scope_ref: "safe://scope/001".to_owned(),
                 display_summary_ref: "safe://summary/001".to_owned(),
+                display_summary: None,
                 native_routing_ref: String::new(),
                 lifecycle: ApprovalRequestLifecycleKind::Open as i32,
                 request_revision: 1,

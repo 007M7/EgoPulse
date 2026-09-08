@@ -7,17 +7,19 @@ use std::{
 use egopulse_client_kernel::authorization_contract_ref;
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::ContractReference,
-    harness::v1::{ApprovalRequestLifecycleKind, harness_observation},
+    harness::v1::{ApprovalRequestLifecycleKind, ApprovalRequestObservation, harness_observation},
     policy::v1::{
         ConsumeHarnessApprovalDecisionCommand, HarnessApprovalDecisionRecord,
         HarnessApprovalRequestBinding, IssueHarnessApprovalDecisionCommand, PolicyAuthorityProof,
     },
 };
-use egopulse_harness_adapter::{AdapterEdge, AdapterEdgeError};
+use egopulse_harness_adapter::{AdapterEdge, AdapterEdgeError, RetainedApprovalAuthorization};
 use egopulse_policy_decision_authority::{
     AuthenticatedPolicyPrincipal, PolicyReferenceRejection, PolicyReferenceResolver,
     ResolvedApprovalAuthorization,
 };
+use prost::Message;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// The reviewed local-user policy used by the first single-Harness vertical.
@@ -65,7 +67,9 @@ impl LocalUserPolicyResolver {
         }
         let mut adapter_ids = BTreeSet::new();
         if config.adapters.iter().any(|adapter| {
-            adapter.adapter_id.trim().is_empty() || !adapter_ids.insert(adapter.adapter_id.clone())
+            adapter.adapter_id.trim().is_empty()
+                || adapter.edge.adapter_id() != adapter.adapter_id
+                || !adapter_ids.insert(adapter.adapter_id.clone())
         }) {
             return Err(LocalUserPolicyConfigurationError::InvalidConfiguration);
         }
@@ -133,29 +137,61 @@ impl PolicyReferenceResolver for LocalUserPolicyResolver {
         let expires_at = timestamp_after(&now, self.decision_ttl)?;
         let mut matched = None;
         for adapter in &self.adapters {
-            let projections = adapter
+            let snapshot = adapter
                 .edge
                 .lock()
                 .map_err(|_| PolicyReferenceRejection::IntegrityFailure)?
-                .pending_approval_projection_messages()
+                .approval_authorization_snapshot()
                 .map_err(map_edge_error)?;
-            for projection in projections.into_iter().filter(|value| {
-                value.observation.payload.as_ref().is_some_and(|payload| {
-                    matches!(
-                        payload,
-                        harness_observation::Payload::ApprovalRequest(request)
-                            if request.approval_request_id == command.approval_request_id
-                    )
-                })
+            let mut adapter_match: Option<RetainedApprovalAuthorization> = None;
+            for entry in snapshot.entries.into_iter().filter(|value| {
+                value
+                    .projection
+                    .observation
+                    .payload
+                    .as_ref()
+                    .is_some_and(|payload| {
+                        matches!(
+                            payload,
+                            harness_observation::Payload::ApprovalRequest(request)
+                                if request.approval_request_id == command.approval_request_id
+                        )
+                    })
             }) {
+                let projection = &entry.projection;
+                let request_revision = match projection.observation.payload.as_ref() {
+                    Some(harness_observation::Payload::ApprovalRequest(request)) => {
+                        request.request_revision
+                    }
+                    _ => return Err(PolicyReferenceRejection::IntegrityFailure),
+                };
+                if request_revision == 0
+                    || adapter_match.as_ref().is_some_and(|current| {
+                        let current_revision = match current.projection.observation.payload.as_ref()
+                        {
+                            Some(harness_observation::Payload::ApprovalRequest(request)) => {
+                                request.request_revision
+                            }
+                            _ => 0,
+                        };
+                        request_revision <= current_revision
+                            || projection.source_revision <= current.projection.source_revision
+                    })
+                {
+                    return Err(PolicyReferenceRejection::IntegrityFailure);
+                }
+                adapter_match = Some(entry);
+            }
+            if let Some(projection) = adapter_match {
                 if matched.is_some() {
                     return Err(PolicyReferenceRejection::IntegrityFailure);
                 }
-                matched = Some((adapter.adapter_id.clone(), projection));
+                matched = Some((adapter, projection));
             }
         }
-        let (adapter_id, projection) = matched.ok_or(PolicyReferenceRejection::NotFound)?;
-        let request = match projection.observation.payload {
+        let (adapter, entry) = matched.ok_or(PolicyReferenceRejection::NotFound)?;
+        let projection = &entry.projection;
+        let request = match projection.observation.payload.as_ref() {
             Some(harness_observation::Payload::ApprovalRequest(request)) => request,
             _ => return Err(PolicyReferenceRejection::IntegrityFailure),
         };
@@ -172,8 +208,10 @@ impl PolicyReferenceResolver for LocalUserPolicyResolver {
         {
             return Err(PolicyReferenceRejection::RequestMismatch);
         }
+        let request = private_approval_request(&entry)?;
+        let projection = entry.projection;
         let binding = HarnessApprovalRequestBinding {
-            adapter_id,
+            adapter_id: adapter.adapter_id.clone(),
             attempt_id: projection.attempt_id,
             dispatch_id: projection.dispatch_id,
             fencing_token: projection.fencing_token,
@@ -283,6 +321,63 @@ fn timestamp_after(
     })
 }
 
+/// Public projections deliberately omit native routing. Recover it only from
+/// the exact retained private observation, after validating the public/private
+/// join and the owning dispatch. Raw bytes never leave this resolver.
+fn private_approval_request(
+    entry: &RetainedApprovalAuthorization,
+) -> Result<ApprovalRequestObservation, PolicyReferenceRejection> {
+    let projection = &entry.projection;
+    let evidence = &entry.evidence;
+    let envelope = &entry.envelope;
+    if entry.lineage.as_ref().is_none_or(|lineage| {
+        lineage.task_id.trim().is_empty()
+            || lineage.task_revision == 0
+            || lineage.work_revision == 0
+    }) || evidence.observation.observation_id != projection.source_observation_id
+        || evidence.observation.observation_sequence != projection.source_revision
+        || evidence.observation.native_event_digest_sha256
+            != format!("{:x}", Sha256::digest(&evidence.raw_event))
+        || projection.payload_digest_sha256
+            != format!(
+                "{:x}",
+                Sha256::digest(projection.observation.encode_to_vec())
+            )
+        || envelope.run_id != projection.run_id
+        || envelope.step_id != projection.step_id
+        || envelope.attempt_id != projection.attempt_id
+        || envelope.dispatch_id != projection.dispatch_id
+        || envelope.fencing_token != projection.fencing_token
+        || evidence.observation.capability_profile_id.trim().is_empty()
+        || envelope
+            .capability_profile_ref
+            .as_ref()
+            .map(|profile| profile.contract_id.as_str())
+            != Some(evidence.observation.capability_profile_id.as_str())
+        || envelope
+            .route_binding
+            .as_ref()
+            .map(|route| route.capability_profile_id.as_str())
+            != Some(evidence.observation.capability_profile_id.as_str())
+    {
+        return Err(PolicyReferenceRejection::IntegrityFailure);
+    }
+    let mut sanitized = evidence.observation.clone();
+    let request = match sanitized.payload.as_mut() {
+        Some(harness_observation::Payload::ApprovalRequest(request)) => request,
+        _ => return Err(PolicyReferenceRejection::IntegrityFailure),
+    };
+    if request.native_routing_ref.trim().is_empty() {
+        return Err(PolicyReferenceRejection::IntegrityFailure);
+    }
+    let private_request = request.clone();
+    request.native_routing_ref.clear();
+    if sanitized != projection.observation {
+        return Err(PolicyReferenceRejection::IntegrityFailure);
+    }
+    Ok(private_request)
+}
+
 fn map_edge_error(error: AdapterEdgeError) -> PolicyReferenceRejection {
     match error {
         AdapterEdgeError::Sql(_)
@@ -306,7 +401,8 @@ mod tests {
     use egopulse_domain_contracts::v01::egopulse::{
         harness::v1::{
             ApprovalDecision, ApprovalDecisionReceipt, ApprovalKind, ApprovalRequestObservation,
-            DeliveryDisposition, DispatchEnvelope, HarnessObservation, harness_observation,
+            DeliveryDisposition, DispatchEnvelope, DispatchRouteBinding, HarnessObservation,
+            harness_observation,
         },
         policy::v1::{
             ConsumeHarnessApprovalDecisionCommand, HarnessApprovalDecisionRecord,
@@ -369,11 +465,21 @@ mod tests {
                 dispatch_id: format!("dispatch-{adapter_id}"),
                 dispatch_fingerprint: "f".repeat(64),
                 fencing_token: 7,
+                capability_profile_ref: Some(ContractReference {
+                    contract_id: "profile:policy-test".to_owned(),
+                    ..Default::default()
+                }),
+                route_binding: Some(DispatchRouteBinding {
+                    capability_profile_id: "profile:policy-test".to_owned(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             1,
         )
         .expect("prepare dispatch");
+        edge.bind_dispatch_task_lineage(&format!("dispatch-{adapter_id}"), "task-policy", 1, 1, 1)
+            .expect("bind task lineage");
         edge.append_observation(
             &format!("dispatch-{adapter_id}"),
             &format!("native-{approval_request_id}"),
@@ -382,6 +488,7 @@ mod tests {
                 attempt_id: format!("attempt-{adapter_id}"),
                 dispatch_id: format!("dispatch-{adapter_id}"),
                 fencing_token: 7,
+                capability_profile_id: "profile:policy-test".to_owned(),
                 payload: Some(harness_observation::Payload::ApprovalRequest(
                     ApprovalRequestObservation {
                         approval_request_id: approval_request_id.to_owned(),
@@ -389,6 +496,7 @@ mod tests {
                         action_digest_sha256: "a".repeat(64),
                         requested_scope_ref: "scope://safe".to_owned(),
                         display_summary_ref: format!("summary://{approval_request_id}"),
+                        display_summary: None,
                         native_routing_ref: format!("native://{approval_request_id}"),
                         lifecycle: ApprovalRequestLifecycleKind::Open as i32,
                         request_revision: 1,
@@ -400,6 +508,21 @@ mod tests {
         )
         .expect("append approval observation");
         edge
+    }
+
+    fn acknowledge_pending_approval_projections(edge: &mut AdapterEdge) {
+        let pending = edge
+            .pending_approval_projection_messages()
+            .expect("read pending approval projections");
+        for projection in pending {
+            assert!(
+                edge.acknowledge_approval_projection_message(
+                    &projection.message_id,
+                    &projection.payload_digest_sha256,
+                )
+                .expect("acknowledge approval projection")
+            );
+        }
     }
 
     #[test]
@@ -463,6 +586,77 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_request_with_later_withdrawal_rejects_the_old_open_command() {
+        let root = edge_root();
+        let mut edge =
+            edge_with_pending_approval(&root, "adapter.db", "codex", "approval-withdrawn", 0x55);
+        let open = edge
+            .pending_approval_projection_messages()
+            .expect("read open approval projection")
+            .pop()
+            .expect("open approval projection exists");
+        acknowledge_pending_approval_projections(&mut edge);
+        edge.append_observation(
+            "dispatch-codex",
+            "native-approval-withdrawn-revision-2",
+            b"approval-request-withdrawn-raw",
+            HarnessObservation {
+                attempt_id: "attempt-codex".to_owned(),
+                dispatch_id: "dispatch-codex".to_owned(),
+                fencing_token: 7,
+                payload: Some(harness_observation::Payload::ApprovalRequest(
+                    ApprovalRequestObservation {
+                        approval_request_id: "approval-withdrawn".to_owned(),
+                        kind: ApprovalKind::Command as i32,
+                        action_digest_sha256: "a".repeat(64),
+                        requested_scope_ref: "scope://safe".to_owned(),
+                        display_summary_ref: "summary://approval-withdrawn".to_owned(),
+                        display_summary: None,
+                        native_routing_ref: "native://approval-withdrawn".to_owned(),
+                        lifecycle: ApprovalRequestLifecycleKind::Withdrawn as i32,
+                        request_revision: 2,
+                    },
+                )),
+                ..Default::default()
+            },
+            3,
+        )
+        .expect("append withdrawn approval observation");
+        acknowledge_pending_approval_projections(&mut edge);
+
+        let resolver = LocalUserPolicyResolver::new(LocalUserPolicyResolverConfig {
+            edge,
+            adapter_id: "codex".to_owned(),
+            authorization_policy_ref: authorization_contract_ref(),
+            authentication_context_ref: "local-ipc:test".to_owned(),
+            allowed_scope_refs: BTreeSet::from(["scope://safe".to_owned()]),
+            decision_ttl: Duration::from_secs(300),
+        })
+        .expect("valid local user policy");
+        let error = resolver
+            .resolve_issue(
+                &IssueHarnessApprovalDecisionCommand {
+                    approval_request_id: "approval-withdrawn".to_owned(),
+                    expected_action_digest_sha256: "a".repeat(64),
+                    expected_request_observation_id: open.source_observation_id,
+                    expected_request_observation_sequence: open.source_revision,
+                    expected_request_revision: 1,
+                    reason_code: "stale-open-request".to_owned(),
+                    ..Default::default()
+                },
+                &AuthenticatedPolicyPrincipal {
+                    kind: egopulse_policy_decision_authority::PolicyPrincipalKind::LocalUser,
+                    principal_id: "os-user:test".to_owned(),
+                    authenticated: true,
+                },
+            )
+            .expect_err("withdrawn latest request must reject the old Open command");
+        assert_eq!(error, PolicyReferenceRejection::RequestMismatch);
+        drop(resolver);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn multi_provider_policy_routes_exactly_one_adapter_and_rejects_collisions() {
         let root = edge_root();
         let codex = edge_with_pending_approval(&root, "codex.db", "codex", "approval-codex", 0x51);
@@ -515,20 +709,22 @@ mod tests {
         assert_eq!(resolved.request.adapter_id, "opencode");
 
         drop(resolver);
-        let duplicate_a = edge_with_pending_approval(
+        let mut duplicate_a = edge_with_pending_approval(
             &root,
             "duplicate-a.db",
             "duplicate-a",
             "approval-collision",
             0x53,
         );
-        let duplicate_b = edge_with_pending_approval(
+        let mut duplicate_b = edge_with_pending_approval(
             &root,
             "duplicate-b.db",
             "duplicate-b",
             "approval-collision",
             0x54,
         );
+        acknowledge_pending_approval_projections(&mut duplicate_a);
+        acknowledge_pending_approval_projections(&mut duplicate_b);
         let collision = LocalUserPolicyResolver::new_multi(LocalUserPolicyResolverMultiConfig {
             adapters: vec![
                 LocalUserPolicyAdapterConfig {
@@ -561,6 +757,157 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_private_request_issues_through_the_real_policy_authority() {
+        use egopulse_domain_contracts::v01::egopulse::{
+            common::v1::CommandMetadata,
+            policy::v1::{PolicyDecisionCommand, policy_decision_command},
+        };
+        use egopulse_policy_decision_authority::{
+            PolicyAuthorityConfig, PolicyDecisionAuthority, PolicySqlCipherKey,
+            canonical_request_digest,
+        };
+
+        let root = edge_root();
+        let mut edge =
+            edge_with_pending_approval(&root, "adapter.db", "codex", "approval-issue", 0x56);
+        let projection = edge
+            .pending_approval_projection_messages()
+            .expect("projection")
+            .remove(0);
+        acknowledge_pending_approval_projections(&mut edge);
+        let entry = edge
+            .approval_authorization_snapshot()
+            .expect("consistent owner snapshot")
+            .entries
+            .remove(0);
+        let request = private_approval_request(&entry).expect("private binding");
+        assert_eq!(request.native_routing_ref, "native://approval-issue");
+        for field in 0..8 {
+            let mut changed = entry.clone();
+            match field {
+                0 => changed.projection.observation.native_event_digest_sha256 = "0".repeat(64),
+                1 => {
+                    changed.projection.observation.capability_profile_id =
+                        "profile:other".to_owned()
+                }
+                2 => changed.projection.fencing_token += 1,
+                3 => changed.projection.run_id = "run-other".to_owned(),
+                4 => changed.projection.source_revision += 1,
+                5 => changed.evidence.raw_event.push(b'x'),
+                6 => changed.lineage = None,
+                _ => changed.envelope.route_binding = None,
+            }
+            assert_eq!(
+                private_approval_request(&changed),
+                Err(PolicyReferenceRejection::IntegrityFailure)
+            );
+        }
+        let public = match projection
+            .observation
+            .payload
+            .as_ref()
+            .expect("public payload")
+        {
+            harness_observation::Payload::ApprovalRequest(request) => request,
+            _ => panic!("approval payload"),
+        };
+        assert!(public.native_routing_ref.is_empty());
+        let resolver = LocalUserPolicyResolver::new(LocalUserPolicyResolverConfig {
+            edge,
+            adapter_id: "codex".to_owned(),
+            authorization_policy_ref: authorization_contract_ref(),
+            authentication_context_ref: "local-ipc:test".to_owned(),
+            allowed_scope_refs: BTreeSet::from(["scope://safe".to_owned()]),
+            decision_ttl: Duration::from_secs(300),
+        })
+        .expect("resolver");
+        let mut authority = PolicyDecisionAuthority::open(
+            PolicyAuthorityConfig {
+                database_path: root.join("policy.db"),
+                store_epoch: "policy-issue-test".to_owned(),
+                key: PolicySqlCipherKey::new([0x57; 32]),
+            },
+            resolver,
+        )
+        .expect("real policy authority");
+        let mut command = PolicyDecisionCommand {
+            command: Some(
+                policy_decision_command::Command::IssueHarnessApprovalDecision(
+                    IssueHarnessApprovalDecisionCommand {
+                        metadata: Some(CommandMetadata {
+                            command_id: "policy-issue-test".to_owned(),
+                            idempotency_key: "policy-issue-test".to_owned(),
+                            idempotency_scope: "policy-test".to_owned(),
+                            issued_at: Some(current_timestamp().expect("time")),
+                            correlation_id: "policy-issue-test".to_owned(),
+                            ..Default::default()
+                        }),
+                        approval_request_id: public.approval_request_id.clone(),
+                        expected_action_digest_sha256: public.action_digest_sha256.clone(),
+                        expected_request_observation_id: projection.source_observation_id,
+                        expected_request_observation_sequence: projection.source_revision,
+                        expected_request_revision: public.request_revision,
+                        decision: ApprovalDecision::AllowOnce as i32,
+                        reason_code: "ISOLATED_POLICY_TEST".to_owned(),
+                        ..Default::default()
+                    },
+                ),
+            ),
+        };
+        let digest = canonical_request_digest(&command);
+        let Some(policy_decision_command::Command::IssueHarnessApprovalDecision(issue)) =
+            command.command.as_mut()
+        else {
+            panic!("issue")
+        };
+        issue
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .request_digest_sha256 = digest;
+        let principal = AuthenticatedPolicyPrincipal {
+            kind: egopulse_policy_decision_authority::PolicyPrincipalKind::LocalUser,
+            principal_id: "os-user:test".to_owned(),
+            authenticated: true,
+        };
+        let result = authority
+            .execute(&command, &principal)
+            .expect("execute issue");
+        assert!(
+            result.committed,
+            "Policy rejected trusted request: {:?}",
+            result.safe_error_fingerprint
+        );
+        assert!(
+            authority
+                .execute(&command, &principal)
+                .expect("exact replay")
+                .replayed
+        );
+        drop(authority);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn policy_configuration_rejects_an_adapter_owner_alias() {
+        let root = edge_root();
+        let edge = edge_with_pending_approval(&root, "adapter.db", "codex", "approval-owner", 0x58);
+        let configured = LocalUserPolicyResolver::new(LocalUserPolicyResolverConfig {
+            edge,
+            adapter_id: "other-owner".to_owned(),
+            authorization_policy_ref: authorization_contract_ref(),
+            authentication_context_ref: "local-ipc:test".to_owned(),
+            allowed_scope_refs: BTreeSet::from(["scope://safe".to_owned()]),
+            decision_ttl: Duration::from_secs(300),
+        });
+        assert!(matches!(
+            configured,
+            Err(LocalUserPolicyConfigurationError::InvalidConfiguration)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn policy_resolver_builds_binding_from_durable_adapter_projection() {
         let root = edge_root();
         let mut edge = AdapterEdge::open(AdapterEdgeConfig {
@@ -581,11 +928,21 @@ mod tests {
                 dispatch_id: "dispatch-1".to_owned(),
                 dispatch_fingerprint: "f".repeat(64),
                 fencing_token: 7,
+                capability_profile_ref: Some(ContractReference {
+                    contract_id: "profile:policy-test".to_owned(),
+                    ..Default::default()
+                }),
+                route_binding: Some(DispatchRouteBinding {
+                    capability_profile_id: "profile:policy-test".to_owned(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             1,
         )
         .expect("prepare dispatch");
+        edge.bind_dispatch_task_lineage("dispatch-1", "task-policy", 1, 1, 1)
+            .expect("bind task lineage");
         edge.append_observation(
             "dispatch-1",
             "native-approval-1",
@@ -594,6 +951,7 @@ mod tests {
                 attempt_id: "attempt-1".to_owned(),
                 dispatch_id: "dispatch-1".to_owned(),
                 fencing_token: 7,
+                capability_profile_id: "profile:policy-test".to_owned(),
                 payload: Some(harness_observation::Payload::ApprovalRequest(
                     ApprovalRequestObservation {
                         approval_request_id: "approval-1".to_owned(),
@@ -601,6 +959,7 @@ mod tests {
                         action_digest_sha256: "a".repeat(64),
                         requested_scope_ref: "scope://safe".to_owned(),
                         display_summary_ref: "summary://approval-1".to_owned(),
+                        display_summary: None,
                         native_routing_ref: "native://approval-1".to_owned(),
                         lifecycle: ApprovalRequestLifecycleKind::Open as i32,
                         request_revision: 3,
@@ -636,6 +995,18 @@ mod tests {
             .expect("read approval projection")
             .pop()
             .expect("approval projection exists");
+        assert!(
+            edge.acknowledge_approval_projection_message(
+                &projection.message_id,
+                &projection.payload_digest_sha256,
+            )
+            .expect("acknowledge approval projection")
+        );
+        assert!(
+            edge.pending_approval_projection_messages()
+                .expect("projection outbox drained")
+                .is_empty()
+        );
         let resolver = LocalUserPolicyResolver::new(LocalUserPolicyResolverConfig {
             edge,
             adapter_id: "codex".to_owned(),
@@ -668,6 +1039,7 @@ mod tests {
         assert_eq!(resolved.request.dispatch_id, "dispatch-1");
         assert_eq!(resolved.request.fencing_token, 7);
         assert_eq!(resolved.request.request_revision, 3);
+        assert_eq!(resolved.request.native_routing_ref, "native://approval-1");
         assert_eq!(
             resolved.authority_proof.authenticated_principal_id,
             "os-user:test"

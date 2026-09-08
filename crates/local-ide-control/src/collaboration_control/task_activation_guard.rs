@@ -7,9 +7,9 @@ use super::{
     RecordDispatchIntentCommand, RecordHarnessAckCommand, RecordRunningObservationCommand,
     ReferenceAuthorization, ReferenceGuardRejection, RequestAttemptCancellationCommand,
     ResolvedArtifactReturn, ResolvedHarnessEvidence, ResolvedStepReturn, RunSnapshot,
-    SingleHarnessWorkConfig, StepSnapshot,
+    SingleHarnessWorkConfig, StepSnapshot, TaskCancellationHandoff,
 };
-use egopulse_domain_contracts::v01::egopulse::collaboration::v1::RunPlan;
+use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{AttemptStatus, RunPlan};
 use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
 use egopulse_domain_contracts::v01::egopulse::task::v1::{TaskSnapshot, TaskStatus};
 use std::sync::{Arc, Mutex};
@@ -37,12 +37,32 @@ pub struct TaskActivationReferenceGuard {
 /// Harness Adapter continue to share one runtime and one durable writer.
 #[derive(Clone, Default)]
 pub struct TaskActivationReferenceHandle {
-    state: Arc<Mutex<Option<TaskActivationReferenceGuard>>>,
+    state: Arc<Mutex<TaskReferenceState>>,
+}
+
+#[derive(Default)]
+struct TaskReferenceState {
+    activation: Option<TaskActivationReferenceGuard>,
+    cancellation: Option<TaskCancellationReferenceGuard>,
+}
+
+/// A short-lived proof installed only while one already-validated Task
+/// cancellation handoff is committed into its exact Collaboration attempt.
+/// The Task event itself remains owned by Task Authority; this value never
+/// grants another Task, Run, Attempt, or retry permission.
+#[derive(Clone, Debug, PartialEq)]
+struct TaskCancellationReferenceGuard {
+    handoff: TaskCancellationHandoff,
+    run: RunSnapshot,
+    step: StepSnapshot,
+    attempt: AttemptSnapshot,
 }
 
 impl TaskActivationReferenceHandle {
-    pub(crate) fn new(state: Arc<Mutex<Option<TaskActivationReferenceGuard>>>) -> Self {
-        Self { state }
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TaskReferenceState::default())),
+        }
     }
 
     pub(crate) fn bind(
@@ -52,11 +72,32 @@ impl TaskActivationReferenceHandle {
         lease_ttl_seconds: u64,
     ) -> Result<(), ()> {
         let mut state = self.state.lock().map_err(|_| ())?;
-        *state = Some(TaskActivationReferenceGuard::new(
+        state.activation = Some(TaskActivationReferenceGuard::new(
             task,
             config,
             lease_ttl_seconds,
         ));
+        state.cancellation = None;
+        Ok(())
+    }
+
+    pub(crate) fn bind_cancellation(
+        &self,
+        handoff: TaskCancellationHandoff,
+        snapshot: &CollaborationSnapshot,
+        attempt: &AttemptSnapshot,
+    ) -> Result<(), ()> {
+        let guard = TaskCancellationReferenceGuard::new(handoff, snapshot, attempt)?;
+        let mut state = self.state.lock().map_err(|_| ())?;
+        state.cancellation = Some(guard);
+        Ok(())
+    }
+
+    /// Clears the one-shot cancellation binding before the runner can process
+    /// another handoff. A failed/aborted commit cannot authorize a later Task.
+    pub(crate) fn clear_cancellation(&self) -> Result<(), ()> {
+        let mut state = self.state.lock().map_err(|_| ())?;
+        state.cancellation = None;
         Ok(())
     }
 
@@ -69,6 +110,22 @@ impl TaskActivationReferenceHandle {
             .lock()
             .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?;
         state
+            .activation
+            .as_ref()
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)
+            .and_then(operation)
+    }
+
+    fn with_cancellation_guard<T>(
+        &self,
+        operation: impl FnOnce(&TaskCancellationReferenceGuard) -> Result<T, ReferenceGuardRejection>,
+    ) -> Result<T, ReferenceGuardRejection> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?;
+        state
+            .cancellation
             .as_ref()
             .ok_or(ReferenceGuardRejection::UnverifiedReference)
             .and_then(operation)
@@ -86,7 +143,7 @@ pub struct TaskActivationGuardSet<E> {
 impl<E> TaskActivationGuardSet<E> {
     #[must_use]
     pub fn new(evidence: E) -> (Self, TaskActivationReferenceHandle) {
-        let handle = TaskActivationReferenceHandle::new(Arc::new(Mutex::new(None)));
+        let handle = TaskActivationReferenceHandle::new();
         (
             Self {
                 reference: handle.clone(),
@@ -160,7 +217,7 @@ where
         snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
         self.reference
-            .with_guard(|guard| guard.validate_cancellation_request(command, snapshot))
+            .with_cancellation_guard(|guard| guard.validate_cancellation_request(command, snapshot))
     }
 }
 
@@ -208,6 +265,14 @@ where
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
         self.evidence
             .validate_cancellation_outcome(command, snapshot)
+    }
+
+    fn resolve_cancellation_return(
+        &self,
+        command: &RecordAttemptCancellationOutcomeCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ResolvedArtifactReturn, ReferenceGuardRejection> {
+        self.evidence.resolve_cancellation_return(command, snapshot)
     }
 
     fn validate_reconciliation(
@@ -275,6 +340,128 @@ impl TaskActivationReferenceGuard {
     fn step_is_planned(&self, step_id: &str) -> bool {
         self.plan.steps.iter().any(|step| step.step_id == step_id)
     }
+}
+
+impl TaskCancellationReferenceGuard {
+    fn new(
+        handoff: TaskCancellationHandoff,
+        snapshot: &CollaborationSnapshot,
+        attempt: &AttemptSnapshot,
+    ) -> Result<Self, ()> {
+        let run_id = handoff
+            .task
+            .current_run_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or(())?;
+        let run = snapshot
+            .run
+            .as_ref()
+            .filter(|run| {
+                run.run_id == run_id
+                    && run.task_id == handoff.task.task_id
+                    && run.work_revision == handoff.task.work_revision
+            })
+            .ok_or(())?;
+        let step = snapshot
+            .steps
+            .iter()
+            .find(|step| step.step_id == attempt.step_id && step.run_id == run_id)
+            .ok_or(())?;
+        if handoff.message_id.trim().is_empty()
+            || handoff.payload_digest_sha256.len() != 64
+            || !handoff
+                .payload_digest_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || handoff.cancellation_request_id.trim().is_empty()
+            || handoff.task.task_id.trim().is_empty()
+            || handoff.task.status != TaskStatus::CancellationPending as i32
+            || attempt.run_id != run_id
+            || attempt
+                .dispatch_id
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            || !matches!(
+                AttemptStatus::try_from(attempt.status),
+                Ok(AttemptStatus::DispatchPending
+                    | AttemptStatus::Dispatched
+                    | AttemptStatus::Acknowledged
+                    | AttemptStatus::Running)
+            )
+        {
+            return Err(());
+        }
+        Ok(Self {
+            handoff,
+            run: run.clone(),
+            step: step.clone(),
+            attempt: attempt.clone(),
+        })
+    }
+
+    fn validate_cancellation_request(
+        &self,
+        command: &RequestAttemptCancellationCommand,
+        snapshot: &CollaborationSnapshot,
+    ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+        let base = command
+            .base
+            .as_ref()
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        let meta = base
+            .meta
+            .as_ref()
+            .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+        if command.task_cancellation_request_id != self.handoff.cancellation_request_id
+            || base.run_id != self.run.run_id
+            || base.expected_run_revision != self.run.revision
+            || base.step_id != self.step.step_id
+            || base.expected_step_revision != self.step.revision
+            || base.attempt_id != self.attempt.attempt_id
+            || base.expected_attempt_revision != self.attempt.revision
+            || meta.command_id
+                != format!(
+                    "task-cancellation-delivery:{}",
+                    self.handoff.cancellation_request_id
+                )
+            || meta.idempotency_key != self.handoff.cancellation_request_id
+            || meta.idempotency_scope != self.attempt.attempt_id
+            || meta.issued_at.as_ref() != Some(&self.handoff.requested_at)
+            || meta.correlation_id != self.handoff.task.task_id
+            || meta.causation_id.as_deref() != Some(self.handoff.cancellation_request_id.as_str())
+            || !complete_lowercase_sha256(&meta.request_digest_sha256)
+            || snapshot.run.as_ref() != Some(&self.run)
+            || snapshot
+                .steps
+                .iter()
+                .find(|step| step.step_id == self.step.step_id)
+                != Some(&self.step)
+            || snapshot
+                .attempts
+                .iter()
+                .find(|attempt| attempt.attempt_id == self.attempt.attempt_id)
+                != Some(&self.attempt)
+        {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
+        }
+        Ok(ReferenceAuthorization {
+            evidence_refs: vec![format!(
+                "task-cancellation:{}@{}#{}:{}",
+                self.handoff.task.task_id,
+                self.handoff.task.revision,
+                self.handoff.task.work_revision,
+                self.handoff.message_id
+            )],
+        })
+    }
+}
+
+fn complete_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl CollaborationReferenceGuard for TaskActivationReferenceGuard {
@@ -413,8 +600,56 @@ impl CollaborationReferenceGuard for TaskActivationReferenceGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{CreateRunCommand, StepPlan};
+    use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
+        AttemptCommandBase, CreateRunCommand, Lease, RequestAttemptCancellationCommand, StepPlan,
+    };
+    use egopulse_domain_contracts::v01::egopulse::common::v1::CommandMetadata;
     use egopulse_domain_contracts::v01::egopulse::harness::v1::NativeSessionStrategy;
+    use prost_types::Timestamp;
+
+    struct DenyEvidence;
+
+    impl HarnessEvidenceResolver for DenyEvidence {
+        fn resolve_delivery_receipt(
+            &self,
+            _command: &RecordDeliveryReceiptCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn resolve_harness_ack(
+            &self,
+            _command: &RecordHarnessAckCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn validate_running_observation(
+            &self,
+            _command: &RecordRunningObservationCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn validate_cancellation_outcome(
+            &self,
+            _command: &RecordAttemptCancellationOutcomeCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn validate_reconciliation(
+            &self,
+            _command: &RecordAttemptReconciliationCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+    }
 
     fn contract_ref(id: &str) -> ContractReference {
         ContractReference {
@@ -452,6 +687,296 @@ mod tests {
             attempt_supervisor_principal_id: "attempt-supervisor:001".to_owned(),
             harness_adapter_principal_id: "adapter:codex".to_owned(),
         }
+    }
+
+    fn cancellation_snapshot() -> (CollaborationSnapshot, AttemptSnapshot) {
+        let attempt = AttemptSnapshot {
+            attempt_id: "attempt-cancel-001".to_owned(),
+            run_id: "run-cancel-001".to_owned(),
+            step_id: "step-cancel-001".to_owned(),
+            revision: 7,
+            status: AttemptStatus::Running as i32,
+            dispatch_id: Some("dispatch-cancel-001".to_owned()),
+            lease: Some(Lease {
+                lease_id: "lease-cancel-001".to_owned(),
+                fencing_token: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        (
+            CollaborationSnapshot {
+                run: Some(RunSnapshot {
+                    run_id: "run-cancel-001".to_owned(),
+                    task_id: "task-cancel-001".to_owned(),
+                    revision: 5,
+                    work_revision: 2,
+                    ..Default::default()
+                }),
+                steps: vec![StepSnapshot {
+                    step_id: "step-cancel-001".to_owned(),
+                    run_id: "run-cancel-001".to_owned(),
+                    revision: 6,
+                    ..Default::default()
+                }],
+                attempts: vec![attempt.clone()],
+            },
+            attempt,
+        )
+    }
+
+    fn cancellation_handoff() -> TaskCancellationHandoff {
+        TaskCancellationHandoff {
+            message_id: "task-outbox-cancellation-001".to_owned(),
+            payload_digest_sha256: "a".repeat(64),
+            cancellation_request_id: "task-event-cancellation-001".to_owned(),
+            requested_at: Timestamp {
+                seconds: 123,
+                nanos: 456,
+            },
+            task: TaskSnapshot {
+                task_id: "task-cancel-001".to_owned(),
+                revision: 4,
+                work_revision: 2,
+                status: TaskStatus::CancellationPending as i32,
+                current_run_id: Some("run-cancel-001".to_owned()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn cancellation_command(
+        handoff: &TaskCancellationHandoff,
+        snapshot: &CollaborationSnapshot,
+        attempt: &AttemptSnapshot,
+    ) -> RequestAttemptCancellationCommand {
+        let run = snapshot.run.as_ref().expect("run");
+        let step = snapshot.steps.first().expect("step");
+        RequestAttemptCancellationCommand {
+            base: Some(AttemptCommandBase {
+                meta: Some(CommandMetadata {
+                    command_id: format!(
+                        "task-cancellation-delivery:{}",
+                        handoff.cancellation_request_id
+                    ),
+                    idempotency_key: handoff.cancellation_request_id.clone(),
+                    idempotency_scope: attempt.attempt_id.clone(),
+                    request_digest_sha256: "b".repeat(64),
+                    issued_at: Some(handoff.requested_at),
+                    correlation_id: handoff.task.task_id.clone(),
+                    causation_id: Some(handoff.cancellation_request_id.clone()),
+                }),
+                run_id: run.run_id.clone(),
+                expected_run_revision: run.revision,
+                step_id: step.step_id.clone(),
+                expected_step_revision: step.revision,
+                attempt_id: attempt.attempt_id.clone(),
+                expected_attempt_revision: attempt.revision,
+            }),
+            task_cancellation_request_id: handoff.cancellation_request_id.clone(),
+        }
+    }
+
+    #[test]
+    fn cancellation_proof_is_exact_one_shot_and_task_scoped() {
+        let (snapshot, attempt) = cancellation_snapshot();
+        let handoff = cancellation_handoff();
+        let handle = TaskActivationReferenceHandle::new();
+        handle
+            .bind_cancellation(handoff.clone(), &snapshot, &attempt)
+            .expect("bind exact Task cancellation handoff");
+
+        let command = cancellation_command(&handoff, &snapshot, &attempt);
+        assert!(
+            handle
+                .with_cancellation_guard(|guard| {
+                    guard.validate_cancellation_request(&command, &snapshot)
+                })
+                .is_ok()
+        );
+
+        let mut old_attempt = command.clone();
+        old_attempt
+            .base
+            .as_mut()
+            .expect("base")
+            .expected_attempt_revision -= 1;
+        assert!(
+            handle
+                .with_cancellation_guard(|guard| {
+                    guard.validate_cancellation_request(&old_attempt, &snapshot)
+                })
+                .is_err()
+        );
+
+        let mut forged_request = command.clone();
+        forged_request.task_cancellation_request_id = "task-event-forged".to_owned();
+        assert!(
+            handle
+                .with_cancellation_guard(|guard| {
+                    guard.validate_cancellation_request(&forged_request, &snapshot)
+                })
+                .is_err()
+        );
+
+        let mut other_task = handoff.clone();
+        other_task.task.task_id = "task-other-001".to_owned();
+        assert!(
+            handle
+                .bind_cancellation(other_task, &snapshot, &attempt)
+                .is_err()
+        );
+
+        handle.clear_cancellation().expect("clear one-shot proof");
+        assert!(
+            handle
+                .with_cancellation_guard(|guard| {
+                    guard.validate_cancellation_request(&command, &snapshot)
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_task_cancellation_handoff_commits_the_live_collaboration_attempt() {
+        let config = SingleHarnessWorkConfig {
+            run_id: "run-live-cancel-001".to_owned(),
+            attempt_id: "attempt-live-cancel-001".to_owned(),
+            dispatch_id: "dispatch-live-cancel-001".to_owned(),
+            plan: RunPlan {
+                plan_id: "plan-live-cancel-001".to_owned(),
+                digest_sha256: "c".repeat(64),
+                max_active_attempts: 1,
+                steps: vec![StepPlan {
+                    step_id: "step-live-cancel-001".to_owned(),
+                    step_kind: "implementation".to_owned(),
+                    input_bundle_ref: "input-live-cancel-001".to_owned(),
+                    expected_output_contract_ref: Some(contract_ref("output")),
+                    required_capability_profile_ref: Some(contract_ref("capability")),
+                    max_attempts: 2,
+                    ..Default::default()
+                }],
+                budget_profile_ref: Some(contract_ref("budget")),
+            },
+            harness_id: "codex".to_owned(),
+            capability_profile_ref: contract_ref("capability"),
+            workspace_ref: "workspace-live-cancel-001".to_owned(),
+            lease_policy_ref: contract_ref("lease"),
+            owner_instance_id: "owner-live-cancel-001".to_owned(),
+            material: DispatchMaterial {
+                input_bundle_sha256: "d".repeat(64),
+                sandbox_profile_ref: contract_ref("sandbox"),
+                tool_policy_ref: contract_ref("tool"),
+                data_egress_policy_ref: contract_ref("egress"),
+                approval_policy_ref: contract_ref("approval"),
+                session_strategy: NativeSessionStrategy::CreateNew,
+                native_session_ref: None,
+                checkpoint_ref: None,
+                route_binding: None,
+                evidence_refs: vec!["material:live-cancel".to_owned()],
+            },
+            task_authority_principal_id: "task-authority:live-cancel".to_owned(),
+            collaboration_principal_id: "collaboration-control:live-cancel".to_owned(),
+            attempt_supervisor_principal_id: "attempt-supervisor:live-cancel".to_owned(),
+            harness_adapter_principal_id: "adapter:live-cancel".to_owned(),
+        };
+        let active_task = TaskSnapshot {
+            task_id: "task-live-cancel-001".to_owned(),
+            revision: 1,
+            work_revision: 1,
+            status: TaskStatus::Active as i32,
+            current_run_id: Some(config.run_id.clone()),
+            ..Default::default()
+        };
+        let root =
+            std::env::temp_dir().join(format!("egopulse-live-cancel-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).expect("test root");
+        let (guard, reference) = TaskActivationGuardSet::new(DenyEvidence);
+        let mut control = super::super::CollaborationControl::open(
+            super::super::CollaborationControlConfig {
+                database_path: root.join("collaboration.sqlite3"),
+                store_epoch: "live-cancellation-guard-test-v1".to_owned(),
+                key: super::super::CollaborationSqlCipherKey::new([0x92; 32]),
+            },
+            guard,
+            super::super::SystemAuthorityClock,
+        )
+        .expect("Collaboration Control");
+        reference
+            .bind(active_task.clone(), &config, 60)
+            .expect("bind activation proof");
+        let result =
+            super::super::start_single_harness_workflow(&mut control, &active_task, &config)
+                .expect("real Collaboration activation");
+        let snapshot = match control
+            .get_collaboration(&result.run_id)
+            .expect("read Collaboration")
+            .outcome
+        {
+            Some(super::super::get_collaboration_response::Outcome::Snapshot(snapshot)) => snapshot,
+            _ => panic!("live Collaboration snapshot"),
+        };
+        let attempt = snapshot
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == result.attempt_id)
+            .expect("live attempt")
+            .clone();
+        let handoff = TaskCancellationHandoff {
+            message_id: "task-outbox-cancellation-live-001".to_owned(),
+            payload_digest_sha256: "e".repeat(64),
+            cancellation_request_id: "task-event-cancellation-live-001".to_owned(),
+            requested_at: Timestamp {
+                seconds: 234,
+                nanos: 0,
+            },
+            task: TaskSnapshot {
+                status: TaskStatus::CancellationPending as i32,
+                revision: 2,
+                ..active_task
+            },
+        };
+        reference
+            .bind_cancellation(handoff.clone(), &snapshot, &attempt)
+            .expect("bind exact cancellation proof");
+        let request = cancellation_command(&handoff, &snapshot, &attempt);
+        let mut command = super::super::CollaborationCommand {
+            command: Some(
+                super::super::collaboration_command::Command::RequestAttemptCancellation(request),
+            ),
+        };
+        assert!(super::super::seal_request_digest(&mut command).is_some());
+        let committed = control
+            .execute(
+                &command,
+                &super::super::AuthenticatedCollaborationPrincipal {
+                    kind: super::super::CollaborationPrincipalKind::CollaborationControl,
+                    principal_id: "collaboration-control:task-cancellation".to_owned(),
+                    authenticated: true,
+                },
+            )
+            .expect("commit cancellation request");
+        assert!(committed.committed_event.is_some());
+        reference
+            .clear_cancellation()
+            .expect("clear cancellation proof");
+        let after = match control
+            .get_collaboration(&result.run_id)
+            .expect("read committed Collaboration")
+            .outcome
+        {
+            Some(super::super::get_collaboration_response::Outcome::Snapshot(snapshot)) => snapshot,
+            _ => panic!("committed Collaboration snapshot"),
+        };
+        assert_eq!(
+            after.run.expect("run").status,
+            super::super::RunStatus::CancellationPending as i32
+        );
+        assert_eq!(
+            after.attempts[0].status,
+            AttemptStatus::CancellationPending as i32
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

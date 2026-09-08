@@ -97,6 +97,18 @@ pub trait VerdictReferenceResolver: Send + Sync + 'static {
         scope: &VerdictScope,
     ) -> Result<(), VerdictReferenceRejection>;
 
+    /// Late delivery may settle an application already committed while this
+    /// Verdict was live. Only the owning Task event/receipt can prove that
+    /// earlier application; ordinary expired requests remain rejected.
+    fn validate_task_commit_before_expiry(
+        &self,
+        _command: &ConsumeFounderVerdictCommand,
+        _scope: &VerdictScope,
+        _expires_at: &Timestamp,
+    ) -> Result<(), VerdictReferenceRejection> {
+        Err(VerdictReferenceRejection::TaskCommitReceiptInvalid)
+    }
+
     fn validate_revoke(
         &self,
         _command: &RevokeFounderVerdictCommand,
@@ -111,6 +123,18 @@ pub trait VerdictReferenceResolver: Send + Sync + 'static {
         _principal: &AuthenticatedVerdictPrincipal,
     ) -> Result<Vec<String>, VerdictReferenceRejection> {
         Err(VerdictReferenceRejection::PermissionDenied)
+    }
+
+    /// Supplies the immutable owner snapshot for exact Policy authorization
+    /// validation. Existing resolvers retain their explicit expiry policy.
+    fn validate_expiry_for_verdict(
+        &self,
+        command: &ExpireFounderVerdictCommand,
+        principal: &AuthenticatedVerdictPrincipal,
+        _verdict: &FounderVerdict,
+        _state: &FounderVerdictState,
+    ) -> Result<Vec<String>, VerdictReferenceRejection> {
+        self.validate_expiry(command, principal)
     }
 
     fn validate_supersede(
@@ -166,6 +190,15 @@ pub struct VerdictProjectionMessage {
     pub source_revision: u64,
     pub payload_digest_sha256: String,
     pub result: VerdictCommandResult,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingTaskVerdictHandoff {
+    pub message_id: String,
+    pub payload_digest_sha256: String,
+    pub event: VerdictEvent,
+    pub verdict: FounderVerdict,
+    pub state: FounderVerdictState,
 }
 
 #[derive(Debug, Error)]
@@ -343,6 +376,102 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
                 ))
             })
             .transpose()
+    }
+
+    pub fn get_for_task_application(
+        &self,
+        id: &str,
+    ) -> Result<Option<(FounderVerdict, FounderVerdictState)>, VerdictAuthorityFailure> {
+        let now = self.clock.now()?;
+        let Some((verdict, state)) = self.get(id)? else {
+            return Ok(None);
+        };
+        if !matches!(
+            FounderVerdictStateKind::try_from(state.state),
+            Ok(FounderVerdictStateKind::Issued)
+        ) || timestamp_after_or_equal(&now, verdict.expires_at.as_ref())
+        {
+            return Ok(None);
+        }
+        Ok(Some((verdict, state)))
+    }
+
+    pub fn pending_task_handoffs(
+        &self,
+    ) -> Result<Vec<PendingTaskVerdictHandoff>, VerdictAuthorityFailure> {
+        self.store
+            .pending_task_verdict_outbox()?
+            .into_iter()
+            .map(|pending| {
+                let actual_payload_digest = hex::encode(Sha256::digest(&pending.payload));
+                let event = VerdictEvent::decode(pending.payload.as_slice())?;
+                let stored_event = VerdictEvent::decode(pending.stored_event.as_slice())?;
+                let verdict = FounderVerdict::decode(pending.verdict.as_slice())?;
+                let state = FounderVerdictState::decode(pending.state.as_slice())?;
+                let state_kind = FounderVerdictStateKind::try_from(state.state)
+                    .unwrap_or(FounderVerdictStateKind::Unspecified);
+                let immutable_payload_valid =
+                    verdict_payload_matches(&verdict, &pending.verdict_payload_digest_sha256);
+                if actual_payload_digest != pending.payload_digest_sha256
+                    || pending.payload != pending.stored_event
+                    || event != stored_event
+                    || !matches!(
+                        VerdictEventKind::try_from(event.kind),
+                        Ok(VerdictEventKind::Issued)
+                    )
+                    || event.event_id != pending.source_event_id
+                    || event.founder_verdict_id != pending.event_verdict_id
+                    || event.resulting_state_revision != pending.event_revision
+                    || event.resulting_state_revision != 1
+                    || verdict.founder_verdict_id != event.founder_verdict_id
+                    || state.founder_verdict_id != event.founder_verdict_id
+                    || state.revision != pending.stored_state_revision
+                    || state.state != pending.stored_state_kind
+                    || state.revision < event.resulting_state_revision
+                    || state_kind == FounderVerdictStateKind::Unspecified
+                    || pending.event_request_digest_sha256.len() != 64
+                    || !pending
+                        .event_request_digest_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                    || pending.event_request_digest_sha256 != pending.receipt_request_digest_sha256
+                    || pending.receipt_aggregate_id != event.founder_verdict_id
+                    || pending.receipt_aggregate_revision != event.resulting_state_revision
+                    || pending.receipt_store_epoch != self.store.store_epoch()
+                    || !pending.receipt_acknowledged_after_durability_barrier
+                    || !immutable_payload_valid
+                {
+                    return Err(VerdictAuthorityFailure::Storage);
+                }
+                Ok(PendingTaskVerdictHandoff {
+                    message_id: pending.message_id,
+                    payload_digest_sha256: pending.payload_digest_sha256,
+                    event,
+                    verdict,
+                    state,
+                })
+            })
+            .collect()
+    }
+
+    pub fn acknowledge_task_handoff(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, VerdictAuthorityFailure> {
+        self.store
+            .acknowledge_task_verdict_outbox(message_id, expected_payload_digest_sha256)
+            .map_err(VerdictAuthorityFailure::from)
+    }
+
+    pub fn hold_task_handoff(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, VerdictAuthorityFailure> {
+        self.store
+            .hold_task_verdict_outbox(message_id, expected_payload_digest_sha256)
+            .map_err(VerdictAuthorityFailure::from)
     }
 
     pub fn inspect_store(&self) -> Result<VerdictStoreInspection, VerdictAuthorityFailure> {
@@ -742,15 +871,21 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
             return Ok(error);
         }
         let now = self.clock.now()?;
-        if timestamp_after_or_equal(&now, verdict.expires_at.as_ref()) {
-            return Ok(error_result(VerdictErrorCode::Expired, "VERDICT_EXPIRED"));
-        }
         let Some(scope) = verdict.scope.as_ref() else {
             return Ok(error_result(
                 VerdictErrorCode::IntegrityFailure,
                 "STORED_VERDICT_SCOPE_MISSING",
             ));
         };
+        if timestamp_after_or_equal(&now, verdict.expires_at.as_ref())
+            && verdict.expires_at.as_ref().is_none_or(|expires_at| {
+                self.resolver
+                    .validate_task_commit_before_expiry(command, scope, expires_at)
+                    .is_err()
+            })
+        {
+            return Ok(error_result(VerdictErrorCode::Expired, "VERDICT_EXPIRED"));
+        }
         if let Err(rejection) = self.resolver.validate_task_commit(command, scope) {
             return Ok(reference_error(rejection));
         }
@@ -939,7 +1074,10 @@ impl<C: VerdictClock> FounderVerdictAuthority<C> {
         if let Some(error) = validate_issued_revision(&current, command.expected_state_revision) {
             return Ok(error);
         }
-        let mut evidence = match self.resolver.validate_expiry(command, principal) {
+        let mut evidence = match self
+            .resolver
+            .validate_expiry_for_verdict(command, principal, &verdict, &current)
+        {
             Ok(evidence) => evidence,
             Err(rejection) => return Ok(reference_error(rejection)),
         };
@@ -1260,6 +1398,20 @@ fn content_address_complete(address: Option<&ContentAddress>) -> bool {
             && a.digest.bytes().all(|b| b.is_ascii_hexdigit())
             && a.byte_length > 0
     })
+}
+
+fn verdict_payload_matches(verdict: &FounderVerdict, expected_digest: &str) -> bool {
+    let Some(address) = verdict.canonical_payload.as_ref() else {
+        return false;
+    };
+    let mut canonical = verdict.clone();
+    canonical.canonical_payload = None;
+    let payload = canonical.encode_to_vec();
+    let actual_digest = hex::encode(Sha256::digest(&payload));
+    address.algorithm == HashAlgorithm::Sha256 as i32
+        && address.digest == expected_digest
+        && actual_digest == expected_digest
+        && address.byte_length == payload.len() as u64
 }
 
 fn contract_complete(reference: &ContractReference) -> bool {

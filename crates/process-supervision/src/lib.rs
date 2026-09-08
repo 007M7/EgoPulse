@@ -211,6 +211,19 @@ impl SupervisedProcessSpec {
         self
     }
 
+    /// Prefer an installed desktop PowerShell on Windows for the child only.
+    /// Keep this separate from provider credentials and from inherited names.
+    #[must_use]
+    pub fn with_desktop_shell_path(self) -> Self {
+        #[cfg(windows)]
+        if let Some(path) = egopulse_local_ipc_platform::desktop_powershell_path()
+            .and_then(|value| value.into_string().ok())
+        {
+            return self.with_environment_override("PATH", path);
+        }
+        self
+    }
+
     /// Adds one explicitly reviewed environment name to an isolated process.
     /// Duplicate names are ignored so composition order cannot widen the
     /// inherited set accidentally.
@@ -403,6 +416,22 @@ pub async fn run_governed_process(
     request: &[u8],
     budget: GovernedProcessBudget,
 ) -> Result<GovernedProcessReceipt, GovernedProcessError> {
+    let receipt = run_governed_process_outcome(spec, request, budget).await?;
+    if receipt.exit_code != 0 {
+        return Err(GovernedProcessError::Crashed);
+    }
+    Ok(receipt)
+}
+
+/// Captures a bounded receipt for a normally exited process, including a
+/// non-zero exit code. Acceptance commands use this to retain failure evidence;
+/// a returned receipt does not imply that the command or its criterion passed.
+/// Spawn, timeout, output-limit and abnormal termination failures remain errors.
+pub async fn run_governed_process_outcome(
+    spec: &SupervisedProcessSpec,
+    request: &[u8],
+    budget: GovernedProcessBudget,
+) -> Result<GovernedProcessReceipt, GovernedProcessError> {
     if budget.timeout.is_zero() || budget.output_limit_bytes == 0 {
         return Err(GovernedProcessError::InvalidSpecification);
     }
@@ -437,13 +466,13 @@ pub async fn run_governed_process(
         {
             return Err(GovernedProcessError::OutputLimit);
         }
-        if !status.success() {
-            return Err(GovernedProcessError::Crashed);
-        }
+        // A signal termination has no portable exit code. Never encode it as
+        // zero: doing so would turn missing execution evidence into success.
+        let exit_code = status.code().ok_or(GovernedProcessError::Crashed)?;
         Ok(GovernedProcessReceipt {
             stdout,
             stderr,
-            exit_code: status.code().unwrap_or_default(),
+            exit_code,
             duration_ms: started.elapsed().as_millis() as u64,
         })
     };

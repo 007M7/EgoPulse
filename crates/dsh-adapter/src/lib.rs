@@ -414,6 +414,7 @@ impl NativeHarnessDriver for DshAcpDriver {
                             requested_scope_ref: "adapter-edge://dsh-acp/approval/scope".to_owned(),
                             display_summary_ref: "adapter-edge://dsh-acp/approval/summary"
                                 .to_owned(),
+                            display_summary: None,
                             native_routing_ref: routing_ref.clone(),
                             lifecycle: ApprovalRequestLifecycleKind::Open as i32,
                             request_revision: 1,
