@@ -13321,7 +13321,7 @@ impl Default for U04cConptyOutput {
 
 struct U04cConptySession {
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    _master: Box<dyn portable_pty::MasterPty + Send>,
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     output: Arc<Mutex<U04cConptyOutput>>,
     reader: Option<thread::JoinHandle<()>>,
@@ -13383,7 +13383,7 @@ impl U04cConptySession {
         });
         Self {
             child,
-            _master: pair.master,
+            master: Some(pair.master),
             writer: Some(writer),
             output,
             reader: Some(reader),
@@ -13496,6 +13496,9 @@ impl U04cConptySession {
         };
         assert!(status.success(), "U-04c ConPTY failed: {status:?}");
         self.writer.take();
+        // Close the pseudoconsole while its reader still drains output. Keeping
+        // the master alive can prevent EOF even after the TUI exits successfully.
+        self.master.take();
         let reader_deadline = Instant::now() + R9A3_WITNESS_REAP_TIMEOUT;
         while self
             .reader
@@ -13671,6 +13674,7 @@ impl Drop for U04cConptySession {
                 thread::sleep(Duration::from_millis(10));
             }
         }
+        self.master.take();
         if self
             .reader
             .as_ref()
