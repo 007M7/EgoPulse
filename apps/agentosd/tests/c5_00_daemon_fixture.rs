@@ -14586,6 +14586,31 @@ async fn m13_real_daemon_cli_tui_dispatch_and_restart_preserve_one_memory_pair()
         value.contains("GOVERNED MEMORY REFERENCE DATA (UNTRUSTED)") && value.contains(MEMORY_TEXT)
     }));
 
+    // The driver's record is written before the Adapter observation is
+    // durably appended and consumed. Wait for that boundary before stopping
+    // the daemon; a successful native dispatch alone is not the receipt.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let adapter = read_r8b2c_adapter_store(
+                &root.join("r8a-adapter.db"),
+                &[0x32; 32],
+                &routed_ids.dispatch_id,
+            )
+            .expect("read M-13 observation before stopping daemon");
+            if adapter.observation_count == 1 && adapter.pending_observation_count == 0 {
+                break;
+            }
+            if let Some(status) = daemon
+                .try_wait()
+                .expect("inspect M-13 daemon before durable observation")
+            {
+                panic!("M-13 daemon exited before durable observation: {status}");
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("M-13 durable observation deadline");
     stop_u04c_fixture(&mut daemon, "M-13 first daemon").await;
     let first_pair = read_m13_memory_dispatch_pair(
         &root.join("context-authority.db"),
