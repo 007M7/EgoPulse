@@ -14756,7 +14756,15 @@ async fn phase_one_two_tasks_exact_replay_return_and_restart_remain_isolated() {
     wait_for_cli_status_with_child(&instance, &mut daemon).await;
 
     let first = prepare_and_confirm_r8b2c_work(&root, &instance, "phase-one-first").await;
-    wait_for_r8b2c_task_status(&instance, &first.task_id, TaskStatus::Active, &mut daemon).await;
+    // Wait for the driver's return to commit before comparing replay snapshots:
+    // Active can legitimately advance while the replay CLI process starts.
+    wait_for_r8b2c_task_status(
+        &instance,
+        &first.task_id,
+        TaskStatus::VerificationPending,
+        &mut daemon,
+    )
+    .await;
     let first_task_before_replay = read_r8b2c_task_oracle(&root, &first.task_id);
     let replay = run_tui(
         &instance,
