@@ -1155,6 +1155,18 @@ impl<C: TaskResultReviewClient + ?Sized + 'static> ResultReviewController<C> {
     pub fn task_id(&self) -> &str {
         &self.task_id
     }
+
+    /// Returns only the scope carried by the validated Task snapshot, never a
+    /// value reconstructed from rendered review or Artifact text.
+    #[must_use]
+    pub fn trusted_task_target_scope_ref(&self) -> Option<&str> {
+        self.trusted_review
+            .as_ref()
+            .and_then(|review| review.task_view.task.as_ref())
+            .map(|task| task.target_scope_ref.as_str())
+            .filter(|scope| !scope.trim().is_empty())
+    }
+
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.runtime.is_some()
@@ -2318,7 +2330,7 @@ fn parse_recovery_paths(value: &str) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
-fn client_private_recovery_directory() -> Result<PathBuf, String> {
+pub(crate) fn client_private_recovery_directory() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     #[cfg(target_os = "macos")]
@@ -3079,6 +3091,29 @@ mod tests {
         controller.trusted_review = Some(review);
         controller.model = Some(model);
         controller
+    }
+
+    #[test]
+    fn trusted_task_target_scope_ref_reads_only_the_loaded_task_snapshot() {
+        let mut controller = loaded_actionable_controller(VerificationConclusion::Passed);
+        assert_eq!(controller.trusted_task_target_scope_ref(), None);
+
+        controller
+            .trusted_review
+            .as_mut()
+            .expect("trusted review")
+            .task_view
+            .task
+            .as_mut()
+            .expect("trusted Task")
+            .target_scope_ref = "scope:trusted-task".to_owned();
+        assert_eq!(
+            controller.trusted_task_target_scope_ref(),
+            Some("scope:trusted-task")
+        );
+
+        controller.trusted_review = None;
+        assert_eq!(controller.trusted_task_target_scope_ref(), None);
     }
 
     async fn pump_until_verdict_stage(

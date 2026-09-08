@@ -24,7 +24,8 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::review::{
-    CodexReadOnlyReviewOutcome, CodexReadOnlyReviewRequest, ReviewExchange, ReviewMessageAction,
+    CodexReadOnlyReviewOutcome, CodexReadOnlyReviewRequest, CodexReadOnlyTurnOutcome,
+    CodexReadOnlyTurnRequest, ReviewExchange, ReviewMessageAction,
 };
 
 pub const CODEX_ADAPTER_ID: &str = "codex-adapter";
@@ -178,6 +179,179 @@ fn apply_environment_overrides(
     spec
 }
 
+fn isolated_app_server_arguments(additional_overrides: &[String]) -> Vec<String> {
+    let mut overrides = [
+        "features.apps=false",
+        "features.plugins=false",
+        "features.remote_plugin=false",
+        "features.multi_agent=false",
+        "features.hooks=false",
+        "features.shell_tool=false",
+        "features.unified_exec=false",
+        "features.shell_snapshot=false",
+        "features.goals=false",
+        "features.memories=false",
+        "web_search=\"disabled\"",
+        "tools.view_image=false",
+        // These empty tables make the discovery process parse independently
+        // of malformed inherited entries. They do not clear lower layers;
+        // every discovered entry is disabled explicitly in the second pass.
+        "mcp_servers={}",
+        "plugins={}",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    overrides.extend_from_slice(additional_overrides);
+    overrides
+        .into_iter()
+        .flat_map(|value| ["-c".to_owned(), value])
+        .chain(["app-server".to_owned(), "--stdio".to_owned()])
+        .collect()
+}
+
+fn isolated_base_config_matches(config: &Value) -> bool {
+    let feature_disabled = |name: &str| {
+        config
+            .pointer(&format!("/features/{name}"))
+            .and_then(Value::as_bool)
+            == Some(false)
+    };
+    [
+        "apps",
+        "plugins",
+        "remote_plugin",
+        "multi_agent",
+        "hooks",
+        "shell_tool",
+        "unified_exec",
+        "shell_snapshot",
+        "goals",
+        "memories",
+    ]
+    .into_iter()
+    .all(feature_disabled)
+        && config.get("web_search").and_then(Value::as_str) == Some("disabled")
+}
+
+#[derive(Default)]
+struct ExternalToolInventory {
+    mcp_servers: Vec<String>,
+    plugins: Vec<String>,
+    plugin_mcp_servers: Vec<(String, String)>,
+}
+
+impl ExternalToolInventory {
+    fn from_config(config: &Value) -> Result<Self, ()> {
+        let mut inventory = Self::default();
+        if let Some(servers) = config.get("mcp_servers") {
+            let servers = servers.as_object().ok_or(())?;
+            for name in servers.keys() {
+                validate_config_key(name)?;
+                inventory.mcp_servers.push(name.clone());
+            }
+        }
+        if let Some(plugins) = config.get("plugins") {
+            let plugins = plugins.as_object().ok_or(())?;
+            for (plugin_name, plugin) in plugins {
+                validate_config_key(plugin_name)?;
+                inventory.plugins.push(plugin_name.clone());
+                if let Some(servers) = plugin.get("mcp_servers") {
+                    let servers = servers.as_object().ok_or(())?;
+                    for server_name in servers.keys() {
+                        validate_config_key(server_name)?;
+                        inventory
+                            .plugin_mcp_servers
+                            .push((plugin_name.clone(), server_name.clone()));
+                    }
+                }
+            }
+        }
+        Ok(inventory)
+    }
+
+    fn disabling_overrides(&self) -> Vec<String> {
+        self.mcp_servers
+            .iter()
+            .map(|name| format!("mcp_servers.{name}.enabled=false"))
+            .chain(
+                self.plugins
+                    .iter()
+                    .map(|name| format!("plugins.{name}.enabled=false")),
+            )
+            .chain(self.plugin_mcp_servers.iter().map(|(plugin, server)| {
+                format!("plugins.{plugin}.mcp_servers.{server}.enabled=false")
+            }))
+            .collect()
+    }
+
+    fn all_disabled(&self, config: &Value) -> bool {
+        self.mcp_servers.iter().all(|name| {
+            config
+                .pointer(&format!("/mcp_servers/{name}/enabled"))
+                .and_then(Value::as_bool)
+                == Some(false)
+        }) && self.plugins.iter().all(|name| {
+            config
+                .pointer(&format!("/plugins/{name}/enabled"))
+                .and_then(Value::as_bool)
+                == Some(false)
+        }) && self.plugin_mcp_servers.iter().all(|(plugin, server)| {
+            config
+                .pointer(&format!("/plugins/{plugin}/mcp_servers/{server}/enabled"))
+                .and_then(Value::as_bool)
+                == Some(false)
+        })
+    }
+}
+
+fn validate_config_key(value: &str) -> Result<(), ()> {
+    (!value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'@')))
+    .then_some(())
+    .ok_or(())
+}
+
+fn tool_isolation_unverified() -> DriverError {
+    driver_error(
+        DriverErrorCertainty::ProvenNotSent,
+        HarnessErrorCode::DependencyUnavailable,
+        "CODEX_READ_ONLY_TOOL_ISOLATION_UNVERIFIED",
+        &[],
+    )
+}
+
+fn is_tool_activity(value: &Value) -> bool {
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if method.starts_with("mcpServer/")
+        || method.starts_with("item/tool/")
+        || method.starts_with("tool/")
+    {
+        return true;
+    }
+    let item_type = value
+        .pointer("/params/item/type")
+        .or_else(|| value.pointer("/params/type"))
+        .and_then(Value::as_str);
+    matches!(
+        item_type,
+        Some(
+            "commandExecution"
+                | "fileChange"
+                | "mcpToolCall"
+                | "dynamicToolCall"
+                | "collabToolCall"
+                | "webSearch"
+                | "imageView"
+        )
+    )
+}
+
 struct ActiveDispatch {
     dispatch_id: String,
     thread_id: String,
@@ -278,7 +452,11 @@ impl CodexAppServerDriver {
                 &[],
             ));
         }
-        let result = match timeout(request.timeout, self.run_read_only_review_inner(&request)).await
+        let result = match timeout(
+            request.timeout,
+            self.run_read_only_review_inner(&request, false, None),
+        )
+        .await
         {
             Ok(result) => result,
             Err(_) => Err(driver_error(
@@ -292,26 +470,106 @@ impl CodexAppServerDriver {
         result
     }
 
+    /// Runs one cognition-only model turn on a fresh app-server process. The
+    /// process receives temporary highest-precedence tool-disable overrides,
+    /// and their effective values are verified before the thread is created.
+    /// No native delivery is retried by this method.
+    pub async fn run_read_only_turn(
+        &mut self,
+        request: CodexReadOnlyTurnRequest,
+    ) -> Result<CodexReadOnlyTurnOutcome, DriverError> {
+        let output_schema = request.output_schema.clone();
+        let review_request: CodexReadOnlyReviewRequest = request.into();
+        if review_request.execution_id.trim().is_empty()
+            || review_request.model.trim().is_empty()
+            || review_request.prompt.trim().is_empty()
+            || !review_request.working_directory.is_absolute()
+            || !review_request.working_directory.is_dir()
+            || review_request.timeout.is_zero()
+            || review_request.output_limit_bytes == 0
+        {
+            return Err(driver_error(
+                DriverErrorCertainty::ProvenNotSent,
+                HarnessErrorCode::InvalidArgument,
+                "CODEX_READ_ONLY_TURN_REQUEST_INVALID",
+                &[],
+            ));
+        }
+        if self.session.is_some() || self.active.is_some() {
+            return Err(driver_error(
+                DriverErrorCertainty::ProvenNotSent,
+                HarnessErrorCode::InvalidArgument,
+                "CODEX_READ_ONLY_TURN_DRIVER_NOT_FRESH",
+                &[],
+            ));
+        }
+        let result = match timeout(
+            review_request.timeout,
+            self.run_read_only_review_inner(&review_request, true, Some(&output_schema)),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(driver_error(
+                DriverErrorCertainty::DeliveryUnknown,
+                HarnessErrorCode::DependencyUnavailable,
+                "CODEX_READ_ONLY_TURN_TIMEOUT",
+                review_request.execution_id.as_bytes(),
+            )),
+        };
+        self.shutdown_review_session().await;
+        result
+    }
+
     async fn run_read_only_review_inner(
         &mut self,
         request: &CodexReadOnlyReviewRequest,
+        isolate_external_tools: bool,
+        output_schema: Option<&Value>,
     ) -> Result<CodexReadOnlyReviewOutcome, DriverError> {
         let started = std::time::Instant::now();
-        self.ensure_session(&request.working_directory).await?;
+        if isolate_external_tools {
+            self.ensure_session(&request.working_directory, true, &[])
+                .await?;
+            let discovery_config = self.read_effective_config().await?;
+            if !isolated_base_config_matches(&discovery_config) {
+                return Err(tool_isolation_unverified());
+            }
+            let inventory = ExternalToolInventory::from_config(&discovery_config)
+                .map_err(|_| tool_isolation_unverified())?;
+            let disabling_overrides = inventory.disabling_overrides();
+            self.shutdown_review_session().await;
+            self.ensure_session(&request.working_directory, true, &disabling_overrides)
+                .await?;
+            let isolated_config = self.read_effective_config().await?;
+            if !isolated_base_config_matches(&isolated_config)
+                || !inventory.all_disabled(&isolated_config)
+            {
+                return Err(tool_isolation_unverified());
+            }
+        } else {
+            self.ensure_session(&request.working_directory, false, &[])
+                .await?;
+        }
         let session = self.session.as_mut().expect("review session initialized");
 
         let thread_request_id = session.next_id();
+        let mut thread_params = json!({
+            "cwd": request.working_directory,
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            "experimentalRawEvents": false,
+            "model": request.model,
+        });
+        if isolate_external_tools {
+            thread_params["dynamicTools"] = json!([]);
+            thread_params["ephemeral"] = json!(true);
+        }
         session
             .write_value(&json!({
                 "id": thread_request_id,
                 "method": "thread/start",
-                "params": {
-                    "cwd": request.working_directory,
-                    "approvalPolicy": "never",
-                    "sandbox": "read-only",
-                    "experimentalRawEvents": false,
-                    "model": request.model,
-                }
+                "params": thread_params
             }))
             .await?;
         let (thread_response, thread_raw) = session
@@ -342,18 +600,22 @@ impl CodexAppServerDriver {
             })?;
 
         let turn_request_id = session.next_id();
+        let mut turn_params = json!({
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": request.prompt}],
+            "cwd": request.working_directory,
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
+            "model": request.model,
+        });
+        if let Some(output_schema) = output_schema {
+            turn_params["outputSchema"] = output_schema.clone();
+        }
         session
             .write_value(&json!({
                 "id": turn_request_id,
                 "method": "turn/start",
-                "params": {
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": request.prompt}],
-                    "cwd": request.working_directory,
-                    "approvalPolicy": "never",
-                    "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
-                    "model": request.model,
-                }
+                "params": turn_params
             }))
             .await?;
         let (turn_response, turn_raw) = session
@@ -386,6 +648,14 @@ impl CodexAppServerDriver {
                     DriverErrorCertainty::DeliveryUnknown,
                     HarnessErrorCode::ProtocolMismatch,
                     "CODEX_REVIEW_UNEXPECTED_RESPONSE",
+                    &raw,
+                ));
+            }
+            if isolate_external_tools && is_tool_activity(&value) {
+                return Err(driver_error(
+                    DriverErrorCertainty::DeliveryUnknown,
+                    HarnessErrorCode::ProtocolMismatch,
+                    "CODEX_READ_ONLY_TURN_TOOL_ACTIVITY",
                     &raw,
                 ));
             }
@@ -470,7 +740,12 @@ impl CodexAppServerDriver {
         first
     }
 
-    async fn ensure_session(&mut self, working_directory: &PathBuf) -> Result<(), DriverError> {
+    async fn ensure_session(
+        &mut self,
+        working_directory: &PathBuf,
+        isolate_external_tools: bool,
+        additional_overrides: &[String],
+    ) -> Result<(), DriverError> {
         if self.session.is_some() {
             return Ok(());
         }
@@ -478,7 +753,11 @@ impl CodexAppServerDriver {
             SupervisedProcessSpec::new(&self.config.executable, working_directory),
             &self.config.environment_overrides,
         );
-        spec.arguments = vec!["app-server".to_owned(), "--stdio".to_owned()];
+        spec.arguments = if isolate_external_tools {
+            isolated_app_server_arguments(additional_overrides)
+        } else {
+            vec!["app-server".to_owned(), "--stdio".to_owned()]
+        };
         let mut process = SupervisedProcess::spawn(&spec).await.map_err(|error| {
             driver_error(
                 DriverErrorCertainty::ProvenNotSent,
@@ -534,6 +813,25 @@ impl CodexAppServerDriver {
             .await?;
         self.session = Some(session);
         Ok(())
+    }
+
+    async fn read_effective_config(&mut self) -> Result<Value, DriverError> {
+        let session = self.session.as_mut().expect("session initialized");
+        let request_id = session.next_id();
+        session
+            .write_value(&json!({
+                "id": request_id,
+                "method": "config/read",
+                "params": { "includeLayers": false }
+            }))
+            .await?;
+        let (response, _) = session
+            .read_response(request_id, self.config.request_timeout)
+            .await?;
+        response
+            .pointer("/result/config")
+            .cloned()
+            .ok_or_else(tool_isolation_unverified)
     }
 
     async fn start_or_resume_thread(
@@ -1341,7 +1639,7 @@ impl CodexAppServerDriver {
             }
         };
         if event.criticality == ObservationCriticality::Terminal {
-            if self.has_pending_native_exchange() {
+            if self.has_pending_native_exchange() || !self.queued_events.is_empty() {
                 if self.deferred_terminal_event.is_some() {
                     return Err(driver_error(
                         DriverErrorCertainty::DeliveryUnknown,
@@ -1353,8 +1651,7 @@ impl CodexAppServerDriver {
                 self.deferred_terminal_event = Some(event);
                 return Ok(None);
             }
-            self.completed_dispatch_id = Some(envelope.dispatch_id.clone());
-            self.active = None;
+            self.release_terminal_dispatch(envelope);
         }
         Ok(Some(event))
     }
@@ -1365,13 +1662,46 @@ impl CodexAppServerDriver {
             || !self.pending_control_requests.is_empty()
     }
 
+    fn dispatch_lifecycle_is_released(&self) -> bool {
+        self.active.is_none()
+            && self.pending_agent_message.is_none()
+            && self.terminal_output_candidate.is_none()
+            && self.pending_approvals.is_empty()
+            && self.responded_approvals.is_empty()
+            && self.queued_events.is_empty()
+            && self.pending_control_requests.is_empty()
+            && self.deferred_terminal_event.is_none()
+    }
+
+    fn ensure_dispatch_ready(&self) -> Result<(), DriverError> {
+        if self.dispatch_lifecycle_is_released() {
+            Ok(())
+        } else {
+            Err(driver_error(
+                DriverErrorCertainty::ProvenNotSent,
+                HarnessErrorCode::DeliveryRejected,
+                "CODEX_DISPATCH_BUSY",
+                &[],
+            ))
+        }
+    }
+
+    fn release_terminal_dispatch(&mut self, envelope: &DispatchEnvelope) {
+        // A partial assistant assembly is only meaningful while its native
+        // turn is active. A terminal notification settles that lifecycle; it
+        // must not retain this driver after an interruption or a malformed
+        // completion that lacked item/completed.
+        self.pending_agent_message = None;
+        self.completed_dispatch_id = Some(envelope.dispatch_id.clone());
+        self.active = None;
+    }
+
     fn take_ready_deferred_terminal(&mut self, envelope: &DispatchEnvelope) -> Option<DriverEvent> {
-        if self.has_pending_native_exchange() {
+        if self.has_pending_native_exchange() || !self.queued_events.is_empty() {
             return None;
         }
         let event = self.deferred_terminal_event.take()?;
-        self.completed_dispatch_id = Some(envelope.dispatch_id.clone());
-        self.active = None;
+        self.release_terminal_dispatch(envelope);
         Some(event)
     }
 
@@ -1471,6 +1801,10 @@ impl CodexAppServerDriver {
 }
 
 impl NativeHarnessDriver for CodexAppServerDriver {
+    fn is_dispatch_ready(&self) -> bool {
+        self.dispatch_lifecycle_is_released()
+    }
+
     fn probe<'a>(
         &'a mut self,
         request: &'a ProbeHarnessRequest,
@@ -1511,7 +1845,11 @@ impl NativeHarnessDriver for CodexAppServerDriver {
         material: &'a ResolvedDispatchMaterial,
     ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
         Box::pin(async move {
-            self.ensure_session(&material.workspace_root).await?;
+            // This guard must precede session initialization and thread/turn
+            // writes: a shared driver has exactly one native active lifecycle.
+            self.ensure_dispatch_ready()?;
+            self.ensure_session(&material.workspace_root, false, &[])
+                .await?;
             let thread_id = self.start_or_resume_thread(envelope, material).await?;
             let session = self.session.as_mut().expect("session initialized");
             let request_id = session.next_id();
@@ -1653,7 +1991,7 @@ impl NativeHarnessDriver for CodexAppServerDriver {
         context: &'a ReconciliationContext,
     ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
         Box::pin(async move {
-            self.ensure_session(&context.material.workspace_root)
+            self.ensure_session(&context.material.workspace_root, false, &[])
                 .await?;
             let active = self
                 .active
@@ -2135,9 +2473,64 @@ pub(crate) fn native_rate_limit_reached(params: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn cognition_isolation_disables_every_discovered_native_extension() {
+        let discovery = json!({
+            "features": {
+                "apps": false, "plugins": false, "remote_plugin": false,
+                "multi_agent": false, "hooks": false, "shell_tool": false,
+                "unified_exec": false, "shell_snapshot": false,
+                "goals": false, "memories": false
+            },
+            "web_search": "disabled",
+            "mcp_servers": {"node_repl": {"enabled": true}},
+            "plugins": {
+                "@computer-use": {
+                    "enabled": true,
+                    "mcp_servers": {"desktop": {"enabled": true}}
+                }
+            }
+        });
+        let inventory = ExternalToolInventory::from_config(&discovery).expect("valid native names");
+        let overrides = inventory.disabling_overrides();
+        assert!(overrides.contains(&"mcp_servers.node_repl.enabled=false".to_owned()));
+        assert!(overrides.contains(&"plugins.@computer-use.enabled=false".to_owned()));
+        assert!(
+            overrides
+                .contains(&"plugins.@computer-use.mcp_servers.desktop.enabled=false".to_owned())
+        );
+
+        let mut isolated = discovery;
+        isolated["mcp_servers"]["node_repl"]["enabled"] = json!(false);
+        isolated["plugins"]["@computer-use"]["enabled"] = json!(false);
+        isolated["plugins"]["@computer-use"]["mcp_servers"]["desktop"]["enabled"] = json!(false);
+        assert!(isolated_base_config_matches(&isolated));
+        assert!(inventory.all_disabled(&isolated));
+    }
+
+    #[test]
+    fn cognition_isolation_accepts_at_sign_but_rejects_unsafe_dotted_key_characters() {
+        assert_eq!(validate_config_key("@computer-use"), Ok(()));
+        for value in ["", "plugin.name", "plugin/name", "plugin name"] {
+            assert_eq!(validate_config_key(value), Err(()));
+        }
+    }
+
+    #[test]
+    fn cognition_isolation_rejects_any_tool_activity() {
+        for value in [
+            json!({"method":"item/started","params":{"item":{"type":"mcpToolCall"}}}),
+            json!({"method":"item/started","params":{"item":{"type":"commandExecution"}}}),
+            json!({"method":"mcpServer/startupStatus/updated","params":{}}),
+        ] {
+            assert!(is_tool_activity(&value));
+        }
+    }
+
     #[test]
     fn review_checks_effective_read_only_policy_and_exact_model_before_turn() {
-        use super::*;
         let expected = json!({"result": {"model": "configured-model", "approvalPolicy": "never",
             "sandbox": {"type": "readOnly", "networkAccess": false}}});
         assert!(review_thread_configuration_matches(
@@ -2252,8 +2645,6 @@ mod tests {
             LegacyExecutionStartRawClassification::Conflict
         );
     }
-    use super::*;
-
     #[test]
     fn process_environment_is_isolated_and_credentials_are_explicit() {
         let spec = apply_environment_overrides(
@@ -2539,15 +2930,47 @@ mod tests {
             "method": "turn/completed",
             "params": { "turn": { "id": "turn-output", "status": "completed" } }
         });
-        driver
-            .map_notification(
-                &envelope,
-                "turn/completed",
-                terminal.clone(),
-                serde_json::to_vec(&terminal).expect("terminal bytes"),
-            )
-            .expect("map terminal")
+        assert!(
+            driver
+                .map_notification(
+                    &envelope,
+                    "turn/completed",
+                    terminal.clone(),
+                    serde_json::to_vec(&terminal).expect("terminal bytes"),
+                )
+                .expect("defer terminal")
+                .is_none(),
+            "terminal must wait until queued content signals are emitted"
+        );
+        assert!(driver.deferred_terminal_event.is_some());
+
+        let content = driver
+            .next_event(&envelope)
+            .await
+            .expect("drain content signal")
+            .expect("content signal");
+        assert!(matches!(
+            content.payload,
+            harness_observation::Payload::ContentSignal(_)
+        ));
+        while !driver.queued_events.is_empty() {
+            let content = driver
+                .next_event(&envelope)
+                .await
+                .expect("drain remaining content")
+                .expect("queued content observation");
+            assert!(matches!(
+                content.payload,
+                harness_observation::Payload::ContentSignal(_)
+            ));
+            assert!(!driver.is_dispatch_ready());
+        }
+        let terminal = driver
+            .next_event(&envelope)
+            .await
+            .expect("release deferred terminal")
             .expect("terminal observation");
+        assert_eq!(terminal.criticality, ObservationCriticality::Terminal);
 
         let candidate = driver
             .take_terminal_output_candidate(&envelope)
@@ -2564,6 +2987,49 @@ mod tests {
                 .expect("candidate replay")
                 .is_none()
         );
+        assert!(driver.is_dispatch_ready());
+    }
+
+    #[tokio::test]
+    async fn dispatch_readiness_blocks_overwrite_until_terminal_candidate_is_taken() {
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch-busy".to_owned(),
+            ..Default::default()
+        };
+        driver.active = Some(ActiveDispatch {
+            dispatch_id: envelope.dispatch_id.clone(),
+            thread_id: "thread-busy".to_owned(),
+            turn_id: Some("turn-busy".to_owned()),
+            turn_request_id: 1,
+            workspace_root: std::env::current_dir().expect("test workspace"),
+        });
+
+        assert!(!driver.is_dispatch_ready());
+        let busy = driver
+            .ensure_dispatch_ready()
+            .expect_err("active dispatch blocks send");
+        assert_eq!(busy.certainty, DriverErrorCertainty::ProvenNotSent);
+        assert_eq!(busy.code, HarnessErrorCode::DeliveryRejected);
+        assert_eq!(busy.safe_detail_code, "CODEX_DISPATCH_BUSY");
+
+        driver.active = None;
+        driver.completed_dispatch_id = Some(envelope.dispatch_id.clone());
+        driver.terminal_output_candidate = Some(TerminalOutputCandidate {
+            dispatch_id: envelope.dispatch_id.clone(),
+            native_completion_ref: "item-busy".to_owned(),
+            media_type: "text/plain; charset=utf-8".to_owned(),
+            content: b"pending collector evidence".to_vec(),
+        });
+        assert!(!driver.is_dispatch_ready());
+        assert!(
+            driver
+                .take_terminal_output_candidate(&envelope)
+                .await
+                .expect("candidate extraction")
+                .is_some()
+        );
+        assert!(driver.is_dispatch_ready());
     }
 
     #[test]
@@ -2806,6 +3272,11 @@ mod tests {
             turn_request_id: 1,
             workspace_root: std::env::current_dir().expect("test workspace"),
         });
+        driver.pending_agent_message = Some(AgentMessageAssembly {
+            message_id: "message-interrupted".to_owned(),
+            revision: 1,
+            raw_cumulative: b"provisional partial output".to_vec(),
+        });
         let request = approval_request(9);
         let raw = serde_json::to_vec(&request).expect("request bytes");
         driver
@@ -2886,6 +3357,8 @@ mod tests {
             driver.completed_dispatch_id.as_deref(),
             Some(envelope.dispatch_id.as_str())
         );
+        assert!(driver.pending_agent_message.is_none());
+        assert!(driver.is_dispatch_ready());
     }
 
     #[test]

@@ -78,6 +78,9 @@ function Set-JsonProperty {
 }
 
 $root = (Resolve-Path -LiteralPath $PackageRoot).Path
+if ($root.Contains([string][IO.Path]::PathSeparator)) {
+    throw 'PackageRoot contains the PATH separator; extract the package to a directory without semicolons.'
+}
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64' -or -not [Environment]::Is64BitOperatingSystem) {
     throw 'EgoPulse first release supports Windows x64 only.'
 }
@@ -316,6 +319,27 @@ Write-Output "production_provider_preflight=ready profile:$($productionProfile.p
 if ($Launch) {
     $daemonProcess = Start-Process -FilePath $daemon -WorkingDirectory $root -WindowStyle Hidden -PassThru
     Write-Output "agentosd=launched pid=$($daemonProcess.Id)"
+}
+
+# Make the commands printed below resolvable. Never copy the combined process
+# PATH into the user PATH, which would duplicate machine-managed entries.
+$binDirectory = Join-Path $root 'bin'
+$pathSeparator = [IO.Path]::PathSeparator
+$processPathEntries = @($env:PATH -split [regex]::Escape([string]$pathSeparator))
+if ($processPathEntries -notcontains $binDirectory) {
+    $env:PATH = $binDirectory + $pathSeparator + $env:PATH
+}
+if (-not $NoPersistEnvironment) {
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $userPathEntries = @($userPath -split [regex]::Escape([string]$pathSeparator))
+    if ($userPathEntries -notcontains $binDirectory) {
+        $updatedUserPath = if ([string]::IsNullOrWhiteSpace($userPath)) {
+            $binDirectory
+        } else {
+            $binDirectory + $pathSeparator + $userPath
+        }
+        [Environment]::SetEnvironmentVariable('Path', $updatedUserPath, 'User')
+    }
 }
 
 $environmentMode = if ($NoPersistEnvironment) { 'process-only' } else { 'persisted' }

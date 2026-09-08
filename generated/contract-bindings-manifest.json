@@ -1,190 +1,190 @@
 {
-    "schemaVersion":  "egopulse-generated-contract-bindings/v0.1",
-    "sourceManifestSha256":  "96aec62ba142624d7674c1c5216be48b3ce2629b179b86d05bb90f0761ff61ab",
-    "generators":  {
-                       "buf":  "1.72.0",
-                       "protocGenEs":  "2.14.0",
-                       "tonicProstBuild":  "0.14.6",
-                       "grpcioTools":  "1.83.0",
-                       "protobufPython":  "7.35.1"
-                   },
-    "fileCount":  44,
-    "files":  [
-                  {
-                      "path":  "crates/domain-contracts/src/generated/egopulse.artifact.v1.rs",
-                      "sha256":  "9f13857b19f439a6ab93072afc84fe36b80d0857f4b1ed0af495fa43eb9dbe54"
-                  },
-                  {
-                      "path":  "crates/domain-contracts/src/generated/egopulse.collaboration.v1.rs",
-                      "sha256":  "856d008c21aff554e76e86a0f816ea5aa94544b35ab4e21c0d00f2aec3010243"
-                  },
-                  {
-                      "path":  "crates/domain-contracts/src/generated/egopulse.common.v1.rs",
-                      "sha256":  "5b26c084b2624784ee2965b297a61a61c4709a5b872b0e7047c430cfb8de4d0f"
-                  },
-                  {
-                      "path":  "crates/domain-contracts/src/generated/egopulse.harness.v1.rs",
-                      "sha256":  "4419ff08e3ca111a7e9aaa0fae9a70d5a2e09766efb31dfeae24330bc8a774cd"
-                  },
-                  {
-                      "path":  "crates/domain-contracts/src/generated/egopulse.localapi.v1.rs",
-                      "sha256":  "11ea6a0939d62ae232883691825b7caaac5401bf521ee21ae51c52c37fb78f5a"
-                  },
-                  {
-                      "path":  "crates/domain-contracts/src/generated/egopulse.memory.v1.rs",
-                      "sha256":  "7f1c1129a3594716d99dc37043eed8e0d504035f5742998d6b245479a389b619"
-                  },
-                  {
-                      "path":  "crates/domain-contracts/src/generated/egopulse.persistence.v1.rs",
-                      "sha256":  "528ccc6cc76b4895503ebb078b7b9e3c472cded17bda1ea1205eb9feede4314f"
-                  },
-                  {
-                      "path":  "crates/domain-contracts/src/generated/egopulse.policy.v1.rs",
-                      "sha256":  "7bab598f662d75a318fd27fa07ecd9eba7da6f28e180986da1d532f8b7a6177d"
-                  },
-                  {
-                      "path":  "crates/domain-contracts/src/generated/egopulse.task.v1.rs",
-                      "sha256":  "73fcc17d64c984f9f29828082c9b15c0ee870898c7db001cdafc78542fb4f71f"
-                  },
-                  {
-                      "path":  "crates/domain-contracts/src/generated/egopulse.verdict.v1.rs",
-                      "sha256":  "2d32cadc4ebe01ca80d08357fdbb0b6aad64c9fe892fbfe52dd0c624b4f9d8ac"
-                  },
-                  {
-                      "path":  "crates/domain-contracts/src/generated/egopulse.verification.v1.rs",
-                      "sha256":  "80eccbb6912e57cdd8723e7648bdad4c0ffd587456db369bb16685d9d8bcebed"
-                  },
-                  {
-                      "path":  "packages/generated-client/src/generated/egopulse/artifact/v1/artifact_pb.ts",
-                      "sha256":  "012261a494a66a865c63f4ae1e1ae36f065ab772ea278b101e35fc85733aaace"
-                  },
-                  {
-                      "path":  "packages/generated-client/src/generated/egopulse/collaboration/v1/collaboration_pb.ts",
-                      "sha256":  "4f0bedfbcc9677216224a64d66e256cbce3e9e5e503ceff16d1e87d4b75a7112"
-                  },
-                  {
-                      "path":  "packages/generated-client/src/generated/egopulse/common/v1/common_pb.ts",
-                      "sha256":  "2137e3ca10119b9626dee84c4abe72c15e88b42223a7b64b1f3f8057c3da91bb"
-                  },
-                  {
-                      "path":  "packages/generated-client/src/generated/egopulse/harness/v1/harness_pb.ts",
-                      "sha256":  "94a9c3e58639d3c2e39131ef8ea7487062fd64abd445ff0f3ddfddb5169485f6"
-                  },
-                  {
-                      "path":  "packages/generated-client/src/generated/egopulse/localapi/v1/local_api_pb.ts",
-                      "sha256":  "3d0c828430c14a2fe13c7afde4e082dd5dcfea3648b095c827561e1cf98cd461"
-                  },
-                  {
-                      "path":  "packages/generated-client/src/generated/egopulse/memory/v1/memory_pb.ts",
-                      "sha256":  "78b3ba0f512e248be2765f763e8521735a563531faddc37db5071b298e91c060"
-                  },
-                  {
-                      "path":  "packages/generated-client/src/generated/egopulse/persistence/v1/persistence_pb.ts",
-                      "sha256":  "873e0d1fce79353e2062991f482ef8f8e949360d9e6988653221828e163fb383"
-                  },
-                  {
-                      "path":  "packages/generated-client/src/generated/egopulse/policy/v1/policy_pb.ts",
-                      "sha256":  "ef9cb815957667139d331bd379b275879079e460170a65ec7f3e5523c7e2c221"
-                  },
-                  {
-                      "path":  "packages/generated-client/src/generated/egopulse/task/v1/task_pb.ts",
-                      "sha256":  "8146d6c1de106453760ec297e92b1216ef946a48c9a8d10dacc4ba20b34d2601"
-                  },
-                  {
-                      "path":  "packages/generated-client/src/generated/egopulse/verdict/v1/verdict_pb.ts",
-                      "sha256":  "01b12e07f9f6138cf3eb8c510a1dd5431ba244ebbe5ac77080e18ed33dbaf911"
-                  },
-                  {
-                      "path":  "packages/generated-client/src/generated/egopulse/verification/v1/verification_pb.ts",
-                      "sha256":  "243975ad6c55c7f578d0f72410904137c37241003412ab7841bd38c24323c630"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/artifact/v1/artifact_pb2.py",
-                      "sha256":  "57046f7b4a2d79e853bdbe3ddfdb235eedba0b53dfdc918cd9dbcc52ded01419"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/artifact/v1/artifact_pb2.pyi",
-                      "sha256":  "26c279c761bbf7f68e69f37746cdfbe2cc24dac0fda8a0177cfebbcc5dfefb73"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/collaboration/v1/collaboration_pb2.py",
-                      "sha256":  "f12a55f06a159a281484134a1e7781ab4557997f9a7aa4e7b60ce549b37e0bda"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/collaboration/v1/collaboration_pb2.pyi",
-                      "sha256":  "69ac8b929ea66c2d88e8d63fa4b132389da122b155a819559c1124459b5bfc38"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/common/v1/common_pb2.py",
-                      "sha256":  "fe96e27005f589dacf0c6ee74a238602ff400b5b50885c5b732886a3905d149a"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/common/v1/common_pb2.pyi",
-                      "sha256":  "d9c36c76c40f466c9dc1bc76b0f26c52d60ac8e7360e323f8afe9900f8dde6f8"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/harness/v1/harness_pb2.py",
-                      "sha256":  "5e2de92023fc25f6a960434c2606d25b9a42960ca8aac040a473a98ddcdd9e60"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/harness/v1/harness_pb2.pyi",
-                      "sha256":  "0973dac6f2d1b3f260f44207b6ca051ac618b65c5dbdf20fd66413e0ada3d841"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/localapi/v1/local_api_pb2.py",
-                      "sha256":  "711a1e65eda456b3d3a9cace03734f274342af263b0fd455012b84859c8ba8f3"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/localapi/v1/local_api_pb2.pyi",
-                      "sha256":  "4a5ab3622960a01165b089f1dd8b532dd99b01c95e38af1ec344a7ce26e0c0df"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/memory/v1/memory_pb2.py",
-                      "sha256":  "c265119ae96d6697153a97a395b85526add5a629daa4be609365b1ea0ff8c3b0"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/memory/v1/memory_pb2.pyi",
-                      "sha256":  "892fe4c62454837e7d8899dd44a9617027edb2fa3826677f58a7c3046e7a3f1e"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/persistence/v1/persistence_pb2.py",
-                      "sha256":  "add1826407f54161720cc11dac088cf600b6cc09482f66445fbf841e32d74e4e"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/persistence/v1/persistence_pb2.pyi",
-                      "sha256":  "269dc8230e751415dbf5e1557e16719c41fc461202dd7e33ebfa9d181d049d2e"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/policy/v1/policy_pb2.py",
-                      "sha256":  "7fd7258079c99acf2af5d99fa03f09b20898b4263507b247c0f823eb3743a0fb"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/policy/v1/policy_pb2.pyi",
-                      "sha256":  "fa7ce8994f980275cd817838483ef6ff3e0a28e452effa0fe8bce8129fc46042"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/task/v1/task_pb2.py",
-                      "sha256":  "9ab40dd71b3b9c0a1186b240326f41883c3fc4b32657d6dec95f328f58add5a7"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/task/v1/task_pb2.pyi",
-                      "sha256":  "1697f98f5e7f8bc33983ded8c21080e023c83457ec96ed4d8b90a4ebbd909596"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/verdict/v1/verdict_pb2.py",
-                      "sha256":  "f842ea25cfc8afd3ae37509142beff94831e029a54c573fef99eeb124c8ce5d7"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/verdict/v1/verdict_pb2.pyi",
-                      "sha256":  "658038f5cf762ebbd4378ceb010cc23542348e08380e645f58a108d1fbb9efcb"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/verification/v1/verification_pb2.py",
-                      "sha256":  "708e58fc3e92bde0ced9220daff491eb916ac1ecc1c9f749220d62251d84c341"
-                  },
-                  {
-                      "path":  "workers/contract-bindings/src/egopulse/verification/v1/verification_pb2.pyi",
-                      "sha256":  "25dea20e4137c916f9b5175f4f58e96a7aad8fdd8ea724ad601843b7539a84d3"
-                  }
-              ]
+  "schemaVersion": "egopulse-generated-contract-bindings/v0.1",
+  "sourceManifestSha256": "689910dab83ef77d84b08867bbe4e040d3d0ea43e0e5e3d0bbb963d81c65b28b",
+  "generators": {
+    "buf": "1.72.0",
+    "protocGenEs": "2.14.0",
+    "tonicProstBuild": "0.14.6",
+    "grpcioTools": "1.83.0",
+    "protobufPython": "7.35.1"
+  },
+  "fileCount": 44,
+  "files": [
+    {
+      "path": "crates/domain-contracts/src/generated/egopulse.artifact.v1.rs",
+      "sha256": "9f13857b19f439a6ab93072afc84fe36b80d0857f4b1ed0af495fa43eb9dbe54"
+    },
+    {
+      "path": "crates/domain-contracts/src/generated/egopulse.collaboration.v1.rs",
+      "sha256": "856d008c21aff554e76e86a0f816ea5aa94544b35ab4e21c0d00f2aec3010243"
+    },
+    {
+      "path": "crates/domain-contracts/src/generated/egopulse.common.v1.rs",
+      "sha256": "5b26c084b2624784ee2965b297a61a61c4709a5b872b0e7047c430cfb8de4d0f"
+    },
+    {
+      "path": "crates/domain-contracts/src/generated/egopulse.harness.v1.rs",
+      "sha256": "4419ff08e3ca111a7e9aaa0fae9a70d5a2e09766efb31dfeae24330bc8a774cd"
+    },
+    {
+      "path": "crates/domain-contracts/src/generated/egopulse.localapi.v1.rs",
+      "sha256": "d767e1989d130d88835bdf3879d4317430122dc8fe6d14981fecd53c61e3d833"
+    },
+    {
+      "path": "crates/domain-contracts/src/generated/egopulse.memory.v1.rs",
+      "sha256": "7f1c1129a3594716d99dc37043eed8e0d504035f5742998d6b245479a389b619"
+    },
+    {
+      "path": "crates/domain-contracts/src/generated/egopulse.persistence.v1.rs",
+      "sha256": "528ccc6cc76b4895503ebb078b7b9e3c472cded17bda1ea1205eb9feede4314f"
+    },
+    {
+      "path": "crates/domain-contracts/src/generated/egopulse.policy.v1.rs",
+      "sha256": "7bab598f662d75a318fd27fa07ecd9eba7da6f28e180986da1d532f8b7a6177d"
+    },
+    {
+      "path": "crates/domain-contracts/src/generated/egopulse.task.v1.rs",
+      "sha256": "73fcc17d64c984f9f29828082c9b15c0ee870898c7db001cdafc78542fb4f71f"
+    },
+    {
+      "path": "crates/domain-contracts/src/generated/egopulse.verdict.v1.rs",
+      "sha256": "2d32cadc4ebe01ca80d08357fdbb0b6aad64c9fe892fbfe52dd0c624b4f9d8ac"
+    },
+    {
+      "path": "crates/domain-contracts/src/generated/egopulse.verification.v1.rs",
+      "sha256": "80eccbb6912e57cdd8723e7648bdad4c0ffd587456db369bb16685d9d8bcebed"
+    },
+    {
+      "path": "packages/generated-client/src/generated/egopulse/artifact/v1/artifact_pb.ts",
+      "sha256": "012261a494a66a865c63f4ae1e1ae36f065ab772ea278b101e35fc85733aaace"
+    },
+    {
+      "path": "packages/generated-client/src/generated/egopulse/collaboration/v1/collaboration_pb.ts",
+      "sha256": "4f0bedfbcc9677216224a64d66e256cbce3e9e5e503ceff16d1e87d4b75a7112"
+    },
+    {
+      "path": "packages/generated-client/src/generated/egopulse/common/v1/common_pb.ts",
+      "sha256": "2137e3ca10119b9626dee84c4abe72c15e88b42223a7b64b1f3f8057c3da91bb"
+    },
+    {
+      "path": "packages/generated-client/src/generated/egopulse/harness/v1/harness_pb.ts",
+      "sha256": "94a9c3e58639d3c2e39131ef8ea7487062fd64abd445ff0f3ddfddb5169485f6"
+    },
+    {
+      "path": "packages/generated-client/src/generated/egopulse/localapi/v1/local_api_pb.ts",
+      "sha256": "d11b0410bde62f0a07616eca2990a3c118a47a80cbfa05ebeccde28581aa96bf"
+    },
+    {
+      "path": "packages/generated-client/src/generated/egopulse/memory/v1/memory_pb.ts",
+      "sha256": "78b3ba0f512e248be2765f763e8521735a563531faddc37db5071b298e91c060"
+    },
+    {
+      "path": "packages/generated-client/src/generated/egopulse/persistence/v1/persistence_pb.ts",
+      "sha256": "873e0d1fce79353e2062991f482ef8f8e949360d9e6988653221828e163fb383"
+    },
+    {
+      "path": "packages/generated-client/src/generated/egopulse/policy/v1/policy_pb.ts",
+      "sha256": "ef9cb815957667139d331bd379b275879079e460170a65ec7f3e5523c7e2c221"
+    },
+    {
+      "path": "packages/generated-client/src/generated/egopulse/task/v1/task_pb.ts",
+      "sha256": "8146d6c1de106453760ec297e92b1216ef946a48c9a8d10dacc4ba20b34d2601"
+    },
+    {
+      "path": "packages/generated-client/src/generated/egopulse/verdict/v1/verdict_pb.ts",
+      "sha256": "01b12e07f9f6138cf3eb8c510a1dd5431ba244ebbe5ac77080e18ed33dbaf911"
+    },
+    {
+      "path": "packages/generated-client/src/generated/egopulse/verification/v1/verification_pb.ts",
+      "sha256": "243975ad6c55c7f578d0f72410904137c37241003412ab7841bd38c24323c630"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/artifact/v1/artifact_pb2.py",
+      "sha256": "57046f7b4a2d79e853bdbe3ddfdb235eedba0b53dfdc918cd9dbcc52ded01419"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/artifact/v1/artifact_pb2.pyi",
+      "sha256": "26c279c761bbf7f68e69f37746cdfbe2cc24dac0fda8a0177cfebbcc5dfefb73"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/collaboration/v1/collaboration_pb2.py",
+      "sha256": "f12a55f06a159a281484134a1e7781ab4557997f9a7aa4e7b60ce549b37e0bda"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/collaboration/v1/collaboration_pb2.pyi",
+      "sha256": "69ac8b929ea66c2d88e8d63fa4b132389da122b155a819559c1124459b5bfc38"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/common/v1/common_pb2.py",
+      "sha256": "fe96e27005f589dacf0c6ee74a238602ff400b5b50885c5b732886a3905d149a"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/common/v1/common_pb2.pyi",
+      "sha256": "d9c36c76c40f466c9dc1bc76b0f26c52d60ac8e7360e323f8afe9900f8dde6f8"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/harness/v1/harness_pb2.py",
+      "sha256": "5e2de92023fc25f6a960434c2606d25b9a42960ca8aac040a473a98ddcdd9e60"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/harness/v1/harness_pb2.pyi",
+      "sha256": "0973dac6f2d1b3f260f44207b6ca051ac618b65c5dbdf20fd66413e0ada3d841"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/localapi/v1/local_api_pb2.py",
+      "sha256": "130edb15d62b104267bdda575168625a7d7b85e511a598eadea304775b34d089"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/localapi/v1/local_api_pb2.pyi",
+      "sha256": "435669dbef52bb75304b0dedfa99943bda308ab2e80a38c7bd13c2bd93925c3a"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/memory/v1/memory_pb2.py",
+      "sha256": "c265119ae96d6697153a97a395b85526add5a629daa4be609365b1ea0ff8c3b0"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/memory/v1/memory_pb2.pyi",
+      "sha256": "892fe4c62454837e7d8899dd44a9617027edb2fa3826677f58a7c3046e7a3f1e"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/persistence/v1/persistence_pb2.py",
+      "sha256": "add1826407f54161720cc11dac088cf600b6cc09482f66445fbf841e32d74e4e"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/persistence/v1/persistence_pb2.pyi",
+      "sha256": "269dc8230e751415dbf5e1557e16719c41fc461202dd7e33ebfa9d181d049d2e"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/policy/v1/policy_pb2.py",
+      "sha256": "7fd7258079c99acf2af5d99fa03f09b20898b4263507b247c0f823eb3743a0fb"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/policy/v1/policy_pb2.pyi",
+      "sha256": "fa7ce8994f980275cd817838483ef6ff3e0a28e452effa0fe8bce8129fc46042"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/task/v1/task_pb2.py",
+      "sha256": "9ab40dd71b3b9c0a1186b240326f41883c3fc4b32657d6dec95f328f58add5a7"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/task/v1/task_pb2.pyi",
+      "sha256": "1697f98f5e7f8bc33983ded8c21080e023c83457ec96ed4d8b90a4ebbd909596"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/verdict/v1/verdict_pb2.py",
+      "sha256": "f842ea25cfc8afd3ae37509142beff94831e029a54c573fef99eeb124c8ce5d7"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/verdict/v1/verdict_pb2.pyi",
+      "sha256": "658038f5cf762ebbd4378ceb010cc23542348e08380e645f58a108d1fbb9efcb"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/verification/v1/verification_pb2.py",
+      "sha256": "708e58fc3e92bde0ced9220daff491eb916ac1ecc1c9f749220d62251d84c341"
+    },
+    {
+      "path": "workers/contract-bindings/src/egopulse/verification/v1/verification_pb2.pyi",
+      "sha256": "25dea20e4137c916f9b5175f4f58e96a7aad8fdd8ea724ad601843b7539a84d3"
+    }
+  ]
 }

@@ -92,6 +92,7 @@ mod context_mutation;
 mod founder_material;
 #[cfg(test)]
 mod founder_material_tests;
+mod intent_interpretation;
 mod memory_mutation;
 mod memory_retrieval;
 mod owners;
@@ -103,6 +104,7 @@ mod repository_material;
 mod repository_setup;
 mod return_collector;
 mod return_projection;
+mod rework_preparation;
 mod security;
 mod task;
 mod task_evidence;
@@ -411,6 +413,7 @@ pub struct DaemonProviders {
 }
 
 struct RepositoryDispatchComposition {
+    coordinator: Option<Arc<repository_dispatch::RepositoryDispatchCoordinator>>,
     material: RepositoryMaterialConfig,
     admission: artifact::DerivedWorkspaceAdmissionHandle,
     command_artifacts: RepositoryCommandArtifactPolicyConfig,
@@ -532,21 +535,29 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
                 if route != expected {
                     return Ok(SingleHarnessWorkflowResolution::NotApplicable);
                 }
-                let run_id =
-                    work_preparation::work_capability_run_id(&activation.task.task_id, route)
-                        .map_err(|_| SingleHarnessWorkflowResolverError::InvalidConfiguration)?;
+                let work_revision = activation.task.work_revision;
+                let run_id = work_preparation::work_capability_run_id(
+                    &activation.task.task_id,
+                    work_revision,
+                    route,
+                )
+                .map_err(|_| SingleHarnessWorkflowResolverError::InvalidConfiguration)?;
                 if activation.task.current_run_id.as_deref() != Some(run_id.as_str()) {
                     return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
                 }
                 config.run_id = run_id;
-                config.attempt_id = format!(
-                    "attempt:work:{}:{}",
-                    activation.task.task_id, route.route_binding_sha256
-                );
-                config.dispatch_id = format!(
-                    "dispatch:work:{}:{}",
-                    activation.task.task_id, route.route_binding_sha256
-                );
+                config.attempt_id = work_capability_execution_id(
+                    "attempt",
+                    &activation.task.task_id,
+                    work_revision,
+                    &route.route_binding_sha256,
+                )?;
+                config.dispatch_id = work_capability_execution_id(
+                    "dispatch",
+                    &activation.task.task_id,
+                    work_revision,
+                    &route.route_binding_sha256,
+                )?;
                 // Step identities are global in Collaboration storage, just
                 // like Attempt identities. Instantiate the single-step
                 // template per task instead of reusing its storage key.
@@ -556,10 +567,12 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
                 {
                     return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
                 }
-                config.plan.steps[0].step_id = format!(
-                    "step:work:{}:{}",
-                    activation.task.task_id, route.route_binding_sha256
-                );
+                config.plan.steps[0].step_id = work_capability_execution_id(
+                    "step",
+                    &activation.task.task_id,
+                    work_revision,
+                    &route.route_binding_sha256,
+                )?;
                 if route.capability_profile_ref.as_ref() != Some(&config.capability_profile_ref)
                     || config.plan.steps.iter().any(|step| {
                         step.required_capability_profile_ref.as_ref()
@@ -641,6 +654,24 @@ impl SingleHarnessWorkflowResolver for ConfiguredSingleHarnessWorkflow {
             }
             None => Ok(SingleHarnessWorkflowResolution::Resolved(Box::new(config))),
         }
+    }
+}
+
+fn work_capability_execution_id(
+    kind: &str,
+    task_id: &str,
+    work_revision: u64,
+    route_binding_sha256: &str,
+) -> Result<String, SingleHarnessWorkflowResolverError> {
+    if work_revision == 0 {
+        return Err(SingleHarnessWorkflowResolverError::InvalidConfiguration);
+    }
+    if work_revision == 1 {
+        Ok(format!("{kind}:work:{task_id}:{route_binding_sha256}"))
+    } else {
+        Ok(format!(
+            "{kind}:work:{task_id}:revision:{work_revision}:{route_binding_sha256}"
+        ))
     }
 }
 
@@ -1002,6 +1033,14 @@ impl CodexHarnessCompositionConfig {
         }
         self.native.validate()
     }
+
+    fn app_server_config(&self) -> CodexAppServerConfig {
+        let mut config = CodexAppServerConfig::new(self.codex_executable.clone());
+        for (name, value) in &self.environment_overrides {
+            config = config.with_environment_override(name.clone(), value.clone());
+        }
+        config
+    }
 }
 
 pub struct AuthorityCompositionInputs {
@@ -1289,6 +1328,7 @@ impl DaemonProviders {
         command_artifacts: RepositoryCommandArtifactPolicyConfig,
     ) -> Self {
         self.repository_dispatch = Some(RepositoryDispatchComposition {
+            coordinator: None,
             material,
             admission,
             command_artifacts,
@@ -1632,6 +1672,9 @@ impl DaemonProviders {
                 final_artifact_relation_policy,
             } = profile;
             let repository_dispatch = match self.repository_dispatch.as_ref() {
+                Some(repository) if repository.coordinator.is_some() => {
+                    repository.coordinator.clone()
+                }
                 Some(repository) => {
                     let context = self.context_authority.as_ref().ok_or(
                         DaemonCompositionError::InvalidConfiguration(
@@ -1783,7 +1826,6 @@ impl DaemonProviders {
                 Some(source) => evidence.with_approval_delivery_source(Arc::clone(source)),
                 None => evidence,
             };
-            let (guard, reference) = TaskActivationGuardSet::new(evidence);
             // The dispatch owner emits durable Collaboration projections;
             // attach its outbox to the same projector as the Task owner.
             // This separate owner handle exposes only projection read/ACK.
@@ -1824,16 +1866,6 @@ impl DaemonProviders {
                 store_epoch: config.collaboration_store_epoch.clone(),
                 key: CollaborationSqlCipherKey::new(config.collaboration_key),
             };
-            let control = CollaborationControl::open(
-                CollaborationControlConfig {
-                    database_path: config.collaboration_database_path,
-                    store_epoch: config.collaboration_store_epoch,
-                    key: CollaborationSqlCipherKey::new(config.collaboration_key),
-                },
-                guard,
-                SystemAuthorityClock,
-            )
-            .map_err(DaemonCompositionError::Collaboration)?;
             self.harness_content_lineage_readers
                 .push(Arc::new(Mutex::new(
                     CollaborationLineageReader::open(lineage_reader_config)
@@ -1900,6 +1932,20 @@ impl DaemonProviders {
             if let Some(repository_dispatch) = repository_dispatch.as_ref() {
                 adapter = adapter.with_ready_dispatch_material_guard(repository_dispatch.clone());
             }
+            // The guard observes the exact adapter moved into this runner.
+            // A separately reopened edge cannot prove process-local absence.
+            let evidence = evidence.with_runtime_residency(adapter.runtime_residency_reader());
+            let (guard, reference) = TaskActivationGuardSet::new(evidence);
+            let control = CollaborationControl::open(
+                CollaborationControlConfig {
+                    database_path: config.collaboration_database_path,
+                    store_epoch: config.collaboration_store_epoch,
+                    key: CollaborationSqlCipherKey::new(config.collaboration_key),
+                },
+                guard,
+                SystemAuthorityClock,
+            )
+            .map_err(DaemonCompositionError::Collaboration)?;
             let principal = AuthenticatedCollaborationPrincipal {
                 kind: CollaborationPrincipalKind::HarnessAdapter,
                 principal_id: config.workflow.harness_adapter_principal_id.clone(),
@@ -2014,7 +2060,8 @@ impl DaemonProviders {
                 .map_err(|_| {
                     DaemonCompositionError::InvalidConfiguration("cancellation delivery worker")
                 })?
-                .with_task_reconciliation(reconciler),
+                .with_task_reconciliation(reconciler)
+                .with_lineage_readers(self.harness_content_lineage_readers.clone()),
             ));
         }
         Ok(self)
@@ -2579,11 +2626,44 @@ async fn run_harness_dispatch_worker(
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
     let mut previous_blockages = std::collections::BTreeSet::new();
+    let mut append_deferred = false;
     loop {
         if *stop.borrow() {
             return Ok(());
         }
-        let report = runner.run_once().await?;
+        let report = match runner.run_once().await {
+            Ok(report) => report,
+            Err(HarnessDispatchCycleError::Adapter(error))
+                if error.is_retryable_observation_append() =>
+            {
+                // Only an exact observation retained by this same Adapter may
+                // retry here. Other storage/integrity failures remain fatal.
+                if !append_deferred {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"event": "harness_observation_append_deferred"})
+                    );
+                }
+                append_deferred = true;
+                tokio::select! {
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() {
+                            return Ok(());
+                        }
+                    }
+                    _ = tokio::time::sleep(interval.max(Duration::from_millis(100))) => {}
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if append_deferred {
+            eprintln!(
+                "{}",
+                serde_json::json!({"event": "harness_observation_append_resumed"})
+            );
+            append_deferred = false;
+        }
         let mut current_blockages = std::collections::BTreeSet::new();
         for blockage in report.activation_blockages {
             let key = (
@@ -2935,6 +3015,44 @@ mod tests {
         runs: Arc<AtomicUsize>,
     }
 
+    struct OneFailureDispatchRunner {
+        runs: Arc<AtomicUsize>,
+        deferred: bool,
+        invalid_deferred_source: bool,
+    }
+
+    impl HarnessDispatchRunner for OneFailureDispatchRunner {
+        fn run_once(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<HarnessDispatchCycleReport, HarnessDispatchCycleError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let first = self.runs.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if !first {
+                    return Ok(HarnessDispatchCycleReport::default());
+                }
+                use egopulse_harness_adapter::{AdapterEdgeError, GovernedAdapterError};
+                let error = if self.deferred {
+                    if self.invalid_deferred_source {
+                        GovernedAdapterError::ObservationAppendDeferred {
+                            source: AdapterEdgeError::IntegrityFailure,
+                        }
+                    } else {
+                        GovernedAdapterError::observation_append_busy_for_test()
+                    }
+                } else {
+                    GovernedAdapterError::Edge(AdapterEdgeError::IntegrityFailure)
+                };
+                Err(HarnessDispatchCycleError::Adapter(error))
+            })
+        }
+    }
+
     impl HarnessDispatchRunner for CountingDispatchRunner {
         fn run_once(
             &self,
@@ -3220,6 +3338,42 @@ mod tests {
             .expect("worker join")
             .expect("worker should stop cleanly");
         assert!(runs.load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn harness_dispatch_worker_retries_only_deferred_append_errors() {
+        for (deferred, invalid_deferred_source) in [(true, false), (false, false), (true, true)] {
+            let runs = Arc::new(AtomicUsize::new(0));
+            let runner = Arc::new(OneFailureDispatchRunner {
+                runs: Arc::clone(&runs),
+                deferred,
+                invalid_deferred_source,
+            });
+            let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
+            let worker = tokio::spawn(run_harness_dispatch_worker(
+                runner,
+                Duration::from_millis(1),
+                stop_receiver,
+            ));
+            if deferred && !invalid_deferred_source {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while runs.load(Ordering::SeqCst) < 2 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("same runner must retry its retained append");
+                stop_sender.send(true).expect("stop recovered worker");
+                worker.await.expect("worker join").expect("clean stop");
+            } else {
+                let result = tokio::time::timeout(Duration::from_secs(2), worker)
+                    .await
+                    .expect("integrity error must stop the worker")
+                    .expect("worker join");
+                assert!(result.is_err(), "integrity errors must not be retried");
+                assert_eq!(runs.load(Ordering::SeqCst), 1);
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3845,13 +3999,14 @@ mod tests {
             .expect("issue route context");
         let context = Arc::new(Mutex::new(authority));
         let task_id = "task:route-aware";
-        let run_id =
-            work_preparation::work_capability_run_id(task_id, &route).expect("route-bound run ID");
+        let run_id = work_preparation::work_capability_run_id(task_id, 1, &route)
+            .expect("route-bound run ID");
         let activation = egopulse_local_ide_control::collaboration_control::TaskActivationHandoff {
             message_id: "message-route-aware".to_owned(),
             payload_digest_sha256: "payload-route-aware".to_owned(),
             task: egopulse_domain_contracts::v01::egopulse::task::v1::TaskSnapshot {
                 task_id: task_id.to_owned(),
+                work_revision: 1,
                 current_run_id: Some(run_id.clone()),
                 input_snapshot_id: context_snapshot.snapshot_id.clone(),
                 target_scope_ref: "scope:repo".to_owned(),
@@ -3880,11 +4035,85 @@ mod tests {
             panic!("route-aware workflow must carry dispatch route binding");
         };
         assert_eq!(resolved.run_id, run_id);
+        let replayed = ConfiguredSingleHarnessWorkflow::new(config.clone())
+            .with_context_authority(Arc::clone(&context))
+            .with_work_capability_route(route.clone())
+            .with_trusted_dispatch_route_profile(route_profile.clone())
+            .resolve(&activation)
+            .expect("replay exact route-aware workflow");
+        let SingleHarnessWorkflowResolution::ResolvedWithRouteBinding {
+            config: replayed, ..
+        } = replayed
+        else {
+            panic!("replayed route-aware workflow must carry dispatch route binding");
+        };
+        assert_eq!(replayed.run_id, resolved.run_id);
+        assert_eq!(
+            replayed.plan.steps[0].step_id,
+            resolved.plan.steps[0].step_id
+        );
+        assert_eq!(replayed.attempt_id, resolved.attempt_id);
+        assert_eq!(replayed.dispatch_id, resolved.dispatch_id);
+
+        let mut revised_activation = activation.clone();
+        revised_activation.task.work_revision = 2;
+        revised_activation.task.current_run_id = Some(
+            work_preparation::work_capability_run_id(task_id, 2, &route)
+                .expect("revised route-bound run ID"),
+        );
+        let revised = ConfiguredSingleHarnessWorkflow::new(config.clone())
+            .with_context_authority(Arc::clone(&context))
+            .with_work_capability_route(route.clone())
+            .resolve(&revised_activation)
+            .expect("resolve revised task work");
+        let SingleHarnessWorkflowResolution::Resolved(revised) = revised else {
+            panic!("revised workflow configuration");
+        };
+        assert_eq!(
+            revised.run_id,
+            format!(
+                "run:work:{task_id}:revision:2:{}",
+                route.route_binding_sha256
+            )
+        );
+        assert_eq!(
+            revised.plan.steps[0].step_id,
+            format!(
+                "step:work:{task_id}:revision:2:{}",
+                route.route_binding_sha256
+            )
+        );
+        assert_eq!(
+            revised.attempt_id,
+            format!(
+                "attempt:work:{task_id}:revision:2:{}",
+                route.route_binding_sha256
+            )
+        );
+        assert_eq!(
+            revised.dispatch_id,
+            format!(
+                "dispatch:work:{task_id}:revision:2:{}",
+                route.route_binding_sha256
+            )
+        );
+        assert_ne!(revised.run_id, resolved.run_id);
+        assert_ne!(
+            revised.plan.steps[0].step_id,
+            resolved.plan.steps[0].step_id
+        );
+        assert_ne!(revised.attempt_id, resolved.attempt_id);
+        assert_ne!(revised.dispatch_id, resolved.dispatch_id);
+
         let mut second_activation = activation.clone();
         second_activation.task.task_id = "task:route-aware-second".to_owned();
         second_activation.task.current_run_id = Some(
-            work_preparation::work_capability_run_id(&second_activation.task.task_id, &route)
-                .expect("second route-bound run ID"),
+            work_preparation::work_capability_run_id(
+                &second_activation.task.task_id,
+                second_activation.task.work_revision,
+                &route,
+            )
+            .expect("second route-bound run ID"),
         );
         let second = ConfiguredSingleHarnessWorkflow::new(config.clone())
             .with_context_authority(Arc::clone(&context))
@@ -4147,8 +4376,12 @@ mod tests {
         };
         assert_eq!(task.status, TaskStatus::Active as i32);
         assert_eq!(task.work_capability_route.as_ref(), Some(&exact_route));
-        let expected_run_id = work_preparation::work_capability_run_id(&task.task_id, &exact_route)
-            .expect("route-bound run ID");
+        let expected_run_id = work_preparation::work_capability_run_id(
+            &task.task_id,
+            task.work_revision,
+            &exact_route,
+        )
+        .expect("route-bound run ID");
         let expected_attempt_id = format!(
             "attempt:work:{}:{}",
             task.task_id, exact_route.route_binding_sha256

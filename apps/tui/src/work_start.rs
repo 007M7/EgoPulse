@@ -40,6 +40,9 @@ trait WorkStartConfirmation: Send {
 
 trait WorkStartConfirmationRecovery: Send + Sync {
     fn replay(self: Arc<Self>) -> WorkStartReplayConfirmationFuture;
+    fn recovery_hint(&self) -> Option<String> {
+        None
+    }
 }
 
 struct WorkStartPrepared {
@@ -237,11 +240,27 @@ impl WorkStartPreview {
 
 struct ProductionWorkStartClient {
     attachment: Arc<ClientAttachment>,
+    rework: Option<(String, u64)>,
 }
 
 impl WorkStartClient for ProductionWorkStartClient {
     fn prepare(self: Arc<Self>, input: GuidedWorkInput) -> WorkStartPrepareFuture {
         Box::pin(async move {
+            if let Some((task_id, revision)) = self.rework.as_ref() {
+                let recovery = Arc::new(ReworkPreparationRecovery {
+                    attachment: Arc::clone(&self.attachment),
+                    task_id: task_id.clone(),
+                    revision: *revision,
+                    key: format!("rework-prepare:{}", uuid::Uuid::now_v7()),
+                });
+                return match recovery.prepare().await {
+                    Ok(prepared) => Ok(WorkStartPreparationOutcome::Prepared(Box::new(prepared))),
+                    Err(ReworkAttemptFailure::Unknown(_)) => {
+                        Ok(WorkStartPreparationOutcome::OutcomeUnknown(recovery))
+                    }
+                    Err(ReworkAttemptFailure::Rejected(detail)) => Err(detail),
+                };
+            }
             match self.attachment.prepare_guided_work(input).await {
                 Ok(GuidedWorkPreparationAttempt::Prepared(prepared)) => {
                     Ok(WorkStartPreparationOutcome::Prepared(Box::new(
@@ -259,6 +278,165 @@ impl WorkStartClient for ProductionWorkStartClient {
                 Err(error) => Err(safe_guided_work_error(&error)),
             }
         })
+    }
+}
+
+struct ReworkPreparationRecovery {
+    attachment: Arc<ClientAttachment>,
+    task_id: String,
+    revision: u64,
+    key: String,
+}
+
+enum ReworkAttemptFailure {
+    Unknown(String),
+    Rejected(String),
+}
+
+impl ReworkAttemptFailure {
+    fn detail(self) -> String {
+        match self {
+            Self::Unknown(detail) | Self::Rejected(detail) => detail,
+        }
+    }
+}
+
+impl From<String> for ReworkAttemptFailure {
+    fn from(detail: String) -> Self {
+        Self::Rejected(detail)
+    }
+}
+
+fn rework_attempt_failure(
+    error: egopulse_client_operations::ClientWorkError,
+) -> ReworkAttemptFailure {
+    use egopulse_client_operations::ClientWorkError;
+    use egopulse_domain_contracts::v01::egopulse::localapi::v1::LocalApiErrorCode;
+    match error {
+        ClientWorkError::Kernel(_) => {
+            ReworkAttemptFailure::Rejected("返工请求未发送：当前会话不可用。".to_owned())
+        }
+        ClientWorkError::Api(error)
+            if matches!(
+                LocalApiErrorCode::try_from(error.code),
+                Ok(LocalApiErrorCode::InvalidArgument
+                    | LocalApiErrorCode::Unauthenticated
+                    | LocalApiErrorCode::PermissionDenied
+                    | LocalApiErrorCode::ContractIncompatible
+                    | LocalApiErrorCode::SessionExpired
+                    | LocalApiErrorCode::CapabilityNotAdmitted
+                    | LocalApiErrorCode::ConfigurationMigrationRequired)
+            ) =>
+        {
+            ReworkAttemptFailure::Rejected(
+                "返工请求已被拒绝；请检查会话、权限与所选任务。".to_owned(),
+            )
+        }
+        // Unavailable or malformed replies may occur after an Authority commit.
+        // Retain exact recovery rather than asserting that nothing was written.
+        _ => ReworkAttemptFailure::Unknown(
+            "返工结果尚未确认；保留原请求，精确重试或查看原任务。".to_owned(),
+        ),
+    }
+}
+
+impl ReworkPreparationRecovery {
+    async fn prepare(&self) -> Result<WorkStartPrepared, ReworkAttemptFailure> {
+        let prepared = self
+            .attachment
+            .prepare_rework(self.task_id.clone(), self.revision, self.key.clone())
+            .await
+            .map_err(rework_attempt_failure)?;
+        if prepared.task_id != self.task_id
+            || prepared.task_revision != self.revision
+            || prepared.work_revision == 0
+            || prepared.directive_id.trim().is_empty()
+        {
+            return Err("返工响应与所选任务不一致。".to_owned().into());
+        }
+        let work = prepared.work.ok_or_else(|| "返工预览缺失。".to_owned())?;
+        let safe = egopulse_client_operations::rework_safe_preview(&work)
+            .map_err(|_| "返工预览未通过完整性检查。".to_owned())?;
+        let recovery = egopulse_client_operations::DurableReworkConfirmation::capture(
+            &self.attachment,
+            self.task_id.clone(),
+            work.snapshot_id,
+            work.confirmation_binding_sha256,
+            format!("rework-confirm:{}", uuid::Uuid::now_v7()),
+        )
+        .map_err(|_| "无法建立返工恢复记录；尚未确认。".to_owned())?;
+        let recovery_path = crate::result_review::client_private_recovery_directory()?
+            .join(format!("rework-{}.json", uuid::Uuid::now_v7()));
+        recovery
+            .write_new(&recovery_path)
+            .map_err(|_| "无法保存返工恢复记录；尚未确认。".to_owned())?;
+        Ok(WorkStartPrepared {
+            preview: WorkStartPreview::from_shared(&safe),
+            confirmation: Box::new(ReworkConfirmation {
+                attachment: Arc::clone(&self.attachment),
+                task_id: self.task_id.clone(),
+                recovery,
+                recovery_path,
+            }),
+        })
+    }
+}
+
+impl WorkStartPreparationRecovery for ReworkPreparationRecovery {
+    fn replay(self: Arc<Self>) -> WorkStartReplayPreparationFuture {
+        Box::pin(async move { self.prepare().await.map_err(ReworkAttemptFailure::detail) })
+    }
+}
+
+#[derive(Clone)]
+struct ReworkConfirmation {
+    attachment: Arc<ClientAttachment>,
+    task_id: String,
+    recovery: egopulse_client_operations::DurableReworkConfirmation,
+    recovery_path: std::path::PathBuf,
+}
+
+impl ReworkConfirmation {
+    async fn send(&self) -> Result<String, ReworkAttemptFailure> {
+        let result = self
+            .recovery
+            .replay(&self.attachment)
+            .await
+            .map_err(rework_attempt_failure)?;
+        let task_id = confirmed_task_id(result).map_err(|error| safe_guided_work_error(&error))?;
+        if task_id != self.task_id {
+            return Err("返工回执的任务身份不一致。".to_owned().into());
+        }
+        Ok(task_id)
+    }
+}
+
+impl WorkStartConfirmation for ReworkConfirmation {
+    fn confirm(self: Box<Self>) -> WorkStartConfirmFuture {
+        Box::pin(async move {
+            match self.send().await {
+                Ok(task_id) => Ok(WorkStartConfirmationOutcome::Confirmed(task_id)),
+                Err(ReworkAttemptFailure::Unknown(_)) => Ok(
+                    WorkStartConfirmationOutcome::OutcomeUnknown(Arc::new(*self)),
+                ),
+                Err(ReworkAttemptFailure::Rejected(detail)) => Err(format!(
+                    "{detail} 恢复记录：{}",
+                    self.recovery_path.display()
+                )),
+            }
+        })
+    }
+}
+
+impl WorkStartConfirmationRecovery for ReworkConfirmation {
+    fn recovery_hint(&self) -> Option<String> {
+        Some(format!(
+            "恢复记录：{}；重开后可用 egopulse work recover-rework。",
+            self.recovery_path.display()
+        ))
+    }
+    fn replay(self: Arc<Self>) -> WorkStartReplayConfirmationFuture {
+        Box::pin(async move { self.send().await.map_err(ReworkAttemptFailure::detail) })
     }
 }
 
@@ -487,6 +665,7 @@ impl WorkStartDraft {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkStartPageModel {
+    rework_task: Option<String>,
     stage: WorkStartStage,
     active_field: WorkStartField,
     draft: WorkStartDraft,
@@ -497,6 +676,7 @@ pub struct WorkStartPageModel {
 impl Default for WorkStartPageModel {
     fn default() -> Self {
         Self {
+            rework_task: None,
             stage: WorkStartStage::Editing,
             active_field: WorkStartField::Intent,
             draft: WorkStartDraft::default(),
@@ -556,14 +736,23 @@ impl WorkStartPageModel {
     }
 
     pub fn push(&mut self, character: char) {
+        if self.rework_task.is_some() {
+            return;
+        }
         self.active_value_mut().push(character);
     }
 
     pub fn backspace(&mut self) {
+        if self.rework_task.is_some() {
+            return;
+        }
         self.active_value_mut().pop();
     }
 
     pub fn toggle_memory(&mut self) {
+        if self.rework_task.is_some() {
+            return;
+        }
         self.draft.memory_enabled = !self.draft.memory_enabled;
         self.message = if self.draft.memory_enabled {
             "Governed Memory retrieval enabled for this work".to_owned()
@@ -635,6 +824,14 @@ pub fn render_work_start_page(frame: &mut Frame<'_>, area: Rect, model: &WorkSta
         )),
         Line::from(format!("Status: {}", model.message())),
     ];
+    if let Some(task_id) = model.rework_task.as_ref() {
+        lines = vec![
+            Line::from(format!("继续返工：{task_id}")),
+            Line::from("范围、模型路线和起始材料继承原任务；核对返工要求后再确认。"),
+            Line::from(format!("Stage: {:?}", model.stage())),
+            Line::from(format!("Status: {}", model.message())),
+        ];
+    }
     if let Some(preview) = model.preview() {
         lines.extend([
             Line::from(""),
@@ -1044,10 +1241,14 @@ impl<C: WorkStartClient + ?Sized + 'static> WorkStartControllerCore<C> {
                     "Task confirmed; opening Task Watch without inferring completion".to_owned();
             }
             WorkStartWorkerEvent::ConfirmationUnknown { recovery, .. } => {
+                let hint = recovery.recovery_hint();
                 self.confirmation_recovery = Some(recovery);
                 self.model.stage = WorkStartStage::ConfirmationOutcomeUnknown;
                 self.model.message = "Task confirmation outcome is unknown; Enter exact-replays or w opens Task Watch for reconciliation"
                         .to_owned();
+                if let Some(hint) = hint {
+                    self.model.message.push_str(&format!(" {hint}"));
+                }
             }
             WorkStartWorkerEvent::Failed { detail, .. } => {
                 let preparation_unknown = self.preparation_recovery.is_some();
@@ -1107,8 +1308,23 @@ impl WorkStartController {
     #[must_use]
     pub fn new(attachment: Arc<ClientAttachment>) -> Self {
         Self {
-            inner: WorkStartControllerCore::new(Arc::new(ProductionWorkStartClient { attachment })),
+            inner: WorkStartControllerCore::new(Arc::new(ProductionWorkStartClient {
+                attachment,
+                rework: None,
+            })),
         }
+    }
+
+    /// Reuses the existing preview/confirmation state machine for one Task.
+    pub fn new_rework(attachment: Arc<ClientAttachment>, task_id: String, revision: u64) -> Self {
+        let mut controller = Self {
+            inner: WorkStartControllerCore::new(Arc::new(ProductionWorkStartClient {
+                attachment,
+                rework: Some((task_id.clone(), revision)),
+            })),
+        };
+        controller.inner.model.rework_task = Some(task_id);
+        controller
     }
 
     #[must_use]
@@ -1181,6 +1397,40 @@ mod tests {
 
     use super::*;
     use tokio::sync::Notify;
+
+    #[test]
+    fn rework_rejection_is_distinct_from_possible_committed_response_loss() {
+        use egopulse_client_operations::ClientWorkError;
+        use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
+            LocalApiError, LocalApiErrorCode,
+        };
+        for code in [
+            LocalApiErrorCode::InvalidArgument,
+            LocalApiErrorCode::PermissionDenied,
+            LocalApiErrorCode::SessionExpired,
+        ] {
+            assert!(matches!(
+                rework_attempt_failure(ClientWorkError::Api(Box::new(LocalApiError {
+                    code: code as i32,
+                    ..Default::default()
+                }))),
+                ReworkAttemptFailure::Rejected(_)
+            ));
+        }
+        for error in [
+            ClientWorkError::Transport("lost response".to_owned()),
+            ClientWorkError::Protocol("missing receipt"),
+            ClientWorkError::Api(Box::new(LocalApiError {
+                code: LocalApiErrorCode::AuthorityUnavailable as i32,
+                ..Default::default()
+            })),
+        ] {
+            assert!(matches!(
+                rework_attempt_failure(error),
+                ReworkAttemptFailure::Unknown(_)
+            ));
+        }
+    }
 
     struct ScriptedClient {
         prepares: AtomicU64,

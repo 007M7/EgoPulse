@@ -23,7 +23,13 @@ use prost::Message;
 use prost_types::Timestamp;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{collections::HashSet, future::Future, path::PathBuf, pin::Pin};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -378,6 +384,14 @@ pub enum LegacyExecutionStartRecovery {
 pub type NativeHarnessFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait NativeHarnessDriver {
+    /// Reports whether this driver can accept a new dispatch without replacing
+    /// an already-active native execution. Drivers that support concurrent
+    /// dispatches keep the permissive default.
+    #[must_use]
+    fn is_dispatch_ready(&self) -> bool {
+        true
+    }
+
     fn probe<'a>(
         &'a mut self,
         request: &'a ProbeHarnessRequest,
@@ -432,6 +446,10 @@ pub trait NativeHarnessDriver {
 // at the provider-neutral adapter boundary; no provider-specific code needs to
 // know how another provider is stored.
 impl NativeHarnessDriver for Box<dyn NativeHarnessDriver + Send> {
+    fn is_dispatch_ready(&self) -> bool {
+        (**self).is_dispatch_ready()
+    }
+
     fn probe<'a>(
         &'a mut self,
         request: &'a ProbeHarnessRequest,
@@ -524,10 +542,113 @@ pub enum GovernedAdapterError {
     InvalidReconciliationEvidence,
     #[error("durable delivered dispatch recovery evidence is invalid")]
     InvalidDeliveredRecoveryEvidence,
+    #[error("process-local Adapter residency evidence is unavailable")]
+    ResidencyEvidenceUnavailable,
     #[error("native terminal output candidate extraction failed")]
     TerminalOutputCandidate,
+    #[error("terminal observation append is deferred while the Adapter Edge is busy")]
+    ObservationAppendDeferred {
+        #[source]
+        source: AdapterEdgeError,
+    },
     #[error("Harness content disclosure failed closed")]
     ContentDisclosure(#[from] ContentDisclosureError),
+}
+
+impl GovernedAdapterError {
+    /// Constructs the storage-owner failure used by downstream worker tests.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn observation_append_busy_for_test() -> Self {
+        Self::ObservationAppendDeferred {
+            source: AdapterEdgeError::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )),
+        }
+    }
+
+    /// Returns true only for the retained-observation retry boundary that is
+    /// safe to retry within this Adapter process.
+    #[must_use]
+    pub fn is_retryable_observation_append(&self) -> bool {
+        matches!(
+            self,
+            Self::ObservationAppendDeferred { source }
+                if is_retryable_observation_append_failure(source)
+        )
+    }
+}
+
+#[derive(Default)]
+struct AdapterRuntimeResidencyState {
+    resident_dispatches: HashSet<String>,
+    active_nonresident_observations: HashMap<String, usize>,
+}
+
+/// Read-only capability for the process-local residency state of one concrete
+/// `GovernedHarnessAdapter` instance.
+///
+/// A reopened `AdapterEdge` cannot construct this capability. Composition must
+/// obtain it from the same Adapter instance owned by the dispatch runner and
+/// give it to the Authority evidence resolver.
+#[derive(Clone)]
+pub struct AdapterRuntimeResidencyReader {
+    adapter_id: String,
+    state: Arc<Mutex<AdapterRuntimeResidencyState>>,
+}
+
+impl AdapterRuntimeResidencyReader {
+    #[must_use]
+    pub fn adapter_id(&self) -> &str {
+        &self.adapter_id
+    }
+
+    /// Returns true only while the owning Adapter has an active, scoped
+    /// observation proving that this dispatch is absent from its resident set.
+    /// Lock failure is an error so Authority callers can fail closed.
+    pub fn observes_nonresident_dispatch(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<bool, GovernedAdapterError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| GovernedAdapterError::ResidencyEvidenceUnavailable)?;
+        Ok(!state.resident_dispatches.contains(dispatch_id)
+            && state
+                .active_nonresident_observations
+                .get(dispatch_id)
+                .is_some_and(|count| *count > 0))
+    }
+}
+
+/// Scoped proof that the owning Adapter observed a dispatch as nonresident.
+/// Dropping the value removes the proof, so a durable receipt cannot reuse it
+/// outside the exact Authority call which requested the observation.
+pub struct NonresidentDispatchObservation {
+    dispatch_id: String,
+    state: Arc<Mutex<AdapterRuntimeResidencyState>>,
+}
+
+impl Drop for NonresidentDispatchObservation {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(count) = state
+            .active_nonresident_observations
+            .get_mut(&self.dispatch_id)
+        else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            state
+                .active_nonresident_observations
+                .remove(&self.dispatch_id);
+        }
+    }
 }
 
 pub struct GovernedHarnessAdapter<R, D, C> {
@@ -548,7 +669,50 @@ pub struct GovernedHarnessAdapter<R, D, C> {
     // This is intentionally process-local. A persisted Delivered receipt only
     // proves a prior native side effect; it cannot prove a restarted adapter
     // still owns a live native session that may be polled for terminal events.
-    resident_dispatches: HashSet<String>,
+    runtime_residency: Arc<Mutex<AdapterRuntimeResidencyState>>,
+    // Driver events are destructive reads. Keep the exact event-derived
+    // observation and any terminal candidate here until the Edge atomically
+    // records both, so a transient Edge failure cannot release native capacity.
+    pending_observation_append: Option<PendingObservationAppend>,
+    #[cfg(test)]
+    next_observation_append_failure_for_test: Option<TestObservationAppendFailure>,
+}
+
+#[cfg(test)]
+enum TestObservationAppendFailure {
+    DatabaseBusy,
+    IntegrityFailure,
+}
+
+struct PendingObservationAppend {
+    dispatch_id: String,
+    attempt_id: String,
+    fencing_token: u64,
+    native_key: String,
+    raw_event: Vec<u8>,
+    observation: HarnessObservation,
+    terminal_output: Option<TerminalOutputCandidate>,
+    terminal: bool,
+    received_at_seconds: i64,
+}
+
+impl PendingObservationAppend {
+    fn matches(&self, envelope: &DispatchEnvelope) -> bool {
+        self.dispatch_id == envelope.dispatch_id
+            && self.attempt_id == envelope.attempt_id
+            && self.fencing_token == envelope.fencing_token
+    }
+}
+
+fn is_retryable_observation_append_failure(error: &AdapterEdgeError) -> bool {
+    matches!(
+        error,
+        AdapterEdgeError::Sql(error)
+            if matches!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            )
+    )
 }
 
 pub enum ManagedDisclosureCredentials {
@@ -852,7 +1016,10 @@ where
             final_artifact_relation_policy:
                 FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
             ready_dispatch_material_guard: None,
-            resident_dispatches: HashSet::new(),
+            runtime_residency: Arc::new(Mutex::new(AdapterRuntimeResidencyState::default())),
+            pending_observation_append: None,
+            #[cfg(test)]
+            next_observation_append_failure_for_test: None,
         }
     }
 
@@ -1100,7 +1267,10 @@ where
         self.edge
             .record_dispatch_receipt(&receipt, raw_evidence, now.seconds)?;
         if receipt.disposition == DeliveryDisposition::Delivered as i32 {
-            self.resident_dispatches
+            self.runtime_residency
+                .lock()
+                .map_err(|_| GovernedAdapterError::ResidencyEvidenceUnavailable)?
+                .resident_dispatches
                 .insert(envelope.dispatch_id.clone());
         }
         Ok(dispatch_receipt(receipt))
@@ -1112,75 +1282,187 @@ where
     /// session for polling.
     #[must_use]
     pub fn has_resident_dispatch(&self, dispatch_id: &str) -> bool {
-        self.resident_dispatches.contains(dispatch_id)
+        self.runtime_residency
+            .lock()
+            .map(|state| state.resident_dispatches.contains(dispatch_id))
+            .unwrap_or(true)
+    }
+
+    /// Returns the current driver admission state for a new native dispatch.
+    /// Durable receipt replay and observation recovery use their existing
+    /// paths and do not depend on this signal.
+    #[must_use]
+    pub fn is_dispatch_ready(&self) -> bool {
+        self.pending_observation_append.is_none() && self.driver.is_dispatch_ready()
+    }
+
+    /// Exposes a read-only view of this exact Adapter instance's residency.
+    /// The handle must be installed on the Authority evidence resolver paired
+    /// with this Adapter by daemon composition.
+    #[must_use]
+    pub fn runtime_residency_reader(&self) -> AdapterRuntimeResidencyReader {
+        AdapterRuntimeResidencyReader {
+            adapter_id: self.adapter_id.clone(),
+            state: Arc::clone(&self.runtime_residency),
+        }
+    }
+
+    /// Creates a short-lived proof for one Authority call after observing that
+    /// this exact Adapter instance does not own the native dispatch stream.
+    pub fn observe_nonresident_dispatch(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<NonresidentDispatchObservation, GovernedAdapterError> {
+        let mut state = self
+            .runtime_residency
+            .lock()
+            .map_err(|_| GovernedAdapterError::ResidencyEvidenceUnavailable)?;
+        if state.resident_dispatches.contains(dispatch_id) {
+            return Err(GovernedAdapterError::InvalidDeliveredRecoveryEvidence);
+        }
+        *state
+            .active_nonresident_observations
+            .entry(dispatch_id.to_owned())
+            .or_default() += 1;
+        drop(state);
+        Ok(NonresidentDispatchObservation {
+            dispatch_id: dispatch_id.to_owned(),
+            state: Arc::clone(&self.runtime_residency),
+        })
     }
 
     pub async fn pump_one(
         &mut self,
         envelope: &DispatchEnvelope,
     ) -> Result<Option<HarnessObservation>, GovernedAdapterError> {
-        let event = match self.driver.next_event(envelope).await {
-            Ok(value) => value,
-            Err(error) => Some(driver_error_event(error, self.clock.now())),
+        let pending = match self.pending_observation_append.take() {
+            Some(pending) if pending.matches(envelope) => pending,
+            Some(pending) => {
+                self.pending_observation_append = Some(pending);
+                return Ok(None);
+            }
+            None => {
+                let event = match self.driver.next_event(envelope).await {
+                    Ok(value) => value,
+                    Err(error) => Some(driver_error_event(error, self.clock.now())),
+                };
+                let Some(event) = event else {
+                    return Ok(None);
+                };
+                let received_at = self.clock.now();
+                let terminal = event.criticality == ObservationCriticality::Terminal;
+                let completed = terminal
+                    && matches!(
+                        &event.payload,
+                        harness_observation::Payload::Lifecycle(lifecycle)
+                            if lifecycle.kind == LifecycleKind::ExecutionCompleted as i32
+                    );
+                let terminal_output = if completed {
+                    self.driver
+                        .take_terminal_output_candidate(envelope)
+                        .await
+                        .map_err(|_| GovernedAdapterError::TerminalOutputCandidate)?
+                } else {
+                    None
+                };
+                let mut observation = HarnessObservation {
+                    observation_id: String::new(),
+                    adapter_id: self.adapter_id.clone(),
+                    attempt_id: envelope.attempt_id.clone(),
+                    dispatch_id: envelope.dispatch_id.clone(),
+                    fencing_token: envelope.fencing_token,
+                    observation_sequence: 0,
+                    native_event_id: event.native_event_id,
+                    native_sequence: event.native_sequence,
+                    native_event_digest_sha256: String::new(),
+                    capability_profile_id: self.capability_profile_id.clone(),
+                    criticality: event.criticality as i32,
+                    raw_evidence_ref: String::new(),
+                    native_observed_at: Some(event.native_observed_at),
+                    adapter_received_at: Some(received_at),
+                    payload: Some(event.payload),
+                };
+                observation.native_event_digest_sha256 = sha256(&event.raw_event);
+                if matches!(
+                    observation.payload.as_ref(),
+                    Some(harness_observation::Payload::ContentSignal(_))
+                ) {
+                    self.bind_content_observation(envelope, &mut observation)?;
+                }
+                PendingObservationAppend {
+                    dispatch_id: envelope.dispatch_id.clone(),
+                    attempt_id: envelope.attempt_id.clone(),
+                    fencing_token: envelope.fencing_token,
+                    native_key: event.native_key,
+                    raw_event: event.raw_event,
+                    observation,
+                    terminal_output,
+                    terminal,
+                    received_at_seconds: received_at.seconds,
+                }
+            }
         };
-        let Some(event) = event else {
-            return Ok(None);
+        let appended = match self.append_pending_observation(&pending) {
+            Ok(appended) => appended,
+            Err(source) => {
+                self.pending_observation_append = Some(pending);
+                if is_retryable_observation_append_failure(&source) {
+                    return Err(GovernedAdapterError::ObservationAppendDeferred { source });
+                }
+                return Err(source.into());
+            }
         };
-        let received_at = self.clock.now();
-        let terminal = event.criticality == ObservationCriticality::Terminal;
-        let completed = event.criticality == ObservationCriticality::Terminal
-            && matches!(
-                &event.payload,
-                harness_observation::Payload::Lifecycle(lifecycle)
-                    if lifecycle.kind == LifecycleKind::ExecutionCompleted as i32
-            );
-        let terminal_output = if completed {
-            self.driver
-                .take_terminal_output_candidate(envelope)
-                .await
-                .map_err(|_| GovernedAdapterError::TerminalOutputCandidate)?
-        } else {
-            None
-        };
-        let mut observation = HarnessObservation {
-            observation_id: String::new(),
-            adapter_id: self.adapter_id.clone(),
-            attempt_id: envelope.attempt_id.clone(),
-            dispatch_id: envelope.dispatch_id.clone(),
-            fencing_token: envelope.fencing_token,
-            observation_sequence: 0,
-            native_event_id: event.native_event_id,
-            native_sequence: event.native_sequence,
-            native_event_digest_sha256: String::new(),
-            capability_profile_id: self.capability_profile_id.clone(),
-            criticality: event.criticality as i32,
-            raw_evidence_ref: String::new(),
-            native_observed_at: Some(event.native_observed_at),
-            adapter_received_at: Some(received_at),
-            payload: Some(event.payload),
-        };
-        observation.native_event_digest_sha256 = sha256(&event.raw_event);
-        if matches!(
-            observation.payload.as_ref(),
-            Some(harness_observation::Payload::ContentSignal(_))
-        ) {
-            self.bind_content_observation(envelope, &mut observation)?;
-        }
-        let appended = self.edge.append_observation_with_terminal_output(
-            &envelope.dispatch_id,
-            &event.native_key,
-            &event.raw_event,
-            observation,
-            terminal_output.as_ref(),
-            received_at.seconds,
-        )?;
-        if terminal {
-            self.resident_dispatches.remove(&envelope.dispatch_id);
+        if pending.terminal {
+            self.runtime_residency
+                .lock()
+                .map_err(|_| GovernedAdapterError::ResidencyEvidenceUnavailable)?
+                .resident_dispatches
+                .remove(&envelope.dispatch_id);
         }
         Ok(Some(match appended {
             crate::ObservationAppend::Committed(value)
             | crate::ObservationAppend::Replay(value) => value,
         }))
+    }
+
+    fn append_pending_observation(
+        &mut self,
+        pending: &PendingObservationAppend,
+    ) -> Result<crate::ObservationAppend, AdapterEdgeError> {
+        #[cfg(test)]
+        if let Some(failure) = self.next_observation_append_failure_for_test.take() {
+            return Err(match failure {
+                TestObservationAppendFailure::DatabaseBusy => {
+                    AdapterEdgeError::Sql(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                        None,
+                    ))
+                }
+                TestObservationAppendFailure::IntegrityFailure => {
+                    AdapterEdgeError::IntegrityFailure
+                }
+            });
+        }
+        self.edge.append_observation_with_terminal_output(
+            &pending.dispatch_id,
+            &pending.native_key,
+            &pending.raw_event,
+            pending.observation.clone(),
+            pending.terminal_output.as_ref(),
+            pending.received_at_seconds,
+        )
+    }
+
+    #[cfg(test)]
+    fn fail_next_observation_append_with_busy_for_test(&mut self) {
+        self.next_observation_append_failure_for_test =
+            Some(TestObservationAppendFailure::DatabaseBusy);
+    }
+
+    #[cfg(test)]
+    fn fail_next_observation_append_with_integrity_failure_for_test(&mut self) {
+        self.next_observation_append_failure_for_test =
+            Some(TestObservationAppendFailure::IntegrityFailure);
     }
 
     /// Reads a driver-owned terminal output candidate without persisting it.
@@ -2998,6 +3280,82 @@ mod dispatch_context_gate_tests {
         }
     }
 
+    struct TerminalCandidateDriver {
+        sends: Arc<AtomicUsize>,
+        candidate_reads: Arc<AtomicUsize>,
+        terminal: Option<DriverEvent>,
+        terminal_output: Option<TerminalOutputCandidate>,
+    }
+
+    impl NativeHarnessDriver for TerminalCandidateDriver {
+        fn is_dispatch_ready(&self) -> bool {
+            true
+        }
+
+        fn probe<'a>(
+            &'a mut self,
+            _request: &'a ProbeHarnessRequest,
+        ) -> NativeHarnessFuture<'a, Result<ProbeHarnessResult, DriverError>> {
+            Box::pin(async { panic!("probe is not used") })
+        }
+
+        fn send_dispatch<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+            _material: &'a ResolvedDispatchMaterial,
+        ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(DriverDelivery {
+                    native_request_ref: "native-request:terminal-candidate-test".to_owned(),
+                    native_session_ref: "native-session:terminal-candidate-test".to_owned(),
+                    native_execution_ref: Some(
+                        "native-execution:terminal-candidate-test".to_owned(),
+                    ),
+                    raw_evidence: b"terminal-candidate-delivered".to_vec(),
+                })
+            })
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Option<DriverEvent>, DriverError>> {
+            let event = self.terminal.take();
+            Box::pin(async move { Ok(event) })
+        }
+
+        fn take_terminal_output_candidate<'a>(
+            &'a mut self,
+            _envelope: &'a DispatchEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Option<TerminalOutputCandidate>, DriverError>> {
+            self.candidate_reads.fetch_add(1, Ordering::SeqCst);
+            let candidate = self.terminal_output.take();
+            Box::pin(async move { Ok(candidate) })
+        }
+
+        fn decide_approval<'a>(
+            &'a mut self,
+            _envelope: &'a ApprovalDecisionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            Box::pin(async { panic!("approval is not used") })
+        }
+
+        fn cancel<'a>(
+            &'a mut self,
+            _envelope: &'a CancelExecutionEnvelope,
+        ) -> NativeHarnessFuture<'a, Result<Vec<u8>, DriverError>> {
+            Box::pin(async { panic!("cancel is not used") })
+        }
+
+        fn reconcile<'a>(
+            &'a mut self,
+            _context: &'a ReconciliationContext,
+        ) -> NativeHarnessFuture<'a, Result<ReconciliationFinding, DriverError>> {
+            Box::pin(async { panic!("reconcile is not used") })
+        }
+    }
+
     #[derive(Clone)]
     struct CountingGate {
         authorization: DispatchContextAuthorization,
@@ -3878,6 +4236,10 @@ mod dispatch_context_gate_tests {
                 if receipt.disposition == DeliveryDisposition::Delivered as i32
         ));
         assert!(governed.has_resident_dispatch(&dispatch.dispatch_id));
+        assert!(matches!(
+            governed.observe_nonresident_dispatch(&dispatch.dispatch_id),
+            Err(GovernedAdapterError::InvalidDeliveredRecoveryEvidence)
+        ));
         assert_eq!(sends.load(Ordering::SeqCst), 1);
 
         governed.dispatch(&dispatch).await.expect("durable replay");
@@ -3894,6 +4256,26 @@ mod dispatch_context_gate_tests {
             ObservationCriticality::Terminal as i32
         );
         assert!(!governed.has_resident_dispatch(&dispatch.dispatch_id));
+        let reader = governed.runtime_residency_reader();
+        assert!(
+            !reader
+                .observes_nonresident_dispatch(&dispatch.dispatch_id)
+                .expect("read unobserved nonresident state")
+        );
+        let observation = governed
+            .observe_nonresident_dispatch(&dispatch.dispatch_id)
+            .expect("observe terminal dispatch as nonresident");
+        assert!(
+            reader
+                .observes_nonresident_dispatch(&dispatch.dispatch_id)
+                .expect("read scoped nonresident observation")
+        );
+        drop(observation);
+        assert!(
+            !reader
+                .observes_nonresident_dispatch(&dispatch.dispatch_id)
+                .expect("scoped observation is removed on drop")
+        );
         drop(governed);
 
         let mut reopened = adapter(&root.database(), resolved, Arc::clone(&sends));
@@ -3903,6 +4285,169 @@ mod dispatch_context_gate_tests {
             .expect("persisted delivered replay after reopen");
         assert!(!reopened.has_resident_dispatch(&dispatch.dispatch_id));
         assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn busy_terminal_append_keeps_native_capacity_busy_until_same_candidate_commits() {
+        let root = FixtureRoot::new("terminal-append-retry");
+        let resolved = material();
+        let mut dispatch = envelope(&resolved, "dispatch-terminal-append-retry");
+        dispatch.input_bundle_ref = "static-terminal-append-retry.json".to_owned();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let candidate_reads = Arc::new(AtomicUsize::new(0));
+        let terminal = DriverEvent {
+            native_key: "native:terminal-append-retry".to_owned(),
+            native_event_id: Some("native-event:terminal-append-retry".to_owned()),
+            native_sequence: Some(2),
+            native_observed_at: Timestamp {
+                seconds: 10,
+                nanos: 0,
+            },
+            criticality: ObservationCriticality::Terminal,
+            payload: harness_observation::Payload::Lifecycle(
+                egopulse_domain_contracts::v01::egopulse::harness::v1::LifecycleObservation {
+                    kind: LifecycleKind::ExecutionCompleted as i32,
+                    ..Default::default()
+                },
+            ),
+            raw_event: b"terminal-append-retry-event".to_vec(),
+        };
+        let expected_content = b"same terminal output bytes".to_vec();
+        let mut governed = GovernedHarnessAdapter::new(
+            ADAPTER_ID,
+            PROFILE_ID,
+            protocol(),
+            open_edge(&root.database()),
+            FixtureResolver {
+                material: resolved.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            },
+            TerminalCandidateDriver {
+                sends: Arc::clone(&sends),
+                candidate_reads: Arc::clone(&candidate_reads),
+                terminal: Some(terminal),
+                terminal_output: Some(TerminalOutputCandidate {
+                    dispatch_id: dispatch.dispatch_id.clone(),
+                    native_completion_ref: "item:terminal-append-retry".to_owned(),
+                    media_type: "text/plain".to_owned(),
+                    content: expected_content.clone(),
+                }),
+            },
+            FixedClock,
+        );
+
+        governed.dispatch(&dispatch).await.expect("native send");
+        governed
+            .bind_dispatch_task_lineage(&dispatch.dispatch_id, "task-terminal-append-retry", 1, 1)
+            .expect("bind dispatch lineage");
+        governed.fail_next_observation_append_with_busy_for_test();
+
+        assert!(matches!(
+            governed.pump_one(&dispatch).await,
+            Err(GovernedAdapterError::ObservationAppendDeferred {
+                source: AdapterEdgeError::Sql(error),
+            }) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+        ));
+        assert!(governed.has_resident_dispatch(&dispatch.dispatch_id));
+        assert!(
+            !governed.is_dispatch_ready(),
+            "the Adapter-local pending append must block a second native dispatch"
+        );
+        assert_eq!(candidate_reads.load(Ordering::SeqCst), 1);
+
+        let terminal = governed
+            .pump_one(&dispatch)
+            .await
+            .expect("retry pending terminal append")
+            .expect("terminal observation");
+        assert_eq!(
+            terminal.criticality,
+            ObservationCriticality::Terminal as i32
+        );
+        assert_eq!(candidate_reads.load(Ordering::SeqCst), 1);
+        assert!(!governed.has_resident_dispatch(&dispatch.dispatch_id));
+        assert!(governed.is_dispatch_ready());
+
+        let stored = governed
+            .edge
+            .terminal_output_candidate_for_dispatch(&dispatch.dispatch_id)
+            .expect("read committed candidate")
+            .expect("candidate persisted");
+        assert_eq!(stored.native_completion_ref, "item:terminal-append-retry");
+        assert_eq!(stored.content, expected_content);
+    }
+
+    #[tokio::test]
+    async fn terminal_append_integrity_failure_remains_fatal() {
+        let root = FixtureRoot::new("terminal-append-integrity");
+        let resolved = material();
+        let mut dispatch = envelope(&resolved, "dispatch-terminal-append-integrity");
+        dispatch.input_bundle_ref = "static-terminal-append-integrity.json".to_owned();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let terminal = DriverEvent {
+            native_key: "native:terminal-append-integrity".to_owned(),
+            native_event_id: Some("native-event:terminal-append-integrity".to_owned()),
+            native_sequence: Some(2),
+            native_observed_at: Timestamp {
+                seconds: 10,
+                nanos: 0,
+            },
+            criticality: ObservationCriticality::Terminal,
+            payload: harness_observation::Payload::Lifecycle(
+                egopulse_domain_contracts::v01::egopulse::harness::v1::LifecycleObservation {
+                    kind: LifecycleKind::ExecutionInterrupted as i32,
+                    ..Default::default()
+                },
+            ),
+            raw_event: b"terminal-append-integrity-event".to_vec(),
+        };
+        let mut governed = GovernedHarnessAdapter::new(
+            ADAPTER_ID,
+            PROFILE_ID,
+            protocol(),
+            open_edge(&root.database()),
+            FixtureResolver {
+                material: resolved,
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            },
+            ResidentDriver {
+                sends,
+                terminal: Some(terminal),
+            },
+            FixedClock,
+        );
+
+        governed.dispatch(&dispatch).await.expect("native send");
+        governed.fail_next_observation_append_with_integrity_failure_for_test();
+        assert!(matches!(
+            governed.pump_one(&dispatch).await,
+            Err(GovernedAdapterError::Edge(
+                AdapterEdgeError::IntegrityFailure
+            ))
+        ));
+        assert!(governed.has_resident_dispatch(&dispatch.dispatch_id));
+        assert!(!governed.is_dispatch_ready());
+    }
+
+    #[test]
+    fn only_busy_or_locked_edge_failures_are_deferred() {
+        let sqlite_failure = |code| {
+            AdapterEdgeError::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+        };
+        assert!(is_retryable_observation_append_failure(&sqlite_failure(
+            rusqlite::ffi::SQLITE_BUSY
+        )));
+        assert!(is_retryable_observation_append_failure(&sqlite_failure(
+            rusqlite::ffi::SQLITE_LOCKED
+        )));
+        assert!(!is_retryable_observation_append_failure(
+            &AdapterEdgeError::IntegrityFailure
+        ));
     }
 
     #[tokio::test]

@@ -512,6 +512,58 @@ class WorkPreparationPreview(_message.Message):
     preference_revision_at_resolution: int
     def __init__(self, snapshot_id: _Optional[str] = ..., snapshot_revision: _Optional[int] = ..., normalized_intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., compiled_context_sha256: _Optional[str] = ..., included_sources: _Optional[_Iterable[_Union[WorkSourceFact, _Mapping]]] = ..., excluded_sources: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., non_goals: _Optional[_Iterable[str]] = ..., allowed_read_paths: _Optional[_Iterable[str]] = ..., allowed_write_paths: _Optional[_Iterable[str]] = ..., allowed_tools: _Optional[_Iterable[str]] = ..., external_resources: _Optional[_Iterable[str]] = ..., acceptance_contract_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., budget_profile_ref: _Optional[_Union[_common_pb2.ContractReference, _Mapping]] = ..., memory_authority_revision: _Optional[int] = ..., memory_pack_snapshot_sha256: _Optional[str] = ..., recovery_entry: _Optional[str] = ..., visibility: _Optional[str] = ..., redactions: _Optional[_Iterable[_Union[RedactedField, _Mapping]]] = ..., expires_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., confirmation_binding_sha256: _Optional[str] = ..., gate_ready: _Optional[bool] = ..., blockers: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., warnings: _Optional[_Iterable[_Union[WorkGateNotice, _Mapping]]] = ..., required_confirmations: _Optional[_Iterable[str]] = ..., evidence_required: _Optional[_Iterable[str]] = ..., ready_for_founder_confirmation: _Optional[bool] = ..., deadline: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., context_state_revision: _Optional[int] = ..., work_capability: _Optional[_Union[WorkCapabilityView, _Mapping]] = ..., work_capability_selection_source: _Optional[_Union[WorkCapabilitySelectionSource, str]] = ..., preference_revision_at_resolution: _Optional[int] = ...) -> None: ...
 
+class IntentConversationMessage(_message.Message):
+    __slots__ = ("from_assistant", "text")
+    FROM_ASSISTANT_FIELD_NUMBER: _ClassVar[int]
+    TEXT_FIELD_NUMBER: _ClassVar[int]
+    from_assistant: bool
+    text: str
+    def __init__(self, from_assistant: _Optional[bool] = ..., text: _Optional[str] = ...) -> None: ...
+
+class InterpretIntentRequest(_message.Message):
+    __slots__ = ("client", "text", "history", "work_capability_choice_id")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    TEXT_FIELD_NUMBER: _ClassVar[int]
+    HISTORY_FIELD_NUMBER: _ClassVar[int]
+    WORK_CAPABILITY_CHOICE_ID_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    text: str
+    history: _containers.RepeatedCompositeFieldContainer[IntentConversationMessage]
+    work_capability_choice_id: str
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., text: _Optional[str] = ..., history: _Optional[_Iterable[_Union[IntentConversationMessage, _Mapping]]] = ..., work_capability_choice_id: _Optional[str] = ...) -> None: ...
+
+class IntentWorkCandidate(_message.Message):
+    __slots__ = ("intent", "work_type", "target_scope_ref", "sources")
+    INTENT_FIELD_NUMBER: _ClassVar[int]
+    WORK_TYPE_FIELD_NUMBER: _ClassVar[int]
+    TARGET_SCOPE_REF_FIELD_NUMBER: _ClassVar[int]
+    SOURCES_FIELD_NUMBER: _ClassVar[int]
+    intent: str
+    work_type: str
+    target_scope_ref: str
+    sources: _containers.RepeatedCompositeFieldContainer[WorkSourceRequest]
+    def __init__(self, intent: _Optional[str] = ..., work_type: _Optional[str] = ..., target_scope_ref: _Optional[str] = ..., sources: _Optional[_Iterable[_Union[WorkSourceRequest, _Mapping]]] = ...) -> None: ...
+
+class InterpretedIntent(_message.Message):
+    __slots__ = ("reply", "needs_clarification", "work_candidate", "work_capability")
+    REPLY_FIELD_NUMBER: _ClassVar[int]
+    NEEDS_CLARIFICATION_FIELD_NUMBER: _ClassVar[int]
+    WORK_CANDIDATE_FIELD_NUMBER: _ClassVar[int]
+    WORK_CAPABILITY_FIELD_NUMBER: _ClassVar[int]
+    reply: str
+    needs_clarification: bool
+    work_candidate: IntentWorkCandidate
+    work_capability: WorkCapabilityView
+    def __init__(self, reply: _Optional[str] = ..., needs_clarification: _Optional[bool] = ..., work_candidate: _Optional[_Union[IntentWorkCandidate, _Mapping]] = ..., work_capability: _Optional[_Union[WorkCapabilityView, _Mapping]] = ...) -> None: ...
+
+class InterpretIntentResponse(_message.Message):
+    __slots__ = ("interpretation", "error")
+    INTERPRETATION_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    interpretation: InterpretedIntent
+    error: LocalApiError
+    def __init__(self, interpretation: _Optional[_Union[InterpretedIntent, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
 class PrepareWorkRequest(_message.Message):
     __slots__ = ("client", "intent", "work_type", "target_scope_ref", "sources", "idempotency_key", "memory_mode", "use_default_work_capability", "explicit_work_capability_choice_id")
     CLIENT_FIELD_NUMBER: _ClassVar[int]
@@ -563,6 +615,62 @@ class ConfirmWorkAccepted(_message.Message):
     def __init__(self, authority_result: _Optional[_Union[_task_pb2.TaskCommandResult, _Mapping]] = ..., await_token: _Optional[_Union[ProjectionAwaitToken, _Mapping]] = ...) -> None: ...
 
 class ConfirmWorkResponse(_message.Message):
+    __slots__ = ("accepted", "error")
+    ACCEPTED_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    accepted: ConfirmWorkAccepted
+    error: LocalApiError
+    def __init__(self, accepted: _Optional[_Union[ConfirmWorkAccepted, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class PrepareReworkRequest(_message.Message):
+    __slots__ = ("client", "task_id", "expected_revision", "idempotency_key")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPECTED_REVISION_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    task_id: str
+    expected_revision: int
+    idempotency_key: str
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., task_id: _Optional[str] = ..., expected_revision: _Optional[int] = ..., idempotency_key: _Optional[str] = ...) -> None: ...
+
+class ReworkPreparationPreview(_message.Message):
+    __slots__ = ("work", "task_id", "task_revision", "work_revision", "directive_id")
+    WORK_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    TASK_REVISION_FIELD_NUMBER: _ClassVar[int]
+    WORK_REVISION_FIELD_NUMBER: _ClassVar[int]
+    DIRECTIVE_ID_FIELD_NUMBER: _ClassVar[int]
+    work: WorkPreparationPreview
+    task_id: str
+    task_revision: int
+    work_revision: int
+    directive_id: str
+    def __init__(self, work: _Optional[_Union[WorkPreparationPreview, _Mapping]] = ..., task_id: _Optional[str] = ..., task_revision: _Optional[int] = ..., work_revision: _Optional[int] = ..., directive_id: _Optional[str] = ...) -> None: ...
+
+class PrepareReworkResponse(_message.Message):
+    __slots__ = ("preview", "error")
+    PREVIEW_FIELD_NUMBER: _ClassVar[int]
+    ERROR_FIELD_NUMBER: _ClassVar[int]
+    preview: ReworkPreparationPreview
+    error: LocalApiError
+    def __init__(self, preview: _Optional[_Union[ReworkPreparationPreview, _Mapping]] = ..., error: _Optional[_Union[LocalApiError, _Mapping]] = ...) -> None: ...
+
+class ConfirmReworkRequest(_message.Message):
+    __slots__ = ("client", "task_id", "snapshot_id", "confirmation_binding_sha256", "idempotency_key")
+    CLIENT_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    SNAPSHOT_ID_FIELD_NUMBER: _ClassVar[int]
+    CONFIRMATION_BINDING_SHA256_FIELD_NUMBER: _ClassVar[int]
+    IDEMPOTENCY_KEY_FIELD_NUMBER: _ClassVar[int]
+    client: ClientRequestMetadata
+    task_id: str
+    snapshot_id: str
+    confirmation_binding_sha256: str
+    idempotency_key: str
+    def __init__(self, client: _Optional[_Union[ClientRequestMetadata, _Mapping]] = ..., task_id: _Optional[str] = ..., snapshot_id: _Optional[str] = ..., confirmation_binding_sha256: _Optional[str] = ..., idempotency_key: _Optional[str] = ...) -> None: ...
+
+class ConfirmReworkResponse(_message.Message):
     __slots__ = ("accepted", "error")
     ACCEPTED_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]

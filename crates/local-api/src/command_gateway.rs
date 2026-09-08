@@ -35,6 +35,12 @@ use egopulse_local_ipc_platform::PeerConnectionInfo;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
+    ConfirmReworkRequest, ConfirmReworkResponse, InterpretIntentRequest, InterpretIntentResponse,
+    InterpretedIntent, PrepareReworkRequest, PrepareReworkResponse, ReworkPreparationPreview,
+    confirm_rework_response, interpret_intent_response, prepare_rework_response,
+};
+
 use crate::{
     read_tokens::{AwaitTarget, ReadTokenCodec, ReadTokenScope},
     session::{AuthenticatedSession, SessionAuthenticationFailure, SessionRegistry},
@@ -50,6 +56,61 @@ const RPC_EXECUTE_CONTEXT: &str = "LocalCommandGatewayService/ExecuteContextMuta
 const RPC_LIST_WORK_CAPABILITIES: &str = "LocalCommandGatewayService/ListWorkCapabilities";
 const RPC_SET_DEFAULT_WORK_CAPABILITY: &str = "LocalCommandGatewayService/SetDefaultWorkCapability";
 const RPC_PREPARE_WORK: &str = "LocalCommandGatewayService/PrepareWork";
+
+fn valid_intent_input(request: &InterpretIntentRequest) -> bool {
+    if request.text.trim().is_empty()
+        || request.text.len() > 16_384
+        || request.history.len() > 16
+        || request.work_capability_choice_id.len() > 256
+    {
+        return false;
+    }
+    let mut total = request.text.len();
+    for message in &request.history {
+        if message.text.trim().is_empty() || message.text.len() > 16_384 {
+            return false;
+        }
+        total += message.text.len();
+    }
+    total <= 65_536
+}
+
+fn safe_intent_text(text: &str, limit: usize) -> bool {
+    !text.trim().is_empty()
+        && text.len() <= limit
+        && !text.chars().any(|character| {
+            (character.is_control() && character != '\n' && character != '\t' && character != '\r')
+                || matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+}
+
+fn valid_intent_output(value: &InterpretedIntent) -> bool {
+    if !safe_intent_text(&value.reply, 16_384)
+        || (value.needs_clarification && value.work_candidate.is_some())
+    {
+        return false;
+    }
+    let Some(candidate) = &value.work_candidate else {
+        return true;
+    };
+    safe_intent_text(&candidate.intent, 16_384)
+        && safe_intent_text(&candidate.work_type, 256)
+        && safe_intent_text(&candidate.target_scope_ref, 256)
+        && candidate.sources.len() <= 16
+        && candidate.sources.iter().all(|source| {
+            safe_intent_text(&source.source_ref, 4_096) && safe_intent_text(&source.label, 4_096)
+        })
+        && value.reply.len()
+            + candidate.intent.len()
+            + candidate.work_type.len()
+            + candidate.target_scope_ref.len()
+            + candidate
+                .sources
+                .iter()
+                .map(|source| source.source_ref.len() + source.label.len())
+                .sum::<usize>()
+            <= 65_536
+}
 const RPC_CONFIRM_WORK: &str = "LocalCommandGatewayService/ConfirmWork";
 
 /// The principal boundary passed from the governed Local API session into an
@@ -86,6 +147,20 @@ pub enum CommandPortFailure {
 }
 
 pub trait TaskCommandPort: Send + Sync + 'static {
+    fn replay_system_revision_if_recorded(
+        &self,
+        _command: &TaskCommand,
+    ) -> Result<Option<CommandPortResult<TaskCommandResult>>, CommandPortFailure> {
+        Ok(None)
+    }
+    /// Daemon-owned continuation; only ReviseTask may cross this boundary.
+    fn execute_system_revision(
+        &self,
+        _command: &TaskCommand,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
+
     fn execute(
         &self,
         command: &TaskCommand,
@@ -294,6 +369,30 @@ impl MemoryMutationPort for FailClosedMemoryMutationPort {
 /// delegate confirmation to the Task Authority.
 #[tonic::async_trait]
 pub trait WorkPreparationPort: Send + Sync + 'static {
+    async fn prepare_rework(
+        &self,
+        _request: &PrepareReworkRequest,
+        _principal: &CommandPrincipal,
+    ) -> Result<ReworkPreparationPreview, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
+
+    fn confirm_rework(
+        &self,
+        _request: &ConfirmReworkRequest,
+        _principal: &CommandPrincipal,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
+    /// Read-only model interpretation. It grants no permission and creates no Task.
+    async fn interpret(
+        &self,
+        _request: &InterpretIntentRequest,
+        _principal: &CommandPrincipal,
+    ) -> Result<InterpretedIntent, CommandPortFailure> {
+        Err(CommandPortFailure::Unavailable)
+    }
+
     async fn prepare(
         &self,
         request: &PrepareWorkRequest,
@@ -564,6 +663,51 @@ impl CommandGatewayApplication {
         }
     }
 
+    pub async fn interpret_intent(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: InterpretIntentRequest,
+    ) -> InterpretIntentResponse {
+        let correlation_id = client_correlation_id(request.client.as_ref());
+        let context = match self.authorize_rpc(
+            peer,
+            request.client.as_ref(),
+            "LocalCommandGatewayService/InterpretIntent",
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return InterpretIntentResponse {
+                    outcome: Some(interpret_intent_response::Outcome::Error(
+                        (*error).with_correlation(correlation_id),
+                    )),
+                };
+            }
+        };
+        let valid = valid_intent_input(&request);
+        let result = if valid {
+            self.work_port.interpret(&request, &context.principal).await
+        } else {
+            Err(CommandPortFailure::InvalidArgument)
+        }
+        .and_then(|interpretation| {
+            if valid_intent_output(&interpretation) {
+                Ok(interpretation)
+            } else {
+                Err(CommandPortFailure::IntegrityFailure)
+            }
+        });
+        InterpretIntentResponse {
+            outcome: Some(match result {
+                Ok(interpretation) => {
+                    interpret_intent_response::Outcome::Interpretation(interpretation)
+                }
+                Err(error) => {
+                    interpret_intent_response::Outcome::Error(port_error(error, correlation_id))
+                }
+            }),
+        }
+    }
+
     pub async fn prepare_work(
         &self,
         peer: Option<&PeerConnectionInfo>,
@@ -631,6 +775,92 @@ impl CommandGatewayApplication {
             }
             Err(error) => ConfirmWorkResponse {
                 outcome: Some(confirm_work_response::Outcome::Error(port_error(
+                    error,
+                    correlation_id,
+                ))),
+            },
+        }
+    }
+
+    pub async fn prepare_rework(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: PrepareReworkRequest,
+    ) -> PrepareReworkResponse {
+        let correlation_id = client_correlation_id(request.client.as_ref());
+        let context = match self.authorize_rpc(
+            peer,
+            request.client.as_ref(),
+            "LocalCommandGatewayService/PrepareRework",
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return PrepareReworkResponse {
+                    outcome: Some(prepare_rework_response::Outcome::Error(
+                        (*error).with_correlation(correlation_id),
+                    )),
+                };
+            }
+        };
+        match self
+            .work_port
+            .prepare_rework(&request, &context.principal)
+            .await
+        {
+            Ok(preview) => PrepareReworkResponse {
+                outcome: Some(prepare_rework_response::Outcome::Preview(preview)),
+            },
+            Err(error) => PrepareReworkResponse {
+                outcome: Some(prepare_rework_response::Outcome::Error(port_error(
+                    error,
+                    correlation_id,
+                ))),
+            },
+        }
+    }
+
+    pub fn confirm_rework(
+        &self,
+        peer: Option<&PeerConnectionInfo>,
+        request: ConfirmReworkRequest,
+    ) -> ConfirmReworkResponse {
+        let correlation_id = client_correlation_id(request.client.as_ref());
+        let context = match self.authorize_rpc(
+            peer,
+            request.client.as_ref(),
+            "LocalCommandGatewayService/ConfirmRework",
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return ConfirmReworkResponse {
+                    outcome: Some(confirm_rework_response::Outcome::Error(
+                        (*error).with_correlation(correlation_id),
+                    )),
+                };
+            }
+        };
+        match self.work_port.confirm_rework(&request, &context.principal) {
+            Ok(port_result) => {
+                let (await_token, gateway_error) = self.issue_await_token(
+                    &context.session,
+                    port_result.source_revision,
+                    port_result.await_target,
+                    correlation_id,
+                );
+                ConfirmReworkResponse {
+                    outcome: Some(match gateway_error {
+                        Some(error) => confirm_rework_response::Outcome::Error(error),
+                        None => confirm_rework_response::Outcome::Accepted(
+                            egopulse_domain_contracts::v01::egopulse::localapi::v1::ConfirmWorkAccepted {
+                                authority_result: Some(port_result.result),
+                                await_token,
+                            },
+                        ),
+                    }),
+                }
+            }
+            Err(error) => ConfirmReworkResponse {
+                outcome: Some(confirm_rework_response::Outcome::Error(port_error(
                     error,
                     correlation_id,
                 ))),
@@ -1184,6 +1414,18 @@ impl LocalCommandGatewayEndpoint {
 
 #[tonic::async_trait]
 impl LocalCommandGatewayService for LocalCommandGatewayEndpoint {
+    async fn interpret_intent(
+        &self,
+        request: Request<InterpretIntentRequest>,
+    ) -> Result<Response<InterpretIntentResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(
+            self.application
+                .interpret_intent(peer.as_ref(), request.into_inner())
+                .await,
+        ))
+    }
+
     async fn list_work_capabilities(
         &self,
         request: Request<ListWorkCapabilitiesRequest>,
@@ -1226,6 +1468,29 @@ impl LocalCommandGatewayService for LocalCommandGatewayEndpoint {
         Ok(Response::new(
             self.application
                 .confirm_work(peer.as_ref(), request.into_inner()),
+        ))
+    }
+
+    async fn prepare_rework(
+        &self,
+        request: Request<PrepareReworkRequest>,
+    ) -> Result<Response<PrepareReworkResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(
+            self.application
+                .prepare_rework(peer.as_ref(), request.into_inner())
+                .await,
+        ))
+    }
+
+    async fn confirm_rework(
+        &self,
+        request: Request<ConfirmReworkRequest>,
+    ) -> Result<Response<ConfirmReworkResponse>, Status> {
+        let peer = Self::peer(&request);
+        Ok(Response::new(
+            self.application
+                .confirm_rework(peer.as_ref(), request.into_inner()),
         ))
     }
 
@@ -1876,6 +2141,61 @@ fn approval_response_error(error: LocalApiError) -> DecideHarnessApprovalRespons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intent_output_rejects_terminal_controls_and_contradictory_clarification() {
+        let mut output = InterpretedIntent {
+            reply: "你好，想做什么？".to_owned(),
+            ..Default::default()
+        };
+        assert!(valid_intent_output(&output));
+        output.reply = "\u{1b}[2J".to_owned();
+        assert!(!valid_intent_output(&output));
+        output.reply = "safe\u{202e}unsafe".to_owned();
+        assert!(!valid_intent_output(&output));
+        output.reply = "请补充目标".to_owned();
+        output.needs_clarification = true;
+        output.work_candidate = Some(
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::IntentWorkCandidate {
+                intent: "change".to_owned(),
+                work_type: "repository".to_owned(),
+                target_scope_ref: "scope:founder".to_owned(),
+                sources: vec![],
+            },
+        );
+        assert!(!valid_intent_output(&output));
+        output.needs_clarification = false;
+        assert!(valid_intent_output(&output));
+    }
+
+    #[test]
+    fn intent_input_limits_reject_empty_and_oversized_history() {
+        let mut request = InterpretIntentRequest {
+            text: "你好".to_owned(),
+            ..Default::default()
+        };
+        assert!(valid_intent_input(&request));
+        request.text = " ".to_owned();
+        assert!(!valid_intent_input(&request));
+        request.text = "a".repeat(16_385);
+        assert!(!valid_intent_input(&request));
+        request.text = "hello".to_owned();
+        request.history = vec![
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::IntentConversationMessage {
+                    from_assistant: false,
+                    text: "a".repeat(16_384),
+                };
+                4
+            ];
+        assert!(!valid_intent_input(&request));
+        request
+            .history
+            .iter_mut()
+            .for_each(|message| message.text = "hello".to_owned());
+        assert!(valid_intent_input(&request));
+        request.history.resize(17, request.history[0].clone());
+        assert!(!valid_intent_input(&request));
+    }
 
     #[test]
     fn policy_result_sanitization_excludes_authority_proof_and_request_binding() {

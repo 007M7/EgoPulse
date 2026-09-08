@@ -7,15 +7,18 @@
 //! later observes `ExecutionInterrupted` and drives the existing structured
 //! cancellation settlement.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use egopulse_cognition_runtime::task_authority::TaskCancellationReconciliation;
+use egopulse_cognition_runtime::task_authority::{
+    NoRunTaskCancellationProof, TaskCancellationReconciliation, UnclaimedTaskActivation,
+};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
     CancelExecutionReceipt, CancellationDeliveryDisposition, cancel_execution_result,
 };
 use egopulse_local_ide_control::collaboration_control::{
-    HarnessCancellationDeliveryError, HarnessCancellationDeliveryTarget, TaskCancellationHandoff,
-    TaskCancellationSource, TaskCancellationSourceError,
+    CollaborationLineageReader, HarnessCancellationDeliveryError,
+    HarnessCancellationDeliveryTarget, TaskCancellationHandoff, TaskCancellationSource,
+    TaskCancellationSourceError,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -56,6 +59,13 @@ pub(crate) trait TaskCancellationReconciler: Send + Sync + 'static {
         &self,
         handoff: &TaskCancellationHandoff,
     ) -> Result<TaskCancellationReconciliation, TaskCancellationSourceError>;
+
+    fn settle_no_run_task_cancellation(
+        &self,
+        _proof: &NoRunTaskCancellationProof,
+    ) -> Result<TaskCancellationReconciliation, TaskCancellationSourceError> {
+        Err(TaskCancellationSourceError::Integrity)
+    }
 }
 
 impl CancellationDeliveryRoute {
@@ -75,6 +85,7 @@ pub(crate) struct CancellationDeliveryWorker {
     source: Arc<dyn TaskCancellationSource>,
     reconciler: Option<Arc<dyn TaskCancellationReconciler>>,
     routes: Vec<CancellationDeliveryRoute>,
+    lineage_readers: Vec<Arc<Mutex<CollaborationLineageReader>>>,
 }
 
 impl CancellationDeliveryWorker {
@@ -89,6 +100,7 @@ impl CancellationDeliveryWorker {
             source,
             reconciler: None,
             routes,
+            lineage_readers: Vec::new(),
         })
     }
 
@@ -98,6 +110,54 @@ impl CancellationDeliveryWorker {
     ) -> Self {
         self.reconciler = Some(reconciler);
         self
+    }
+
+    pub(crate) fn with_lineage_readers(
+        mut self,
+        readers: Vec<Arc<Mutex<CollaborationLineageReader>>>,
+    ) -> Self {
+        self.lineage_readers = readers;
+        self
+    }
+
+    fn no_run_proof(
+        &self,
+        handoff: &TaskCancellationHandoff,
+        activation: UnclaimedTaskActivation,
+    ) -> Result<NoRunTaskCancellationProof, &'static str> {
+        if self.lineage_readers.is_empty() {
+            return Err("CANCELLATION_COLLABORATION_READERS_UNAVAILABLE");
+        }
+        if activation.task_id != handoff.task.task_id
+            || activation.work_revision != handoff.task.work_revision
+            || handoff.task.current_run_id.as_deref() != Some(activation.reserved_run_id.as_str())
+        {
+            return Err("CANCELLATION_UNCLAIMED_ACTIVATION_MISMATCH");
+        }
+        for reader in &self.lineage_readers {
+            let reader = reader
+                .lock()
+                .map_err(|_| "CANCELLATION_COLLABORATION_READER_UNAVAILABLE")?;
+            if reader
+                .run_exists(&activation.reserved_run_id)
+                .map_err(|_| "CANCELLATION_COLLABORATION_READER_UNAVAILABLE")?
+            {
+                return Err("CANCELLATION_COLLABORATION_RUN_EXISTS");
+            }
+        }
+        // Task Authority has already held this exact unclaimed activation.
+        // All configured Collaboration owners now confirm the reserved run is
+        // absent, so no concurrent activation can invalidate this observation.
+        let evidence = format!(
+            "collaboration-run-absent:{}:cancellation:{}",
+            activation.reserved_run_id, handoff.cancellation_request_id
+        );
+        Ok(NoRunTaskCancellationProof {
+            activation,
+            cancellation_message_id: handoff.message_id.clone(),
+            cancellation_payload_digest_sha256: handoff.payload_digest_sha256.clone(),
+            collaboration_absence_evidence_id: evidence,
+        })
     }
 
     pub(crate) async fn run_once(
@@ -120,6 +180,26 @@ impl CancellationDeliveryWorker {
                         continue;
                     }
                     Ok(TaskCancellationReconciliation::NeedsNativeDelivery) => {}
+                    Ok(TaskCancellationReconciliation::NeedsNoRunProof(activation)) => {
+                        let proof = match self.no_run_proof(&handoff, activation) {
+                            Ok(proof) => proof,
+                            Err(reason) => {
+                                report.held.push(held(&handoff, reason));
+                                continue;
+                            }
+                        };
+                        match reconciler.settle_no_run_task_cancellation(&proof) {
+                            Ok(TaskCancellationReconciliation::SettledAndAcknowledged {
+                                ..
+                            }) => {
+                                report.task_settled_and_acknowledged += 1;
+                            }
+                            _ => report
+                                .held
+                                .push(held(&handoff, "CANCELLATION_NO_RUN_SETTLEMENT_UNCONFIRMED")),
+                        }
+                        continue;
+                    }
                     Ok(TaskCancellationReconciliation::SettledAndAcknowledged { .. }) => {
                         report.task_settled_and_acknowledged += 1;
                         continue;
@@ -236,8 +316,34 @@ fn held(handoff: &TaskCancellationHandoff, safe_reason_code: &'static str) -> He
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egopulse_domain_contracts::v01::egopulse::harness::v1::CancelExecutionResult;
-    use std::{future::Future, pin::Pin, sync::Mutex};
+    use egopulse_domain_contracts::v01::egopulse::{
+        collaboration::v1::{
+            AcquireAttemptLeaseCommand, ActivateRunCommand, AttemptSnapshot, CollaborationCommand,
+            CollaborationSnapshot, CreateAttemptCommand, CreateRunCommand,
+            MarkAttemptOutcomeUnknownCommand, RecordAttemptCancellationOutcomeCommand,
+            RecordAttemptReconciliationCommand, RecordDeliveryReceiptCommand,
+            RecordDispatchIntentCommand, RecordHarnessAckCommand, RecordRunningObservationCommand,
+            RunPlan, RunSnapshot, StepPlan, StepSnapshot, collaboration_command,
+        },
+        common::v1::{CommandMetadata, ContractReference},
+        harness::v1::CancelExecutionResult,
+    };
+    use egopulse_local_ide_control::collaboration_control::{
+        AuthenticatedCollaborationPrincipal, CollaborationControl, CollaborationControlConfig,
+        CollaborationLineageReaderConfig, CollaborationPrincipalKind, CollaborationReferenceGuard,
+        CollaborationSqlCipherKey, DispatchMaterial, HarnessEvidenceResolver, LeaseAuthorization,
+        ReferenceAuthorization, ReferenceGuardRejection, ResolvedHarnessEvidence,
+        SystemAuthorityClock, seal_request_digest,
+    };
+    use std::{
+        fs,
+        future::Future,
+        panic::AssertUnwindSafe,
+        path::PathBuf,
+        pin::Pin,
+        sync::{Arc, Mutex},
+    };
+    use uuid::Uuid;
 
     #[derive(Default)]
     struct Source {
@@ -274,7 +380,7 @@ mod tests {
             &self,
             _handoff: &TaskCancellationHandoff,
         ) -> Result<TaskCancellationReconciliation, TaskCancellationSourceError> {
-            Ok(self.0)
+            Ok(self.0.clone())
         }
     }
 
@@ -371,6 +477,290 @@ mod tests {
         )
     }
 
+    #[derive(Clone, Copy)]
+    struct LineageBootstrapGuard;
+
+    impl CollaborationReferenceGuard for LineageBootstrapGuard {
+        fn validate_create_run(
+            &self,
+            _command: &CreateRunCommand,
+        ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+            Ok(ReferenceAuthorization {
+                evidence_refs: vec!["lineage-bootstrap:create-run".to_owned()],
+            })
+        }
+
+        fn validate_activate_run(
+            &self,
+            _command: &ActivateRunCommand,
+            _run: &RunSnapshot,
+        ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn validate_create_attempt(
+            &self,
+            _command: &CreateAttemptCommand,
+            _run: &RunSnapshot,
+            _step: &StepSnapshot,
+        ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn authorize_lease(
+            &self,
+            _command: &AcquireAttemptLeaseCommand,
+            _attempt: &AttemptSnapshot,
+        ) -> Result<LeaseAuthorization, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn resolve_dispatch_material(
+            &self,
+            _command: &RecordDispatchIntentCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<DispatchMaterial, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn validate_unknown_outcome(
+            &self,
+            _command: &MarkAttemptOutcomeUnknownCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn validate_cancellation_request(
+            &self,
+            _command: &egopulse_domain_contracts::v01::egopulse::collaboration::v1::RequestAttemptCancellationCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+    }
+
+    impl HarnessEvidenceResolver for LineageBootstrapGuard {
+        fn resolve_delivery_receipt(
+            &self,
+            _command: &RecordDeliveryReceiptCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn resolve_harness_ack(
+            &self,
+            _command: &RecordHarnessAckCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ResolvedHarnessEvidence, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn validate_running_observation(
+            &self,
+            _command: &RecordRunningObservationCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn validate_cancellation_outcome(
+            &self,
+            _command: &RecordAttemptCancellationOutcomeCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+
+        fn validate_reconciliation(
+            &self,
+            _command: &RecordAttemptReconciliationCommand,
+            _snapshot: &CollaborationSnapshot,
+        ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
+            Err(ReferenceGuardRejection::UnverifiedReference)
+        }
+    }
+
+    struct CollaborationLineageFixture {
+        root: PathBuf,
+        database_path: PathBuf,
+    }
+
+    impl CollaborationLineageFixture {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "egopulse-cancellation-lineage-{label}-{}",
+                Uuid::now_v7()
+            ));
+            fs::create_dir_all(&root).expect("create Collaboration lineage fixture directory");
+            let database_path = root.join("collaboration.sqlcipher");
+            let _owner = CollaborationControl::open(
+                CollaborationControlConfig {
+                    database_path: database_path.clone(),
+                    store_epoch: "cancellation-lineage-test-v1".to_owned(),
+                    key: CollaborationSqlCipherKey::new([0x51; 32]),
+                },
+                LineageBootstrapGuard,
+                SystemAuthorityClock,
+            )
+            .expect("initialize owner-managed Collaboration store");
+            Self {
+                root,
+                database_path,
+            }
+        }
+
+        fn reader(&self) -> Arc<Mutex<CollaborationLineageReader>> {
+            Arc::new(Mutex::new(
+                CollaborationLineageReader::open(CollaborationLineageReaderConfig {
+                    database_path: self.database_path.clone(),
+                    store_epoch: "cancellation-lineage-test-v1".to_owned(),
+                    key: CollaborationSqlCipherKey::new([0x51; 32]),
+                })
+                .expect("open query-only Collaboration lineage reader"),
+            ))
+        }
+
+        fn create_run(&self, run_id: &str) {
+            let mut owner = CollaborationControl::open(
+                CollaborationControlConfig {
+                    database_path: self.database_path.clone(),
+                    store_epoch: "cancellation-lineage-test-v1".to_owned(),
+                    key: CollaborationSqlCipherKey::new([0x51; 32]),
+                },
+                LineageBootstrapGuard,
+                SystemAuthorityClock,
+            )
+            .expect("reopen owner-managed Collaboration store");
+            let mut command = CollaborationCommand {
+                command: Some(collaboration_command::Command::CreateRun(
+                    CreateRunCommand {
+                        meta: Some(CommandMetadata {
+                            command_id: format!("lineage-create:{run_id}"),
+                            idempotency_key: format!("lineage-create:{run_id}"),
+                            idempotency_scope: "task-1/work-1".to_owned(),
+                            request_digest_sha256: String::new(),
+                            issued_at: Some(prost_types::Timestamp {
+                                seconds: 1,
+                                nanos: 0,
+                            }),
+                            correlation_id: "lineage-fixture".to_owned(),
+                            causation_id: None,
+                        }),
+                        run_id: run_id.to_owned(),
+                        task_id: "task-1".to_owned(),
+                        task_revision: 1,
+                        work_revision: 1,
+                        plan: Some(RunPlan {
+                            plan_id: "lineage-plan".to_owned(),
+                            digest_sha256: "1".repeat(64),
+                            max_active_attempts: 1,
+                            steps: vec![StepPlan {
+                                step_id: "lineage-step".to_owned(),
+                                step_kind: "governed_harness_work".to_owned(),
+                                depends_on_step_ids: Vec::new(),
+                                input_bundle_ref: "lineage-input".to_owned(),
+                                expected_output_contract_ref: Some(ContractReference {
+                                    contract_id: "lineage-output".to_owned(),
+                                    version: "v1".to_owned(),
+                                    sha256: "2".repeat(64),
+                                }),
+                                required_capability_profile_ref: Some(ContractReference {
+                                    contract_id: "lineage-capability".to_owned(),
+                                    version: "v1".to_owned(),
+                                    sha256: "3".repeat(64),
+                                }),
+                                max_attempts: 2,
+                            }],
+                            budget_profile_ref: Some(ContractReference {
+                                contract_id: "lineage-budget".to_owned(),
+                                version: "v1".to_owned(),
+                                sha256: "4".repeat(64),
+                            }),
+                        }),
+                    },
+                )),
+            };
+            seal_request_digest(&mut command).expect("seal owner CreateRun request");
+            let result = owner
+                .execute(
+                    &command,
+                    &AuthenticatedCollaborationPrincipal {
+                        kind: CollaborationPrincipalKind::TaskAuthority,
+                        principal_id: "task-authority:lineage-fixture".to_owned(),
+                        authenticated: true,
+                    },
+                )
+                .expect("create Collaboration Run through owner");
+            assert!(
+                result.committed_event.is_some(),
+                "owner must commit test Run"
+            );
+        }
+    }
+
+    impl Drop for CollaborationLineageFixture {
+        fn drop(&mut self) {
+            if self.root.exists() {
+                fs::remove_dir_all(&self.root).expect("remove Collaboration lineage fixture");
+            }
+        }
+    }
+
+    struct NoRunReconciler {
+        activation: UnclaimedTaskActivation,
+        settled: Arc<Mutex<Vec<NoRunTaskCancellationProof>>>,
+    }
+
+    impl TaskCancellationReconciler for NoRunReconciler {
+        fn reconcile_task_cancellation(
+            &self,
+            _handoff: &TaskCancellationHandoff,
+        ) -> Result<TaskCancellationReconciliation, TaskCancellationSourceError> {
+            Ok(TaskCancellationReconciliation::NeedsNoRunProof(
+                self.activation.clone(),
+            ))
+        }
+
+        fn settle_no_run_task_cancellation(
+            &self,
+            proof: &NoRunTaskCancellationProof,
+        ) -> Result<TaskCancellationReconciliation, TaskCancellationSourceError> {
+            self.settled
+                .lock()
+                .expect("settled lock")
+                .push(proof.clone());
+            Ok(TaskCancellationReconciliation::SettledAndAcknowledged {
+                status: egopulse_domain_contracts::v01::egopulse::task::v1::TaskStatus::Cancelled,
+                committed: true,
+                replayed: false,
+            })
+        }
+    }
+
+    fn no_run_handoff() -> TaskCancellationHandoff {
+        let mut handoff = handoff();
+        handoff.task.current_run_id = Some("reserved-run".to_owned());
+        handoff.task.work_revision = 1;
+        handoff
+    }
+
+    fn unclaimed_activation(handoff: &TaskCancellationHandoff) -> UnclaimedTaskActivation {
+        UnclaimedTaskActivation {
+            message_id: "activation-message".to_owned(),
+            payload_digest_sha256: "b".repeat(64),
+            task_id: handoff.task.task_id.clone(),
+            task_revision: 1,
+            work_revision: handoff.task.work_revision,
+            reserved_run_id: handoff
+                .task
+                .current_run_id
+                .clone()
+                .expect("reserved run fixture"),
+        }
+    }
+
     #[tokio::test]
     async fn delivered_interrupt_acknowledges_handoff_without_claiming_task_cancellation() {
         let source = Arc::new(Source {
@@ -416,6 +806,199 @@ mod tests {
         assert!(report.held.is_empty());
         assert_eq!(*source.acknowledgements.lock().expect("ack lock"), 0);
         assert_eq!(*deliveries.lock().expect("delivery lock"), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_cancellation_without_owner_readers_cannot_claim_no_native_effect() {
+        let mut handoff = handoff();
+        handoff.task.current_run_id = Some("reserved-run".to_owned());
+        handoff.task.work_revision = 1;
+        let source = Arc::new(Source {
+            pending: Mutex::new(vec![handoff.clone()]),
+            acknowledgements: Mutex::new(0),
+        });
+        let (target, deliveries) = target(receipt(CancellationDeliveryDisposition::Delivered));
+        let worker = CancellationDeliveryWorker::new(
+            Arc::clone(&source) as Arc<dyn TaskCancellationSource>,
+            vec![CancellationDeliveryRoute::new(Arc::new(target))],
+        )
+        .expect("worker")
+        .with_task_reconciliation(Arc::new(Reconciler(
+            TaskCancellationReconciliation::NeedsNoRunProof(UnclaimedTaskActivation {
+                message_id: "activation-message".to_owned(),
+                payload_digest_sha256: "b".repeat(64),
+                task_id: handoff.task.task_id.clone(),
+                task_revision: 2,
+                work_revision: 1,
+                reserved_run_id: "reserved-run".to_owned(),
+            }),
+        )));
+        let report = worker.run_once().await.expect("cycle");
+        assert_eq!(report.task_settled_and_acknowledged, 0);
+        assert_eq!(report.delivered_and_acknowledged, 0);
+        assert_eq!(report.held.len(), 1);
+        assert_eq!(
+            report.held[0].safe_reason_code,
+            "CANCELLATION_COLLABORATION_READERS_UNAVAILABLE"
+        );
+        assert_eq!(*source.acknowledgements.lock().expect("ack lock"), 0);
+        assert_eq!(*deliveries.lock().expect("delivery lock"), 0);
+    }
+
+    #[tokio::test]
+    async fn no_run_proof_from_all_query_only_collaboration_readers_settles_without_native_delivery()
+     {
+        let handoff = no_run_handoff();
+        let source = Arc::new(Source {
+            pending: Mutex::new(vec![handoff.clone()]),
+            acknowledgements: Mutex::new(0),
+        });
+        let first_owner = CollaborationLineageFixture::new("no-run-first");
+        let second_owner = CollaborationLineageFixture::new("no-run-second");
+        let first_reader = first_owner.reader();
+        let second_reader = second_owner.reader();
+        assert!(
+            !first_reader
+                .lock()
+                .expect("first query-only reader lock")
+                .run_exists("reserved-run")
+                .expect("query first owner"),
+            "the first owner must not fabricate a Collaboration Run"
+        );
+        assert!(
+            !second_reader
+                .lock()
+                .expect("second query-only reader lock")
+                .run_exists("reserved-run")
+                .expect("query second owner"),
+            "the second owner must not fabricate a Collaboration Run"
+        );
+        let settled = Arc::new(Mutex::new(Vec::new()));
+        let (target, deliveries) = target(receipt(CancellationDeliveryDisposition::Delivered));
+        let worker = CancellationDeliveryWorker::new(
+            Arc::clone(&source) as Arc<dyn TaskCancellationSource>,
+            vec![CancellationDeliveryRoute::new(Arc::new(target))],
+        )
+        .expect("worker")
+        .with_task_reconciliation(Arc::new(NoRunReconciler {
+            activation: unclaimed_activation(&handoff),
+            settled: Arc::clone(&settled),
+        }))
+        .with_lineage_readers(vec![first_reader, second_reader]);
+
+        let report = worker.run_once().await.expect("cycle");
+        assert_eq!(report.task_settled_and_acknowledged, 1);
+        assert_eq!(report.delivered_and_acknowledged, 0);
+        assert!(report.held.is_empty());
+        let proofs = settled.lock().expect("settled proof lock");
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].activation.reserved_run_id, "reserved-run");
+        assert_eq!(
+            proofs[0].collaboration_absence_evidence_id,
+            "collaboration-run-absent:reserved-run:cancellation:cancel-1"
+        );
+        assert_eq!(*source.acknowledgements.lock().expect("ack lock"), 0);
+        assert_eq!(*deliveries.lock().expect("delivery lock"), 0);
+        drop(proofs);
+        drop(worker);
+        drop(first_owner);
+        drop(second_owner);
+    }
+
+    #[tokio::test]
+    async fn no_run_proof_refuses_settlement_when_any_query_only_owner_has_the_reserved_run() {
+        let handoff = no_run_handoff();
+        let source = Arc::new(Source {
+            pending: Mutex::new(vec![handoff.clone()]),
+            acknowledgements: Mutex::new(0),
+        });
+        let absent_owner = CollaborationLineageFixture::new("run-absent");
+        let existing_owner = CollaborationLineageFixture::new("run-exists");
+        existing_owner.create_run("reserved-run");
+        let absent_reader = absent_owner.reader();
+        let existing_reader = existing_owner.reader();
+        assert!(
+            existing_reader
+                .lock()
+                .expect("existing query-only reader lock")
+                .run_exists("reserved-run")
+                .expect("query owner-created Run"),
+            "the fixture must prove a real owner-created Collaboration Run"
+        );
+        let settled = Arc::new(Mutex::new(Vec::new()));
+        let (target, deliveries) = target(receipt(CancellationDeliveryDisposition::Delivered));
+        let worker = CancellationDeliveryWorker::new(
+            Arc::clone(&source) as Arc<dyn TaskCancellationSource>,
+            vec![CancellationDeliveryRoute::new(Arc::new(target))],
+        )
+        .expect("worker")
+        .with_task_reconciliation(Arc::new(NoRunReconciler {
+            activation: unclaimed_activation(&handoff),
+            settled: Arc::clone(&settled),
+        }))
+        .with_lineage_readers(vec![absent_reader, existing_reader]);
+
+        let report = worker.run_once().await.expect("cycle");
+        assert_eq!(report.task_settled_and_acknowledged, 0);
+        assert_eq!(report.delivered_and_acknowledged, 0);
+        assert_eq!(
+            report.held,
+            vec![held(&handoff, "CANCELLATION_COLLABORATION_RUN_EXISTS")]
+        );
+        assert!(settled.lock().expect("settled proof lock").is_empty());
+        assert_eq!(*source.acknowledgements.lock().expect("ack lock"), 0);
+        assert_eq!(*deliveries.lock().expect("delivery lock"), 0);
+        drop(worker);
+        drop(absent_owner);
+        drop(existing_owner);
+    }
+
+    #[tokio::test]
+    async fn no_run_proof_refuses_settlement_when_any_query_only_owner_cannot_be_read() {
+        let handoff = no_run_handoff();
+        let source = Arc::new(Source {
+            pending: Mutex::new(vec![handoff.clone()]),
+            acknowledgements: Mutex::new(0),
+        });
+        let readable_owner = CollaborationLineageFixture::new("reader-available");
+        let unavailable_owner = CollaborationLineageFixture::new("reader-unavailable");
+        let readable_reader = readable_owner.reader();
+        let unavailable_reader = unavailable_owner.reader();
+        let poison_target = Arc::clone(&unavailable_reader);
+        let poisoned = std::panic::catch_unwind(AssertUnwindSafe(move || {
+            let _guard = poison_target.lock().expect("reader lock before poison");
+            panic!("poison query-only Collaboration lineage reader");
+        }));
+        assert!(poisoned.is_err(), "fixture must poison the reader mutex");
+        let settled = Arc::new(Mutex::new(Vec::new()));
+        let (target, deliveries) = target(receipt(CancellationDeliveryDisposition::Delivered));
+        let worker = CancellationDeliveryWorker::new(
+            Arc::clone(&source) as Arc<dyn TaskCancellationSource>,
+            vec![CancellationDeliveryRoute::new(Arc::new(target))],
+        )
+        .expect("worker")
+        .with_task_reconciliation(Arc::new(NoRunReconciler {
+            activation: unclaimed_activation(&handoff),
+            settled: Arc::clone(&settled),
+        }))
+        .with_lineage_readers(vec![readable_reader, unavailable_reader]);
+
+        let report = worker.run_once().await.expect("cycle");
+        assert_eq!(report.task_settled_and_acknowledged, 0);
+        assert_eq!(report.delivered_and_acknowledged, 0);
+        assert_eq!(
+            report.held,
+            vec![held(
+                &handoff,
+                "CANCELLATION_COLLABORATION_READER_UNAVAILABLE"
+            )]
+        );
+        assert!(settled.lock().expect("settled proof lock").is_empty());
+        assert_eq!(*source.acknowledgements.lock().expect("ack lock"), 0);
+        assert_eq!(*deliveries.lock().expect("delivery lock"), 0);
+        drop(worker);
+        drop(readable_owner);
+        drop(unavailable_owner);
     }
 
     #[tokio::test]

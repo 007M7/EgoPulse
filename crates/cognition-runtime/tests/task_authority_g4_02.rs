@@ -156,6 +156,65 @@ fn valid_create_command() -> TaskCommand {
     command
 }
 
+#[test]
+fn recorded_command_lookup_is_read_only_and_preserves_the_exact_prior_receipt() {
+    let store = IsolatedStore::new("recorded-command");
+    let mut authority = open_authority(&store.database_path());
+    let command = valid_create_command();
+    assert!(
+        authority
+            .replay_recorded(&command, &founder())
+            .expect("lookup")
+            .is_none()
+    );
+    let created = authority.execute(&command, &founder()).expect("create");
+    let task = committed_task(&created);
+    let mut activation = TaskCommand {
+        command: Some(task_command::Command::ActivateTask(ActivateTaskCommand {
+            meta: Some(metadata(
+                "activate-recorded",
+                "activate-recorded",
+                "corr-recorded",
+            )),
+            task_id: task.task_id.clone(),
+            expected_revision: task.revision,
+            work_revision: task.work_revision,
+            run_id: "run:recorded".to_owned(),
+        })),
+    };
+    set_digest(&mut activation);
+    let principal = AuthenticatedPrincipal {
+        kind: PrincipalKind::CollaborationControl,
+        principal_id: "collaboration:test".to_owned(),
+        authenticated: true,
+    };
+    let active = authority
+        .execute(&activation, &principal)
+        .expect("activate");
+    assert_eq!(committed_task(&active).revision, task.revision + 1);
+    let replay = authority
+        .replay_recorded(&command, &founder())
+        .expect("lookup")
+        .expect("historical receipt");
+    assert!(replay.replayed);
+    assert_eq!(replay.committed_event, created.committed_event);
+    assert_eq!(committed_task(&replay), task);
+    let mut altered = command.clone();
+    if let Some(task_command::Command::CreateTask(create)) = altered.command.as_mut() {
+        create.work_type = "different".to_owned();
+    }
+    set_digest(&mut altered);
+    assert_eq!(
+        error_code(
+            &authority
+                .replay_recorded(&altered, &founder())
+                .expect("lookup")
+                .expect("conflict")
+        ),
+        TaskErrorCode::IdempotencyConflict
+    );
+}
+
 fn set_digest(command: &mut TaskCommand) {
     let digest = canonical_request_digest(command).expect("canonical Task request digest");
     match command.command.as_mut().expect("Task command variant") {

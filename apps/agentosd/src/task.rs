@@ -242,6 +242,24 @@ impl TaskTransitionGuard for ConfiguredTaskTransitionGuard {
         current: &TaskSnapshot,
     ) -> Result<TransitionAuthorization, TransitionGuardRejection> {
         match command.command.as_ref() {
+            Some(task_command::Command::ReviseTask(value)) => {
+                let context = self
+                    .context_authority
+                    .as_ref()
+                    .ok_or(TransitionGuardRejection::UnverifiedReference)?;
+                let verdict = self
+                    .founder_verdict
+                    .as_ref()
+                    .ok_or(TransitionGuardRejection::UnverifiedReference)?;
+                let evidence_refs = crate::rework_preparation::validate_rework_transition(
+                    current, value, context, verdict,
+                )?;
+                Ok(TransitionAuthorization {
+                    evidence_refs,
+                    founder_decision: None,
+                    founder_verdict_state_revision: None,
+                })
+            }
             Some(task_command::Command::ActivateTask(value))
                 if current.status == TaskStatus::Ready as i32
                     && value.work_revision == current.work_revision

@@ -33,8 +33,8 @@ pub use edge::{
     SafeContentOwnerSnapshot, SafeContentProjectionMessage,
 };
 pub use runtime::{
-    AdapterClock, AdapterReconciliationEvidence, AuthorizedDispatchContext,
-    DispatchContextAuthorization, DispatchContextAuthorizationGate,
+    AdapterClock, AdapterReconciliationEvidence, AdapterRuntimeResidencyReader,
+    AuthorizedDispatchContext, DispatchContextAuthorization, DispatchContextAuthorizationGate,
     DispatchContextAuthorizationReceipt, DispatchContextBinding, DispatchContextRecovery,
     DispatchContextRecoveryGate, DispatchContextReference, DispatchMaterialResolver,
     DispatchMemoryPackBinding, DispatchMemoryUseReceipt, DriverDelivery, DriverError,
@@ -43,7 +43,8 @@ pub use runtime::{
     HistoricalDispatchContextBinding, HistoricalDispatchContextState,
     LegacyExecutionStartRawClassification, LegacyExecutionStartRawContext,
     LegacyExecutionStartRecovery, ManagedDisclosureCredentials, NativeHarnessDriver,
-    NativeHarnessFuture, ProbeValidationError, ReadyDispatchMaterialGuard, ReconciliationContext,
-    ReconciliationFinding, ResolvedDispatchMaterial, SystemAdapterClock, TerminalOutputCandidate,
+    NativeHarnessFuture, NonresidentDispatchObservation, ProbeValidationError,
+    ReadyDispatchMaterialGuard, ReconciliationContext, ReconciliationFinding,
+    ResolvedDispatchMaterial, SystemAdapterClock, TerminalOutputCandidate,
     classify_dispatch_context_reference, validate_probe_result,
 };

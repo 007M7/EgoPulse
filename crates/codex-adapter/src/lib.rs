@@ -16,5 +16,6 @@ pub use protocol::{
 };
 pub use review::{
     CodexReadOnlyModelCallReceipt, CodexReadOnlyReviewOutcome, CodexReadOnlyReviewRequest,
-    CodexReadOnlyReviewTerminalStatus, CodexReadOnlyReviewUsage,
+    CodexReadOnlyReviewTerminalStatus, CodexReadOnlyReviewUsage, CodexReadOnlyTurnOutcome,
+    CodexReadOnlyTurnRequest,
 };

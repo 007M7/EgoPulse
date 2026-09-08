@@ -13,6 +13,34 @@ pub struct CodexReadOnlyReviewRequest {
     pub output_limit_bytes: usize,
 }
 
+/// One fresh, bounded read-only model turn whose caller does not inherit the
+/// user's MCP, app, hook, web-search, shell, or collaboration tool surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexReadOnlyTurnRequest {
+    pub execution_id: String,
+    pub working_directory: PathBuf,
+    pub model: String,
+    pub prompt: String,
+    pub output_schema: Value,
+    pub timeout: Duration,
+    pub output_limit_bytes: usize,
+}
+
+impl From<CodexReadOnlyTurnRequest> for CodexReadOnlyReviewRequest {
+    fn from(value: CodexReadOnlyTurnRequest) -> Self {
+        Self {
+            execution_id: value.execution_id,
+            working_directory: value.working_directory,
+            model: value.model,
+            prompt: value.prompt,
+            timeout: value.timeout,
+            output_limit_bytes: value.output_limit_bytes,
+        }
+    }
+}
+
+pub type CodexReadOnlyTurnOutcome = CodexReadOnlyReviewOutcome;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodexReadOnlyReviewTerminalStatus {
     Completed,

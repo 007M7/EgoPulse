@@ -231,7 +231,6 @@ const R8B_PAUSE_BEFORE_RUNNER_MODE: &str = "dynamic-pause-before-runner";
 const R8B2C_BEGIN_DELIVERY_MODE: &str = "dynamic-r8b2c-begin-delivery";
 const R8B2C_UNKNOWN_RECOVERY_MODE: &str = "dynamic-r8b2c-unknown-recovery";
 const R8B2C_DELIVERED_BEFORE_POLL_MODE: &str = "dynamic-r8b2c-delivered-before-poll";
-const R8B2C_ACK_RECOVERY_MODE: &str = "dynamic-r8b2c-ack-recovery";
 const R9A3D_EXTERNAL_SEND_MODE: &str = "dynamic-r9a3d-external-send";
 const R9A3D_EXTERNAL_RECOVERY_MODE: &str = "dynamic-r9a3d-external-recovery";
 const R9A3E_PREAUTH_UNAVAILABLE_MODE: &str = "dynamic-r9a3e-preauth-unavailable";
@@ -303,7 +302,6 @@ const R8B_FIRST_RUNNER_CYCLE_RECORD: &str = "r8b-first-runner-cycle-complete";
 const R8B2C_BEGIN_DELIVERY_PHASE: &str = "begin-delivery-before-receipt";
 const R8B2C_DELIVERED_BEFORE_POLL_PHASE: &str = "delivered-before-poll";
 const R8B2C_UNKNOWN_RECOVERED_PHASE: &str = "unknown-recovered";
-const R8B2C_ACK_REHYDRATED_PHASE: &str = "ack-rehydrated";
 const R9A2C_CLI_CONTEXT_BYTES: &[u8] =
     br#"{"surface":"cli","private":"r9a2c-context-bytes-sentinel"}"#;
 const R9A2C_CONTEXT_EXPIRES_AT_SECONDS: i64 = 4_102_444_800;
@@ -1744,7 +1742,6 @@ impl NativeHarnessDriver for R8b2cFixtureDriver {
 enum R8b2cRunnerCheckpoint {
     DeliveredBeforePoll,
     UnknownRecovered,
-    AckRehydrated,
     PreAuthorizationUnavailable,
     RevokedReadyRejected,
 }
@@ -1780,11 +1777,6 @@ impl HarnessDispatchRunner for R8b2cCheckpointRunner {
                             == egopulse_local_ide_control::collaboration_control::TaskRecoveryKind::OutcomeUnknown
                     }),
                     R8B2C_UNKNOWN_RECOVERED_PHASE,
-                    false,
-                ),
-                R8b2cRunnerCheckpoint::AckRehydrated => (
-                    report.observations_consumed > 0,
-                    R8B2C_ACK_REHYDRATED_PHASE,
                     false,
                 ),
                 R8b2cRunnerCheckpoint::PreAuthorizationUnavailable => (
@@ -3446,7 +3438,6 @@ fn dynamic_fixture_mode() -> bool {
             | R8B2C_BEGIN_DELIVERY_MODE
             | R8B2C_UNKNOWN_RECOVERY_MODE
             | R8B2C_DELIVERED_BEFORE_POLL_MODE
-            | R8B2C_ACK_RECOVERY_MODE
             | R9A3D_EXTERNAL_SEND_MODE
             | R9A3D_EXTERNAL_RECOVERY_MODE
             | R9A3E_PREAUTH_UNAVAILABLE_MODE
@@ -3458,10 +3449,7 @@ fn dynamic_fixture_mode() -> bool {
 fn r8b2c_fixture_mode() -> bool {
     matches!(
         fixture_mode().as_str(),
-        R8B2C_BEGIN_DELIVERY_MODE
-            | R8B2C_UNKNOWN_RECOVERY_MODE
-            | R8B2C_DELIVERED_BEFORE_POLL_MODE
-            | R8B2C_ACK_RECOVERY_MODE
+        R8B2C_BEGIN_DELIVERY_MODE | R8B2C_UNKNOWN_RECOVERY_MODE | R8B2C_DELIVERED_BEFORE_POLL_MODE
     )
 }
 
@@ -5086,7 +5074,6 @@ fn open_fixture_providers(root: &Path) -> DaemonProviders {
             | R8B2C_BEGIN_DELIVERY_MODE
             | R8B2C_UNKNOWN_RECOVERY_MODE
             | R8B2C_DELIVERED_BEFORE_POLL_MODE
-            | R8B2C_ACK_RECOVERY_MODE
             | R9A3D_EXTERNAL_SEND_MODE
             | R9A3D_EXTERNAL_RECOVERY_MODE
             | R9A3E_PREAUTH_UNAVAILABLE_MODE
@@ -5379,7 +5366,6 @@ where
     } else if let Some(checkpoint) = match mode.as_str() {
         R8B2C_DELIVERED_BEFORE_POLL_MODE => Some(R8b2cRunnerCheckpoint::DeliveredBeforePoll),
         R8B2C_UNKNOWN_RECOVERY_MODE => Some(R8b2cRunnerCheckpoint::UnknownRecovered),
-        R8B2C_ACK_RECOVERY_MODE => Some(R8b2cRunnerCheckpoint::AckRehydrated),
         R9A3E_PREAUTH_UNAVAILABLE_MODE => Some(R8b2cRunnerCheckpoint::PreAuthorizationUnavailable),
         R9A3E_REVOKED_READY_MODE => Some(R8b2cRunnerCheckpoint::RevokedReadyRejected),
         _ => None,
@@ -5475,7 +5461,6 @@ async fn spawn_fixture_with_mode(root: &Path, instance: &str, mode: &str) -> Chi
                     | R8B2C_BEGIN_DELIVERY_MODE
                     | R8B2C_UNKNOWN_RECOVERY_MODE
                     | R8B2C_DELIVERED_BEFORE_POLL_MODE
-                    | R8B2C_ACK_RECOVERY_MODE
                     | R9A3D_EXTERNAL_SEND_MODE
                     | R9A3D_EXTERNAL_RECOVERY_MODE
                     | R9A3E_PREAUTH_UNAVAILABLE_MODE
@@ -11673,7 +11658,7 @@ async fn r8b2c_begin_delivery_hard_kill_recovers_unknown_without_resend_or_poll(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
+async fn r8b2c_delivered_before_poll_hard_kill_holds_without_resend_or_poll() {
     let root = std::env::temp_dir().join(format!("egopulse-r8b2c-delivered-{}", Uuid::now_v7()));
     fs::create_dir_all(&root).expect("create R-8B.2c delivered fixture root");
     let instance = format!("r8b2c-delivered-{}", Uuid::now_v7());
@@ -11815,31 +11800,36 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
 
     hard_kill_r8b2c_child(&mut child, R8B2C_DELIVERED_BEFORE_POLL_PHASE).await;
 
-    let mut restarted = spawn_fixture_with_mode(&root, &instance, R8B2C_ACK_RECOVERY_MODE).await;
+    let mut restarted =
+        spawn_fixture_with_mode(&root, &instance, R8B2C_UNKNOWN_RECOVERY_MODE).await;
     wait_for_cli_status_with_child(&instance, &mut restarted).await;
     wait_for_r8b2c_checkpoint(
         &root,
         &instance,
         &routed_ids.dispatch_id,
-        R8B2C_ACK_REHYDRATED_PHASE,
+        R8B2C_UNKNOWN_RECOVERED_PHASE,
         &mut restarted,
     )
     .await;
 
+    let interrupted =
+        wait_for_r8b2c_task_status(&instance, &task_id, TaskStatus::Interrupted, &mut restarted)
+            .await;
+    assert_eq!(interrupted["data"]["currentRunId"], routed_ids.run_id);
     assert_eq!(witness.ledger_count("send_dispatch"), 1);
-    assert_eq!(witness.ledger_count("reconcile"), 0);
-    assert_eq!(witness.ledger_count("ack_emitted"), 1);
-    assert!(witness.ledger_count("next_event") >= 1);
+    assert_eq!(witness.ledger_count("next_event"), 0);
+    assert_eq!(witness.ledger_count("reconcile"), 1);
+    assert_eq!(witness.ledger_count("ack_emitted"), 0);
     assert_eq!(
         witness.native_event_state(&routed_ids.dispatch_id),
-        Some(("emitted".to_owned(), 1))
+        Some(("pending".to_owned(), 0))
     );
 
     let adapter = read_r8b2c_adapter_oracle(&root, &routed_ids);
     assert_eq!(adapter.dispatch_count, 1);
     assert_eq!(adapter.delivery_unknown_count, 0);
     assert_eq!(adapter.observation_count, 1);
-    assert_eq!(adapter.pending_observation_count, 0);
+    assert_eq!(adapter.pending_observation_count, 1);
     assert_eq!(adapter.dispatch_state, "delivered");
     let receipt_after_restart = adapter
         .receipt
@@ -11856,22 +11846,26 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
         "restart must preserve the exact protobuf bytes of the original Delivered receipt"
     );
 
+    let reconciliation_key = format!(
+        "reconciliation:adapter-reconciliation:{}",
+        routed_ids.dispatch_id
+    );
     let observation = adapter
         .observations
         .iter()
-        .find(|observation| observation.native_key == "fake-ack")
-        .expect("original FakeCodexDriver ACK row must remain durable");
+        .find(|observation| observation.native_key == reconciliation_key)
+        .expect("nonresident Delivered recovery must persist reconciliation evidence");
     let observation_id = &observation.observation_id;
     assert_eq!(observation.dispatch_id, routed_ids.dispatch_id);
-    assert_eq!(observation.ingestion_state, "consumed");
+    assert_eq!(observation.ingestion_state, "pending");
     assert_eq!(observation.observation.observation_id, *observation_id);
     assert_eq!(observation.observation.dispatch_id, observation.dispatch_id);
     assert!(matches!(
         observation.observation.payload,
-        Some(harness_observation::Payload::Ack(ref ack))
-            if ack.ack_receipt_id == format!("fake-ack-{}", routed_ids.dispatch_id)
+        Some(harness_observation::Payload::Diagnostic(ref diagnostic))
+            if diagnostic.safe_diagnostic_code == "ADAPTER_RECONCILIATION_OUTCOME_UNKNOWN"
     ));
-    assert_eq!(observation.raw_event, b"fake-ack");
+    assert!(!observation.raw_event.is_empty());
     assert_eq!(
         observation.native_event_digest_sha256,
         format!("{:x}", Sha256::digest(observation.raw_event.as_slice()))
@@ -11879,18 +11873,30 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     assert!(!observation.raw_evidence_ref.trim().is_empty());
 
     let collaboration = read_r8b2c_collaboration_oracle(&root, &routed_ids);
-    assert_eq!(collaboration.outbox_state, "delivered");
-    assert_eq!(collaboration.run.status, RunStatus::Active as i32);
-    assert_eq!(collaboration.step.status, StepStatus::Active as i32);
+    assert_eq!(collaboration.outbox_state, "held");
+    assert_eq!(collaboration.run.status, RunStatus::Held as i32);
+    assert_eq!(collaboration.step.status, StepStatus::Held as i32);
+    assert_eq!(collaboration.attempt.status, AttemptStatus::Held as i32);
     assert_eq!(
-        collaboration.attempt.status,
-        AttemptStatus::Acknowledged as i32
+        collaboration.attempt.recovery_class,
+        RecoveryClass::ManualOnly as i32
     );
-    assert_eq!(collaboration.attempt.last_harness_sequence, 1);
+    assert_eq!(
+        collaboration.run.hold_reason_code.as_deref(),
+        Some("MANUAL_RECOVERY_REQUIRED")
+    );
+    assert_eq!(
+        collaboration.step.hold_reason_code.as_deref(),
+        Some("MANUAL_RECOVERY_REQUIRED")
+    );
+    assert_eq!(
+        collaboration.attempt.hold_reason_code.as_deref(),
+        Some("MANUAL_RECOVERY_REQUIRED")
+    );
     let task_before_stable = read_r8b2c_task_oracle(&root, &task_id);
     assert_eq!(
         task_before_stable.snapshot.status,
-        TaskStatus::Active as i32
+        TaskStatus::Interrupted as i32
     );
     assert_eq!(
         task_before_stable.snapshot.current_run_id,
@@ -11899,6 +11905,7 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     assert_eq!(read_empty_r9a3_verdict_oracle(&root), verdict_before_revoke);
     let stable_counts = (
         witness.ledger_count("send_dispatch"),
+        witness.ledger_count("next_event"),
         witness.ledger_count("reconcile"),
         witness.ledger_count("ack_emitted"),
     );
@@ -11913,24 +11920,22 @@ async fn r8b2c_delivered_before_poll_hard_kill_rehydrates_ack_without_resend() {
     assert_eq!(
         (
             witness.ledger_count("send_dispatch"),
+            witness.ledger_count("next_event"),
             witness.ledger_count("reconcile"),
             witness.ledger_count("ack_emitted"),
         ),
         stable_counts,
-        "Delivered recovery stable window must not resend, reconcile, or emit another ACK"
+        "Delivered nonresident recovery must not resend, poll, reconcile again, or emit the pending ACK"
     );
-    let active =
-        wait_for_r8b2c_task_status(&instance, &task_id, TaskStatus::Active, &mut restarted).await;
-    assert_eq!(active["data"]["currentRunId"], routed_ids.run_id);
 
     drop(restarted.stdin.take());
     let status = restarted
         .wait()
         .await
-        .expect("wait for R-8B.2c ACK recovery child");
+        .expect("wait for R-8B.2c Delivered nonresident recovery child");
     assert!(
         status.success(),
-        "R-8B.2c ACK recovery child failed: {status}"
+        "R-8B.2c Delivered nonresident recovery child failed: {status}"
     );
     fs::remove_dir_all(&root).expect("remove R-8B.2c delivered fixture root");
 }
@@ -14607,6 +14612,8 @@ async fn m13_real_daemon_cli_tui_dispatch_and_restart_preserve_one_memory_pair()
     .expect("read first M-13 Adapter evidence");
     assert_eq!(first_adapter.dispatch_count, 1);
     assert_eq!(first_adapter.delivery_unknown_count, 0);
+    assert_eq!(first_adapter.observation_count, 1);
+    assert_eq!(first_adapter.pending_observation_count, 0);
 
     let mut restarted = spawn_fixture_with_mode(&root, &instance, M13_MEMORY_DISPATCH_MODE).await;
     wait_for_cli_status_with_child(&instance, &mut restarted).await;
@@ -14634,7 +14641,73 @@ async fn m13_real_daemon_cli_tui_dispatch_and_restart_preserve_one_memory_pair()
     )
     .expect("read restarted M-13 Adapter evidence");
     assert_eq!(second_pair, first_pair);
-    assert_eq!(second_adapter, first_adapter);
+    assert_eq!(second_adapter.dispatch_count, first_adapter.dispatch_count);
+    assert_eq!(
+        second_adapter.delivery_unknown_count,
+        first_adapter.delivery_unknown_count
+    );
+    assert_eq!(
+        second_adapter.observation_count,
+        first_adapter.observation_count + 1
+    );
+    assert_eq!(
+        second_adapter.pending_observation_count,
+        first_adapter.pending_observation_count + 1
+    );
+    assert_eq!(second_adapter.dispatch_state, first_adapter.dispatch_state);
+    assert_eq!(second_adapter.attempt_id, first_adapter.attempt_id);
+    assert_eq!(second_adapter.fencing_token, first_adapter.fencing_token);
+    assert_eq!(
+        second_adapter.dispatch_fingerprint,
+        first_adapter.dispatch_fingerprint
+    );
+    assert_eq!(
+        second_adapter.envelope_digest_sha256,
+        first_adapter.envelope_digest_sha256
+    );
+    assert_eq!(second_adapter.envelope, first_adapter.envelope);
+    assert_eq!(second_adapter.receipt, first_adapter.receipt);
+    let first_ack = first_adapter
+        .observations
+        .iter()
+        .find(|row| row.native_key == "fake-ack")
+        .expect("read first M-13 native ACK");
+    let restarted_ack = second_adapter
+        .observations
+        .iter()
+        .find(|row| row.native_key == "fake-ack")
+        .expect("restart must retain the original M-13 native ACK");
+    assert_eq!(restarted_ack.observation_id, first_ack.observation_id);
+    assert_eq!(restarted_ack.dispatch_id, first_ack.dispatch_id);
+    assert_eq!(
+        restarted_ack.native_event_digest_sha256,
+        first_ack.native_event_digest_sha256
+    );
+    assert_eq!(restarted_ack.raw_evidence_ref, first_ack.raw_evidence_ref);
+    assert_eq!(restarted_ack.ingestion_state, first_ack.ingestion_state);
+    assert_eq!(restarted_ack.observation, first_ack.observation);
+    assert_eq!(restarted_ack.raw_event, first_ack.raw_event);
+    let reconciliation_key = format!(
+        "reconciliation:adapter-reconciliation:{}",
+        routed_ids.dispatch_id
+    );
+    let reconciliation = second_adapter
+        .observations
+        .iter()
+        .find(|row| row.native_key == reconciliation_key)
+        .expect("M-13 restart must retain its nonresident reconciliation fact");
+    assert_eq!(reconciliation.dispatch_id, routed_ids.dispatch_id);
+    assert_eq!(reconciliation.ingestion_state, "pending");
+    assert!(!reconciliation.raw_event.is_empty());
+    let reconciliation_observation =
+        HarnessObservation::decode(reconciliation.observation.as_slice())
+            .expect("decode M-13 nonresident reconciliation observation");
+    assert!(matches!(
+        reconciliation_observation.payload,
+        Some(harness_observation::Payload::Diagnostic(ref diagnostic))
+            if diagnostic.safe_diagnostic_code
+                == "ADAPTER_RECONCILIATION_TERMINAL_OBSERVATION_RECOVERED"
+    ));
     assert_eq!(
         fs::read(&record_path).expect("read stable M-13 driver evidence"),
         first_driver_bytes,

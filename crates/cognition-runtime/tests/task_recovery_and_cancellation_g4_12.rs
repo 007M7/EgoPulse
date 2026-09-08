@@ -1,8 +1,8 @@
 use egopulse_cognition_runtime::task_authority::{
-    AuthenticatedPrincipal, CreationAuthorization, CreationGuardRejection, PrincipalKind,
-    SqlCipherKey, TaskAuthority, TaskAuthorityConfig, TaskCancellationReconciliation,
-    TaskCreationGuard, TaskTransitionGuard, TransitionAuthorization, TransitionGuardRejection,
-    canonical_request_digest,
+    AuthenticatedPrincipal, CreationAuthorization, CreationGuardRejection,
+    NoRunTaskCancellationProof, PrincipalKind, SqlCipherKey, TaskAuthority, TaskAuthorityConfig,
+    TaskCancellationReconciliation, TaskCreationGuard, TaskTransitionGuard,
+    TransitionAuthorization, TransitionGuardRejection, canonical_request_digest,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::{CommandMetadata, ContractReference};
 use egopulse_domain_contracts::v01::egopulse::task::v1::{
@@ -824,5 +824,180 @@ fn terminal_active_run_consumes_late_cancellation_ack_without_redelivery() {
             .pending_task_cancellations()
             .expect("late active-run ACK consumed")
             .is_empty()
+    );
+}
+
+#[test]
+fn active_cancellation_holds_unclaimed_activation_and_settles_from_absence_proof() {
+    let isolated = IsolatedStore::new("active-unclaimed-cancellation");
+    let database_path = isolated.database_path();
+    let mut authority = open_authority(&database_path);
+    let task_id = active_task(&mut authority);
+    let activation = authority
+        .pending_task_activations()
+        .expect("read pending activation")
+        .pop()
+        .expect("one activation");
+
+    let mut request = TaskCommand {
+        command: Some(task_command::Command::RequestTaskCancellation(
+            RequestTaskCancellationCommand {
+                meta: Some(metadata("cmd-cancel-unclaimed", "cancel-unclaimed")),
+                task_id: task_id.clone(),
+                expected_revision: 2,
+                reason_code: "founder_abandoned".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut request);
+    authority
+        .execute(&request, &founder())
+        .expect("request cancellation before activation claim");
+    assert!(
+        authority
+            .pending_task_activations()
+            .expect("held activation is not dispatchable")
+            .is_empty()
+    );
+    assert!(
+        !authority
+            .claim_task_activation(&activation.message_id, &activation.payload_digest_sha256,)
+            .expect("held activation cannot be claimed")
+    );
+
+    drop(authority);
+    let mut reopened = open_authority(&database_path);
+    let cancellation = reopened
+        .pending_task_cancellations()
+        .expect("recover cancellation handoff")
+        .pop()
+        .expect("one cancellation");
+    let held = match reopened
+        .reconcile_task_cancellation(
+            &cancellation.message_id,
+            &cancellation.payload_digest_sha256,
+            &collaboration_control(),
+        )
+        .expect("reconcile held activation")
+    {
+        TaskCancellationReconciliation::NeedsNoRunProof(held) => held,
+        other => panic!("expected no-run proof request, got {other:?}"),
+    };
+    assert_eq!(held.message_id, activation.message_id);
+    assert_eq!(held.payload_digest_sha256, activation.payload_digest_sha256);
+    assert_eq!(held.task_id, task_id);
+    assert_eq!(held.reserved_run_id, "run-001");
+
+    let proof = NoRunTaskCancellationProof {
+        activation: held,
+        cancellation_message_id: cancellation.message_id,
+        cancellation_payload_digest_sha256: cancellation.payload_digest_sha256,
+        collaboration_absence_evidence_id: "collaboration-absence:run-001@owner-read".to_owned(),
+    };
+    let settled = reopened
+        .settle_no_run_task_cancellation(&proof, &collaboration_control())
+        .expect("settle from owner-backed absence proof");
+    assert_eq!(
+        settled,
+        TaskCancellationReconciliation::SettledAndAcknowledged {
+            status: TaskStatus::Cancelled,
+            committed: true,
+            replayed: false,
+        }
+    );
+    let cancelled = reopened
+        .get_task(&task_id)
+        .expect("read no-run cancellation");
+    let cancelled = match cancelled.outcome.expect("Task outcome") {
+        egopulse_domain_contracts::v01::egopulse::task::v1::get_task_response::Outcome::Task(
+            task,
+        ) => task,
+        _ => panic!("expected cancelled Task snapshot"),
+    };
+    assert_eq!(cancelled.status, TaskStatus::Cancelled as i32);
+    assert!(cancelled.current_run_id.is_none());
+    let replayed = reopened
+        .settle_no_run_task_cancellation(&proof, &collaboration_control())
+        .expect("exact no-run settlement replay");
+    assert_eq!(
+        replayed,
+        TaskCancellationReconciliation::SettledAndAcknowledged {
+            status: TaskStatus::Cancelled,
+            committed: false,
+            replayed: true,
+        }
+    );
+    let mut forged = proof;
+    forged.collaboration_absence_evidence_id = "collaboration-absence:forged".to_owned();
+    assert!(
+        reopened
+            .settle_no_run_task_cancellation(&forged, &collaboration_control())
+            .is_err()
+    );
+}
+
+#[test]
+fn claimed_activation_is_not_reclassified_as_no_run_by_later_cancellation() {
+    let isolated = IsolatedStore::new("active-claimed-cancellation");
+    let database_path = isolated.database_path();
+    let mut authority = open_authority(&database_path);
+    let task_id = active_task(&mut authority);
+    let activation = authority
+        .pending_task_activations()
+        .expect("read activation")
+        .pop()
+        .expect("one activation");
+    assert!(
+        authority
+            .claim_task_activation(&activation.message_id, &activation.payload_digest_sha256,)
+            .expect("claim activation")
+    );
+
+    let mut request = TaskCommand {
+        command: Some(task_command::Command::RequestTaskCancellation(
+            RequestTaskCancellationCommand {
+                meta: Some(metadata("cmd-cancel-claimed", "cancel-claimed")),
+                task_id,
+                expected_revision: 2,
+                reason_code: "founder_abandoned".to_owned(),
+            },
+        )),
+    };
+    set_digest(&mut request);
+    authority
+        .execute(&request, &founder())
+        .expect("request cancellation after activation claim");
+    let cancellation = authority
+        .pending_task_cancellations()
+        .expect("read cancellation")
+        .pop()
+        .expect("one cancellation");
+    assert_eq!(
+        authority
+            .reconcile_task_cancellation(
+                &cancellation.message_id,
+                &cancellation.payload_digest_sha256,
+                &collaboration_control(),
+            )
+            .expect("claimed activation requires native reconciliation"),
+        TaskCancellationReconciliation::NeedsNativeDelivery
+    );
+
+    drop(authority);
+    let mut reopened = open_authority(&database_path);
+    assert!(
+        reopened
+            .claim_task_activation(&activation.message_id, &activation.payload_digest_sha256,)
+            .expect("exact activation claim replays after restart")
+    );
+    assert_eq!(
+        reopened
+            .reconcile_task_cancellation(
+                &cancellation.message_id,
+                &cancellation.payload_digest_sha256,
+                &collaboration_control(),
+            )
+            .expect("restart preserves native reconciliation"),
+        TaskCancellationReconciliation::NeedsNativeDelivery
     );
 }

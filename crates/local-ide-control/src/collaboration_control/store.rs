@@ -343,6 +343,16 @@ impl CollaborationLineageStore {
             .optional()
             .map_err(StoreError::from)
     }
+
+    pub fn run_exists(&self, run_id: &str) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM collaboration_runs WHERE run_id = ?1)",
+                [run_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
 }
 
 impl CollaborationStore {

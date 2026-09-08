@@ -1,8 +1,8 @@
 {
   "schemaVersion": "v01-gate3-contract-candidate-manifest/v0.1",
   "candidateId": "v01-gate3-contracts",
-  "candidateVersion": "0.1.0-draft.23",
-  "status": "targeted_revision_work_capability_routing_founder_frozen_implementation_authorized",
+  "candidateVersion": "0.1.0-draft.24",
+  "status": "targeted_revision_personal_agent_intent_founder_authorized",
   "ssotRole": "implementation_contract_ssot",
   "featureId": "v01-governed-single-harness-work-loop",
   "architectureAuthorityRef": "conversation:2026-08-23:founder-v01-feature-adr-a01",
@@ -31,6 +31,7 @@
   "r9cHarnessContentAuthorityRef": "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7",
   "m13MemoryContextAuthorityRef": "conversation:2026-09-05:founder-resume-after-m13-decision-package",
   "workCapabilityRoutingAuthorityRef": "conversation:2026-09-05:founder-adr0004-option-b-freeze",
+  "personalAgentIntentAuthorityRef": "conversation:2026-09-08:founder-authorized-phase-one-personal-agent-intent-entry",
   "implementationAuthorized": true,
   "handoffRule": {
     "gate": "Gate 4",
@@ -136,6 +137,12 @@
       "founderDecisionRequired": true
     },
     {
+      "id": "ADR-0005",
+      "name": "Phase-One Personal Agent Intent Entry",
+      "status": "founder_authorized_additive_contract",
+      "founderDecisionRequired": true
+    },
+    {
       "id": "R-9A.2",
       "name": "Context Revoke Local API and Shared Semantic Confirmation",
       "status": "founder_confirmed_locally_verified",
@@ -164,6 +171,7 @@
     "harnessContentDisclosureProfile": "passed_exact_source_disclosure_limits_recovery_authorization_and_fixture_catalog",
     "r9cContractGate": "passed_r9c_d01_d12_proto_profile_fixture_fixed_vectors_and_generated_bindings",
     "m13ContractGate": "passed_m13_work_memory_mode_compatibility_and_cross_language_bindings",
+    "personalAgentIntentContractGate": "founder_authorized_contract_pinned_generation_and_runtime_verification_pending",
     "r9aAcceptanceGates": "passed_gate7_existing_adapter_receipt_and_task_run_step_attempt_unchanged_after_revoke;gate9_authorization_first_and_revoke_first_restart_paths_use_independent_external_side_effect_witness;gate10_context_paths_do_not_create_or_advance_founder_verdict;gate11_scheme_c_new_commit_validation_and_exact_historical_replay_zero_writes_with_changed_semantics_conflict"
   },
   "artifacts": [
@@ -205,7 +213,7 @@
     },
     {
       "path": "client-kernel-profile.schema.json",
-      "sha256": "3b85f23b2f68b7c5e8d81f3ccfa8cce51e850c27fd827116d5f3ffc9fa721173"
+      "sha256": "da387d7831eafac04f7c0000bf3c4bb284867bd41963fdccfcb219b46cfec60f"
     },
     {
       "path": "collaboration-fixture-envelope.schema.json",
@@ -629,7 +637,7 @@
     },
     {
       "path": "fixtures/localapi/v1/valid-open-desktop-session.json",
-      "sha256": "6c6e93b2f9ff801e3b6a3ac18fdf3ee994edd6b04b328eb9ef113739add6a421"
+      "sha256": "f84a64f29a4f2561f132fb63a7626e5892f6a9e2deb4843908bc697fb4fd524b"
     },
     {
       "path": "fixtures/localapi/v1/valid-task-command-authority-result.json",
@@ -1033,11 +1041,11 @@
     },
     {
       "path": "IMPLEMENTATION-SSOT.json",
-      "sha256": "98d958aaa8f02efab73d94861699b08bdc17465f3db2ce588520cd0dac2b03e4"
+      "sha256": "0de1fa06f1ed9e10b09166cfd6a04ff3e65592b26db182d1a900daf3b23a3fe6"
     },
     {
       "path": "IMPLEMENTATION-SSOT.md",
-      "sha256": "cfa0e4e7585ce717aa3196fff0f48225535e05dc3675389b0e23113d1e0f1f0a"
+      "sha256": "0f197856bbe3971844452c2780aa88e3e92f5ac0473f8134e6339340355c85cf"
     },
     {
       "path": "json-schema/foundation-health.schema.json",
@@ -1057,11 +1065,11 @@
     },
     {
       "path": "profiles/authorization/v1/v01-default.json",
-      "sha256": "67ee9e1ca23def452b963e68584c0f6394586b033da4fd2e5e74318adfbd7e46"
+      "sha256": "cf79c0b4fb23003917ed2ad86fbfbb5afb5674e2ba66fb8a9c3ead15cb6cf2b1"
     },
     {
       "path": "profiles/client-kernel/v1/v01-default.json",
-      "sha256": "500d1421381ea3929e6cd92c0ce7bc0e849a93f32d941366ff35037915aaea3d"
+      "sha256": "19666c3dad67f6d9a936a974e2b86f6f959bba093ac3045b7708cdd4192d972f"
     },
     {
       "path": "profiles/context-revoke/v1/v01-default.json",
@@ -1097,7 +1105,7 @@
     },
     {
       "path": "proto/egopulse/localapi/v1/local_api.proto",
-      "sha256": "c538920c3bd5b779ac79afefeea91403e266210501cdd4284389329f79174524"
+      "sha256": "3d3daee736c9ea655307790a5cc4d3a1e75083b2c5362221d2d2adc3f954d9e0"
     },
     {
       "path": "proto/egopulse/memory/v1/memory.proto",
@@ -1137,7 +1145,7 @@
     },
     {
       "path": "scripts/validate-candidate.js",
-      "sha256": "546d26f1acac9432860ef9300f89092c63025ff3a9a824c02afffc1d6995bc41"
+      "sha256": "96105401fba2ed945ab0855b81c53401ff66682138d4bf4cb0712e6a89a9fd8b"
     },
     {
       "path": "scripts/verify-faults.ps1",

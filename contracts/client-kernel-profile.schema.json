@@ -36,7 +36,7 @@
       "type": "array",
       "uniqueItems": true,
       "minItems": 10,
-      "items": { "enum": ["session_negotiation", "query", "list", "watch_complete_snapshots", "content_baseline_pagination", "watch_operation_records", "await_projection", "memory_retrieval", "governed_memory_work_preparation", "governed_work_capability_routing", "context_revoke_full_digest_confirmation", "typed_command", "stable_cursor", "reset_and_refetch", "read_your_write", "typed_error", "frame_deduplication", "content_generation_fencing"] }
+      "items": { "enum": ["session_negotiation", "query", "list", "watch_complete_snapshots", "content_baseline_pagination", "watch_operation_records", "await_projection", "memory_retrieval", "governed_memory_work_preparation", "governed_work_capability_routing", "personal_agent_intent_interpretation", "context_revoke_full_digest_confirmation", "typed_command", "stable_cursor", "reset_and_refetch", "read_your_write", "typed_error", "frame_deduplication", "content_generation_fencing"] }
     },
     "streamSemantics": {
       "type": "object",

@@ -141,6 +141,15 @@ impl CollaborationLineageReader {
             .task_id_for_attempt(attempt_id)
             .map_err(CollaborationControlError::from)
     }
+
+    pub fn run_exists(&self, run_id: &str) -> Result<bool, CollaborationControlError> {
+        if run_id.trim().is_empty() {
+            return Err(CollaborationControlError::Persistence);
+        }
+        self.store
+            .run_exists(run_id)
+            .map_err(CollaborationControlError::from)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -430,6 +439,17 @@ pub trait TaskActivationSource: Send + Sync {
         &self,
     ) -> Result<Vec<TaskActivationHandoff>, TaskActivationSourceError>;
 
+    /// Atomically reserves one exact Task activation before any Collaboration
+    /// Run or lease is created. Sources without an owner-backed claim remain
+    /// fail-closed.
+    fn claim_task_activation(
+        &self,
+        _message_id: &str,
+        _payload_digest_sha256: &str,
+    ) -> Result<bool, TaskActivationSourceError> {
+        Ok(false)
+    }
+
     fn acknowledge_task_activation(
         &self,
         message_id: &str,
@@ -445,6 +465,14 @@ where
         &self,
     ) -> Result<Vec<TaskActivationHandoff>, TaskActivationSourceError> {
         (**self).pending_task_activations()
+    }
+
+    fn claim_task_activation(
+        &self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, TaskActivationSourceError> {
+        (**self).claim_task_activation(message_id, payload_digest_sha256)
     }
 
     fn acknowledge_task_activation(
@@ -733,6 +761,14 @@ where
                 )),
             },
         })
+    }
+
+    /// Returns the timestamp used by this Authority instance for command
+    /// preconditions. Runners use it to recheck a persisted lease immediately
+    /// before a native side effect instead of consulting an unrelated clock.
+    #[must_use]
+    pub fn current_timestamp(&self) -> Timestamp {
+        self.clock.now()
     }
 
     pub fn pending_dispatches(

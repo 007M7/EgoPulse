@@ -11,18 +11,19 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use egopulse_client_operations::{
     ClientAttachment, ClientContextRevokeError, ClientReadError, ClientWorkError,
     ContextRevokeInput, DurableFounderVerdictRecovery, FounderSupportingMaterialCollection,
-    GovernedHoldReason, GovernedProjectionReason, GovernedTaskState, GuidedApprovalDecision,
-    GuidedApprovalDecisionInput, GuidedFounderVerdictInput, GuidedFounderVerdictSelection,
-    GuidedWorkCapabilityChoice, GuidedWorkInput, GuidedWorkMemoryMode, GuidedWorkSource,
-    HarnessContentFilter, PreparedContextRevoke, attach as attach_client, command_metadata,
-    set_task_digest, set_verdict_digest, timestamp_after,
+    GovernedHoldReason, GovernedProjectionReason, GovernedTaskState, GovernedWorkCapabilityCatalog,
+    GuidedApprovalDecision, GuidedApprovalDecisionInput, GuidedFounderVerdictInput,
+    GuidedFounderVerdictSelection, GuidedWorkCapabilityChoice, GuidedWorkInput,
+    GuidedWorkMemoryMode, GuidedWorkSource, HarnessContentFilter, PreparedContextRevoke,
+    attach as attach_client, command_metadata, set_task_digest, set_verdict_digest,
+    timestamp_after,
 };
 use egopulse_director_facade::{
     ContextAuthority, ContextSourceInput, DirectorInput, build_event_packet_preview,
@@ -35,10 +36,11 @@ use egopulse_domain_contracts::v01::egopulse::{
     localapi::v1::{
         AcceptMemoryCommand, AwaitProjectionRequest, ExecuteFounderVerdictRequest,
         ExecuteMemoryMutationRequest, ExecuteTaskCommandRequest, GetEvidenceGraphRequest,
-        HarnessApprovalView, LocalApiErrorCode, MemoryMutationCommand, MemoryMutationReceipt,
-        ProjectionAwaitToken, ProjectionHealth, RetrieveMemoryRequest, SourceRevision,
-        SubmitMemoryCandidateCommand, TaskView, await_projection_response,
-        get_evidence_graph_response, memory_mutation_command, retrieve_memory_response,
+        HarnessApprovalView, IntentConversationMessage, IntentWorkCandidate, LocalApiErrorCode,
+        MemoryMutationCommand, MemoryMutationReceipt, ProjectionAwaitToken, ProjectionHealth,
+        RetrieveMemoryRequest, SourceRevision, SubmitMemoryCandidateCommand, TaskView,
+        await_projection_response, get_evidence_graph_response, memory_mutation_command,
+        retrieve_memory_response,
     },
     task::v1::TaskStatus,
     task::v1::{
@@ -71,7 +73,9 @@ use egopulse_tui::task_watch::{
     TaskWatchBaselineFuture, TaskWatchClient, TaskWatchController, TaskWatchOpenFuture,
     TaskWatchPageModel, TaskWatchPhase,
 };
-use egopulse_tui::work_start::{WorkStartController, WorkStartStage, render_work_start_page};
+use egopulse_tui::work_start::{
+    WorkStartController, WorkStartDraft, WorkStartStage, render_work_start_page,
+};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -80,13 +84,22 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Tabs, Wrap},
 };
 use serde_json::json;
+use tokio::sync::mpsc;
 use uuid::Uuid;
+
+fn default_tui_instance_from_environment(environment_instance: Option<String>) -> String {
+    environment_instance.unwrap_or_else(|| "default".to_owned())
+}
+
+fn default_tui_instance() -> String {
+    default_tui_instance_from_environment(std::env::var("EGOPULSE_IPC_INSTANCE").ok())
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "egopulse-tui", version, about = "EgoPulse terminal surface")]
 struct Args {
     /// Use a specific local daemon instance.
-    #[arg(long, default_value = "default")]
+    #[arg(long, default_value_t = default_tui_instance())]
     instance: String,
     /// Print the foundation probe without entering raw terminal mode.
     #[arg(long)]
@@ -115,7 +128,7 @@ enum TuiCommand {
     },
     /// Build the same governed work preview as the CLI without creating a Task.
     WorkPlan {
-        /// Natural-language work intent from the Founder.
+        /// 用自然语言描述要做的工作。
         #[arg(long)]
         intent: String,
         /// Explicit project or workspace scope.
@@ -904,6 +917,7 @@ impl CommandForm {
 
 enum InteractiveMode {
     Dashboard,
+    IntentConversation,
     GovernedState,
     WorkStart,
     TaskWatch,
@@ -920,6 +934,10 @@ enum InteractiveAction {
     Command(Box<TuiCommand>),
     StageContextRevoke(ContextRevokeInput),
     ConfirmContextRevoke,
+    OpenIntentConversation,
+    CloseIntentConversation,
+    InterpretIntentConversation,
+    ApplyIntentWorkCandidate,
     OpenWorkStart,
     OpenGovernedState,
     CloseGovernedState,
@@ -939,11 +957,269 @@ enum InteractiveAction {
     OpenResultReview,
     RefreshResultReview,
     CloseResultReview,
+    OpenMemoryCandidate { scope_ref: Option<String> },
+    OpenRework { task_id: String, revision: u64 },
     OpenApprovalQueue,
     RefetchApprovalQueue,
     CloseApprovalQueue,
     SubmitApprovalDecision,
     Quit,
+}
+
+const INTENT_INPUT_LIMIT_BYTES: usize = 16 * 1024;
+const INTENT_HISTORY_LIMIT: usize = 16;
+const INTENT_HISTORY_LIMIT_BYTES: usize = 64 * 1024;
+
+struct IntentConversation {
+    input: String,
+    history: Vec<IntentConversationMessage>,
+    reply: String,
+    needs_clarification: bool,
+    work_candidate: Option<IntentWorkCandidate>,
+    capability_catalog: GovernedWorkCapabilityCatalog,
+    capability_cursor: usize,
+    explicit_capability_choice_id: Option<String>,
+    pending_text: Option<String>,
+    receiver: Option<
+        mpsc::Receiver<
+            Result<
+                egopulse_domain_contracts::v01::egopulse::localapi::v1::InterpretedIntent,
+                String,
+            >,
+        >,
+    >,
+}
+
+impl IntentConversation {
+    fn new(capability_catalog: GovernedWorkCapabilityCatalog) -> Self {
+        let capability_cursor = capability_catalog
+            .capabilities
+            .iter()
+            .position(|capability| capability.current_future_work_default)
+            .unwrap_or(0);
+        Self {
+            input: String::new(),
+            history: Vec::new(),
+            reply: "请直接描述想做的事。收到建议后会先填入工作草稿；请在下一页核对并明确准备，系统才会继续。".to_owned(),
+            needs_clarification: false,
+            work_candidate: None,
+            capability_catalog,
+            capability_cursor,
+            explicit_capability_choice_id: None,
+            pending_text: None,
+            receiver: None,
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    fn push_text(&mut self, text: &str) -> bool {
+        let mut accepted = true;
+        for character in text.chars() {
+            if self.input.len().saturating_add(character.len_utf8()) > INTENT_INPUT_LIMIT_BYTES {
+                accepted = false;
+                break;
+            }
+            self.input.push(character);
+        }
+        accepted
+    }
+
+    fn pop_input(&mut self) {
+        self.input.pop();
+    }
+
+    fn select_previous_capability(&mut self) {
+        let count = self.capability_catalog.capabilities.len();
+        if count > 0 {
+            self.capability_cursor = self.capability_cursor.checked_sub(1).unwrap_or(count - 1);
+        }
+    }
+
+    fn select_next_capability(&mut self) {
+        let count = self.capability_catalog.capabilities.len();
+        if count > 0 {
+            self.capability_cursor = (self.capability_cursor + 1) % count;
+        }
+    }
+
+    fn choose_highlighted_capability(&mut self) -> Result<(), String> {
+        let capability = self
+            .capability_catalog
+            .capabilities
+            .get(self.capability_cursor)
+            .ok_or_else(|| "当前没有可选的执行能力".to_owned())?;
+        if !capability.selectable {
+            return Err(format!(
+                "此执行能力暂不可用：{}",
+                capability
+                    .safe_reason_code
+                    .as_deref()
+                    .unwrap_or("暂无可用原因")
+            ));
+        }
+        let choice_id = capability.choice_id.clone();
+        if self.explicit_capability_choice_id != choice_id {
+            self.explicit_capability_choice_id = choice_id;
+            self.clear_candidate_after_capability_change();
+        }
+        Ok(())
+    }
+
+    fn use_future_work_default(&mut self) {
+        if self.explicit_capability_choice_id.take().is_some() {
+            self.clear_candidate_after_capability_change();
+        }
+    }
+
+    fn selected_choice_id(&self) -> String {
+        self.explicit_capability_choice_id
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn send(&mut self, attachment: Arc<ClientAttachment>) -> Result<(), String> {
+        if self.is_running() {
+            return Err("正在生成回复，请等待完成后再操作".to_owned());
+        }
+        let text = self.input.clone();
+        if text.trim().is_empty() {
+            return Err("请先输入你的需求，再发送".to_owned());
+        }
+        let history_was_trimmed = self.trim_history_for_request(&text);
+        let pending_text = text.clone();
+        let history = self.history.clone();
+        let capability_choice_id = self.selected_choice_id();
+        let (sender, receiver) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let _ = sender
+                .send(
+                    attachment
+                        .interpret_intent(text, history, capability_choice_id)
+                        .await,
+                )
+                .await;
+        });
+        self.pending_text = Some(pending_text);
+        self.receiver = Some(receiver);
+        self.reply = if history_was_trimmed {
+            "正在整理你的需求；为控制对话窗口，已省略较早消息。尚未准备或创建任何工作。".to_owned()
+        } else {
+            "正在整理你的需求；尚未准备或创建任何工作。".to_owned()
+        };
+        Ok(())
+    }
+
+    fn pump(&mut self) -> bool {
+        let result = match self
+            .receiver
+            .as_mut()
+            .and_then(|receiver| match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => Some(Err(
+                    "暂时没有收到回复；没有确认任何工作。需要时请明确再次发送。".to_owned(),
+                )),
+            }) {
+            Some(result) => result,
+            None => return false,
+        };
+        self.receiver = None;
+        let text = self.pending_text.take().unwrap_or_default();
+        match result {
+            Ok(interpretation) => {
+                self.append_history(false, text);
+                self.reply = bounded_intent_text(interpretation.reply);
+                self.needs_clarification = interpretation.needs_clarification;
+                self.work_candidate = interpretation.work_candidate;
+                self.append_history(true, self.reply.clone());
+                self.input.clear();
+            }
+            Err(error) => {
+                self.reply = error;
+            }
+        }
+        true
+    }
+
+    fn append_history(&mut self, from_assistant: bool, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.history.push(IntentConversationMessage {
+            from_assistant,
+            text: bounded_intent_text(text),
+        });
+        while self.history.len() > INTENT_HISTORY_LIMIT
+            || self
+                .history
+                .iter()
+                .map(|message| message.text.len())
+                .sum::<usize>()
+                > INTENT_HISTORY_LIMIT_BYTES
+        {
+            self.history.remove(0);
+        }
+    }
+
+    fn trim_history_for_request(&mut self, current_text: &str) -> bool {
+        let history_budget = INTENT_HISTORY_LIMIT_BYTES.saturating_sub(current_text.len());
+        let mut trimmed = false;
+        while self
+            .history
+            .iter()
+            .map(|message| message.text.len())
+            .sum::<usize>()
+            > history_budget
+        {
+            if self.history.is_empty() {
+                break;
+            }
+            self.history.remove(0);
+            trimmed = true;
+        }
+        trimmed
+    }
+
+    fn clear_candidate_after_capability_change(&mut self) {
+        if self.work_candidate.take().is_some() {
+            self.needs_clarification = false;
+            self.reply = "执行能力已变更。请重新发送需求，以生成与当前选择相符的建议。".to_owned();
+        }
+    }
+}
+
+fn bounded_intent_text(text: String) -> String {
+    if text.len() <= INTENT_INPUT_LIMIT_BYTES {
+        return text;
+    }
+    let mut bounded = String::new();
+    for character in text.chars() {
+        if bounded.len().saturating_add(character.len_utf8()) > INTENT_INPUT_LIMIT_BYTES {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
+}
+
+fn populate_work_start_draft(
+    draft: &mut WorkStartDraft,
+    candidate: IntentWorkCandidate,
+    explicit_capability_choice_id: Option<String>,
+) {
+    draft.intent = candidate.intent;
+    draft.work_type = candidate.work_type;
+    draft.target_scope_ref = candidate.target_scope_ref;
+    draft.context_references = candidate
+        .sources
+        .into_iter()
+        .map(|source| source.source_ref)
+        .collect::<Vec<_>>()
+        .join(", ");
+    draft.capability_choice_id = explicit_capability_choice_id.unwrap_or_default();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1050,7 +1326,6 @@ fn work_start_key_intent(
     key: crossterm::event::KeyEvent,
 ) -> WorkStartKeyIntent {
     match (stage, key.code) {
-        (_, KeyCode::Char('q')) => WorkStartKeyIntent::Quit,
         (WorkStartStage::Editing, KeyCode::Esc) | (WorkStartStage::Failed, KeyCode::Esc) => {
             WorkStartKeyIntent::Close
         }
@@ -1065,6 +1340,7 @@ fn work_start_key_intent(
         {
             WorkStartKeyIntent::Push(character)
         }
+        (_, KeyCode::Char('q')) => WorkStartKeyIntent::Quit,
         (WorkStartStage::Editing | WorkStartStage::Failed, KeyCode::Enter) => {
             WorkStartKeyIntent::Prepare
         }
@@ -1256,6 +1532,13 @@ trait InteractiveClient: TaskWatchClient + ApprovalQueueClient + TaskResultRevie
     fn work_start_controller(&self) -> Result<WorkStartController, String> {
         Err("Work Start is unavailable for this client".to_owned())
     }
+    fn rework_controller(
+        &self,
+        _task_id: String,
+        _revision: u64,
+    ) -> Result<WorkStartController, String> {
+        Err("Rework is unavailable for this client".to_owned())
+    }
 }
 
 struct AttachedClient(Arc<ClientAttachment>);
@@ -1347,6 +1630,22 @@ impl InteractiveClient for AttachedClient {
 
     fn work_start_controller(&self) -> Result<WorkStartController, String> {
         Ok(WorkStartController::new(Arc::clone(&self.0)))
+    }
+    fn rework_controller(
+        &self,
+        task_id: String,
+        revision: u64,
+    ) -> Result<WorkStartController, String> {
+        self.require_rpc("LocalCommandGatewayService/PrepareRework", "work.rework")?;
+        self.require_rpc(
+            "LocalCommandGatewayService/ConfirmRework",
+            "work.confirm-rework",
+        )?;
+        Ok(WorkStartController::new_rework(
+            Arc::clone(&self.0),
+            task_id,
+            revision,
+        ))
     }
 }
 
@@ -2958,6 +3257,7 @@ struct Snapshot {
 struct App {
     instance: String,
     client: Option<Arc<dyn InteractiveClient>>,
+    intent_attachment: Option<Arc<ClientAttachment>>,
     governed_state_client: Option<Arc<AttachedClient>>,
     content_attachment: Option<Arc<ClientAttachment>>,
     snapshot: Option<Snapshot>,
@@ -2970,6 +3270,7 @@ struct App {
     approval_queue: Option<ApprovalQueueController<dyn InteractiveClient>>,
     result_review: Option<ResultReviewController<dyn InteractiveClient>>,
     work_start: Option<WorkStartController>,
+    intent_conversation: Option<IntentConversation>,
     governed_state: Option<GovernedStateController>,
     pending_task_watch_selection: Option<String>,
 }
@@ -2979,6 +3280,7 @@ impl App {
         Self {
             instance,
             client: None,
+            intent_attachment: None,
             governed_state_client: None,
             content_attachment: None,
             snapshot: None,
@@ -2991,6 +3293,7 @@ impl App {
             approval_queue: None,
             result_review: None,
             work_start: None,
+            intent_conversation: None,
             governed_state: None,
             pending_task_watch_selection: None,
         }
@@ -3016,12 +3319,35 @@ impl App {
         };
     }
 
+    fn open_memory_candidate_form(&mut self, scope_ref: Option<String>) {
+        let scope_ref = scope_ref.filter(|scope| !scope.trim().is_empty());
+        let mut form = CommandForm::new(CommandKind::MemoryCandidate);
+        for field in &mut form.fields {
+            match field.label {
+                "memory-id" | "idempotency-key" => field.value = Uuid::now_v7().to_string(),
+                "scope-ref" => field.value = scope_ref.clone().unwrap_or_default(),
+                _ => {}
+            }
+        }
+        self.mode = InteractiveMode::Form(form);
+        self.message = if scope_ref.is_some() {
+            "请填写要记下的经验和来源；范围已从当前任务的可信快照填入。提交的只是候选，仍需用户审阅后决定是否接受。"
+                .to_owned()
+        } else {
+            "请填写要记下的经验、来源和范围；当前页面没有可验证的范围或来源可预填。提交的只是候选，仍需用户审阅后决定是否接受。"
+                .to_owned()
+        };
+    }
+
     fn handle_key(
         &mut self,
         key: crossterm::event::KeyEvent,
     ) -> Result<Option<InteractiveAction>, String> {
         match &mut self.mode {
             InteractiveMode::Dashboard => match key.code {
+                KeyCode::Enter | KeyCode::Char('i') => {
+                    Ok(Some(InteractiveAction::OpenIntentConversation))
+                }
                 KeyCode::Char('c') => {
                     self.open_palette();
                     Ok(None)
@@ -3034,6 +3360,82 @@ impl App {
                 KeyCode::Char('q') | KeyCode::Esc => Ok(Some(InteractiveAction::Quit)),
                 _ => Ok(None),
             },
+            InteractiveMode::IntentConversation => {
+                let conversation = self
+                    .intent_conversation
+                    .as_mut()
+                    .ok_or_else(|| "对话输入暂不可用".to_owned())?;
+                match key.code {
+                    KeyCode::Esc => {
+                        if conversation.is_running() {
+                            self.message = "正在生成回复，请等待完成后再返回".to_owned();
+                            Ok(None)
+                        } else {
+                            Ok(Some(InteractiveAction::CloseIntentConversation))
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if conversation.is_running() {
+                            self.message = "正在生成回复，请等待完成".to_owned();
+                            Ok(None)
+                        } else {
+                            Ok(Some(InteractiveAction::InterpretIntentConversation))
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if !conversation.is_running() {
+                            conversation.pop_input();
+                        }
+                        Ok(None)
+                    }
+                    KeyCode::Up => {
+                        conversation.select_previous_capability();
+                        Ok(None)
+                    }
+                    KeyCode::Down => {
+                        conversation.select_next_capability();
+                        Ok(None)
+                    }
+                    KeyCode::F(2) => {
+                        self.message = if conversation.is_running() {
+                            "正在生成回复，暂不能变更执行能力".to_owned()
+                        } else {
+                            match conversation.choose_highlighted_capability() {
+                                Ok(()) => {
+                                    "已选择此执行能力；若已有建议，请重新发送后再填入工作草稿"
+                                        .to_owned()
+                                }
+                                Err(error) => error,
+                            }
+                        };
+                        Ok(None)
+                    }
+                    KeyCode::F(3) => {
+                        self.message = if conversation.is_running() {
+                            "正在生成回复，暂不能变更执行能力".to_owned()
+                        } else {
+                            conversation.use_future_work_default();
+                            "已改用默认执行能力；若已有建议，请重新发送后再填入工作草稿".to_owned()
+                        };
+                        Ok(None)
+                    }
+                    KeyCode::F(4) => Ok(Some(InteractiveAction::ApplyIntentWorkCandidate)),
+                    KeyCode::Char(character)
+                        if !conversation.is_running()
+                            && !key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        if !conversation.push_text(&character.to_string()) {
+                            self.message = format!(
+                                "单次输入最多 {INTENT_INPUT_LIMIT_BYTES} 字节，超出的内容未加入"
+                            );
+                        }
+                        Ok(None)
+                    }
+                    _ => Ok(None),
+                }
+            }
             InteractiveMode::GovernedState => match key.code {
                 KeyCode::Esc => Ok(Some(InteractiveAction::CloseGovernedState)),
                 KeyCode::Char('q') => Ok(Some(InteractiveAction::Quit)),
@@ -3138,6 +3540,46 @@ impl App {
                 {
                     Ok(Some(InteractiveAction::OpenHarnessContent))
                 }
+                KeyCode::Char('f') if self.pending_task_watch_selection.is_none() => {
+                    let selected =
+                        self.task_watch
+                            .as_ref()
+                            .and_then(|controller| controller.model())
+                            .and_then(|model| {
+                                model.tasks.iter().find(|task| {
+                                    Some(&task.task_id) == model.selected_task_id.as_ref()
+                                })
+                            });
+                    if let Some(task) = selected.filter(|task| task.status == TaskStatus::Rework) {
+                        Ok(Some(InteractiveAction::OpenRework {
+                            task_id: task.task_id.clone(),
+                            revision: task.revision,
+                        }))
+                    } else {
+                        self.message =
+                            "请先选择已裁决为 Rework 的任务；返工会继续同一个任务。".to_owned();
+                        Ok(None)
+                    }
+                }
+                KeyCode::Char('m')
+                    if self.pending_task_watch_selection.is_none()
+                        && self
+                            .task_watch
+                            .as_ref()
+                            .and_then(|controller| controller.model())
+                            .and_then(|model| model.selected_task_id.as_ref())
+                            .is_some() =>
+                {
+                    Ok(Some(InteractiveAction::OpenMemoryCandidate {
+                        scope_ref: None,
+                    }))
+                }
+                KeyCode::Char('m') => {
+                    self.message =
+                        "请先选择一个任务，再记下经验；当前任务视图没有可验证的范围或来源可预填。"
+                            .to_owned();
+                    Ok(None)
+                }
                 KeyCode::Char('q') => Ok(Some(InteractiveAction::Quit)),
                 KeyCode::Up => {
                     if let Some(controller) = &mut self.task_watch {
@@ -3227,6 +3669,16 @@ impl App {
                     ResultReviewVerdictStage::Viewing | ResultReviewVerdictStage::Committed,
                     KeyCode::Char('r'),
                 ) => Ok(Some(InteractiveAction::RefreshResultReview)),
+                (
+                    ResultReviewVerdictStage::Viewing | ResultReviewVerdictStage::Committed,
+                    KeyCode::Char('m'),
+                ) => Ok(Some(InteractiveAction::OpenMemoryCandidate {
+                    scope_ref: self
+                        .result_review
+                        .as_ref()
+                        .and_then(ResultReviewController::trusted_task_target_scope_ref)
+                        .map(ToOwned::to_owned),
+                })),
                 (
                     ResultReviewVerdictStage::Viewing | ResultReviewVerdictStage::Committed,
                     KeyCode::Char('q'),
@@ -3770,6 +4222,92 @@ impl App {
         Ok(())
     }
 
+    async fn start_intent_conversation(&mut self) -> Result<(), String> {
+        if let Some(conversation) = self.intent_conversation.as_ref() {
+            self.message = conversation.reply.clone();
+            self.mode = InteractiveMode::IntentConversation;
+            return Ok(());
+        }
+        let attached = AttachedClient::open(&self.instance).await?;
+        let catalog = attached
+            .0
+            .list_work_capabilities()
+            .await
+            .map_err(tui_work_error)?;
+        self.intent_attachment = Some(Arc::clone(&attached.0));
+        self.intent_conversation = Some(IntentConversation::new(catalog));
+        self.mode = InteractiveMode::IntentConversation;
+        self.message = "请输入你想完成的事。回复只会生成建议，确认前不会创建工作。".to_owned();
+        Ok(())
+    }
+
+    fn close_intent_conversation(&mut self) -> Result<(), String> {
+        if self
+            .intent_conversation
+            .as_ref()
+            .is_some_and(IntentConversation::is_running)
+        {
+            return Err("正在生成回复，请等待完成后再返回".to_owned());
+        }
+        self.intent_conversation.take();
+        self.intent_attachment.take();
+        self.mode = InteractiveMode::Dashboard;
+        self.message = "已关闭需求输入；没有准备或创建任何工作。".to_owned();
+        Ok(())
+    }
+
+    fn interpret_intent_conversation(&mut self) -> Result<(), String> {
+        let attachment = Arc::clone(
+            self.intent_attachment
+                .as_ref()
+                .ok_or_else(|| "未连接到本地服务，暂时不能发送需求".to_owned())?,
+        );
+        self.intent_conversation
+            .as_mut()
+            .ok_or_else(|| "对话输入暂不可用".to_owned())?
+            .send(attachment)
+    }
+
+    fn apply_intent_conversation_events(&mut self) {
+        let Some(conversation) = self.intent_conversation.as_mut() else {
+            return;
+        };
+        if conversation.pump() {
+            self.message = conversation.reply.clone();
+        }
+    }
+
+    async fn apply_intent_work_candidate(&mut self) -> Result<(), String> {
+        let (candidate, explicit_capability_choice_id) = {
+            let conversation = self
+                .intent_conversation
+                .as_ref()
+                .ok_or_else(|| "对话输入暂不可用".to_owned())?;
+            if conversation.is_running() {
+                return Err("请等待当前回复完成后，再填入工作草稿".to_owned());
+            }
+            (
+                conversation
+                    .work_candidate
+                    .clone()
+                    .ok_or_else(|| "当前没有可填入草稿的建议；请先补充回复中的问题".to_owned())?,
+                conversation.explicit_capability_choice_id.clone(),
+            )
+        };
+        self.start_work_start().await?;
+        let draft = self
+            .work_start
+            .as_mut()
+            .ok_or_else(|| "Work Start controller is unavailable".to_owned())?
+            .model_mut()
+            .draft_mut();
+        populate_work_start_draft(draft, candidate, explicit_capability_choice_id);
+        self.intent_conversation.take();
+        self.intent_attachment.take();
+        self.message = "建议已填入工作草稿。请核对后按 Enter 准备；当前没有创建工作。".to_owned();
+        Ok(())
+    }
+
     async fn start_work_start(&mut self) -> Result<(), String> {
         if self.work_start.is_some() {
             self.stop_task_watch().await;
@@ -4303,6 +4841,14 @@ impl App {
                     body[1],
                 ),
             },
+            InteractiveMode::IntentConversation => match self.intent_conversation.as_ref() {
+                Some(conversation) => render_intent_conversation(frame, body[1], conversation),
+                None => frame.render_widget(
+                    Paragraph::new("需求输入暂不可用。")
+                        .block(Block::default().borders(Borders::ALL).title("需求对话")),
+                    body[1],
+                ),
+            },
             InteractiveMode::GovernedState => match self.governed_state.as_ref() {
                 Some(controller) => render_governed_state(frame, body[1], controller.model()),
                 None => frame.render_widget(
@@ -4420,18 +4966,22 @@ impl App {
     fn footer_text(&self) -> String {
         if matches!(self.mode, InteractiveMode::Dashboard) {
             return format!(
-                "{} - n new work - w task watch - a approval queue - g governed state - c command palette - r refresh - Tab panel - q quit",
+                "{} - Enter/i 用自然语言描述需求 - n new work - w task watch - a approval queue - g governed state - c command palette - r refresh - Tab panel - q quit",
                 self.message
             );
         }
         match &self.mode {
+            InteractiveMode::IntentConversation => format!(
+                "{} - 输入或粘贴需求 - Enter 发送 - ↑↓ 选择能力 - F2 选用 - F3 默认 - F4 填入工作草稿 - Esc 返回",
+                self.message
+            ),
             InteractiveMode::GovernedState => format!(
                 "{} - Esc dashboard - q quit; this page is observation-only",
                 self.message
             ),
             InteractiveMode::TaskWatch => {
                 format!(
-                    "{} - Up/Down select - h live content - Enter review - Esc dashboard - r refetch - q quit",
+                    "{} - Up/Down select - h live content - Enter review - f 继续返工 - m 记下经验 - Esc dashboard - r refetch - q quit",
                     self.message
                 )
             }
@@ -4449,7 +4999,7 @@ impl App {
                 .map(ResultReviewController::verdict_stage)
             {
                 Some(ResultReviewVerdictStage::Viewing) => format!(
-                    "{} - a Accept - x Reject - w Rework - v recover saved Verdict - Tab section - r refresh - Esc Task Watch",
+                    "{} - a Accept - x Reject - w Rework - m 记下经验 - v recover saved Verdict - Tab section - r refresh - Esc Task Watch",
                     self.message
                 ),
                 Some(ResultReviewVerdictStage::Drafting) => format!(
@@ -4481,7 +5031,7 @@ impl App {
                     self.message
                 ),
                 Some(ResultReviewVerdictStage::Committed) => format!(
-                    "{} - Authority committed; r refresh projection - Esc Task Watch",
+                    "{} - Authority committed; m 记下经验 - r refresh projection - Esc Task Watch",
                     self.message
                 ),
                 None => self.message.clone(),
@@ -4665,6 +5215,122 @@ fn render_command_form(frame: &mut Frame<'_>, area: Rect, form: &CommandForm) {
             )
             .highlight_style(Style::default().fg(Color::Yellow)),
         area,
+    );
+}
+
+fn render_intent_conversation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    conversation: &IntentConversation,
+) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+        .split(area);
+    let mut lines = vec![
+        Line::from("在这里用自然语言说明需求。回复会生成建议，不会直接创建工作。"),
+        Line::from(format!(
+            "对话上下文最多保留 {INTENT_HISTORY_LIMIT} 条、共 {INTENT_HISTORY_LIMIT_BYTES} 字节；发送时优先保留当前输入。"
+        )),
+        Line::from(format!(
+            "你的需求{}：{}",
+            if conversation.is_running() {
+                "（发送中）"
+            } else {
+                ""
+            },
+            if conversation.input.is_empty() {
+                "<可输入或粘贴中文、英文等内容>"
+            } else {
+                conversation.input.as_str()
+            }
+        )),
+        Line::from(format!(
+            "回复{}：{}",
+            if conversation.needs_clarification {
+                "（需要补充）"
+            } else {
+                ""
+            },
+            conversation.reply
+        )),
+    ];
+    if let Some(candidate) = conversation.work_candidate.as_ref() {
+        lines.extend([
+            Line::from(""),
+            Line::from("建议内容（请先在工作草稿中核对）："),
+            Line::from(format!("目标：{}", candidate.intent)),
+            Line::from(format!("工作类型：{}", candidate.work_type)),
+            Line::from(format!("范围：{}", candidate.target_scope_ref)),
+            Line::from(format!("资料引用：{} 条", candidate.sources.len())),
+        ]);
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("需求对话"))
+            .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    let selected_choice = conversation
+        .explicit_capability_choice_id
+        .as_deref()
+        .unwrap_or("<默认执行能力>");
+    let mut capability_lines = vec![Line::from(format!(
+        "执行能力：{selected_choice}（回复不会替你选择或修改此项）"
+    ))];
+    for (index, capability) in conversation
+        .capability_catalog
+        .capabilities
+        .iter()
+        .enumerate()
+    {
+        let marker = if index == conversation.capability_cursor {
+            ">"
+        } else {
+            " "
+        };
+        let selected = if capability.choice_id.as_deref()
+            == conversation.explicit_capability_choice_id.as_deref()
+        {
+            " 已选择"
+        } else if capability.current_future_work_default {
+            " 默认"
+        } else {
+            ""
+        };
+        let reason = capability
+            .safe_reason_code
+            .as_deref()
+            .map(|value| format!(" 原因={value}"))
+            .unwrap_or_default();
+        capability_lines.push(Line::from(format!(
+            "{marker} {} / {} / {} -> {} [{}]{}{}",
+            capability.provider_alias,
+            capability.harness_alias,
+            capability.harness_model_alias,
+            capability.provider_model_alias,
+            if capability.selectable {
+                "可用"
+            } else {
+                "不可用"
+            },
+            selected,
+            reason,
+        )));
+    }
+    if conversation.capability_catalog.capabilities.is_empty() {
+        capability_lines.push(Line::from("当前没有可展示的执行能力。"));
+    }
+    frame.render_widget(
+        Paragraph::new(capability_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Provider / Harness / model"),
+            )
+            .wrap(Wrap { trim: false }),
+        sections[1],
     );
 }
 
@@ -5270,7 +5936,11 @@ async fn run_interactive(args: Args) -> Result<(), String> {
                 || app
                     .result_review
                     .as_ref()
-                    .is_some_and(ResultReviewController::has_unsettled_sent_verdict))
+                    .is_some_and(ResultReviewController::has_unsettled_sent_verdict)
+                || app
+                    .intent_conversation
+                    .as_ref()
+                    .is_some_and(IntentConversation::is_running))
         {
             continue;
         }
@@ -5284,9 +5954,18 @@ async fn finish_interactive_session<T>(
     app: &mut App,
     result: Result<T, String>,
 ) -> Result<T, String> {
+    if app
+        .intent_conversation
+        .as_ref()
+        .is_some_and(IntentConversation::is_running)
+    {
+        return Err("正在生成回复，请等待完成".to_owned());
+    }
     if !app.settle_work_start_for_quit().await {
         return Err(app.message.clone());
     }
+    app.intent_conversation.take();
+    app.intent_attachment.take();
     app.stop_task_watch().await;
     app.stop_harness_content().await;
     app.stop_approval_queue().await;
@@ -5312,6 +5991,27 @@ async fn execute_interactive_action(
             app.mode = InteractiveMode::Dashboard;
             app.message = "Governed State closed; no Authority state was changed".to_owned();
             *next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+        }
+        InteractiveAction::OpenIntentConversation => {
+            if let Err(error) = app.start_intent_conversation().await {
+                app.mode = InteractiveMode::Dashboard;
+                app.message = format!("需求输入暂不可用：{error}");
+            }
+        }
+        InteractiveAction::CloseIntentConversation => {
+            if let Err(error) = app.close_intent_conversation() {
+                app.message = error;
+            }
+        }
+        InteractiveAction::InterpretIntentConversation => {
+            if let Err(error) = app.interpret_intent_conversation() {
+                app.message = format!("需求未发送：{error}");
+            }
+        }
+        InteractiveAction::ApplyIntentWorkCandidate => {
+            if let Err(error) = app.apply_intent_work_candidate().await {
+                app.message = format!("建议未填入工作草稿：{error}");
+            }
         }
         InteractiveAction::OpenWorkStart => {
             if let Err(error) = app.start_work_start().await {
@@ -5456,6 +6156,26 @@ async fn execute_interactive_action(
                 app.message = format!("Task Watch unavailable after review: {error}");
             }
         }
+        InteractiveAction::OpenMemoryCandidate { scope_ref } => {
+            app.open_memory_candidate_form(scope_ref);
+        }
+        InteractiveAction::OpenRework { task_id, revision } => {
+            if app.work_start.is_some() {
+                app.message = "已有待处理的工作预览，请先完成或取消它。".to_owned();
+            } else if let Some(client) = app.client.as_ref() {
+                match client.rework_controller(task_id, revision) {
+                    Ok(mut controller) => {
+                        controller.prepare().await?;
+                        app.stop_task_watch().await;
+                        app.work_start = Some(controller);
+                        app.mode = InteractiveMode::WorkStart;
+                        app.message =
+                            "正在读取已裁决的返工要求；预览后按 Enter 确认继续原任务。".to_owned();
+                    }
+                    Err(error) => app.message = error,
+                }
+            }
+        }
         InteractiveAction::OpenApprovalQueue | InteractiveAction::RefetchApprovalQueue => {
             if let Err(error) = app.start_approval_queue().await {
                 app.mode = InteractiveMode::Dashboard;
@@ -5536,6 +6256,9 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
         {
             app.message = format!("Work Start stopped fail-closed: {error}");
         }
+        if matches!(app.mode, InteractiveMode::IntentConversation) {
+            app.apply_intent_conversation_events();
+        }
         if matches!(app.mode, InteractiveMode::GovernedState)
             && let Err(error) = app.apply_governed_state_events()
         {
@@ -5572,26 +6295,39 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
             }
             next_refresh = tokio::time::Instant::now() + app.refresh_interval;
         }
-        if event::poll(Duration::from_millis(150)).map_err(|error| error.to_string())?
-            && let Event::Key(key) = event::read().map_err(|error| error.to_string())?
-            && key.kind == KeyEventKind::Press
-        {
-            let dashboard = matches!(app.mode, InteractiveMode::Dashboard);
-            if dashboard && key.code == KeyCode::Char('r') {
-                app.message = "Refreshing…".to_owned();
-                app.refresh().await;
-                next_refresh = tokio::time::Instant::now() + app.refresh_interval;
-                continue;
-            }
-            if dashboard && matches!(key.code, KeyCode::Tab | KeyCode::Right | KeyCode::Left) {
-                app.panel = app.panel.next();
-                continue;
-            }
-            if let Some(action) = app.handle_key(key)?
-                && execute_interactive_action(app, action, &mut next_refresh).await?
-                    == InteractiveLoopControl::Quit
-            {
-                return Ok(());
+        if event::poll(Duration::from_millis(150)).map_err(|error| error.to_string())? {
+            match event::read().map_err(|error| error.to_string())? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let dashboard = matches!(app.mode, InteractiveMode::Dashboard);
+                    if dashboard && key.code == KeyCode::Char('r') {
+                        app.message = "Refreshing…".to_owned();
+                        app.refresh().await;
+                        next_refresh = tokio::time::Instant::now() + app.refresh_interval;
+                        continue;
+                    }
+                    if dashboard
+                        && matches!(key.code, KeyCode::Tab | KeyCode::Right | KeyCode::Left)
+                    {
+                        app.panel = app.panel.next();
+                        continue;
+                    }
+                    if let Some(action) = app.handle_key(key)?
+                        && execute_interactive_action(app, action, &mut next_refresh).await?
+                            == InteractiveLoopControl::Quit
+                    {
+                        return Ok(());
+                    }
+                }
+                Event::Paste(text) if matches!(app.mode, InteractiveMode::IntentConversation) => {
+                    if let Some(conversation) = app.intent_conversation.as_mut()
+                        && !conversation.is_running()
+                        && !conversation.push_text(&text)
+                    {
+                        app.message =
+                            format!("单次输入最多 {INTENT_INPUT_LIMIT_BYTES} 字节，粘贴内容已截断");
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -5600,14 +6336,18 @@ async fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), S
 fn init_terminal() -> io::Result<DefaultTerminal> {
     enable_raw_mode()?;
     let mut output = stdout();
-    execute!(output, EnterAlternateScreen)?;
+    execute!(output, EnterAlternateScreen, EnableBracketedPaste)?;
     Ok(ratatui::init())
 }
 
 fn restore_terminal(terminal: &mut DefaultTerminal) -> io::Result<()> {
     ratatui::restore();
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     Ok(())
 }
 
@@ -5644,7 +6384,8 @@ mod tests {
     use crossterm::event::{KeyEvent, KeyModifiers};
     use egopulse_client_operations::{
         ApprovalWatchClassification, ClientGovernedTaskError, ClientTaskResultReviewError,
-        GovernedProjectionPosition, GovernedProjectionState, TaskResultReview,
+        GovernedProjectionPosition, GovernedProjectionState, GovernedWorkCapability,
+        GovernedWorkCapabilityAvailability, TaskResultReview,
     };
     use egopulse_domain_contracts::v01::egopulse::{
         artifact::v1::{
@@ -5654,7 +6395,7 @@ mod tests {
         common::v1::ContractReference as TestContractReference,
         localapi::v1::{
             AvailableAction, AvailableActionKind, EvidenceGraphView, ProjectionMetadata,
-            ProjectionPosition, SourceDomain,
+            ProjectionPosition, SourceDomain, WorkSourceRequest,
         },
         verification::v1::{VerificationArtifact, VerificationBinding},
     };
@@ -7678,6 +8419,125 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rework_shortcut_uses_selected_task_revision_and_rejects_active_tasks() {
+        for status in [TaskStatus::Active, TaskStatus::Rework] {
+            let mut snapshot = watch_snapshot("task:continue", 7, 1);
+            snapshot.tasks[0]
+                .task
+                .as_mut()
+                .expect("fixture task")
+                .status = status as i32;
+            let client = Arc::new(WatchInteractiveClient {
+                snapshots: Arc::new(Mutex::new(VecDeque::from([snapshot]))),
+                sessions: Arc::new(Mutex::new(VecDeque::new())),
+                snapshot_calls: Arc::new(AtomicUsize::new(0)),
+                open_calls: Arc::new(AtomicUsize::new(0)),
+                next_calls: Arc::new(AtomicUsize::new(0)),
+            });
+            let mut app = App::new("rework-test".to_owned());
+            app.client = Some(client as Arc<dyn InteractiveClient>);
+            app.start_task_watch().await.expect("open Task Watch");
+            let action = app
+                .handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+                .expect("map shortcut");
+            if status == TaskStatus::Rework {
+                assert!(
+                    matches!(action, Some(InteractiveAction::OpenRework { task_id, revision: 7 }) if task_id == "task:continue")
+                );
+            } else {
+                assert!(action.is_none());
+            }
+            app.stop_task_watch().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn post_task_memory_candidate_entry_uses_existing_candidate_form_only() {
+        let client = Arc::new(WatchInteractiveClient {
+            snapshots: Arc::new(Mutex::new(VecDeque::from([watch_snapshot(
+                "task:remember",
+                1,
+                1,
+            )]))),
+            sessions: Arc::new(Mutex::new(VecDeque::new())),
+            snapshot_calls: Arc::new(AtomicUsize::new(0)),
+            open_calls: Arc::new(AtomicUsize::new(0)),
+            next_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut app = App::new("memory-candidate".to_owned());
+        app.client = Some(Arc::clone(&client) as Arc<dyn InteractiveClient>);
+        app.start_task_watch().await.expect("open Task Watch");
+
+        let action = app
+            .handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .expect("map Task Watch memory key")
+            .expect("selected Task opens candidate form");
+        assert!(matches!(
+            action,
+            InteractiveAction::OpenMemoryCandidate { scope_ref: None }
+        ));
+        let mut next_refresh = tokio::time::Instant::now();
+        execute_interactive_action(&mut app, action, &mut next_refresh)
+            .await
+            .expect("open candidate form");
+
+        let InteractiveMode::Form(form) = &app.mode else {
+            panic!("Memory candidate form should be open");
+        };
+        assert_eq!(form.kind, CommandKind::MemoryCandidate);
+        let value = |label| {
+            form.fields
+                .iter()
+                .find(|field| field.label == label)
+                .map(|field| field.value.as_str())
+                .expect("candidate field")
+        };
+        assert!(Uuid::parse_str(value("memory-id")).is_ok());
+        assert!(Uuid::parse_str(value("idempotency-key")).is_ok());
+        assert!(value("content").is_empty());
+        assert!(value("source-ref").is_empty());
+        assert!(value("scope-ref").is_empty());
+        assert!(app.message.contains("只是候选"));
+        assert!(app.message.contains("范围或来源"));
+
+        app.open_memory_candidate_form(Some("scope:trusted-task".to_owned()));
+        let InteractiveMode::Form(form) = &app.mode else {
+            panic!("seeded Memory candidate form should be open");
+        };
+        assert_eq!(
+            form.fields
+                .iter()
+                .find(|field| field.label == "scope-ref")
+                .map(|field| field.value.as_str()),
+            Some("scope:trusted-task")
+        );
+        assert!(
+            form.fields
+                .iter()
+                .find(|field| field.label == "source-ref")
+                .is_some_and(|field| field.value.is_empty())
+        );
+
+        let review_client = Arc::new(FakeInteractiveClient {
+            prepare_calls: Arc::new(AtomicUsize::new(0)),
+            commit_calls: Arc::new(AtomicUsize::new(0)),
+            captured: Arc::new(Mutex::new(Vec::new())),
+        });
+        let mut review_app = App::new("review-memory-candidate".to_owned());
+        review_app.mode = InteractiveMode::ResultReview;
+        review_app.result_review = Some(ResultReviewController::new(
+            review_client as Arc<dyn InteractiveClient>,
+            "task:remember".to_owned(),
+        ));
+        assert!(matches!(
+            review_app
+                .handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+                .expect("map Result Review memory key"),
+            Some(InteractiveAction::OpenMemoryCandidate { scope_ref: None })
+        ));
+    }
+
     #[test]
     fn context_revoke_form_preserves_order_and_requires_modal_confirmation() {
         let mut form = CommandForm::new(CommandKind::ContextRevoke);
@@ -8146,6 +9006,10 @@ mod tests {
             WorkStartKeyIntent::Push('x')
         );
         assert_eq!(
+            work_start_key_intent(WorkStartStage::Editing, key(KeyCode::Char('q'))),
+            WorkStartKeyIntent::Push('q')
+        );
+        assert_eq!(
             work_start_key_intent(WorkStartStage::Editing, key(KeyCode::Backspace)),
             WorkStartKeyIntent::Backspace
         );
@@ -8238,6 +9102,162 @@ mod tests {
             work_start_exit_policy(WorkStartStage::ConfirmationOutcomeUnknown, false),
             WorkStartExitPolicy::PreserveRecovery
         );
+    }
+
+    #[test]
+    fn tui_instance_default_uses_the_ipc_environment_or_default() {
+        assert_eq!(
+            default_tui_instance_from_environment(Some("isolated-fixture".to_owned())),
+            "isolated-fixture"
+        );
+        assert_eq!(default_tui_instance_from_environment(None), "default");
+    }
+
+    fn intent_capability_catalog() -> GovernedWorkCapabilityCatalog {
+        GovernedWorkCapabilityCatalog {
+            capabilities: vec![
+                GovernedWorkCapability {
+                    provider_profile_id: "provider:admitted".to_owned(),
+                    provider_alias: "ProviderA".to_owned(),
+                    harness_alias: "HarnessA".to_owned(),
+                    harness_model_alias: "model-a".to_owned(),
+                    provider_model_alias: "model-a".to_owned(),
+                    availability: GovernedWorkCapabilityAvailability::Admitted,
+                    selectable: true,
+                    safe_reason_code: None,
+                    choice_id: Some("choice:admitted".to_owned()),
+                    route_binding_sha256: Some("route-a".to_owned()),
+                    current_future_work_default: true,
+                },
+                GovernedWorkCapability {
+                    provider_profile_id: "provider:held".to_owned(),
+                    provider_alias: "ProviderB".to_owned(),
+                    harness_alias: "HarnessB".to_owned(),
+                    harness_model_alias: "model-b".to_owned(),
+                    provider_model_alias: "model-b".to_owned(),
+                    availability: GovernedWorkCapabilityAvailability::Held,
+                    selectable: false,
+                    safe_reason_code: Some("CAPABILITY_HELD".to_owned()),
+                    choice_id: None,
+                    route_binding_sha256: None,
+                    current_future_work_default: false,
+                },
+            ],
+            default_choice_id: "choice:admitted".to_owned(),
+            preference_revision: 1,
+            configuration_migration_required: false,
+        }
+    }
+
+    fn intent_work_candidate() -> IntentWorkCandidate {
+        IntentWorkCandidate {
+            intent: "核对仓库 README".to_owned(),
+            work_type: "governed_repository_change".to_owned(),
+            target_scope_ref: "default/README.md".to_owned(),
+            sources: vec![WorkSourceRequest {
+                source_ref: "default/README.md".to_owned(),
+                label: "README".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn intent_conversation_keeps_q_chinese_input_and_bounded_history() {
+        let mut app = App::new("intent-input".to_owned());
+        app.mode = InteractiveMode::IntentConversation;
+        app.intent_conversation = Some(IntentConversation::new(intent_capability_catalog()));
+
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+                .expect("handle q as input")
+                .is_none()
+        );
+        let conversation = app.intent_conversation.as_mut().expect("conversation");
+        assert!(conversation.push_text("整理中文需求"));
+        assert_eq!(conversation.input, "q整理中文需求");
+
+        for index in 0..(INTENT_HISTORY_LIMIT + 2) {
+            conversation.append_history(false, format!("需求 {index}"));
+        }
+        assert_eq!(conversation.history.len(), INTENT_HISTORY_LIMIT);
+        assert!(
+            conversation
+                .history
+                .iter()
+                .map(|message| message.text.len())
+                .sum::<usize>()
+                <= INTENT_HISTORY_LIMIT_BYTES
+        );
+
+        conversation.history.clear();
+        for index in 0..INTENT_HISTORY_LIMIT {
+            conversation.append_history(false, format!("{index}:{}", "x".repeat(4090)));
+        }
+        assert!(conversation.trim_history_for_request(&"y".repeat(INTENT_INPUT_LIMIT_BYTES)));
+        assert!(
+            conversation
+                .history
+                .iter()
+                .map(|message| message.text.len())
+                .sum::<usize>()
+                <= INTENT_HISTORY_LIMIT_BYTES - INTENT_INPUT_LIMIT_BYTES
+        );
+    }
+
+    #[test]
+    fn intent_conversation_uses_visible_capability_rows_without_raw_id_input() {
+        let mut conversation = IntentConversation::new(intent_capability_catalog());
+        assert_eq!(conversation.selected_choice_id(), "");
+        conversation.work_candidate = Some(intent_work_candidate());
+
+        conversation
+            .choose_highlighted_capability()
+            .expect("select admitted row");
+        assert_eq!(conversation.selected_choice_id(), "choice:admitted");
+        assert!(conversation.work_candidate.is_none());
+        assert!(conversation.reply.contains("请重新发送"));
+
+        conversation.select_next_capability();
+        assert!(
+            conversation
+                .choose_highlighted_capability()
+                .expect_err("held row must remain unavailable")
+                .contains("CAPABILITY_HELD")
+        );
+        assert_eq!(conversation.selected_choice_id(), "choice:admitted");
+
+        let (_sender, receiver) = mpsc::channel(1);
+        let mut app = App::new("intent-pending-choice".to_owned());
+        app.mode = InteractiveMode::IntentConversation;
+        app.intent_conversation = Some(IntentConversation {
+            receiver: Some(receiver),
+            ..IntentConversation::new(intent_capability_catalog())
+        });
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+                .expect("ignore capability change while pending")
+                .is_none()
+        );
+        let pending = app.intent_conversation.as_ref().expect("conversation");
+        assert_eq!(pending.selected_choice_id(), "");
+        assert!(app.message.contains("暂不能变更执行能力"));
+    }
+
+    #[test]
+    fn intent_work_candidate_only_populates_existing_work_start_draft() {
+        let mut draft = WorkStartDraft::default();
+        populate_work_start_draft(
+            &mut draft,
+            intent_work_candidate(),
+            Some("choice:admitted".to_owned()),
+        );
+
+        assert_eq!(draft.intent, "核对仓库 README");
+        assert_eq!(draft.work_type, "governed_repository_change");
+        assert_eq!(draft.target_scope_ref, "default/README.md");
+        assert_eq!(draft.context_references, "default/README.md");
+        assert_eq!(draft.capability_choice_id, "choice:admitted");
+        assert!(draft.memory_enabled);
     }
 
     #[tokio::test]

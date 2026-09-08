@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     future::Future,
     path::{Path, PathBuf},
@@ -14,17 +15,20 @@ use egopulse_artifact_authority::{
 use egopulse_cognition_runtime::context_authority::ContextAuthority;
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{
-        ArtifactCommand, ArtifactDescriptor, ArtifactSemanticClass, ArtifactStatus, ContentAddress,
-        HashAlgorithm, IntegrityStatus, LineageBinding, ProducerIdentity, Provenance,
-        SealArtifactCommand, StageArtifactCommand, artifact_command,
+        ArtifactCommand, ArtifactDescriptor, ArtifactSemanticClass, ArtifactSetStatus,
+        ArtifactStatus, ContentAddress, HashAlgorithm, IntegrityStatus, LineageBinding,
+        ProducerIdentity, Provenance, SealArtifactCommand, StageArtifactCommand, artifact_command,
     },
     common::v1::{CommandMetadata, ContractReference},
     harness::v1::{DispatchEnvelope, HarnessError, HarnessErrorCode},
+    task::v1::{TaskSnapshot, TaskStatus},
+    verdict::v1::VerdictScope,
 };
 use egopulse_harness_adapter::{
     DispatchContextReference, ReadyDispatchMaterialGuard, ResolvedDispatchMaterial,
     classify_dispatch_context_reference,
 };
+use egopulse_local_api::command_gateway::CommandPortFailure;
 use egopulse_local_ide_control::collaboration_control::{
     SingleHarnessWorkConfig, SingleHarnessWorkResult, TaskActivationHandoff,
     TaskDispatchMaterialPreparer, TaskDispatchMaterialRejection,
@@ -42,8 +46,12 @@ use crate::{
     artifact::DerivedWorkspaceAdmissionLease,
     artifact::{DerivedWorkspaceAdmissionBinding, DerivedWorkspaceAdmissionHandle},
     repository_material::{
-        FrozenRepositoryMaterialV1, RepositoryMaterialConfig,
+        FrozenRepositoryMaterialV1, RepositoryMaterialConfig, RepositoryPathAccess,
         frozen_repository_material_from_compiled_context,
+    },
+    rework_preparation::{
+        ReworkContentAddress, ReworkLineageBinding, ReworkRepositoryCarryForward,
+        SealedReworkRepositoryCarryForward,
     },
 };
 
@@ -98,6 +106,40 @@ pub(crate) struct CapturedRepositoryReturn {
     pub(crate) final_manifest_content: ContentAddress,
     pub(crate) evidence_profile_ref: ContractReference,
     pub(crate) admission_lease: DerivedWorkspaceAdmissionLease,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PriorRepositoryArtifactSelection {
+    artifact_set_id: String,
+    lineage: LineageBinding,
+    baseline_artifact_id: String,
+    initial_manifest_artifact_id: String,
+    patch_artifact_id: String,
+    final_manifest_artifact_id: String,
+}
+
+struct VerifiedRepositoryReworkBase {
+    workspace_ref: String,
+    source_binding_ref: String,
+    patch: Vec<u8>,
+    final_manifest: FinalWorkspaceManifestPayload,
+    patch_content: ContentAddress,
+    final_manifest_content: ContentAddress,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct ReworkRepositoryContextView {
+    pub(crate) rework_followup_version: u64,
+    pub(crate) memory_mode: String,
+    pub(crate) task_id: String,
+    pub(crate) task_revision: u64,
+    pub(crate) prior_work_revision: u64,
+    pub(crate) repository_carry_forward: SealedReworkRepositoryCarryForward,
+}
+
+struct ResolvedRepositoryInput {
+    material: FrozenRepositoryMaterialV1,
+    rework: Option<SealedReworkRepositoryCarryForward>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -206,20 +248,285 @@ impl RepositoryDispatchCoordinator {
         })
     }
 
+    fn verify_rework_base(
+        &self,
+        material: &FrozenRepositoryMaterialV1,
+        proof: &PriorRepositoryArtifactSelection,
+    ) -> Result<VerifiedRepositoryReworkBase, TaskDispatchMaterialRejection> {
+        let authority = self
+            .artifact
+            .lock()
+            .map_err(|_| rejection("REWORK_ARTIFACT_AUTHORITY_UNAVAILABLE"))?;
+        let required_ids = [
+            &proof.baseline_artifact_id,
+            &proof.initial_manifest_artifact_id,
+            &proof.patch_artifact_id,
+            &proof.final_manifest_artifact_id,
+        ];
+        if !proof.artifact_set_id.is_empty() {
+            let artifact_set = authority
+                .read_artifact_set(&proof.artifact_set_id)
+                .map_err(|_| rejection("REWORK_ARTIFACT_AUTHORITY_UNAVAILABLE"))?
+                .ok_or_else(|| rejection("REWORK_ARTIFACT_SET_MISSING"))?;
+            if artifact_set.status != ArtifactSetStatus::Sealed as i32
+                || artifact_set.lineage.as_ref() != Some(&proof.lineage)
+                || required_ids
+                    .iter()
+                    .any(|id| !artifact_set.artifact_ids.contains(id))
+            {
+                return Err(rejection("REWORK_ARTIFACT_SET_BINDING_MISMATCH"));
+            }
+        }
+
+        let read = |artifact_id: &str| {
+            let artifact = authority
+                .read_artifact(artifact_id)
+                .map_err(|_| rejection("REWORK_ARTIFACT_AUTHORITY_UNAVAILABLE"))?
+                .ok_or_else(|| rejection("REWORK_ARTIFACT_MISSING"))?;
+            if artifact.status != ArtifactStatus::Sealed as i32
+                || artifact.integrity_status != IntegrityStatus::DigestVerified as i32
+            {
+                return Err(rejection("REWORK_ARTIFACT_UNSEALED"));
+            }
+            let address = artifact
+                .content
+                .as_ref()
+                .ok_or_else(|| rejection("REWORK_ARTIFACT_CONTENT_MISSING"))?;
+            let bytes = authority
+                .read_blob(address)
+                .map_err(|_| rejection("REWORK_ARTIFACT_AUTHORITY_UNAVAILABLE"))?;
+            Ok::<_, TaskDispatchMaterialRejection>((artifact, bytes))
+        };
+        let (baseline_artifact, baseline_bytes) = read(&proof.baseline_artifact_id)?;
+        let baseline: RepositoryBaselinePayload = serde_json::from_slice(&baseline_bytes)
+            .map_err(|_| rejection("REWORK_BASELINE_INVALID"))?;
+        let source_binding_ref =
+            repository_source_binding_ref(&baseline, &proof.lineage, &baseline.input_bundle_sha256);
+        if !prior_baseline_matches(material, proof, &baseline)
+            || !artifact_policy_matches(&baseline_artifact, &self.artifact_policy)
+            || !artifact_matches(
+                &baseline_artifact,
+                ArtifactSemanticClass::RepositoryBaseline,
+                "application/json",
+                &proof.lineage,
+                &[],
+                &source_binding_ref,
+                &baseline.workspace_ref,
+                &self.artifact_policy.attempt_supervisor_principal_id,
+            )
+        {
+            return Err(rejection("REWORK_BASELINE_BINDING_MISMATCH"));
+        }
+
+        let (initial_artifact, initial_bytes) = read(&proof.initial_manifest_artifact_id)?;
+        let initial: InitialWorkspaceManifestPayload = serde_json::from_slice(&initial_bytes)
+            .map_err(|_| rejection("REWORK_INITIAL_MANIFEST_INVALID"))?;
+        let initial_inputs = initial_artifact
+            .provenance
+            .as_ref()
+            .map(|provenance| provenance.input_artifact_ids.as_slice())
+            .ok_or_else(|| rejection("REWORK_INITIAL_MANIFEST_INVALID"))?;
+        if !prior_initial_manifest_matches(&initial, &baseline, &proof.lineage)
+            || !prior_initial_inputs_are_valid(
+                &authority,
+                initial_inputs,
+                &proof.baseline_artifact_id,
+                &proof.lineage,
+                &initial,
+                &self.artifact_policy,
+                material,
+            )?
+            || !artifact_policy_matches(&initial_artifact, &self.artifact_policy)
+            || !artifact_matches(
+                &initial_artifact,
+                ArtifactSemanticClass::WorkspaceManifest,
+                "application/json",
+                &proof.lineage,
+                initial_inputs,
+                &source_binding_ref,
+                &baseline.workspace_ref,
+                &self.artifact_policy.attempt_supervisor_principal_id,
+            )
+        {
+            return Err(rejection("REWORK_INITIAL_MANIFEST_BINDING_MISMATCH"));
+        }
+
+        let (patch_artifact, patch) = read(&proof.patch_artifact_id)?;
+        if !artifact_policy_matches(&patch_artifact, &self.artifact_policy)
+            || !artifact_matches(
+                &patch_artifact,
+                ArtifactSemanticClass::RepositoryPatch,
+                "application/vnd.git.patch",
+                &proof.lineage,
+                &[
+                    proof.baseline_artifact_id.clone(),
+                    proof.initial_manifest_artifact_id.clone(),
+                ],
+                &source_binding_ref,
+                &baseline.workspace_ref,
+                &self.artifact_policy.attempt_supervisor_principal_id,
+            )
+        {
+            return Err(rejection("REWORK_PATCH_BINDING_MISMATCH"));
+        }
+        let patch_content = content_address(&patch);
+
+        let (final_artifact, final_bytes) = read(&proof.final_manifest_artifact_id)?;
+        let final_manifest: FinalWorkspaceManifestPayload = serde_json::from_slice(&final_bytes)
+            .map_err(|_| rejection("REWORK_FINAL_MANIFEST_INVALID"))?;
+        let sealed = SealedRepositoryDispatchMaterial {
+            frozen_material: material.clone(),
+            workspace_ref: baseline.workspace_ref.clone(),
+            baseline_commit: baseline.baseline_commit.clone(),
+            baseline_tree: baseline.baseline_tree.clone(),
+            baseline_artifact_id: proof.baseline_artifact_id.clone(),
+            initial_manifest_artifact_id: proof.initial_manifest_artifact_id.clone(),
+            lineage: proof.lineage.clone(),
+            source_binding_ref: source_binding_ref.clone(),
+        };
+        if !final_manifest_valid(&final_manifest, &sealed, &patch_content)
+            || !artifact_policy_matches(&final_artifact, &self.artifact_policy)
+            || !artifact_matches(
+                &final_artifact,
+                ArtifactSemanticClass::WorkspaceManifest,
+                "application/json",
+                &proof.lineage,
+                &[
+                    proof.baseline_artifact_id.clone(),
+                    proof.initial_manifest_artifact_id.clone(),
+                    proof.patch_artifact_id.clone(),
+                ],
+                &source_binding_ref,
+                &baseline.workspace_ref,
+                &self.artifact_policy.attempt_supervisor_principal_id,
+            )
+        {
+            return Err(rejection("REWORK_FINAL_MANIFEST_BINDING_MISMATCH"));
+        }
+        drop(authority);
+        Ok(VerifiedRepositoryReworkBase {
+            workspace_ref: baseline.workspace_ref,
+            source_binding_ref,
+            patch,
+            final_manifest,
+            patch_content,
+            final_manifest_content: content_address(&final_bytes),
+        })
+    }
+
+    fn verify_frozen_rework_carry_forward(
+        &self,
+        carry: &SealedReworkRepositoryCarryForward,
+    ) -> Result<VerifiedRepositoryReworkBase, TaskDispatchMaterialRejection> {
+        let lineage = carry.lineage.to_proto();
+        if !lineage_is_complete(&lineage)
+            || lineage.task_id != carry.prior_task_id
+            || lineage.task_revision != carry.prior_task_revision
+            || lineage.work_revision != carry.prior_work_revision
+            || carry.artifact_set_id.trim().is_empty()
+            || carry.artifact_set_manifest.to_proto().algorithm != HashAlgorithm::Sha256 as i32
+            || !lowercase_sha256_valid(&carry.artifact_set_manifest.to_proto().digest)
+            || carry.baseline_artifact_id != baseline_artifact_id(&lineage.dispatch_id)
+            || carry.initial_manifest_artifact_id
+                != initial_manifest_artifact_id(&lineage.dispatch_id)
+            || carry.repository_patch_artifact_id
+                != repository_patch_artifact_id(&lineage.dispatch_id)
+            || carry.final_manifest_artifact_id != final_manifest_artifact_id(&lineage.dispatch_id)
+        {
+            return Err(rejection("REWORK_LINEAGE_MISMATCH"));
+        }
+        let selection = PriorRepositoryArtifactSelection {
+            artifact_set_id: carry.artifact_set_id.clone(),
+            baseline_artifact_id: carry.baseline_artifact_id.clone(),
+            initial_manifest_artifact_id: carry.initial_manifest_artifact_id.clone(),
+            patch_artifact_id: carry.repository_patch_artifact_id.clone(),
+            final_manifest_artifact_id: carry.final_manifest_artifact_id.clone(),
+            lineage,
+        };
+        let authority = self
+            .artifact
+            .lock()
+            .map_err(|_| rejection("REWORK_ARTIFACT_AUTHORITY_UNAVAILABLE"))?;
+        let set = authority
+            .read_artifact_set(&carry.artifact_set_id)
+            .map_err(|_| rejection("REWORK_ARTIFACT_AUTHORITY_UNAVAILABLE"))?
+            .ok_or_else(|| rejection("REWORK_ARTIFACT_SET_MISSING"))?;
+        if set.canonical_manifest.as_ref() != Some(&carry.artifact_set_manifest.to_proto()) {
+            return Err(rejection("REWORK_ARTIFACT_SET_BINDING_MISMATCH"));
+        }
+        drop(authority);
+        let verified = self.verify_rework_base(&carry.frozen_material, &selection)?;
+        if verified.patch_content.digest != carry.repository_patch_sha256
+            || verified.final_manifest_content.digest != carry.final_manifest_sha256
+            || verified.workspace_ref != carry.workspace_ref
+            || verified.source_binding_ref != carry.source_binding_ref
+        {
+            return Err(rejection("REWORK_FROZEN_PROOF_MISMATCH"));
+        }
+        validate_rework_paths(&carry.frozen_material, &verified.final_manifest)?;
+        Ok(verified)
+    }
+
+    async fn materialize_or_verify_rework_workspace(
+        &self,
+        workspace_ref: &str,
+        carry: &SealedReworkRepositoryCarryForward,
+    ) -> Result<(), TaskDispatchMaterialRejection> {
+        let verified = self.verify_frozen_rework_carry_forward(carry)?;
+        let workspace = self.workspace_root.join(workspace_ref);
+        let canonical = workspace
+            .canonicalize()
+            .map_err(|_| rejection("REWORK_WORKSPACE_UNAVAILABLE"))?;
+        if canonical != workspace || !canonical.is_dir() {
+            return Err(rejection("REWORK_WORKSPACE_CONFLICT"));
+        }
+        let mut expected_manifest = verified.final_manifest;
+        expected_manifest.workspace_ref = workspace_ref.to_owned();
+        match verify_clean_workspace(&carry.frozen_material, &canonical).await {
+            Ok(()) => {
+                restore_rework_patch(
+                    &carry.frozen_material,
+                    &self.workspace_root,
+                    &canonical,
+                    workspace_ref,
+                    &verified.patch,
+                    &expected_manifest,
+                )
+                .await
+            }
+            Err(RepositoryDispatchError::Rejected) => {
+                verify_restored_rework_workspace(
+                    &carry.frozen_material,
+                    &canonical,
+                    workspace_ref,
+                    &verified.patch,
+                    &expected_manifest,
+                )
+                .await
+            }
+            Err(RepositoryDispatchError::Unavailable) => {
+                Err(rejection("REWORK_WORKSPACE_UNAVAILABLE"))
+            }
+        }
+    }
+
     fn resolve_task_material(
         &self,
         activation: &TaskActivationHandoff,
-    ) -> Result<Option<FrozenRepositoryMaterialV1>, TaskDispatchMaterialRejection> {
+    ) -> Result<Option<ResolvedRepositoryInput>, TaskDispatchMaterialRejection> {
+        self.resolve_task_snapshot_material(&activation.task)
+    }
+
+    fn resolve_task_snapshot_material(
+        &self,
+        task: &TaskSnapshot,
+    ) -> Result<Option<ResolvedRepositoryInput>, TaskDispatchMaterialRejection> {
         let now = unix_seconds().ok_or_else(|| rejection("REPOSITORY_MATERIAL_CLOCK"))?;
         let resolved = self
             .context
             .lock()
             .map_err(|_| rejection("REPOSITORY_CONTEXT_UNAVAILABLE"))?
-            .resolve(
-                &activation.task.input_snapshot_id,
-                &activation.task.target_scope_ref,
-                now,
-            )
+            .resolve(&task.input_snapshot_id, &task.target_scope_ref, now)
             .map_err(|_| rejection("REPOSITORY_CONTEXT_UNAVAILABLE"))?;
         let Some(material) =
             frozen_repository_material_from_compiled_context(&resolved.compiled_context)
@@ -227,8 +534,7 @@ impl RepositoryDispatchCoordinator {
         else {
             return Ok(None);
         };
-        let contract_ref = activation
-            .task
+        let contract_ref = task
             .acceptance_contract_ref
             .as_ref()
             .ok_or_else(|| rejection("REPOSITORY_ACCEPTANCE_REFERENCE_MISSING"))?;
@@ -241,13 +547,23 @@ impl RepositoryDispatchCoordinator {
         {
             return Err(rejection("REPOSITORY_MATERIAL_CONFIGURATION_DRIFT"));
         }
-        Ok(Some(material))
+        let rework = rework_repository_context(&resolved.compiled_context)
+            .map_err(|_| rejection("REWORK_REPOSITORY_CONTEXT_INVALID"))?;
+        if task.status == TaskStatus::Active as i32
+            && let Some(context) = rework.as_ref()
+        {
+            validate_frozen_rework_context(context, task, &material)?;
+        }
+        Ok(Some(ResolvedRepositoryInput {
+            material,
+            rework: rework.map(|context| context.repository_carry_forward),
+        }))
     }
 
     fn resolve_envelope_material(
         &self,
         envelope: &DispatchEnvelope,
-    ) -> Result<Option<(FrozenRepositoryMaterialV1, String)>, HarnessError> {
+    ) -> Result<Option<(ResolvedRepositoryInput, String)>, HarnessError> {
         let snapshot_id = match classify_dispatch_context_reference(&envelope.input_bundle_ref) {
             DispatchContextReference::NotContextBound => return Ok(None),
             DispatchContextReference::ContextSnapshot { snapshot_id } => snapshot_id,
@@ -297,7 +613,22 @@ impl RepositoryDispatchCoordinator {
                 "REPOSITORY_MATERIAL_CONFIGURATION_DRIFT",
             ));
         }
-        Ok(material.map(|material| (material, snapshot_id)))
+        let Some(material) = material else {
+            return Ok(None);
+        };
+        let rework = rework_repository_context(&resolved.compiled_context).map_err(|_| {
+            harness_rejection(
+                HarnessErrorCode::IntegrityFailure,
+                "REWORK_REPOSITORY_CONTEXT_INVALID",
+            )
+        })?;
+        Ok(Some((
+            ResolvedRepositoryInput {
+                material,
+                rework: rework.map(|context| context.repository_carry_forward),
+            },
+            snapshot_id,
+        )))
     }
 
     /// Reconstructs the exact derived-workspace admission from the two sealed
@@ -314,10 +645,15 @@ impl RepositoryDispatchCoordinator {
         )>,
         HarnessError,
     > {
-        let Some((material, snapshot_id)) = self.resolve_envelope_material(envelope)? else {
+        let Some((input, snapshot_id)) = self.resolve_envelope_material(envelope)? else {
             return Ok(None);
         };
-        let baseline = self.ready_dispatch_baseline(envelope, &material, &snapshot_id)?;
+        let baseline = self.ready_dispatch_baseline(
+            envelope,
+            &input.material,
+            &snapshot_id,
+            input.rework.as_ref(),
+        )?;
         let lineage = artifact_lineage_from_baseline(&baseline, envelope);
         let source_binding_ref = source_binding_ref_from_baseline(&baseline, envelope);
         let lease = self
@@ -335,7 +671,7 @@ impl RepositoryDispatchCoordinator {
             })?;
         Ok(Some((
             SealedRepositoryDispatchMaterial {
-                frozen_material: material,
+                frozen_material: input.material,
                 workspace_ref: baseline.workspace_ref,
                 baseline_commit: baseline.baseline_commit,
                 baseline_tree: baseline.baseline_tree,
@@ -651,6 +987,7 @@ impl RepositoryDispatchCoordinator {
         activation: &TaskActivationHandoff,
         config: &SingleHarnessWorkConfig,
         material: &FrozenRepositoryMaterialV1,
+        rework: Option<&SealedReworkRepositoryCarryForward>,
     ) -> Result<String, TaskDispatchMaterialRejection> {
         if config.material.input_bundle_sha256
             != activation
@@ -661,11 +998,23 @@ impl RepositoryDispatchCoordinator {
         {
             return Err(rejection("REPOSITORY_INPUT_BINDING_MISMATCH"));
         }
-        let workspace_ref = derived_workspace_ref(
-            &activation.task.task_id,
-            &activation.task.input_snapshot_id,
-            material.baseline_commit(),
-        );
+        let workspace_ref = match rework {
+            Some(carry) => {
+                validate_rework_activation(activation, carry)?;
+                derived_rework_workspace_ref(
+                    &activation.task.task_id,
+                    activation.task.work_revision,
+                    &activation.task.input_snapshot_id,
+                    material.baseline_commit(),
+                    &carry.repository_patch_sha256,
+                )
+            }
+            None => derived_workspace_ref(
+                &activation.task.task_id,
+                &activation.task.input_snapshot_id,
+                material.baseline_commit(),
+            ),
+        };
         let destination = self.workspace_root.join(&workspace_ref);
         if destination.exists() {
             let canonical = destination
@@ -674,7 +1023,10 @@ impl RepositoryDispatchCoordinator {
             if canonical != destination || !canonical.is_dir() {
                 return Err(rejection("REPOSITORY_WORKSPACE_CONFLICT"));
             }
-            if !self.pre_dispatch_artifacts_are_sealed(&config.dispatch_id)? {
+            if let Some(carry) = rework {
+                self.materialize_or_verify_rework_workspace(&workspace_ref, carry)
+                    .await?;
+            } else if !self.pre_dispatch_artifacts_are_sealed(&config.dispatch_id)? {
                 verify_clean_workspace(material, &canonical)
                     .await
                     .map_err(map_material_rejection)?;
@@ -690,6 +1042,10 @@ impl RepositoryDispatchCoordinator {
         verify_clean_workspace(material, &destination)
             .await
             .map_err(map_material_rejection)?;
+        if let Some(carry) = rework {
+            self.materialize_or_verify_rework_workspace(&workspace_ref, carry)
+                .await?;
+        }
         Ok(workspace_ref)
     }
 
@@ -717,14 +1073,27 @@ impl RepositoryDispatchCoordinator {
         Ok(true)
     }
 
-    fn seal_pre_dispatch_artifacts(
+    async fn seal_pre_dispatch_artifacts(
         &self,
         activation: &TaskActivationHandoff,
         config: &SingleHarnessWorkConfig,
         result: &SingleHarnessWorkResult,
         material: &FrozenRepositoryMaterialV1,
+        rework: Option<&SealedReworkRepositoryCarryForward>,
     ) -> Result<(), TaskDispatchMaterialRejection> {
-        validate_result_binding(activation, config, result, material)?;
+        validate_result_binding(activation, config, result, material, rework)?;
+        let workspace = self
+            .workspace_root
+            .join(&config.workspace_ref)
+            .canonicalize()
+            .map_err(|_| rejection("REPOSITORY_WORKSPACE_UNAVAILABLE"))?;
+        let captured = capture_workspace_state(material, &workspace, &config.workspace_ref)
+            .await
+            .map_err(map_material_rejection)?;
+        if rework.is_none() && (!captured.patch.is_empty() || !captured.manifest.entries.is_empty())
+        {
+            return Err(rejection("REPOSITORY_WORKSPACE_NOT_CLEAN"));
+        }
         let lineage = artifact_lineage(activation, &result.envelope);
         let source_binding_ref = source_binding_ref(
             activation,
@@ -763,7 +1132,13 @@ impl RepositoryDispatchCoordinator {
             "repository-baseline",
         )?;
 
-        let manifest = initial_manifest_payload(activation, result, material);
+        let manifest = initial_manifest_payload(
+            activation,
+            result,
+            material,
+            captured.manifest.status_porcelain_sha256,
+            captured.patch.is_empty() && captured.manifest.entries.is_empty(),
+        );
         let manifest_bytes = serde_json::to_vec(&manifest)
             .map_err(|_| rejection("REPOSITORY_MANIFEST_ENCODING_FAILED"))?;
         let manifest_artifact = self.artifact_candidate(
@@ -772,7 +1147,7 @@ impl RepositoryDispatchCoordinator {
             "application/json",
             &manifest_bytes,
             lineage,
-            vec![baseline_id],
+            initial_manifest_input_artifact_ids(&baseline_id, rework),
             source_binding_ref,
             &config.workspace_ref,
             &config.attempt_supervisor_principal_id,
@@ -784,7 +1159,9 @@ impl RepositoryDispatchCoordinator {
             &result.dispatch_id,
             "workspace-initial",
         )?;
-        self.verify_sealed_pre_dispatch_artifacts(activation, config, result, material)
+        self.verify_sealed_pre_dispatch_artifacts(
+            activation, config, result, material, &manifest, rework,
+        )
     }
 
     // Keeping the candidate inputs explicit makes every Authority-bound field
@@ -891,6 +1268,8 @@ impl RepositoryDispatchCoordinator {
         config: &SingleHarnessWorkConfig,
         result: &SingleHarnessWorkResult,
         material: &FrozenRepositoryMaterialV1,
+        initial_manifest: &InitialWorkspaceManifestPayload,
+        rework: Option<&SealedReworkRepositoryCarryForward>,
     ) -> Result<(), TaskDispatchMaterialRejection> {
         let lineage = artifact_lineage(activation, &result.envelope);
         let source_ref = source_binding_ref(
@@ -913,16 +1292,15 @@ impl RepositoryDispatchCoordinator {
             &config.workspace_ref,
             &config.attempt_supervisor_principal_id,
         )?;
-        let manifest_bytes =
-            serde_json::to_vec(&initial_manifest_payload(activation, result, material))
-                .map_err(|_| rejection("REPOSITORY_MANIFEST_ENCODING_FAILED"))?;
+        let manifest_bytes = serde_json::to_vec(initial_manifest)
+            .map_err(|_| rejection("REPOSITORY_MANIFEST_ENCODING_FAILED"))?;
         self.verify_one_artifact(
             &initial_manifest_artifact_id(&result.dispatch_id),
             ArtifactSemanticClass::WorkspaceManifest,
             "application/json",
             &manifest_bytes,
             &lineage,
-            &[baseline_id],
+            &initial_manifest_input_artifact_ids(&baseline_id, rework),
             &source_ref,
             &config.workspace_ref,
             &config.attempt_supervisor_principal_id,
@@ -998,6 +1376,7 @@ impl RepositoryDispatchCoordinator {
         envelope: &DispatchEnvelope,
         material: &FrozenRepositoryMaterialV1,
         snapshot_id: &str,
+        rework: Option<&SealedReworkRepositoryCarryForward>,
     ) -> Result<RepositoryBaselinePayload, HarnessError> {
         let baseline_id = baseline_artifact_id(&envelope.dispatch_id);
         let bytes = self.read_sealed_artifact_bytes(&baseline_id)?;
@@ -1024,11 +1403,19 @@ impl RepositoryDispatchCoordinator {
             || payload.workspace_ref != envelope.workspace_ref
             || payload.baseline_commit != material.baseline_commit()
             || payload.baseline_tree != material.baseline_tree()
-            || derived_workspace_ref(
+            || expected_workspace_ref(
                 &payload.task_id,
+                payload.work_revision,
                 &payload.input_snapshot_id,
                 &payload.baseline_commit,
+                rework,
             ) != payload.workspace_ref
+            || rework.is_some_and(|carry| {
+                carry.prior_task_id != payload.task_id
+                    || carry.prior_task_revision >= payload.task_revision
+                    || carry.prior_work_revision.checked_add(1) != Some(payload.work_revision)
+                    || carry.frozen_material != *material
+            })
         {
             return Err(harness_rejection(
                 HarnessErrorCode::IntegrityFailure,
@@ -1060,7 +1447,29 @@ impl RepositoryDispatchCoordinator {
                 "REPOSITORY_BASELINE_ARTIFACT_INVALID",
             )
         })?;
-        let expected_manifest = initial_manifest_payload_from_baseline(&payload, envelope);
+        let (status_porcelain_sha256, clean) = match rework {
+            Some(carry) => {
+                let verified = self
+                    .verify_frozen_rework_carry_forward(carry)
+                    .map_err(|_| {
+                        harness_rejection(
+                            HarnessErrorCode::IntegrityFailure,
+                            "REWORK_FROZEN_PROOF_MISMATCH",
+                        )
+                    })?;
+                (
+                    verified.final_manifest.status_porcelain_sha256,
+                    verified.patch.is_empty() && verified.final_manifest.entries.is_empty(),
+                )
+            }
+            None => (sha256(&[]), true),
+        };
+        let expected_manifest = initial_manifest_payload_from_baseline(
+            &payload,
+            envelope,
+            status_porcelain_sha256,
+            clean,
+        );
         let expected_manifest = serde_json::to_vec(&expected_manifest).map_err(|_| {
             harness_rejection(
                 HarnessErrorCode::IntegrityFailure,
@@ -1073,7 +1482,7 @@ impl RepositoryDispatchCoordinator {
             "application/json",
             &expected_manifest,
             &lineage,
-            &[baseline_id],
+            &initial_manifest_input_artifact_ids(&baseline_id, rework),
             &source_ref,
             &payload.workspace_ref,
             &self.artifact_policy.attempt_supervisor_principal_id,
@@ -1131,6 +1540,81 @@ impl RepositoryDispatchCoordinator {
     }
 }
 
+impl ReworkRepositoryCarryForward for RepositoryDispatchCoordinator {
+    fn resolve(
+        &self,
+        task: &TaskSnapshot,
+        scope: &VerdictScope,
+    ) -> Result<SealedReworkRepositoryCarryForward, CommandPortFailure> {
+        if task.status != TaskStatus::Rework as i32
+            || task.task_id != scope.task_id
+            || scope.task_revision.checked_add(1) != Some(task.revision)
+            || scope.work_revision != task.work_revision
+            || scope.artifact_set_id.trim().is_empty()
+            || scope.artifact_set_manifest.is_none()
+        {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        let input = self
+            .resolve_task_snapshot_material(task)
+            .map_err(|_| CommandPortFailure::Unavailable)?
+            .ok_or(CommandPortFailure::IntegrityFailure)?;
+        let artifact_set = self
+            .artifact
+            .lock()
+            .map_err(|_| CommandPortFailure::Unavailable)?
+            .read_artifact_set(&scope.artifact_set_id)
+            .map_err(|_| CommandPortFailure::Unavailable)?
+            .ok_or(CommandPortFailure::IntegrityFailure)?;
+        let lineage = artifact_set
+            .lineage
+            .clone()
+            .ok_or(CommandPortFailure::IntegrityFailure)?;
+        if artifact_set.status != ArtifactSetStatus::Sealed as i32
+            || artifact_set.canonical_manifest.as_ref() != scope.artifact_set_manifest.as_ref()
+            || !lineage_belongs_to_rework_scope(&lineage, scope)
+            || !lineage_is_complete(&lineage)
+        {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        let selection = PriorRepositoryArtifactSelection {
+            artifact_set_id: scope.artifact_set_id.clone(),
+            baseline_artifact_id: baseline_artifact_id(&lineage.dispatch_id),
+            initial_manifest_artifact_id: initial_manifest_artifact_id(&lineage.dispatch_id),
+            patch_artifact_id: repository_patch_artifact_id(&lineage.dispatch_id),
+            final_manifest_artifact_id: final_manifest_artifact_id(&lineage.dispatch_id),
+            lineage,
+        };
+        let verified = self
+            .verify_rework_base(&input.material, &selection)
+            .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+        validate_rework_paths(&input.material, &verified.final_manifest)
+            .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+        Ok(SealedReworkRepositoryCarryForward {
+            prior_task_id: scope.task_id.clone(),
+            prior_task_revision: selection.lineage.task_revision,
+            prior_work_revision: scope.work_revision,
+            artifact_set_id: selection.artifact_set_id,
+            artifact_set_manifest: ReworkContentAddress::from(
+                scope
+                    .artifact_set_manifest
+                    .as_ref()
+                    .ok_or(CommandPortFailure::IntegrityFailure)?,
+            ),
+            lineage: ReworkLineageBinding::from(&selection.lineage),
+            baseline_artifact_id: selection.baseline_artifact_id,
+            initial_manifest_artifact_id: selection.initial_manifest_artifact_id,
+            repository_patch_artifact_id: selection.patch_artifact_id,
+            repository_patch_sha256: verified.patch_content.digest,
+            final_manifest_artifact_id: selection.final_manifest_artifact_id,
+            final_manifest_sha256: verified.final_manifest_content.digest,
+            workspace_ref: verified.workspace_ref,
+            source_binding_ref: verified.source_binding_ref,
+            frozen_material: input.material,
+        })
+    }
+}
+
 impl TaskDispatchMaterialPreparer for RepositoryDispatchCoordinator {
     fn prepare<'a>(
         &'a self,
@@ -1144,11 +1628,11 @@ impl TaskDispatchMaterialPreparer for RepositoryDispatchCoordinator {
         >,
     > {
         Box::pin(async move {
-            let Some(material) = self.resolve_task_material(activation)? else {
+            let Some(input) = self.resolve_task_material(activation)? else {
                 return Ok(config);
             };
             config.workspace_ref = self
-                .prepare_task_workspace(activation, &config, &material)
+                .prepare_task_workspace(activation, &config, &input.material, input.rework.as_ref())
                 .await?;
             Ok(config)
         })
@@ -1161,10 +1645,22 @@ impl TaskDispatchMaterialPreparer for RepositoryDispatchCoordinator {
         result: &'a SingleHarnessWorkResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), TaskDispatchMaterialRejection>> + Send + 'a>> {
         Box::pin(async move {
-            let Some(material) = self.resolve_task_material(activation)? else {
+            let Some(input) = self.resolve_task_material(activation)? else {
                 return Ok(());
             };
-            self.seal_pre_dispatch_artifacts(activation, config, result, &material)
+            if let Some(carry) = input.rework.as_ref() {
+                self.materialize_or_verify_rework_workspace(&config.workspace_ref, carry)
+                    .await?;
+            }
+            self.seal_pre_dispatch_artifacts(
+                activation,
+                config,
+                result,
+                &input.material,
+                input.rework.as_ref(),
+            )
+            .await?;
+            Ok(())
         })
     }
 }
@@ -1176,10 +1672,15 @@ impl ReadyDispatchMaterialGuard for RepositoryDispatchCoordinator {
         resolved_material: &'a ResolvedDispatchMaterial,
     ) -> Pin<Box<dyn Future<Output = Result<(), HarnessError>> + Send + 'a>> {
         Box::pin(async move {
-            let Some((material, snapshot_id)) = self.resolve_envelope_material(envelope)? else {
+            let Some((input, snapshot_id)) = self.resolve_envelope_material(envelope)? else {
                 return Ok(());
             };
-            let baseline = self.ready_dispatch_baseline(envelope, &material, &snapshot_id)?;
+            let baseline = self.ready_dispatch_baseline(
+                envelope,
+                &input.material,
+                &snapshot_id,
+                input.rework.as_ref(),
+            )?;
             let expected_workspace = self
                 .workspace_root
                 .join(&baseline.workspace_ref)
@@ -1206,18 +1707,45 @@ impl ReadyDispatchMaterialGuard for RepositoryDispatchCoordinator {
                     "REPOSITORY_WORKSPACE_BINDING_MISMATCH",
                 ));
             }
-            verify_clean_workspace(&material, &actual_workspace)
+            if let Some(carry) = input.rework.as_ref() {
+                let verified = self
+                    .verify_frozen_rework_carry_forward(carry)
+                    .map_err(|_| {
+                        harness_rejection(
+                            HarnessErrorCode::IntegrityFailure,
+                            "REWORK_FROZEN_PROOF_MISMATCH",
+                        )
+                    })?;
+                let mut expected_manifest = verified.final_manifest;
+                expected_manifest.workspace_ref = baseline.workspace_ref.clone();
+                verify_restored_rework_workspace(
+                    &input.material,
+                    &actual_workspace,
+                    &baseline.workspace_ref,
+                    &verified.patch,
+                    &expected_manifest,
+                )
                 .await
-                .map_err(|error| match error {
-                    RepositoryDispatchError::Unavailable => harness_rejection(
-                        HarnessErrorCode::DependencyUnavailable,
-                        "REPOSITORY_WORKSPACE_UNAVAILABLE",
-                    ),
-                    RepositoryDispatchError::Rejected => harness_rejection(
+                .map_err(|_| {
+                    harness_rejection(
                         HarnessErrorCode::IntegrityFailure,
-                        "REPOSITORY_WORKSPACE_NOT_READY",
-                    ),
+                        "REWORK_WORKSPACE_NOT_READY",
+                    )
                 })?;
+            } else {
+                verify_clean_workspace(&input.material, &actual_workspace)
+                    .await
+                    .map_err(|error| match error {
+                        RepositoryDispatchError::Unavailable => harness_rejection(
+                            HarnessErrorCode::DependencyUnavailable,
+                            "REPOSITORY_WORKSPACE_UNAVAILABLE",
+                        ),
+                        RepositoryDispatchError::Rejected => harness_rejection(
+                            HarnessErrorCode::IntegrityFailure,
+                            "REPOSITORY_WORKSPACE_NOT_READY",
+                        ),
+                    })?;
+            }
             Ok(())
         })
     }
@@ -1228,6 +1756,7 @@ fn validate_result_binding(
     config: &SingleHarnessWorkConfig,
     result: &SingleHarnessWorkResult,
     material: &FrozenRepositoryMaterialV1,
+    rework: Option<&SealedReworkRepositoryCarryForward>,
 ) -> Result<(), TaskDispatchMaterialRejection> {
     if result.run_id != config.run_id
         || result.attempt_id != config.attempt_id
@@ -1235,15 +1764,36 @@ fn validate_result_binding(
         || result.envelope.workspace_ref != config.workspace_ref
         || result.envelope.input_bundle_sha256 != config.material.input_bundle_sha256
         || config.workspace_ref
-            != derived_workspace_ref(
+            != expected_workspace_ref(
                 &activation.task.task_id,
+                activation.task.work_revision,
                 &activation.task.input_snapshot_id,
                 material.baseline_commit(),
+                rework,
             )
     {
         return Err(rejection("REPOSITORY_DISPATCH_BINDING_MISMATCH"));
     }
     Ok(())
+}
+
+fn expected_workspace_ref(
+    task_id: &str,
+    work_revision: u64,
+    input_snapshot_id: &str,
+    baseline_commit: &str,
+    rework: Option<&SealedReworkRepositoryCarryForward>,
+) -> String {
+    match rework {
+        Some(carry) => derived_rework_workspace_ref(
+            task_id,
+            work_revision,
+            input_snapshot_id,
+            baseline_commit,
+            &carry.repository_patch_sha256,
+        ),
+        None => derived_workspace_ref(task_id, input_snapshot_id, baseline_commit),
+    }
 }
 
 fn baseline_payload(
@@ -1272,6 +1822,8 @@ fn initial_manifest_payload(
     activation: &TaskActivationHandoff,
     result: &SingleHarnessWorkResult,
     material: &FrozenRepositoryMaterialV1,
+    status_porcelain_sha256: String,
+    clean: bool,
 ) -> InitialWorkspaceManifestPayload {
     let envelope = &result.envelope;
     InitialWorkspaceManifestPayload {
@@ -1292,14 +1844,28 @@ fn initial_manifest_payload(
         workspace_ref: envelope.workspace_ref.clone(),
         baseline_commit: material.baseline_commit().to_owned(),
         baseline_tree: material.baseline_tree().to_owned(),
-        status_porcelain_sha256: sha256(&[]),
-        clean: true,
+        status_porcelain_sha256,
+        clean,
     }
+}
+
+fn initial_manifest_input_artifact_ids(
+    baseline_artifact_id: &str,
+    rework: Option<&SealedReworkRepositoryCarryForward>,
+) -> Vec<String> {
+    let mut ids = vec![baseline_artifact_id.to_owned()];
+    if let Some(carry) = rework {
+        ids.push(carry.repository_patch_artifact_id.clone());
+        ids.push(carry.final_manifest_artifact_id.clone());
+    }
+    ids
 }
 
 fn initial_manifest_payload_from_baseline(
     baseline: &RepositoryBaselinePayload,
     envelope: &DispatchEnvelope,
+    status_porcelain_sha256: String,
+    clean: bool,
 ) -> InitialWorkspaceManifestPayload {
     InitialWorkspaceManifestPayload {
         schema_version: INITIAL_MANIFEST_SCHEMA.to_owned(),
@@ -1319,8 +1885,8 @@ fn initial_manifest_payload_from_baseline(
         workspace_ref: envelope.workspace_ref.clone(),
         baseline_commit: baseline.baseline_commit.clone(),
         baseline_tree: baseline.baseline_tree.clone(),
-        status_porcelain_sha256: sha256(&[]),
-        clean: true,
+        status_porcelain_sha256,
+        clean,
     }
 }
 
@@ -1443,6 +2009,350 @@ pub(crate) fn derived_workspace_ref(
         "repository-task-{}",
         framed_sha256(&[task_id, input_snapshot_id, baseline_commit])
     )
+}
+
+pub(crate) fn derived_rework_workspace_ref(
+    task_id: &str,
+    work_revision: u64,
+    input_snapshot_id: &str,
+    baseline_commit: &str,
+    prior_patch_sha256: &str,
+) -> String {
+    format!(
+        "repository-task-{}",
+        framed_sha256(&[
+            task_id,
+            &work_revision.to_string(),
+            input_snapshot_id,
+            baseline_commit,
+            prior_patch_sha256,
+        ])
+    )
+}
+
+pub(crate) fn rework_execution_revision_chain_valid(
+    prior_execution_task_revision: u64,
+    rework_task_revision: u64,
+    active_task_revision: u64,
+) -> bool {
+    prior_execution_task_revision < rework_task_revision
+        && rework_task_revision.checked_add(2) == Some(active_task_revision)
+}
+
+fn validate_rework_activation(
+    activation: &TaskActivationHandoff,
+    carry: &SealedReworkRepositoryCarryForward,
+) -> Result<(), TaskDispatchMaterialRejection> {
+    if activation.task.status != TaskStatus::Active as i32
+        || activation.task.task_id != carry.prior_task_id
+        || carry.prior_task_revision >= activation.task.revision
+        || carry.prior_work_revision.checked_add(1) != Some(activation.task.work_revision)
+        || activation
+            .task
+            .current_run_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || !lowercase_sha256_valid(&carry.repository_patch_sha256)
+        || !lowercase_sha256_valid(&carry.final_manifest_sha256)
+        || carry.repository_patch_artifact_id.trim().is_empty()
+        || carry.final_manifest_artifact_id.trim().is_empty()
+        || carry.workspace_ref.trim().is_empty()
+        || carry.source_binding_ref.trim().is_empty()
+    {
+        return Err(rejection("REWORK_LINEAGE_MISMATCH"));
+    }
+    Ok(())
+}
+
+pub(crate) fn rework_repository_context(
+    bytes: &[u8],
+) -> Result<Option<ReworkRepositoryContextView>, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let Some(rework) = value.get("rework_followup") else {
+        return Ok(None);
+    };
+    serde_json::from_value(rework.clone()).map(Some)
+}
+
+fn validate_frozen_rework_context(
+    context: &ReworkRepositoryContextView,
+    task: &TaskSnapshot,
+    material: &FrozenRepositoryMaterialV1,
+) -> Result<(), TaskDispatchMaterialRejection> {
+    let carry = &context.repository_carry_forward;
+    if context.rework_followup_version != 1
+        || context.memory_mode != "frozen_original_context"
+        || carry.frozen_material != *material
+        || context.task_id != task.task_id
+        || !rework_execution_revision_chain_valid(
+            carry.prior_task_revision,
+            context.task_revision,
+            task.revision,
+        )
+        || context.prior_work_revision.checked_add(1) != Some(task.work_revision)
+        || carry.prior_task_id != context.task_id
+        || carry.prior_work_revision != context.prior_work_revision
+    {
+        return Err(rejection("REWORK_REPOSITORY_CONTEXT_BINDING_MISMATCH"));
+    }
+    if task.status != TaskStatus::Active as i32
+        || task.current_run_id.as_deref().is_none_or(str::is_empty)
+        || !lowercase_sha256_valid(&carry.repository_patch_sha256)
+        || !lowercase_sha256_valid(&carry.final_manifest_sha256)
+        || carry.repository_patch_artifact_id.trim().is_empty()
+        || carry.final_manifest_artifact_id.trim().is_empty()
+        || carry.workspace_ref.trim().is_empty()
+        || carry.source_binding_ref.trim().is_empty()
+        || carry.artifact_set_id.trim().is_empty()
+        || carry.lineage.to_proto().task_id != carry.prior_task_id
+        || carry.lineage.to_proto().task_revision != carry.prior_task_revision
+        || carry.lineage.to_proto().work_revision != carry.prior_work_revision
+    {
+        return Err(rejection("REWORK_REPOSITORY_CONTEXT_BINDING_MISMATCH"));
+    }
+    Ok(())
+}
+
+fn lineage_is_complete(lineage: &LineageBinding) -> bool {
+    !lineage.task_id.trim().is_empty()
+        && lineage.task_revision > 0
+        && lineage.work_revision > 0
+        && !lineage.run_id.trim().is_empty()
+        && lineage.run_revision > 0
+        && !lineage.step_id.trim().is_empty()
+        && lineage.step_revision > 0
+        && !lineage.attempt_id.trim().is_empty()
+        && lineage.attempt_revision > 0
+        && !lineage.dispatch_id.trim().is_empty()
+        && lineage.fencing_token > 0
+}
+
+// Repository artifacts retain the Task revision that created the run. The
+// Verdict scope can be a later revision after return, Verification, and verdict
+// preparation have been recorded, but it must describe the same work revision.
+fn lineage_belongs_to_rework_scope(lineage: &LineageBinding, scope: &VerdictScope) -> bool {
+    lineage.task_id == scope.task_id
+        && lineage.task_revision <= scope.task_revision
+        && lineage.work_revision == scope.work_revision
+}
+
+fn prior_baseline_matches(
+    material: &FrozenRepositoryMaterialV1,
+    proof: &PriorRepositoryArtifactSelection,
+    baseline: &RepositoryBaselinePayload,
+) -> bool {
+    baseline.schema_version == BASELINE_SCHEMA
+        && baseline.task_id == proof.lineage.task_id
+        && baseline.task_revision == proof.lineage.task_revision
+        && baseline.work_revision == proof.lineage.work_revision
+        && baseline.baseline_commit == material.baseline_commit()
+        && baseline.baseline_tree == material.baseline_tree()
+        && baseline.workspace_ref.starts_with("repository-task-")
+        && !baseline.workspace_ref.contains('/')
+        && !baseline.workspace_ref.contains('\\')
+}
+
+fn prior_initial_manifest_matches(
+    initial: &InitialWorkspaceManifestPayload,
+    baseline: &RepositoryBaselinePayload,
+    lineage: &LineageBinding,
+) -> bool {
+    initial.schema_version == INITIAL_MANIFEST_SCHEMA
+        && initial.task_id == baseline.task_id
+        && initial.task_revision == baseline.task_revision
+        && initial.work_revision == baseline.work_revision
+        && initial.run_id == lineage.run_id
+        && initial.run_revision == lineage.run_revision
+        && initial.step_id == lineage.step_id
+        && initial.step_revision == lineage.step_revision
+        && initial.attempt_id == lineage.attempt_id
+        && initial.attempt_revision == lineage.attempt_revision
+        && initial.dispatch_id == lineage.dispatch_id
+        && initial.fencing_token == lineage.fencing_token
+        && initial.input_snapshot_id == baseline.input_snapshot_id
+        && initial.input_bundle_sha256 == baseline.input_bundle_sha256
+        && initial.workspace_ref == baseline.workspace_ref
+        && initial.baseline_commit == baseline.baseline_commit
+        && initial.baseline_tree == baseline.baseline_tree
+        && lowercase_sha256_valid(&initial.status_porcelain_sha256)
+}
+
+fn prior_initial_inputs_are_valid(
+    authority: &ArtifactAuthority<ConfiguredArtifactAdmissionGuard>,
+    input_ids: &[String],
+    current_baseline_artifact_id: &str,
+    current_lineage: &LineageBinding,
+    initial: &InitialWorkspaceManifestPayload,
+    policy: &RepositoryDispatchArtifactPolicy,
+    material: &FrozenRepositoryMaterialV1,
+) -> Result<bool, TaskDispatchMaterialRejection> {
+    if input_ids.len() == 1 && input_ids[0] == current_baseline_artifact_id {
+        return Ok(initial.clean && initial.status_porcelain_sha256 == sha256(&[]));
+    }
+    if input_ids.len() != 3 || input_ids[0] != current_baseline_artifact_id {
+        return Ok(false);
+    }
+    let patch = authority
+        .read_artifact(&input_ids[1])
+        .map_err(|_| rejection("REWORK_ARTIFACT_AUTHORITY_UNAVAILABLE"))?
+        .ok_or_else(|| rejection("REWORK_INHERITED_PATCH_MISSING"))?;
+    let final_manifest = authority
+        .read_artifact(&input_ids[2])
+        .map_err(|_| rejection("REWORK_ARTIFACT_AUTHORITY_UNAVAILABLE"))?
+        .ok_or_else(|| rejection("REWORK_INHERITED_MANIFEST_MISSING"))?;
+    let inherited_lineage = patch
+        .provenance
+        .as_ref()
+        .and_then(|provenance| provenance.lineage.as_ref())
+        .ok_or_else(|| rejection("REWORK_INHERITED_LINEAGE_INVALID"))?;
+    if final_manifest
+        .provenance
+        .as_ref()
+        .and_then(|provenance| provenance.lineage.as_ref())
+        != Some(inherited_lineage)
+        || !lineage_is_complete(inherited_lineage)
+        || inherited_lineage.task_id != current_lineage.task_id
+        || inherited_lineage.work_revision.checked_add(1) != Some(current_lineage.work_revision)
+        || inherited_lineage.task_revision >= current_lineage.task_revision
+        || input_ids[1] != repository_patch_artifact_id(&inherited_lineage.dispatch_id)
+        || input_ids[2] != final_manifest_artifact_id(&inherited_lineage.dispatch_id)
+        || !artifact_policy_matches(&patch, policy)
+        || !artifact_policy_matches(&final_manifest, policy)
+    {
+        return Ok(false);
+    }
+    let patch_address = patch
+        .content
+        .as_ref()
+        .ok_or_else(|| rejection("REWORK_INHERITED_PATCH_INVALID"))?;
+    let patch_bytes = authority
+        .read_blob(patch_address)
+        .map_err(|_| rejection("REWORK_ARTIFACT_AUTHORITY_UNAVAILABLE"))?;
+    let final_address = final_manifest
+        .content
+        .as_ref()
+        .ok_or_else(|| rejection("REWORK_INHERITED_MANIFEST_INVALID"))?;
+    let final_bytes = authority
+        .read_blob(final_address)
+        .map_err(|_| rejection("REWORK_ARTIFACT_AUTHORITY_UNAVAILABLE"))?;
+    let final_payload: FinalWorkspaceManifestPayload = serde_json::from_slice(&final_bytes)
+        .map_err(|_| rejection("REWORK_INHERITED_MANIFEST_INVALID"))?;
+    let patch_content = content_address(&patch_bytes);
+    if patch.content.as_ref() != Some(&patch_content)
+        || final_manifest.content.as_ref() != Some(&content_address(&final_bytes))
+    {
+        return Ok(false);
+    }
+    let inherited_source = patch
+        .provenance
+        .as_ref()
+        .and_then(|provenance| provenance.raw_source_ref.as_deref())
+        .ok_or_else(|| rejection("REWORK_INHERITED_PATCH_INVALID"))?;
+    let inherited_workspace = &final_payload.workspace_ref;
+    let inherited_baseline_id = baseline_artifact_id(&inherited_lineage.dispatch_id);
+    let inherited_initial_id = initial_manifest_artifact_id(&inherited_lineage.dispatch_id);
+    let sealed = SealedRepositoryDispatchMaterial {
+        frozen_material: material.clone(),
+        workspace_ref: inherited_workspace.clone(),
+        baseline_commit: material.baseline_commit().to_owned(),
+        baseline_tree: material.baseline_tree().to_owned(),
+        baseline_artifact_id: inherited_baseline_id.clone(),
+        initial_manifest_artifact_id: inherited_initial_id.clone(),
+        lineage: inherited_lineage.clone(),
+        source_binding_ref: inherited_source.to_owned(),
+    };
+    Ok(artifact_matches(
+        &patch,
+        ArtifactSemanticClass::RepositoryPatch,
+        "application/vnd.git.patch",
+        inherited_lineage,
+        &[inherited_baseline_id.clone(), inherited_initial_id.clone()],
+        inherited_source,
+        inherited_workspace,
+        &policy.attempt_supervisor_principal_id,
+    ) && artifact_matches(
+        &final_manifest,
+        ArtifactSemanticClass::WorkspaceManifest,
+        "application/json",
+        inherited_lineage,
+        &[
+            inherited_baseline_id,
+            inherited_initial_id,
+            input_ids[1].clone(),
+        ],
+        inherited_source,
+        inherited_workspace,
+        &policy.attempt_supervisor_principal_id,
+    ) && final_manifest_valid(&final_payload, &sealed, &patch_content)
+        && initial.status_porcelain_sha256 == final_payload.status_porcelain_sha256
+        && initial.clean == (patch_bytes.is_empty() && final_payload.entries.is_empty()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn artifact_matches(
+    artifact: &ArtifactDescriptor,
+    semantic_class: ArtifactSemanticClass,
+    media_type: &str,
+    lineage: &LineageBinding,
+    input_artifact_ids: &[String],
+    source_binding_ref: &str,
+    workspace_ref: &str,
+    producer_principal_id: &str,
+) -> bool {
+    let Some(provenance) = artifact.provenance.as_ref() else {
+        return false;
+    };
+    let Some(producer) = provenance.producer.as_ref() else {
+        return false;
+    };
+    artifact.semantic_class == semantic_class as i32
+        && artifact.status == ArtifactStatus::Sealed as i32
+        && artifact.integrity_status == IntegrityStatus::DigestVerified as i32
+        && artifact.media_type == media_type
+        && artifact.content.is_some()
+        && provenance.lineage.as_ref() == Some(lineage)
+        && provenance.input_artifact_ids == input_artifact_ids
+        && provenance.workspace_ref == workspace_ref
+        && provenance.raw_source_ref.as_deref() == Some(source_binding_ref)
+        && producer.principal_kind == ArtifactPrincipalKind::AttemptSupervisor.as_str()
+        && producer.principal_id == producer_principal_id
+        && producer.component_name == "agentosd-repository-dispatch"
+}
+
+fn artifact_policy_matches(
+    artifact: &ArtifactDescriptor,
+    policy: &RepositoryDispatchArtifactPolicy,
+) -> bool {
+    artifact.type_contract_ref.as_ref() == Some(&policy.artifact_type_ref)
+        && artifact.retention_profile_ref.as_ref() == Some(&policy.retention_profile_ref)
+        && artifact
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.transformation_contract_ref.as_ref())
+            == Some(&policy.transformation_contract_ref)
+}
+
+fn validate_rework_paths(
+    material: &FrozenRepositoryMaterialV1,
+    manifest: &FinalWorkspaceManifestPayload,
+) -> Result<(), TaskDispatchMaterialRejection> {
+    let mut unique = BTreeSet::new();
+    for entry in &manifest.entries {
+        let bytes =
+            hex::decode(&entry.path_hex).map_err(|_| rejection("REWORK_MANIFEST_PATH_INVALID"))?;
+        let path =
+            std::str::from_utf8(&bytes).map_err(|_| rejection("REWORK_MANIFEST_PATH_INVALID"))?;
+        if path.contains('\\')
+            || !unique.insert(path.to_owned())
+            || material
+                .path_access(path)
+                .map_err(|_| rejection("REWORK_MANIFEST_PATH_INVALID"))?
+                != RepositoryPathAccess::Allowed
+        {
+            return Err(rejection("REWORK_MANIFEST_PATH_NOT_ALLOWED"));
+        }
+    }
+    Ok(())
 }
 
 fn pre_dispatch_artifact_ids(dispatch_id: &str) -> [String; 2] {
@@ -1829,6 +2739,59 @@ async fn create_detached_worktree(
         workspace_root,
     )
     .await?;
+    Ok(())
+}
+
+async fn restore_rework_patch(
+    material: &FrozenRepositoryMaterialV1,
+    supervision_root: &Path,
+    workspace: &Path,
+    workspace_ref: &str,
+    patch: &[u8],
+    expected_manifest: &FinalWorkspaceManifestPayload,
+) -> Result<(), TaskDispatchMaterialRejection> {
+    verify_clean_workspace(material, workspace)
+        .await
+        .map_err(map_material_rejection)?;
+    if !patch.is_empty() {
+        git_bytes(
+            material,
+            workspace,
+            &["apply", "--check", "--binary", "--whitespace=nowarn", "-"],
+            patch,
+            None,
+            supervision_root,
+        )
+        .await
+        .map_err(map_material_rejection)?;
+        git_bytes(
+            material,
+            workspace,
+            &["apply", "--binary", "--whitespace=nowarn", "-"],
+            patch,
+            None,
+            supervision_root,
+        )
+        .await
+        .map_err(map_material_rejection)?;
+    }
+    verify_restored_rework_workspace(material, workspace, workspace_ref, patch, expected_manifest)
+        .await
+}
+
+async fn verify_restored_rework_workspace(
+    material: &FrozenRepositoryMaterialV1,
+    workspace: &Path,
+    workspace_ref: &str,
+    patch: &[u8],
+    expected_manifest: &FinalWorkspaceManifestPayload,
+) -> Result<(), TaskDispatchMaterialRejection> {
+    let captured = capture_workspace_state(material, workspace, workspace_ref)
+        .await
+        .map_err(map_material_rejection)?;
+    if captured.patch != patch || captured.manifest != *expected_manifest {
+        return Err(rejection("REWORK_RESTORED_CONTENT_MISMATCH"));
+    }
     Ok(())
 }
 
@@ -2308,6 +3271,171 @@ mod tests {
             .await
             .expect("capture changed repository return");
         assert_ne!(captured, changed);
+    }
+
+    #[tokio::test]
+    async fn rework_workspace_restores_only_the_sealed_patch_into_a_new_revision_workspace() {
+        let fixture = GitFixture::new(None);
+        let material = fixture.material();
+        let prior = fixture.workspaces.join("repository-task-prior");
+        create_detached_worktree(&material, &fixture.workspaces, &prior)
+            .await
+            .expect("prior detached worktree");
+        fs::write(prior.join("tracked.txt"), "prior sealed change\n")
+            .expect("prior repository change");
+        let captured = capture_workspace_state(&material, &prior, "repository-task-prior")
+            .await
+            .expect("capture prior sealed result");
+
+        // A later mutation in the old live workspace is deliberately excluded
+        // from the carried bytes.
+        fs::write(prior.join("tracked.txt"), "unsealed later mutation\n")
+            .expect("mutate old live workspace");
+        let next_ref = derived_rework_workspace_ref(
+            "task-one",
+            2,
+            "ctx:next",
+            material.baseline_commit(),
+            &sha256(&captured.patch),
+        );
+        let next = fixture.workspaces.join(&next_ref);
+        create_detached_worktree(&material, &fixture.workspaces, &next)
+            .await
+            .expect("next detached worktree");
+        let mut expected = captured.manifest;
+        expected.workspace_ref = next_ref.clone();
+        restore_rework_patch(
+            &material,
+            &fixture.workspaces,
+            &next,
+            &next_ref,
+            &captured.patch,
+            &expected,
+        )
+        .await
+        .expect("restore sealed prior result");
+        assert_eq!(
+            fs::read_to_string(next.join("tracked.txt")).expect("restored tracked file"),
+            "prior sealed change\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn rework_workspace_rejects_a_manifest_that_does_not_match_the_sealed_patch() {
+        let fixture = GitFixture::new(None);
+        let material = fixture.material();
+        let prior = fixture.workspaces.join("repository-task-prior-invalid");
+        create_detached_worktree(&material, &fixture.workspaces, &prior)
+            .await
+            .expect("prior detached worktree");
+        fs::write(prior.join("tracked.txt"), "prior sealed change\n")
+            .expect("prior repository change");
+        let captured = capture_workspace_state(&material, &prior, "repository-task-prior-invalid")
+            .await
+            .expect("capture prior sealed result");
+        let next_ref = derived_rework_workspace_ref(
+            "task-one",
+            2,
+            "ctx:next",
+            material.baseline_commit(),
+            &sha256(&captured.patch),
+        );
+        let next = fixture.workspaces.join(&next_ref);
+        create_detached_worktree(&material, &fixture.workspaces, &next)
+            .await
+            .expect("next detached worktree");
+        let mut wrong = captured.manifest;
+        wrong.workspace_ref = next_ref.clone();
+        wrong.status_porcelain_sha256 = "f".repeat(64);
+        assert_eq!(
+            restore_rework_patch(
+                &material,
+                &fixture.workspaces,
+                &next,
+                &next_ref,
+                &captured.patch,
+                &wrong,
+            )
+            .await,
+            Err(rejection("REWORK_RESTORED_CONTENT_MISMATCH"))
+        );
+    }
+
+    #[test]
+    fn rework_initial_manifest_provenance_binds_the_inherited_sealed_state() {
+        let fixture = GitFixture::new(None);
+        let carry = SealedReworkRepositoryCarryForward {
+            prior_task_id: "task-one".to_owned(),
+            prior_task_revision: 4,
+            prior_work_revision: 1,
+            artifact_set_id: "set-prior".to_owned(),
+            artifact_set_manifest: ReworkContentAddress::from(&ContentAddress {
+                algorithm: HashAlgorithm::Sha256 as i32,
+                digest: "a".repeat(64),
+                byte_length: 10,
+            }),
+            lineage: ReworkLineageBinding::from(&LineageBinding {
+                task_id: "task-one".to_owned(),
+                task_revision: 4,
+                work_revision: 1,
+                run_id: "run-prior".to_owned(),
+                run_revision: 1,
+                step_id: "step-prior".to_owned(),
+                step_revision: 1,
+                attempt_id: "attempt-prior".to_owned(),
+                attempt_revision: 1,
+                dispatch_id: "dispatch-prior".to_owned(),
+                fencing_token: 1,
+            }),
+            baseline_artifact_id: "artifact:repository-baseline:dispatch-prior".to_owned(),
+            initial_manifest_artifact_id: "artifact:workspace-initial:dispatch-prior".to_owned(),
+            repository_patch_artifact_id: "artifact:repository-patch:dispatch-prior".to_owned(),
+            repository_patch_sha256: "b".repeat(64),
+            final_manifest_artifact_id: "artifact:workspace-final:dispatch-prior".to_owned(),
+            final_manifest_sha256: "c".repeat(64),
+            workspace_ref: "repository-task-prior".to_owned(),
+            source_binding_ref: "repository-dispatch-binding:sha256:prior".to_owned(),
+            frozen_material: fixture.material(),
+        };
+        assert_eq!(
+            initial_manifest_input_artifact_ids(
+                "artifact:repository-baseline:dispatch-new",
+                Some(&carry)
+            ),
+            vec![
+                "artifact:repository-baseline:dispatch-new".to_owned(),
+                "artifact:repository-patch:dispatch-prior".to_owned(),
+                "artifact:workspace-final:dispatch-prior".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rework_revision_chain_accepts_intervening_task_transitions() {
+        assert!(rework_execution_revision_chain_valid(2, 5, 7));
+        assert!(!rework_execution_revision_chain_valid(5, 5, 7));
+        assert!(!rework_execution_revision_chain_valid(2, 5, 6));
+
+        let lineage = LineageBinding {
+            task_id: "task-one".to_owned(),
+            task_revision: 2,
+            work_revision: 1,
+            ..Default::default()
+        };
+        let scope = VerdictScope {
+            task_id: "task-one".to_owned(),
+            task_revision: 4,
+            work_revision: 1,
+            ..Default::default()
+        };
+        assert!(lineage_belongs_to_rework_scope(&lineage, &scope));
+        assert!(!lineage_belongs_to_rework_scope(
+            &LineageBinding {
+                task_revision: 5,
+                ..lineage
+            },
+            &scope
+        ));
     }
 
     #[test]

@@ -10,17 +10,17 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const API_CONTRACT_ID: &str = "egopulse.localapi.v1";
-pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.23";
+pub const API_CONTRACT_VERSION: &str = "0.1.0-draft.24";
 pub const API_CONTRACT_DIGEST_SHA256: &str =
-    "bfc9cb017e959457ab07259a4dfd830b03769fb65d7aeea4ab9681dc7cfbe984";
+    "3d3daee736c9ea655307790a5cc4d3a1e75083b2c5362221d2d2adc3f954d9e0";
 pub const CLIENT_KERNEL_CONTRACT_ID: &str = "egopulse.client-kernel.v1";
 pub const CLIENT_KERNEL_CONTRACT_VERSION: &str = "0.1.0";
 pub const CLIENT_KERNEL_PROFILE_DIGEST_SHA256: &str =
-    "500d1421381ea3929e6cd92c0ce7bc0e849a93f32d941366ff35037915aaea3d";
+    "19666c3dad67f6d9a936a974e2b86f6f959bba093ac3045b7708cdd4192d972f";
 pub const AUTHORIZATION_CONTRACT_ID: &str = "egopulse.authorization.v1";
 pub const AUTHORIZATION_CONTRACT_VERSION: &str = "0.1.0";
 pub const AUTHORIZATION_PROFILE_DIGEST_SHA256: &str =
-    "67ee9e1ca23def452b963e68584c0f6394586b033da4fd2e5e74318adfbd7e46";
+    "cf79c0b4fb23003917ed2ad86fbfbb5afb5674e2ba66fb8a9c3ead15cb6cf2b1";
 pub const HARNESS_CONTENT_DISCLOSURE_CONTRACT_ID: &str = "egopulse.harness-content-disclosure.v1";
 pub const HARNESS_CONTENT_DISCLOSURE_CONTRACT_VERSION: &str = "0.1.1";
 pub const HARNESS_CONTENT_DISCLOSURE_PROFILE_ID: &str = "harness-content-disclosure-v01-default";
@@ -29,7 +29,7 @@ pub const HARNESS_CONTENT_DISCLOSURE_PROFILE_DIGEST_SHA256: &str =
 const R9C_PROFILE_AUTHORITY_REF: &str =
     "conversation:2026-09-04:founder-froze-r9c-d01-d12-and-phase-2-82-section-7";
 const CURRENT_PROFILE_AUTHORITY_REF: &str =
-    "conversation:2026-09-05:founder-adr0004-option-b-freeze";
+    "conversation:2026-09-08:founder-authorized-phase-one-personal-agent-intent-entry";
 
 const CLIENT_KERNEL_PROFILE_BYTES: &[u8] =
     include_bytes!("../../../contracts/profiles/client-kernel/v1/v01-default.json");
@@ -672,6 +672,7 @@ fn validate_client_kernel_profile(
         "memory_retrieval",
         "governed_memory_work_preparation",
         "governed_work_capability_routing",
+        "personal_agent_intent_interpretation",
         "context_revoke_full_digest_confirmation",
         "content_baseline_pagination",
         "watch_operation_records",
@@ -1414,9 +1415,22 @@ mod tests {
     }
 
     #[test]
+    fn intent_interpretation_requires_work_preparation_permission() {
+        let profiles = ContractProfiles::embedded().expect("profiles load");
+        let rpc = "LocalCommandGatewayService/InterpretIntent";
+        assert!(matches!(
+            profiles.authorize_rpc(rpc, &BTreeSet::from(["local.task.read".to_owned()])),
+            Err(ContractProfileError::PermissionDenied(_))
+        ));
+        profiles
+            .authorize_rpc(rpc, &BTreeSet::from(["local.work.prepare".to_owned()]))
+            .expect("existing work preparation permission permits interpretation");
+    }
+
+    #[test]
     fn r9c_harness_content_profile_and_permission_are_exact_and_independent() {
-        let profiles = ContractProfiles::embedded().expect("draft.23 profiles load");
-        assert_eq!(API_CONTRACT_VERSION, "0.1.0-draft.23");
+        let profiles = ContractProfiles::embedded().expect("draft.24 profiles load");
+        assert_eq!(API_CONTRACT_VERSION, "0.1.0-draft.24");
         assert_eq!(
             profiles.harness_content_disclosure.contract_id,
             HARNESS_CONTENT_DISCLOSURE_CONTRACT_ID

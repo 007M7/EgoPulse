@@ -104,6 +104,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Ask the Personal Agent; work proposals still require preview and confirmation.
+    Ask {
+        text: String,
+        #[arg(long, default_value = "")]
+        capability: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Attach to the local daemon and print typed projection status.
     Status {
         /// Emit stable JSON for scripts.
@@ -224,6 +232,34 @@ enum ContextCommand {
 
 #[derive(Debug, Subcommand)]
 enum WorkCommand {
+    /// Replay the exact saved Rework confirmation with current authentication.
+    RecoverRework {
+        recovery_path: std::path::PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prepare continuation of an applied Rework directive on the same Task.
+    Rework {
+        task_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Confirm the frozen preview returned by work rework.
+    ConfirmRework {
+        task_id: String,
+        snapshot_id: String,
+        #[arg(long)]
+        confirmation_binding_sha256: String,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Prepare and explicitly confirm one governed work request.
     Start {
         #[arg(long)]
@@ -1237,6 +1273,11 @@ type CliCommandFuture = Pin<Box<dyn Future<Output = Result<(), CliFailure>>>>;
 /// of the stack needs of existing commands.
 fn dispatch_command(command: Command) -> CliCommandFuture {
     match command {
+        Command::Ask {
+            text,
+            capability,
+            json,
+        } => Box::pin(ask(text, capability, json)),
         Command::Status { json } => Box::pin(status(json)),
         Command::Await {
             token_json,
@@ -1257,7 +1298,8 @@ fn dispatch_command(command: Command) -> CliCommandFuture {
 
 fn command_json(command: &Command) -> bool {
     match command {
-        Command::Status { json }
+        Command::Ask { json, .. }
+        | Command::Status { json }
         | Command::Await { json, .. }
         | Command::Task {
             command:
@@ -1297,6 +1339,9 @@ fn command_json(command: &Command) -> bool {
                 | WorkCommand::Start { json, .. }
                 | WorkCommand::Prepare { json, .. }
                 | WorkCommand::Confirm { json, .. }
+                | WorkCommand::Rework { json, .. }
+                | WorkCommand::ConfirmRework { json, .. }
+                | WorkCommand::RecoverRework { json, .. }
                 | WorkCommand::Capabilities { json }
                 | WorkCommand::SetDefault { json, .. },
         }
@@ -1823,6 +1868,180 @@ async fn work(command: WorkCommand) -> Result<(), CliFailure> {
                     payload["data"]["replayed"].as_bool().unwrap_or(false),
                 );
             }
+            Ok(())
+        }
+        WorkCommand::ConfirmRework {
+            task_id,
+            snapshot_id,
+            confirmation_binding_sha256,
+            idempotency_key,
+            json,
+        } => {
+            let attached = attach("work.confirm-rework").await?;
+            attached.require_rpc(
+                "LocalCommandGatewayService/ConfirmRework",
+                "work.confirm-rework",
+            )?;
+            let recovery_path = new_rework_confirmation_recovery_path()
+                .map_err(|failure| failure.for_operation("work.confirm-rework"))?;
+            let recovery = egopulse_client_operations::DurableReworkConfirmation::capture(
+                &attached.0,
+                task_id,
+                snapshot_id,
+                confirmation_binding_sha256,
+                idempotency_key,
+            )
+            .map_err(|error| {
+                rework_confirmation_failure_with_recovery(
+                    client_work_failure(error, "work.confirm-rework"),
+                    &recovery_path,
+                )
+            })?;
+            recovery
+                .write_new(&recovery_path)
+                .map_err(|_| rework_confirmation_recovery_storage_failure(&recovery_path))?;
+            let confirmed = recovery.replay(&attached.0).await.map_err(|error| {
+                rework_confirmation_failure_with_recovery(
+                    client_work_failure(error, "work.confirm-rework"),
+                    &recovery_path,
+                )
+            })?;
+            let replayed = confirmed.result.replayed;
+            let task = match confirmed.result.outcome {
+                Some(task_command_result::Outcome::Task(task)) => task,
+                Some(task_command_result::Outcome::Error(error)) => {
+                    return Err(rework_confirmation_failure_with_recovery(
+                        CliFailure::task_authority(
+                            error.code,
+                            error.safe_detail_code,
+                            "work.confirm-rework",
+                        ),
+                        &recovery_path,
+                    ));
+                }
+                None => {
+                    return Err(rework_confirmation_failure_with_recovery(
+                        CliFailure::protocol("confirmed task authority outcome missing")
+                            .for_operation("work.confirm-rework"),
+                        &recovery_path,
+                    ));
+                }
+            };
+            let payload = rework_confirmation_result_json(
+                &task.task_id,
+                task.revision,
+                task.work_revision,
+                task.status,
+                replayed,
+                confirmed.await_token,
+                &recovery_path,
+            );
+            if json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                println!(
+                    "Work confirmed: task={} revision={} status={} replayed={}",
+                    payload["data"]["taskId"].as_str().unwrap_or(""),
+                    payload["data"]["revision"].as_u64().unwrap_or_default(),
+                    payload["data"]["status"].as_str().unwrap_or(""),
+                    payload["data"]["replayed"].as_bool().unwrap_or(false),
+                );
+                println!("Recovery path: {}", recovery_path.display());
+            }
+            Ok(())
+        }
+        WorkCommand::RecoverRework {
+            recovery_path,
+            json,
+        } => {
+            let attached = attach("work.recover-rework").await?;
+            attached.require_rpc(
+                "LocalCommandGatewayService/ConfirmRework",
+                "work.recover-rework",
+            )?;
+            let recovery =
+                egopulse_client_operations::DurableReworkConfirmation::read(&recovery_path)
+                    .map_err(|error| client_work_failure(error, "work.recover-rework"))?;
+            let confirmed = recovery
+                .replay(&attached.0)
+                .await
+                .map_err(|error| client_work_failure(error, "work.recover-rework"))?;
+            let replayed = confirmed.result.replayed;
+            let task = match confirmed.result.outcome {
+                Some(task_command_result::Outcome::Task(task)) => task,
+                Some(task_command_result::Outcome::Error(error)) => {
+                    return Err(CliFailure::task_authority(
+                        error.code,
+                        error.safe_detail_code,
+                        "work.recover-rework",
+                    ));
+                }
+                None => {
+                    return Err(
+                        CliFailure::protocol("confirmed task authority outcome missing")
+                            .for_operation("work.recover-rework"),
+                    );
+                }
+            };
+            let payload = json!({
+                "schemaVersion": "egopulse.cli-result/v0.1",
+                "ok": true,
+                "operation": "work.recover-rework",
+                "data": {
+                    "taskId": task.task_id,
+                    "revision": task.revision,
+                    "workRevision": task.work_revision,
+                    "status": TaskStatus::try_from(task.status).map(|status| status.as_str_name()).unwrap_or("TASK_STATUS_UNSPECIFIED"),
+                    "replayed": replayed,
+                    "awaitToken": await_token_json(confirmed.await_token),
+                },
+                "correlationId": Uuid::now_v7().to_string(),
+            });
+            if json {
+                println!("{}", serde_json::to_string(&payload).unwrap());
+            } else {
+                println!(
+                    "Work confirmed: task={} revision={} status={} replayed={}",
+                    payload["data"]["taskId"].as_str().unwrap_or(""),
+                    payload["data"]["revision"].as_u64().unwrap_or_default(),
+                    payload["data"]["status"].as_str().unwrap_or(""),
+                    payload["data"]["replayed"].as_bool().unwrap_or(false),
+                );
+            }
+            Ok(())
+        }
+        WorkCommand::Rework {
+            task_id,
+            expected_revision,
+            idempotency_key,
+            json,
+        } => {
+            let attached = attach("work.rework").await?;
+            attached.require_rpc("LocalCommandGatewayService/PrepareRework", "work.rework")?;
+            let preview = attached
+                .0
+                .prepare_rework(task_id, expected_revision, idempotency_key)
+                .await
+                .map_err(|error| client_work_failure(error, "work.rework"))?;
+            let work = preview.work.as_ref().ok_or_else(|| {
+                CliFailure::protocol("rework preview missing").for_operation("work.rework")
+            })?;
+            let payload = json!({
+                "schemaVersion": "egopulse.cli-result/v0.1", "ok": true, "operation": "work.rework",
+                "data": {"taskId": preview.task_id, "taskRevision": preview.task_revision,
+                    "workRevision": preview.work_revision, "directiveId": preview.directive_id,
+                    "work": work_preview_json(work)},
+                "correlationId": Uuid::now_v7().to_string(),
+            });
+            println!(
+                "{}",
+                if json {
+                    payload.to_string()
+                } else {
+                    serde_json::to_string_pretty(&payload)
+                        .map_err(|_| CliFailure::protocol("preview serialization failed"))?
+                }
+            );
             Ok(())
         }
         WorkCommand::Capabilities { json } => {
@@ -2523,6 +2742,32 @@ fn work_preview_json(
     })
 }
 
+fn rework_confirmation_result_json(
+    task_id: &str,
+    revision: u64,
+    work_revision: u64,
+    status: i32,
+    replayed: bool,
+    await_token: Option<ProjectionAwaitToken>,
+    recovery_path: &std::path::Path,
+) -> serde_json::Value {
+    json!({
+        "schemaVersion": "egopulse.cli-result/v0.1",
+        "ok": true,
+        "operation": "work.confirm-rework",
+        "data": {
+            "taskId": task_id,
+            "revision": revision,
+            "workRevision": work_revision,
+            "status": TaskStatus::try_from(status).map(|status| status.as_str_name()).unwrap_or("TASK_STATUS_UNSPECIFIED"),
+            "replayed": replayed,
+            "awaitToken": await_token_json(await_token),
+            "recoveryPath": recovery_path.display().to_string(),
+        },
+        "correlationId": Uuid::now_v7().to_string(),
+    })
+}
+
 fn work_capability_preview_json(capability: &WorkCapabilityView) -> serde_json::Value {
     json!({
         "choiceId": capability.choice_id,
@@ -2821,6 +3066,48 @@ async fn memory_mutation(
             payload["data"]["revision"].as_u64().unwrap_or(0),
             payload["data"]["state"].as_str().unwrap_or(""),
         );
+    }
+    Ok(())
+}
+
+async fn ask(text: String, capability: String, json_output: bool) -> Result<(), CliFailure> {
+    let attached = attach("ask").await?;
+    let result = attached
+        .0
+        .interpret_intent_typed(text, Vec::new(), capability)
+        .await
+        .map_err(|error| match error {
+            ClientWorkError::Transport(detail) => {
+                let mut failure = CliFailure::daemon_unavailable(detail).for_operation("ask");
+                failure.required_action_code = Some("RECONNECT_AND_RETRY_INTENT".to_owned());
+                failure
+            }
+            error => client_work_failure(error, "ask"),
+        })?;
+    if json_output {
+        let candidate = result.work_candidate.as_ref().map(|candidate| {
+            json!({
+                "intent": candidate.intent,
+                "workType": candidate.work_type,
+                "targetScopeRef": candidate.target_scope_ref,
+                "sources": candidate.sources.iter().map(|source| json!({
+                    "sourceRef": source.source_ref, "label": source.label,
+                })).collect::<Vec<_>>(),
+            })
+        });
+        println!(
+            "{}",
+            json!({"schemaVersion": "egopulse.cli-result/v0.1", "ok": true,
+                "operation": "ask", "correlationId": Uuid::now_v7().to_string(),
+                "data": {"reply": result.reply, "needsClarification": result.needs_clarification,
+                    "workCandidate": candidate, "taskCreated": false}})
+        );
+    } else {
+        println!("{}", result.reply);
+        if let Some(candidate) = result.work_candidate {
+            println!("\n工作建议：{}", candidate.intent);
+            println!("尚未执行。打开 egopulse-tui 继续对话、预览并确认工作。");
+        }
     }
     Ok(())
 }
@@ -4729,6 +5016,43 @@ fn new_founder_verdict_recovery_path() -> Result<PathBuf, CliFailure> {
 fn new_founder_material_recovery_path() -> Result<PathBuf, CliFailure> {
     let directory = ensure_founder_verdict_recovery_directory()?;
     Ok(directory.join(format!("founder-material-{}.json", Uuid::now_v7())))
+}
+
+fn new_rework_confirmation_recovery_path() -> Result<PathBuf, CliFailure> {
+    let directory = ensure_founder_verdict_recovery_directory()?;
+    Ok(directory.join(format!("rework-{}.json", Uuid::now_v7())))
+}
+
+fn rework_confirmation_recovery_storage_failure(recovery_path: &std::path::Path) -> CliFailure {
+    CliFailure {
+        exit_code: 8,
+        reason_code: "REWORK_RECOVERY_STORAGE_FAILED",
+        message: format!(
+            "Rework confirmation recovery could not be saved; no confirmation was sent and any existing recovery record was preserved; recovery_path={}",
+            recovery_path.display()
+        ),
+        category: "recovery",
+        retryable: false,
+        required_action_code: Some("PRESERVE_EXISTING_REWORK_RECOVERY_RECORD".to_owned()),
+        safe_fingerprint: Some("rework_confirmation_recovery_storage_failed".to_owned()),
+        safe_command_id: None,
+        safe_correlation_id: None,
+        safe_recovery_path: Some(recovery_path.display().to_string()),
+        safe_material_recovery_paths: Vec::new(),
+        operation: "work.confirm-rework",
+    }
+}
+
+fn rework_confirmation_failure_with_recovery(
+    mut failure: CliFailure,
+    recovery_path: &std::path::Path,
+) -> CliFailure {
+    failure.safe_recovery_path = Some(recovery_path.display().to_string());
+    failure.message.push_str(&format!(
+        "; recover the exact confirmation with recovery_path={}",
+        recovery_path.display()
+    ));
+    failure
 }
 
 fn private_founder_verdict_recovery_path(path: &std::path::Path) -> Result<PathBuf, CliFailure> {
@@ -8712,6 +9036,59 @@ mod tests {
             guided_work_start_mode(&guided_cli_input(), false, false, false, true).unwrap(),
             GuidedWorkStartMode::Interactive
         );
+    }
+
+    #[test]
+    fn confirm_rework_outputs_a_safe_recovery_path_without_confirmation_tuple() {
+        let cli = Cli::try_parse_from([
+            "egopulse",
+            "work",
+            "confirm-rework",
+            "task:safe",
+            "ctx:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--confirmation-binding-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--idempotency-key",
+            "rework-confirm:private-key",
+            "--json",
+        ])
+        .expect("Rework confirmation CLI");
+        assert!(command_json(&cli.command));
+
+        let path = PathBuf::from(
+            r"C:\Users\founder\AppData\Local\egopulse\client\founder-verdict-recovery\rework-safe.json",
+        );
+        let success = rework_confirmation_result_json(
+            "task:safe",
+            9,
+            3,
+            TaskStatus::Ready as i32,
+            false,
+            None,
+            &path,
+        );
+        assert_eq!(success["data"]["recoveryPath"], path.display().to_string());
+        let encoded = serde_json::to_string(&success).expect("single JSON object");
+        assert!(serde_json::from_str::<serde_json::Value>(&encoded).is_ok());
+        for forbidden in [
+            "ctx:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "rework-confirm:private-key",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+
+        let failure = rework_confirmation_recovery_storage_failure(&path);
+        let failure_json = failure.json_envelope();
+        assert_eq!(
+            failure_json["error"]["recoveryPath"],
+            path.display().to_string()
+        );
+        assert_eq!(
+            failure_json["error"]["code"],
+            "REWORK_RECOVERY_STORAGE_FAILED"
+        );
+        assert!(failure.message.contains("no confirmation was sent"));
     }
 
     #[test]

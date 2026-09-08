@@ -63,6 +63,12 @@ foreach (`$keyName in @($keyLiterals)) {
     }
 }
 Write-Output 'process_authority_keys=preserved'
+foreach (`$commandName in @('egopulse', 'egopulse-tui')) {
+    `$resolvedCommand = Get-Command `$commandName -CommandType Application -ErrorAction Stop
+    `$expectedCommand = Join-Path $(ConvertTo-SingleQuotedPowerShellLiteral $PackageRoot) "bin/`$commandName.exe"
+    if (`$resolvedCommand.Source -ine `$expectedCommand) { throw "installer command resolves outside package: `$commandName" }
+}
+Write-Output 'process_commands=available'
 "@
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $powershellPath = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
@@ -128,6 +134,7 @@ foreach ($entry in [Environment]::GetEnvironmentVariables('Process').GetEnumerat
     }
 }
 $userEnvironmentBefore = Get-EgoPulseEnvironmentSnapshot -Target User
+$userPathBefore = [Environment]::GetEnvironmentVariable('Path', 'User')
 
 try {
     $env:PATH = "$(Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0');$(Join-Path $env:SystemRoot 'System32')"
@@ -185,6 +192,7 @@ try {
 
     $userEnvironmentAfter = Get-EgoPulseEnvironmentSnapshot -Target User
     Assert-Condition ($userEnvironmentAfter -ceq $userEnvironmentBefore) 'NoPersistEnvironment changed User-scope EGOPULSE environment variables'
+    Assert-Condition ([Environment]::GetEnvironmentVariable('Path', 'User') -ceq $userPathBefore) 'NoPersistEnvironment changed User-scope PATH'
     Write-Output "installer_hermetic_test=passed ipc_instance=$ipcInstance"
 }
 finally {

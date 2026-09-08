@@ -1614,7 +1614,7 @@ fn r9c_d11_descriptor_footprint_adds_no_authority_or_store() {
 #[test]
 fn r9c_d12_manifest_fixture_and_cross_language_bindings_are_pinned() {
     let manifest = json(MANIFEST);
-    assert_eq!(manifest["candidateVersion"], "0.1.0-draft.23");
+    assert_eq!(manifest["candidateVersion"], "0.1.0-draft.24");
     assert_eq!(manifest["r9cHarnessContentAuthorityRef"], R9C_AUTHORITY);
     let artifacts = manifest["artifacts"]
         .as_array()

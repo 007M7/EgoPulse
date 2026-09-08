@@ -714,6 +714,38 @@ impl ContextAuthority {
         }))
     }
 
+    /// Reads the owner's exact prepared bytes for confirmation reconciliation.
+    /// This does not authorize execution or renew expiry/revocation. Callers
+    /// must use normal resolve before any command that has not already committed.
+    pub fn read_prepared_confirmation(
+        &self,
+        principal: &AuthenticatedContextPrincipal,
+        snapshot_id: &str,
+        confirmation_binding: &str,
+    ) -> Result<ResolvedContextSnapshot, ContextAuthorityFailure> {
+        validate_principal(principal)?;
+        validate_routing(snapshot_id, "snapshot_id")?;
+        let stored = self
+            .store
+            .snapshot_with_bytes(snapshot_id)?
+            .ok_or(ContextAuthorityFailure::NotFound)?;
+        if stored.snapshot.owner_principal_id != principal.principal_id
+            || stored.snapshot.confirmation_binding_sha256 != confirmation_binding
+        {
+            return Err(ContextAuthorityFailure::Unauthorized);
+        }
+        if sha256(&stored.compiled_context) != stored.snapshot.compiled_context_sha256
+            || stored.snapshot.snapshot_id
+                != format!("ctx:{}", stored.snapshot.compiled_context_sha256)
+        {
+            return Err(ContextAuthorityFailure::IntegrityFailure);
+        }
+        Ok(ResolvedContextSnapshot {
+            snapshot: stored.snapshot,
+            compiled_context: stored.compiled_context,
+        })
+    }
+
     /// Issues an immutable snapshot and returns a digest-bound receipt.
     pub fn issue(
         &mut self,
@@ -1609,6 +1641,52 @@ fn current_timestamp() -> Result<i64, ContextAuthorityFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prepared_confirmation_read_preserves_history_without_renewing_revoked_context() {
+        let mut authority = authority();
+        let request = input("prepared-confirmation-read");
+        let (_, snapshot) = authority.issue(&request, &compiler()).expect("issue");
+        authority
+            .revoke(
+                &founder("founder:test"),
+                &revoke_request(&snapshot.snapshot_id, 1, "revoke-prepared"),
+            )
+            .expect("revoke");
+        let restored = authority
+            .read_prepared_confirmation(
+                &founder("founder:test"),
+                &snapshot.snapshot_id,
+                &snapshot.confirmation_binding_sha256,
+            )
+            .expect("read owned immutable bytes");
+        assert_eq!(restored.compiled_context, request.compiled_context);
+        assert!(matches!(
+            authority.resolve(
+                &snapshot.snapshot_id,
+                &snapshot.target_scope_ref,
+                current_timestamp().expect("clock")
+            ),
+            Err(ContextAuthorityFailure::Revoked)
+        ));
+        assert!(
+            authority
+                .read_prepared_confirmation(
+                    &founder("founder:other"),
+                    &snapshot.snapshot_id,
+                    &snapshot.confirmation_binding_sha256
+                )
+                .is_err()
+        );
+        assert!(
+            authority
+                .read_prepared_confirmation(
+                    &founder("founder:test"),
+                    &snapshot.snapshot_id,
+                    &"0".repeat(64)
+                )
+                .is_err()
+        );
+    }
     use std::fs;
     use std::path::Path;
     use std::sync::{

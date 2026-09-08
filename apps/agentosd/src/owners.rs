@@ -13,7 +13,8 @@ use crate::projections::{OwnerProjectionSource, PendingOwnerProjection, Projecti
 use egopulse_cognition_runtime::context_authority::ContextPrincipalKind;
 use egopulse_cognition_runtime::memory_authority::MemoryPrincipalKind;
 use egopulse_cognition_runtime::task_authority::{
-    AuthenticatedPrincipal, PrincipalKind as TaskPrincipalKind, TaskAuthority, TaskAuthorityFailure,
+    AuthenticatedPrincipal, NoRunTaskCancellationProof, PrincipalKind as TaskPrincipalKind,
+    TaskAuthority, TaskAuthorityFailure,
 };
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::CommandMetadata,
@@ -277,6 +278,61 @@ const SYSTEM_ACTIVATION_PRINCIPAL_ID: &str = "collaboration-control:system-activ
 const SYSTEM_EVIDENCE_INTAKE_PRINCIPAL_ID: &str = "collaboration-control:artifact-evidence-intake";
 
 impl TaskCommandPort for AuthorityCommandPorts {
+    fn replay_system_revision_if_recorded(
+        &self,
+        command: &TaskCommand,
+    ) -> Result<Option<CommandPortResult<TaskCommandResult>>, CommandPortFailure> {
+        if !matches!(command.command, Some(task_command::Command::ReviseTask(_))) {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        let principal = AuthenticatedPrincipal {
+            kind: TaskPrincipalKind::FounderAuthority,
+            principal_id: "founder-authority:rework-confirmation".to_owned(),
+            authenticated: true,
+        };
+        let result = self
+            .task
+            .lock()
+            .map_err(|_| CommandPortFailure::IntegrityFailure)?
+            .replay_recorded(command, &principal)
+            .map_err(task_failure)?;
+        Ok(result.map(|result| {
+            let source_revision = result.committed_event.as_ref().and_then(|event| {
+                event.snapshot.as_ref().map(|task| SourceRevision {
+                    domain: SourceDomain::Task as i32,
+                    aggregate_id: task.task_id.clone(),
+                    revision: task.revision,
+                    last_event_id: event.event_id.clone(),
+                })
+            });
+            let await_target = source_revision.as_ref().map(|revision| AwaitTarget::Task {
+                task_id: revision.aggregate_id.clone(),
+            });
+            CommandPortResult {
+                result,
+                source_revision,
+                await_target,
+            }
+        }))
+    }
+
+    fn execute_system_revision(
+        &self,
+        command: &TaskCommand,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        if !matches!(command.command, Some(task_command::Command::ReviseTask(_))) {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        self.execute_as_owner(
+            command,
+            AuthenticatedPrincipal {
+                kind: TaskPrincipalKind::FounderAuthority,
+                principal_id: "founder-authority:rework-confirmation".to_owned(),
+                authenticated: true,
+            },
+        )
+    }
+
     fn execute(
         &self,
         command: &TaskCommand,
@@ -406,6 +462,18 @@ impl TaskActivationSource for AuthorityCommandPorts {
             })
     }
 
+    fn claim_task_activation(
+        &self,
+        message_id: &str,
+        payload_digest_sha256: &str,
+    ) -> Result<bool, TaskActivationSourceError> {
+        self.task
+            .lock()
+            .map_err(|_| TaskActivationSourceError::Unavailable)?
+            .claim_task_activation(message_id, payload_digest_sha256)
+            .map_err(task_activation_source_error)
+    }
+
     fn acknowledge_task_activation(
         &self,
         message_id: &str,
@@ -482,6 +550,27 @@ impl TaskCancellationReconciler for AuthorityCommandPorts {
             .reconcile_task_cancellation(
                 &handoff.message_id,
                 &handoff.payload_digest_sha256,
+                &AuthenticatedPrincipal {
+                    kind: TaskPrincipalKind::CollaborationControl,
+                    principal_id: "collaboration-control:task-cancellation".to_owned(),
+                    authenticated: true,
+                },
+            )
+            .map_err(task_cancellation_source_error)
+    }
+
+    fn settle_no_run_task_cancellation(
+        &self,
+        proof: &NoRunTaskCancellationProof,
+    ) -> Result<
+        egopulse_cognition_runtime::task_authority::TaskCancellationReconciliation,
+        TaskCancellationSourceError,
+    > {
+        self.task
+            .lock()
+            .map_err(|_| TaskCancellationSourceError::Unavailable)?
+            .settle_no_run_task_cancellation(
+                proof,
                 &AuthenticatedPrincipal {
                     kind: TaskPrincipalKind::CollaborationControl,
                     principal_id: "collaboration-control:task-cancellation".to_owned(),

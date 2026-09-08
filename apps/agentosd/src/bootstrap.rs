@@ -808,7 +808,7 @@ impl ProductionBootstrapConfig {
             SharedAuthorityHandlesCompositionInputs {
                 task: Arc::clone(&task),
                 policy: Arc::clone(&policy),
-                verdict: founder_verdict_handle,
+                verdict: Arc::clone(&founder_verdict_handle),
                 cross_authority_operation_gate: Arc::clone(&cross_authority_operation_gate),
                 principal_resolver,
                 session_principal_resolver,
@@ -872,7 +872,7 @@ impl ProductionBootstrapConfig {
                     task: Arc::clone(&task),
                     artifact: Arc::clone(&artifact),
                     verification: Arc::clone(&verification),
-                    admission: derived_workspace_admission,
+                    admission: derived_workspace_admission.clone(),
                 },
                 &self.codex,
                 commands,
@@ -883,6 +883,63 @@ impl ProductionBootstrapConfig {
             providers = providers.with_memory_retrieval(Arc::clone(&memory), memory_retrieval)?;
         }
         providers = providers.with_memory_mutation(Arc::clone(&memory), memory_principal_resolver);
+        let intent_defaults = only_configured_value(&task_guard_config.allowed_work_types).zip(
+            only_configured_value(&task_guard_config.allowed_target_scope_refs),
+        );
+        let rework_coordinator = if let Some(material) = repository_material.as_ref() {
+            let native = &self.codex.native;
+            let collector = &native.return_collector;
+            let repository = Arc::new(
+                crate::repository_dispatch::RepositoryDispatchCoordinator::new(
+                    Arc::clone(&context),
+                    Arc::clone(&artifact),
+                    derived_workspace_admission.clone(),
+                    material.clone(),
+                    native.workspace_root.clone(),
+                    crate::repository_dispatch::RepositoryDispatchArtifactPolicy {
+                        artifact_type_ref: collector.artifact_type_ref.clone(),
+                        transformation_contract_ref: collector.transformation_contract_ref.clone(),
+                        retention_profile_ref: collector.retention_profile_ref.clone(),
+                        artifact_authority_principal_id: collector
+                            .artifact_authority_principal_id
+                            .clone(),
+                        attempt_supervisor_principal_id: native
+                            .workflow
+                            .attempt_supervisor_principal_id
+                            .clone(),
+                        evidence_profile_ref: collector.evidence_profile_ref.clone(),
+                    },
+                )
+                .map_err(ProductionBootstrapError::InvalidConfiguration)?,
+            );
+            if let Some(composition) = providers.repository_dispatch.as_mut() {
+                composition.coordinator = Some(Arc::clone(&repository));
+            }
+            let resolver = crate::rework_preparation::ReworkPreparationResolver::new(
+                Arc::clone(&task),
+                Arc::clone(&founder_verdict_handle),
+                Arc::new(
+                    crate::founder_material::ArtifactAuthorityFounderSupportingMaterialSource::new(
+                        Arc::clone(&artifact),
+                    ),
+                ),
+                repository,
+            );
+            Some(Arc::new(
+                crate::rework_preparation::ReworkPreparationCoordinator::new(
+                    Arc::clone(&context),
+                    Arc::clone(&providers.task_port),
+                    resolver,
+                    task_guard_config.budget_profile_ref.clone(),
+                )
+                .map_err(|_| ProductionBootstrapError::WorkPreparation)?
+                .with_input_bundle_root(native.input_bundle_root.clone())
+                .map_err(|_| ProductionBootstrapError::WorkPreparation)?
+                .with_work_capability_registry(Arc::clone(&self.work_capability_registry)),
+            ))
+        } else {
+            None
+        };
         let mut work_port = ConfiguredWorkPreparationPort::new(
             Arc::clone(&context),
             Arc::clone(&providers.task_port),
@@ -896,6 +953,14 @@ impl ProductionBootstrapConfig {
         .and_then(|port| port.with_activation_run_id(self.codex.native.workflow.run_id.clone()))
         .map(|port| port.with_work_capability_registry(Arc::clone(&self.work_capability_registry)))
         .map_err(|_| ProductionBootstrapError::WorkPreparation)?;
+        if let Some(coordinator) = rework_coordinator {
+            work_port = work_port.with_rework_preparation(coordinator);
+        }
+        if let Some((_work_type, target_scope_ref)) = intent_defaults {
+            work_port = work_port
+                .with_codex_intent_interpreter(self.codex.app_server_config(), target_scope_ref)
+                .map_err(|_| ProductionBootstrapError::WorkPreparation)?;
+        }
         if let Some(repository_material) = repository_material {
             work_port = work_port
                 .with_repository_material(repository_material)
@@ -2657,6 +2722,12 @@ fn non_empty_set(
         return Err(ProductionBootstrapError::InvalidConfiguration(field));
     }
     Ok(values)
+}
+
+fn only_configured_value(values: &BTreeSet<String>) -> Option<String> {
+    (values.len() == 1)
+        .then(|| values.iter().next().cloned())
+        .flatten()
 }
 
 fn seconds(value: u64, field: &'static str) -> Result<Duration, ProductionBootstrapError> {

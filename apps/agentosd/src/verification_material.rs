@@ -9,8 +9,8 @@ use egopulse_cognition_runtime::context_authority::ContextAuthority;
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{
         ArtifactDescriptor, ArtifactSemanticClass, ArtifactSetStatus, ArtifactStatus, Claim,
-        ClaimSourceType, ClaimStatus, Evidence, EvidenceProducerClass, EvidenceStatus,
-        IntegrityStatus, LineageBinding,
+        ClaimSourceType, ClaimStatus, ContentAddress, Evidence, EvidenceProducerClass,
+        EvidenceStatus, HashAlgorithm, IntegrityStatus, LineageBinding,
     },
     common::v1::ContractReference,
     verification::v1::VerificationBinding,
@@ -24,12 +24,14 @@ use crate::{
     },
     repository_dispatch::{
         FinalWorkspaceManifestPayload, InitialWorkspaceManifestPayload, RepositoryBaselinePayload,
-        derived_workspace_ref, repository_source_binding_ref,
+        derived_rework_workspace_ref, derived_workspace_ref, repository_source_binding_ref,
+        rework_execution_revision_chain_valid, rework_repository_context,
     },
     repository_material::{
-        FrozenRepositoryMaterialV1, RepositoryCommandRequirement,
+        FrozenRepositoryMaterialV1, RepositoryCommandRequirement, RepositoryPathAccess,
         frozen_repository_material_from_compiled_context,
     },
+    rework_preparation::SealedReworkRepositoryCarryForward,
 };
 
 const BASELINE_SCHEMA: &str = "egopulse.repository-baseline/v1";
@@ -164,6 +166,12 @@ pub(crate) enum VerificationMaterialError {
     Unavailable,
 }
 
+struct VerifiedReworkCarryForward {
+    carry: SealedReworkRepositoryCarryForward,
+    final_payload: FinalWorkspaceManifestPayload,
+    patch_is_empty: bool,
+}
+
 impl RepositoryVerificationMaterialResolver {
     pub(crate) fn new(
         context: Arc<Mutex<ContextAuthority>>,
@@ -215,7 +223,8 @@ impl RepositoryVerificationMaterialResolver {
             .read_artifact_set(&binding.artifact_set_id)
             .map_err(map_source_error)?
             .ok_or(VerificationMaterialError::Unavailable)?;
-        if set.status != ArtifactSetStatus::Sealed as i32
+        if set.artifact_set_id != binding.artifact_set_id
+            || set.status != ArtifactSetStatus::Sealed as i32
             || set.lineage.as_ref() != Some(lineage)
             || set.canonical_manifest.as_ref() != Some(expected_manifest)
             || content_address(&canonical_artifact_set_manifest(&set)) != *expected_manifest
@@ -303,13 +312,29 @@ impl RepositoryVerificationMaterialResolver {
         frozen
             .validate_stored(acceptance_ref)
             .map_err(|_| VerificationMaterialError::Invalid)?;
-        if frozen.baseline_commit != baseline_payload.baseline_commit
-            || frozen.baseline_tree != baseline_payload.baseline_tree
-            || derived_workspace_ref(
+        let rework = self.resolve_rework_carry_forward(
+            &resolved.compiled_context,
+            lineage,
+            acceptance_ref,
+            &frozen,
+        )?;
+        let expected_workspace_ref = match rework.as_ref() {
+            Some(verified) => derived_rework_workspace_ref(
+                &lineage.task_id,
+                lineage.work_revision,
+                &baseline_payload.input_snapshot_id,
+                &baseline_payload.baseline_commit,
+                &verified.carry.repository_patch_sha256,
+            ),
+            None => derived_workspace_ref(
                 &lineage.task_id,
                 &baseline_payload.input_snapshot_id,
                 &baseline_payload.baseline_commit,
-            ) != baseline_payload.workspace_ref
+            ),
+        };
+        if frozen.baseline_commit != baseline_payload.baseline_commit
+            || frozen.baseline_tree != baseline_payload.baseline_tree
+            || expected_workspace_ref != baseline_payload.workspace_ref
         {
             return Err(VerificationMaterialError::Invalid);
         }
@@ -330,13 +355,21 @@ impl RepositoryVerificationMaterialResolver {
             &[],
             &self.policy,
         )?;
+        let initial_input_ids = match rework.as_ref() {
+            Some(verified) => vec![
+                baseline_id.clone(),
+                verified.carry.repository_patch_artifact_id.clone(),
+                verified.carry.final_manifest_artifact_id.clone(),
+            ],
+            None => vec![baseline_id.clone()],
+        };
         validate_repository_artifact(
             &initial_manifest,
             ArtifactSemanticClass::WorkspaceManifest,
             lineage,
             &baseline_payload.workspace_ref,
             &source_binding_ref,
-            std::slice::from_ref(&baseline_id),
+            &initial_input_ids,
             &self.policy,
         )?;
         validate_repository_artifact(
@@ -361,25 +394,8 @@ impl RepositoryVerificationMaterialResolver {
         let initial_payload: InitialWorkspaceManifestPayload =
             serde_json::from_slice(&initial_manifest.bytes)
                 .map_err(|_| VerificationMaterialError::Invalid)?;
-        if initial_payload.schema_version != INITIAL_MANIFEST_SCHEMA
-            || initial_payload.task_id != lineage.task_id
-            || initial_payload.task_revision != lineage.task_revision
-            || initial_payload.work_revision != lineage.work_revision
-            || initial_payload.run_id != lineage.run_id
-            || initial_payload.run_revision != lineage.run_revision
-            || initial_payload.step_id != lineage.step_id
-            || initial_payload.step_revision != lineage.step_revision
-            || initial_payload.attempt_id != lineage.attempt_id
-            || initial_payload.attempt_revision != lineage.attempt_revision
-            || initial_payload.dispatch_id != lineage.dispatch_id
-            || initial_payload.fencing_token != lineage.fencing_token
-            || initial_payload.input_snapshot_id != baseline_payload.input_snapshot_id
-            || initial_payload.input_bundle_sha256 != baseline_payload.input_bundle_sha256
-            || initial_payload.workspace_ref != baseline_payload.workspace_ref
-            || initial_payload.baseline_commit != baseline_payload.baseline_commit
-            || initial_payload.baseline_tree != baseline_payload.baseline_tree
-            || initial_payload.status_porcelain_sha256 != sha256_bytes(&[])
-            || !initial_payload.clean
+        if !initial_payload_matches_lineage(&initial_payload, &baseline_payload, lineage)
+            || !initial_manifest_state_matches(&initial_payload, rework.as_ref())
         {
             return Err(VerificationMaterialError::Invalid);
         }
@@ -387,32 +403,12 @@ impl RepositoryVerificationMaterialResolver {
         let final_payload: FinalWorkspaceManifestPayload =
             serde_json::from_slice(&final_manifest.bytes)
                 .map_err(|_| VerificationMaterialError::Invalid)?;
-        if final_payload.schema_version != FINAL_MANIFEST_SCHEMA
-            || final_payload.workspace_ref != baseline_payload.workspace_ref
-            || final_payload.baseline_commit != baseline_payload.baseline_commit
-            || final_payload.baseline_tree != baseline_payload.baseline_tree
-            || final_payload.observed_head_commit != baseline_payload.baseline_commit
-            || final_payload.observed_head_tree != baseline_payload.baseline_tree
-            || final_payload.status_porcelain_sha256.len() != 64
-            || !final_payload
-                .status_porcelain_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            || final_payload.patch_sha256
-                != patch
-                    .descriptor
-                    .content
-                    .as_ref()
-                    .map(|v| v.digest.as_str())
-                    .unwrap_or_default()
-            || final_payload.patch_bytes != patch.bytes.len() as u64
-            || final_payload.entries.iter().any(|entry| {
-                !matches!(
-                    entry.status.as_str(),
-                    "A" | "M" | "D" | "T" | "U" | "X" | "B"
-                ) || entry.path_hex.is_empty()
-            })
-        {
+        if !final_payload_matches(
+            &final_payload,
+            &baseline_payload,
+            &patch,
+            &baseline_payload.workspace_ref,
+        ) {
             return Err(VerificationMaterialError::Invalid);
         }
 
@@ -606,6 +602,201 @@ impl RepositoryVerificationMaterialResolver {
         })
     }
 
+    fn resolve_rework_carry_forward(
+        &self,
+        compiled_context: &[u8],
+        current_lineage: &LineageBinding,
+        acceptance_ref: &ContractReference,
+        frozen: &FrozenRepositoryMaterialV1,
+    ) -> Result<Option<VerifiedReworkCarryForward>, VerificationMaterialError> {
+        let Some(context) = rework_repository_context(compiled_context)
+            .map_err(|_| VerificationMaterialError::Invalid)?
+        else {
+            return Ok(None);
+        };
+        let carry = context.repository_carry_forward;
+        let prior_lineage = carry.lineage.to_proto();
+        let set_manifest = carry.artifact_set_manifest.to_proto();
+        if context.rework_followup_version != 1
+            || context.memory_mode != "frozen_original_context"
+            || context.task_id != current_lineage.task_id
+            || !rework_execution_revision_chain_valid(
+                carry.prior_task_revision,
+                context.task_revision,
+                current_lineage.task_revision,
+            )
+            || context.prior_work_revision.checked_add(1) != Some(current_lineage.work_revision)
+            || carry.prior_task_id != current_lineage.task_id
+            || carry.prior_work_revision.checked_add(1) != Some(current_lineage.work_revision)
+            || carry.frozen_material != *frozen
+            || !lineage_complete(&prior_lineage)
+            || prior_lineage.task_id != carry.prior_task_id
+            || prior_lineage.task_revision != carry.prior_task_revision
+            || prior_lineage.work_revision != carry.prior_work_revision
+            || set_manifest.algorithm != HashAlgorithm::Sha256 as i32
+            || !sha256_address_valid(&set_manifest)
+        {
+            return Err(VerificationMaterialError::Invalid);
+        }
+        let baseline_id = format!("artifact:repository-baseline:{}", prior_lineage.dispatch_id);
+        let initial_id = format!("artifact:workspace-initial:{}", prior_lineage.dispatch_id);
+        let patch_id = format!("artifact:repository-patch:{}", prior_lineage.dispatch_id);
+        let final_id = format!("artifact:workspace-final:{}", prior_lineage.dispatch_id);
+        if carry.baseline_artifact_id != baseline_id
+            || carry.initial_manifest_artifact_id != initial_id
+            || carry.repository_patch_artifact_id != patch_id
+            || carry.final_manifest_artifact_id != final_id
+        {
+            return Err(VerificationMaterialError::Invalid);
+        }
+        let set = self
+            .artifacts
+            .read_artifact_set(&carry.artifact_set_id)
+            .map_err(map_source_error)?
+            .ok_or(VerificationMaterialError::Unavailable)?;
+        if set.artifact_set_id != carry.artifact_set_id
+            || set.status != ArtifactSetStatus::Sealed as i32
+            || set.lineage.as_ref() != Some(&prior_lineage)
+            || set.canonical_manifest.as_ref() != Some(&set_manifest)
+            || content_address(&canonical_artifact_set_manifest(&set)) != set_manifest
+            || [
+                baseline_id.as_str(),
+                initial_id.as_str(),
+                patch_id.as_str(),
+                final_id.as_str(),
+            ]
+            .iter()
+            .any(|id| !set.artifact_ids.iter().any(|stored| stored == id))
+        {
+            return Err(VerificationMaterialError::Invalid);
+        }
+        let baseline = self.read_verified_artifact(&baseline_id, &prior_lineage)?;
+        let initial = self.read_verified_artifact(&initial_id, &prior_lineage)?;
+        let patch = self.read_verified_artifact(&patch_id, &prior_lineage)?;
+        let final_manifest = self.read_verified_artifact(&final_id, &prior_lineage)?;
+        let baseline_payload: RepositoryBaselinePayload =
+            serde_json::from_slice(&baseline.bytes)
+                .map_err(|_| VerificationMaterialError::Invalid)?;
+        validate_baseline_payload(&baseline_payload, &prior_lineage, acceptance_ref)?;
+        if baseline_payload.baseline_commit != frozen.baseline_commit
+            || baseline_payload.baseline_tree != frozen.baseline_tree
+            || baseline_payload.workspace_ref != carry.workspace_ref
+        {
+            return Err(VerificationMaterialError::Invalid);
+        }
+        let source_binding_ref = repository_source_binding_ref(
+            &baseline_payload,
+            &prior_lineage,
+            &baseline_payload.input_bundle_sha256,
+        );
+        if source_binding_ref != carry.source_binding_ref {
+            return Err(VerificationMaterialError::Invalid);
+        }
+        let old_initial_inputs = initial
+            .descriptor
+            .provenance
+            .as_ref()
+            .ok_or(VerificationMaterialError::Invalid)?
+            .input_artifact_ids
+            .clone();
+        if !valid_prior_initial_inputs(&old_initial_inputs, &baseline_id) {
+            return Err(VerificationMaterialError::Invalid);
+        }
+        validate_repository_artifact(
+            &baseline,
+            ArtifactSemanticClass::RepositoryBaseline,
+            &prior_lineage,
+            &carry.workspace_ref,
+            &carry.source_binding_ref,
+            &[],
+            &self.policy,
+        )?;
+        validate_repository_artifact(
+            &initial,
+            ArtifactSemanticClass::WorkspaceManifest,
+            &prior_lineage,
+            &carry.workspace_ref,
+            &carry.source_binding_ref,
+            &old_initial_inputs,
+            &self.policy,
+        )?;
+        validate_repository_artifact(
+            &patch,
+            ArtifactSemanticClass::RepositoryPatch,
+            &prior_lineage,
+            &carry.workspace_ref,
+            &carry.source_binding_ref,
+            &[baseline_id.clone(), initial_id.clone()],
+            &self.policy,
+        )?;
+        validate_repository_artifact(
+            &final_manifest,
+            ArtifactSemanticClass::WorkspaceManifest,
+            &prior_lineage,
+            &carry.workspace_ref,
+            &carry.source_binding_ref,
+            &[baseline_id, initial_id, patch_id],
+            &self.policy,
+        )?;
+        let initial_payload: InitialWorkspaceManifestPayload =
+            serde_json::from_slice(&initial.bytes)
+                .map_err(|_| VerificationMaterialError::Invalid)?;
+        if !initial_payload_matches_lineage(&initial_payload, &baseline_payload, &prior_lineage)
+            || (old_initial_inputs.len() == 1
+                && (!initial_payload.clean
+                    || initial_payload.status_porcelain_sha256 != sha256_bytes(&[])))
+        {
+            return Err(VerificationMaterialError::Invalid);
+        }
+        let final_payload: FinalWorkspaceManifestPayload =
+            serde_json::from_slice(&final_manifest.bytes)
+                .map_err(|_| VerificationMaterialError::Invalid)?;
+        if !final_payload_matches(
+            &final_payload,
+            &baseline_payload,
+            &patch,
+            &carry.workspace_ref,
+        ) || !rework_final_paths_valid(&final_payload, frozen)
+            || patch
+                .descriptor
+                .content
+                .as_ref()
+                .map(|address| address.digest.as_str())
+                != Some(carry.repository_patch_sha256.as_str())
+            || final_manifest
+                .descriptor
+                .content
+                .as_ref()
+                .map(|address| address.digest.as_str())
+                != Some(carry.final_manifest_sha256.as_str())
+        {
+            return Err(VerificationMaterialError::Invalid);
+        }
+        Ok(Some(VerifiedReworkCarryForward {
+            carry,
+            final_payload,
+            patch_is_empty: patch.bytes.is_empty(),
+        }))
+    }
+
+    #[cfg(test)]
+    pub(super) fn verify_rework_carry_forward_for_test(
+        &self,
+        compiled_context: &[u8],
+        current_lineage: &LineageBinding,
+        acceptance_ref: &ContractReference,
+        frozen: &FrozenRepositoryMaterialV1,
+    ) -> Result<(), VerificationMaterialError> {
+        self.resolve_rework_carry_forward(
+            compiled_context,
+            current_lineage,
+            acceptance_ref,
+            frozen,
+        )?
+        .ok_or(VerificationMaterialError::Invalid)
+        .map(|_| ())
+    }
+
     fn read_claim(&self, id: &str) -> Result<Claim, VerificationMaterialError> {
         self.artifacts
             .read_claim(id)
@@ -754,6 +945,118 @@ fn validate_baseline_payload(
         return Err(VerificationMaterialError::Invalid);
     }
     Ok(())
+}
+
+fn sha256_address_valid(address: &ContentAddress) -> bool {
+    address.algorithm == HashAlgorithm::Sha256 as i32
+        && address.digest.len() == 64
+        && address
+            .digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_prior_initial_inputs(input_ids: &[String], baseline_id: &str) -> bool {
+    (input_ids.len() == 1 && input_ids[0] == baseline_id)
+        || (input_ids.len() == 3
+            && input_ids[0] == baseline_id
+            && input_ids[1].starts_with("artifact:repository-patch:")
+            && input_ids[2].starts_with("artifact:workspace-final:")
+            && input_ids.iter().collect::<BTreeSet<_>>().len() == input_ids.len())
+}
+
+fn initial_payload_matches_lineage(
+    initial: &InitialWorkspaceManifestPayload,
+    baseline: &RepositoryBaselinePayload,
+    lineage: &LineageBinding,
+) -> bool {
+    initial.schema_version == INITIAL_MANIFEST_SCHEMA
+        && initial.task_id == lineage.task_id
+        && initial.task_revision == lineage.task_revision
+        && initial.work_revision == lineage.work_revision
+        && initial.run_id == lineage.run_id
+        && initial.run_revision == lineage.run_revision
+        && initial.step_id == lineage.step_id
+        && initial.step_revision == lineage.step_revision
+        && initial.attempt_id == lineage.attempt_id
+        && initial.attempt_revision == lineage.attempt_revision
+        && initial.dispatch_id == lineage.dispatch_id
+        && initial.fencing_token == lineage.fencing_token
+        && initial.input_snapshot_id == baseline.input_snapshot_id
+        && initial.input_bundle_sha256 == baseline.input_bundle_sha256
+        && initial.workspace_ref == baseline.workspace_ref
+        && initial.baseline_commit == baseline.baseline_commit
+        && initial.baseline_tree == baseline.baseline_tree
+        && initial.status_porcelain_sha256.len() == 64
+        && initial
+            .status_porcelain_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn initial_manifest_state_matches(
+    initial: &InitialWorkspaceManifestPayload,
+    rework: Option<&VerifiedReworkCarryForward>,
+) -> bool {
+    match rework {
+        None => initial.clean && initial.status_porcelain_sha256 == sha256_bytes(&[]),
+        Some(verified) => {
+            initial.status_porcelain_sha256 == verified.final_payload.status_porcelain_sha256
+                && initial.clean
+                    == (verified.patch_is_empty && verified.final_payload.entries.is_empty())
+        }
+    }
+}
+
+fn final_payload_matches(
+    final_payload: &FinalWorkspaceManifestPayload,
+    baseline: &RepositoryBaselinePayload,
+    patch: &VerifiedArtifactBytes,
+    workspace_ref: &str,
+) -> bool {
+    final_payload.schema_version == FINAL_MANIFEST_SCHEMA
+        && final_payload.workspace_ref == workspace_ref
+        && final_payload.baseline_commit == baseline.baseline_commit
+        && final_payload.baseline_tree == baseline.baseline_tree
+        && final_payload.observed_head_commit == baseline.baseline_commit
+        && final_payload.observed_head_tree == baseline.baseline_tree
+        && final_payload.status_porcelain_sha256.len() == 64
+        && final_payload
+            .status_porcelain_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && final_payload.patch_sha256
+            == patch
+                .descriptor
+                .content
+                .as_ref()
+                .map(|value| value.digest.as_str())
+                .unwrap_or_default()
+        && final_payload.patch_bytes == patch.bytes.len() as u64
+        && final_payload.entries.iter().all(|entry| {
+            matches!(
+                entry.status.as_str(),
+                "A" | "M" | "D" | "T" | "U" | "X" | "B"
+            ) && !entry.path_hex.is_empty()
+        })
+}
+
+fn rework_final_paths_valid(
+    manifest: &FinalWorkspaceManifestPayload,
+    frozen: &FrozenRepositoryMaterialV1,
+) -> bool {
+    let mut paths = BTreeSet::new();
+    manifest.entries.iter().all(|entry| {
+        let Ok(bytes) = hex::decode(&entry.path_hex) else {
+            return false;
+        };
+        let Ok(path) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        !path.contains('\\')
+            && paths.insert(path.to_owned())
+            && frozen.path_access(path).ok() == Some(RepositoryPathAccess::Allowed)
+    })
 }
 
 fn validate_repository_artifact(

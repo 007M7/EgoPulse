@@ -327,6 +327,42 @@ message WorkPreparationPreview {
   optional uint64 preference_revision_at_resolution = 33;
 }
 
+// Untrusted conversation context, never an Authority event or permission grant.
+message IntentConversationMessage {
+  bool from_assistant = 1;
+  string text = 2;
+}
+
+message InterpretIntentRequest {
+  ClientRequestMetadata client = 1;
+  string text = 2;
+  repeated IntentConversationMessage history = 3;
+  // Empty means resolve the existing future-work default. No silent fallback.
+  string work_capability_choice_id = 4;
+}
+
+// A proposal only. PrepareWork must revalidate all fields before confirmation.
+message IntentWorkCandidate {
+  string intent = 1;
+  string work_type = 2;
+  string target_scope_ref = 3;
+  repeated WorkSourceRequest sources = 4;
+}
+
+message InterpretedIntent {
+  string reply = 1;
+  bool needs_clarification = 2;
+  IntentWorkCandidate work_candidate = 3;
+  WorkCapabilityView work_capability = 4;
+}
+
+message InterpretIntentResponse {
+  oneof outcome {
+    InterpretedIntent interpretation = 1;
+    LocalApiError error = 2;
+  }
+}
+
 message PrepareWorkRequest {
   ClientRequestMetadata client = 1;
   string intent = 2;
@@ -361,6 +397,45 @@ message ConfirmWorkAccepted {
 }
 
 message ConfirmWorkResponse {
+  oneof outcome {
+    ConfirmWorkAccepted accepted = 1;
+    LocalApiError error = 2;
+  }
+}
+
+// Rework follows an already applied Founder directive on the same Task.
+// Sources, scope, route and required changes are resolved by Authorities.
+message PrepareReworkRequest {
+  ClientRequestMetadata client = 1;
+  string task_id = 2;
+  uint64 expected_revision = 3;
+  string idempotency_key = 4;
+}
+
+message ReworkPreparationPreview {
+  WorkPreparationPreview work = 1;
+  string task_id = 2;
+  uint64 task_revision = 3;
+  uint64 work_revision = 4;
+  string directive_id = 5;
+}
+
+message PrepareReworkResponse {
+  oneof outcome {
+    ReworkPreparationPreview preview = 1;
+    LocalApiError error = 2;
+  }
+}
+
+message ConfirmReworkRequest {
+  ClientRequestMetadata client = 1;
+  string task_id = 2;
+  string snapshot_id = 3;
+  string confirmation_binding_sha256 = 4;
+  string idempotency_key = 5;
+}
+
+message ConfirmReworkResponse {
   oneof outcome {
     ConfirmWorkAccepted accepted = 1;
     LocalApiError error = 2;
@@ -916,10 +991,13 @@ service LocalReadModelService {
 }
 
 service LocalCommandGatewayService {
+  rpc InterpretIntent(InterpretIntentRequest) returns (InterpretIntentResponse);
   rpc ListWorkCapabilities(ListWorkCapabilitiesRequest) returns (ListWorkCapabilitiesResponse);
   rpc SetDefaultWorkCapability(SetDefaultWorkCapabilityRequest) returns (SetDefaultWorkCapabilityResponse);
   rpc PrepareWork(PrepareWorkRequest) returns (PrepareWorkResponse);
   rpc ConfirmWork(ConfirmWorkRequest) returns (ConfirmWorkResponse);
+  rpc PrepareRework(PrepareReworkRequest) returns (PrepareReworkResponse);
+  rpc ConfirmRework(ConfirmReworkRequest) returns (ConfirmReworkResponse);
   rpc ExecuteTaskCommand(ExecuteTaskCommandRequest) returns (ExecuteTaskCommandResponse);
   rpc DecideHarnessApproval(DecideHarnessApprovalRequest) returns (DecideHarnessApprovalResponse);
   rpc ExecuteFounderVerdict(ExecuteFounderVerdictRequest) returns (ExecuteFounderVerdictResponse);

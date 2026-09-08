@@ -11,13 +11,19 @@ use egopulse_domain_contracts::v01::egopulse::collaboration::v1::{
     RecordDeliveryReceiptCommand, RecordHarnessAckCommand, RecordRunningObservationCommand,
 };
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    ApprovalDecisionEnvelope, DeliveryDisposition, LifecycleKind, harness_observation,
+    ApprovalDecisionEnvelope, DeliveryDisposition, DispatchReceipt, LifecycleKind,
+    harness_observation,
 };
 use egopulse_domain_contracts::v01::egopulse::policy::v1::{
     HarnessApprovalDecisionRecord, HarnessApprovalDecisionState,
 };
-use egopulse_harness_adapter::AdapterEdge;
+use egopulse_harness_adapter::{AdapterEdge, AdapterRuntimeResidencyReader};
+use prost::Message;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
+
+const NATIVE_DISPATCH_SESSION_NOT_RESIDENT_REASON_CODE: &str =
+    "NATIVE_DISPATCH_SESSION_NOT_RESIDENT";
 
 type ApprovalPolicyEvidenceReader = Arc<
     dyn Fn(
@@ -40,6 +46,7 @@ type ApprovalPolicyEvidenceReader = Arc<
 /// durable Adapter record with the expected digest, fence and payload shape.
 pub struct AdapterBackedHarnessEvidenceResolver {
     edge: AdapterEdge,
+    runtime_residency: Option<AdapterRuntimeResidencyReader>,
     approval_policy_evidence: Option<ApprovalPolicyEvidenceReader>,
 }
 
@@ -48,8 +55,17 @@ impl AdapterBackedHarnessEvidenceResolver {
     pub fn new(edge: AdapterEdge) -> Self {
         Self {
             edge,
+            runtime_residency: None,
             approval_policy_evidence: None,
         }
+    }
+
+    /// Installs the read-only residency capability exported by the same
+    /// `GovernedHarnessAdapter` instance owned by the dispatch runner.
+    #[must_use]
+    pub fn with_runtime_residency(mut self, reader: AdapterRuntimeResidencyReader) -> Self {
+        self.runtime_residency = Some(reader);
+        self
     }
 
     #[must_use]
@@ -84,7 +100,14 @@ impl HarnessEvidenceResolver for AdapterBackedHarnessEvidenceResolver {
         command: &MarkAttemptOutcomeUnknownCommand,
         snapshot: &CollaborationSnapshot,
     ) -> Result<ReferenceAuthorization, ReferenceGuardRejection> {
-        if command.reason_code != DELIVERY_OUTCOME_UNKNOWN_REASON_CODE {
+        let expected_disposition = match command.reason_code.as_str() {
+            DELIVERY_OUTCOME_UNKNOWN_REASON_CODE => DeliveryDisposition::Unknown,
+            NATIVE_DISPATCH_SESSION_NOT_RESIDENT_REASON_CODE => DeliveryDisposition::Delivered,
+            _ => return Err(ReferenceGuardRejection::UnverifiedReference),
+        };
+        let is_nonresident_recovery =
+            command.reason_code == NATIVE_DISPATCH_SESSION_NOT_RESIDENT_REASON_CODE;
+        if command.uncertainty_evidence_id.trim().is_empty() {
             return Err(ReferenceGuardRejection::UnverifiedReference);
         }
         let base = command
@@ -111,8 +134,7 @@ impl HarnessEvidenceResolver for AdapterBackedHarnessEvidenceResolver {
             .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?;
         if let Some(receipt) = receipt.filter(|receipt| {
             receipt.receipt_id == command.uncertainty_evidence_id
-                && DeliveryDisposition::try_from(receipt.disposition)
-                    == Ok(DeliveryDisposition::Unknown)
+                && DeliveryDisposition::try_from(receipt.disposition) == Ok(expected_disposition)
         }) {
             let envelope = self
                 .edge
@@ -139,6 +161,10 @@ impl HarnessEvidenceResolver for AdapterBackedHarnessEvidenceResolver {
                 || receipt.fencing_token != fencing_token
                 || receipt.fencing_token != envelope.fencing_token
                 || receipt.capability_profile_id != capability.contract_id
+                || (is_nonresident_recovery
+                    && (receipt.evidence_ref.trim().is_empty()
+                        || receipt.delivered_at.is_none()
+                        || canonical_receipt_digest(&receipt) != receipt.receipt_digest_sha256))
                 || envelope.dispatch_id != dispatch_id
                 || envelope.run_id != run.run_id
                 || envelope.step_id != attempt.step_id
@@ -150,12 +176,35 @@ impl HarnessEvidenceResolver for AdapterBackedHarnessEvidenceResolver {
             {
                 return Err(ReferenceGuardRejection::UnverifiedReference);
             }
+            if is_nonresident_recovery {
+                let residency = self
+                    .runtime_residency
+                    .as_ref()
+                    .filter(|reader| reader.adapter_id() == self.edge.adapter_id())
+                    .ok_or(ReferenceGuardRejection::UnverifiedReference)?;
+                if !residency
+                    .observes_nonresident_dispatch(dispatch_id)
+                    .map_err(|_| ReferenceGuardRejection::UnverifiedReference)?
+                {
+                    return Err(ReferenceGuardRejection::UnverifiedReference);
+                }
+            }
             return Ok(ReferenceAuthorization {
-                evidence_refs: vec![format!(
-                    "adapter-delivery-unknown:{}:{}@durable",
-                    receipt.receipt_id, receipt.receipt_digest_sha256
-                )],
+                evidence_refs: vec![if is_nonresident_recovery {
+                    format!(
+                        "adapter-delivered-nonresident:{}:{}@durable",
+                        receipt.receipt_id, receipt.receipt_digest_sha256
+                    )
+                } else {
+                    format!(
+                        "adapter-delivery-unknown:{}:{}@durable",
+                        receipt.receipt_id, receipt.receipt_digest_sha256
+                    )
+                }],
             });
+        }
+        if is_nonresident_recovery {
+            return Err(ReferenceGuardRejection::UnverifiedReference);
         }
         approval_evidence::validate_approval_delivery_unknown(
             &self.edge,
@@ -354,4 +403,10 @@ impl HarnessEvidenceResolver for AdapterBackedHarnessEvidenceResolver {
             )],
         })
     }
+}
+
+fn canonical_receipt_digest(receipt: &DispatchReceipt) -> String {
+    let mut canonical = receipt.clone();
+    canonical.receipt_digest_sha256.clear();
+    hex::encode(Sha256::digest(canonical.encode_to_vec()))
 }

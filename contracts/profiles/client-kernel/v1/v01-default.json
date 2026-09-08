@@ -2,10 +2,10 @@
   "schemaVersion": "egopulse.client-kernel-profile/v0.1",
   "contractId": "egopulse.client-kernel.v1",
   "contractVersion": "0.1.0",
-  "authorityRef": "conversation:2026-09-05:founder-adr0004-option-b-freeze",
+  "authorityRef": "conversation:2026-09-08:founder-authorized-phase-one-personal-agent-intent-entry",
   "localApiCompatibility": {
     "contractId": "egopulse.localapi.v1",
-    "minimumVersion": "0.1.0-draft.23",
+    "minimumVersion": "0.1.0-draft.24",
     "maximumVersionExclusive": "0.2.0",
     "runtimeReferenceRequired": true
   },
@@ -26,6 +26,7 @@
     "memory_retrieval",
     "governed_memory_work_preparation",
     "governed_work_capability_routing",
+    "personal_agent_intent_interpretation",
     "context_revoke_full_digest_confirmation",
     "typed_command",
     "stable_cursor",

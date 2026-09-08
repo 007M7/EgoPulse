@@ -136,6 +136,14 @@ pub struct GovernedReturnEvidenceResolver<G, C> {
 }
 
 impl<G, C> GovernedReturnEvidenceResolver<G, C> {
+    pub(crate) fn with_runtime_residency(
+        mut self,
+        reader: egopulse_harness_adapter::AdapterRuntimeResidencyReader,
+    ) -> Self {
+        self.harness = self.harness.with_runtime_residency(reader);
+        self
+    }
+
     pub(crate) fn with_approval_delivery_source(
         mut self,
         source: Arc<dyn crate::approval_delivery::ApprovalDeliverySource>,

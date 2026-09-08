@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 base64.workspace = true
 egopulse-domain-contracts.workspace = true

@@ -342,6 +342,64 @@ pub struct WorkPreparationPreview {
     #[prost(uint64, optional, tag = "33")]
     pub preference_revision_at_resolution: ::core::option::Option<u64>,
 }
+/// Untrusted conversation context, never an Authority event or permission grant.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct IntentConversationMessage {
+    #[prost(bool, tag = "1")]
+    pub from_assistant: bool,
+    #[prost(string, tag = "2")]
+    pub text: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InterpretIntentRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub history: ::prost::alloc::vec::Vec<IntentConversationMessage>,
+    /// Empty means resolve the existing future-work default. No silent fallback.
+    #[prost(string, tag = "4")]
+    pub work_capability_choice_id: ::prost::alloc::string::String,
+}
+/// A proposal only. PrepareWork must revalidate all fields before confirmation.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IntentWorkCandidate {
+    #[prost(string, tag = "1")]
+    pub intent: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub work_type: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub target_scope_ref: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "4")]
+    pub sources: ::prost::alloc::vec::Vec<WorkSourceRequest>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InterpretedIntent {
+    #[prost(string, tag = "1")]
+    pub reply: ::prost::alloc::string::String,
+    #[prost(bool, tag = "2")]
+    pub needs_clarification: bool,
+    #[prost(message, optional, tag = "3")]
+    pub work_candidate: ::core::option::Option<IntentWorkCandidate>,
+    #[prost(message, optional, tag = "4")]
+    pub work_capability: ::core::option::Option<WorkCapabilityView>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InterpretIntentResponse {
+    #[prost(oneof = "interpret_intent_response::Outcome", tags = "1, 2")]
+    pub outcome: ::core::option::Option<interpret_intent_response::Outcome>,
+}
+/// Nested message and enum types in `InterpretIntentResponse`.
+pub mod interpret_intent_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Outcome {
+        #[prost(message, tag = "1")]
+        Interpretation(super::InterpretedIntent),
+        #[prost(message, tag = "2")]
+        Error(super::LocalApiError),
+    }
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrepareWorkRequest {
     #[prost(message, optional, tag = "1")]
@@ -415,6 +473,75 @@ pub struct ConfirmWorkResponse {
 }
 /// Nested message and enum types in `ConfirmWorkResponse`.
 pub mod confirm_work_response {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Outcome {
+        #[prost(message, tag = "1")]
+        Accepted(super::ConfirmWorkAccepted),
+        #[prost(message, tag = "2")]
+        Error(super::LocalApiError),
+    }
+}
+/// Rework follows an already applied Founder directive on the same Task.
+/// Sources, scope, route and required changes are resolved by Authorities.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PrepareReworkRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub expected_revision: u64,
+    #[prost(string, tag = "4")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReworkPreparationPreview {
+    #[prost(message, optional, tag = "1")]
+    pub work: ::core::option::Option<WorkPreparationPreview>,
+    #[prost(string, tag = "2")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub task_revision: u64,
+    #[prost(uint64, tag = "4")]
+    pub work_revision: u64,
+    #[prost(string, tag = "5")]
+    pub directive_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PrepareReworkResponse {
+    #[prost(oneof = "prepare_rework_response::Outcome", tags = "1, 2")]
+    pub outcome: ::core::option::Option<prepare_rework_response::Outcome>,
+}
+/// Nested message and enum types in `PrepareReworkResponse`.
+pub mod prepare_rework_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Outcome {
+        #[prost(message, tag = "1")]
+        Preview(super::ReworkPreparationPreview),
+        #[prost(message, tag = "2")]
+        Error(super::LocalApiError),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ConfirmReworkRequest {
+    #[prost(message, optional, tag = "1")]
+    pub client: ::core::option::Option<ClientRequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub task_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub snapshot_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub confirmation_binding_sha256: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub idempotency_key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ConfirmReworkResponse {
+    #[prost(oneof = "confirm_rework_response::Outcome", tags = "1, 2")]
+    pub outcome: ::core::option::Option<confirm_rework_response::Outcome>,
+}
+/// Nested message and enum types in `ConfirmReworkResponse`.
+pub mod confirm_rework_response {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Outcome {
         #[prost(message, tag = "1")]
@@ -3470,6 +3597,35 @@ pub mod local_command_gateway_service_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
+        pub async fn interpret_intent(
+            &mut self,
+            request: impl tonic::IntoRequest<super::InterpretIntentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::InterpretIntentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalCommandGatewayService/InterpretIntent",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalCommandGatewayService",
+                        "InterpretIntent",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn list_work_capabilities(
             &mut self,
             request: impl tonic::IntoRequest<super::ListWorkCapabilitiesRequest>,
@@ -3582,6 +3738,64 @@ pub mod local_command_gateway_service_client {
                     GrpcMethod::new(
                         "egopulse.localapi.v1.LocalCommandGatewayService",
                         "ConfirmWork",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn prepare_rework(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PrepareReworkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PrepareReworkResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalCommandGatewayService/PrepareRework",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalCommandGatewayService",
+                        "PrepareRework",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn confirm_rework(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ConfirmReworkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ConfirmReworkResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/egopulse.localapi.v1.LocalCommandGatewayService/ConfirmRework",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "egopulse.localapi.v1.LocalCommandGatewayService",
+                        "ConfirmRework",
                     ),
                 );
             self.inner.unary(req, path, codec).await
@@ -3777,6 +3991,13 @@ pub mod local_command_gateway_service_server {
     /// Generated trait containing gRPC methods that should be implemented for use with LocalCommandGatewayServiceServer.
     #[async_trait]
     pub trait LocalCommandGatewayService: std::marker::Send + std::marker::Sync + 'static {
+        async fn interpret_intent(
+            &self,
+            request: tonic::Request<super::InterpretIntentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::InterpretIntentResponse>,
+            tonic::Status,
+        >;
         async fn list_work_capabilities(
             &self,
             request: tonic::Request<super::ListWorkCapabilitiesRequest>,
@@ -3803,6 +4024,20 @@ pub mod local_command_gateway_service_server {
             request: tonic::Request<super::ConfirmWorkRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ConfirmWorkResponse>,
+            tonic::Status,
+        >;
+        async fn prepare_rework(
+            &self,
+            request: tonic::Request<super::PrepareReworkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PrepareReworkResponse>,
+            tonic::Status,
+        >;
+        async fn confirm_rework(
+            &self,
+            request: tonic::Request<super::ConfirmReworkRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ConfirmReworkResponse>,
             tonic::Status,
         >;
         async fn execute_task_command(
@@ -3925,6 +4160,55 @@ pub mod local_command_gateway_service_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
+                "/egopulse.localapi.v1.LocalCommandGatewayService/InterpretIntent" => {
+                    #[allow(non_camel_case_types)]
+                    struct InterpretIntentSvc<T: LocalCommandGatewayService>(pub Arc<T>);
+                    impl<
+                        T: LocalCommandGatewayService,
+                    > tonic::server::UnaryService<super::InterpretIntentRequest>
+                    for InterpretIntentSvc<T> {
+                        type Response = super::InterpretIntentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::InterpretIntentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalCommandGatewayService>::interpret_intent(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = InterpretIntentSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/egopulse.localapi.v1.LocalCommandGatewayService/ListWorkCapabilities" => {
                     #[allow(non_camel_case_types)]
                     struct ListWorkCapabilitiesSvc<T: LocalCommandGatewayService>(
@@ -4112,6 +4396,104 @@ pub mod local_command_gateway_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ConfirmWorkSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/egopulse.localapi.v1.LocalCommandGatewayService/PrepareRework" => {
+                    #[allow(non_camel_case_types)]
+                    struct PrepareReworkSvc<T: LocalCommandGatewayService>(pub Arc<T>);
+                    impl<
+                        T: LocalCommandGatewayService,
+                    > tonic::server::UnaryService<super::PrepareReworkRequest>
+                    for PrepareReworkSvc<T> {
+                        type Response = super::PrepareReworkResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PrepareReworkRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalCommandGatewayService>::prepare_rework(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PrepareReworkSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/egopulse.localapi.v1.LocalCommandGatewayService/ConfirmRework" => {
+                    #[allow(non_camel_case_types)]
+                    struct ConfirmReworkSvc<T: LocalCommandGatewayService>(pub Arc<T>);
+                    impl<
+                        T: LocalCommandGatewayService,
+                    > tonic::server::UnaryService<super::ConfirmReworkRequest>
+                    for ConfirmReworkSvc<T> {
+                        type Response = super::ConfirmReworkResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ConfirmReworkRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as LocalCommandGatewayService>::confirm_rework(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ConfirmReworkSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -132,6 +132,8 @@ const APPLY_FOUNDER_VERDICT_COMMAND: &str = "apply_founder_verdict";
 const GUIDED_FOUNDER_APPLY_SCOPE: &str = "guided-founder-decision/apply/v1";
 
 mod founder_recovery;
+mod rework_recovery;
+pub use rework_recovery::DurableReworkConfirmation;
 mod recovery_store;
 pub use founder_recovery::{
     DurableFounderDecisionAttempt, DurableFounderMaterialAttempt, DurableFounderMaterialRecovery,
@@ -1959,6 +1961,8 @@ pub struct GuidedWorkInput {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GuidedWorkNonGoal {
+    ReworkRequiresConfirmation,
+    ReworkPreservesTaskIdentity,
     ProviderRouteCannotBeModelSelected,
     MemoryMutationExcluded,
 }
@@ -1967,6 +1971,10 @@ impl GuidedWorkNonGoal {
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
+            Self::ReworkRequiresConfirmation => {
+                "Founder required changes do not authorize execution or acceptance"
+            }
+            Self::ReworkPreservesTaskIdentity => "rework preparation does not create a second Task",
             Self::ProviderRouteCannotBeModelSelected => {
                 "provider/model route cannot be selected or changed by model output"
             }
@@ -2290,6 +2298,62 @@ impl PreparedContextRevoke {
 }
 
 impl ClientAttachment {
+    /// Interprets user text without preparing, confirming or executing work.
+    /// An unknown transport outcome is surfaced; model calls are never retried here.
+    pub async fn interpret_intent(
+        &self,
+        text: String,
+        history: Vec<
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::IntentConversationMessage,
+        >,
+        work_capability_choice_id: String,
+    ) -> Result<egopulse_domain_contracts::v01::egopulse::localapi::v1::InterpretedIntent, String>
+    {
+        self.interpret_intent_typed(text, history, work_capability_choice_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Preserves the shared typed API error for structured clients.
+    pub async fn interpret_intent_typed(
+        &self,
+        text: String,
+        history: Vec<
+            egopulse_domain_contracts::v01::egopulse::localapi::v1::IntentConversationMessage,
+        >,
+        work_capability_choice_id: String,
+    ) -> Result<
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::InterpretedIntent,
+        ClientWorkError,
+    > {
+        use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
+            InterpretIntentRequest, interpret_intent_response,
+        };
+        self.require_rpc("LocalCommandGatewayService/InterpretIntent")?;
+        let response = self
+            .connection
+            .command_gateway_service()
+            .interpret_intent(InterpretIntentRequest {
+                client: Some(self.metadata(None)?),
+                text,
+                history,
+                work_capability_choice_id,
+            })
+            .await
+            .map_err(|_| {
+                ClientWorkError::Transport("Intent response unavailable; no work was confirmed. Retry explicitly if needed."
+                    .to_owned())
+            })?
+            .into_inner();
+        match response.outcome {
+            Some(interpret_intent_response::Outcome::Interpretation(value)) => Ok(value),
+            Some(interpret_intent_response::Outcome::Error(error)) => {
+                Err(ClientWorkError::Api(Box::new(error)))
+            }
+            None => Err(ClientWorkError::Protocol("Intent response outcome missing")),
+        }
+    }
+
     pub fn metadata(
         &self,
         correlation_id: Option<String>,
@@ -2956,6 +3020,42 @@ impl ClientAttachment {
         }
     }
 
+    /// Prepare the next work revision from the applied Rework directive.
+    pub async fn prepare_rework(
+        &self,
+        task_id: String,
+        expected_revision: u64,
+        idempotency_key: String,
+    ) -> Result<
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::ReworkPreparationPreview,
+        ClientWorkError,
+    > {
+        use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
+            PrepareReworkRequest, prepare_rework_response,
+        };
+        let response = self
+            .connection
+            .command_gateway_service()
+            .prepare_rework(PrepareReworkRequest {
+                client: Some(self.metadata(None)?),
+                task_id,
+                expected_revision,
+                idempotency_key,
+            })
+            .await
+            .map_err(|error| ClientWorkError::Transport(error.to_string()))?
+            .into_inner();
+        match response.outcome {
+            Some(prepare_rework_response::Outcome::Preview(preview)) => Ok(preview),
+            Some(prepare_rework_response::Outcome::Error(error)) => {
+                Err(ClientWorkError::Api(Box::new(error)))
+            }
+            None => Err(ClientWorkError::Protocol(
+                "rework preparation outcome missing",
+            )),
+        }
+    }
+
     /// Confirms exactly the binding displayed in the preparation preview. The
     /// daemon—not this client—creates the Task command through Task Authority.
     pub async fn confirm_work(
@@ -2982,6 +3082,36 @@ impl ClientAttachment {
                 await_token: accepted.await_token,
             }),
             Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_work_response::Outcome::Error(error)) => Err(ClientWorkError::Api(Box::new(error))),
+            None => Err(ClientWorkError::Protocol("confirm outcome missing")),
+        }
+    }
+    /// Confirm a frozen follow-up without creating a second Task.
+    pub async fn confirm_rework(
+        &self,
+        task_id: String,
+        snapshot_id: String,
+        confirmation_binding_sha256: String,
+        idempotency_key: String,
+    ) -> Result<ConfirmedWork, ClientWorkError> {
+        let response: egopulse_domain_contracts::v01::egopulse::localapi::v1::ConfirmReworkResponse = self
+            .connection
+            .command_gateway_service()
+            .confirm_rework(egopulse_domain_contracts::v01::egopulse::localapi::v1::ConfirmReworkRequest {
+                task_id,
+                client: Some(self.metadata(None)?),
+                snapshot_id,
+                confirmation_binding_sha256,
+                idempotency_key,
+            })
+            .await
+            .map_err(|error| ClientWorkError::Transport(error.to_string()))?
+            .into_inner();
+        match response.outcome {
+            Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_rework_response::Outcome::Accepted(accepted)) => Ok(ConfirmedWork {
+                result: accepted.authority_result.ok_or(ClientWorkError::Protocol("confirmed task result missing"))?,
+                await_token: accepted.await_token,
+            }),
+            Some(egopulse_domain_contracts::v01::egopulse::localapi::v1::confirm_rework_response::Outcome::Error(error)) => Err(ClientWorkError::Api(Box::new(error))),
             None => Err(ClientWorkError::Protocol("confirm outcome missing")),
         }
     }
@@ -3567,6 +3697,12 @@ fn safe_guided_work_warning(value: &str) -> Option<GovernedWorkNotice> {
 
 fn safe_guided_work_non_goal(value: &str) -> Option<GuidedWorkNonGoal> {
     match value {
+        "Founder required changes do not authorize execution or acceptance" => {
+            Some(GuidedWorkNonGoal::ReworkRequiresConfirmation)
+        }
+        "rework preparation does not create a second Task" => {
+            Some(GuidedWorkNonGoal::ReworkPreservesTaskIdentity)
+        }
         "provider/model route cannot be selected or changed by model output" => {
             Some(GuidedWorkNonGoal::ProviderRouteCannotBeModelSelected)
         }
@@ -3675,6 +3811,45 @@ fn guided_work_safe_preview(
         gate_ready: preview.gate_ready,
         ready_for_founder_confirmation: preview.ready_for_founder_confirmation,
     })
+}
+
+/// Validates the client-visible portion of a daemon-resolved Rework preview.
+/// Task/Artifact authority remains entirely on the server.
+pub fn rework_safe_preview(
+    preview: &WorkPreparationPreview,
+) -> Result<GuidedWorkPreview, ClientGuidedWorkError> {
+    if !preview
+        .snapshot_id
+        .strip_prefix("ctx:")
+        .is_some_and(is_canonical_sha256)
+        || !is_canonical_sha256(&preview.confirmation_binding_sha256)
+        || !is_canonical_sha256(&preview.compiled_context_sha256)
+        || preview.snapshot_revision == 0
+        || preview.context_state_revision == 0
+        || !is_guided_work_text(&preview.normalized_intent, GUIDED_WORK_MAX_TEXT_BYTES)
+        || !is_guided_work_response_text(&preview.work_type)
+        || !is_guided_work_response_text(&preview.target_scope_ref)
+        || preview.required_confirmations != ["founder.confirm_rework"]
+        || preview.included_sources.is_empty()
+        || preview.included_sources.len() > GUIDED_WORK_MAX_SOURCES
+        || preview.included_sources.iter().any(|source| {
+            !source.included
+                || !is_canonical_sha256(&source.content_sha256)
+                || !is_guided_work_response_text(&source.source_ref)
+                || !is_guided_work_response_text(&source.label)
+                || source.authority != "founder-verdict-authority"
+        })
+        || !preview.excluded_sources.is_empty()
+        || !preview.blockers.is_empty()
+        || !preview.warnings.is_empty()
+        || !preview.gate_ready
+        || !preview.ready_for_founder_confirmation
+    {
+        return Err(ClientGuidedWorkError::Protocol(
+            "rework preview binding is incomplete",
+        ));
+    }
+    guided_work_safe_preview(preview, GuidedWorkMemoryMode::Disabled)
 }
 
 fn seal_guided_work_confirmation(

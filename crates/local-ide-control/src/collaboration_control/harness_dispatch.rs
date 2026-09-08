@@ -33,6 +33,9 @@ use sha2::Digest;
 use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc};
 use thiserror::Error;
 
+const NATIVE_DISPATCH_SESSION_NOT_RESIDENT_REASON_CODE: &str =
+    "NATIVE_DISPATCH_SESSION_NOT_RESIDENT";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskRecoveryKind {
     /// The Collaboration run reached a committed Cancelled outcome. The owning
@@ -297,6 +300,7 @@ enum ObservationSettlement {
 enum ActivePumpStep {
     DurableEventAppended,
     Idle,
+    Held,
     Retire,
     Blocked(DurableReplayBarrier),
 }
@@ -983,45 +987,67 @@ where
             )
             .await?;
             let mut blocked_dispatch_ids = BTreeSet::new();
-            for activation in activations {
-                let config = match resolver
-                    .resolve(&activation)
-                    .map_err(|_| HarnessDispatchCycleError::TaskActivationResolver)?
-                {
-                    SingleHarnessWorkflowResolution::NotApplicable => continue,
-                    SingleHarnessWorkflowResolution::Resolved(config) => (*config, None),
-                    SingleHarnessWorkflowResolution::ResolvedWithRouteBinding {
-                        config,
-                        route_binding,
-                    } => (*config, Some(*route_binding)),
-                };
-                let (mut config, route_binding) = config;
-                if !workflow_matches_profile(&config, self.capability_profile_filter.as_ref()) {
-                    continue;
-                }
-                if let Some(preparer) = task_dispatch_material_preparer.as_ref() {
-                    let dispatch_id = config.dispatch_id.clone();
-                    match preparer.prepare(&activation, config).await {
-                        Ok(prepared) => config = prepared,
-                        Err(rejection) => {
-                            blocked_dispatch_ids.insert(dispatch_id.clone());
-                            report.activation_blockages.push(TaskActivationBlockage {
-                                task_id: activation.task.task_id.clone(),
-                                dispatch_id,
-                                safe_detail_code: rejection.safe_detail_code,
-                            });
-                            continue;
+            // Do not acquire a lease or create another DispatchPending while
+            // this single driver has work, including an older unsent pending
+            // intent. At most one matching activation can consume the free
+            // slot in a cycle; its dispatch is attempted below before another
+            // activation is considered on a later poll.
+            if !pending_dispatch_reserves_capacity(control, adapter, &pending)?
+                && adapter.is_dispatch_ready()
+            {
+                for activation in activations {
+                    let config = match resolver
+                        .resolve(&activation)
+                        .map_err(|_| HarnessDispatchCycleError::TaskActivationResolver)?
+                    {
+                        SingleHarnessWorkflowResolution::NotApplicable => continue,
+                        SingleHarnessWorkflowResolution::Resolved(config) => (*config, None),
+                        SingleHarnessWorkflowResolution::ResolvedWithRouteBinding {
+                            config,
+                            route_binding,
+                        } => (*config, Some(*route_binding)),
+                    };
+                    let (mut config, route_binding) = config;
+                    if !workflow_matches_profile(&config, self.capability_profile_filter.as_ref()) {
+                        continue;
+                    }
+                    if !source
+                        .claim_task_activation(
+                            &activation.message_id,
+                            &activation.payload_digest_sha256,
+                        )
+                        .map_err(|_| HarnessDispatchCycleError::TaskActivationSource)?
+                    {
+                        report.activation_blockages.push(TaskActivationBlockage {
+                            task_id: activation.task.task_id.clone(),
+                            dispatch_id: config.dispatch_id.clone(),
+                            safe_detail_code: "TASK_ACTIVATION_CLAIM_REJECTED".to_owned(),
+                        });
+                        continue;
+                    }
+                    if let Some(preparer) = task_dispatch_material_preparer.as_ref() {
+                        let dispatch_id = config.dispatch_id.clone();
+                        match preparer.prepare(&activation, config).await {
+                            Ok(prepared) => config = prepared,
+                            Err(rejection) => {
+                                blocked_dispatch_ids.insert(dispatch_id.clone());
+                                report.activation_blockages.push(TaskActivationBlockage {
+                                    task_id: activation.task.task_id.clone(),
+                                    dispatch_id,
+                                    safe_detail_code: rejection.safe_detail_code,
+                                });
+                                continue;
+                            }
                         }
                     }
-                }
-                reference
-                    .bind(activation.task.clone(), &config, *lease_ttl_seconds)
-                    .map_err(|_| {
-                        HarnessDispatchCycleError::TaskActivationWorkflow(
-                            "activation reference binding failed".to_owned(),
-                        )
-                    })?;
-                let result = super::single_harness_workflow::start_single_harness_workflow_with_route_binding(
+                    reference
+                        .bind(activation.task.clone(), &config, *lease_ttl_seconds)
+                        .map_err(|_| {
+                            HarnessDispatchCycleError::TaskActivationWorkflow(
+                                "activation reference binding failed".to_owned(),
+                            )
+                        })?;
+                    let result = super::single_harness_workflow::start_single_harness_workflow_with_route_binding(
                     control,
                     &activation.task,
                     &config,
@@ -1030,30 +1056,32 @@ where
                 .map_err(|error| {
                     HarnessDispatchCycleError::TaskActivationWorkflow(error.to_string())
                 })?;
-                if let Some(preparer) = task_dispatch_material_preparer.as_ref()
-                    && let Err(rejection) = preparer
-                        .seal_before_activation_ack(&activation, &config, &result)
-                        .await
-                {
-                    blocked_dispatch_ids.insert(result.dispatch_id.clone());
-                    report.activation_blockages.push(TaskActivationBlockage {
-                        task_id: activation.task.task_id.clone(),
-                        dispatch_id: result.dispatch_id,
-                        safe_detail_code: rejection.safe_detail_code,
-                    });
-                    continue;
+                    if let Some(preparer) = task_dispatch_material_preparer.as_ref()
+                        && let Err(rejection) = preparer
+                            .seal_before_activation_ack(&activation, &config, &result)
+                            .await
+                    {
+                        blocked_dispatch_ids.insert(result.dispatch_id.clone());
+                        report.activation_blockages.push(TaskActivationBlockage {
+                            task_id: activation.task.task_id.clone(),
+                            dispatch_id: result.dispatch_id,
+                            safe_detail_code: rejection.safe_detail_code,
+                        });
+                        continue;
+                    }
+                    if !source
+                        .acknowledge_task_activation(
+                            &activation.message_id,
+                            &activation.payload_digest_sha256,
+                        )
+                        .map_err(|_| HarnessDispatchCycleError::TaskActivationSource)?
+                    {
+                        return Err(HarnessDispatchCycleError::TaskActivationSource);
+                    }
+                    report.activations_started += 1;
+                    report.activations_acknowledged += 1;
+                    break;
                 }
-                if !source
-                    .acknowledge_task_activation(
-                        &activation.message_id,
-                        &activation.payload_digest_sha256,
-                    )
-                    .map_err(|_| HarnessDispatchCycleError::TaskActivationSource)?
-                {
-                    return Err(HarnessDispatchCycleError::TaskActivationSource);
-                }
-                report.activations_started += 1;
-                report.activations_acknowledged += 1;
             }
             let dispatched = dispatch_pending_for_profile(
                 control,
@@ -1664,6 +1692,11 @@ where
         ..HarnessDispatchCycleReport::default()
     };
     for dispatch in pending {
+        // A durable Adapter receipt means dispatch() will take its exact replay
+        // path and will not call the native driver. This must remain available
+        // while the driver is busy so a lost Collaboration ingestion ACK can
+        // converge. Only a genuinely new native send waits for readiness.
+        let stored_receipt = adapter.stored_dispatch_receipt(&dispatch.envelope.dispatch_id)?;
         let collaboration = control.get_collaboration(&dispatch.envelope.run_id)?;
         let snapshot = match collaboration.outcome {
             Some(get_collaboration_response::Outcome::Snapshot(snapshot)) => snapshot,
@@ -1674,6 +1707,29 @@ where
             .as_ref()
             .filter(|run| run.run_id == dispatch.envelope.run_id)
             .ok_or(CollaborationControlError::Persistence)?;
+        if stored_receipt.is_none() {
+            if let Err(safe_detail_code) = validate_pending_dispatch_for_send(
+                &snapshot,
+                &dispatch.envelope,
+                &control.current_timestamp(),
+            ) {
+                report.activation_blockages.push(TaskActivationBlockage {
+                    task_id: run.task_id.clone(),
+                    dispatch_id: dispatch.envelope.dispatch_id.clone(),
+                    safe_detail_code: safe_detail_code.to_owned(),
+                });
+                record_pending_dispatch_recovery_finding(
+                    &snapshot,
+                    &dispatch.envelope,
+                    safe_detail_code,
+                    &mut report,
+                );
+                continue;
+            }
+            if !adapter.is_dispatch_ready() {
+                continue;
+            }
+        }
         let result = adapter.dispatch(&dispatch.envelope).await?;
         let Some(outcome) = result.outcome else {
             report.dispatches_rejected += 1;
@@ -1716,6 +1772,100 @@ where
         }
     }
     Ok(report)
+}
+
+fn pending_dispatch_reserves_capacity<G, C, R, D, A>(
+    control: &CollaborationControl<G, C>,
+    adapter: &GovernedHarnessAdapter<R, D, A>,
+    pending: &[DispatchEnvelope],
+) -> Result<bool, HarnessDispatchCycleError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+    R: DispatchMaterialResolver,
+    D: NativeHarnessDriver,
+    A: AdapterClock,
+{
+    let now = control.current_timestamp();
+    for envelope in pending {
+        if adapter
+            .stored_dispatch_receipt(&envelope.dispatch_id)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let snapshot = collaboration_snapshot(control, &envelope.run_id)?;
+        if validate_pending_dispatch_for_send(&snapshot, envelope, &now).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn record_pending_dispatch_recovery_finding(
+    snapshot: &CollaborationSnapshot,
+    envelope: &DispatchEnvelope,
+    safe_detail_code: &str,
+    report: &mut HarnessDispatchCycleReport,
+) {
+    let Some(run) = snapshot
+        .run
+        .as_ref()
+        .filter(|run| run.run_id == envelope.run_id)
+    else {
+        return;
+    };
+    let finding = TaskRecoveryFinding {
+        kind: TaskRecoveryKind::OutcomeUnknown,
+        task_id: run.task_id.clone(),
+        run_id: run.run_id.clone(),
+        evidence_ref: format!(
+            "collaboration-pending-dispatch:{}:{safe_detail_code}",
+            envelope.dispatch_id
+        ),
+    };
+    if !report.task_recovery_findings.contains(&finding) {
+        report.task_recovery_findings.push(finding);
+    }
+}
+
+fn validate_pending_dispatch_for_send(
+    snapshot: &CollaborationSnapshot,
+    envelope: &DispatchEnvelope,
+    now: &prost_types::Timestamp,
+) -> Result<(), &'static str> {
+    let step = snapshot
+        .steps
+        .iter()
+        .find(|step| step.step_id == envelope.step_id)
+        .ok_or("DISPATCH_PENDING_BINDING_STALE")?;
+    let attempt = snapshot
+        .attempts
+        .iter()
+        .find(|attempt| attempt.attempt_id == envelope.attempt_id)
+        .ok_or("DISPATCH_PENDING_BINDING_STALE")?;
+    let lease = attempt
+        .lease
+        .as_ref()
+        .ok_or("DISPATCH_PENDING_BINDING_STALE")?;
+    if step.current_attempt_id.as_deref() != Some(envelope.attempt_id.as_str())
+        || attempt.step_id != envelope.step_id
+        || attempt.status != AttemptStatus::DispatchPending as i32
+        || attempt.revision != envelope.attempt_revision
+        || attempt.dispatch_id.as_deref() != Some(envelope.dispatch_id.as_str())
+        || attempt.dispatch_fingerprint.as_deref() != Some(envelope.dispatch_fingerprint.as_str())
+        || lease.fencing_token != envelope.fencing_token
+    {
+        return Err("DISPATCH_PENDING_BINDING_STALE");
+    }
+    let expires_at = lease
+        .expires_at
+        .as_ref()
+        .ok_or("DISPATCH_PENDING_LEASE_EXPIRED")?;
+    if (expires_at.seconds, expires_at.nanos) <= (now.seconds, now.nanos) {
+        return Err("DISPATCH_PENDING_LEASE_EXPIRED");
+    }
+    Ok(())
 }
 
 /// Replays durable normal observations before polling one immutable dispatch.
@@ -1947,6 +2097,7 @@ where
                     active_envelopes.push(envelope);
                     break;
                 }
+                ActivePumpStep::Held => break,
                 ActivePumpStep::Retire
                 | ActivePumpStep::Blocked(DurableReplayBarrier::Terminal) => break,
                 ActivePumpStep::Blocked(DurableReplayBarrier::Clear) => {
@@ -1994,6 +2145,11 @@ where
         ));
     }
 
+    if !adapter.has_resident_dispatch(&envelope.dispatch_id) {
+        hold_nonresident_delivered_dispatch(control, adapter, delivered, report)?;
+        return Ok(ActivePumpStep::Held);
+    }
+
     let Some(observation) = adapter.pump_one(envelope).await? else {
         return Ok(ActivePumpStep::Idle);
     };
@@ -2011,6 +2167,66 @@ where
         // spin on the native key in this cycle.
         Ok(ActivePumpStep::Idle)
     }
+}
+
+fn hold_nonresident_delivered_dispatch<G, C, R, D, A>(
+    control: &mut CollaborationControl<G, C>,
+    adapter: &GovernedHarnessAdapter<R, D, A>,
+    delivered: &DeliveredDispatchForObservation,
+    report: &mut HarnessDispatchCycleReport,
+) -> Result<(), HarnessDispatchCycleError>
+where
+    G: CollaborationReferenceGuard + HarnessEvidenceResolver,
+    C: AuthorityClock,
+    R: DispatchMaterialResolver,
+    D: NativeHarnessDriver,
+    A: AdapterClock,
+{
+    let envelope = &delivered.envelope;
+    adapter.verify_delivered_recovery_candidate(envelope)?;
+    if adapter.has_resident_dispatch(&envelope.dispatch_id) {
+        return Err(HarnessDispatchCycleError::Recovery(
+            "nonresident recovery candidate became resident".to_owned(),
+        ));
+    }
+    let receipt = adapter
+        .edge()
+        .delivered_dispatch_receipt(&envelope.dispatch_id)
+        .map_err(GovernedAdapterError::from)?
+        .ok_or_else(|| {
+            HarnessDispatchCycleError::Recovery(
+                "nonresident recovery delivery receipt is missing".to_owned(),
+            )
+        })?;
+    let _nonresident_observation = adapter.observe_nonresident_dispatch(&envelope.dispatch_id)?;
+    let snapshot = collaboration_snapshot(control, &envelope.run_id)?;
+    let mut command = CollaborationCommand {
+        command: Some(collaboration_command::Command::MarkAttemptOutcomeUnknown(
+            MarkAttemptOutcomeUnknownCommand {
+                base: Some(recovery_attempt_base(
+                    &snapshot,
+                    &envelope.attempt_id,
+                    &receipt.receipt_id,
+                    "native-session-not-resident",
+                )?),
+                reason_code: NATIVE_DISPATCH_SESSION_NOT_RESIDENT_REASON_CODE.to_owned(),
+                uncertainty_evidence_id: receipt.receipt_id,
+            },
+        )),
+    };
+    seal_request_digest(&mut command).ok_or_else(|| {
+        HarnessDispatchCycleError::Recovery(
+            "nonresident recovery command could not be sealed".to_owned(),
+        )
+    })?;
+    require_recovery_commit(
+        control.execute(&command, &recovery_principal())?,
+        "native-session-not-resident",
+    )?;
+    if !report.held_dispatch_ids.contains(&envelope.dispatch_id) {
+        report.held_dispatch_ids.push(envelope.dispatch_id.clone());
+    }
+    record_task_recovery_finding_if_still_held(control, envelope, report)
 }
 
 fn current_delivered_candidate<G, C>(

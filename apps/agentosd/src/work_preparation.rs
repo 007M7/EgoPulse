@@ -23,8 +23,9 @@ use egopulse_domain_contracts::memory::{
 use egopulse_domain_contracts::v01::egopulse::{
     common::v1::{CommandMetadata, ContractReference},
     localapi::v1::{
-        ConfirmWorkRequest, PrepareWorkRequest, WorkCapabilitySelectionSource, WorkGateNotice,
-        WorkMemoryMode, WorkPreparationPreview, WorkSourceFact, prepare_work_request,
+        ConfirmWorkRequest, InterpretIntentRequest, InterpretedIntent, PrepareWorkRequest,
+        WorkCapabilitySelectionSource, WorkGateNotice, WorkMemoryMode, WorkPreparationPreview,
+        WorkSourceFact, prepare_work_request,
     },
     memory::v1::{AcceptedMemoryInput, RetrievalRequest},
     task::v1::{
@@ -43,11 +44,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::intent_interpretation::ConfiguredIntentInterpreter;
 use crate::memory_retrieval::{GovernedWorkMemoryRetrieval, WorkMemoryRetrievalPort};
 use crate::repository_material::{
     FrozenRepositoryMaterialV1, RepositoryMaterialConfig, RepositoryMaterialError,
     freeze_repository_material, frozen_repository_material_from_compiled_context,
 };
+use crate::rework_preparation::ReworkPreparationCoordinator;
 use crate::work_capability::{ResolvedWorkCapability, WorkCapabilityRegistry};
 
 #[derive(Clone, Debug, Serialize)]
@@ -223,7 +226,7 @@ pub(crate) fn work_capability_route_from_compiled_context(
         .map(|resolved| resolved.map(|resolved| resolved.route))
 }
 
-fn work_capability_resolution_from_compiled_context(
+pub(crate) fn work_capability_resolution_from_compiled_context(
     compiled_context: &[u8],
 ) -> Result<Option<ResolvedWorkCapability>, CommandPortFailure> {
     let root: serde_json::Value = serde_json::from_slice(compiled_context)
@@ -250,16 +253,47 @@ fn work_capability_resolution_from_compiled_context(
 
 pub(crate) fn work_capability_run_id(
     task_id: &str,
+    work_revision: u64,
     route: &WorkCapabilityRouteBinding,
 ) -> Result<String, CommandPortFailure> {
-    if task_id.trim().is_empty() {
+    if task_id.trim().is_empty() || work_revision == 0 {
         return Err(CommandPortFailure::IntegrityFailure);
     }
     validate_work_capability_route_binding(route)
         .map_err(|_| CommandPortFailure::IntegrityFailure)?;
+    if work_revision > 1 {
+        return Ok(format!(
+            "run:work:{task_id}:revision:{work_revision}:{}",
+            route.route_binding_sha256
+        ));
+    }
     Ok(format!(
         "run:work:{}:{}",
         task_id, route.route_binding_sha256
+    ))
+}
+
+pub(crate) fn work_capability_view_from_compiled_context(
+    compiled_context: &[u8],
+    registry: Option<&WorkCapabilityRegistry>,
+) -> Result<
+    (
+        Option<egopulse_domain_contracts::v01::egopulse::localapi::v1::WorkCapabilityView>,
+        i32,
+        Option<u64>,
+    ),
+    CommandPortFailure,
+> {
+    let resolved = work_capability_resolution_from_compiled_context(compiled_context)?
+        .ok_or(CommandPortFailure::CapabilityNotAdmitted)?;
+    let view = registry
+        .ok_or(CommandPortFailure::Unavailable)?
+        .projection_for_resolution(&resolved)
+        .map_err(work_capability_failure)?;
+    Ok((
+        Some(view),
+        resolved.selection_source as i32,
+        resolved.preference_revision_at_resolution,
     ))
 }
 
@@ -278,6 +312,8 @@ pub struct ConfiguredWorkPreparationPort {
     input_bundle_root: Option<PathBuf>,
     repository_material: Option<RepositoryMaterialConfig>,
     work_capability_registry: Option<Arc<WorkCapabilityRegistry>>,
+    intent_interpreter: Option<ConfiguredIntentInterpreter>,
+    rework_preparation: Option<Arc<ReworkPreparationCoordinator>>,
     /// Reviewed daemon-owned workflow instance used for post-confirmation
     /// activation. None is retained by foundation/unit-test compositions.
     activation_run_id: Option<String>,
@@ -313,6 +349,8 @@ impl ConfiguredWorkPreparationPort {
             input_bundle_root: None,
             repository_material: None,
             work_capability_registry: None,
+            intent_interpreter: None,
+            rework_preparation: None,
             activation_run_id: None,
         })
     }
@@ -323,6 +361,14 @@ impl ConfiguredWorkPreparationPort {
         }
         self.input_bundle_root = Some(root);
         Ok(self)
+    }
+
+    pub(crate) fn with_rework_preparation(
+        mut self,
+        coordinator: Arc<ReworkPreparationCoordinator>,
+    ) -> Self {
+        self.rework_preparation = Some(coordinator);
+        self
     }
 
     pub fn with_activation_run_id(mut self, run_id: String) -> Result<Self, CommandPortFailure> {
@@ -345,6 +391,26 @@ impl ConfiguredWorkPreparationPort {
     pub fn with_work_capability_registry(mut self, registry: Arc<WorkCapabilityRegistry>) -> Self {
         self.work_capability_registry = Some(registry);
         self
+    }
+
+    pub(crate) fn with_codex_intent_interpreter(
+        mut self,
+        codex: egopulse_codex_adapter::CodexAppServerConfig,
+        target_scope_ref: String,
+    ) -> Result<Self, CommandPortFailure> {
+        let mut work_types = self.allowed_work_types.iter();
+        let work_type = work_types
+            .next()
+            .filter(|_| work_types.next().is_none())
+            .cloned()
+            .ok_or(CommandPortFailure::IntegrityFailure)?;
+        self.intent_interpreter = Some(ConfiguredIntentInterpreter::new(
+            codex,
+            self.workspace_root.clone(),
+            work_type,
+            target_scope_ref,
+        )?);
+        Ok(self)
     }
 
     fn resolve_work_capability(
@@ -839,6 +905,60 @@ impl ConfiguredWorkPreparationPort {
 
 #[tonic::async_trait]
 impl WorkPreparationPort for ConfiguredWorkPreparationPort {
+    async fn prepare_rework(
+        &self,
+        request: &egopulse_domain_contracts::v01::egopulse::localapi::v1::PrepareReworkRequest,
+        principal: &CommandPrincipal,
+    ) -> Result<
+        egopulse_domain_contracts::v01::egopulse::localapi::v1::ReworkPreparationPreview,
+        CommandPortFailure,
+    > {
+        self.rework_preparation
+            .as_ref()
+            .ok_or(CommandPortFailure::Unavailable)?
+            .prepare(request, principal)
+            .await
+    }
+
+    fn confirm_rework(
+        &self,
+        request: &egopulse_domain_contracts::v01::egopulse::localapi::v1::ConfirmReworkRequest,
+        principal: &CommandPrincipal,
+    ) -> Result<CommandPortResult<TaskCommandResult>, CommandPortFailure> {
+        self.rework_preparation
+            .as_ref()
+            .ok_or(CommandPortFailure::Unavailable)?
+            .confirm(request, principal)
+    }
+
+    async fn interpret(
+        &self,
+        request: &InterpretIntentRequest,
+        _principal: &CommandPrincipal,
+    ) -> Result<InterpretedIntent, CommandPortFailure> {
+        let registry = self
+            .work_capability_registry
+            .as_ref()
+            .ok_or(CommandPortFailure::Unavailable)?;
+        let resolved = if request.work_capability_choice_id.trim().is_empty() {
+            registry.resolve_default()
+        } else {
+            registry.resolve_choice(request.work_capability_choice_id.trim())
+        }
+        .map_err(work_capability_failure)?;
+        if resolved.route().harness_id != "codex_app_server" {
+            return Err(CommandPortFailure::CapabilityNotAdmitted);
+        }
+        let view = registry
+            .projection_for_resolution(&resolved)
+            .map_err(work_capability_failure)?;
+        self.intent_interpreter
+            .as_ref()
+            .ok_or(CommandPortFailure::Unavailable)?
+            .interpret(request, &resolved.route().harness_model_id, view)
+            .await
+    }
+
     async fn prepare(
         &self,
         request: &PrepareWorkRequest,
@@ -964,7 +1084,7 @@ impl WorkPreparationPort for ConfiguredWorkPreparationPort {
             return Ok(created);
         }
         let run_id = match work_capability_route.as_ref() {
-            Some(route) => work_capability_run_id(&task.task_id, route)?,
+            Some(route) => work_capability_run_id(&task.task_id, task.work_revision, route)?,
             None => configured_run_id.to_owned(),
         };
 
@@ -1236,7 +1356,7 @@ fn safe_source_path(root: &Path, source_ref: &str) -> Option<PathBuf> {
     path.starts_with(root).then_some(path)
 }
 
-fn persist_input_bundle(
+pub(crate) fn persist_input_bundle(
     root: Option<&Path>,
     digest: &str,
     bytes: &[u8],
@@ -2065,7 +2185,7 @@ mod tests {
             };
             assert_eq!(
                 activate.run_id,
-                work_capability_run_id("task-work-preparation", &expected_route)
+                work_capability_run_id("task-work-preparation", 1, &expected_route)
                     .expect("route-bound run ID")
             );
             assert_ne!(activate.run_id, "legacy-static-run");

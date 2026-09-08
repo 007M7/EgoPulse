@@ -243,6 +243,15 @@ impl DshAcpDriver {
 }
 
 impl NativeHarnessDriver for DshAcpDriver {
+    fn is_dispatch_ready(&self) -> bool {
+        self.pending_approvals.is_empty()
+            && self.active.as_ref().is_none_or(|active| {
+                self.terminal_dispatch_id.as_deref() == Some(active.dispatch_id.as_str())
+                    && (self.completed_dispatch_id.as_deref() != Some(active.dispatch_id.as_str())
+                        || active.output_candidate_taken)
+            })
+    }
+
     fn probe<'a>(
         &'a mut self,
         request: &'a ProbeHarnessRequest,
@@ -256,10 +265,7 @@ impl NativeHarnessDriver for DshAcpDriver {
         material: &'a ResolvedDispatchMaterial,
     ) -> NativeHarnessFuture<'a, Result<DriverDelivery, DriverError>> {
         Box::pin(async move {
-            if self.active.is_some()
-                && self.terminal_dispatch_id.as_deref()
-                    != self.active.as_ref().map(|value| value.dispatch_id.as_str())
-            {
+            if !self.is_dispatch_ready() {
                 return Err(dependency_error("DSH_ACP_ACTIVE_DISPATCH_EXISTS"));
             }
             self.ensure_session(&material.workspace_root).await?;
@@ -1143,6 +1149,7 @@ mod tests {
             r"C:\dsh.exe",
             std::env::current_dir().expect("cwd"),
         ));
+        assert!(driver.is_dispatch_ready());
         driver.active = Some(ActiveDispatch {
             dispatch_id: "dispatch:dsh-output-candidate".to_owned(),
             native_session_ref: "dsh-session-candidate".to_owned(),
@@ -1150,10 +1157,12 @@ mod tests {
             output_text: "committed answer".to_owned(),
             output_candidate_taken: false,
         });
+        assert!(!driver.is_dispatch_ready());
         driver.record_terminal_dispatch(
             "dispatch:dsh-output-candidate",
             LifecycleKind::ExecutionCompleted,
         );
+        assert!(!driver.is_dispatch_ready());
         let envelope = DispatchEnvelope {
             dispatch_id: "dispatch:dsh-output-candidate".to_owned(),
             ..DispatchEnvelope::default()
@@ -1168,6 +1177,7 @@ mod tests {
         assert_eq!(candidate.native_completion_ref, "dsh-acp-prompt:41");
         assert_eq!(candidate.media_type, "text/plain; charset=utf-8");
         assert_eq!(candidate.content, b"committed answer");
+        assert!(driver.is_dispatch_ready());
         assert!(
             driver
                 .take_terminal_output_candidate(&envelope)
@@ -1196,6 +1206,7 @@ mod tests {
                 output_candidate_taken: false,
             });
             driver.record_terminal_dispatch(&dispatch_id, kind);
+            assert!(driver.is_dispatch_ready());
             let envelope = DispatchEnvelope {
                 dispatch_id,
                 ..DispatchEnvelope::default()

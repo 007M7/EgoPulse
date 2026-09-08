@@ -169,6 +169,7 @@ pub struct TaskAuthority {
     store: TaskStore,
     creation_guard: Box<dyn TaskCreationGuard>,
     transition_guard: Box<dyn TaskTransitionGuard>,
+    active_no_run_cancellation_proof: Option<NoRunTaskCancellationProof>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -187,6 +188,24 @@ pub struct PendingTaskActivation {
     pub event: TaskEvent,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnclaimedTaskActivation {
+    pub message_id: String,
+    pub payload_digest_sha256: String,
+    pub task_id: String,
+    pub task_revision: u64,
+    pub work_revision: u64,
+    pub reserved_run_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoRunTaskCancellationProof {
+    pub activation: UnclaimedTaskActivation,
+    pub cancellation_message_id: String,
+    pub cancellation_payload_digest_sha256: String,
+    pub collaboration_absence_evidence_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingTaskVerification {
     pub message_id: String,
@@ -194,9 +213,10 @@ pub struct PendingTaskVerification {
     pub event: TaskEvent,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskCancellationReconciliation {
     NeedsNativeDelivery,
+    NeedsNoRunProof(UnclaimedTaskActivation),
     SettledAndAcknowledged {
         status: TaskStatus,
         committed: bool,
@@ -229,6 +249,7 @@ impl TaskAuthority {
             store,
             creation_guard: Box::new(creation_guard),
             transition_guard: Box::new(transition_guard),
+            active_no_run_cancellation_proof: None,
         })
     }
 
@@ -425,6 +446,62 @@ impl TaskAuthority {
             .map_err(TaskAuthorityFailure::from)
     }
 
+    /// Reads an exact command receipt without executing a transition. Current
+    /// Task state may have advanced since this command committed.
+    pub fn replay_recorded(
+        &self,
+        command: &TaskCommand,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<Option<TaskCommandResult>, TaskAuthorityFailure> {
+        let Some(operation) = operation_name(command) else {
+            return Ok(None);
+        };
+        if !principal.authenticated
+            || principal.principal_id.trim().is_empty()
+            || !operation_allowed(operation, principal.kind)
+        {
+            return Ok(Some(error_result(
+                TaskErrorCode::PermissionDenied,
+                "PRINCIPAL_OPERATION_NOT_ALLOWED",
+                None,
+            )));
+        }
+        let Some(meta) = command_metadata(command).filter(|meta| metadata_is_complete(meta)) else {
+            return Ok(Some(error_result(
+                TaskErrorCode::InvalidArgument,
+                "COMMAND_METADATA_INCOMPLETE",
+                None,
+            )));
+        };
+        let digest = canonical_request_digest(command)?;
+        if digest != meta.request_digest_sha256 {
+            return Ok(Some(error_result(
+                TaskErrorCode::InvalidArgument,
+                "REQUEST_DIGEST_MISMATCH",
+                None,
+            )));
+        }
+        let Some(record) = self.store.idempotency_record(
+            &principal.principal_id,
+            operation,
+            &meta.idempotency_scope,
+            &meta.idempotency_key,
+        )?
+        else {
+            return Ok(None);
+        };
+        if record.request_digest_sha256 != digest {
+            return Ok(Some(error_result(
+                TaskErrorCode::IdempotencyConflict,
+                "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST",
+                Some(record.task_revision),
+            )));
+        }
+        let mut result = TaskCommandResult::decode(record.result.as_slice())?;
+        result.replayed = true;
+        Ok(Some(result))
+    }
+
     pub fn pending_cross_authority_outbox(
         &self,
     ) -> Result<Vec<PendingTaskOutbox>, TaskAuthorityFailure> {
@@ -437,9 +514,9 @@ impl TaskAuthority {
         &self,
     ) -> Result<Vec<PendingTaskActivation>, TaskAuthorityFailure> {
         self.store
-            .pending_cross_authority_outbox()?
+            .task_activation_outboxes(None)?
             .into_iter()
-            .filter(|message| message.destination_domain == COLLABORATION_CONTROL_DESTINATION)
+            .filter(|message| matches!(message.delivery_state.as_str(), "pending" | "delivered"))
             .map(|message| {
                 let actual_digest = hex::encode(Sha256::digest(&message.payload));
                 if actual_digest != message.payload_digest_sha256 {
@@ -464,6 +541,22 @@ impl TaskAuthority {
                 })
             })
             .collect()
+    }
+
+    /// Atomically claims one exact activation before Collaboration work is
+    /// created. Exact replay of an already-claimed handoff succeeds; held and
+    /// consumed handoffs cannot be reclaimed.
+    pub fn claim_task_activation(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, TaskAuthorityFailure> {
+        if message_id.trim().is_empty() || !sha256_is_complete(expected_payload_digest_sha256) {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        self.store
+            .claim_task_activation(message_id, expected_payload_digest_sha256)
+            .map_err(TaskAuthorityFailure::from)
     }
 
     /// Returns a Task's durable cancellation request for the Collaboration
@@ -554,6 +647,9 @@ impl TaskAuthority {
         if live.status == TaskStatus::CancellationPending as i32 && live.revision == frozen.revision
         {
             if live.current_run_id.is_some() {
+                if let Some(activation) = self.held_unclaimed_activation(&live)? {
+                    return Ok(TaskCancellationReconciliation::NeedsNoRunProof(activation));
+                }
                 return Ok(TaskCancellationReconciliation::NeedsNativeDelivery);
             }
             let issued_at = handoff
@@ -621,6 +717,239 @@ impl TaskAuthority {
             committed: false,
             replayed: true,
         })
+    }
+
+    /// Settles an Active Task whose activation was atomically held before any
+    /// Collaboration run was created. The caller must first prove through the
+    /// Collaboration owner that the reserved run identity is absent.
+    pub fn settle_no_run_task_cancellation(
+        &mut self,
+        proof: &NoRunTaskCancellationProof,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<TaskCancellationReconciliation, TaskAuthorityFailure> {
+        if !principal.authenticated
+            || principal.kind != PrincipalKind::CollaborationControl
+            || principal.principal_id.trim().is_empty()
+            || proof.cancellation_message_id.trim().is_empty()
+            || !sha256_is_complete(&proof.cancellation_payload_digest_sha256)
+            || proof.collaboration_absence_evidence_id.trim().is_empty()
+        {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        let record = self
+            .store
+            .cross_authority_outbox_record(
+                &proof.cancellation_message_id,
+                COLLABORATION_CANCELLATION_DESTINATION,
+            )?
+            .ok_or(TaskAuthorityFailure::InvalidCrossAuthorityHandoff)?;
+        if record.payload_digest_sha256 != proof.cancellation_payload_digest_sha256
+            || hex::encode(Sha256::digest(&record.payload)) != record.payload_digest_sha256
+        {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        let cancellation_event = TaskEvent::decode(record.payload.as_slice())?;
+        let frozen = cancellation_event
+            .snapshot
+            .as_ref()
+            .ok_or(TaskAuthorityFailure::InvalidCrossAuthorityHandoff)?;
+        if cancellation_event.kind != TaskEventKind::CancellationRequested as i32
+            || cancellation_event.task_id != proof.activation.task_id
+            || cancellation_event.resulting_revision != frozen.revision
+            || cancellation_event.work_revision != frozen.work_revision
+            || frozen.current_run_id.as_deref() != Some(proof.activation.reserved_run_id.as_str())
+        {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        let live = self
+            .store
+            .task_snapshot(&cancellation_event.task_id)?
+            .ok_or(TaskAuthorityFailure::InvalidCrossAuthorityHandoff)
+            .and_then(|bytes| TaskSnapshot::decode(bytes.as_slice()).map_err(Into::into))?;
+        self.validate_held_activation(&proof.activation)?;
+
+        if matches!(live.status, value if value == TaskStatus::Cancelled as i32)
+            && record.delivery_state == "consumed"
+        {
+            let committed = self
+                .store
+                .committed_event_at_revision(&live.task_id, live.revision)?
+                .ok_or(TaskAuthorityFailure::InvalidCrossAuthorityHandoff)?;
+            let event = TaskEvent::decode(committed.payload.as_slice())?;
+            let expected_evidence = [
+                format!("cancellation-receipt:{}", cancellation_event.event_id),
+                format!(
+                    "collaboration-no-run:{}",
+                    proof.collaboration_absence_evidence_id
+                ),
+                format!("held-activation:{}", proof.activation.message_id),
+                format!(
+                    "held-activation-digest:{}",
+                    proof.activation.payload_digest_sha256
+                ),
+                format!("reserved-run:{}", proof.activation.reserved_run_id),
+            ];
+            if event.kind != TaskEventKind::CancellationRecorded as i32
+                || !expected_evidence
+                    .iter()
+                    .all(|expected| event.evidence_refs.contains(expected))
+            {
+                return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+            }
+            return Ok(TaskCancellationReconciliation::SettledAndAcknowledged {
+                status: TaskStatus::Cancelled,
+                committed: false,
+                replayed: true,
+            });
+        }
+        if record.delivery_state != "pending"
+            || live.status != TaskStatus::CancellationPending as i32
+            || live.revision != frozen.revision
+            || live.work_revision != frozen.work_revision
+            || live.current_run_id != frozen.current_run_id
+        {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+
+        let issued_at = cancellation_event
+            .occurred_at
+            .ok_or(TaskAuthorityFailure::InvalidCrossAuthorityHandoff)?;
+        let stable_identity = cancellation_event.event_id.clone();
+        let mut command = TaskCommand {
+            command: Some(task_command::Command::RecordTaskCancellationOutcome(
+                egopulse_domain_contracts::v01::egopulse::task::v1::RecordTaskCancellationOutcomeCommand {
+                    meta: Some(CommandMetadata {
+                        command_id: format!("settle-unclaimed-activation-cancellation-{stable_identity}"),
+                        idempotency_key: format!("unclaimed-activation-cancellation:{stable_identity}"),
+                        idempotency_scope: "task-authority/unclaimed-activation-cancellation/v1".to_owned(),
+                        request_digest_sha256: String::new(),
+                        issued_at: Some(issued_at),
+                        correlation_id: cancellation_event.correlation_id.clone(),
+                        causation_id: Some(stable_identity.clone()),
+                    }),
+                    task_id: live.task_id.clone(),
+                    expected_revision: live.revision,
+                    outcome: TaskStatus::Cancelled as i32,
+                    cancellation_receipt_id: stable_identity,
+                },
+            )),
+        };
+        let digest = canonical_request_digest(&command)?;
+        command_metadata_mut(&mut command)
+            .expect("constructed no-run cancellation outcome metadata")
+            .request_digest_sha256 = digest;
+        self.active_no_run_cancellation_proof = Some(proof.clone());
+        let result = self.execute(&command, principal);
+        self.active_no_run_cancellation_proof = None;
+        let result = result?;
+        let Some(task_command_result::Outcome::Task(settled)) = result.outcome.as_ref() else {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        };
+        if settled.status != TaskStatus::Cancelled as i32
+            || settled.task_id != live.task_id
+            || settled.current_run_id.is_some()
+        {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        if !self.acknowledge_cross_authority_outbox(
+            &proof.cancellation_message_id,
+            &proof.cancellation_payload_digest_sha256,
+        )? {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        Ok(TaskCancellationReconciliation::SettledAndAcknowledged {
+            status: TaskStatus::Cancelled,
+            committed: result.committed_event.is_some(),
+            replayed: result.replayed,
+        })
+    }
+
+    fn held_unclaimed_activation(
+        &self,
+        task: &TaskSnapshot,
+    ) -> Result<Option<UnclaimedTaskActivation>, TaskAuthorityFailure> {
+        let Some(reserved_run_id) = task.current_run_id.as_deref() else {
+            return Ok(None);
+        };
+        let matches = self
+            .store
+            .task_activation_outboxes(Some(&task.task_id))?
+            .into_iter()
+            .filter_map(|record| {
+                if hex::encode(Sha256::digest(&record.payload)) != record.payload_digest_sha256 {
+                    return Some(Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff));
+                }
+                let event = match TaskEvent::decode(record.payload.as_slice()) {
+                    Ok(event) => event,
+                    Err(error) => return Some(Err(error.into())),
+                };
+                let Some(snapshot) = event.snapshot.as_ref() else {
+                    return Some(Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff));
+                };
+                if event.kind != TaskEventKind::Activated as i32
+                    || event.task_id != snapshot.task_id
+                    || event.resulting_revision != snapshot.revision
+                    || event.work_revision != snapshot.work_revision
+                    || snapshot.current_run_id.as_deref() != Some(reserved_run_id)
+                {
+                    return Some(Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff));
+                }
+                if snapshot.task_id != task.task_id
+                    || snapshot.work_revision != task.work_revision
+                    || record.delivery_state != "held"
+                {
+                    return None;
+                }
+                Some(Ok(UnclaimedTaskActivation {
+                    message_id: record.message_id,
+                    payload_digest_sha256: record.payload_digest_sha256,
+                    task_id: snapshot.task_id.clone(),
+                    task_revision: snapshot.revision,
+                    work_revision: snapshot.work_revision,
+                    reserved_run_id: reserved_run_id.to_owned(),
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if matches.len() > 1 {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        Ok(matches.into_iter().next())
+    }
+
+    fn validate_held_activation(
+        &self,
+        activation: &UnclaimedTaskActivation,
+    ) -> Result<(), TaskAuthorityFailure> {
+        let record = self
+            .store
+            .cross_authority_outbox_record(
+                &activation.message_id,
+                COLLABORATION_CONTROL_DESTINATION,
+            )?
+            .ok_or(TaskAuthorityFailure::InvalidCrossAuthorityHandoff)?;
+        if record.delivery_state != "held"
+            || record.payload_digest_sha256 != activation.payload_digest_sha256
+            || hex::encode(Sha256::digest(&record.payload)) != record.payload_digest_sha256
+        {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        let event = TaskEvent::decode(record.payload.as_slice())?;
+        let snapshot = event
+            .snapshot
+            .as_ref()
+            .ok_or(TaskAuthorityFailure::InvalidCrossAuthorityHandoff)?;
+        if event.kind != TaskEventKind::Activated as i32
+            || event.task_id != activation.task_id
+            || event.resulting_revision != activation.task_revision
+            || event.work_revision != activation.work_revision
+            || snapshot.task_id != activation.task_id
+            || snapshot.revision != activation.task_revision
+            || snapshot.work_revision != activation.work_revision
+            || snapshot.current_run_id.as_deref() != Some(activation.reserved_run_id.as_str())
+        {
+            return Err(TaskAuthorityFailure::InvalidCrossAuthorityHandoff);
+        }
+        Ok(())
     }
 
     /// Returns only durable EvidenceSubmitted handoffs addressed to the
@@ -1135,13 +1464,69 @@ impl TaskAuthority {
                         Some(current.revision),
                     ));
                 }
+                let uses_task_event_as_active_receipt = current.current_run_id.is_some()
+                    && self.pending_task_cancellations()?.iter().any(|pending| {
+                        pending.event.task_id == current.task_id
+                            && pending.event.resulting_revision == current.revision
+                            && pending.event.event_id == value.cancellation_receipt_id
+                            && pending.event.snapshot.as_ref().is_some_and(|snapshot| {
+                                snapshot.current_run_id == current.current_run_id
+                            })
+                    });
+                let no_run_evidence = if uses_task_event_as_active_receipt {
+                    let Some(proof) = self.active_no_run_cancellation_proof.as_ref() else {
+                        return Ok(error_result(
+                            TaskErrorCode::UnverifiedReference,
+                            "UNCLAIMED_ACTIVATION_CANCELLATION_PROOF_MISSING",
+                            Some(current.revision),
+                        ));
+                    };
+                    let activation_matches = proof.activation.task_id == current.task_id
+                        && proof.activation.work_revision == current.work_revision
+                        && current.current_run_id.as_deref()
+                            == Some(proof.activation.reserved_run_id.as_str())
+                        && value.outcome == TaskStatus::Cancelled as i32
+                        && value.cancellation_receipt_id
+                            == proof
+                                .cancellation_message_id
+                                .strip_prefix("task-outbox-cancellation-")
+                                .unwrap_or_default()
+                        && self.held_unclaimed_activation(&current)?.as_ref()
+                            == Some(&proof.activation);
+                    if !activation_matches {
+                        return Ok(error_result(
+                            TaskErrorCode::UnverifiedReference,
+                            "UNCLAIMED_ACTIVATION_CANCELLATION_PROOF_MISMATCH",
+                            Some(current.revision),
+                        ));
+                    }
+                    vec![
+                        format!(
+                            "collaboration-no-run:{}",
+                            proof.collaboration_absence_evidence_id
+                        ),
+                        format!("held-activation:{}", proof.activation.message_id),
+                        format!(
+                            "held-activation-digest:{}",
+                            proof.activation.payload_digest_sha256
+                        ),
+                        format!("reserved-run:{}", proof.activation.reserved_run_id),
+                    ]
+                } else {
+                    Vec::new()
+                };
                 next.status = value.outcome;
+                if uses_task_event_as_active_receipt {
+                    next.current_run_id = None;
+                }
+                let mut cancellation_evidence = vec![format!(
+                    "cancellation-receipt:{}",
+                    value.cancellation_receipt_id
+                )];
+                cancellation_evidence.extend(no_run_evidence);
                 (
                     TaskEventKind::CancellationRecorded,
-                    vec![format!(
-                        "cancellation-receipt:{}",
-                        value.cancellation_receipt_id
-                    )],
+                    cancellation_evidence,
                     None,
                 )
             }
@@ -1243,6 +1628,10 @@ impl TaskAuthority {
             read_outbox_message_id: &read_outbox_id,
             event_digest_sha256: &event_digest,
             cross_authority_outbox: cross,
+            hold_pending_activation_for_task: matches!(
+                command.command.as_ref(),
+                Some(task_command::Command::RequestTaskCancellation(_))
+            ) && current.status == TaskStatus::Active as i32,
         })?;
         if !changed {
             return Ok(error_result(
@@ -1506,6 +1895,10 @@ fn contract_reference_is_complete(reference: &ContractReference) -> bool {
             .sha256
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sha256_is_complete(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn creation_guard_error(rejection: CreationGuardRejection) -> TaskCommandResult {

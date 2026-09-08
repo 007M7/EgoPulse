@@ -180,6 +180,7 @@ pub(super) struct MutationCommit<'a> {
     pub read_outbox_message_id: &'a str,
     pub event_digest_sha256: &'a str,
     pub cross_authority_outbox: Option<CrossAuthorityOutbox<'a>>,
+    pub hold_pending_activation_for_task: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,6 +201,14 @@ pub struct PendingTaskOutbox {
     pub destination_domain: String,
     pub payload_digest_sha256: String,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct TaskActivationOutboxRecord {
+    pub message_id: String,
+    pub payload_digest_sha256: String,
+    pub payload: Vec<u8>,
+    pub delivery_state: String,
 }
 
 pub(super) struct CommittedTaskEvent {
@@ -496,6 +505,21 @@ impl TaskStore {
                 params![commit.event_id, outbox.message_id, outbox.destination_domain],
             )?;
         }
+        if commit.hold_pending_activation_for_task {
+            let changed = transaction.execute(
+                "UPDATE task_cross_authority_outbox
+                 SET delivery_state='held'
+                 WHERE destination_domain='collaboration-control'
+                   AND delivery_state='pending'
+                   AND source_event_id IN (
+                     SELECT event_id FROM task_events WHERE task_id=?1
+                   )",
+                [commit.task_id],
+            )?;
+            if changed > 1 {
+                return Err(StoreError::IntegrityFailure);
+            }
+        }
         transaction.execute(
             "INSERT INTO task_commit_receipts(event_id,aggregate_id,aggregate_revision,outbox_message_id,idempotency_key,request_digest_sha256,store_epoch,acknowledged_after_durability_barrier,committed_at_seconds) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8)",
             params![commit.event_id, commit.task_id, commit.resulting_revision as i64, commit.read_outbox_message_id, commit.idempotency_key, commit.request_digest_sha256, self.store_epoch, commit.committed_at_seconds],
@@ -583,6 +607,91 @@ impl TaskStore {
             .map_err(StoreError::from)
     }
 
+    pub fn task_activation_outboxes(
+        &self,
+        task_id: Option<&str>,
+    ) -> Result<Vec<TaskActivationOutboxRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT o.message_id,o.canonical_payload_digest_sha256,o.payload,o.delivery_state
+             FROM task_cross_authority_outbox o
+             JOIN task_events e ON e.event_id=o.source_event_id
+             WHERE o.destination_domain='collaboration-control'
+               AND (?1 IS NULL OR e.task_id=?1)
+               AND o.delivery_state IN ('pending','delivered','held')
+             ORDER BY o.created_at_seconds,o.message_id",
+        )?;
+        statement
+            .query_map([task_id], |row| {
+                Ok(TaskActivationOutboxRecord {
+                    message_id: row.get(0)?,
+                    payload_digest_sha256: row.get(1)?,
+                    payload: row.get(2)?,
+                    delivery_state: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn cross_authority_outbox_record(
+        &self,
+        message_id: &str,
+        destination_domain: &str,
+    ) -> Result<Option<TaskActivationOutboxRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT message_id,canonical_payload_digest_sha256,payload,delivery_state
+                 FROM task_cross_authority_outbox
+                 WHERE message_id=?1 AND destination_domain=?2",
+                params![message_id, destination_domain],
+                |row| {
+                    Ok(TaskActivationOutboxRecord {
+                        message_id: row.get(0)?,
+                        payload_digest_sha256: row.get(1)?,
+                        payload: row.get(2)?,
+                        delivery_state: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn claim_task_activation(
+        &mut self,
+        message_id: &str,
+        expected_payload_digest_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE task_cross_authority_outbox
+             SET delivery_state='delivered'
+             WHERE message_id=?1
+               AND destination_domain='collaboration-control'
+               AND canonical_payload_digest_sha256=?2
+               AND delivery_state='pending'",
+            params![message_id, expected_payload_digest_sha256],
+        )?;
+        if changed == 1 {
+            transaction.commit()?;
+            return Ok(true);
+        }
+        let state = transaction
+            .query_row(
+                "SELECT delivery_state FROM task_cross_authority_outbox
+                 WHERE message_id=?1
+                   AND destination_domain='collaboration-control'
+                   AND canonical_payload_digest_sha256=?2",
+                params![message_id, expected_payload_digest_sha256],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        transaction.commit()?;
+        Ok(state.as_deref() == Some("delivered"))
+    }
+
     pub fn pending_projection_outbox(
         &self,
     ) -> Result<Vec<PendingTaskProjectionOutbox>, StoreError> {
@@ -654,7 +763,7 @@ impl TaskStore {
         let changed = self.connection.execute(
             "UPDATE task_cross_authority_outbox SET delivery_state='consumed'
              WHERE message_id=?1 AND canonical_payload_digest_sha256=?2
-               AND delivery_state='pending'",
+               AND delivery_state IN ('pending','delivered')",
             params![message_id, expected_payload_digest_sha256],
         )?;
         Ok(changed == 1)

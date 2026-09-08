@@ -47,13 +47,16 @@ use crate::{
     },
     repository_dispatch::{
         FinalWorkspaceManifestEntry, FinalWorkspaceManifestPayload,
-        InitialWorkspaceManifestPayload, RepositoryBaselinePayload, derived_workspace_ref,
-        repository_source_binding_ref,
+        InitialWorkspaceManifestPayload, RepositoryBaselinePayload, derived_rework_workspace_ref,
+        derived_workspace_ref, repository_source_binding_ref,
     },
     repository_material::{
         FrozenContractReference, FrozenRepositoryMaterialV1, RepositoryAcceptanceCommandV1,
         RepositoryAcceptanceContractV1, RepositoryCommandRequirement,
         RepositoryEvidenceRequirement,
+    },
+    rework_preparation::{
+        ReworkContentAddress, ReworkLineageBinding, SealedReworkRepositoryCarryForward,
     },
     verification_material::{
         RepositoryCommandObservationOutcome, RepositoryVerificationMaterialPolicy,
@@ -882,6 +885,181 @@ async fn loader_ignores_overwritten_live_contract_and_uses_frozen_context_body()
         material.scope.acceptance_contract_ref,
         fixture.frozen.acceptance_contract_ref()
     );
+}
+
+#[tokio::test]
+async fn rework_loader_verifies_complete_prior_set_and_derives_revision_workspace() {
+    let fixture = Fixture::new().await;
+    let first = fixture
+        .resolver()
+        .resolve(&fixture.binding, unix_seconds())
+        .expect("first sealed repository material");
+    let prior_lineage = fixture
+        .binding
+        .lineage
+        .as_ref()
+        .expect("prior lineage")
+        .clone();
+    let carry = sealed_rework_carry(&fixture, &first, &prior_lineage);
+    let current_lineage = rework_lineage(&prior_lineage);
+    let compiled_context = compiled_rework_context(&fixture.frozen, &carry);
+
+    fixture
+        .resolver()
+        .verify_rework_carry_forward_for_test(
+            &compiled_context,
+            &current_lineage,
+            &fixture.frozen.acceptance_contract_ref(),
+            &fixture.frozen,
+        )
+        .expect("complete prior ArtifactSet carry is reusable");
+
+    let workspace_ref = derived_rework_workspace_ref(
+        &current_lineage.task_id,
+        current_lineage.work_revision,
+        &first.baseline.input_snapshot_id,
+        &first.baseline.baseline_commit,
+        &carry.repository_patch_sha256,
+    );
+    assert_ne!(workspace_ref, first.baseline.workspace_ref);
+}
+
+#[tokio::test]
+async fn rework_loader_rejects_carry_with_wrong_sealed_manifest_digest() {
+    let fixture = Fixture::new().await;
+    let first = fixture
+        .resolver()
+        .resolve(&fixture.binding, unix_seconds())
+        .expect("first sealed repository material");
+    let prior_lineage = fixture
+        .binding
+        .lineage
+        .as_ref()
+        .expect("prior lineage")
+        .clone();
+    let mut carry = sealed_rework_carry(&fixture, &first, &prior_lineage);
+    carry.final_manifest_sha256 = "f".repeat(64);
+    let compiled_context = compiled_rework_context(&fixture.frozen, &carry);
+
+    assert_eq!(
+        fixture.resolver().verify_rework_carry_forward_for_test(
+            &compiled_context,
+            &rework_lineage(&prior_lineage),
+            &fixture.frozen.acceptance_contract_ref(),
+            &fixture.frozen,
+        ),
+        Err(VerificationMaterialError::Invalid)
+    );
+}
+
+fn sealed_rework_carry(
+    fixture: &Fixture,
+    first: &crate::verification_material::VerifiedRepositoryVerificationMaterial,
+    lineage: &LineageBinding,
+) -> SealedReworkRepositoryCarryForward {
+    SealedReworkRepositoryCarryForward {
+        prior_task_id: lineage.task_id.clone(),
+        prior_task_revision: lineage.task_revision,
+        prior_work_revision: lineage.work_revision,
+        artifact_set_id: fixture.binding.artifact_set_id.clone(),
+        artifact_set_manifest: ReworkContentAddress::from(
+            fixture
+                .binding
+                .artifact_set_manifest
+                .as_ref()
+                .expect("prior set manifest"),
+        ),
+        lineage: ReworkLineageBinding::from(lineage),
+        baseline_artifact_id: first.baseline.artifact.descriptor.artifact_id.clone(),
+        initial_manifest_artifact_id: first.initial_manifest.descriptor.artifact_id.clone(),
+        repository_patch_artifact_id: first.patch.descriptor.artifact_id.clone(),
+        repository_patch_sha256: first
+            .patch
+            .descriptor
+            .content
+            .as_ref()
+            .expect("prior patch content")
+            .digest
+            .clone(),
+        final_manifest_artifact_id: first.final_manifest.descriptor.artifact_id.clone(),
+        final_manifest_sha256: first
+            .final_manifest
+            .descriptor
+            .content
+            .as_ref()
+            .expect("prior final manifest content")
+            .digest
+            .clone(),
+        workspace_ref: first.baseline.workspace_ref.clone(),
+        source_binding_ref: first.baseline.source_binding_ref.clone(),
+        frozen_material: fixture.frozen.clone(),
+    }
+}
+
+fn rework_lineage(prior: &LineageBinding) -> LineageBinding {
+    LineageBinding {
+        task_id: prior.task_id.clone(),
+        // Return, Verification, and Verdict transitions can advance the Task
+        // several revisions after the execution Artifact lineage. Rework then
+        // adds Revise and Activate before this next execution lineage.
+        task_revision: prior.task_revision + 5,
+        work_revision: prior.work_revision + 1,
+        run_id: "run:verification-material:rework".to_owned(),
+        run_revision: 1,
+        step_id: "step:verification-material:rework".to_owned(),
+        step_revision: 1,
+        attempt_id: "attempt:verification-material:rework".to_owned(),
+        attempt_revision: 1,
+        dispatch_id: "dispatch:verification-material:rework".to_owned(),
+        fencing_token: prior.fencing_token + 1,
+    }
+}
+
+fn compiled_rework_context(
+    frozen: &FrozenRepositoryMaterialV1,
+    carry: &SealedReworkRepositoryCarryForward,
+) -> Vec<u8> {
+    let acceptance = frozen.acceptance_contract_ref();
+    serde_json::to_vec(&serde_json::json!({
+        "prompt": "apply the sealed rework directive",
+        "repository_material_version": 1,
+        "repository_material": frozen,
+        "rework_followup": {
+            "rework_followup_version": 1,
+            "memory_mode": "frozen_original_context",
+            "owner_principal_id": "founder:verification-material",
+            "task_id": carry.prior_task_id,
+            "task_revision": carry.prior_task_revision + 3,
+            "prior_work_revision": carry.prior_work_revision,
+            "work_type": "governed_repository_change",
+            "target_scope_ref": "project:fixture",
+            "acceptance_contract_ref": {
+                "contract_id": acceptance.contract_id,
+                "version": acceptance.version,
+                "sha256": acceptance.sha256
+            },
+            "budget_profile_ref": "budget:fixture",
+            "founder_verdict_id": "verdict:rework",
+            "verdict_state_revision": 1,
+            "verdict_application_event_id": "event:rework",
+            "directive_id": "directive:rework",
+            "directive_reason_code": "FOUNDER_REWORK_REQUIRED",
+            "required_changes_artifact_id": "artifact:required-changes",
+            "required_changes_content_sha256": "a".repeat(64),
+            "required_changes_material_id": "material:required-changes",
+            "required_changes_author_principal_id": "founder:verification-material",
+            "required_changes_body": "keep the prior sealed changes and revise them",
+            "required_changes_coverage": {
+                "risk_category": 0,
+                "discrepancy_ids": [],
+                "unverified_item_ids": []
+            },
+            "bound_workspace_ref": carry.workspace_ref,
+            "bound_source_binding_ref": carry.source_binding_ref,
+            "repository_carry_forward": carry
+        }
+    }))
+    .expect("compiled rework Context")
 }
 
 fn fixture_lineage() -> LineageBinding {
