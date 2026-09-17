@@ -24,7 +24,8 @@ use egopulse_domain_contracts::v01::egopulse::{
 use egopulse_harness_adapter::{DriverErrorCertainty, NativeHarnessDriver};
 use egopulse_verification_authority::{
     CheckerOutputRole, CheckerProcessFailure, GovernedVerificationCheckOutput,
-    GovernedVerificationChecker, GovernedVerificationCheckerError, SegoMappedResult,
+    GovernedVerificationChecker, GovernedVerificationCheckerError,
+    SEGO_REVIEW_ARTIFACT_CONTRACT_ID, SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION, SegoMappedResult,
     SegoMapperPolicy, checker_failure_result, checker_output_execution_ref, map_sego_review,
 };
 use prost::Message;
@@ -354,6 +355,8 @@ impl RepositoryVerificationChecker {
             criterion_id: "review".into(),
             requirement: CriterionRequirement::MustPass,
             checker_profile_ref: profile_ref(review_profile),
+            contract_id: SEGO_REVIEW_ARTIFACT_CONTRACT_ID.to_owned(),
+            contract_revision: SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION,
             expected_scope: scope,
             expected_diff_hash: subject_digest,
             expected_reviewer: review_profile.checker_id.clone(),
@@ -898,6 +901,8 @@ mod tests {
                 "review",
                 CheckerAssuranceClass::ModelAssisted,
             )),
+            contract_id: SEGO_REVIEW_ARTIFACT_CONTRACT_ID.to_owned(),
+            contract_revision: SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION,
             expected_scope: "scope:one".into(),
             expected_diff_hash: "b".repeat(64),
             expected_reviewer: "codex-review".into(),

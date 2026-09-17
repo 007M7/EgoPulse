@@ -9,6 +9,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
+/// The Sego review contract this mapper is written against. The review
+/// artifact payload carries no contract-id or revision field, so the contract
+/// identity cannot be read back from the artifact; it is pinned here and in
+/// mapper configuration. A Sego contract revision bump must update both pins
+/// deliberately and re-run the fixture-backed mapper tests.
+pub const SEGO_REVIEW_ARTIFACT_CONTRACT_ID: &str = "sego.review.artifact/v1";
+pub const SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION: u64 = 2;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegoFindingEvidenceBinding {
     pub evidence_id: String,
@@ -21,6 +29,8 @@ pub struct SegoMapperPolicy {
     pub criterion_id: String,
     pub requirement: CriterionRequirement,
     pub checker_profile_ref: ContractReference,
+    pub contract_id: String,
+    pub contract_revision: u64,
     pub expected_scope: String,
     pub expected_diff_hash: String,
     pub expected_reviewer: String,

@@ -417,6 +417,10 @@ async fn exercise_verification_worker(unfinished_run: bool) {
                 criterion_id: "criterion-g4-10".to_owned(),
                 requirement: CriterionRequirement::MustPass,
                 checker_profile_ref: mapper_profile_ref,
+                contract_id: egopulse_verification_authority::SEGO_REVIEW_ARTIFACT_CONTRACT_ID
+                    .to_owned(),
+                contract_revision:
+                    egopulse_verification_authority::SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION,
                 expected_scope: "g4-10".to_owned(),
                 expected_diff_hash: SHA_A.to_owned(),
                 expected_reviewer: "sego".to_owned(),
