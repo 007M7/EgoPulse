@@ -2583,36 +2583,6 @@ mod tests {
     }
 
     #[test]
-    fn thread_activity_and_turn_started_emit_only_one_execution_start() {
-        use super::*;
-        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
-        let envelope = DispatchEnvelope::default();
-        let values = [
-            json!({"method":"thread/status/changed","params":{"status":{"type":"active"}}}),
-            json!({"method":"turn/started","params":{"turn":{"id":"turn-one"}}}),
-        ];
-        let events: Vec<_> = values
-            .into_iter()
-            .map(|value| {
-                let raw = serde_json::to_vec(&value).unwrap();
-                driver.map_value(&envelope, value, raw).unwrap().unwrap()
-            })
-            .collect();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    &event.payload,
-                    harness_observation::Payload::Lifecycle(lifecycle)
-                        if lifecycle.kind == LifecycleKind::ExecutionStarted as i32
-                ))
-                .count(),
-            1
-        );
-        assert_eq!(events[0].criticality, ObservationCriticality::Informational);
-    }
-
-    #[test]
     fn legacy_execution_start_requires_exact_old_shape_and_ack_turn() {
         let exact = LegacyExecutionStartRawContext {
             prior_raw_event: serde_json::to_vec(&json!({

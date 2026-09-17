@@ -42,6 +42,7 @@ use egopulse_policy_decision_authority::{
 use egopulse_process_supervision::is_supported_executable_file;
 use egopulse_verification_authority::{
     ArtifactBackedReferenceResolver, ReferenceRejection, ResolvedVerificationInput,
+    SEGO_REVIEW_ARTIFACT_CONTRACT_ID, SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION,
     SegoFindingEvidenceBinding, SegoMapperPolicy, VerificationAuthority,
     VerificationAuthorityConfig, VerificationAuthorityFailure, VerificationReferenceResolver,
     VerificationSqlCipherKey,
@@ -1323,6 +1324,10 @@ struct SegoMapperFile {
     criterion_id: String,
     requirement: i32,
     checker_profile_ref: ReferenceFile,
+    #[serde(default = "default_mapper_contract_id")]
+    contract_id: String,
+    #[serde(default = "default_mapper_contract_revision")]
+    contract_revision: u64,
     expected_scope: String,
     expected_diff_hash: String,
     expected_reviewer: String,
@@ -1335,6 +1340,14 @@ struct SegoMapperFile {
     raw_output_address: ContentAddressFile,
     #[serde(default)]
     finding_evidence: std::collections::BTreeMap<String, FindingEvidenceFile>,
+}
+
+fn default_mapper_contract_id() -> String {
+    SEGO_REVIEW_ARTIFACT_CONTRACT_ID.to_owned()
+}
+
+fn default_mapper_contract_revision() -> u64 {
+    SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION
 }
 
 #[derive(Debug, Deserialize)]
@@ -2972,10 +2985,22 @@ impl SegoMapperFile {
                 "verification_worker.mapper.failure_threshold",
             ));
         }
+        if self.contract_id != SEGO_REVIEW_ARTIFACT_CONTRACT_ID {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.mapper.contract_id",
+            ));
+        }
+        if self.contract_revision != SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.mapper.contract_revision",
+            ));
+        }
         Ok(SegoMapperPolicy {
             criterion_id: self.criterion_id,
             requirement,
             checker_profile_ref: self.checker_profile_ref.into_typed(),
+            contract_id: self.contract_id,
+            contract_revision: self.contract_revision,
             expected_scope: self.expected_scope,
             expected_diff_hash: self.expected_diff_hash,
             expected_reviewer: self.expected_reviewer,

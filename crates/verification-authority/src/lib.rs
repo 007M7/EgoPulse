@@ -20,8 +20,9 @@ pub use reference_resolver::{
     checker_output_execution_ref,
 };
 pub use sego::{
-    CheckerProcessFailure, SegoFindingEvidenceBinding, SegoMapError, SegoMappedResult,
-    SegoMapperPolicy, checker_failure_result, map_sego_review,
+    CheckerProcessFailure, SEGO_REVIEW_ARTIFACT_CONTRACT_ID,
+    SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION, SegoFindingEvidenceBinding, SegoMapError,
+    SegoMappedResult, SegoMapperPolicy, checker_failure_result, map_sego_review,
 };
 pub use sego_runner::{GovernedSegoRunError, GovernedSegoRunResult, GovernedSegoRunner};
 pub use store::VerificationStoreInspection;

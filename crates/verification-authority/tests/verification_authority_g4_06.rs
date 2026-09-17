@@ -1483,12 +1483,35 @@ fn profile_ref(profile: &CheckerProfile) -> ContractReference {
     )
 }
 
+#[test]
+fn mapper_policy_pins_sego_review_artifact_contract() {
+    assert_eq!(
+        egopulse_verification_authority::SEGO_REVIEW_ARTIFACT_CONTRACT_ID,
+        "sego.review.artifact/v1"
+    );
+    assert_eq!(
+        egopulse_verification_authority::SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION,
+        2
+    );
+    let policy = mapper_policy();
+    assert_eq!(
+        policy.contract_id,
+        egopulse_verification_authority::SEGO_REVIEW_ARTIFACT_CONTRACT_ID
+    );
+    assert_eq!(
+        policy.contract_revision,
+        egopulse_verification_authority::SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION
+    );
+}
+
 fn mapper_policy() -> SegoMapperPolicy {
     let profile = checker_profile(CheckerAssuranceClass::ModelAssisted);
     SegoMapperPolicy {
         criterion_id: "review".to_owned(),
         requirement: CriterionRequirement::MustPass,
         checker_profile_ref: profile_ref(&profile),
+        contract_id: egopulse_verification_authority::SEGO_REVIEW_ARTIFACT_CONTRACT_ID.to_owned(),
+        contract_revision: egopulse_verification_authority::SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION,
         expected_scope: "staged".to_owned(),
         expected_diff_hash: SHA_C.to_owned(),
         expected_reviewer: "sego".to_owned(),

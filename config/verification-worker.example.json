@@ -46,6 +46,8 @@
       "version": "v1",
       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
+    "contract_id": "sego.review.artifact/v1",
+    "contract_revision": 2,
     "expected_scope": "replace-scope",
     "expected_diff_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     "expected_reviewer": "replace-reviewer",
