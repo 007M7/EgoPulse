@@ -2127,6 +2127,7 @@ fn resolve_provider_credential(
 const PRODUCTION_ADMISSIBLE_ROUTES: &[(ProviderId, ProviderHarnessKind)] = &[
     (ProviderId::Gpt, ProviderHarnessKind::CodexAppServer),
     (ProviderId::DeepSeek, ProviderHarnessKind::DshAcp),
+    (ProviderId::DeepSeek, ProviderHarnessKind::OpenCodeAcp),
 ];
 
 fn validate_provider_profiles(
