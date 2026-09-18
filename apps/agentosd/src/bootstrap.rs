@@ -2128,6 +2128,7 @@ const PRODUCTION_ADMISSIBLE_ROUTES: &[(ProviderId, ProviderHarnessKind)] = &[
     (ProviderId::Gpt, ProviderHarnessKind::CodexAppServer),
     (ProviderId::DeepSeek, ProviderHarnessKind::DshAcp),
     (ProviderId::DeepSeek, ProviderHarnessKind::OpenCodeAcp),
+    (ProviderId::DeepSeek, ProviderHarnessKind::CodexAppServer),
 ];
 
 fn validate_provider_profiles(
@@ -3841,12 +3842,12 @@ mod tests {
         validate_provider_profiles(&[profile])
             .expect("Founder-promoted deepseek/dsh production route is admissible");
 
-        // The reverse pairing (deepseek over the codex harness) stays
+        // A pairing outside the table (deepseek over the kimi CLI) stays
         // rejected: promotion is per route, not per provider.
         let cross_harness = ProviderProfileFile {
-            profile_id: "deepseek-codex-production".to_owned(),
+            profile_id: "deepseek-kimi-production".to_owned(),
             provider: "deepseek".to_owned(),
-            harness: "codex_app_server".to_owned(),
+            harness: "kimi_cli_acp".to_owned(),
             admission: "production".to_owned(),
             exact_model: None,
             model_ids: Vec::new(),
