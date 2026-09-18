@@ -2119,6 +2119,16 @@ fn resolve_provider_credential(
     }
 }
 
+/// Production-admissible Provider/Harness routes. ADR-0004 admitted only
+/// GPT-through-Codex; the Founder promoted DeepSeek-over-DSH on 2026-09-19
+/// (harness expansion ruling: claude code/zcode/dsh/kimi selectable; current
+/// compute: DS + opencode). Routes outside this list keep failing Production
+/// admission with `production_admission_pending` until promoted with evidence.
+const PRODUCTION_ADMISSIBLE_ROUTES: &[(ProviderId, ProviderHarnessKind)] = &[
+    (ProviderId::Gpt, ProviderHarnessKind::CodexAppServer),
+    (ProviderId::DeepSeek, ProviderHarnessKind::DshAcp),
+];
+
 fn validate_provider_profiles(
     profiles: &[ProviderBootstrapProfile],
 ) -> Result<(), ProductionBootstrapError> {
@@ -2143,8 +2153,11 @@ fn validate_provider_profiles(
         }
         if profile.admission == ProviderAdmission::Production {
             production_count += 1;
-            if profile.provider != ProviderId::Gpt
-                || profile.harness != ProviderHarnessKind::CodexAppServer
+            if !PRODUCTION_ADMISSIBLE_ROUTES
+                .iter()
+                .any(|(provider, harness)| {
+                    profile.provider == *provider && profile.harness == *harness
+                })
             {
                 return Err(ProductionBootstrapError::InvalidConfiguration(
                     "provider_profiles.production_admission_pending",
@@ -3793,6 +3806,64 @@ mod tests {
         unproven_production_profile.admission = ProviderAdmission::Production;
         assert!(matches!(
             validate_provider_profiles(&[unproven_production_profile]),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "provider_profiles.production_admission_pending"
+            ))
+        ));
+    }
+
+    #[test]
+    fn deepseek_dsh_production_route_is_founder_promoted() {
+        let profile = ProviderProfileFile {
+            profile_id: "deepseek-dsh-production".to_owned(),
+            provider: "deepseek".to_owned(),
+            harness: "dsh_acp".to_owned(),
+            admission: "production".to_owned(),
+            exact_model: None,
+            model_ids: Vec::new(),
+            models: vec![ProviderModelFile {
+                harness_model_id: "deepseek-v4-pro".to_owned(),
+                provider_model_id: "deepseek-v4-pro".to_owned(),
+            }],
+            catalog_snapshot: None,
+            selected_model: Some("deepseek-v4-pro".to_owned()),
+            executable: "dsh".to_owned(),
+            credential: ProviderCredentialFile::ApiKeyEnvironment {
+                source_env: "DEEPSEEK_API_KEY".to_owned(),
+                target_env: "DEEPSEEK_API_KEY".to_owned(),
+            },
+            hold_reason: None,
+        }
+        .into_typed()
+        .expect("deepseek/dsh profile composes");
+
+        validate_provider_profiles(&[profile])
+            .expect("Founder-promoted deepseek/dsh production route is admissible");
+
+        // The reverse pairing (deepseek over the codex harness) stays
+        // rejected: promotion is per route, not per provider.
+        let cross_harness = ProviderProfileFile {
+            profile_id: "deepseek-codex-production".to_owned(),
+            provider: "deepseek".to_owned(),
+            harness: "codex_app_server".to_owned(),
+            admission: "production".to_owned(),
+            exact_model: None,
+            model_ids: Vec::new(),
+            models: vec![ProviderModelFile {
+                harness_model_id: "deepseek-v4-pro".to_owned(),
+                provider_model_id: "deepseek-v4-pro".to_owned(),
+            }],
+            catalog_snapshot: None,
+            selected_model: Some("deepseek-v4-pro".to_owned()),
+            executable: "codex".to_owned(),
+            credential: ProviderCredentialFile::HarnessAccount,
+            hold_reason: None,
+        }
+        .into_typed()
+        .expect("deepseek/codex profile composes as configuration");
+
+        assert!(matches!(
+            validate_provider_profiles(&[cross_harness]),
             Err(ProductionBootstrapError::InvalidConfiguration(
                 "provider_profiles.production_admission_pending"
             ))
