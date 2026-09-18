@@ -536,11 +536,7 @@ impl ProductionBootstrapConfig {
         let codex_profile_index = self
             .provider_profiles
             .iter()
-            .position(|profile| {
-                profile.provider == ProviderId::Gpt
-                    && profile.harness == ProviderHarnessKind::CodexAppServer
-                    && profile.admission == ProviderAdmission::Production
-            })
+            .position(|profile| profile.admission == ProviderAdmission::Production)
             .ok_or(ProductionBootstrapError::InvalidConfiguration(
                 "provider_profiles.production_codex_route_binding",
             ))?;
@@ -974,21 +970,17 @@ impl ProductionBootstrapConfig {
                 self.memory_candidate_producers,
             )?;
         }
-        let codex_provider_profile = self
+        let production_provider_profile = self
             .provider_profiles
             .iter()
-            .find(|profile| {
-                profile.provider == ProviderId::Gpt
-                    && profile.harness == ProviderHarnessKind::CodexAppServer
-                    && profile.admission == ProviderAdmission::Production
-            })
+            .find(|profile| profile.admission == ProviderAdmission::Production)
             .cloned()
             .ok_or(ProductionBootstrapError::InvalidConfiguration(
                 "provider_profiles.production_codex_route_binding",
             ))?;
         providers = providers.with_codex_harness(
             self.codex,
-            codex_provider_profile,
+            production_provider_profile,
             artifact,
             verification,
         )?;
@@ -1559,8 +1551,8 @@ fn compatibility_codex_route_from_parts(
         route_id: "route:compat-codex:v1".to_owned(),
         route_generation: 1,
         provider_profile_id: profile.profile_id.clone(),
-        provider_id: "gpt".to_owned(),
-        harness_id: "codex_app_server".to_owned(),
+        provider_id: profile.provider.as_str().to_owned(),
+        harness_id: profile.harness.as_str().to_owned(),
         harness_model_id: model.harness_model_id.clone(),
         provider_model_id: model.provider_model_id.clone(),
         capability_profile_ref: Some(capability_profile_ref),
@@ -1596,8 +1588,8 @@ fn validate_codex_route_runtime_binding(
         .as_ref()
         .map(|snapshot| snapshot.evidence_digest_sha256.as_str());
     if route.provider_profile_id != profile.profile_id
-        || route.provider_id != "gpt"
-        || route.harness_id != "codex_app_server"
+        || route.provider_id != profile.provider.as_str()
+        || route.harness_id != profile.harness.as_str()
         || route.harness_model_id != model.harness_model_id
         || route.provider_model_id != model.provider_model_id
         || route.capability_profile_ref.as_ref()
@@ -1691,15 +1683,11 @@ fn render_v3_migration(
     validate_provider_profiles(&provider_profiles)?;
     let production_profiles = provider_profiles
         .iter()
-        .filter(|profile| {
-            profile.provider == ProviderId::Gpt
-                && profile.harness == ProviderHarnessKind::CodexAppServer
-                && profile.admission == ProviderAdmission::Production
-        })
+        .filter(|profile| profile.admission == ProviderAdmission::Production)
         .collect::<Vec<_>>();
     let [production_profile] = production_profiles.as_slice() else {
         return Err(ProductionBootstrapError::InvalidConfiguration(
-            "configuration migration requires exactly one production Codex profile",
+            "configuration migration requires exactly one production profile",
         ));
     };
 
@@ -2206,12 +2194,9 @@ impl UserOwnedBootstrapFile {
             .map(ProviderProfileFile::into_typed)
             .collect::<Result<Vec<_>, _>>()?;
         validate_provider_profiles(&provider_profiles)?;
-        let gpt_environment_overrides = provider_profiles
+        let production_environment_overrides = provider_profiles
             .iter()
-            .find(|profile| {
-                profile.provider == ProviderId::Gpt
-                    && profile.admission == ProviderAdmission::Production
-            })
+            .find(|profile| profile.admission == ProviderAdmission::Production)
             .map(|profile| resolve_provider_credential(&profile.credential))
             .transpose()?
             .unwrap_or_default();
@@ -2524,7 +2509,7 @@ impl UserOwnedBootstrapFile {
                 self.codex.codex_executable,
                 "codex.codex_executable",
             )?),
-            environment_overrides: gpt_environment_overrides,
+            environment_overrides: production_environment_overrides,
             work_capability_route: None,
         };
         if let Some(profile) = provider_profiles.iter().find(|profile| {
@@ -2537,21 +2522,17 @@ impl UserOwnedBootstrapFile {
                 "provider_profiles.production_codex_binding",
             ));
         }
-        let production_codex_profile = provider_profiles
+        let production_profile = provider_profiles
             .iter()
-            .find(|profile| {
-                profile.provider == ProviderId::Gpt
-                    && profile.harness == ProviderHarnessKind::CodexAppServer
-                    && profile.admission == ProviderAdmission::Production
-            })
+            .find(|profile| profile.admission == ProviderAdmission::Production)
             .ok_or(ProductionBootstrapError::InvalidConfiguration(
                 "provider_profiles.production_codex_route_binding",
             ))?;
         if let Some(config) = &self.repository_verification {
-            config.validate_model(production_codex_profile)?;
+            config.validate_model(production_profile)?;
         }
         let (admitted_route, default_choice_id, preference_revision) = if migration_required {
-            let route = compatibility_codex_route(production_codex_profile, &codex)?;
+            let route = compatibility_codex_route(production_profile, &codex)?;
             let choice_id = format!("compat-codex:{}", &route.route_binding_sha256[..16]);
             (route, choice_id, 1)
         } else {
@@ -2559,7 +2540,7 @@ impl UserOwnedBootstrapFile {
                 work_capabilities_file.ok_or(ProductionBootstrapError::InvalidConfiguration(
                     "work_capabilities are required in v3",
                 ))?;
-            file.into_typed(production_codex_profile, &codex)?
+            file.into_typed(production_profile, &codex)?
         };
         codex.work_capability_route = Some(admitted_route.clone());
         let work_capability_registry = Arc::new(WorkCapabilityRegistry::new(
