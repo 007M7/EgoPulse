@@ -122,7 +122,7 @@ foreach ($binary in $binaries) {
     Copy-EgoPulseFileExclusively -SourcePath $source -DestinationPath (Join-Path $binRoot $binary)
 }
 
-foreach ($source in @('README.md', 'SECURITY.md', 'WINDOWS-EARLY-ACCESS.md', 'setup-memory-worker.ps1', 'install-egopulse.ps1')) {
+foreach ($source in @('README.md', 'SECURITY.md', 'WINDOWS-EARLY-ACCESS.md', 'setup-memory-worker.ps1', 'install-egopulse.ps1', 'get-codex-models.ps1')) {
     Copy-EgoPulseFileExclusively -SourcePath $source -DestinationPath (Join-Path $candidateRoot (Split-Path -Leaf $source))
 }
 $configRoot = Join-Path $candidateRoot 'config'
@@ -142,6 +142,9 @@ foreach ($source in @('Cargo.lock', 'pnpm-lock.yaml')) {
 $operatorDocsRoot = Join-Path $candidateRoot 'docs/engineering'
 $null = New-Item -ItemType Directory -Path $operatorDocsRoot
 Copy-EgoPulseFileExclusively -SourcePath 'docs/engineering/repository-work-loop.md' -DestinationPath (Join-Path $operatorDocsRoot 'repository-work-loop.md')
+$personalAgentDocsRoot = Join-Path $candidateRoot 'docs/product'
+$null = New-Item -ItemType Directory -Path $personalAgentDocsRoot
+Copy-EgoPulseFileExclusively -SourcePath 'docs/product/personal-agent-usage.md' -DestinationPath (Join-Path $personalAgentDocsRoot 'personal-agent-usage.md')
 Copy-EgoPulseFileExclusively -SourcePath 'workers/foundation-probe/uv.lock' -DestinationPath (Join-Path $manifestRoot 'foundation-probe.uv.lock')
 Copy-EgoPulseFileExclusively -SourcePath 'workers/contract-bindings/uv.lock' -DestinationPath (Join-Path $manifestRoot 'contract-bindings.uv.lock')
 

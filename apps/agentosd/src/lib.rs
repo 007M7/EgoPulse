@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -130,15 +130,16 @@ pub use artifact::{
     ConfiguredArtifactAdmissionGuard, ConfiguredArtifactAdmissionGuardConfig,
 };
 pub use bootstrap::{
-    DenyVerificationReferences, FounderSupportingMaterialConfig, LocalUserPolicyBootstrapConfig,
-    ProductionBootstrapConfig, ProductionBootstrapError, ProviderAdmission,
-    ProviderBootstrapProfile, ProviderCatalogModelView, ProviderCatalogProfileView,
-    ProviderCatalogRefreshError, ProviderCatalogRefreshPreview, ProviderCatalogSnapshot,
-    ProviderCredentialReference, ProviderHarnessKind, ProviderId, ProviderModelBinding,
-    RepositoryCommandArtifactPolicyConfig, RepositoryVerificationConfig,
-    WorkCapabilityConfigTransitionReport, apply_work_capability_config_migration,
-    preview_work_capability_config_migration, preview_work_capability_config_rollback,
-    rollback_work_capability_config_to_v2,
+    CodexModelAdmissionRouteView, CodexModelAdmissionTransitionReport, DenyVerificationReferences,
+    FounderSupportingMaterialConfig, LocalUserPolicyBootstrapConfig, ProductionBootstrapConfig,
+    ProductionBootstrapError, ProviderAdmission, ProviderBootstrapProfile,
+    ProviderCatalogModelView, ProviderCatalogProfileView, ProviderCatalogRefreshError,
+    ProviderCatalogRefreshPreview, ProviderCatalogSnapshot, ProviderCredentialReference,
+    ProviderHarnessKind, ProviderId, ProviderModelBinding, RepositoryCommandArtifactPolicyConfig,
+    RepositoryVerificationConfig, WorkCapabilityConfigTransitionReport,
+    apply_codex_model_admission_transition, apply_work_capability_config_migration,
+    preview_codex_model_admission_transition, preview_work_capability_config_migration,
+    preview_work_capability_config_rollback, rollback_work_capability_config_to_v2,
 };
 pub use context_mutation::ContextMutationPortAdapter;
 pub use memory_mutation::{
@@ -696,6 +697,7 @@ fn context_snapshot_digest(
 /// values are not inferred from a Task payload or provider response. A ctx
 /// bundle binding may only be rebound from an Authority-resolved Task snapshot.
 /// Provider process configuration stays outside this type.
+#[derive(Clone)]
 pub struct NativeHarnessCompositionConfig {
     pub collaboration_database_path: PathBuf,
     pub collaboration_store_epoch: String,
@@ -717,6 +719,7 @@ pub struct NativeHarnessCompositionConfig {
 /// Codex-specific process input wrapped around the provider-neutral native
 /// Harness composition. The user-owned JSON shape remains unchanged; only the
 /// typed daemon boundary separates process choice from governed composition.
+#[derive(Clone)]
 pub struct CodexHarnessCompositionConfig {
     pub native: NativeHarnessCompositionConfig,
     pub codex_executable: PathBuf,
@@ -933,6 +936,36 @@ fn trusted_codex_route_profile(
     })
 }
 
+fn trusted_codex_route_profile_for_route(
+    profile: &ProviderBootstrapProfile,
+    route: &WorkCapabilityRouteBinding,
+) -> Result<TrustedDispatchRouteProfile, DaemonCompositionError> {
+    let model = profile
+        .models
+        .iter()
+        .find(|model| model.harness_model_id == route.harness_model_id)
+        .ok_or(DaemonCompositionError::InvalidConfiguration(
+            "production Codex provider model binding",
+        ))?;
+    Ok(TrustedDispatchRouteProfile {
+        provider_bootstrap_profile_id: profile.profile_id.clone(),
+        selected_harness_id: "codex_app_server".to_owned(),
+        provider_model_id: model.provider_model_id.clone(),
+        catalog_snapshot_sha256: profile
+            .catalog_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.evidence_digest_sha256.clone()),
+        capability_profile_id: route
+            .capability_profile_ref
+            .as_ref()
+            .ok_or(DaemonCompositionError::InvalidConfiguration(
+                "production Codex capability profile binding",
+            ))?
+            .contract_id
+            .clone(),
+    })
+}
+
 fn validate_codex_work_capability_route(
     route: &WorkCapabilityRouteBinding,
     profile: &ProviderBootstrapProfile,
@@ -945,7 +978,7 @@ fn validate_codex_work_capability_route(
     let model = profile
         .models
         .iter()
-        .find(|model| model.harness_model_id == profile.exact_model)
+        .find(|model| model.harness_model_id == route.harness_model_id)
         .ok_or(DaemonCompositionError::InvalidConfiguration(
             "production Codex provider model binding",
         ))?;
@@ -968,6 +1001,56 @@ fn validate_codex_work_capability_route(
         ));
     }
     Ok(())
+}
+
+fn route_scoped_store_path(
+    base: &Path,
+    route_digest: &str,
+) -> Result<PathBuf, DaemonCompositionError> {
+    let file_name = base
+        .file_name()
+        .ok_or(DaemonCompositionError::InvalidConfiguration(
+            "native Harness store path",
+        ))?;
+    let mut scoped_name = file_name.to_os_string();
+    scoped_name.push(".route-");
+    scoped_name.push(route_digest);
+    Ok(base.with_file_name(scoped_name))
+}
+
+/// Derives one route-local native composition from the primary base.
+///
+/// This is the single source of truth for a route's persistent Adapter
+/// database path and store epoch: the primary route keeps the unscoped base
+/// identity, and only a non-primary route is scoped by its sealed route
+/// binding digest. The Policy resolver must reuse this exact derivation rather
+/// than restating it, so a route's approval store and its dispatch store can
+/// never drift apart.
+pub(crate) fn native_config_for_codex_route(
+    base: &NativeHarnessCompositionConfig,
+    route: &WorkCapabilityRouteBinding,
+) -> Result<NativeHarnessCompositionConfig, DaemonCompositionError> {
+    let mut config = base.clone();
+    let primary = route.native_composition_generation == base.workflow.run_id;
+    if !primary {
+        config.collaboration_database_path = route_scoped_store_path(
+            &base.collaboration_database_path,
+            &route.route_binding_sha256,
+        )?;
+        config.adapter_database_path =
+            route_scoped_store_path(&base.adapter_database_path, &route.route_binding_sha256)?;
+        config.collaboration_store_epoch = format!(
+            "{}:route:{}",
+            base.collaboration_store_epoch, route.route_binding_sha256
+        );
+        config.adapter_store_epoch = format!(
+            "{}:route:{}",
+            base.adapter_store_epoch, route.route_binding_sha256
+        );
+        config.workflow.run_id = route.native_composition_generation.clone();
+    }
+    config.default_model = Some(route.harness_model_id.clone());
+    Ok(config)
 }
 
 fn codex_disclosure_credentials(
@@ -1494,6 +1577,29 @@ impl DaemonProviders {
         >,
         verification: Arc<Mutex<egopulse_verification_authority::VerificationAuthority>>,
     ) -> Result<Self, DaemonCompositionError> {
+        let routes = config.work_capability_route.clone().into_iter().collect();
+        self.with_codex_harness_routes(
+            config,
+            provider_profile,
+            routes,
+            artifact_authority,
+            verification,
+        )
+    }
+
+    /// Installs one isolated Codex App Server runner for every explicitly
+    /// admitted route. The production profile catalog is validation input;
+    /// catalog entries that are absent from `routes` remain unavailable.
+    pub(crate) fn with_codex_harness_routes(
+        self,
+        config: CodexHarnessCompositionConfig,
+        provider_profile: ProviderBootstrapProfile,
+        routes: Vec<WorkCapabilityRouteBinding>,
+        artifact_authority: Arc<
+            Mutex<egopulse_artifact_authority::ArtifactAuthority<ConfiguredArtifactAdmissionGuard>>,
+        >,
+        verification: Arc<Mutex<egopulse_verification_authority::VerificationAuthority>>,
+    ) -> Result<Self, DaemonCompositionError> {
         config.validate()?;
         let CodexHarnessCompositionConfig {
             native,
@@ -1503,18 +1609,46 @@ impl DaemonProviders {
         } = config;
         let disclosure_credentials =
             codex_disclosure_credentials(&provider_profile, &environment_overrides);
-        let mut process = CodexAppServerConfig::new(codex_executable);
-        for (name, value) in environment_overrides {
-            process = process.with_environment_override(name, value);
+        if routes.is_empty() {
+            let mut process = CodexAppServerConfig::new(codex_executable);
+            for (name, value) in environment_overrides {
+                process = process.with_environment_override(name, value);
+            }
+            let route_profile = trusted_codex_route_profile(&provider_profile, &native)?;
+            let capability_profile_ref = native.workflow.capability_profile_ref.clone();
+            return self.with_profiled_native_harness_drivers(
+                vec![ProfiledNativeHarnessComposition {
+                    config: native,
+                    profile: NativeHarnessCompositionProfile {
+                        adapter_id: CODEX_ADAPTER_ID.to_owned(),
+                        capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
+                        capability_profile_ref,
+                        observed_protocol: codex_protocol_fingerprint(),
+                        final_artifact_relation_policy:
+                            FinalArtifactRelationPolicy::RequiredGovernedContent,
+                    },
+                    driver: Box::new(CodexAppServerDriver::new(process)),
+                    route_profile: Some(route_profile),
+                    work_capability_route,
+                    disclosure_credentials,
+                }],
+                artifact_authority,
+                verification,
+            );
         }
-        let route_profile = trusted_codex_route_profile(&provider_profile, &native)?;
-        if let Some(route) = work_capability_route.as_ref() {
-            validate_codex_work_capability_route(route, &provider_profile, &native)?;
-        }
-        let capability_profile_ref = native.workflow.capability_profile_ref.clone();
-        self.with_profiled_native_harness_drivers(
-            vec![ProfiledNativeHarnessComposition {
-                config: native,
+
+        let mut compositions = Vec::with_capacity(routes.len());
+        for route in routes {
+            let route_native = native_config_for_codex_route(&native, &route)?;
+            validate_codex_work_capability_route(&route, &provider_profile, &route_native)?;
+            let route_profile = trusted_codex_route_profile_for_route(&provider_profile, &route)?;
+            let mut process = CodexAppServerConfig::new(codex_executable.clone());
+            for (name, value) in &environment_overrides {
+                process = process.with_environment_override(name.clone(), value.clone());
+            }
+            let capability_profile_ref = route_native.workflow.capability_profile_ref.clone();
+            compositions.push(ProfiledNativeHarnessComposition {
+                config: route_native,
                 profile: NativeHarnessCompositionProfile {
                     adapter_id: CODEX_ADAPTER_ID.to_owned(),
                     capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
@@ -1525,12 +1659,11 @@ impl DaemonProviders {
                 },
                 driver: Box::new(CodexAppServerDriver::new(process)),
                 route_profile: Some(route_profile),
-                work_capability_route,
-                disclosure_credentials,
-            }],
-            artifact_authority,
-            verification,
-        )
+                work_capability_route: Some(route),
+                disclosure_credentials: disclosure_credentials.clone(),
+            });
+        }
+        self.with_profiled_native_harness_drivers(compositions, artifact_authority, verification)
     }
 
     /// Installs the production Harness composition around an explicit native
@@ -5363,6 +5496,112 @@ mod tests {
             ),
             egopulse_harness_adapter::ManagedDisclosureCredentials::ManagedOutOfBounds
         ));
+    }
+
+    /// D2: route derivation is the single source of persistent store identity.
+    ///
+    /// The Policy resolver opens one Adapter edge per admitted route by calling
+    /// [`native_config_for_codex_route`] on that route. This proves the two
+    /// properties that make that safe: the primary route keeps the unscoped
+    /// base identity (so every existing installation's approval receipts stay
+    /// where they are), and each secondary route gets a distinct identity
+    /// derived from its sealed binding — deterministically, so a restart
+    /// resolves the same store rather than a fresh one.
+    #[test]
+    fn codex_route_derivation_preserves_primary_identity_and_isolates_secondaries() {
+        let root = std::path::Path::new("E:\\route-derivation-test");
+        let base = multi_native_config(root, "base");
+        let capability_profile_ref = base.workflow.capability_profile_ref.clone();
+        let route = |route_id: &str, generation: &str, model: &str| {
+            egopulse_domain_contracts::work_capability::seal_work_capability_route_binding(
+                WorkCapabilityRouteBinding {
+                    route_id: route_id.to_owned(),
+                    route_generation: 1,
+                    provider_profile_id: "provider-profile:route-derivation".to_owned(),
+                    provider_id: "gpt".to_owned(),
+                    harness_id: "codex_app_server".to_owned(),
+                    harness_model_id: model.to_owned(),
+                    provider_model_id: model.to_owned(),
+                    capability_profile_ref: Some(capability_profile_ref.clone()),
+                    catalog_snapshot_sha256: Some("ab".repeat(32)),
+                    native_composition_generation: generation.to_owned(),
+                    route_binding_sha256: String::new(),
+                },
+            )
+            .expect("sealed route derivation route")
+        };
+
+        // The primary route is the one whose generation is the base run.
+        let primary = route(
+            "route:derivation:primary",
+            &base.workflow.run_id,
+            "derivation/primary",
+        );
+        let primary_native =
+            native_config_for_codex_route(&base, &primary).expect("primary route derivation");
+        assert_eq!(
+            primary_native.adapter_database_path, base.adapter_database_path,
+            "the primary route must keep the unscoped base Adapter database"
+        );
+        assert_eq!(
+            primary_native.adapter_store_epoch, base.adapter_store_epoch,
+            "the primary route must keep the base Adapter store epoch"
+        );
+
+        // A second admitted route is a distinct sealed binding.
+        let secondary = route(
+            "route:derivation:secondary",
+            "derivation-secondary-run",
+            "derivation/secondary",
+        );
+        assert_ne!(
+            secondary.route_binding_sha256, primary.route_binding_sha256,
+            "two admitted routes must not share a sealed binding digest"
+        );
+        let secondary_native =
+            native_config_for_codex_route(&base, &secondary).expect("secondary route derivation");
+        assert_ne!(
+            secondary_native.adapter_database_path, base.adapter_database_path,
+            "a secondary route must not share the primary Adapter database"
+        );
+        assert_ne!(
+            secondary_native.adapter_database_path, primary_native.adapter_database_path,
+            "admitted routes must not collide on one Adapter database"
+        );
+        let scoped_name = secondary_native
+            .adapter_database_path
+            .file_name()
+            .expect("scoped adapter file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            scoped_name.contains(&secondary.route_binding_sha256),
+            "a secondary Adapter database must be scoped by its route digest: {scoped_name}"
+        );
+        assert!(
+            secondary_native
+                .adapter_store_epoch
+                .ends_with(&secondary.route_binding_sha256),
+            "a secondary Adapter store epoch must be scoped by its route digest: {}",
+            secondary_native.adapter_store_epoch
+        );
+
+        // Restart stability: deriving the same route again is identical, so a
+        // restarted daemon resolves the store that already holds the receipts.
+        let rederived =
+            native_config_for_codex_route(&base, &secondary).expect("secondary re-derivation");
+        assert_eq!(
+            rederived.adapter_database_path, secondary_native.adapter_database_path,
+            "route derivation must be deterministic across calls"
+        );
+        assert_eq!(
+            rederived.adapter_store_epoch, secondary_native.adapter_store_epoch,
+            "route store epoch must be deterministic across calls"
+        );
+        assert_eq!(
+            rederived.adapter_key, secondary_native.adapter_key,
+            "route derivation must not rotate the Adapter key"
+        );
     }
 
     #[allow(dead_code)]

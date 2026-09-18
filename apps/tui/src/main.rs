@@ -969,6 +969,40 @@ enum InteractiveAction {
 const INTENT_INPUT_LIMIT_BYTES: usize = 16 * 1024;
 const INTENT_HISTORY_LIMIT: usize = 16;
 const INTENT_HISTORY_LIMIT_BYTES: usize = 64 * 1024;
+const CAPABILITY_SELECTOR_VISIBLE_OPTIONS: usize = 6;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapabilitySelector {
+    Provider,
+    Harness,
+    Model,
+}
+
+impl CapabilitySelector {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Provider => "Provider",
+            Self::Harness => "Harness",
+            Self::Model => "Model",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Provider => Self::Harness,
+            Self::Harness => Self::Model,
+            Self::Model => Self::Provider,
+        }
+    }
+
+    const fn previous(self) -> Self {
+        match self {
+            Self::Provider => Self::Model,
+            Self::Harness => Self::Provider,
+            Self::Model => Self::Harness,
+        }
+    }
+}
 
 struct IntentConversation {
     input: String,
@@ -978,6 +1012,10 @@ struct IntentConversation {
     work_candidate: Option<IntentWorkCandidate>,
     capability_catalog: GovernedWorkCapabilityCatalog,
     capability_cursor: usize,
+    capability_selector: CapabilitySelector,
+    capability_selector_open: bool,
+    provider_alias: Option<String>,
+    harness_alias: Option<String>,
     explicit_capability_choice_id: Option<String>,
     pending_text: Option<String>,
     receiver: Option<
@@ -992,23 +1030,24 @@ struct IntentConversation {
 
 impl IntentConversation {
     fn new(capability_catalog: GovernedWorkCapabilityCatalog) -> Self {
-        let capability_cursor = capability_catalog
-            .capabilities
-            .iter()
-            .position(|capability| capability.current_future_work_default)
-            .unwrap_or(0);
-        Self {
+        let mut conversation = Self {
             input: String::new(),
             history: Vec::new(),
             reply: "请直接描述想做的事。收到建议后会先填入工作草稿；请在下一页核对并明确准备，系统才会继续。".to_owned(),
             needs_clarification: false,
             work_candidate: None,
             capability_catalog,
-            capability_cursor,
+            capability_cursor: 0,
+            capability_selector: CapabilitySelector::Provider,
+            capability_selector_open: false,
+            provider_alias: None,
+            harness_alias: None,
             explicit_capability_choice_id: None,
             pending_text: None,
             receiver: None,
-        }
+        };
+        conversation.reset_capability_browser_to_effective_choice();
+        conversation
     }
 
     fn is_running(&self) -> bool {
@@ -1031,25 +1070,347 @@ impl IntentConversation {
         self.input.pop();
     }
 
-    fn select_previous_capability(&mut self) {
-        let count = self.capability_catalog.capabilities.len();
-        if count > 0 {
-            self.capability_cursor = self.capability_cursor.checked_sub(1).unwrap_or(count - 1);
+    fn move_capability_cursor(&mut self, previous: bool) {
+        let options = self.capability_option_indexes();
+        if options.is_empty() {
+            return;
         }
+        let current = options
+            .iter()
+            .position(|index| *index == self.capability_cursor)
+            .unwrap_or(0);
+        let next = if previous {
+            current.checked_sub(1).unwrap_or(options.len() - 1)
+        } else {
+            (current + 1) % options.len()
+        };
+        self.capability_cursor = options[next];
+    }
+
+    fn select_previous_capability(&mut self) {
+        self.move_capability_cursor(true);
     }
 
     fn select_next_capability(&mut self) {
-        let count = self.capability_catalog.capabilities.len();
-        if count > 0 {
-            self.capability_cursor = (self.capability_cursor + 1) % count;
+        self.move_capability_cursor(false);
+    }
+
+    fn capability_option_indexes(&self) -> Vec<usize> {
+        let capabilities = &self.capability_catalog.capabilities;
+        match self.capability_selector {
+            CapabilitySelector::Provider => {
+                let mut options: Vec<usize> = Vec::new();
+                for (index, capability) in capabilities.iter().enumerate() {
+                    if !options.iter().any(|existing| {
+                        capabilities[*existing].provider_alias == capability.provider_alias
+                    }) {
+                        options.push(index);
+                    }
+                }
+                options
+            }
+            CapabilitySelector::Harness => {
+                let Some(provider_alias) = self.provider_alias.as_deref() else {
+                    return Vec::new();
+                };
+                let mut options: Vec<usize> = Vec::new();
+                for (index, capability) in capabilities.iter().enumerate() {
+                    if capability.provider_alias == provider_alias
+                        && !options.iter().any(|existing| {
+                            capabilities[*existing].harness_alias == capability.harness_alias
+                        })
+                    {
+                        options.push(index);
+                    }
+                }
+                options
+            }
+            CapabilitySelector::Model => capabilities
+                .iter()
+                .enumerate()
+                .filter_map(|(index, capability)| {
+                    (self.provider_alias.as_deref() == Some(capability.provider_alias.as_str())
+                        && self.harness_alias.as_deref() == Some(capability.harness_alias.as_str()))
+                    .then_some(index)
+                })
+                .collect(),
         }
     }
 
-    fn choose_highlighted_capability(&mut self) -> Result<(), String> {
+    fn capability_option_is_selectable(&self, index: usize) -> bool {
+        let Some(capability) = self.capability_catalog.capabilities.get(index) else {
+            return false;
+        };
+        match self.capability_selector {
+            CapabilitySelector::Provider => {
+                self.capability_catalog
+                    .capabilities
+                    .iter()
+                    .any(|candidate| {
+                        candidate.provider_alias == capability.provider_alias
+                            && candidate.selectable
+                    })
+            }
+            CapabilitySelector::Harness => {
+                self.capability_catalog
+                    .capabilities
+                    .iter()
+                    .any(|candidate| {
+                        candidate.provider_alias == capability.provider_alias
+                            && candidate.harness_alias == capability.harness_alias
+                            && candidate.selectable
+                    })
+            }
+            CapabilitySelector::Model => capability.selectable,
+        }
+    }
+
+    fn capability_option_reason(&self, index: usize) -> Option<String> {
+        let capability = self.capability_catalog.capabilities.get(index)?;
+        if self.capability_option_is_selectable(index) {
+            return None;
+        }
+        let reason =
+            match self.capability_selector {
+                CapabilitySelector::Provider => self
+                    .capability_catalog
+                    .capabilities
+                    .iter()
+                    .find_map(|candidate| {
+                        (candidate.provider_alias == capability.provider_alias)
+                            .then_some(candidate.safe_reason_code.as_deref())
+                            .flatten()
+                    }),
+                CapabilitySelector::Harness => self
+                    .capability_catalog
+                    .capabilities
+                    .iter()
+                    .find_map(|candidate| {
+                        (candidate.provider_alias == capability.provider_alias
+                            && candidate.harness_alias == capability.harness_alias)
+                            .then_some(candidate.safe_reason_code.as_deref())
+                            .flatten()
+                    }),
+                CapabilitySelector::Model => capability.safe_reason_code.as_deref(),
+            };
+        Some(reason.unwrap_or("CAPABILITY_UNAVAILABLE").to_owned())
+    }
+
+    fn capability_option_label(&self, index: usize) -> String {
+        let capability = &self.capability_catalog.capabilities[index];
+        match self.capability_selector {
+            CapabilitySelector::Provider => capability.provider_alias.clone(),
+            CapabilitySelector::Harness => capability.harness_alias.clone(),
+            CapabilitySelector::Model => format!(
+                "{} / {}",
+                capability.harness_model_alias, capability.provider_model_alias
+            ),
+        }
+    }
+
+    fn selector_value(&self, selector: CapabilitySelector) -> String {
+        let capability = match selector {
+            CapabilitySelector::Provider => {
+                self.provider_alias.as_deref().and_then(|provider_alias| {
+                    self.capability_catalog
+                        .capabilities
+                        .iter()
+                        .find(|capability| capability.provider_alias == provider_alias)
+                })
+            }
+            CapabilitySelector::Harness => self
+                .provider_alias
+                .as_deref()
+                .zip(self.harness_alias.as_deref())
+                .and_then(|(provider_alias, harness_alias)| {
+                    self.capability_catalog
+                        .capabilities
+                        .iter()
+                        .find(|capability| {
+                            capability.provider_alias == provider_alias
+                                && capability.harness_alias == harness_alias
+                        })
+                }),
+            CapabilitySelector::Model => self
+                .current_browser_capability_index()
+                .and_then(|index| self.capability_catalog.capabilities.get(index)),
+        };
+        capability
+            .map(|capability| match selector {
+                CapabilitySelector::Provider => capability.provider_alias.clone(),
+                CapabilitySelector::Harness => capability.harness_alias.clone(),
+                CapabilitySelector::Model => format!(
+                    "{} / {}",
+                    capability.harness_model_alias, capability.provider_model_alias
+                ),
+            })
+            .unwrap_or_else(|| "<未选择>".to_owned())
+    }
+
+    fn capability_option_is_current(&self, index: usize) -> bool {
+        let Some(current) = self.effective_capability_index() else {
+            return false;
+        };
+        let current = &self.capability_catalog.capabilities[current];
+        let capability = &self.capability_catalog.capabilities[index];
+        match self.capability_selector {
+            CapabilitySelector::Provider => current.provider_alias == capability.provider_alias,
+            CapabilitySelector::Harness => {
+                current.provider_alias == capability.provider_alias
+                    && current.harness_alias == capability.harness_alias
+            }
+            CapabilitySelector::Model => current.choice_id == capability.choice_id,
+        }
+    }
+
+    fn effective_capability_index(&self) -> Option<usize> {
+        let choice_id = self
+            .explicit_capability_choice_id
+            .as_deref()
+            .unwrap_or(self.capability_catalog.default_choice_id.as_str());
+        self.capability_catalog
+            .capabilities
+            .iter()
+            .position(|capability| {
+                capability.selectable && capability.choice_id.as_deref() == Some(choice_id)
+            })
+    }
+
+    fn effective_capability_label(&self) -> String {
+        self.effective_capability_index()
+            .map(|index| {
+                let capability = &self.capability_catalog.capabilities[index];
+                format!(
+                    "{} / {} / {} / {}",
+                    capability.provider_alias,
+                    capability.harness_alias,
+                    capability.harness_model_alias,
+                    capability.provider_model_alias
+                )
+            })
+            .unwrap_or_else(|| "<没有可验证的可用默认能力>".to_owned())
+    }
+
+    fn current_browser_capability_index(&self) -> Option<usize> {
+        self.effective_capability_index()
+            .filter(|index| {
+                let capability = &self.capability_catalog.capabilities[*index];
+                self.provider_alias.as_deref() == Some(capability.provider_alias.as_str())
+                    && self.harness_alias.as_deref() == Some(capability.harness_alias.as_str())
+            })
+            .or_else(|| {
+                self.capability_catalog
+                    .capabilities
+                    .iter()
+                    .position(|capability| {
+                        self.provider_alias.as_deref() == Some(capability.provider_alias.as_str())
+                            && self.harness_alias.as_deref()
+                                == Some(capability.harness_alias.as_str())
+                            && capability.selectable
+                    })
+            })
+            .or_else(|| {
+                self.capability_catalog
+                    .capabilities
+                    .iter()
+                    .position(|capability| {
+                        self.provider_alias.as_deref() == Some(capability.provider_alias.as_str())
+                            && self.harness_alias.as_deref()
+                                == Some(capability.harness_alias.as_str())
+                    })
+            })
+    }
+
+    fn reset_capability_browser_to_effective_choice(&mut self) {
+        if let Some(index) = self.effective_capability_index() {
+            let capability = &self.capability_catalog.capabilities[index];
+            self.provider_alias = Some(capability.provider_alias.clone());
+            self.harness_alias = Some(capability.harness_alias.clone());
+            self.capability_cursor = index;
+        }
+    }
+
+    fn sync_capability_cursor(&mut self) {
+        let options = self.capability_option_indexes();
+        if options.contains(&self.capability_cursor) {
+            return;
+        }
+        self.capability_cursor = match self.capability_selector {
+            CapabilitySelector::Provider => {
+                self.provider_alias.as_deref().and_then(|provider_alias| {
+                    options.iter().copied().find(|index| {
+                        self.capability_catalog.capabilities[*index].provider_alias
+                            == provider_alias
+                    })
+                })
+            }
+            CapabilitySelector::Harness => {
+                self.harness_alias.as_deref().and_then(|harness_alias| {
+                    options.iter().copied().find(|index| {
+                        self.capability_catalog.capabilities[*index].harness_alias == harness_alias
+                    })
+                })
+            }
+            CapabilitySelector::Model => self.current_browser_capability_index(),
+        }
+        .or_else(|| {
+            options
+                .iter()
+                .copied()
+                .find(|index| self.capability_option_is_selectable(*index))
+        })
+        .or_else(|| options.first().copied())
+        .unwrap_or(0);
+    }
+
+    fn focus_capability_selector(&mut self, selector: CapabilitySelector) {
+        self.capability_selector = selector;
+        self.capability_selector_open = true;
+        self.sync_capability_cursor();
+    }
+
+    fn select_provider(&mut self, index: usize) {
+        let provider_alias = self.capability_catalog.capabilities[index]
+            .provider_alias
+            .clone();
+        self.provider_alias = Some(provider_alias.clone());
+        self.harness_alias = self
+            .effective_capability_index()
+            .and_then(|current| {
+                let current = &self.capability_catalog.capabilities[current];
+                (current.provider_alias == provider_alias).then(|| current.harness_alias.clone())
+            })
+            .or_else(|| {
+                self.capability_catalog
+                    .capabilities
+                    .iter()
+                    .find(|candidate| {
+                        candidate.provider_alias == provider_alias && candidate.selectable
+                    })
+                    .map(|candidate| candidate.harness_alias.clone())
+            })
+            .or_else(|| {
+                self.capability_catalog
+                    .capabilities
+                    .iter()
+                    .find(|candidate| candidate.provider_alias == provider_alias)
+                    .map(|candidate| candidate.harness_alias.clone())
+            });
+    }
+
+    fn select_harness(&mut self, index: usize) {
+        self.harness_alias = Some(
+            self.capability_catalog.capabilities[index]
+                .harness_alias
+                .clone(),
+        );
+    }
+
+    fn choose_capability_index(&mut self, index: usize) -> Result<(), String> {
         let capability = self
             .capability_catalog
             .capabilities
-            .get(self.capability_cursor)
+            .get(index)
             .ok_or_else(|| "当前没有可选的执行能力".to_owned())?;
         if !capability.selectable {
             return Err(format!(
@@ -1060,18 +1421,81 @@ impl IntentConversation {
                     .unwrap_or("暂无可用原因")
             ));
         }
-        let choice_id = capability.choice_id.clone();
-        if self.explicit_capability_choice_id != choice_id {
-            self.explicit_capability_choice_id = choice_id;
+        let choice_id = capability
+            .choice_id
+            .clone()
+            .ok_or_else(|| "此执行能力没有受治理的选择标识".to_owned())?;
+        if self.explicit_capability_choice_id.as_deref() != Some(choice_id.as_str()) {
+            self.explicit_capability_choice_id = Some(choice_id);
+            self.reset_capability_browser_to_effective_choice();
             self.clear_candidate_after_capability_change();
         }
         Ok(())
+    }
+
+    fn choose_highlighted_capability(&mut self) -> Result<(), String> {
+        let highlighted = self.capability_cursor;
+        if !self.capability_option_indexes().contains(&highlighted) {
+            return Err("当前没有可选的执行能力".to_owned());
+        }
+        if self.capability_selector == CapabilitySelector::Model {
+            return self.choose_capability_index(highlighted);
+        }
+        match self.capability_selector {
+            CapabilitySelector::Provider => self.select_provider(highlighted),
+            CapabilitySelector::Harness => self.select_harness(highlighted),
+            CapabilitySelector::Model => {}
+        }
+        self.capability_selector = CapabilitySelector::Model;
+        self.sync_capability_cursor();
+        self.choose_capability_index(
+            self.current_browser_capability_index()
+                .ok_or_else(|| "当前筛选条件下没有可选的执行能力".to_owned())?,
+        )
+    }
+
+    fn confirm_capability_selector(&mut self) -> Result<Option<String>, String> {
+        if !self.capability_selector_open {
+            self.capability_selector_open = true;
+            self.sync_capability_cursor();
+            return Ok(Some(format!(
+                "已展开 {} 选择器",
+                self.capability_selector.label()
+            )));
+        }
+        let index = self.capability_cursor;
+        if !self.capability_option_indexes().contains(&index) {
+            return Err("当前没有可选的执行能力".to_owned());
+        }
+        match self.capability_selector {
+            CapabilitySelector::Provider => {
+                self.select_provider(index);
+                self.capability_selector = CapabilitySelector::Harness;
+                self.sync_capability_cursor();
+                Ok(Some("已筛选 Provider；请选择 Harness".to_owned()))
+            }
+            CapabilitySelector::Harness => {
+                self.select_harness(index);
+                self.capability_selector = CapabilitySelector::Model;
+                self.sync_capability_cursor();
+                Ok(Some("已筛选 Harness；请选择 Model".to_owned()))
+            }
+            CapabilitySelector::Model => {
+                self.choose_capability_index(index)?;
+                self.capability_selector_open = false;
+                Ok(Some(
+                    "已选择此执行能力；若已有建议，请重新发送后再填入工作草稿".to_owned(),
+                ))
+            }
+        }
     }
 
     fn use_future_work_default(&mut self) {
         if self.explicit_capability_choice_id.take().is_some() {
             self.clear_candidate_after_capability_change();
         }
+        self.reset_capability_browser_to_effective_choice();
+        self.capability_selector_open = false;
     }
 
     fn selected_choice_id(&self) -> String {
@@ -3370,6 +3794,10 @@ impl App {
                         if conversation.is_running() {
                             self.message = "正在生成回复，请等待完成后再返回".to_owned();
                             Ok(None)
+                        } else if conversation.capability_selector_open {
+                            conversation.capability_selector_open = false;
+                            self.message = "已收起执行能力选择器；当前能力未改变".to_owned();
+                            Ok(None)
                         } else {
                             Ok(Some(InteractiveAction::CloseIntentConversation))
                         }
@@ -3377,6 +3805,13 @@ impl App {
                     KeyCode::Enter => {
                         if conversation.is_running() {
                             self.message = "正在生成回复，请等待完成".to_owned();
+                            Ok(None)
+                        } else if conversation.capability_selector_open {
+                            match conversation.confirm_capability_selector() {
+                                Ok(Some(message)) => self.message = message,
+                                Ok(None) => {}
+                                Err(error) => self.message = error,
+                            }
                             Ok(None)
                         } else {
                             Ok(Some(InteractiveAction::InterpretIntentConversation))
@@ -3389,11 +3824,33 @@ impl App {
                         Ok(None)
                     }
                     KeyCode::Up => {
+                        conversation.capability_selector_open = true;
+                        conversation.sync_capability_cursor();
                         conversation.select_previous_capability();
                         Ok(None)
                     }
                     KeyCode::Down => {
+                        conversation.capability_selector_open = true;
+                        conversation.sync_capability_cursor();
                         conversation.select_next_capability();
+                        Ok(None)
+                    }
+                    KeyCode::Tab => {
+                        conversation
+                            .focus_capability_selector(conversation.capability_selector.next());
+                        self.message = format!(
+                            "正在选择 {}；↑↓ 浏览，Enter 确定，Esc 收起",
+                            conversation.capability_selector.label()
+                        );
+                        Ok(None)
+                    }
+                    KeyCode::BackTab => {
+                        conversation
+                            .focus_capability_selector(conversation.capability_selector.previous());
+                        self.message = format!(
+                            "正在选择 {}；↑↓ 浏览，Enter 确定，Esc 收起",
+                            conversation.capability_selector.label()
+                        );
                         Ok(None)
                     }
                     KeyCode::F(2) => {
@@ -3402,6 +3859,7 @@ impl App {
                         } else {
                             match conversation.choose_highlighted_capability() {
                                 Ok(()) => {
+                                    conversation.capability_selector_open = false;
                                     "已选择此执行能力；若已有建议，请重新发送后再填入工作草稿"
                                         .to_owned()
                                 }
@@ -4972,7 +5430,7 @@ impl App {
         }
         match &self.mode {
             InteractiveMode::IntentConversation => format!(
-                "{} - 输入或粘贴需求 - Enter 发送 - ↑↓ 选择能力 - F2 选用 - F3 默认 - F4 填入工作草稿 - Esc 返回",
+                "{} - 输入或粘贴需求 - Tab 选择 Provider/Harness/Model - ↑↓ 浏览 - Enter 确定/发送 - F2 选用 - F3 默认 - F4 填入工作草稿 - Esc 收起/返回",
                 self.message
             ),
             InteractiveMode::GovernedState => format!(
@@ -5225,7 +5683,14 @@ fn render_intent_conversation(
 ) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+        .constraints(if conversation.capability_selector_open {
+            [
+                Constraint::Min(3),
+                Constraint::Length(area.height.saturating_sub(3).min(16)),
+            ]
+        } else {
+            [Constraint::Percentage(56), Constraint::Percentage(44)]
+        })
         .split(area);
     let mut lines = vec![
         Line::from("在这里用自然语言说明需求。回复会生成建议，不会直接创建工作。"),
@@ -5272,64 +5737,87 @@ fn render_intent_conversation(
         sections[0],
     );
 
-    let selected_choice = conversation
-        .explicit_capability_choice_id
-        .as_deref()
-        .unwrap_or("<默认执行能力>");
+    let selection_kind = if conversation.explicit_capability_choice_id.is_some() {
+        "已选"
+    } else {
+        "默认"
+    };
     let mut capability_lines = vec![Line::from(format!(
-        "执行能力：{selected_choice}（回复不会替你选择或修改此项）"
+        "当前执行能力（{selection_kind}）：{}",
+        conversation.effective_capability_label(),
     ))];
-    for (index, capability) in conversation
-        .capability_catalog
-        .capabilities
-        .iter()
-        .enumerate()
-    {
-        let marker = if index == conversation.capability_cursor {
-            ">"
+    for selector in [
+        CapabilitySelector::Provider,
+        CapabilitySelector::Harness,
+        CapabilitySelector::Model,
+    ] {
+        let marker = if selector == conversation.capability_selector {
+            "▶"
         } else {
             " "
         };
-        let selected = if capability.choice_id.as_deref()
-            == conversation.explicit_capability_choice_id.as_deref()
+        let expanded = if selector == conversation.capability_selector
+            && conversation.capability_selector_open
         {
-            " 已选择"
-        } else if capability.current_future_work_default {
-            " 默认"
+            "（展开）"
         } else {
             ""
         };
-        let reason = capability
-            .safe_reason_code
-            .as_deref()
-            .map(|value| format!(" 原因={value}"))
-            .unwrap_or_default();
         capability_lines.push(Line::from(format!(
-            "{marker} {} / {} / {} -> {} [{}]{}{}",
-            capability.provider_alias,
-            capability.harness_alias,
-            capability.harness_model_alias,
-            capability.provider_model_alias,
-            if capability.selectable {
-                "可用"
-            } else {
-                "不可用"
-            },
-            selected,
-            reason,
+            "{marker} {}：{} {expanded}",
+            selector.label(),
+            conversation.selector_value(selector),
         )));
     }
-    if conversation.capability_catalog.capabilities.is_empty() {
-        capability_lines.push(Line::from("当前没有可展示的执行能力。"));
+    capability_lines.push(Line::from(
+        "Tab/Shift+Tab 切换选择器；↑↓ 展开并浏览；Enter 逐级确定；F2 选用当前可用组合；F3 恢复默认。",
+    ));
+
+    if conversation.capability_selector_open {
+        let options = conversation.capability_option_indexes();
+        if options.is_empty() {
+            capability_lines.push(Line::from("当前筛选条件下没有可展示的能力。"));
+        } else {
+            let cursor = options
+                .iter()
+                .position(|index| *index == conversation.capability_cursor)
+                .unwrap_or(0);
+            let visible = usize::from(sections[1].height.saturating_sub(7))
+                .min(CAPABILITY_SELECTOR_VISIBLE_OPTIONS);
+            let start = cursor.saturating_sub(visible.saturating_sub(1) / 2);
+            let end = (start + visible).min(options.len());
+            for index in &options[start..end] {
+                let marker = if *index == conversation.capability_cursor {
+                    ">"
+                } else {
+                    " "
+                };
+                let status = if conversation.capability_option_is_selectable(*index) {
+                    if conversation.capability_option_is_current(*index) {
+                        "当前"
+                    } else {
+                        "可用"
+                    }
+                } else {
+                    "不可用"
+                };
+                let reason = conversation
+                    .capability_option_reason(*index)
+                    .map(|reason| format!(" 原因={reason}"))
+                    .unwrap_or_default();
+                capability_lines.push(Line::from(format!(
+                    "  {marker} {} [{status}]{reason}",
+                    conversation.capability_option_label(*index),
+                )));
+            }
+        }
     }
     frame.render_widget(
-        Paragraph::new(capability_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Provider / Harness / model"),
-            )
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(capability_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Provider / Harness / model"),
+        ),
         sections[1],
     );
 }
@@ -9130,6 +9618,19 @@ mod tests {
                     current_future_work_default: true,
                 },
                 GovernedWorkCapability {
+                    provider_profile_id: "provider:admitted".to_owned(),
+                    provider_alias: "ProviderA".to_owned(),
+                    harness_alias: "HarnessA".to_owned(),
+                    harness_model_alias: "model-gpt".to_owned(),
+                    provider_model_alias: "gpt-5".to_owned(),
+                    availability: GovernedWorkCapabilityAvailability::Admitted,
+                    selectable: true,
+                    safe_reason_code: None,
+                    choice_id: Some("choice:gpt".to_owned()),
+                    route_binding_sha256: Some("route-gpt".to_owned()),
+                    current_future_work_default: false,
+                },
+                GovernedWorkCapability {
                     provider_profile_id: "provider:held".to_owned(),
                     provider_alias: "ProviderB".to_owned(),
                     harness_alias: "HarnessB".to_owned(),
@@ -9205,26 +9706,64 @@ mod tests {
     }
 
     #[test]
-    fn intent_conversation_uses_visible_capability_rows_without_raw_id_input() {
+    fn intent_conversation_cascades_capability_selectors_by_actual_choice_id() {
         let mut conversation = IntentConversation::new(intent_capability_catalog());
         assert_eq!(conversation.selected_choice_id(), "");
+        assert_eq!(
+            conversation.capability_selector,
+            CapabilitySelector::Provider
+        );
+        assert_eq!(conversation.capability_cursor, 0);
+        assert_eq!(
+            conversation.selector_value(CapabilitySelector::Provider),
+            "ProviderA"
+        );
         conversation.work_candidate = Some(intent_work_candidate());
 
+        conversation.focus_capability_selector(CapabilitySelector::Provider);
         conversation
-            .choose_highlighted_capability()
-            .expect("select admitted row");
-        assert_eq!(conversation.selected_choice_id(), "choice:admitted");
+            .confirm_capability_selector()
+            .expect("confirm Provider");
+        assert_eq!(
+            conversation.capability_selector,
+            CapabilitySelector::Harness
+        );
+        conversation
+            .confirm_capability_selector()
+            .expect("confirm Harness");
+        assert_eq!(conversation.capability_selector, CapabilitySelector::Model);
+        conversation.select_next_capability();
+        conversation
+            .confirm_capability_selector()
+            .expect("select an admitted model");
+        assert_eq!(conversation.selected_choice_id(), "choice:gpt");
         assert!(conversation.work_candidate.is_none());
         assert!(conversation.reply.contains("请重新发送"));
 
+        conversation.focus_capability_selector(CapabilitySelector::Provider);
         conversation.select_next_capability();
+        assert!(!conversation.capability_option_is_selectable(conversation.capability_cursor));
+        assert!(!conversation.capability_option_is_current(conversation.capability_cursor));
+        assert!(
+            conversation
+                .effective_capability_label()
+                .contains("model-gpt")
+        );
+        assert_eq!(
+            conversation.capability_option_reason(conversation.capability_cursor),
+            Some("CAPABILITY_HELD".to_owned())
+        );
         assert!(
             conversation
                 .choose_highlighted_capability()
                 .expect_err("held row must remain unavailable")
                 .contains("CAPABILITY_HELD")
         );
-        assert_eq!(conversation.selected_choice_id(), "choice:admitted");
+        assert_eq!(conversation.selected_choice_id(), "choice:gpt");
+
+        conversation.use_future_work_default();
+        assert_eq!(conversation.selected_choice_id(), "");
+        assert_eq!(conversation.capability_cursor, 0);
 
         let (_sender, receiver) = mpsc::channel(1);
         let mut app = App::new("intent-pending-choice".to_owned());
@@ -9241,6 +9780,132 @@ mod tests {
         let pending = app.intent_conversation.as_ref().expect("conversation");
         assert_eq!(pending.selected_choice_id(), "");
         assert!(app.message.contains("暂不能变更执行能力"));
+    }
+
+    #[test]
+    fn intent_capability_same_provider_crosses_harness_profiles_without_synthesizing_routes() {
+        let mut catalog = intent_capability_catalog();
+        catalog.capabilities[0].provider_alias = "gpt".to_owned();
+        catalog.capabilities[1].provider_alias = "gpt".to_owned();
+        catalog.capabilities[1].provider_profile_id = "profile:gpt:second-harness".to_owned();
+        catalog.capabilities[1].harness_alias = "HarnessSecond".to_owned();
+        let expected_route = catalog.capabilities[1].clone();
+        let mut conversation = IntentConversation::new(catalog);
+
+        conversation.focus_capability_selector(CapabilitySelector::Provider);
+        let providers = conversation.capability_option_indexes();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(conversation.capability_option_label(providers[0]), "gpt");
+        conversation
+            .confirm_capability_selector()
+            .expect("gpt provider");
+        assert_eq!(conversation.capability_option_indexes(), vec![0, 1]);
+        conversation.select_next_capability();
+        conversation
+            .confirm_capability_selector()
+            .expect("second Harness");
+        assert_eq!(conversation.capability_option_indexes(), vec![1]);
+        assert_eq!(conversation.selected_choice_id(), "");
+        conversation
+            .confirm_capability_selector()
+            .expect("exact model choice");
+        assert_eq!(conversation.selected_choice_id(), "choice:gpt");
+        let index = conversation
+            .effective_capability_index()
+            .expect("selected route");
+        assert_eq!(
+            conversation.capability_catalog.capabilities[index],
+            expected_route
+        );
+        assert_eq!(conversation.capability_catalog.capabilities.len(), 3);
+
+        conversation.use_future_work_default();
+        assert_eq!(conversation.effective_capability_index(), Some(0));
+        assert_eq!(conversation.harness_alias.as_deref(), Some("HarnessA"));
+    }
+
+    #[test]
+    fn intent_capability_selector_keys_expand_then_preserve_send_and_escape() {
+        let mut app = App::new("intent-capability-keys".to_owned());
+        app.mode = InteractiveMode::IntentConversation;
+        app.intent_conversation = Some(IntentConversation::new(intent_capability_catalog()));
+
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                .expect("open Harness selector")
+                .is_none()
+        );
+        let conversation = app.intent_conversation.as_ref().expect("conversation");
+        assert_eq!(
+            conversation.capability_selector,
+            CapabilitySelector::Harness
+        );
+        assert!(conversation.capability_selector_open);
+
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .expect("collapse selector")
+                .is_none()
+        );
+        assert!(
+            !app.intent_conversation
+                .as_ref()
+                .expect("conversation")
+                .capability_selector_open
+        );
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .expect("send remains available after closing selector"),
+            Some(InteractiveAction::InterpretIntentConversation)
+        ));
+    }
+
+    #[test]
+    fn intent_model_f2_uses_highlighted_route_and_empty_catalog_is_safe() {
+        let mut conversation = IntentConversation::new(intent_capability_catalog());
+        conversation.focus_capability_selector(CapabilitySelector::Model);
+        conversation.select_next_capability();
+        conversation
+            .choose_highlighted_capability()
+            .expect("F2 selects highlight");
+        assert_eq!(conversation.selected_choice_id(), "choice:gpt");
+        conversation.capability_catalog.capabilities.clear();
+        conversation.focus_capability_selector(CapabilitySelector::Provider);
+        assert!(conversation.confirm_capability_selector().is_err());
+        assert!(conversation.choose_highlighted_capability().is_err());
+    }
+
+    #[test]
+    fn intent_model_dropdown_keeps_scrolled_selection_visible_in_small_terminal() {
+        let mut catalog = intent_capability_catalog();
+        let base = catalog.capabilities[0].clone();
+        catalog.capabilities = (0..12)
+            .map(|index| {
+                let mut capability = base.clone();
+                capability.choice_id = Some(format!("choice:{index}"));
+                capability.harness_model_alias = format!("model-{index:02}");
+                capability.provider_model_alias = format!("model-{index:02}");
+                capability
+            })
+            .collect();
+        catalog.default_choice_id = "choice:0".to_owned();
+        let mut conversation = IntentConversation::new(catalog);
+        conversation.focus_capability_selector(CapabilitySelector::Model);
+        conversation.capability_cursor = 11;
+        let backend = ratatui::backend::TestBackend::new(80, 18);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_intent_conversation(frame, frame.area(), &conversation))
+            .expect("render dropdown");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("> model-11"));
     }
 
     #[test]

@@ -3178,11 +3178,20 @@ mod tests {
 
         let snapshot_id;
         let first_event_id;
+        // The request digest is the digest of the whole compiled snapshot, and
+        // the snapshot carries `expires_at_seconds`. Building this input twice
+        // from the clock would therefore produce two *different* requests
+        // whenever the second boundary is crossed in between, and the authority
+        // would correctly answer the second one with `IdempotencyConflict`. The
+        // replay and dedupe properties below are about the request, not about
+        // when it was computed, so the input is built once and its expiry is
+        // carried into the second, differently-keyed delivery.
+        let restart_input = input("restart-1");
+        let mut dedupe_input = input("restart-1b");
+        dedupe_input.expires_at_seconds = restart_input.expires_at_seconds;
         {
             let mut authority = ContextAuthority::open(config()).expect("open before restart");
-            let (receipt, snapshot) = authority
-                .issue(&input("restart-1"), &compiler())
-                .expect("issue");
+            let (receipt, snapshot) = authority.issue(&restart_input, &compiler()).expect("issue");
             assert!(!receipt.replayed);
             snapshot_id = snapshot.snapshot_id.clone();
             first_event_id = receipt.event_id;
@@ -3208,14 +3217,14 @@ mod tests {
         assert_eq!(resolved.snapshot.snapshot_id, snapshot_id);
 
         let (replay_receipt, replayed) = reopened
-            .issue(&input("restart-1"), &compiler())
+            .issue(&restart_input, &compiler())
             .expect("idempotent replay after restart");
         assert!(replay_receipt.replayed);
         assert_eq!(replay_receipt.event_id, first_event_id);
         assert_eq!(replayed.snapshot_id, snapshot_id);
 
         let (dedupe_receipt, deduped) = reopened
-            .issue(&input("restart-1b"), &compiler())
+            .issue(&dedupe_input, &compiler())
             .expect("content dedupe after restart");
         assert!(dedupe_receipt.replayed);
         assert_eq!(deduped.snapshot_id, snapshot_id);

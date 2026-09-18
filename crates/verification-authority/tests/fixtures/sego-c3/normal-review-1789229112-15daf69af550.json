@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "id": "review-1789229112-15daf69af550",
+  "created_at_epoch_seconds": 1789229112,
+  "reviewer": "sego",
+  "engine_version": "0.1.9",
+  "review_mode": "model_code_review",
+  "resolved_provider": "anthropic",
+  "resolved_model": "claude-sonnet-4-6",
+  "resolved_endpoint": "http://127.0.0.1:8821",
+  "identity_evidence": "self_reported_resolution",
+  "scope": "staged",
+  "diff_hash": "15daf69af5509c0deaed1535b337cc4207714b32d1c88e5c80b8c3e297a189f8",
+  "finding_count": 0,
+  "highest_severity": null,
+  "parse_status": "fallback_raw_text",
+  "git_status": "## No commits yet on master\nA  app.py\n",
+  "findings": [],
+  "raw_text": "Mock streaming says hello from the parity harness.",
+  "evidence_coverage": {
+    "scope_kind": "diff",
+    "file_tree_count": 1,
+    "observed_files": [
+      {
+        "path": "app.py",
+        "listed": true,
+        "content_status": "full",
+        "captured_line_count": 2
+      }
+    ],
+    "captured_file_count": 1,
+    "truncated_file_count": 0,
+    "not_captured_file_count": 0,
+    "skipped_large_file_count": 0,
+    "unreadable_file_count": 0
+  }
+}

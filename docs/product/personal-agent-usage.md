@@ -25,9 +25,25 @@ PowerShell 的 `PS ...>` 提示符接收系统命令。要输入自然语言，�
 
 ## 选择执行能力
 
-对话界面可查看实际配置的 Provider、Harness 和模型，使用上下键和 F2 选择本次可用路线；F3 设置以后工作的默认值。选择变化后需重新解释当前建议。已确认的任务继续使用其冻结路线。
+对话界面按 Tab / Shift+Tab 切换 Provider、Harness、Model 下拉框，上下键浏览，Enter 确认，Esc 收起。后一级只列出所选 Provider/Harness 已配置的组合。F2 选用当前模型路线，F3 恢复使用默认路线，F4 将建议带入工作草稿。选择变化后需重新发送以更新建议；已确认的任务继续使用其冻结路线。
 
 只有显示可选的组合能够用于新工作。候选或挂起的组合会显示不可用原因。Codex 套餐登录与其他 Provider/API 凭证是不同的接入方式；现有登录不代表任意 Harness 都能使用该额度。
+
+模型目录来自实际安装的 Harness；目录可见与启用工作路线是两个步骤。在 PowerShell 7 中查看当前 Codex 登录可见的模型，无需启动推理：
+
+```powershell
+.\get-codex-models.ps1
+```
+
+新安装时，通过 `-CodexModels` 指定要启用的精确模型 ID，首项作为新安装的默认模型。例如，先确认本机目录确实包含下列 ID，再执行：
+
+```powershell
+.\install-egopulse.ps1 -DataRoot 'E:\EgoPulse-new' -CodexModels @('gpt-6-astra', 'gpt-5.6-sol')
+```
+
+这只是模型配置示例；需要仓库执行时仍须提供安装器要求的仓库路径和验收合同。可用 `-CodexExecutable` 指定用于发现与执行的同一 `codex.exe`。未发现的模型会报错，不会自动替换。安装器的模型选项要求新的数据目录，不覆盖已有任务的路由。
+
+ZCode 桌面中的 Chat Completions Base URL 是模型服务地址。它不能替代 ZCode 的外部调用协议，也不会自动把 GLM/OpenCode 候选变成可执行路线。
 
 ## 继续返工与记录经验
 

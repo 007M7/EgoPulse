@@ -24,8 +24,9 @@ use egopulse_domain_contracts::v01::egopulse::{
 use egopulse_harness_adapter::{DriverErrorCertainty, NativeHarnessDriver};
 use egopulse_verification_authority::{
     CheckerOutputRole, CheckerProcessFailure, GovernedVerificationCheckOutput,
-    GovernedVerificationChecker, GovernedVerificationCheckerError, SegoMappedResult,
-    SegoMapperPolicy, checker_failure_result, checker_output_execution_ref, map_sego_review,
+    GovernedVerificationChecker, GovernedVerificationCheckerError, ReconciliationOutcome,
+    SegoMappedResult, SegoMapperPolicy, checker_failure_result, checker_output_execution_ref,
+    held_review_receipt, map_sego_review, reconcile_receipt, review_receipt_from_bytes,
 };
 use prost::Message;
 use serde_json::{Value, json};
@@ -642,6 +643,12 @@ impl DeterministicObservation {
             },
             discrepancies,
             unverified_items: unverified,
+            // This path is the deterministic observation of repository
+            // material. It calls no Provider endpoint and produces no checker
+            // route, so it has no identity evidence to report and no declared
+            // gap. Declaring either here would be inventing a claim.
+            identity_evidence: None,
+            identity_evidence_gap: None,
             review_id: execution,
         }
     }
@@ -822,18 +829,23 @@ fn command_review_summary(command: &RepositoryAcceptanceCommandV1) -> Value {
 }
 
 fn map_bound_review(raw: &[u8], policy: &SegoMapperPolicy, execution_id: &str) -> SegoMappedResult {
-    let id_matches = serde_json::from_slice::<Value>(raw)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("id")
-                .and_then(Value::as_str)
-                .map(|id| id == execution_id)
-        })
-        .unwrap_or(false);
-    if id_matches && let Ok(result) = map_sego_review(raw, policy) {
+    // The dispatch record this execution holds open: the invocation it issued
+    // and the content address it froze for the review input. Reconcile the
+    // arriving bytes against it instead of re-deriving an identity from them.
+    // A response that names another review, or whose bytes are not the ones the
+    // frozen address covers, is not this execution's result.
+    let held = held_review_receipt(execution_id, &policy.raw_output_address);
+    let consistent = review_receipt_from_bytes(execution_id, raw).is_ok_and(|arrived| {
+        matches!(
+            reconcile_receipt(Some(&held), &arrived),
+            ReconciliationOutcome::Consistent { .. }
+        )
+    });
+    if consistent && let Ok(result) = map_sego_review(raw, policy) {
         return result;
     }
+    // Holding is not a result: the rejected delivery keeps the original
+    // execution's criterion identity so it cannot allocate a second one.
     checker_failure_result(policy, execution_id, CheckerProcessFailure::OutputUntrusted)
 }
 
@@ -919,16 +931,27 @@ mod tests {
         })).expect("review fixture")
     }
 
+    /// The frozen raw-output address always covers one exact artifact, so a
+    /// policy is only coherent for the bytes it was frozen for.
+    fn mapper_for(raw: &[u8]) -> SegoMapperPolicy {
+        SegoMapperPolicy {
+            raw_output_address: content_address(raw),
+            ..mapper()
+        }
+    }
+
     #[test]
     fn repository_review_rejects_other_execution_id_and_never_promotes_zero_findings() {
-        let policy = mapper();
-        let own = map_bound_review(&zero_review("run:one"), &policy, "run:one");
+        let own_bytes = zero_review("run:one");
+        let policy = mapper_for(&own_bytes);
+        let own = map_bound_review(&own_bytes, &policy, "run:one");
         assert_eq!(
             own.criterion_result.outcome,
             CriterionOutcome::Unverified as i32
         );
         assert!(own.criterion_result.evidence_ids.is_empty());
-        let foreign = map_bound_review(&zero_review("run:other"), &policy, "run:one");
+        let foreign_bytes = zero_review("run:other");
+        let foreign = map_bound_review(&foreign_bytes, &mapper_for(&foreign_bytes), "run:one");
         assert_eq!(
             foreign.criterion_result.outcome,
             CriterionOutcome::Error as i32
@@ -939,10 +962,45 @@ mod tests {
             foreign.criterion_result.criterion_result_id,
             own.criterion_result.criterion_result_id
         );
-        let other_run = map_bound_review(&zero_review("run:other"), &policy, "run:other");
+        let other_run = map_bound_review(&foreign_bytes, &mapper_for(&foreign_bytes), "run:other");
         assert_ne!(
             own.criterion_result.criterion_result_id,
             other_run.criterion_result.criterion_result_id
+        );
+    }
+
+    #[test]
+    fn repository_review_holds_when_the_frozen_content_address_covers_other_bytes() {
+        let policy = mapper_for(&zero_review("run:one"));
+        // Right review id, right scope and binding, but the bytes are not the
+        // ones the policy froze: a rewrite that keeps the name must not be
+        // consumed as if it were the reviewed artifact.
+        let rewritten = serde_json::to_vec(&json!({
+            "schema_version": 1, "id": "run:one", "scope": "scope:one",
+            "diff_hash": "b".repeat(64), "finding_count": 0, "highest_severity": null,
+            "parse_status": "structured", "findings": [],
+            "reviewer": "codex-review", "engine_version": "1", "review_mode": "model_code_review",
+            "note": "rewritten after the address was frozen",
+        }))
+        .expect("rewritten fixture");
+        assert_ne!(
+            content_address(&zero_review("run:one")),
+            content_address(&rewritten)
+        );
+        let held = map_bound_review(&rewritten, &policy, "run:one");
+        assert_eq!(
+            held.criterion_result.outcome,
+            CriterionOutcome::Error as i32
+        );
+        assert!(
+            held.discrepancies.is_empty() && held.unverified_items.len() <= 1,
+            "a held delivery produces no findings against the artifact"
+        );
+        let consistent = map_bound_review(&zero_review("run:one"), &policy, "run:one");
+        assert_eq!(
+            held.criterion_result.criterion_result_id,
+            consistent.criterion_result.criterion_result_id,
+            "a held delivery must not mint a second criterion identity"
         );
     }
 
@@ -1055,7 +1113,8 @@ mod tests {
 
     #[test]
     fn repository_review_command_success_does_not_replace_model_uncertainty() {
-        let mut review = map_bound_review(&zero_review("run:one"), &mapper(), "run:one");
+        let owned = zero_review("run:one");
+        let mut review = map_bound_review(&owned, &mapper_for(&owned), "run:one");
         let before = review.criterion_result.evidence_coverage;
         let request = VerificationRequest {
             verification_request_id: "request".into(),

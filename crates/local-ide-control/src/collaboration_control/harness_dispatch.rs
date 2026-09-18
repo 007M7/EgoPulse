@@ -1126,13 +1126,20 @@ where
                 "Artifact return receipt has no lineage".to_owned(),
             )
         })?;
-        let candidate = adapter
-            .terminal_output_candidate_for_dispatch(&lineage.dispatch_id)?
-            .ok_or_else(|| {
-                HarnessDispatchCycleError::ReturnCollector(
-                    "terminal Adapter evidence for Artifact return is unavailable".to_owned(),
-                )
-            })?;
+        // A pending return whose dispatch has no terminal output candidate yet
+        // is a held observation, not a cycle failure. The outbox read is
+        // non-destructive (`delivery_state = 'pending'` stays pending), so the
+        // item remains eligible for a later cycle once the candidate exists.
+        //
+        // Treating it as an error used to abort the whole dispatch cycle and
+        // terminate the daemon, which also made the daemon crash-loop on the
+        // same parked message at every restart and left already-created Tasks
+        // unqueryable. Other returns in this batch still settle normally.
+        let Some(candidate) =
+            adapter.terminal_output_candidate_for_dispatch(&lineage.dispatch_id)?
+        else {
+            continue;
+        };
         let snapshot = match control.get_collaboration(&lineage.run_id)?.outcome {
             Some(get_collaboration_response::Outcome::Snapshot(snapshot)) => snapshot,
             _ => {

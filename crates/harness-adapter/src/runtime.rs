@@ -715,6 +715,14 @@ fn is_retryable_observation_append_failure(error: &AdapterEdgeError) -> bool {
     )
 }
 
+/// Credentials a managed disclosure path may use for one native send.
+///
+/// `Clone` exists because a profile-bound multi-route composition installs one
+/// independent runner per admitted route from a single resolved credential
+/// set: each runner owns its own copy rather than sharing one value across
+/// futures. The resolved secret is held in [`Zeroizing`], so a clone is
+/// zeroized on drop like its origin.
+#[derive(Clone)]
 pub enum ManagedDisclosureCredentials {
     HarnessAccount,
     ManagedAvailable(Zeroizing<Vec<String>>),

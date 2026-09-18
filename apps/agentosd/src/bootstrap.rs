@@ -48,6 +48,7 @@ use egopulse_verification_authority::{
 };
 use prost_types::Timestamp;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::work_capability::{
@@ -62,10 +63,11 @@ use crate::{
     ConfiguredTaskCreationGuard, ConfiguredTaskCreationGuardConfig, ConfiguredTaskTransitionGuard,
     ConfiguredVerificationWorker, ContextMutationPortAdapter, DaemonCompositionError,
     DaemonProviders, FounderVerdictConfigurationError, GovernedReturnCollectorConfig,
-    LocalUserPolicyResolver, LocalUserPolicyResolverConfig, MemoryCandidateProducerBinding,
-    MemoryRetrievalCompositionConfig, NativeHarnessCompositionConfig,
-    SharedAuthorityHandlesCompositionInputs, TaskAuthorityCommitReceiptSource,
-    VerificationAuthorityArtifactSource, VerificationProjectionSource, VerificationWorkerConfig,
+    LocalUserPolicyAdapterConfig, LocalUserPolicyResolver, LocalUserPolicyResolverMultiConfig,
+    MemoryCandidateProducerBinding, MemoryRetrievalCompositionConfig,
+    NativeHarnessCompositionConfig, SharedAuthorityHandlesCompositionInputs,
+    TaskAuthorityCommitReceiptSource, VerificationAuthorityArtifactSource,
+    VerificationProjectionSource, VerificationWorkerConfig,
 };
 use crate::{ConfiguredWorkPreparationPort, RepositoryMaterialConfig};
 
@@ -76,14 +78,16 @@ pub use repository::{FounderSupportingMaterialConfig, RepositoryVerificationConf
 const PRODUCTION_BOOTSTRAP_V2: &str = "egopulse.production-bootstrap/v2";
 const PRODUCTION_BOOTSTRAP_V3: &str = "egopulse.production-bootstrap/v3";
 const V2_MIGRATION_BACKUP_SUFFIX: &str = ".v2.bak";
+const CODEX_MODEL_ADMISSION_BACKUP_SUFFIX: &str = ".codex-models.bak";
 const V3_ROLLBACK_BACKUP_SUFFIX: &str = ".v3-rollback.bak";
 const MAX_MIGRATION_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 
 /// Explicit scalar configuration for the local-user Policy resolver. The
-/// Adapter edge is opened by the composition root so the resolver reads the
-/// same durable adapter store as the Codex Harness composition.
+/// Adapter edges are opened by the composition root so the resolver reads the
+/// same durable adapter stores as the Codex Harness composition: one edge per
+/// admitted exact work route, derived from that route's native composition.
 pub struct LocalUserPolicyBootstrapConfig {
-    pub edge: AdapterEdgeConfig,
+    pub edges: Vec<AdapterEdgeConfig>,
     pub authentication_context_ref: String,
     pub authorization_policy_ref: ContractReference,
     pub allowed_scope_refs: BTreeSet<String>,
@@ -224,6 +228,30 @@ pub struct WorkCapabilityConfigTransitionReport {
     pub provider_model_id: String,
     pub route_binding_sha256: String,
     pub preference_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CodexModelAdmissionRouteView {
+    pub choice_id: String,
+    pub harness_model_id: String,
+    pub provider_model_id: String,
+    pub native_composition_generation: String,
+    pub route_binding_sha256: String,
+}
+
+/// Redaction-safe preview of an additive exact-model admission transition.
+/// The profile catalog remains discovery evidence; only the routes listed here
+/// become selectable after the explicit transition is applied.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CodexModelAdmissionTransitionReport {
+    pub applied: bool,
+    pub changed: bool,
+    pub config_path: String,
+    pub retained_backup_path: String,
+    pub default_model: String,
+    pub default_choice_id: String,
+    pub preference_revision: u64,
+    pub routes: Vec<CodexModelAdmissionRouteView>,
 }
 
 /// A provider-neutral preview of a refreshed Harness catalog.
@@ -681,15 +709,29 @@ impl ProductionBootstrapConfig {
             },
         )?));
 
-        let policy_edge = AdapterEdge::open(self.policy_resolver.edge)?;
-        let policy_resolver = LocalUserPolicyResolver::new(LocalUserPolicyResolverConfig {
-            edge: policy_edge,
-            adapter_id: egopulse_codex_adapter::CODEX_ADAPTER_ID.to_owned(),
-            authorization_policy_ref: self.policy_resolver.authorization_policy_ref,
-            authentication_context_ref: self.policy_resolver.authentication_context_ref,
-            allowed_scope_refs: self.policy_resolver.allowed_scope_refs,
-            decision_ttl: self.policy_resolver.decision_ttl,
-        })?;
+        // Open one Policy edge per admitted route and install the multi-store
+        // resolver. A secondary route's approval observation lives in its own
+        // route-scoped store, so a single primary edge would leave that route's
+        // approval unresolvable at Issue time.
+        let policy_adapters = self
+            .policy_resolver
+            .edges
+            .into_iter()
+            .map(|edge| {
+                Ok(LocalUserPolicyAdapterConfig {
+                    edge: AdapterEdge::open(edge)?,
+                    adapter_id: egopulse_codex_adapter::CODEX_ADAPTER_ID.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, ProductionBootstrapError>>()?;
+        let policy_resolver =
+            LocalUserPolicyResolver::new_multi(LocalUserPolicyResolverMultiConfig {
+                adapters: policy_adapters,
+                authorization_policy_ref: self.policy_resolver.authorization_policy_ref,
+                authentication_context_ref: self.policy_resolver.authentication_context_ref,
+                allowed_scope_refs: self.policy_resolver.allowed_scope_refs,
+                decision_ttl: self.policy_resolver.decision_ttl,
+            })?;
         let policy = Arc::new(Mutex::new(PolicyDecisionAuthority::open(
             self.policy,
             crate::verdict_expiry::FounderExpiryPolicyResolver {
@@ -985,9 +1027,11 @@ impl ProductionBootstrapConfig {
             .ok_or(ProductionBootstrapError::InvalidConfiguration(
                 "provider_profiles.production_codex_route_binding",
             ))?;
-        providers = providers.with_codex_harness(
+        let admitted_routes = self.work_capability_registry.admitted_routes();
+        providers = providers.with_codex_harness_routes(
             self.codex,
             codex_provider_profile,
+            admitted_routes,
             artifact,
             verification,
         )?;
@@ -1450,32 +1494,47 @@ struct ReferenceFile {
     sha256: String,
 }
 
+/// The admitted Codex routes a v3 configuration yields, each paired with the
+/// public choice id that selects it, plus the default choice and the
+/// preference revision those routes were read at.
+type AdmittedCodexRoutes = (Vec<(String, WorkCapabilityRouteBinding)>, String, u64);
+
 impl WorkCapabilitiesFile {
     fn into_typed(
         self,
         production_profile: &ProviderBootstrapProfile,
         codex: &CodexHarnessCompositionConfig,
-    ) -> Result<(WorkCapabilityRouteBinding, String, u64), ProductionBootstrapError> {
-        if self.preference_revision == 0 || self.routes.len() != 1 {
+    ) -> Result<AdmittedCodexRoutes, ProductionBootstrapError> {
+        if self.preference_revision == 0 || self.routes.is_empty() {
             return Err(ProductionBootstrapError::InvalidConfiguration(
-                "work_capabilities initial single-route state",
+                "work_capabilities admitted routes",
             ));
         }
         let default_choice_id = required(
             self.default_choice_id,
             "work_capabilities.default_choice_id",
         )?;
-        let route_file = self.routes.into_iter().next().ok_or(
-            ProductionBootstrapError::InvalidConfiguration("work_capabilities.routes"),
-        )?;
-        let (choice_id, route) = route_file.into_typed()?;
-        if choice_id != default_choice_id {
+        let mut routes = Vec::with_capacity(self.routes.len());
+        let mut native_generations = BTreeSet::new();
+        for route_file in self.routes {
+            let (choice_id, route) = route_file.into_typed()?;
+            validate_codex_route_runtime_binding(&route, production_profile, codex)?;
+            if !native_generations.insert(route.native_composition_generation.clone()) {
+                return Err(ProductionBootstrapError::InvalidConfiguration(
+                    "work_capabilities.routes.native_composition_generation",
+                ));
+            }
+            routes.push((choice_id, route));
+        }
+        if !routes
+            .iter()
+            .any(|(choice_id, _)| choice_id == &default_choice_id)
+        {
             return Err(ProductionBootstrapError::InvalidConfiguration(
                 "work_capabilities.default_choice_id",
             ));
         }
-        validate_codex_route_runtime_binding(&route, production_profile, codex)?;
-        Ok((route, default_choice_id, self.preference_revision))
+        Ok((routes, default_choice_id, self.preference_revision))
     }
 }
 
@@ -1571,10 +1630,24 @@ fn validate_codex_route_runtime_binding(
     profile: &ProviderBootstrapProfile,
     codex: &CodexHarnessCompositionConfig,
 ) -> Result<(), ProductionBootstrapError> {
+    validate_codex_route_runtime_parts(
+        route,
+        profile,
+        &codex.native.workflow.capability_profile_ref,
+        &codex.native.workflow.run_id,
+    )
+}
+
+fn validate_codex_route_runtime_parts(
+    route: &WorkCapabilityRouteBinding,
+    profile: &ProviderBootstrapProfile,
+    capability_profile_ref: &ContractReference,
+    primary_native_generation: &str,
+) -> Result<(), ProductionBootstrapError> {
     let model = profile
         .models
         .iter()
-        .find(|model| model.harness_model_id == profile.exact_model)
+        .find(|model| model.harness_model_id == route.harness_model_id)
         .ok_or(ProductionBootstrapError::InvalidConfiguration(
             "provider_profiles.production_codex_model",
         ))?;
@@ -1587,10 +1660,10 @@ fn validate_codex_route_runtime_binding(
         || route.harness_id != "codex_app_server"
         || route.harness_model_id != model.harness_model_id
         || route.provider_model_id != model.provider_model_id
-        || route.capability_profile_ref.as_ref()
-            != Some(&codex.native.workflow.capability_profile_ref)
+        || route.capability_profile_ref.as_ref() != Some(capability_profile_ref)
         || route.catalog_snapshot_sha256.as_deref() != catalog_snapshot_sha256
-        || route.native_composition_generation != codex.native.workflow.run_id
+        || (route.harness_model_id == profile.exact_model)
+            != (route.native_composition_generation == primary_native_generation)
     {
         return Err(ProductionBootstrapError::InvalidConfiguration(
             "work_capabilities.routes.runtime_binding",
@@ -1621,6 +1694,325 @@ pub fn apply_work_capability_config_migration(
         .map_err(transition_persistence_error)?;
     report.applied = true;
     Ok(report)
+}
+
+/// Previews an additive admission of exact Codex models already present in the
+/// configured production profile catalog. Existing sealed routes are retained
+/// byte-for-byte and every existing admitted model must remain requested.
+pub fn preview_codex_model_admission_transition(
+    path: impl AsRef<Path>,
+    admitted_models: &[String],
+    default_model: &str,
+) -> Result<CodexModelAdmissionTransitionReport, ProductionBootstrapError> {
+    let path = path.as_ref();
+    let original = read_transition_config(path)?;
+    render_codex_model_admission(path, &original, admitted_models, default_model)
+        .map(|(report, _)| report)
+}
+
+/// Applies the exact additive Codex model admission preview under the same
+/// configuration lock used by work-capability preference changes.
+pub fn apply_codex_model_admission_transition(
+    path: impl AsRef<Path>,
+    admitted_models: &[String],
+    default_model: &str,
+) -> Result<CodexModelAdmissionTransitionReport, ProductionBootstrapError> {
+    let path = path.as_ref();
+    let original = read_transition_config(path)?;
+    let (mut report, replacement) =
+        render_codex_model_admission(path, &original, admitted_models, default_model)?;
+    if report.changed {
+        persist_explicit_config_transition(
+            path,
+            &original,
+            &replacement,
+            CODEX_MODEL_ADMISSION_BACKUP_SUFFIX,
+        )
+        .map_err(transition_persistence_error)?;
+        report.applied = true;
+    }
+    Ok(report)
+}
+
+fn render_codex_model_admission(
+    path: &Path,
+    original: &[u8],
+    admitted_models: &[String],
+    default_model: &str,
+) -> Result<(CodexModelAdmissionTransitionReport, Vec<u8>), ProductionBootstrapError> {
+    if admitted_models.is_empty() {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "Codex admitted models",
+        ));
+    }
+    let default_model = required(default_model.to_owned(), "Codex default admitted model")?;
+    let mut requested_models = BTreeSet::new();
+    for model in admitted_models {
+        let model = required(model.clone(), "Codex admitted model")?;
+        if !requested_models.insert(model) {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "Codex admitted models must be unique",
+            ));
+        }
+    }
+    if !requested_models.contains(&default_model) {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "Codex default model must be admitted",
+        ));
+    }
+
+    let file: UserOwnedBootstrapFile = serde_json::from_slice(original).map_err(|source| {
+        ProductionBootstrapError::ConfigurationFormat {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    let UserOwnedBootstrapFile {
+        schema_version,
+        provider_profiles,
+        work_capabilities,
+        codex,
+        ..
+    } = file;
+    if schema_version != PRODUCTION_BOOTSTRAP_V3 {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "Codex model admission requires v3 work capabilities",
+        ));
+    }
+    let provider_profiles = provider_profiles
+        .into_iter()
+        .map(ProviderProfileFile::into_typed)
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_provider_profiles(&provider_profiles)?;
+    let production_profiles = provider_profiles
+        .iter()
+        .filter(|profile| {
+            profile.provider == ProviderId::Gpt
+                && profile.harness == ProviderHarnessKind::CodexAppServer
+                && profile.admission == ProviderAdmission::Production
+        })
+        .collect::<Vec<_>>();
+    let [production_profile] = production_profiles.as_slice() else {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "Codex model admission requires exactly one production profile",
+        ));
+    };
+    let configured_default = required(
+        codex.default_model.unwrap_or_default(),
+        "codex.default_model",
+    )?;
+    if configured_default != production_profile.exact_model {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.production_codex_binding",
+        ));
+    }
+    let capability_profile_ref = codex.workflow.capability_profile_ref.into_typed();
+    let primary_native_generation = required(codex.workflow.run_id, "codex.workflow.run_id")?;
+    let work_capabilities = work_capabilities.ok_or(
+        ProductionBootstrapError::InvalidConfiguration("work_capabilities are required in v3"),
+    )?;
+    if work_capabilities.preference_revision == 0 {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "work_capabilities.preference_revision",
+        ));
+    }
+
+    let existing_route_count = work_capabilities.routes.len();
+    let mut existing_by_model = BTreeMap::new();
+    let mut existing_routes = Vec::with_capacity(existing_route_count);
+    for route_file in work_capabilities.routes {
+        let (choice_id, route) = route_file.into_typed()?;
+        validate_codex_route_runtime_parts(
+            &route,
+            production_profile,
+            &capability_profile_ref,
+            &primary_native_generation,
+        )?;
+        if existing_by_model
+            .insert(route.harness_model_id.clone(), choice_id.clone())
+            .is_some()
+        {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "work_capabilities routes must identify unique models",
+            ));
+        }
+        existing_routes.push((choice_id, route));
+    }
+    if existing_routes.is_empty()
+        || existing_by_model
+            .keys()
+            .any(|model| !requested_models.contains(model))
+    {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "Codex model admission is additive",
+        ));
+    }
+
+    let mut routes = existing_routes;
+    for model_id in &requested_models {
+        if existing_by_model.contains_key(model_id) {
+            continue;
+        }
+        let model = production_profile
+            .models
+            .iter()
+            .find(|model| &model.harness_model_id == model_id)
+            .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                "Codex admitted model is absent from the production catalog",
+            ))?;
+        let identity = codex_route_identity(
+            &production_profile.profile_id,
+            &model.harness_model_id,
+            &model.provider_model_id,
+        );
+        let route = seal_work_capability_route_binding(WorkCapabilityRouteBinding {
+            route_id: format!("route:codex:{}", &identity[..32]),
+            route_generation: 1,
+            provider_profile_id: production_profile.profile_id.clone(),
+            provider_id: "gpt".to_owned(),
+            harness_id: "codex_app_server".to_owned(),
+            harness_model_id: model.harness_model_id.clone(),
+            provider_model_id: model.provider_model_id.clone(),
+            capability_profile_ref: Some(capability_profile_ref.clone()),
+            catalog_snapshot_sha256: production_profile
+                .catalog_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.evidence_digest_sha256.clone()),
+            native_composition_generation: format!("codex-native:route:{identity}"),
+            route_binding_sha256: String::new(),
+        })
+        .map_err(|_| {
+            ProductionBootstrapError::InvalidConfiguration("Codex admitted route binding")
+        })?;
+        validate_codex_route_runtime_parts(
+            &route,
+            production_profile,
+            &capability_profile_ref,
+            &primary_native_generation,
+        )?;
+        let choice_id = format!("codex:{}", &identity[..24]);
+        existing_by_model.insert(model_id.clone(), choice_id.clone());
+        routes.push((choice_id, route));
+    }
+    let default_choice_id = existing_by_model.get(&default_model).cloned().ok_or(
+        ProductionBootstrapError::InvalidConfiguration("Codex default admitted route"),
+    )?;
+    let routes_changed = routes.len() != existing_route_count;
+    let default_changed = work_capabilities.default_choice_id != default_choice_id;
+    let changed = routes_changed || default_changed;
+    let preference_revision = if changed {
+        work_capabilities.preference_revision.checked_add(1).ok_or(
+            ProductionBootstrapError::InvalidConfiguration("work_capabilities.preference_revision"),
+        )?
+    } else {
+        work_capabilities.preference_revision
+    };
+
+    let route_views = routes
+        .iter()
+        .map(|(choice_id, route)| CodexModelAdmissionRouteView {
+            choice_id: choice_id.clone(),
+            harness_model_id: route.harness_model_id.clone(),
+            provider_model_id: route.provider_model_id.clone(),
+            native_composition_generation: route.native_composition_generation.clone(),
+            route_binding_sha256: route.route_binding_sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    let report = CodexModelAdmissionTransitionReport {
+        applied: false,
+        changed,
+        config_path: path.display().to_string(),
+        retained_backup_path: transition_backup_path(path, CODEX_MODEL_ADMISSION_BACKUP_SUFFIX)?
+            .display()
+            .to_string(),
+        default_model,
+        default_choice_id: default_choice_id.clone(),
+        preference_revision,
+        routes: route_views,
+    };
+    if !changed {
+        return Ok((report, original.to_vec()));
+    }
+
+    let mut document: serde_json::Value = serde_json::from_slice(original).map_err(|source| {
+        ProductionBootstrapError::ConfigurationFormat {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    let work_capabilities = document
+        .get_mut("work_capabilities")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "work_capabilities configuration",
+        ))?;
+    work_capabilities.insert(
+        "default_choice_id".to_owned(),
+        serde_json::Value::String(default_choice_id),
+    );
+    work_capabilities.insert(
+        "preference_revision".to_owned(),
+        serde_json::Value::Number(preference_revision.into()),
+    );
+    let route_values = work_capabilities
+        .get_mut("routes")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "work_capabilities.routes",
+        ))?;
+    for (choice_id, route) in routes.iter().skip(existing_route_count) {
+        route_values.push(codex_route_json(choice_id, route)?);
+    }
+    let mut replacement = serde_json::to_vec_pretty(&document).map_err(|_| {
+        ProductionBootstrapError::InvalidConfiguration("Codex model admission serialization")
+    })?;
+    replacement.push(b'\n');
+    if replacement.len() > MAX_MIGRATION_CONFIG_BYTES {
+        return Err(ProductionBootstrapError::InvalidConfiguration(
+            "configuration file exceeds migration size limit",
+        ));
+    }
+    Ok((report, replacement))
+}
+
+fn codex_route_identity(
+    profile_id: &str,
+    harness_model_id: &str,
+    provider_model_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    for value in [profile_id, harness_model_id, provider_model_id] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn codex_route_json(
+    choice_id: &str,
+    route: &WorkCapabilityRouteBinding,
+) -> Result<serde_json::Value, ProductionBootstrapError> {
+    let profile_ref = route.capability_profile_ref.as_ref().ok_or(
+        ProductionBootstrapError::InvalidConfiguration("work-capability route capability profile"),
+    )?;
+    Ok(serde_json::json!({
+        "choice_id": choice_id,
+        "route_id": route.route_id,
+        "route_generation": route.route_generation,
+        "provider_profile_id": route.provider_profile_id,
+        "provider_id": route.provider_id,
+        "harness_id": route.harness_id,
+        "harness_model_id": route.harness_model_id,
+        "provider_model_id": route.provider_model_id,
+        "capability_profile_ref": {
+            "contract_id": profile_ref.contract_id,
+            "version": profile_ref.version,
+            "sha256": profile_ref.sha256,
+        },
+        "catalog_snapshot_sha256": route.catalog_snapshot_sha256,
+        "native_composition_generation": route.native_composition_generation,
+        "route_binding_sha256": route.route_binding_sha256,
+    }))
 }
 
 /// Previews a rollback only when the current v3 file is the exact semantic
@@ -2522,10 +2914,10 @@ impl UserOwnedBootstrapFile {
         if let Some(config) = &self.repository_verification {
             config.validate_model(production_codex_profile)?;
         }
-        let (admitted_route, default_choice_id, preference_revision) = if migration_required {
+        let (admitted_routes, default_choice_id, preference_revision) = if migration_required {
             let route = compatibility_codex_route(production_codex_profile, &codex)?;
             let choice_id = format!("compat-codex:{}", &route.route_binding_sha256[..16]);
-            (route, choice_id, 1)
+            (vec![(choice_id.clone(), route)], choice_id, 1)
         } else {
             let file =
                 work_capabilities_file.ok_or(ProductionBootstrapError::InvalidConfiguration(
@@ -2533,14 +2925,50 @@ impl UserOwnedBootstrapFile {
                 ))?;
             file.into_typed(production_codex_profile, &codex)?
         };
-        codex.work_capability_route = Some(admitted_route.clone());
-        let work_capability_registry = Arc::new(WorkCapabilityRegistry::new(
+        let primary_route = admitted_routes
+            .iter()
+            .find(|(_, route)| route.native_composition_generation == codex.native.workflow.run_id)
+            .map(|(_, route)| route.clone())
+            .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                "work_capabilities primary Codex route",
+            ))?;
+        codex.work_capability_route = Some(primary_route);
+        // One Policy Adapter edge per admitted exact work route. A Codex route
+        // shares `CODEX_ADAPTER_ID` with its siblings, so a route's store is
+        // identified by the native composition's route-local database path and
+        // store epoch, never by adapter identity. This reuses the same
+        // derivation the Harness composition uses, so a route's approval store
+        // is exactly the store its dispatch observation was written to. The
+        // primary route stays unscoped, matching every existing installation.
+        let registry_routes: Vec<WorkCapabilityRouteBinding> = admitted_routes
+            .iter()
+            .map(|(_, route)| route.clone())
+            .collect();
+        let policy_edges = registry_routes
+            .iter()
+            .map(|route| {
+                let route_native = crate::native_config_for_codex_route(&codex.native, route)?;
+                Ok(AdapterEdgeConfig {
+                    database_path: route_native.adapter_database_path,
+                    adapter_id: egopulse_codex_adapter::CODEX_ADAPTER_ID.to_owned(),
+                    store_epoch: route_native.adapter_store_epoch,
+                    key: AdapterEdgeKey::new(route_native.adapter_key),
+                })
+            })
+            .collect::<Result<Vec<_>, ProductionBootstrapError>>()?;
+        if policy_edges.is_empty() {
+            return Err(ProductionBootstrapError::InvalidConfiguration(
+                "policy resolver requires at least one admitted Codex route",
+            ));
+        }
+        let work_capability_registry = Arc::new(WorkCapabilityRegistry::new_with_routes(
             config_path,
             &provider_profiles,
-            admitted_route,
+            admitted_routes,
             default_choice_id,
             preference_revision,
             migration_required,
+            &codex.native.workflow.run_id,
         )?);
 
         Ok(ProductionBootstrapConfig {
@@ -2590,12 +3018,7 @@ impl UserOwnedBootstrapFile {
                 key: PolicySqlCipherKey::new(policy_store.key),
             },
             policy_resolver: LocalUserPolicyBootstrapConfig {
-                edge: AdapterEdgeConfig {
-                    database_path: adapter_store.database_path,
-                    adapter_id: egopulse_codex_adapter::CODEX_ADAPTER_ID.to_owned(),
-                    store_epoch: adapter_store.store_epoch,
-                    key: AdapterEdgeKey::new(adapter_store.key),
-                },
+                edges: policy_edges,
                 authentication_context_ref: required(
                     self.policy.authentication_context_ref,
                     "policy.authentication_context_ref",
@@ -3582,6 +4005,97 @@ mod tests {
     }
 
     #[test]
+    fn codex_model_admission_is_additive_and_preserves_existing_route_identity() {
+        let directory = tempfile::tempdir().expect("model admission tempdir");
+        let path = directory.path().join("agentos-config.json");
+        fs::write(&path, packaged_v2_config_bytes()).expect("write v2 config");
+        apply_work_capability_config_migration(&path).expect("apply v2 migration");
+        let before = fs::read(&path).expect("read single-route v3");
+        let before_value: serde_json::Value =
+            serde_json::from_slice(&before).expect("parse single-route v3");
+        let retained_route = before_value["work_capabilities"]["routes"][0].clone();
+
+        let admitted = vec!["gpt-5.6-sol".to_owned(), "gpt-5.6-terra".to_owned()];
+        let preview = preview_codex_model_admission_transition(&path, &admitted, "gpt-5.6-terra")
+            .expect("preview additive model admission");
+        assert!(preview.changed);
+        assert!(!preview.applied);
+        assert_eq!(preview.routes.len(), 2);
+        assert_eq!(preview.default_model, "gpt-5.6-terra");
+        assert_eq!(fs::read(&path).expect("preview stays read-only"), before);
+
+        let applied = apply_codex_model_admission_transition(&path, &admitted, "gpt-5.6-terra")
+            .expect("apply additive model admission");
+        assert!(applied.applied);
+        assert_eq!(applied.preference_revision, 2);
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read multi-route v3"))
+                .expect("parse multi-route v3");
+        assert_eq!(after["work_capabilities"]["routes"][0], retained_route);
+        assert_eq!(
+            after["work_capabilities"]["default_choice_id"],
+            applied.default_choice_id
+        );
+        assert_eq!(after["codex"]["default_model"], "gpt-5.6-sol");
+
+        let after_first_apply = fs::read(&path).expect("read first applied config");
+        let replay = apply_codex_model_admission_transition(&path, &admitted, "gpt-5.6-terra")
+            .expect("repeat exact admission");
+        assert!(!replay.changed);
+        assert!(!replay.applied);
+        assert_eq!(replay.preference_revision, 2);
+        assert_eq!(
+            fs::read(&path).expect("read replayed config"),
+            after_first_apply
+        );
+
+        let appended_models = vec![
+            "gpt-5.6-sol".to_owned(),
+            "gpt-5.6-terra".to_owned(),
+            "gpt-5.6-luna".to_owned(),
+        ];
+        let appended =
+            apply_codex_model_admission_transition(&path, &appended_models, "gpt-5.6-terra")
+                .expect("append one admitted model");
+        assert!(appended.applied);
+        assert_eq!(appended.preference_revision, 3);
+        let after_append: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read appended config"))
+                .expect("parse appended config");
+        assert_eq!(
+            after_append["work_capabilities"]["routes"][0],
+            retained_route
+        );
+        assert_eq!(
+            after_append["work_capabilities"]["routes"][1],
+            after["work_capabilities"]["routes"][1]
+        );
+        assert_eq!(
+            after_append["work_capabilities"]["routes"]
+                .as_array()
+                .expect("routes array")
+                .len(),
+            3
+        );
+
+        // Additivity is enforced against the models already sealed in the
+        // config, so the request must keep the default admitted and omit at
+        // least one existing route. Omitting the default is rejected earlier
+        // and by a different rule ("Codex default model must be admitted"),
+        // which would not exercise this path.
+        assert!(matches!(
+            preview_codex_model_admission_transition(
+                &path,
+                &["gpt-5.6-terra".to_owned()],
+                "gpt-5.6-terra",
+            ),
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "Codex model admission is additive"
+            ))
+        ));
+    }
+
+    #[test]
     fn work_capability_config_rollback_rejects_any_post_migration_drift() {
         let directory = tempfile::tempdir().expect("migration tempdir");
         let path = directory.path().join("agentos-config.json");
@@ -4147,5 +4661,210 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    /// The base production configuration a packaged v2 file yields after the
+    /// explicit migration, without opening any Authority.
+    ///
+    /// Tests use it to derive the same primary route identity and the same
+    /// route-scoped Adapter store that a real daemon start would derive.
+    fn primary_route_base_from_packaged_v2(
+        directory: &Path,
+    ) -> (ProviderBootstrapProfile, CodexHarnessCompositionConfig) {
+        // Fixture-only references for fields that do not take part in route
+        // derivation. The run identity and capability profile are read from the
+        // packaged configuration instead, because those do.
+        let stub_reference = |id: &str| ContractReference {
+            contract_id: format!("egopulse/fixture/{id}"),
+            version: "v1".to_owned(),
+            sha256: "cd".repeat(32),
+        };
+        let config_path = directory.join("agentos-config.json");
+        fs::write(&config_path, packaged_v2_config_bytes()).expect("write packaged v2 config");
+        apply_work_capability_config_migration(&config_path).expect("migrate packaged v2 config");
+        let bytes = fs::read(&config_path).expect("read migrated v3 config");
+        // Only the provider profiles are needed here. Reading them directly
+        // avoids resolving credential references, which the whole-file typed
+        // path requires and a route-identity test must not depend on.
+        let file: UserOwnedBootstrapFile =
+            serde_json::from_slice(&bytes).expect("parse migrated v3 config");
+        let provider_profiles: Vec<ProviderBootstrapProfile> = file
+            .provider_profiles
+            .into_iter()
+            .map(|profile| profile.into_typed().expect("typed provider profile"))
+            .collect();
+        let profile = provider_profiles
+            .into_iter()
+            .find(|profile| {
+                profile.provider == ProviderId::Gpt
+                    && profile.admission == ProviderAdmission::Production
+            })
+            .expect("production Codex profile");
+        let codex_executable = profile.executable.clone();
+        // The base composition must carry the packaged run identity and
+        // capability profile exactly as configured: route derivation mixes both
+        // into the sealed route digest, so a stub value would derive a
+        // different route than the daemon does.
+        let capability_profile_ref = file.codex.workflow.capability_profile_ref.into_typed();
+        let workflow = SingleHarnessWorkConfig {
+            run_id: file.codex.workflow.run_id.clone(),
+            attempt_id: "primary-route-base-attempt".to_owned(),
+            dispatch_id: "primary-route-base-dispatch".to_owned(),
+            plan: RunPlan::default(),
+            harness_id: "codex_app_server".to_owned(),
+            capability_profile_ref: capability_profile_ref.clone(),
+            workspace_ref: "workspace".to_owned(),
+            lease_policy_ref: stub_reference("lease"),
+            owner_instance_id: "primary-route-base-owner".to_owned(),
+            material: DispatchMaterial {
+                input_bundle_sha256: "ab".repeat(32),
+                sandbox_profile_ref: stub_reference("sandbox"),
+                tool_policy_ref: stub_reference("tool"),
+                data_egress_policy_ref: stub_reference("egress"),
+                approval_policy_ref: stub_reference("approval"),
+                session_strategy:
+                    egopulse_domain_contracts::v01::egopulse::harness::v1::NativeSessionStrategy::CreateNew,
+                native_session_ref: None,
+                checkpoint_ref: None,
+                route_binding: None,
+                evidence_refs: vec!["primary-route-base-evidence".to_owned()],
+            },
+            task_authority_principal_id: "primary-route-base-task".to_owned(),
+            collaboration_principal_id: "primary-route-base-collaboration".to_owned(),
+            attempt_supervisor_principal_id: "primary-route-base-supervisor".to_owned(),
+            harness_adapter_principal_id: "primary-route-base-adapter".to_owned(),
+        };
+        let run_id = workflow.run_id.clone();
+        let native = NativeHarnessCompositionConfig {
+            collaboration_database_path: directory.join("collaboration.sqlcipher"),
+            collaboration_store_epoch: "primary-route-base-collaboration".to_owned(),
+            collaboration_key: [0x51; 32],
+            adapter_database_path: directory.join("adapter.sqlcipher"),
+            adapter_store_epoch: "primary-route-base-adapter".to_owned(),
+            adapter_key: [0x52; 32],
+            input_bundle_root: directory.join("input"),
+            workspace_root: directory.join("workspace"),
+            default_model: Some(profile.exact_model.clone()),
+            workflow,
+            lease_ttl_seconds: 30,
+            return_collector: GovernedReturnCollectorConfig {
+                artifact_type_ref: stub_reference("artifact-type"),
+                transformation_contract_ref: stub_reference("transformation"),
+                retention_profile_ref: stub_reference("retention"),
+                claim_semantic_profile_ref: stub_reference("claim-semantic"),
+                claim_acceptance_contract_ref: stub_reference("claim-acceptance"),
+                evidence_profile_ref: stub_reference("evidence-profile"),
+                workspace_ref: "workspace".to_owned(),
+                collector_principal_id: "primary-route-base-collector".to_owned(),
+                artifact_authority_principal_id: "primary-route-base-artifact-authority".to_owned(),
+            },
+        };
+        let codex = CodexHarnessCompositionConfig {
+            native,
+            codex_executable,
+            environment_overrides: Vec::new(),
+            work_capability_route: Some(
+                compatibility_codex_route_from_parts(&profile, capability_profile_ref, run_id)
+                    .expect("compatibility route for the packaged profile"),
+            ),
+        };
+        (profile, codex)
+    }
+
+    /// C03: a daemon restart resolves the same primary route and the same
+    /// route-scoped Adapter store.
+    ///
+    /// The primary route is the one every existing installation already runs
+    /// work under, so its persisted identity and its derived store path/epoch
+    /// must not move when a daemon restarts and re-reads its configuration. If
+    /// they moved, approval authorization and receipts written before the
+    /// restart would resolve against a different store and be lost.
+    #[test]
+    fn primary_route_identity_and_store_are_stable_across_a_config_reload() {
+        let first = tempfile::tempdir().expect("first reload tempdir");
+        let (_, first_codex) = primary_route_base_from_packaged_v2(first.path());
+        let first_route = first_codex
+            .work_capability_route
+            .clone()
+            .expect("primary route");
+        let first_native = crate::native_config_for_codex_route(&first_codex.native, &first_route)
+            .expect("route-native config before restart");
+
+        // A second, independent daemon start: same packaged v2 input, its own
+        // directory, nothing carried over in memory.
+        let second = tempfile::tempdir().expect("second reload tempdir");
+        let (_, second_codex) = primary_route_base_from_packaged_v2(second.path());
+        let second_route = second_codex
+            .work_capability_route
+            .clone()
+            .expect("primary route after restart");
+        let second_native =
+            crate::native_config_for_codex_route(&second_codex.native, &second_route)
+                .expect("route-native config after restart");
+
+        assert_eq!(
+            first_route, second_route,
+            "a restart must resolve the same primary route identity"
+        );
+        assert_eq!(
+            first_route.route_binding_sha256, second_route.route_binding_sha256,
+            "the sealed primary route digest must survive a restart"
+        );
+        assert_eq!(
+            first_route.native_composition_generation, second_route.native_composition_generation,
+            "the primary native composition generation must survive a restart"
+        );
+
+        // The primary route keeps the unscoped base Adapter identity, and the
+        // route-scoped derivation agrees between the two starts.
+        assert_eq!(
+            first_native.adapter_database_path, first_codex.native.adapter_database_path,
+            "the primary route must keep the unscoped base Adapter database"
+        );
+        assert_eq!(
+            first_native.adapter_store_epoch, first_codex.native.adapter_store_epoch,
+            "the primary route must keep the base Adapter store epoch"
+        );
+        assert_eq!(
+            first_native.adapter_store_epoch, second_native.adapter_store_epoch,
+            "the derived Adapter store epoch must be stable across a restart"
+        );
+        assert_eq!(
+            first_native
+                .adapter_database_path
+                .file_name()
+                .expect("primary adapter file name"),
+            second_native
+                .adapter_database_path
+                .file_name()
+                .expect("primary adapter file name after restart"),
+            "the derived Adapter database name must be stable across a restart"
+        );
+
+        // The persisted configuration is stable too: re-reading it yields the
+        // identical sealed binding, so a third start has nothing new to derive.
+        let config_path = second.path().join("agentos-config.json");
+        let reloaded: UserOwnedBootstrapFile = serde_json::from_slice(
+            &fs::read(&config_path).expect("read migrated config after restart"),
+        )
+        .expect("parse migrated config after restart");
+        let persisted = reloaded
+            .work_capabilities
+            .expect("persisted work capabilities");
+        let mut persisted_routes = persisted.routes;
+        assert_eq!(persisted_routes.len(), 1, "one primary route expected");
+        let persisted_choice_id = persisted_routes[0].choice_id.clone();
+        let (reloaded_choice_id, reloaded_route) = persisted_routes
+            .remove(0)
+            .into_typed()
+            .expect("re-read persisted primary route");
+        assert_eq!(
+            reloaded_choice_id, persisted_choice_id,
+            "the persisted choice id must not change on reload"
+        );
+        assert_eq!(
+            reloaded_route, second_route,
+            "re-reading the persisted v3 route must yield the identical sealed binding"
+        );
     }
 }

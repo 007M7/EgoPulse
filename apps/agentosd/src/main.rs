@@ -1,13 +1,16 @@
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::{io::Read, path::PathBuf};
 
 use egopulse_agentosd::{
-    DaemonComposition, DaemonConfig, ProductionBootstrapConfig,
-    WorkCapabilityConfigTransitionReport, apply_work_capability_config_migration,
-    prepare_repository_configuration, preview_work_capability_config_migration,
-    preview_work_capability_config_rollback, rollback_work_capability_config_to_v2,
+    CodexModelAdmissionTransitionReport, DaemonComposition, DaemonConfig,
+    ProductionBootstrapConfig, WorkCapabilityConfigTransitionReport,
+    apply_codex_model_admission_transition, apply_work_capability_config_migration,
+    prepare_repository_configuration, preview_codex_model_admission_transition,
+    preview_work_capability_config_migration, preview_work_capability_config_rollback,
+    rollback_work_capability_config_to_v2,
 };
+use serde::Deserialize;
 use serde_json::json;
 
 fn print_help() {
@@ -24,6 +27,10 @@ Options:
                   Emit the redacted Provider/Model catalog for diagnostics
   --prepare-repository-config REQUEST.json [--json]
                   Write a separate repository configuration candidate; no stores or commands
+  --admit-codex-models REQUEST.json [--json]
+                  Explicitly seal configured Codex model routes; preserve existing routes
+  --preview-codex-models REQUEST.json [--json]
+                  Preview that additive transition without changing configuration
   --preview-v3-migration [--json]
                   Preview the explicit work-capability v2 -> v3 transition
   --migrate-to-v3 [--json]
@@ -57,6 +64,25 @@ async fn main() {
     } else {
         args.as_slice()
     };
+    if command_args.len() == 2
+        && (command_args[0] == "--admit-codex-models"
+            || command_args[0] == "--preview-codex-models")
+    {
+        match admit_codex_models_from_request(
+            PathBuf::from(&command_args[1]),
+            command_args[0] == "--admit-codex-models",
+        ) {
+            Ok(report) => match serde_json::to_string_pretty(&report) {
+                Ok(output) => println!("{output}"),
+                Err(_) => std::process::exit(78),
+            },
+            Err(error) => {
+                eprintln!("agentosd model admission refused: {error}");
+                std::process::exit(78);
+            }
+        }
+        return;
+    }
     if command_args.len() == 2 && command_args[0] == "--prepare-repository-config" {
         match prepare_repository_configuration(PathBuf::from(&command_args[1])) {
             Ok(report) => match serde_json::to_string_pretty(&report) {
@@ -186,6 +212,45 @@ async fn main() {
         }
         std::process::exit(1);
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodexModelAdmissionRequest {
+    config_path: PathBuf,
+    admitted_models: Vec<String>,
+    default_model: String,
+}
+
+fn admit_codex_models_from_request(
+    request_path: PathBuf,
+    apply: bool,
+) -> Result<CodexModelAdmissionTransitionReport, String> {
+    let file = std::fs::File::open(request_path)
+        .map_err(|_| "model admission request could not be opened".to_owned())?;
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "model admission request could not be read".to_owned())?;
+    if bytes.len() > 16 * 1024 {
+        return Err("model admission request exceeds the supported limit".to_owned());
+    }
+    let request: CodexModelAdmissionRequest =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid model admission request".to_owned())?;
+    let result = if apply {
+        apply_codex_model_admission_transition(
+            request.config_path,
+            &request.admitted_models,
+            &request.default_model,
+        )
+    } else {
+        preview_codex_model_admission_transition(
+            request.config_path,
+            &request.admitted_models,
+            &request.default_model,
+        )
+    };
+    result.map_err(|error| error.to_string())
 }
 
 fn user_config_path() -> PathBuf {

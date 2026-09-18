@@ -6,6 +6,8 @@ param(
     [string]$AcceptanceContractPath,
     [string]$GitExecutable,
     [string]$ReviewModel,
+    [string[]]$CodexModels,
+    [string]$CodexExecutable,
     [switch]$Force,
     [switch]$SkipMemoryWorker,
     [switch]$Launch,
@@ -14,6 +16,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+$configureCodexModels = $null -ne $CodexModels -and $CodexModels.Count -gt 0
+if (-not $configureCodexModels -and -not [string]::IsNullOrWhiteSpace($CodexExecutable)) {
+    throw 'Use -CodexModels with -CodexExecutable to explicitly select the models to enable.'
+}
+if ($configureCodexModels) {
+    $seenModels = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($model in $CodexModels) {
+        if ($model -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\z' -or -not $seenModels.Add($model)) {
+            throw 'CodexModels must contain distinct, exact model identities.'
+        }
+    }
+    if ($CodexModels.Count -gt 32) { throw 'Select at most 32 Codex models.' }
+}
 
 if ([string]::IsNullOrWhiteSpace($IpcInstance) -or $IpcInstance -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z') {
     throw 'IpcInstance must be a 1..64 character ASCII token beginning with an alphanumeric character and containing only alphanumeric, dot, underscore, or hyphen characters.'
@@ -92,6 +108,34 @@ foreach ($binary in @('agentosd.exe', 'egopulse.exe', 'egopulse-tui.exe')) {
     }
 }
 
+$modelCatalog = $null
+if ($configureCodexModels) {
+    if (Test-Path -LiteralPath (Join-Path $DataRoot 'agentos-config.json')) {
+        throw 'Codex model setup requires a fresh DataRoot. Preserve existing task routes; use the daemon model-admission transition for an existing configuration.'
+    }
+    $discoveryScript = Join-Path $root 'get-codex-models.ps1'
+    if (-not (Test-Path -LiteralPath $discoveryScript -PathType Leaf)) {
+        throw 'The package is missing get-codex-models.ps1.'
+    }
+    $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop).Source
+    $discoveryArguments = @('-NoProfile', '-NonInteractive', '-File', $discoveryScript)
+    if (-not [string]::IsNullOrWhiteSpace($CodexExecutable)) {
+        $discoveryArguments += @('-CodexExecutable', $CodexExecutable)
+    }
+    $catalogLines = @(& $pwsh @discoveryArguments)
+    if ($LASTEXITCODE -ne 0) { throw 'Codex model discovery failed; installation was not started.' }
+    $modelCatalog = ($catalogLines -join [Environment]::NewLine) | ConvertFrom-Json
+    if ($modelCatalog.schema_version -cne 'egopulse.codex-model-catalog/v1' -or $modelCatalog.inference_started) {
+        throw 'Invalid Codex model discovery report.'
+    }
+    $availableModels = @($modelCatalog.models | ForEach-Object { [string]$_.model })
+    foreach ($model in $CodexModels) {
+        if ($availableModels -cnotcontains $model) {
+            throw "The installed Codex did not advertise requested model '$model'. No fallback was selected."
+        }
+    }
+}
+
 $data = (New-Item -ItemType Directory -Force -Path $DataRoot).FullName
 $configPath = Join-Path $data 'agentos-config.json'
 $templatePath = Join-Path $root 'config/agentos-config.example.json'
@@ -162,6 +206,24 @@ else {
     $config.memory_retrieval.worker_executable = $worker
     $config.memory_retrieval.working_directory = $root
     $config.memory_retrieval.environment_overrides.PYTHONPATH = "$memorySource;$bindings"
+
+    if ($configureCodexModels) {
+        $codexProfiles = @($config.provider_profiles | Where-Object {
+            $_.provider -eq 'gpt' -and $_.harness -eq 'codex_app_server' -and $_.admission -eq 'production'
+        })
+        if ($codexProfiles.Count -ne 1) { throw 'Expected one production Codex profile in the installation template.' }
+        $codexProfile = $codexProfiles[0]
+        $codexProfile.models = @($modelCatalog.models | ForEach-Object {
+            [pscustomobject]@{ harness_model_id = [string]$_.model; provider_model_id = [string]$_.model }
+        })
+        # This is a new installation with no frozen work. The explicit first
+        # model establishes the base composition; the daemon seals each route.
+        $codexProfile.selected_model = $CodexModels[0]
+        $codexProfile.executable = $modelCatalog.executable
+        $codexProfile.PSObject.Properties.Remove('catalog_snapshot')
+        $config.codex.default_model = $CodexModels[0]
+        $config.codex.codex_executable = $modelCatalog.executable
+    }
 
     # Installation-specific replacement changes the reviewed workflow run ID.
     # Persist a v2 source and let the daemon's authoritative transition derive
@@ -273,6 +335,17 @@ if ($requiresFreshV3Migration) {
     if ($LASTEXITCODE -ne 0) {
         throw "EgoPulse fresh-install v3 transition failed with exit code $LASTEXITCODE"
     }
+}
+if ($configureCodexModels) {
+    $admissionRequestPath = Join-Path $data 'codex-model-admission.request.json'
+    $admissionRequest = [ordered]@{
+        config_path = $configPath
+        admitted_models = @($CodexModels)
+        default_model = $CodexModels[0]
+    }
+    [IO.File]::WriteAllText($admissionRequestPath, ($admissionRequest | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false)))
+    & $daemon --admit-codex-models $admissionRequestPath --json
+    if ($LASTEXITCODE -ne 0) { throw 'Explicit Codex model admission failed. Configuration and request are retained for diagnosis.' }
 }
 & $daemon --check-config
 if ($LASTEXITCODE -ne 0) {

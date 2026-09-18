@@ -65,11 +65,8 @@ impl LocalUserPolicyResolver {
         {
             return Err(LocalUserPolicyConfigurationError::InvalidConfiguration);
         }
-        let mut adapter_ids = BTreeSet::new();
         if config.adapters.iter().any(|adapter| {
-            adapter.adapter_id.trim().is_empty()
-                || adapter.edge.adapter_id() != adapter.adapter_id
-                || !adapter_ids.insert(adapter.adapter_id.clone())
+            adapter.adapter_id.trim().is_empty() || adapter.edge.adapter_id() != adapter.adapter_id
         }) {
             return Err(LocalUserPolicyConfigurationError::InvalidConfiguration);
         }
@@ -262,18 +259,69 @@ impl PolicyReferenceResolver for LocalUserPolicyResolver {
             .adapter_receipt
             .as_ref()
             .ok_or(PolicyReferenceRejection::DeliveryReceiptInvalid)?;
-        let adapter = self
-            .adapters
-            .iter()
-            .find(|adapter| adapter.adapter_id == request.adapter_id)
-            .ok_or(PolicyReferenceRejection::NotFound)?;
-        let stored = adapter
-            .edge
-            .lock()
-            .map_err(|_| PolicyReferenceRejection::IntegrityFailure)?
-            .approval_receipt(&request.approval_request_id)
-            .map_err(map_edge_error)?
-            .ok_or(PolicyReferenceRejection::NotFound)?;
+        let mut matched = None;
+        for adapter in &self.adapters {
+            let edge = adapter
+                .edge
+                .lock()
+                .map_err(|_| PolicyReferenceRejection::IntegrityFailure)?;
+            let snapshot = edge
+                .approval_authorization_snapshot()
+                .map_err(map_edge_error)?;
+            let mut exact_binding = false;
+            let mut request_present = false;
+            for entry in &snapshot.entries {
+                let Some(harness_observation::Payload::ApprovalRequest(observed)) =
+                    entry.projection.observation.payload.as_ref()
+                else {
+                    continue;
+                };
+                if observed.approval_request_id != request.approval_request_id {
+                    continue;
+                }
+                request_present = true;
+                let private = private_approval_request(entry)?;
+                let projection = &entry.projection;
+                let binding = HarnessApprovalRequestBinding {
+                    adapter_id: adapter.adapter_id.clone(),
+                    attempt_id: projection.attempt_id.clone(),
+                    dispatch_id: projection.dispatch_id.clone(),
+                    fencing_token: projection.fencing_token,
+                    approval_request_id: private.approval_request_id,
+                    kind: private.kind,
+                    action_digest_sha256: private.action_digest_sha256,
+                    requested_scope_ref: private.requested_scope_ref,
+                    native_routing_ref: private.native_routing_ref,
+                    request_observation_id: projection.source_observation_id.clone(),
+                    request_observation_sequence: projection.source_revision,
+                    request_lifecycle: private.lifecycle,
+                    request_revision: private.request_revision,
+                };
+                if binding == *request {
+                    if exact_binding {
+                        return Err(PolicyReferenceRejection::IntegrityFailure);
+                    }
+                    exact_binding = true;
+                }
+            }
+            // Request identity is globally unambiguous, even when two stores
+            // use the same native adapter ID. Never choose a store by order.
+            if request_present {
+                if matched.is_some() {
+                    return Err(PolicyReferenceRejection::IntegrityFailure);
+                }
+                matched = Some((
+                    exact_binding,
+                    edge.approval_receipt(&request.approval_request_id)
+                        .map_err(map_edge_error)?,
+                ));
+            }
+        }
+        let (exact_binding, stored) = matched.ok_or(PolicyReferenceRejection::NotFound)?;
+        if !exact_binding {
+            return Err(PolicyReferenceRejection::RequestMismatch);
+        }
+        let stored = stored.ok_or(PolicyReferenceRejection::NotFound)?;
         if stored != *receipt
             || receipt.approval_request_id != request.approval_request_id
             || receipt.decision != record.decision
@@ -652,6 +700,224 @@ mod tests {
             )
             .expect_err("withdrawn latest request must reject the old Open command");
         assert_eq!(error, PolicyReferenceRejection::RequestMismatch);
+        drop(resolver);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_adapter_second_store_issue_consume_and_reopen_use_exact_binding() {
+        let root = edge_root();
+        let first = edge_with_pending_approval(&root, "first.db", "codex", "first", 0x61);
+        let mut second = edge_with_pending_approval(&root, "second.db", "codex", "second", 0x62);
+        let projection = second
+            .pending_approval_projection_messages()
+            .unwrap()
+            .remove(0);
+        second
+            .prepare_approval("second", "dispatch-codex", &"d".repeat(64), 2)
+            .unwrap();
+        second.begin_approval("second", 2).unwrap();
+        let receipt = ApprovalDecisionReceipt {
+            receipt_id: "second-receipt".to_owned(),
+            approval_request_id: "second".to_owned(),
+            decision: ApprovalDecision::Deny as i32,
+            disposition: DeliveryDisposition::Delivered as i32,
+            receipt_digest_sha256: "a".repeat(64),
+            delivered_at: None,
+        };
+        second
+            .record_approval_receipt(
+                "second",
+                "delivered",
+                &receipt.encode_to_vec(),
+                b"safe fixture receipt",
+                3,
+            )
+            .unwrap();
+        acknowledge_pending_approval_projections(&mut second);
+        drop(first);
+        drop(second);
+        let principal = AuthenticatedPolicyPrincipal {
+            kind: egopulse_policy_decision_authority::PolicyPrincipalKind::LocalUser,
+            principal_id: "os-user:test".to_owned(),
+            authenticated: true,
+        };
+        let issue = IssueHarnessApprovalDecisionCommand {
+            approval_request_id: "second".to_owned(),
+            expected_action_digest_sha256: "a".repeat(64),
+            expected_request_observation_id: projection.source_observation_id,
+            expected_request_observation_sequence: projection.source_revision,
+            expected_request_revision: 1,
+            ..Default::default()
+        };
+        let mut original = None;
+        // Pass 0 registers the store that owns the request second, so a lookup
+        // that resolves by adapter identity alone selects the sibling store and
+        // cannot find the receipt. Pass 1 reverses the registration order, so
+        // the pair shows the store is chosen by durable request binding rather
+        // than by registration order.
+        for pass in 0..2 {
+            let mut sources = [("first.db", 0x61), ("second.db", 0x62)];
+            if pass == 1 {
+                sources.reverse();
+            }
+            let adapters = sources
+                .into_iter()
+                .map(|(file, key)| LocalUserPolicyAdapterConfig {
+                    edge: AdapterEdge::open(AdapterEdgeConfig {
+                        database_path: root.join(file),
+                        adapter_id: "codex".to_owned(),
+                        store_epoch: "codex-policy-test-epoch".to_owned(),
+                        key: AdapterEdgeKey::new([key; 32]),
+                    })
+                    .unwrap(),
+                    adapter_id: "codex".to_owned(),
+                })
+                .collect();
+            let resolver = LocalUserPolicyResolver::new_multi(LocalUserPolicyResolverMultiConfig {
+                adapters,
+                authorization_policy_ref: authorization_contract_ref(),
+                authentication_context_ref: "local-ipc:test".to_owned(),
+                allowed_scope_refs: BTreeSet::from(["scope://safe".to_owned()]),
+                decision_ttl: Duration::from_secs(300),
+            })
+            .unwrap();
+            let resolved = resolver.resolve_issue(&issue, &principal).unwrap();
+            if let Some(binding) = &original {
+                assert_eq!(binding, &resolved.request);
+            }
+            original = Some(resolved.request.clone());
+            let command = ConsumeHarnessApprovalDecisionCommand {
+                adapter_receipt: Some(receipt.clone()),
+                ..Default::default()
+            };
+            let mut record = HarnessApprovalDecisionRecord {
+                request: Some(resolved.request),
+                decision: receipt.decision,
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    resolver
+                        .validate_adapter_receipt(&command, &record, &principal)
+                        .unwrap(),
+                    vec!["adapter-approval-receipt:second-receipt@durable"]
+                );
+            }
+            record.request.as_mut().unwrap().fencing_token += 1;
+            assert_eq!(
+                resolver
+                    .validate_adapter_receipt(&command, &record, &principal)
+                    .unwrap_err(),
+                PolicyReferenceRejection::RequestMismatch
+            );
+        }
+        // The receipt is bound to the store that owns the request. Reopen both
+        // stores and show the sibling - which shares the adapter ID and is
+        // registered before the owner in pass 0 - holds no receipt the consume
+        // could have returned, while still owning a competing request. A lookup
+        // that resolves by adapter identity alone is therefore observably wrong
+        // rather than merely untested.
+        let sibling = AdapterEdge::open(AdapterEdgeConfig {
+            database_path: root.join("first.db"),
+            adapter_id: "codex".to_owned(),
+            store_epoch: "codex-policy-test-epoch".to_owned(),
+            key: AdapterEdgeKey::new([0x61; 32]),
+        })
+        .expect("reopen sibling store");
+        assert!(
+            sibling
+                .approval_authorization_snapshot()
+                .expect("read sibling snapshot")
+                .entries
+                .iter()
+                .any(|entry| matches!(
+                    entry.projection.observation.payload.as_ref(),
+                    Some(harness_observation::Payload::ApprovalRequest(request))
+                        if request.approval_request_id == "first"
+                )),
+            "the sibling store must own a competing request under the same adapter ID"
+        );
+        assert!(
+            sibling
+                .approval_receipt("second")
+                .expect("read sibling receipt")
+                .is_none(),
+            "the sibling store must not hold the owning store's receipt"
+        );
+        let owner = AdapterEdge::open(AdapterEdgeConfig {
+            database_path: root.join("second.db"),
+            adapter_id: "codex".to_owned(),
+            store_epoch: "codex-policy-test-epoch".to_owned(),
+            key: AdapterEdgeKey::new([0x62; 32]),
+        })
+        .expect("reopen owning store");
+        assert_eq!(
+            owner
+                .approval_receipt("second")
+                .expect("read owning receipt"),
+            Some(receipt.clone()),
+            "the owning store must hold the exact receipt the consume returned"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_adapter_cross_store_request_collision_rejects_issue_and_consume() {
+        let root = edge_root();
+        let first = edge_with_pending_approval(&root, "a.db", "codex", "collision", 0x63);
+        let second = edge_with_pending_approval(&root, "b.db", "codex", "collision", 0x64);
+        let resolver = LocalUserPolicyResolver::new_multi(LocalUserPolicyResolverMultiConfig {
+            adapters: vec![first, second]
+                .into_iter()
+                .map(|edge| LocalUserPolicyAdapterConfig {
+                    edge,
+                    adapter_id: "codex".to_owned(),
+                })
+                .collect(),
+            authorization_policy_ref: authorization_contract_ref(),
+            authentication_context_ref: "local-ipc:test".to_owned(),
+            allowed_scope_refs: BTreeSet::from(["scope://safe".to_owned()]),
+            decision_ttl: Duration::from_secs(300),
+        })
+        .unwrap();
+        let principal = AuthenticatedPolicyPrincipal {
+            kind: egopulse_policy_decision_authority::PolicyPrincipalKind::LocalUser,
+            principal_id: "os-user:test".to_owned(),
+            authenticated: true,
+        };
+        assert_eq!(
+            resolver
+                .resolve_issue(
+                    &IssueHarnessApprovalDecisionCommand {
+                        approval_request_id: "collision".to_owned(),
+                        ..Default::default()
+                    },
+                    &principal
+                )
+                .unwrap_err(),
+            PolicyReferenceRejection::IntegrityFailure
+        );
+        assert_eq!(
+            resolver
+                .validate_adapter_receipt(
+                    &ConsumeHarnessApprovalDecisionCommand {
+                        adapter_receipt: Some(ApprovalDecisionReceipt::default()),
+                        ..Default::default()
+                    },
+                    &HarnessApprovalDecisionRecord {
+                        request: Some(HarnessApprovalRequestBinding {
+                            adapter_id: "codex".to_owned(),
+                            approval_request_id: "collision".to_owned(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    &principal
+                )
+                .unwrap_err(),
+            PolicyReferenceRejection::IntegrityFailure
+        );
         drop(resolver);
         let _ = fs::remove_dir_all(root);
     }

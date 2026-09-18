@@ -113,6 +113,8 @@ pub enum WorkCapabilityRegistryError {
     InvalidAdmittedRoute,
     #[error("work-capability route does not match exactly one production profile/model")]
     AdmittedRouteProfileMismatch,
+    #[error("work-capability route model and declared primary composition generation disagree")]
+    AdmittedRoutePrimaryAnchorMismatch,
     #[error("work-capability choices are not unique")]
     DuplicateChoice,
     #[error("work-capability routes are ambiguous")]
@@ -151,6 +153,12 @@ impl WorkCapabilityRegistry {
     ///
     /// Every configured profile/model remains visible, but only the unique
     /// production model that exactly matches `admitted_route` is selectable.
+    ///
+    /// This entry point declares no primary composition generation, so it
+    /// fails closed to the pre-multi-route rule: the single admitted route must
+    /// be the matched profile's exact model. Admitting a secondary model
+    /// requires the crate-internal multi-route entry, which carries the primary
+    /// generation the multi-route composition is anchored on.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config_path: PathBuf,
@@ -170,7 +178,46 @@ impl WorkCapabilityRegistry {
             choice_id,
             preference_revision,
             migration_required,
+            None,
         )
+    }
+
+    /// Builds a registry from an explicit set of already-sealed admitted
+    /// routes. Catalog visibility alone never creates an admitted route.
+    ///
+    /// `primary_native_generation` is the native composition generation the
+    /// composition root anchors its primary runner on. Each route must agree
+    /// with it: only the matched profile's exact model may carry the primary
+    /// generation, and any other catalog model must carry its own generation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_routes(
+        config_path: PathBuf,
+        profiles: &[ProviderBootstrapProfile],
+        admitted_routes: Vec<(String, WorkCapabilityRouteBinding)>,
+        default_choice_id: String,
+        preference_revision: u64,
+        migration_required: bool,
+        primary_native_generation: &str,
+    ) -> Result<Self, WorkCapabilityRegistryError> {
+        Self::from_admitted_capabilities(
+            config_path,
+            profiles,
+            admitted_routes
+                .into_iter()
+                .map(|(choice_id, route)| AdmittedCapability { choice_id, route })
+                .collect(),
+            default_choice_id,
+            preference_revision,
+            migration_required,
+            Some(primary_native_generation),
+        )
+    }
+
+    pub(crate) fn admitted_routes(&self) -> Vec<WorkCapabilityRouteBinding> {
+        self.admitted_by_choice
+            .values()
+            .map(|admitted| admitted.route.clone())
+            .collect()
     }
 
     /// Resolves the current future-work default without mutating configuration.
@@ -288,6 +335,7 @@ impl WorkCapabilityRegistry {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_admitted_capabilities(
         config_path: PathBuf,
         profiles: &[ProviderBootstrapProfile],
@@ -295,6 +343,7 @@ impl WorkCapabilityRegistry {
         default_choice_id: String,
         preference_revision: u64,
         migration_required: bool,
+        primary_native_generation: Option<&str>,
     ) -> Result<Self, WorkCapabilityRegistryError> {
         if admitted_capabilities.is_empty() || validate_choice_id(&default_choice_id).is_err() {
             return Err(WorkCapabilityRegistryError::InvalidDefaultChoice);
@@ -315,6 +364,29 @@ impl WorkCapabilityRegistry {
             let matches = profile_model_matches(profiles, &admitted.route);
             if matches.len() != 1 {
                 return Err(WorkCapabilityRegistryError::AdmittedRouteProfileMismatch);
+            }
+            // One admitted route must own the primary composition generation,
+            // and it must be the matched profile's exact model. This keeps the
+            // primary runner's unscoped store bound to the exact model the
+            // profile is admitted for: without it, a route for another catalog
+            // model could claim the primary generation, the composition root
+            // would select it as the primary, and the anchored store would be
+            // reused for a different model. A route whose generation is not
+            // declared as the primary one must therefore carry its own.
+            //
+            // Without a declared primary generation this fails closed by
+            // treating every route as the anchored one, so the single-route
+            // constructor cannot admit an unanchored secondary model.
+            let matched_profile = profiles
+                .get(matches[0].0)
+                .ok_or(WorkCapabilityRegistryError::AdmittedRouteProfileMismatch)?;
+            let carries_primary_generation = primary_native_generation.is_none_or(|generation| {
+                admitted.route.native_composition_generation == generation
+            });
+            if (admitted.route.harness_model_id == matched_profile.exact_model)
+                != carries_primary_generation
+            {
+                return Err(WorkCapabilityRegistryError::AdmittedRoutePrimaryAnchorMismatch);
             }
             if !admitted_model_keys.insert(matches[0]) {
                 return Err(WorkCapabilityRegistryError::AmbiguousAdmittedRoute);
@@ -531,7 +603,6 @@ fn route_matches_profile_model(
         && route.harness_id == harness_id(profile.harness)
         && route.harness_model_id == model.harness_model_id
         && route.provider_model_id == model.provider_model_id
-        && profile.exact_model == model.harness_model_id
         && route.catalog_snapshot_sha256
             == profile
                 .catalog_snapshot
@@ -861,6 +932,9 @@ mod tests {
         }
     }
 
+    /// Two independent production profiles, each admitted for its own exact
+    /// model. This fixture declares no primary composition generation, so both
+    /// routes are the anchored exact model of their own profile.
     fn two_route_registry(path: &Path) -> WorkCapabilityRegistry {
         let profiles = vec![
             profile(
@@ -892,6 +966,7 @@ mod tests {
             "choice-a".to_owned(),
             1,
             false,
+            None,
         )
         .expect("two-route test registry")
     }
@@ -1323,5 +1398,234 @@ mod tests {
             Err(WorkCapabilityPortFailure::StateRevisionConflict)
         );
         assert_eq!(fs::read(&config_path).expect("read after"), before);
+    }
+
+    /// A profile whose model catalog is larger than its exact (admitted)
+    /// model. Catalog presence alone must never create an admitted route.
+    fn multi_model_profile(
+        profile_id: &str,
+        exact_model: &str,
+        catalog: &[(&str, &str)],
+    ) -> ProviderBootstrapProfile {
+        let mut profile = profile(
+            profile_id,
+            ProviderAdmission::Production,
+            exact_model,
+            exact_model,
+        );
+        profile.models = catalog
+            .iter()
+            .map(
+                |(harness_model_id, provider_model_id)| ProviderModelBinding {
+                    harness_model_id: (*harness_model_id).to_owned(),
+                    provider_model_id: (*provider_model_id).to_owned(),
+                },
+            )
+            .collect();
+        profile.exact_model = exact_model.to_owned();
+        profile
+    }
+
+    fn route_with_native_generation(
+        profile_id: &str,
+        harness_model_id: &str,
+        provider_model_id: &str,
+        native_composition_generation: &str,
+    ) -> WorkCapabilityRouteBinding {
+        seal_work_capability_route_binding(WorkCapabilityRouteBinding {
+            route_id: format!("route:{profile_id}:{harness_model_id}"),
+            route_generation: 1,
+            provider_profile_id: profile_id.to_owned(),
+            provider_id: "gpt".to_owned(),
+            harness_id: "codex_app_server".to_owned(),
+            harness_model_id: harness_model_id.to_owned(),
+            provider_model_id: provider_model_id.to_owned(),
+            capability_profile_ref: Some(ContractReference {
+                contract_id: "egopulse.harness.codex".to_owned(),
+                version: "1.0.0".to_owned(),
+                sha256: "a".repeat(64),
+            }),
+            catalog_snapshot_sha256: Some("b".repeat(64)),
+            native_composition_generation: native_composition_generation.to_owned(),
+            route_binding_sha256: String::new(),
+        })
+        .expect("seal route")
+    }
+
+    fn anchored_catalog() -> Vec<ProviderBootstrapProfile> {
+        vec![multi_model_profile(
+            "provider-profile:a",
+            "model-a",
+            &[
+                ("model-a", "provider-model-a"),
+                ("model-b", "provider-model-b"),
+            ],
+        )]
+    }
+
+    #[test]
+    fn work_capability_secondary_model_cannot_claim_the_primary_generation() {
+        let error = WorkCapabilityRegistry::new_with_routes(
+            PathBuf::from("unused-agentos.json"),
+            &anchored_catalog(),
+            vec![
+                (
+                    "choice-primary".to_owned(),
+                    route_with_native_generation(
+                        "provider-profile:a",
+                        "model-a",
+                        "provider-model-a",
+                        "native:primary",
+                    ),
+                ),
+                (
+                    "choice-forged".to_owned(),
+                    route_with_native_generation(
+                        "provider-profile:a",
+                        "model-b",
+                        "provider-model-b",
+                        "native:primary",
+                    ),
+                ),
+            ],
+            "choice-primary".to_owned(),
+            1,
+            false,
+            "native:primary",
+        )
+        .err()
+        .expect("a non-exact model must not claim the primary generation");
+        assert_eq!(
+            error,
+            WorkCapabilityRegistryError::AdmittedRoutePrimaryAnchorMismatch
+        );
+    }
+
+    #[test]
+    fn work_capability_exact_model_cannot_declare_a_secondary_generation() {
+        let error = WorkCapabilityRegistry::new_with_routes(
+            PathBuf::from("unused-agentos.json"),
+            &anchored_catalog(),
+            vec![(
+                "choice-drifted".to_owned(),
+                route_with_native_generation(
+                    "provider-profile:a",
+                    "model-a",
+                    "provider-model-a",
+                    "native:secondary",
+                ),
+            )],
+            "choice-drifted".to_owned(),
+            1,
+            false,
+            "native:primary",
+        )
+        .err()
+        .expect("the exact model must carry the declared primary generation");
+        assert_eq!(
+            error,
+            WorkCapabilityRegistryError::AdmittedRoutePrimaryAnchorMismatch
+        );
+    }
+
+    #[test]
+    fn work_capability_admits_a_secondary_model_with_its_own_generation() {
+        let registry = WorkCapabilityRegistry::new_with_routes(
+            PathBuf::from("unused-agentos.json"),
+            &anchored_catalog(),
+            vec![
+                (
+                    "choice-primary".to_owned(),
+                    route_with_native_generation(
+                        "provider-profile:a",
+                        "model-a",
+                        "provider-model-a",
+                        "native:primary",
+                    ),
+                ),
+                (
+                    "choice-secondary".to_owned(),
+                    route_with_native_generation(
+                        "provider-profile:a",
+                        "model-b",
+                        "provider-model-b",
+                        "native:secondary",
+                    ),
+                ),
+            ],
+            "choice-primary".to_owned(),
+            1,
+            false,
+            "native:primary",
+        )
+        .expect("anchored multi-route registry");
+
+        assert_eq!(registry.admitted_routes().len(), 2);
+        let listed = registry.list(&principal()).expect("list");
+        let by_model = |model: &str| {
+            listed
+                .capabilities
+                .iter()
+                .find(|capability| capability.harness_model_alias == model)
+                .expect("catalog model is projected")
+        };
+        assert!(by_model("model-a").selectable);
+        assert_eq!(
+            by_model("model-b").choice_id.as_deref(),
+            Some("choice-secondary")
+        );
+        assert!(by_model("model-b").selectable);
+    }
+
+    #[test]
+    fn work_capability_single_route_constructor_rejects_an_unanchored_secondary_model() {
+        let error = WorkCapabilityRegistry::new(
+            PathBuf::from("unused-agentos.json"),
+            &anchored_catalog(),
+            route_with_native_generation(
+                "provider-profile:a",
+                "model-b",
+                "provider-model-b",
+                "native:secondary",
+            ),
+            "choice-secondary".to_owned(),
+            1,
+            false,
+        )
+        .err()
+        .expect("the single-route constructor declares no primary generation");
+        assert_eq!(
+            error,
+            WorkCapabilityRegistryError::AdmittedRoutePrimaryAnchorMismatch
+        );
+    }
+
+    #[test]
+    fn work_capability_single_route_constructor_still_admits_the_exact_model() {
+        let registry = WorkCapabilityRegistry::new(
+            PathBuf::from("unused-agentos.json"),
+            &anchored_catalog(),
+            route_with_native_generation(
+                "provider-profile:a",
+                "model-a",
+                "provider-model-a",
+                "native:primary",
+            ),
+            "choice-primary".to_owned(),
+            1,
+            false,
+        )
+        .expect("exact-model single-route registry");
+        let listed = registry.list(&principal()).expect("list");
+        let other = listed
+            .capabilities
+            .iter()
+            .find(|capability| capability.harness_model_alias == "model-b")
+            .expect("catalog-only model remains visible");
+        assert!(!other.selectable);
+        assert_eq!(
+            other.safe_reason_code.as_deref(),
+            Some(ROUTE_NOT_ADMITTED_REASON)
+        );
     }
 }

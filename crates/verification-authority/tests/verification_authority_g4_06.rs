@@ -813,6 +813,8 @@ impl GovernedVerificationChecker for BatchChecker {
                             },
                             discrepancies: vec![],
                             unverified_items: vec![],
+                            identity_evidence: None,
+                            identity_evidence_gap: None,
                         }
                     }
                 })
