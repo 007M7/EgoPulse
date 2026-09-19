@@ -950,8 +950,8 @@ fn validate_codex_work_capability_route(
             "production Codex provider model binding",
         ))?;
     if route.provider_profile_id != profile.profile_id
-        || route.provider_id != "gpt"
-        || route.harness_id != "codex_app_server"
+        || route.provider_id != profile.provider.as_str()
+        || route.harness_id != profile.harness.as_str()
         || route.harness_model_id != model.harness_model_id
         || route.provider_model_id != model.provider_model_id
         || route.capability_profile_ref.as_ref() != Some(&native.workflow.capability_profile_ref)

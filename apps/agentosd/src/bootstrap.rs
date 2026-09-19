@@ -404,7 +404,7 @@ fn validate_refreshed_model_identity(
 }
 
 impl ProviderId {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Gpt => "gpt",
             Self::DeepSeek => "deepseek",
@@ -415,7 +415,7 @@ impl ProviderId {
 }
 
 impl ProviderHarnessKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::CodexAppServer => "codex_app_server",
             Self::DshAcp => "dsh_acp",
@@ -3448,7 +3448,7 @@ pub enum ProductionBootstrapError {
     VerdictAuthority(#[from] egopulse_founder_verdict_authority::VerdictAuthorityFailure),
     #[error("principal policy is invalid")]
     PrincipalPolicy(#[from] PrincipalPolicyError),
-    #[error("Codex Harness composition is invalid")]
+    #[error("Codex Harness composition is invalid: {0:#}")]
     Codex(#[from] DaemonCompositionError),
     #[error("Verification worker composition is invalid: {0}")]
     VerificationWorker(#[from] crate::VerificationWorkerConfigurationError),
