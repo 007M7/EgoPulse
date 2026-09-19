@@ -15,7 +15,7 @@ use thiserror::Error;
 /// mapper configuration. A Sego contract revision bump must update both pins
 /// deliberately and re-run the fixture-backed mapper tests.
 pub const SEGO_REVIEW_ARTIFACT_CONTRACT_ID: &str = "sego.review.artifact/v1";
-pub const SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION: u64 = 2;
+pub const SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION: u64 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegoFindingEvidenceBinding {
@@ -88,6 +88,10 @@ struct ReviewArtifact {
     reviewer: Option<String>,
     engine_version: Option<String>,
     review_mode: Option<String>,
+    #[serde(default)]
+    data_egress_class: Option<String>,
+    #[serde(default)]
+    compute_boundary: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -436,6 +440,20 @@ fn validate_review(review: &ReviewArtifact, policy: &SegoMapperPolicy) -> Result
         .min_by_key(|severity| severity_rank_string(severity));
     if review.highest_severity.as_deref() != expected_highest {
         return Err(SegoMapError::InconsistentArtifact);
+    }
+    // Consumer-side disposition for the rev 3 observation fields: an
+    // unnamable data-egress destination or compute boundary is refused
+    // outright (fail-closed); it is never read as `none`, and a missing
+    // field (an unobserving producer path) is refused the same way.
+    match (
+        review.data_egress_class.as_deref(),
+        review.compute_boundary.as_deref(),
+    ) {
+        (
+            Some("none") | Some("provider") | Some("provider_and_fetch"),
+            Some("local") | Some("remote"),
+        ) => {}
+        _ => return Err(SegoMapError::InconsistentArtifact),
     }
     Ok(())
 }

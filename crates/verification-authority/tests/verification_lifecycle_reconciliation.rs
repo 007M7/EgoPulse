@@ -638,7 +638,9 @@ fn sego_review_with_zero_findings() -> Vec<u8> {
         "raw_text": "no findings",
         "reviewer": "sego",
         "engine_version": "0.1.9",
-        "review_mode": "model_code_review"
+        "review_mode": "model_code_review",
+        "data_egress_class": "none",
+        "compute_boundary": "local"
     }))
     .expect("serialize review")
 }
@@ -669,7 +671,9 @@ fn sego_review_with_verified_major() -> Vec<u8> {
         "raw_text": "raw",
         "reviewer": "sego",
         "engine_version": "0.1.9",
-        "review_mode": "model_code_review"
+        "review_mode": "model_code_review",
+        "data_egress_class": "none",
+        "compute_boundary": "local"
     }))
     .expect("serialize review")
 }
@@ -700,7 +704,9 @@ fn sego_review_with_unverified_dependency() -> Vec<u8> {
         "raw_text": "raw",
         "reviewer": "sego",
         "engine_version": "0.1.9",
-        "review_mode": "model_code_review"
+        "review_mode": "model_code_review",
+        "data_egress_class": "none",
+        "compute_boundary": "local"
     }))
     .expect("serialize review")
 }

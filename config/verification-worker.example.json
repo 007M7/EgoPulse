@@ -6,7 +6,9 @@
       "version": "v1",
       "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
     },
-    "criterion_ids": ["replace-criterion-id"],
+    "criterion_ids": [
+      "replace-criterion-id"
+    ],
     "checker_profile_refs": [
       {
         "contract_id": "replace-checker-profile-id",
@@ -23,7 +25,9 @@
     "checker_version": "replace-sego-version",
     "input_contract_ref": null,
     "output_contract_ref": null,
-    "supported_criterion_types": ["replace-criterion-id"],
+    "supported_criterion_types": [
+      "replace-criterion-id"
+    ],
     "assurance_class": 2,
     "sandbox_profile_ref": null,
     "tool_policy_ref": null,
@@ -31,7 +35,9 @@
     "timeout_ms": 30000,
     "network_allowed": false,
     "profile_digest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "attestation_evidence_artifact_ids": ["replace-checker-probe-artifact"],
+    "attestation_evidence_artifact_ids": [
+      "replace-checker-probe-artifact"
+    ],
     "attested_at": null
   },
   "checker_executable": "C:/path/to/sego.exe",
@@ -47,7 +53,7 @@
       "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "contract_id": "sego.review.artifact/v1",
-    "contract_revision": 2,
+    "contract_revision": 3,
     "expected_scope": "replace-scope",
     "expected_diff_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     "expected_reviewer": "replace-reviewer",
