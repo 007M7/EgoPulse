@@ -921,6 +921,7 @@ mod tests {
             "schema_version": 1, "id": id, "scope": "scope:one", "diff_hash": "b".repeat(64),
             "finding_count": 0, "highest_severity": null, "parse_status": "structured", "findings": [],
             "reviewer": "codex-review", "engine_version": "1", "review_mode": "model_code_review",
+            "data_egress_class": "none", "compute_boundary": "local",
         })).expect("review fixture")
     }
 
