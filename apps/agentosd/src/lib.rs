@@ -87,6 +87,7 @@ mod approval_recovery_tests;
 mod artifact;
 mod bootstrap;
 mod cancellation_delivery;
+mod checker_profile_deployment;
 mod context_material;
 mod context_mutation;
 mod founder_material;
@@ -139,6 +140,9 @@ pub use bootstrap::{
     WorkCapabilityConfigTransitionReport, apply_work_capability_config_migration,
     preview_work_capability_config_migration, preview_work_capability_config_rollback,
     rollback_work_capability_config_to_v2,
+};
+pub(crate) use checker_profile_deployment::{
+    CheckerProfileDeploymentConfig, ConfiguredCheckerProfileDeployment,
 };
 pub use context_mutation::ContextMutationPortAdapter;
 pub use memory_mutation::{

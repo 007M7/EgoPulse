@@ -863,6 +863,18 @@ impl ProductionBootstrapConfig {
             ));
         }
         if let Some(worker_config) = self.verification_worker {
+            let deployment = worker_config
+                .checker_profile_deployment
+                .clone()
+                .map(|config| {
+                    crate::ConfiguredCheckerProfileDeployment::new(Arc::clone(&artifact), config)
+                })
+                .transpose()
+                .map_err(|_| {
+                    ProductionBootstrapError::InvalidConfiguration(
+                        "verification_worker.checker_profile_deployment",
+                    )
+                })?;
             let worker = ConfiguredVerificationWorker::new(
                 Arc::clone(&task),
                 Box::new(ArtifactAuthorityReferenceSource::new_shared(Arc::clone(
@@ -870,6 +882,7 @@ impl ProductionBootstrapConfig {
                 ))),
                 Arc::clone(&verification),
                 worker_config,
+                deployment,
             )
             .map_err(ProductionBootstrapError::VerificationWorker)?;
             providers = providers.with_verification_worker(Arc::new(worker));
@@ -1244,6 +1257,10 @@ struct CriterionFile {
 struct VerificationWorkerFile {
     handoff: VerificationWorkerHandoffFile,
     checker_profile: CheckerProfileFile,
+    /// Present when this environment must deploy the declared checker profile
+    /// itself, because no repository workflow owns one here.
+    #[serde(default)]
+    checker_profile_deployment: Option<CheckerProfileDeploymentFile>,
     checker_executable: String,
     #[serde(default)]
     checker_arguments: Vec<String>,
@@ -2853,6 +2870,10 @@ impl VerificationWorkerFile {
         Ok(VerificationWorkerConfig {
             handoff_plan: self.handoff.into_typed(),
             checker_profile: self.checker_profile.into_typed()?,
+            checker_profile_deployment: self
+                .checker_profile_deployment
+                .map(CheckerProfileDeploymentFile::into_typed)
+                .transpose()?,
             checker_executable: PathBuf::from(required(
                 self.checker_executable,
                 "verification_worker.checker_executable",
@@ -2927,6 +2948,50 @@ impl MemoryCandidateProducerFile {
             self.scope_ref,
         )
         .map_err(|_| ProductionBootstrapError::InvalidConfiguration("memory_candidate_producers"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckerProfileDeploymentFile {
+    workspace_ref: String,
+    artifact_type_ref: ReferenceFile,
+    transformation_contract_ref: ReferenceFile,
+    retention_profile_ref: ReferenceFile,
+    collector_principal_id: String,
+    artifact_authority_principal_id: String,
+    sensitivity_class: String,
+}
+
+impl CheckerProfileDeploymentFile {
+    fn into_typed(self) -> Result<crate::CheckerProfileDeploymentConfig, ProductionBootstrapError> {
+        let config = crate::CheckerProfileDeploymentConfig {
+            workspace_ref: required(
+                self.workspace_ref,
+                "verification_worker.checker_profile_deployment.workspace_ref",
+            )?,
+            artifact_type_ref: self.artifact_type_ref.into_typed(),
+            transformation_contract_ref: self.transformation_contract_ref.into_typed(),
+            retention_profile_ref: self.retention_profile_ref.into_typed(),
+            collector_principal_id: required(
+                self.collector_principal_id,
+                "verification_worker.checker_profile_deployment.collector_principal_id",
+            )?,
+            artifact_authority_principal_id: required(
+                self.artifact_authority_principal_id,
+                "verification_worker.checker_profile_deployment.artifact_authority_principal_id",
+            )?,
+            sensitivity_class: required(
+                self.sensitivity_class,
+                "verification_worker.checker_profile_deployment.sensitivity_class",
+            )?,
+        };
+        config.validate().map_err(|_| {
+            ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.checker_profile_deployment",
+            )
+        })?;
+        Ok(config)
     }
 }
 

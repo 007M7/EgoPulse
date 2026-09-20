@@ -40,6 +40,27 @@
     ],
     "attested_at": null
   },
+  "checker_profile_deployment": {
+    "workspace_ref": "default",
+    "artifact_type_ref": {
+      "contract_id": "egopulse.checker-profile-attestation/v1",
+      "version": "v1",
+      "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "transformation_contract_ref": {
+      "contract_id": "checker-profile-deployment/v1",
+      "version": "v1",
+      "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    "retention_profile_ref": {
+      "contract_id": "verification-records/v1",
+      "version": "v1",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "collector_principal_id": "collector:checker-profile-deployment",
+    "artifact_authority_principal_id": "authority:artifact",
+    "sensitivity_class": "local-user-data"
+  },
   "checker_executable": "C:/path/to/sego.exe",
   "checker_arguments": [],
   "working_directory": "C:/path/to/workspace",

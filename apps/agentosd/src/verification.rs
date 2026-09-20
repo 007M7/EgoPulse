@@ -700,6 +700,9 @@ pub struct VerificationWorkerConfig {
     pub model_call_receipt_artifact_ids: Vec<String>,
     pub checker_timeout: Duration,
     pub checker_output_limit: u64,
+    /// Present when no repository workflow deploys this profile, so the worker
+    /// seals the configured declaration itself before attesting it.
+    pub checker_profile_deployment: Option<crate::CheckerProfileDeploymentConfig>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -740,7 +743,152 @@ impl VerificationWorkerConfig {
                 "single-checker reviewed inputs",
             ));
         }
+        if let Some(deployment) = self.checker_profile_deployment.as_ref() {
+            deployment
+                .validate()
+                .map_err(|_| VerificationWorkerConfigurationError::Invalid("checker deployment"))?;
+            // The attestation cites artifacts, so the profile must cite the
+            // declaration this worker is about to seal: a profile that named a
+            // different (or no) evidence would either fail attestation or be
+            // attested on evidence nobody deployed.
+            if !self
+                .checker_profile
+                .attestation_evidence_artifact_ids
+                .contains(&crate::checker_profile_deployment::deployment_artifact_id(
+                    &self.checker_profile.checker_profile_id,
+                ))
+            {
+                return Err(VerificationWorkerConfigurationError::Invalid(
+                    "checker profile deployment evidence",
+                ));
+            }
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod deployment_tests {
+    use super::*;
+    use egopulse_domain_contracts::v01::egopulse::verification::v1::{
+        CriterionRequirement, DiscrepancySeverity,
+    };
+
+    fn reference(id: &str) -> ContractReference {
+        ContractReference {
+            contract_id: id.to_owned(),
+            version: "v1".to_owned(),
+            sha256: "ab".repeat(32),
+        }
+    }
+
+    fn profile() -> egopulse_domain_contracts::v01::egopulse::verification::v1::CheckerProfile {
+        egopulse_domain_contracts::v01::egopulse::verification::v1::CheckerProfile {
+            checker_profile_id: "profile-a".to_owned(),
+            revision: 1,
+            status: 1,
+            checker_id: "checker".to_owned(),
+            checker_version: "v1".to_owned(),
+            input_contract_ref: Some(reference("input")),
+            output_contract_ref: Some(reference("output")),
+            supported_criterion_types: vec!["criterion".to_owned()],
+            assurance_class: 1,
+            sandbox_profile_ref: Some(reference("sandbox")),
+            tool_policy_ref: Some(reference("tools")),
+            data_egress_policy_ref: Some(reference("egress")),
+            timeout_ms: 1000,
+            network_allowed: false,
+            profile_digest_sha256: String::new(),
+            attestation_evidence_artifact_ids: Vec::new(),
+            attested_at: None,
+        }
+    }
+
+    fn config(
+        checker_profile: egopulse_domain_contracts::v01::egopulse::verification::v1::CheckerProfile,
+        checker_profile_deployment: Option<crate::CheckerProfileDeploymentConfig>,
+    ) -> VerificationWorkerConfig {
+        VerificationWorkerConfig {
+            handoff_plan: VerificationHandoffPlan {
+                binding: VerificationBindingTemplate {
+                    claim_id: "claim".to_owned(),
+                    claim_semantic_profile_ref: reference("claim-semantic"),
+                },
+                criterion_ids: vec!["criterion".to_owned()],
+                checker_profile_refs: vec![reference("profile-a")],
+            },
+            checker_profile,
+            checker_profile_deployment,
+            checker_executable: "checker".into(),
+            checker_arguments: Vec::new(),
+            working_directory: ".".into(),
+            checker_request: b"{}".to_vec(),
+            mapper_policy: SegoMapperPolicy {
+                criterion_id: "criterion".to_owned(),
+                requirement: CriterionRequirement::MustPass,
+                checker_profile_ref: reference("profile-a"),
+                contract_id: "sego.review.artifact/v1".to_owned(),
+                contract_revision: 3,
+                expected_scope: "scope".to_owned(),
+                expected_diff_hash: "cd".repeat(32),
+                expected_reviewer: "checker".to_owned(),
+                expected_engine_version: "v1".to_owned(),
+                expected_review_mode: "mode".to_owned(),
+                positive_acceptance: false,
+                failure_threshold: DiscrepancySeverity::Major,
+                raw_output_artifact_id: "artifact".to_owned(),
+                raw_output_address:
+                    egopulse_domain_contracts::v01::egopulse::artifact::v1::ContentAddress {
+                        algorithm: 1,
+                        digest: "ef".repeat(32),
+                        byte_length: 1,
+                    },
+                finding_evidence: std::collections::BTreeMap::new(),
+            },
+            verification_run_id_prefix: "verification-run:".to_owned(),
+            verification_artifact_id_prefix: "verification-artifact:".to_owned(),
+            execution_id_prefix: "verification-execution:".to_owned(),
+            tool_receipt_artifact_ids: Vec::new(),
+            model_call_receipt_artifact_ids: Vec::new(),
+            checker_timeout: std::time::Duration::from_secs(1),
+            checker_output_limit: 1024,
+        }
+    }
+
+    fn deployment() -> crate::CheckerProfileDeploymentConfig {
+        crate::CheckerProfileDeploymentConfig {
+            workspace_ref: "default".to_owned(),
+            artifact_type_ref: reference("checker-profile-attestation"),
+            transformation_contract_ref: reference("checker-profile-deployment"),
+            retention_profile_ref: reference("verification-records"),
+            collector_principal_id: "collector:checker-profile-deployment".to_owned(),
+            artifact_authority_principal_id: "authority:artifact".to_owned(),
+            sensitivity_class: "local-user-data".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_deployment_screen_declares_the_artifact_its_worker_will_seal() {
+        assert_eq!(
+            crate::checker_profile_deployment::deployment_artifact_id("profile-a"),
+            "artifact:checker-profile-attestation:profile-a"
+        );
+    }
+
+    #[test]
+    fn a_deployment_requires_the_profile_to_cite_its_declaration() {
+        assert!(deployment().validate().is_ok());
+        // Without a cited declaration the profile would be attested on
+        // evidence this worker never seals.
+        assert!(config(profile(), Some(deployment())).validate().is_err());
+        let mut cited = profile();
+        cited.attestation_evidence_artifact_ids =
+            vec![crate::checker_profile_deployment::deployment_artifact_id(
+                "profile-a",
+            )];
+        assert!(config(cited.clone(), Some(deployment())).validate().is_ok());
+        // Without a deployment the configuration keeps its previous meaning.
+        assert!(config(cited, None).validate().is_ok());
     }
 }
 
@@ -766,6 +914,8 @@ pub enum VerificationWorkerCycleResult {
 pub enum VerificationWorkerCycleError {
     #[error("checker profile attestation failed: {0}")]
     Attestation(#[from] CheckerProfileAttestationError),
+    #[error("checker profile deployment failed: {0}")]
+    Deployment(#[from] crate::checker_profile_deployment::CheckerProfileDeploymentError),
     #[error("verification handoff intake failed: {0}")]
     Intake(#[from] VerificationHandoffIntakeError),
     #[error(
@@ -861,6 +1011,7 @@ pub struct ConfiguredVerificationWorker {
     intake: VerificationHandoffIntake,
     coordinator: GovernedVerificationExecutionCoordinator<SystemVerificationClock>,
     write_back: SystemTaskVerificationWriteBack,
+    checker_profile_deployment: Option<crate::ConfiguredCheckerProfileDeployment>,
 }
 
 /// The production repository path changes only preparation and execution;
@@ -920,6 +1071,7 @@ impl ConfiguredVerificationWorker {
         artifact: Box<dyn ArtifactReferenceSource>,
         verification: Arc<Mutex<VerificationAuthority>>,
         config: VerificationWorkerConfig,
+        checker_profile_deployment: Option<crate::ConfiguredCheckerProfileDeployment>,
     ) -> Result<Self, VerificationWorkerConfigurationError> {
         config.validate()?;
         let supervisor = GovernedCheckerSupervisor::new(
@@ -929,6 +1081,7 @@ impl ConfiguredVerificationWorker {
             config.checker_output_limit,
         )
         .map_err(|_| VerificationWorkerConfigurationError::CheckerSupervisor)?;
+        let checker_profile_deployment = checker_profile_deployment;
         let intake = VerificationHandoffIntake::new(
             Arc::clone(&task),
             artifact,
@@ -952,6 +1105,7 @@ impl ConfiguredVerificationWorker {
             intake,
             coordinator,
             write_back: SystemTaskVerificationWriteBack::new(task, verification),
+            checker_profile_deployment,
         })
     }
 
@@ -991,6 +1145,7 @@ impl ConfiguredVerificationWorker {
                 &verification,
             )),
             write_back: SystemTaskVerificationWriteBack::new(task, verification),
+            checker_profile_deployment: None,
         })
     }
 
@@ -999,6 +1154,12 @@ impl ConfiguredVerificationWorker {
     ) -> Result<VerificationWorkerCycleResult, VerificationWorkerCycleError> {
         let issued_at = VerificationClock::now(&SystemVerificationClock);
         if let ConfiguredVerificationExecution::Legacy(config) = &self.execution {
+            // A profile is attested only on evidence that exists: the worker
+            // seals its own declaration first, and a failure here leaves the
+            // profile unattested instead of attested on evidence nobody made.
+            if let Some(deployment) = self.checker_profile_deployment.as_ref() {
+                deployment.ensure_sealed(&config.checker_profile, &issued_at)?;
+            }
             self.attestation
                 .attest_one(config.checker_profile.clone(), issued_at)?;
         }
