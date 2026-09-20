@@ -2727,6 +2727,7 @@ async fn run_harness_dispatch_worker(
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
     let mut previous_blockages = std::collections::BTreeSet::new();
+    let mut previous_held_returns = std::collections::BTreeSet::new();
     let mut append_deferred = false;
     loop {
         if *stop.borrow() {
@@ -2765,6 +2766,28 @@ async fn run_harness_dispatch_worker(
             );
             append_deferred = false;
         }
+        // A return the Collaboration refuses on Attempt state is retried every
+        // cycle and can never settle, so it is reported once per distinct
+        // receipt and left in the outbox as the visible governance fact.
+        let mut current_held_returns = std::collections::BTreeSet::new();
+        for held in &report.held_return_receipts {
+            let key = (held.receipt_id.clone(), held.safe_detail_code.clone());
+            current_held_returns.insert(key.clone());
+            if previous_held_returns.contains(&key) {
+                continue;
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "artifact_return_held",
+                    "receipt_id": held.receipt_id,
+                    "run_id": held.run_id,
+                    "attempt_id": held.attempt_id,
+                    "safe_detail_code": held.safe_detail_code,
+                })
+            );
+        }
+        previous_held_returns = current_held_returns;
         let mut current_blockages = std::collections::BTreeSet::new();
         for blockage in report.activation_blockages {
             let key = (
