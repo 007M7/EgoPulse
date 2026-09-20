@@ -914,6 +914,34 @@ impl NativeHarnessCompositionProfile {
     }
 }
 
+/// Identity a production composition claims for one Harness kind: the adapter
+/// that owns its dispatch evidence, and the capability profile it is admitted
+/// under. The Adapter Edge store binds `adapter_id` in its metadata row and
+/// refuses to open for a different one, so every composer that opens that store
+/// — the composition and the policy resolver alike — must resolve this the same
+/// way. `None` means this daemon has no composition for that Harness kind.
+pub fn production_harness_identity(
+    harness: bootstrap::ProviderHarnessKind,
+) -> Option<ProviderHarnessIdentity> {
+    match harness {
+        bootstrap::ProviderHarnessKind::CodexAppServer => Some(ProviderHarnessIdentity {
+            adapter_id: CODEX_ADAPTER_ID,
+            capability_profile_id: CODEX_CAPABILITY_PROFILE_ID,
+        }),
+        bootstrap::ProviderHarnessKind::OpenCodeAcp => Some(ProviderHarnessIdentity {
+            adapter_id: egopulse_opencode_adapter::OPENCODE_ADAPTER_ID,
+            capability_profile_id: egopulse_opencode_adapter::OPENCODE_CAPABILITY_PROFILE_ID,
+        }),
+        bootstrap::ProviderHarnessKind::DshAcp | bootstrap::ProviderHarnessKind::KimiCliAcp => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderHarnessIdentity {
+    pub adapter_id: &'static str,
+    pub capability_profile_id: &'static str,
+}
+
 fn trusted_codex_route_profile(
     profile: &ProviderBootstrapProfile,
     native: &NativeHarnessCompositionConfig,
@@ -1526,65 +1554,68 @@ impl DaemonProviders {
             validate_codex_work_capability_route(route, &provider_profile, &native)?;
         }
         let capability_profile_ref = native.workflow.capability_profile_ref.clone();
-        let (adapter_id, capability_profile_id, observed_protocol, schema_attestation_gap, driver) =
-            match provider_profile.harness {
-                bootstrap::ProviderHarnessKind::CodexAppServer => {
-                    let mut process = CodexAppServerConfig::new(codex_executable);
-                    for (name, value) in &environment_overrides {
-                        process = process.with_environment_override(name.clone(), value.clone());
-                    }
-                    (
-                        CODEX_ADAPTER_ID.to_owned(),
-                        CODEX_CAPABILITY_PROFILE_ID.to_owned(),
-                        codex_protocol_fingerprint(),
-                        None,
-                        Box::new(CodexAppServerDriver::new(process))
-                            as Box<dyn NativeHarnessDriver + Send>,
-                    )
+        let ProviderHarnessIdentity {
+            adapter_id,
+            capability_profile_id,
+        } = production_harness_identity(provider_profile.harness).ok_or(
+            DaemonCompositionError::InvalidConfiguration(
+                "provider_profiles.production_harness_kind",
+            ),
+        )?;
+        let (observed_protocol, schema_attestation_gap, driver) = match provider_profile.harness {
+            bootstrap::ProviderHarnessKind::CodexAppServer => {
+                let mut process = CodexAppServerConfig::new(codex_executable);
+                for (name, value) in &environment_overrides {
+                    process = process.with_environment_override(name.clone(), value.clone());
                 }
-                bootstrap::ProviderHarnessKind::OpenCodeAcp => {
-                    let native_executable_version = provider_profile
-                        .catalog_snapshot
-                        .as_ref()
-                        .map(|snapshot| snapshot.harness_version.trim().to_owned())
-                        .filter(|version| !version.is_empty())
-                        .ok_or(DaemonCompositionError::InvalidConfiguration(
-                            "provider_profiles.production_harness_version",
-                        ))?;
-                    let mut process = egopulse_opencode_adapter::OpenCodeAcpConfig::new(
-                        provider_profile.executable.clone(),
-                        native.workspace_root.clone(),
-                        provider_profile.exact_model.clone(),
-                    );
-                    for (name, value) in &environment_overrides {
-                        process = process.with_environment_override(name.clone(), value.clone());
-                    }
-                    (
-                        egopulse_opencode_adapter::OPENCODE_ADAPTER_ID.to_owned(),
-                        egopulse_opencode_adapter::OPENCODE_CAPABILITY_PROFILE_ID.to_owned(),
-                        egopulse_opencode_adapter::opencode_acp_protocol_fingerprint(
-                            native_executable_version,
-                        ),
-                        Some(
-                            egopulse_opencode_adapter::OPENCODE_ACP_SCHEMA_ATTESTATION_REQUIRED
-                                .to_owned(),
-                        ),
-                        Box::new(egopulse_opencode_adapter::OpenCodeAcpDriver::new(process))
-                            as Box<dyn NativeHarnessDriver + Send>,
-                    )
+                (
+                    codex_protocol_fingerprint(),
+                    None,
+                    Box::new(CodexAppServerDriver::new(process))
+                        as Box<dyn NativeHarnessDriver + Send>,
+                )
+            }
+            bootstrap::ProviderHarnessKind::OpenCodeAcp => {
+                let native_executable_version = provider_profile
+                    .catalog_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.harness_version.trim().to_owned())
+                    .filter(|version| !version.is_empty())
+                    .ok_or(DaemonCompositionError::InvalidConfiguration(
+                        "provider_profiles.production_harness_version",
+                    ))?;
+                let mut process = egopulse_opencode_adapter::OpenCodeAcpConfig::new(
+                    provider_profile.executable.clone(),
+                    native.workspace_root.clone(),
+                    provider_profile.exact_model.clone(),
+                );
+                for (name, value) in &environment_overrides {
+                    process = process.with_environment_override(name.clone(), value.clone());
                 }
-                _ => {
-                    return Err(DaemonCompositionError::InvalidConfiguration(
-                        "provider_profiles.production_harness_kind",
-                    ));
-                }
-            };
+                (
+                    egopulse_opencode_adapter::opencode_acp_protocol_fingerprint(
+                        native_executable_version,
+                    ),
+                    Some(
+                        egopulse_opencode_adapter::OPENCODE_ACP_SCHEMA_ATTESTATION_REQUIRED
+                            .to_owned(),
+                    ),
+                    Box::new(egopulse_opencode_adapter::OpenCodeAcpDriver::new(process))
+                        as Box<dyn NativeHarnessDriver + Send>,
+                )
+            }
+            _ => {
+                return Err(DaemonCompositionError::InvalidConfiguration(
+                    "provider_profiles.production_harness_kind",
+                ));
+            }
+        };
         self.with_profiled_native_harness_drivers(
             vec![ProfiledNativeHarnessComposition {
                 config: native,
                 profile: NativeHarnessCompositionProfile {
-                    adapter_id,
-                    capability_profile_id,
+                    adapter_id: adapter_id.to_owned(),
+                    capability_profile_id: capability_profile_id.to_owned(),
                     capability_profile_ref,
                     observed_protocol,
                     final_artifact_relation_policy:
@@ -3741,6 +3772,35 @@ mod tests {
                 "native Harness composition profile"
             ))
         ));
+    }
+
+    #[test]
+    fn composable_harnesses_resolve_one_adapter_identity() {
+        // The Adapter Edge store binds this identity, and the policy resolver
+        // must name the same one, so a route's adapter is resolved in exactly
+        // one place for every composer.
+        assert_eq!(
+            production_harness_identity(bootstrap::ProviderHarnessKind::CodexAppServer),
+            Some(ProviderHarnessIdentity {
+                adapter_id: CODEX_ADAPTER_ID,
+                capability_profile_id: CODEX_CAPABILITY_PROFILE_ID,
+            })
+        );
+        assert_eq!(
+            production_harness_identity(bootstrap::ProviderHarnessKind::OpenCodeAcp),
+            Some(ProviderHarnessIdentity {
+                adapter_id: egopulse_opencode_adapter::OPENCODE_ADAPTER_ID,
+                capability_profile_id: egopulse_opencode_adapter::OPENCODE_CAPABILITY_PROFILE_ID,
+            })
+        );
+        assert_eq!(
+            production_harness_identity(bootstrap::ProviderHarnessKind::DshAcp),
+            None
+        );
+        assert_eq!(
+            production_harness_identity(bootstrap::ProviderHarnessKind::KimiCliAcp),
+            None
+        );
     }
 
     #[test]

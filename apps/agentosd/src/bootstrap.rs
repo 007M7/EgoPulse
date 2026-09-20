@@ -678,10 +678,27 @@ impl ProductionBootstrapConfig {
             },
         )?));
 
+        // The resolver declares which adapter's approvals it may resolve, and
+        // the store it answers from binds that same identity, so both are read
+        // from the admitted route instead of naming one provider's adapter.
+        let policy_adapter_id = crate::production_harness_identity(
+            self.provider_profiles
+                .iter()
+                .find(|profile| profile.admission == ProviderAdmission::Production)
+                .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                    "provider_profiles.production_harness_kind",
+                ))?
+                .harness,
+        )
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.production_harness_kind",
+        ))?
+        .adapter_id
+        .to_owned();
         let policy_edge = AdapterEdge::open(self.policy_resolver.edge)?;
         let policy_resolver = LocalUserPolicyResolver::new(LocalUserPolicyResolverConfig {
             edge: policy_edge,
-            adapter_id: egopulse_codex_adapter::CODEX_ADAPTER_ID.to_owned(),
+            adapter_id: policy_adapter_id,
             authorization_policy_ref: self.policy_resolver.authorization_policy_ref,
             authentication_context_ref: self.policy_resolver.authentication_context_ref,
             allowed_scope_refs: self.policy_resolver.allowed_scope_refs,
@@ -2605,7 +2622,15 @@ impl UserOwnedBootstrapFile {
             policy_resolver: LocalUserPolicyBootstrapConfig {
                 edge: AdapterEdgeConfig {
                     database_path: adapter_store.database_path,
-                    adapter_id: egopulse_codex_adapter::CODEX_ADAPTER_ID.to_owned(),
+                    // The Adapter Edge store binds one adapter identity, so the
+                    // policy resolver must name the same adapter as the route
+                    // this environment composes.
+                    adapter_id: crate::production_harness_identity(production_profile.harness)
+                        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                            "provider_profiles.production_harness_kind",
+                        ))?
+                        .adapter_id
+                        .to_owned(),
                     store_epoch: adapter_store.store_epoch,
                     key: AdapterEdgeKey::new(adapter_store.key),
                 },
