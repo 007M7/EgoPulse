@@ -1012,6 +1012,10 @@ pub struct ConfiguredVerificationWorker {
     coordinator: GovernedVerificationExecutionCoordinator<SystemVerificationClock>,
     write_back: SystemTaskVerificationWriteBack,
     checker_profile_deployment: Option<crate::ConfiguredCheckerProfileDeployment>,
+    /// Handoff blockages already reported, so a pending handoff this worker
+    /// does not serve is named once instead of on every cycle.
+    reported_handoff_blockages:
+        std::sync::Mutex<std::collections::BTreeSet<(String, String, String)>>,
 }
 
 /// The production repository path changes only preparation and execution;
@@ -1106,6 +1110,7 @@ impl ConfiguredVerificationWorker {
             coordinator,
             write_back: SystemTaskVerificationWriteBack::new(task, verification),
             checker_profile_deployment,
+            reported_handoff_blockages: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -1146,24 +1151,114 @@ impl ConfiguredVerificationWorker {
             )),
             write_back: SystemTaskVerificationWriteBack::new(task, verification),
             checker_profile_deployment: None,
+            reported_handoff_blockages: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         })
+    }
+
+    /// Lineage of the work this worker is configured to verify, read from the
+    /// pending handoff it owns. The deployment is bound to that work, so it is
+    /// sealed only while such a handoff exists.
+    fn deployment_lineage(
+        &self,
+    ) -> Result<
+        Option<egopulse_domain_contracts::v01::egopulse::artifact::v1::LineageBinding>,
+        VerificationWorkerCycleError,
+    > {
+        let owned_claim = match &self.execution {
+            ConfiguredVerificationExecution::Legacy(config) => {
+                Some(config.handoff_plan.binding.claim_id.clone())
+            }
+            ConfiguredVerificationExecution::Prepared { .. } => None,
+        };
+        let pending = {
+            let task = self
+                .intake
+                .task
+                .lock()
+                .map_err(|_| VerificationWorkerCycleError::AuthorityLock)?;
+            task.pending_task_verifications()
+                .map_err(|_| VerificationWorkerCycleError::RequestLineage)?
+        };
+        for handoff in pending {
+            let Some(artifact_set_id) = handoff
+                .event
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.artifact_set_id.as_deref())
+            else {
+                continue;
+            };
+            let Some(artifact_set) = self
+                .intake
+                .artifact
+                .read_artifact_set(artifact_set_id)
+                .map_err(|_| VerificationWorkerCycleError::RequestLineage)?
+            else {
+                continue;
+            };
+            if let Some(claim) = owned_claim.as_deref()
+                && !artifact_set.claim_ids.iter().any(|id| id == claim)
+            {
+                continue;
+            }
+            if let Some(lineage) = artifact_set.lineage.clone() {
+                return Ok(Some(lineage));
+            }
+        }
+        Ok(None)
     }
 
     async fn run_cycle(
         &self,
     ) -> Result<VerificationWorkerCycleResult, VerificationWorkerCycleError> {
         let issued_at = VerificationClock::now(&SystemVerificationClock);
+        // A profile is attested only on evidence that exists. The declaration
+        // is sealed against the lineage of the work this worker serves, so it
+        // can only be deployed while that work is pending — and request
+        // creation then requires the profile to be attested already.
+        let mut profile_ready = self.checker_profile_deployment.is_none();
         if let ConfiguredVerificationExecution::Legacy(config) = &self.execution {
-            // A profile is attested only on evidence that exists: the worker
-            // seals its own declaration first, and a failure here leaves the
-            // profile unattested instead of attested on evidence nobody made.
-            if let Some(deployment) = self.checker_profile_deployment.as_ref() {
-                deployment.ensure_sealed(&config.checker_profile, &issued_at)?;
+            if let Some(deployment) = self.checker_profile_deployment.as_ref()
+                && let Some(lineage) = self.deployment_lineage()?
+            {
+                deployment.ensure_sealed(&config.checker_profile, &lineage, &issued_at)?;
+                profile_ready = true;
             }
-            self.attestation
-                .attest_one(config.checker_profile.clone(), issued_at)?;
+            if profile_ready {
+                self.attestation
+                    .attest_one(config.checker_profile.clone(), issued_at)?;
+            }
         }
-        if let Some(handoff) = self.intake.consume_one(issued_at)?
+        let intake = self.intake.consume_one_with_report(issued_at)?;
+        let mut new_blockages = Vec::new();
+        {
+            let mut reported = self
+                .reported_handoff_blockages
+                .lock()
+                .map_err(|_| VerificationWorkerCycleError::AuthorityLock)?;
+            for blockage in &intake.blockages {
+                let key = (
+                    blockage.task_id.clone(),
+                    blockage.message_id.clone(),
+                    blockage.reason_code.to_owned(),
+                );
+                if reported.insert(key) {
+                    new_blockages.push(blockage.clone());
+                }
+            }
+        }
+        for blockage in &new_blockages {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "verification_handoff_not_served",
+                    "task_id": blockage.task_id,
+                    "message_id": blockage.message_id,
+                    "safe_detail_code": blockage.reason_code,
+                })
+            );
+        }
+        if let Some(handoff) = intake.consumed
             && !handoff.committed
             && !handoff.replayed
         {
@@ -1209,6 +1304,7 @@ impl ConfiguredVerificationWorker {
         {
             return Err(VerificationWorkerCycleError::RequestLineage);
         }
+
         let verification_run_id = self.execution.run_id(&request.verification_request_id);
         let verification_artifact_id = self.execution.artifact_id(&request.verification_request_id);
         let outcome = match &self.execution {
@@ -1386,17 +1482,24 @@ impl VerificationHandoffIntake {
             let resolved = self.prepare_handoff(&handoff, issued_at);
             let (command, expected_request_id) = match resolved {
                 Ok(prepared) => prepared,
-                Err(error) if matches!(self.plan, VerificationHandoffPlanSource::Prepared(_)) => {
+                // A handoff this worker's plan does not describe is simply not
+                // its work: it stays pending for a worker that can serve it.
+                // Only the material of a handoff this plan does own, and its
+                // commit, may fail the cycle.
+                Err(error)
+                    if matches!(
+                        &error,
+                        VerificationHandoffIntakeError::PreparationBlocked(_)
+                            | VerificationHandoffIntakeError::Plan(_)
+                    ) =>
+                {
                     let reason_code = match error {
                         VerificationHandoffIntakeError::PreparationBlocked(reason) => reason,
                         VerificationHandoffIntakeError::Plan(
                             VerificationHandoffPlanError::LineageMismatch,
                         ) => "VERIFICATION_HANDOFF_LINEAGE_MISMATCH",
                         VerificationHandoffIntakeError::Plan(_) => "VERIFICATION_MATERIAL_INVALID",
-                        VerificationHandoffIntakeError::Artifact(_) => {
-                            "VERIFICATION_MATERIAL_UNAVAILABLE"
-                        }
-                        fatal => return Err(fatal),
+                        _ => "VERIFICATION_MATERIAL_UNAVAILABLE",
                     };
                     blockages.push(VerificationHandoffBlockage {
                         task_id: handoff
