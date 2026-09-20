@@ -133,6 +133,27 @@ pub(crate) fn session_new_request(working_directory: &str, id: u64) -> Value {
     })
 }
 
+/// ACP config-option selection. Harnesses that offer a model option on
+/// `session/new` report their own default there, so the exact route is only
+/// established by setting the option before the first prompt.
+pub(crate) fn session_set_config_option_request(
+    id: u64,
+    session_id: &str,
+    config_id: &str,
+    value: &str,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/set_config_option",
+        "params": {
+            "sessionId": session_id,
+            "configId": config_id,
+            "value": value
+        }
+    })
+}
+
 pub(crate) fn session_prompt_request(id: u64, session_id: &str, prompt: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -258,5 +279,15 @@ mod tests {
         );
         assert_eq!(session_cancel_request("s")["method"], "session/cancel");
         assert!(session_cancel_request("s").get("id").is_none());
+    }
+
+    #[test]
+    fn selects_the_session_model_option_by_config_id() {
+        let request =
+            session_set_config_option_request(3, "ses-1", "model", "zen/deepseek-v4-flash");
+        assert_eq!(request["method"], "session/set_config_option");
+        assert_eq!(request["params"]["sessionId"], "ses-1");
+        assert_eq!(request["params"]["configId"], "model");
+        assert_eq!(request["params"]["value"], "zen/deepseek-v4-flash");
     }
 }

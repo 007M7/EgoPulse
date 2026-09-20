@@ -60,6 +60,12 @@ pub struct DshAcpConfig {
     /// This is optional for Harnesses that do not expose model selection, but
     /// must be set when one ACP executable can route to multiple providers.
     pub required_model: Option<String>,
+    /// Establishes `required_model` through the ACP config option before the
+    /// first prompt. A Harness that offers a model option on `session/new`
+    /// reports its own default there, so a route pin that only reads that
+    /// response would either refuse every session or accept whichever model
+    /// the Harness happened to default to.
+    pub select_session_model: bool,
     pub request_timeout: Duration,
 }
 
@@ -72,6 +78,7 @@ impl DshAcpConfig {
             working_directory: working_directory.into(),
             environment_overrides: Vec::new(),
             required_model: None,
+            select_session_model: false,
             request_timeout: Duration::from_secs(10),
         }
     }
@@ -95,6 +102,12 @@ impl DshAcpConfig {
     #[must_use]
     pub fn with_required_model(mut self, model: impl Into<String>) -> Self {
         self.required_model = Some(model.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_model_selection(mut self) -> Self {
+        self.select_session_model = true;
         self
     }
 }
@@ -215,8 +228,10 @@ impl DshAcpDriver {
             driver_error("DSH_ACP_SESSION_NEW_INVALID_MESSAGE", detail.as_bytes())
         })? {
             DshAcpMessage::Response(DshAcpResponse::Result { result, .. }) => {
-                validate_required_session_model(&result, self.config.required_model.as_deref())
-                    .map_err(|code| driver_error(code, session_raw.as_bytes()))?;
+                if !self.config.select_session_model {
+                    validate_required_session_model(&result, self.config.required_model.as_deref())
+                        .map_err(|code| driver_error(code, session_raw.as_bytes()))?;
+                }
                 result
                     .get("sessionId")
                     .and_then(Value::as_str)
@@ -233,9 +248,50 @@ impl DshAcpDriver {
                 ));
             }
         };
+        let mut next_request_id = 3;
+        if self.config.select_session_model {
+            let required_model = self
+                .config
+                .required_model
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+                .ok_or_else(|| {
+                    driver_error("DSH_ACP_REQUIRED_MODEL_INVALID", session_raw.as_bytes())
+                })?;
+            let selection_request = acp::session_set_config_option_request(
+                next_request_id,
+                &session_id,
+                "model",
+                required_model,
+            );
+            write_json_value(
+                &mut process,
+                &selection_request,
+                "DSH_ACP_SESSION_MODEL_WRITE_FAILED",
+            )
+            .await?;
+            let selection_raw =
+                read_response_for_id(&mut process, self.config.request_timeout, next_request_id)
+                    .await?;
+            let selection_result =
+                match acp::parse_message(selection_raw.as_bytes()).map_err(|detail| {
+                    driver_error("DSH_ACP_SESSION_MODEL_INVALID_MESSAGE", detail.as_bytes())
+                })? {
+                    DshAcpMessage::Response(DshAcpResponse::Result { result, .. }) => result,
+                    _ => {
+                        return Err(driver_error(
+                            "DSH_ACP_SESSION_MODEL_REJECTED",
+                            selection_raw.as_bytes(),
+                        ));
+                    }
+                };
+            validate_required_session_model(&selection_result, Some(required_model))
+                .map_err(|code| driver_error(code, selection_raw.as_bytes()))?;
+            next_request_id = next_request_id.saturating_add(1);
+        }
         self.session = Some(DshSession {
             process,
-            next_request_id: 3,
+            next_request_id,
             native_session_ref: session_id,
         });
         Ok(())
@@ -765,6 +821,50 @@ async fn read_json_line(
         .map_err(|_| driver_error(timeout_code, request))?
         .map_err(|error| driver_error(read_code, error.to_string().as_bytes()))?;
     Ok(line)
+}
+
+/// Awaits the ACP response carrying `request_id`, discarding whatever the
+/// Harness interleaves with it. A Harness may emit `session/update`
+/// notifications before answering a request, so a single-line read would
+/// mis-parse the first notification as the answer.
+async fn read_response_for_id(
+    process: &mut SupervisedProcess,
+    request_timeout: Duration,
+    request_id: u64,
+) -> Result<String, DriverError> {
+    const MAX_INTERLEAVED_LINES: usize = 16;
+    for _ in 0..MAX_INTERLEAVED_LINES {
+        let line = read_json_line(
+            process,
+            request_timeout,
+            "DSH_ACP_REQUEST_TIMEOUT",
+            "DSH_ACP_REQUEST_READ_FAILED",
+            b"dsh-acp-request",
+        )
+        .await?;
+        match acp::parse_message(line.as_bytes()) {
+            Ok(DshAcpMessage::Response(DshAcpResponse::Result { id, .. }))
+            | Ok(DshAcpMessage::Response(DshAcpResponse::Error { id: Some(id), .. }))
+                if id.as_u64() == Some(request_id) =>
+            {
+                return Ok(line);
+            }
+            Ok(DshAcpMessage::Response(DshAcpResponse::Error { id: None, .. })) => {
+                return Err(driver_error("DSH_ACP_REQUEST_REJECTED", line.as_bytes()));
+            }
+            Ok(_) => {}
+            Err(detail) => {
+                return Err(driver_error(
+                    "DSH_ACP_REQUEST_INVALID_MESSAGE",
+                    detail.as_bytes(),
+                ));
+            }
+        }
+    }
+    Err(driver_error(
+        "DSH_ACP_REQUEST_UNCONFIRMED",
+        b"dsh-acp-request",
+    ))
 }
 
 fn parse_initialize_response(raw: &[u8]) -> Result<ProbeHarnessResult, DriverError> {

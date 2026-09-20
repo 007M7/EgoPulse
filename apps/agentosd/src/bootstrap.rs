@@ -2512,11 +2512,15 @@ impl UserOwnedBootstrapFile {
             environment_overrides: production_environment_overrides,
             work_capability_route: None,
         };
-        if let Some(profile) = provider_profiles.iter().find(|profile| {
-            profile.provider == ProviderId::Gpt
-                && profile.admission == ProviderAdmission::Production
-        }) && (codex.native.default_model.as_deref() != Some(profile.exact_model.as_str())
-            || codex.codex_executable != profile.executable)
+        // The configured native executable and default model are the admitted
+        // route's, for whichever provider that route serves: composition reads
+        // the profile's executable, so a config that declares a different one
+        // would otherwise describe a route nobody runs.
+        if let Some(profile) = provider_profiles
+            .iter()
+            .find(|profile| profile.admission == ProviderAdmission::Production)
+            && (codex.native.default_model.as_deref() != Some(profile.exact_model.as_str())
+                || codex.codex_executable != profile.executable)
         {
             return Err(ProductionBootstrapError::InvalidConfiguration(
                 "provider_profiles.production_codex_binding",

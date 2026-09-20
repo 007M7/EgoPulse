@@ -801,6 +801,11 @@ pub struct NativeHarnessCompositionProfile {
     capability_profile_ref: ContractReference,
     observed_protocol: NativeProtocolFingerprint,
     final_artifact_relation_policy: FinalArtifactRelationPolicy,
+    /// Named gap for a Harness whose transport publishes no protocol schema.
+    /// `Some` states that the digest is absent because there is nothing to
+    /// digest, and keeps that absence part of the composition identity instead
+    /// of padding the fingerprint with an unobserved value.
+    schema_attestation_gap: Option<String>,
 }
 
 impl NativeHarnessCompositionProfile {
@@ -871,12 +876,20 @@ impl NativeHarnessCompositionProfile {
             capability_profile_ref: required_profile_ref.clone(),
             observed_protocol,
             final_artifact_relation_policy,
+            schema_attestation_gap: None,
         };
         profile.validate()?;
         Ok(profile)
     }
 
     fn validate(&self) -> Result<(), DaemonCompositionError> {
+        let schema_digest_is_sound = match self.schema_attestation_gap.as_deref() {
+            None => !self.observed_protocol.schema_sha256.trim().is_empty(),
+            Some(gap_code) => {
+                !gap_code.trim().is_empty()
+                    && self.observed_protocol.schema_sha256.trim().is_empty()
+            }
+        };
         if self.adapter_id.trim().is_empty()
             || self.capability_profile_id.trim().is_empty()
             || self.capability_profile_ref.contract_id.trim().is_empty()
@@ -885,7 +898,7 @@ impl NativeHarnessCompositionProfile {
             || self.capability_profile_id != self.capability_profile_ref.contract_id
             || self.observed_protocol.protocol_name.trim().is_empty()
             || self.observed_protocol.protocol_version.trim().is_empty()
-            || self.observed_protocol.schema_sha256.trim().is_empty()
+            || !schema_digest_is_sound
             || self.observed_protocol.adapter_version.trim().is_empty()
             || self
                 .observed_protocol
@@ -905,9 +918,10 @@ fn trusted_codex_route_profile(
     profile: &ProviderBootstrapProfile,
     native: &NativeHarnessCompositionConfig,
 ) -> Result<TrustedDispatchRouteProfile, DaemonCompositionError> {
-    if profile.provider != bootstrap::ProviderId::Gpt
-        || profile.harness != bootstrap::ProviderHarnessKind::CodexAppServer
-        || profile.admission != bootstrap::ProviderAdmission::Production
+    // Which provider/Harness pairings may be production is decided once by the
+    // admission table in bootstrap; composition binds to whatever the profile
+    // declares rather than to one provider's name.
+    if profile.admission != bootstrap::ProviderAdmission::Production
         || native.default_model.as_deref() != Some(profile.exact_model.as_str())
     {
         return Err(DaemonCompositionError::InvalidConfiguration(
@@ -923,7 +937,7 @@ fn trusted_codex_route_profile(
         ))?;
     Ok(TrustedDispatchRouteProfile {
         provider_bootstrap_profile_id: profile.profile_id.clone(),
-        selected_harness_id: "codex_app_server".to_owned(),
+        selected_harness_id: profile.harness.as_str().to_owned(),
         provider_model_id: model.provider_model_id.clone(),
         catalog_snapshot_sha256: profile
             .catalog_snapshot
@@ -1485,6 +1499,10 @@ impl DaemonProviders {
     /// Collaboration Control, and the Harness Adapter remain separate owners;
     /// the returned runner is the only process-local writer that sequences
     /// activation consumption and dispatch for this vertical.
+    ///
+    /// The admitted profile chooses the driver, its executable and the
+    /// composition identity, so one production route composes at a time and
+    /// an unadmitted Harness kind is refused instead of silently falling back.
     pub fn with_codex_harness(
         self,
         config: CodexHarnessCompositionConfig,
@@ -1503,27 +1521,77 @@ impl DaemonProviders {
         } = config;
         let disclosure_credentials =
             codex_disclosure_credentials(&provider_profile, &environment_overrides);
-        let mut process = CodexAppServerConfig::new(codex_executable);
-        for (name, value) in environment_overrides {
-            process = process.with_environment_override(name, value);
-        }
         let route_profile = trusted_codex_route_profile(&provider_profile, &native)?;
         if let Some(route) = work_capability_route.as_ref() {
             validate_codex_work_capability_route(route, &provider_profile, &native)?;
         }
         let capability_profile_ref = native.workflow.capability_profile_ref.clone();
+        let (adapter_id, capability_profile_id, observed_protocol, schema_attestation_gap, driver) =
+            match provider_profile.harness {
+                bootstrap::ProviderHarnessKind::CodexAppServer => {
+                    let mut process = CodexAppServerConfig::new(codex_executable);
+                    for (name, value) in &environment_overrides {
+                        process = process.with_environment_override(name.clone(), value.clone());
+                    }
+                    (
+                        CODEX_ADAPTER_ID.to_owned(),
+                        CODEX_CAPABILITY_PROFILE_ID.to_owned(),
+                        codex_protocol_fingerprint(),
+                        None,
+                        Box::new(CodexAppServerDriver::new(process))
+                            as Box<dyn NativeHarnessDriver + Send>,
+                    )
+                }
+                bootstrap::ProviderHarnessKind::OpenCodeAcp => {
+                    let native_executable_version = provider_profile
+                        .catalog_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.harness_version.trim().to_owned())
+                        .filter(|version| !version.is_empty())
+                        .ok_or(DaemonCompositionError::InvalidConfiguration(
+                            "provider_profiles.production_harness_version",
+                        ))?;
+                    let mut process = egopulse_opencode_adapter::OpenCodeAcpConfig::new(
+                        provider_profile.executable.clone(),
+                        native.workspace_root.clone(),
+                        provider_profile.exact_model.clone(),
+                    );
+                    for (name, value) in &environment_overrides {
+                        process = process.with_environment_override(name.clone(), value.clone());
+                    }
+                    (
+                        egopulse_opencode_adapter::OPENCODE_ADAPTER_ID.to_owned(),
+                        egopulse_opencode_adapter::OPENCODE_CAPABILITY_PROFILE_ID.to_owned(),
+                        egopulse_opencode_adapter::opencode_acp_protocol_fingerprint(
+                            native_executable_version,
+                        ),
+                        Some(
+                            egopulse_opencode_adapter::OPENCODE_ACP_SCHEMA_ATTESTATION_REQUIRED
+                                .to_owned(),
+                        ),
+                        Box::new(egopulse_opencode_adapter::OpenCodeAcpDriver::new(process))
+                            as Box<dyn NativeHarnessDriver + Send>,
+                    )
+                }
+                _ => {
+                    return Err(DaemonCompositionError::InvalidConfiguration(
+                        "provider_profiles.production_harness_kind",
+                    ));
+                }
+            };
         self.with_profiled_native_harness_drivers(
             vec![ProfiledNativeHarnessComposition {
                 config: native,
                 profile: NativeHarnessCompositionProfile {
-                    adapter_id: CODEX_ADAPTER_ID.to_owned(),
-                    capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
+                    adapter_id,
+                    capability_profile_id,
                     capability_profile_ref,
-                    observed_protocol: codex_protocol_fingerprint(),
+                    observed_protocol,
                     final_artifact_relation_policy:
                         FinalArtifactRelationPolicy::RequiredGovernedContent,
+                    schema_attestation_gap,
                 },
-                driver: Box::new(CodexAppServerDriver::new(process)),
+                driver,
                 route_profile: Some(route_profile),
                 work_capability_route,
                 disclosure_credentials,
@@ -1562,6 +1630,7 @@ impl DaemonProviders {
                 observed_protocol: codex_protocol_fingerprint(),
                 final_artifact_relation_policy:
                     FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
+                schema_attestation_gap: None,
             },
             driver,
         )
@@ -1670,6 +1739,7 @@ impl DaemonProviders {
                 capability_profile_ref: _,
                 observed_protocol,
                 final_artifact_relation_policy,
+                schema_attestation_gap: _,
             } = profile;
             let repository_dispatch = match self.repository_dispatch.as_ref() {
                 Some(repository) if repository.coordinator.is_some() => {
@@ -3620,6 +3690,7 @@ mod tests {
         let mut profile = NativeHarnessCompositionProfile {
             adapter_id: "adapter".to_owned(),
             capability_profile_id: "profile".to_owned(),
+            schema_attestation_gap: None,
             capability_profile_ref: ContractReference {
                 contract_id: "profile".to_owned(),
                 version: "v1".to_owned(),
@@ -3666,6 +3737,60 @@ mod tests {
         profile.capability_profile_ref.sha256.clear();
         assert!(matches!(
             profile.validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition profile"
+            ))
+        ));
+    }
+
+    #[test]
+    fn composition_profile_names_the_gap_when_the_transport_publishes_no_schema() {
+        fn profile(schema_sha256: &str, gap: Option<&str>) -> NativeHarnessCompositionProfile {
+            NativeHarnessCompositionProfile {
+                adapter_id: "adapter".to_owned(),
+                capability_profile_id: "profile".to_owned(),
+                capability_profile_ref: ContractReference {
+                    contract_id: "profile".to_owned(),
+                    version: "v1".to_owned(),
+                    sha256: "ab".repeat(32),
+                },
+                observed_protocol: NativeProtocolFingerprint {
+                    protocol_name: "acp".to_owned(),
+                    protocol_version: "1".to_owned(),
+                    schema_sha256: schema_sha256.to_owned(),
+                    adapter_version: "adapter-v1".to_owned(),
+                    native_executable_version: "native-v1".to_owned(),
+                    native_binary_sha256: None,
+                },
+                final_artifact_relation_policy:
+                    FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
+                schema_attestation_gap: gap.map(str::to_owned),
+            }
+        }
+
+        assert!(
+            profile("", Some("ACP_SCHEMA_ATTESTATION_REQUIRED"))
+                .validate()
+                .is_ok()
+        );
+        assert!(profile("digest", None).validate().is_ok());
+        // An empty digest with no named gap is indistinguishable from a Harness
+        // that merely failed to report one, so it stays refused.
+        assert!(matches!(
+            profile("", None).validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition profile"
+            ))
+        ));
+        // A named gap next to a digest contradicts itself.
+        assert!(matches!(
+            profile("digest", Some("ACP_SCHEMA_ATTESTATION_REQUIRED")).validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition profile"
+            ))
+        ));
+        assert!(matches!(
+            profile("", Some("  ")).validate(),
             Err(DaemonCompositionError::InvalidConfiguration(
                 "native Harness composition profile"
             ))
@@ -4717,6 +4842,7 @@ mod tests {
             },
             final_artifact_relation_policy:
                 FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
+            schema_attestation_gap: None,
         }
     }
 
