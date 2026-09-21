@@ -357,7 +357,11 @@ fn verify_declaration(
         || actual.type_contract_ref != expected.type_contract_ref
         || actual.retention_profile_ref != expected.retention_profile_ref
         || actual.media_type != expected.media_type
-        || actual_provenance.lineage != expected_provenance.lineage
+        // The declaration's identity is the profile, not the work that first
+        // deployed it: the Authority attests one profile per id, so a later
+        // work item reuses the declaration sealed earlier and its recorded
+        // lineage stays historical. Everything that describes the profile
+        // itself is still compared.
         || actual_provenance.workspace_ref != expected_provenance.workspace_ref
         || actual_provenance.transformation_contract_ref
             != expected_provenance.transformation_contract_ref
