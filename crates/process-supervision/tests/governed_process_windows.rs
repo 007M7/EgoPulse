@@ -266,15 +266,22 @@ async fn governed_process_outcome_does_not_accept_oversized_failed_output() {
 #[tokio::test]
 async fn governed_process_maps_real_child_timeout() {
     let pid_file = unique_pid_file("timeout");
-    let error = run_governed_process(
-        &powershell_spec(&pid_writer_script(&pid_file)),
-        b"request",
-        budget(Duration::from_secs(3), 64),
-    )
-    .await
-    .expect_err("long-running child must time out");
-    assert_eq!(error, GovernedProcessError::Timeout);
+    // The child is a PowerShell process, so the budget has to cover its
+    // start-up; the script then sleeps far longer, which is what exercises the
+    // timeout path. Waiting for the published PID while the run is in flight
+    // removes the race between the child reporting itself and the supervisor
+    // killing it: with a budget shorter than a cold start under load, the child
+    // was killed before it ever wrote the file.
+    let spec = powershell_spec(&pid_writer_script(&pid_file));
+    let run = tokio::spawn(async move {
+        run_governed_process(&spec, b"request", budget(Duration::from_secs(15), 64)).await
+    });
     let pid = wait_for_pid(&pid_file).await;
+    let error = run
+        .await
+        .expect("timeout case task")
+        .expect_err("long-running child must time out");
+    assert_eq!(error, GovernedProcessError::Timeout);
     assert!(
         !process_is_running(pid).await,
         "timed-out child process remained alive: {pid}"
