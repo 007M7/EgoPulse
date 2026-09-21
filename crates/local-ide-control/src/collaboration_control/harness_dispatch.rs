@@ -133,6 +133,21 @@ pub struct HarnessDispatchCycleReport {
     /// telemetry only: durability is owned by the collaboration event log, and
     /// every Task-side settlement re-validates against live Task state.
     pub task_recovery_findings: Vec<TaskRecoveryFinding>,
+    /// Artifact returns whose Attempt no longer accepts returns. Retrying
+    /// cannot clear them and the receipt stays in the outbox as the visible
+    /// governance fact, so they are recorded here instead of stopping the
+    /// daemon that owns every other dispatch.
+    pub held_return_receipts: Vec<HeldReturnReceipt>,
+}
+
+/// One Artifact return the Collaboration refused because its Attempt had
+/// already stopped accepting returns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeldReturnReceipt {
+    pub receipt_id: String,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub safe_detail_code: String,
 }
 
 #[derive(Debug, Error)]
@@ -933,6 +948,7 @@ where
                 task_dispatch_material_preparer,
             } = &mut *runtime;
             let mut recovery_findings = Vec::new();
+            let mut held_return_receipts = Vec::new();
             let return_settlements = consume_artifact_returns(
                 control,
                 adapter,
@@ -940,6 +956,7 @@ where
                 artifact_return_principal.as_ref(),
                 step_return_principal.as_ref(),
                 &mut recovery_findings,
+                &mut held_return_receipts,
             )?;
             let activations = source
                 .pending_task_activations()
@@ -948,6 +965,7 @@ where
                 activations_seen: activations.len() as u64,
                 return_settlements,
                 task_recovery_findings: recovery_findings,
+                held_return_receipts,
                 ..HarnessDispatchCycleReport::default()
             };
             record_settled_cancellation_findings(
@@ -1098,6 +1116,13 @@ where
     }
 }
 
+/// A refusal the Attempt's own recorded state explains is a durable fact: the
+/// same return can never become acceptable by retrying it. Every other refusal
+/// keeps the cycle's error path so a real integrity failure stays fatal.
+fn refused_return_is_held(code: i32) -> bool {
+    CollaborationErrorCode::try_from(code) == Ok(CollaborationErrorCode::StateConflict)
+}
+
 fn consume_artifact_returns<G, C, R, D, A>(
     control: &mut CollaborationControl<G, C>,
     adapter: &mut GovernedHarnessAdapter<R, D, A>,
@@ -1105,6 +1130,7 @@ fn consume_artifact_returns<G, C, R, D, A>(
     principal: Option<&AuthenticatedCollaborationPrincipal>,
     step_return_principal: Option<&AuthenticatedCollaborationPrincipal>,
     recovery_findings: &mut Vec<TaskRecoveryFinding>,
+    held_return_receipts: &mut Vec<HeldReturnReceipt>,
 ) -> Result<u64, HarnessDispatchCycleError>
 where
     G: CollaborationReferenceGuard + HarnessEvidenceResolver,
@@ -1241,11 +1267,24 @@ where
                 },
             )?;
             if result.committed_event.is_none() && !result.replayed {
-                let detail = match result.outcome.as_ref() {
-                    Some(collaboration_command_result::Outcome::Error(error)) => {
-                        format!("{}:{}", error.code, error.safe_detail_code)
-                    }
-                    _ => "missing collaboration error outcome".to_owned(),
+                let refusal = match result.outcome.as_ref() {
+                    Some(collaboration_command_result::Outcome::Error(error)) => Some(error),
+                    _ => None,
+                };
+                if let Some(error) = refusal
+                    && refused_return_is_held(error.code)
+                {
+                    held_return_receipts.push(HeldReturnReceipt {
+                        receipt_id: pending.receipt.receipt_id.clone(),
+                        run_id: run.run_id.clone(),
+                        attempt_id: attempt.attempt_id.clone(),
+                        safe_detail_code: error.safe_detail_code.clone(),
+                    });
+                    continue;
+                }
+                let detail = match refusal {
+                    Some(error) => format!("{}:{}", error.code, error.safe_detail_code),
+                    None => "missing collaboration error outcome".to_owned(),
                 };
                 return Err(HarnessDispatchCycleError::ReturnCollector(format!(
                     "Collaboration rejected Artifact return ({detail})"
@@ -2494,6 +2533,15 @@ fn merge_report(target: &mut HarnessDispatchCycleReport, source: HarnessDispatch
             target.task_recovery_findings.push(finding);
         }
     }
+    for held in source.held_return_receipts {
+        if !target
+            .held_return_receipts
+            .iter()
+            .any(|existing| existing == &held)
+        {
+            target.held_return_receipts.push(held);
+        }
+    }
 }
 
 fn remove_terminal_envelopes(
@@ -2657,6 +2705,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_an_attempt_state_refusal_leaves_the_return_receipt_held() {
+        // The Attempt's recorded state explains this refusal: retrying the same
+        // return cannot succeed, so the cycle holds it instead of failing.
+        assert!(refused_return_is_held(
+            CollaborationErrorCode::StateConflict as i32
+        ));
+        // Every other refusal keeps the fatal path: a revision, fence or
+        // integrity conflict means the cycle is working from a stale or
+        // untrustworthy view rather than from a settled Attempt state.
+        for code in [
+            CollaborationErrorCode::InvalidArgument,
+            CollaborationErrorCode::NotFound,
+            CollaborationErrorCode::RunRevisionConflict,
+            CollaborationErrorCode::EntityRevisionConflict,
+            CollaborationErrorCode::IdempotencyConflict,
+            CollaborationErrorCode::FencingRejected,
+            CollaborationErrorCode::SequenceConflict,
+            CollaborationErrorCode::ContractMismatch,
+            CollaborationErrorCode::IntegrityFailure,
+        ] {
+            assert!(
+                !refused_return_is_held(code as i32),
+                "{code:?} must stay fatal"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn composite_sequences_runners_and_merges_terminal_and_held_identity_separately() {
         let composite = CompositeHarnessDispatchRunner::new(vec![
@@ -2671,6 +2747,12 @@ mod tests {
                     activations_acknowledged: 1,
                     terminal_dispatch_ids: vec!["dispatch:one".to_owned()],
                     held_dispatch_ids: vec!["dispatch:held".to_owned()],
+                    held_return_receipts: vec![HeldReturnReceipt {
+                        receipt_id: "receipt:held".to_owned(),
+                        run_id: "run:one".to_owned(),
+                        attempt_id: "attempt:one".to_owned(),
+                        safe_detail_code: "ATTEMPT_NOT_ACCEPTING_RETURN".to_owned(),
+                    }],
                     ..Default::default()
                 },
             }),
@@ -2688,6 +2770,12 @@ mod tests {
                         "dispatch:two".to_owned(),
                     ],
                     held_dispatch_ids: vec!["dispatch:held".to_owned()],
+                    held_return_receipts: vec![HeldReturnReceipt {
+                        receipt_id: "receipt:held".to_owned(),
+                        run_id: "run:one".to_owned(),
+                        attempt_id: "attempt:one".to_owned(),
+                        safe_detail_code: "ATTEMPT_NOT_ACCEPTING_RETURN".to_owned(),
+                    }],
                     ..Default::default()
                 },
             }),
@@ -2708,6 +2796,9 @@ mod tests {
             vec!["dispatch:one", "dispatch:two"]
         );
         assert_eq!(report.held_dispatch_ids, vec!["dispatch:held"]);
+        // The same held receipt arriving from both children merges once.
+        assert_eq!(report.held_return_receipts.len(), 1);
+        assert_eq!(report.held_return_receipts[0].receipt_id, "receipt:held");
     }
 
     #[test]

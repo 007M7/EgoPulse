@@ -678,10 +678,27 @@ impl ProductionBootstrapConfig {
             },
         )?));
 
+        // The resolver declares which adapter's approvals it may resolve, and
+        // the store it answers from binds that same identity, so both are read
+        // from the admitted route instead of naming one provider's adapter.
+        let policy_adapter_id = crate::production_harness_identity(
+            self.provider_profiles
+                .iter()
+                .find(|profile| profile.admission == ProviderAdmission::Production)
+                .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                    "provider_profiles.production_harness_kind",
+                ))?
+                .harness,
+        )
+        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+            "provider_profiles.production_harness_kind",
+        ))?
+        .adapter_id
+        .to_owned();
         let policy_edge = AdapterEdge::open(self.policy_resolver.edge)?;
         let policy_resolver = LocalUserPolicyResolver::new(LocalUserPolicyResolverConfig {
             edge: policy_edge,
-            adapter_id: egopulse_codex_adapter::CODEX_ADAPTER_ID.to_owned(),
+            adapter_id: policy_adapter_id,
             authorization_policy_ref: self.policy_resolver.authorization_policy_ref,
             authentication_context_ref: self.policy_resolver.authentication_context_ref,
             allowed_scope_refs: self.policy_resolver.allowed_scope_refs,
@@ -846,6 +863,18 @@ impl ProductionBootstrapConfig {
             ));
         }
         if let Some(worker_config) = self.verification_worker {
+            let deployment = worker_config
+                .checker_profile_deployment
+                .clone()
+                .map(|config| {
+                    crate::ConfiguredCheckerProfileDeployment::new(Arc::clone(&artifact), config)
+                })
+                .transpose()
+                .map_err(|_| {
+                    ProductionBootstrapError::InvalidConfiguration(
+                        "verification_worker.checker_profile_deployment",
+                    )
+                })?;
             let worker = ConfiguredVerificationWorker::new(
                 Arc::clone(&task),
                 Box::new(ArtifactAuthorityReferenceSource::new_shared(Arc::clone(
@@ -853,6 +882,7 @@ impl ProductionBootstrapConfig {
                 ))),
                 Arc::clone(&verification),
                 worker_config,
+                deployment,
             )
             .map_err(ProductionBootstrapError::VerificationWorker)?;
             providers = providers.with_verification_worker(Arc::new(worker));
@@ -1227,6 +1257,10 @@ struct CriterionFile {
 struct VerificationWorkerFile {
     handoff: VerificationWorkerHandoffFile,
     checker_profile: CheckerProfileFile,
+    /// Present when this environment must deploy the declared checker profile
+    /// itself, because no repository workflow owns one here.
+    #[serde(default)]
+    checker_profile_deployment: Option<CheckerProfileDeploymentFile>,
     checker_executable: String,
     #[serde(default)]
     checker_arguments: Vec<String>,
@@ -2512,11 +2546,15 @@ impl UserOwnedBootstrapFile {
             environment_overrides: production_environment_overrides,
             work_capability_route: None,
         };
-        if let Some(profile) = provider_profiles.iter().find(|profile| {
-            profile.provider == ProviderId::Gpt
-                && profile.admission == ProviderAdmission::Production
-        }) && (codex.native.default_model.as_deref() != Some(profile.exact_model.as_str())
-            || codex.codex_executable != profile.executable)
+        // The configured native executable and default model are the admitted
+        // route's, for whichever provider that route serves: composition reads
+        // the profile's executable, so a config that declares a different one
+        // would otherwise describe a route nobody runs.
+        if let Some(profile) = provider_profiles
+            .iter()
+            .find(|profile| profile.admission == ProviderAdmission::Production)
+            && (codex.native.default_model.as_deref() != Some(profile.exact_model.as_str())
+                || codex.codex_executable != profile.executable)
         {
             return Err(ProductionBootstrapError::InvalidConfiguration(
                 "provider_profiles.production_codex_binding",
@@ -2601,7 +2639,15 @@ impl UserOwnedBootstrapFile {
             policy_resolver: LocalUserPolicyBootstrapConfig {
                 edge: AdapterEdgeConfig {
                     database_path: adapter_store.database_path,
-                    adapter_id: egopulse_codex_adapter::CODEX_ADAPTER_ID.to_owned(),
+                    // The Adapter Edge store binds one adapter identity, so the
+                    // policy resolver must name the same adapter as the route
+                    // this environment composes.
+                    adapter_id: crate::production_harness_identity(production_profile.harness)
+                        .ok_or(ProductionBootstrapError::InvalidConfiguration(
+                            "provider_profiles.production_harness_kind",
+                        ))?
+                        .adapter_id
+                        .to_owned(),
                     store_epoch: adapter_store.store_epoch,
                     key: AdapterEdgeKey::new(adapter_store.key),
                 },
@@ -2824,6 +2870,10 @@ impl VerificationWorkerFile {
         Ok(VerificationWorkerConfig {
             handoff_plan: self.handoff.into_typed(),
             checker_profile: self.checker_profile.into_typed()?,
+            checker_profile_deployment: self
+                .checker_profile_deployment
+                .map(CheckerProfileDeploymentFile::into_typed)
+                .transpose()?,
             checker_executable: PathBuf::from(required(
                 self.checker_executable,
                 "verification_worker.checker_executable",
@@ -2898,6 +2948,50 @@ impl MemoryCandidateProducerFile {
             self.scope_ref,
         )
         .map_err(|_| ProductionBootstrapError::InvalidConfiguration("memory_candidate_producers"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckerProfileDeploymentFile {
+    workspace_ref: String,
+    artifact_type_ref: ReferenceFile,
+    transformation_contract_ref: ReferenceFile,
+    retention_profile_ref: ReferenceFile,
+    collector_principal_id: String,
+    artifact_authority_principal_id: String,
+    sensitivity_class: String,
+}
+
+impl CheckerProfileDeploymentFile {
+    fn into_typed(self) -> Result<crate::CheckerProfileDeploymentConfig, ProductionBootstrapError> {
+        let config = crate::CheckerProfileDeploymentConfig {
+            workspace_ref: required(
+                self.workspace_ref,
+                "verification_worker.checker_profile_deployment.workspace_ref",
+            )?,
+            artifact_type_ref: self.artifact_type_ref.into_typed(),
+            transformation_contract_ref: self.transformation_contract_ref.into_typed(),
+            retention_profile_ref: self.retention_profile_ref.into_typed(),
+            collector_principal_id: required(
+                self.collector_principal_id,
+                "verification_worker.checker_profile_deployment.collector_principal_id",
+            )?,
+            artifact_authority_principal_id: required(
+                self.artifact_authority_principal_id,
+                "verification_worker.checker_profile_deployment.artifact_authority_principal_id",
+            )?,
+            sensitivity_class: required(
+                self.sensitivity_class,
+                "verification_worker.checker_profile_deployment.sensitivity_class",
+            )?,
+        };
+        config.validate().map_err(|_| {
+            ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.checker_profile_deployment",
+            )
+        })?;
+        Ok(config)
     }
 }
 

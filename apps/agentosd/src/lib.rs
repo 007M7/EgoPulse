@@ -87,6 +87,7 @@ mod approval_recovery_tests;
 mod artifact;
 mod bootstrap;
 mod cancellation_delivery;
+mod checker_profile_deployment;
 mod context_material;
 mod context_mutation;
 mod founder_material;
@@ -139,6 +140,9 @@ pub use bootstrap::{
     WorkCapabilityConfigTransitionReport, apply_work_capability_config_migration,
     preview_work_capability_config_migration, preview_work_capability_config_rollback,
     rollback_work_capability_config_to_v2,
+};
+pub(crate) use checker_profile_deployment::{
+    CheckerProfileDeploymentConfig, ConfiguredCheckerProfileDeployment,
 };
 pub use context_mutation::ContextMutationPortAdapter;
 pub use memory_mutation::{
@@ -801,6 +805,11 @@ pub struct NativeHarnessCompositionProfile {
     capability_profile_ref: ContractReference,
     observed_protocol: NativeProtocolFingerprint,
     final_artifact_relation_policy: FinalArtifactRelationPolicy,
+    /// Named gap for a Harness whose transport publishes no protocol schema.
+    /// `Some` states that the digest is absent because there is nothing to
+    /// digest, and keeps that absence part of the composition identity instead
+    /// of padding the fingerprint with an unobserved value.
+    schema_attestation_gap: Option<String>,
 }
 
 impl NativeHarnessCompositionProfile {
@@ -871,12 +880,20 @@ impl NativeHarnessCompositionProfile {
             capability_profile_ref: required_profile_ref.clone(),
             observed_protocol,
             final_artifact_relation_policy,
+            schema_attestation_gap: None,
         };
         profile.validate()?;
         Ok(profile)
     }
 
     fn validate(&self) -> Result<(), DaemonCompositionError> {
+        let schema_digest_is_sound = match self.schema_attestation_gap.as_deref() {
+            None => !self.observed_protocol.schema_sha256.trim().is_empty(),
+            Some(gap_code) => {
+                !gap_code.trim().is_empty()
+                    && self.observed_protocol.schema_sha256.trim().is_empty()
+            }
+        };
         if self.adapter_id.trim().is_empty()
             || self.capability_profile_id.trim().is_empty()
             || self.capability_profile_ref.contract_id.trim().is_empty()
@@ -885,7 +902,7 @@ impl NativeHarnessCompositionProfile {
             || self.capability_profile_id != self.capability_profile_ref.contract_id
             || self.observed_protocol.protocol_name.trim().is_empty()
             || self.observed_protocol.protocol_version.trim().is_empty()
-            || self.observed_protocol.schema_sha256.trim().is_empty()
+            || !schema_digest_is_sound
             || self.observed_protocol.adapter_version.trim().is_empty()
             || self
                 .observed_protocol
@@ -901,13 +918,42 @@ impl NativeHarnessCompositionProfile {
     }
 }
 
+/// Identity a production composition claims for one Harness kind: the adapter
+/// that owns its dispatch evidence, and the capability profile it is admitted
+/// under. The Adapter Edge store binds `adapter_id` in its metadata row and
+/// refuses to open for a different one, so every composer that opens that store
+/// — the composition and the policy resolver alike — must resolve this the same
+/// way. `None` means this daemon has no composition for that Harness kind.
+pub fn production_harness_identity(
+    harness: bootstrap::ProviderHarnessKind,
+) -> Option<ProviderHarnessIdentity> {
+    match harness {
+        bootstrap::ProviderHarnessKind::CodexAppServer => Some(ProviderHarnessIdentity {
+            adapter_id: CODEX_ADAPTER_ID,
+            capability_profile_id: CODEX_CAPABILITY_PROFILE_ID,
+        }),
+        bootstrap::ProviderHarnessKind::OpenCodeAcp => Some(ProviderHarnessIdentity {
+            adapter_id: egopulse_opencode_adapter::OPENCODE_ADAPTER_ID,
+            capability_profile_id: egopulse_opencode_adapter::OPENCODE_CAPABILITY_PROFILE_ID,
+        }),
+        bootstrap::ProviderHarnessKind::DshAcp | bootstrap::ProviderHarnessKind::KimiCliAcp => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderHarnessIdentity {
+    pub adapter_id: &'static str,
+    pub capability_profile_id: &'static str,
+}
+
 fn trusted_codex_route_profile(
     profile: &ProviderBootstrapProfile,
     native: &NativeHarnessCompositionConfig,
 ) -> Result<TrustedDispatchRouteProfile, DaemonCompositionError> {
-    if profile.provider != bootstrap::ProviderId::Gpt
-        || profile.harness != bootstrap::ProviderHarnessKind::CodexAppServer
-        || profile.admission != bootstrap::ProviderAdmission::Production
+    // Which provider/Harness pairings may be production is decided once by the
+    // admission table in bootstrap; composition binds to whatever the profile
+    // declares rather than to one provider's name.
+    if profile.admission != bootstrap::ProviderAdmission::Production
         || native.default_model.as_deref() != Some(profile.exact_model.as_str())
     {
         return Err(DaemonCompositionError::InvalidConfiguration(
@@ -923,7 +969,7 @@ fn trusted_codex_route_profile(
         ))?;
     Ok(TrustedDispatchRouteProfile {
         provider_bootstrap_profile_id: profile.profile_id.clone(),
-        selected_harness_id: "codex_app_server".to_owned(),
+        selected_harness_id: profile.harness.as_str().to_owned(),
         provider_model_id: model.provider_model_id.clone(),
         catalog_snapshot_sha256: profile
             .catalog_snapshot
@@ -1485,6 +1531,10 @@ impl DaemonProviders {
     /// Collaboration Control, and the Harness Adapter remain separate owners;
     /// the returned runner is the only process-local writer that sequences
     /// activation consumption and dispatch for this vertical.
+    ///
+    /// The admitted profile chooses the driver, its executable and the
+    /// composition identity, so one production route composes at a time and
+    /// an unadmitted Harness kind is refused instead of silently falling back.
     pub fn with_codex_harness(
         self,
         config: CodexHarnessCompositionConfig,
@@ -1503,27 +1553,80 @@ impl DaemonProviders {
         } = config;
         let disclosure_credentials =
             codex_disclosure_credentials(&provider_profile, &environment_overrides);
-        let mut process = CodexAppServerConfig::new(codex_executable);
-        for (name, value) in environment_overrides {
-            process = process.with_environment_override(name, value);
-        }
         let route_profile = trusted_codex_route_profile(&provider_profile, &native)?;
         if let Some(route) = work_capability_route.as_ref() {
             validate_codex_work_capability_route(route, &provider_profile, &native)?;
         }
         let capability_profile_ref = native.workflow.capability_profile_ref.clone();
+        let ProviderHarnessIdentity {
+            adapter_id,
+            capability_profile_id,
+        } = production_harness_identity(provider_profile.harness).ok_or(
+            DaemonCompositionError::InvalidConfiguration(
+                "provider_profiles.production_harness_kind",
+            ),
+        )?;
+        let (observed_protocol, schema_attestation_gap, driver) = match provider_profile.harness {
+            bootstrap::ProviderHarnessKind::CodexAppServer => {
+                let mut process = CodexAppServerConfig::new(codex_executable);
+                for (name, value) in &environment_overrides {
+                    process = process.with_environment_override(name.clone(), value.clone());
+                }
+                (
+                    codex_protocol_fingerprint(),
+                    None,
+                    Box::new(CodexAppServerDriver::new(process))
+                        as Box<dyn NativeHarnessDriver + Send>,
+                )
+            }
+            bootstrap::ProviderHarnessKind::OpenCodeAcp => {
+                let native_executable_version = provider_profile
+                    .catalog_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.harness_version.trim().to_owned())
+                    .filter(|version| !version.is_empty())
+                    .ok_or(DaemonCompositionError::InvalidConfiguration(
+                        "provider_profiles.production_harness_version",
+                    ))?;
+                let mut process = egopulse_opencode_adapter::OpenCodeAcpConfig::new(
+                    provider_profile.executable.clone(),
+                    native.workspace_root.clone(),
+                    provider_profile.exact_model.clone(),
+                );
+                for (name, value) in &environment_overrides {
+                    process = process.with_environment_override(name.clone(), value.clone());
+                }
+                (
+                    egopulse_opencode_adapter::opencode_acp_protocol_fingerprint(
+                        native_executable_version,
+                    ),
+                    Some(
+                        egopulse_opencode_adapter::OPENCODE_ACP_SCHEMA_ATTESTATION_REQUIRED
+                            .to_owned(),
+                    ),
+                    Box::new(egopulse_opencode_adapter::OpenCodeAcpDriver::new(process))
+                        as Box<dyn NativeHarnessDriver + Send>,
+                )
+            }
+            _ => {
+                return Err(DaemonCompositionError::InvalidConfiguration(
+                    "provider_profiles.production_harness_kind",
+                ));
+            }
+        };
         self.with_profiled_native_harness_drivers(
             vec![ProfiledNativeHarnessComposition {
                 config: native,
                 profile: NativeHarnessCompositionProfile {
-                    adapter_id: CODEX_ADAPTER_ID.to_owned(),
-                    capability_profile_id: CODEX_CAPABILITY_PROFILE_ID.to_owned(),
+                    adapter_id: adapter_id.to_owned(),
+                    capability_profile_id: capability_profile_id.to_owned(),
                     capability_profile_ref,
-                    observed_protocol: codex_protocol_fingerprint(),
+                    observed_protocol,
                     final_artifact_relation_policy:
                         FinalArtifactRelationPolicy::RequiredGovernedContent,
+                    schema_attestation_gap,
                 },
-                driver: Box::new(CodexAppServerDriver::new(process)),
+                driver,
                 route_profile: Some(route_profile),
                 work_capability_route,
                 disclosure_credentials,
@@ -1562,6 +1665,7 @@ impl DaemonProviders {
                 observed_protocol: codex_protocol_fingerprint(),
                 final_artifact_relation_policy:
                     FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
+                schema_attestation_gap: None,
             },
             driver,
         )
@@ -1670,6 +1774,7 @@ impl DaemonProviders {
                 capability_profile_ref: _,
                 observed_protocol,
                 final_artifact_relation_policy,
+                schema_attestation_gap: _,
             } = profile;
             let repository_dispatch = match self.repository_dispatch.as_ref() {
                 Some(repository) if repository.coordinator.is_some() => {
@@ -2626,6 +2731,7 @@ async fn run_harness_dispatch_worker(
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
     let mut previous_blockages = std::collections::BTreeSet::new();
+    let mut previous_held_returns = std::collections::BTreeSet::new();
     let mut append_deferred = false;
     loop {
         if *stop.borrow() {
@@ -2664,6 +2770,28 @@ async fn run_harness_dispatch_worker(
             );
             append_deferred = false;
         }
+        // A return the Collaboration refuses on Attempt state is retried every
+        // cycle and can never settle, so it is reported once per distinct
+        // receipt and left in the outbox as the visible governance fact.
+        let mut current_held_returns = std::collections::BTreeSet::new();
+        for held in &report.held_return_receipts {
+            let key = (held.receipt_id.clone(), held.safe_detail_code.clone());
+            current_held_returns.insert(key.clone());
+            if previous_held_returns.contains(&key) {
+                continue;
+            }
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "artifact_return_held",
+                    "receipt_id": held.receipt_id,
+                    "run_id": held.run_id,
+                    "attempt_id": held.attempt_id,
+                    "safe_detail_code": held.safe_detail_code,
+                })
+            );
+        }
+        previous_held_returns = current_held_returns;
         let mut current_blockages = std::collections::BTreeSet::new();
         for blockage in report.activation_blockages {
             let key = (
@@ -3620,6 +3748,7 @@ mod tests {
         let mut profile = NativeHarnessCompositionProfile {
             adapter_id: "adapter".to_owned(),
             capability_profile_id: "profile".to_owned(),
+            schema_attestation_gap: None,
             capability_profile_ref: ContractReference {
                 contract_id: "profile".to_owned(),
                 version: "v1".to_owned(),
@@ -3666,6 +3795,89 @@ mod tests {
         profile.capability_profile_ref.sha256.clear();
         assert!(matches!(
             profile.validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition profile"
+            ))
+        ));
+    }
+
+    #[test]
+    fn composable_harnesses_resolve_one_adapter_identity() {
+        // The Adapter Edge store binds this identity, and the policy resolver
+        // must name the same one, so a route's adapter is resolved in exactly
+        // one place for every composer.
+        assert_eq!(
+            production_harness_identity(bootstrap::ProviderHarnessKind::CodexAppServer),
+            Some(ProviderHarnessIdentity {
+                adapter_id: CODEX_ADAPTER_ID,
+                capability_profile_id: CODEX_CAPABILITY_PROFILE_ID,
+            })
+        );
+        assert_eq!(
+            production_harness_identity(bootstrap::ProviderHarnessKind::OpenCodeAcp),
+            Some(ProviderHarnessIdentity {
+                adapter_id: egopulse_opencode_adapter::OPENCODE_ADAPTER_ID,
+                capability_profile_id: egopulse_opencode_adapter::OPENCODE_CAPABILITY_PROFILE_ID,
+            })
+        );
+        assert_eq!(
+            production_harness_identity(bootstrap::ProviderHarnessKind::DshAcp),
+            None
+        );
+        assert_eq!(
+            production_harness_identity(bootstrap::ProviderHarnessKind::KimiCliAcp),
+            None
+        );
+    }
+
+    #[test]
+    fn composition_profile_names_the_gap_when_the_transport_publishes_no_schema() {
+        fn profile(schema_sha256: &str, gap: Option<&str>) -> NativeHarnessCompositionProfile {
+            NativeHarnessCompositionProfile {
+                adapter_id: "adapter".to_owned(),
+                capability_profile_id: "profile".to_owned(),
+                capability_profile_ref: ContractReference {
+                    contract_id: "profile".to_owned(),
+                    version: "v1".to_owned(),
+                    sha256: "ab".repeat(32),
+                },
+                observed_protocol: NativeProtocolFingerprint {
+                    protocol_name: "acp".to_owned(),
+                    protocol_version: "1".to_owned(),
+                    schema_sha256: schema_sha256.to_owned(),
+                    adapter_version: "adapter-v1".to_owned(),
+                    native_executable_version: "native-v1".to_owned(),
+                    native_binary_sha256: None,
+                },
+                final_artifact_relation_policy:
+                    FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
+                schema_attestation_gap: gap.map(str::to_owned),
+            }
+        }
+
+        assert!(
+            profile("", Some("ACP_SCHEMA_ATTESTATION_REQUIRED"))
+                .validate()
+                .is_ok()
+        );
+        assert!(profile("digest", None).validate().is_ok());
+        // An empty digest with no named gap is indistinguishable from a Harness
+        // that merely failed to report one, so it stays refused.
+        assert!(matches!(
+            profile("", None).validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition profile"
+            ))
+        ));
+        // A named gap next to a digest contradicts itself.
+        assert!(matches!(
+            profile("digest", Some("ACP_SCHEMA_ATTESTATION_REQUIRED")).validate(),
+            Err(DaemonCompositionError::InvalidConfiguration(
+                "native Harness composition profile"
+            ))
+        ));
+        assert!(matches!(
+            profile("", Some("  ")).validate(),
             Err(DaemonCompositionError::InvalidConfiguration(
                 "native Harness composition profile"
             ))
@@ -4717,6 +4929,7 @@ mod tests {
             },
             final_artifact_relation_policy:
                 FinalArtifactRelationPolicy::NotRequiredLegacyOrLifecycleOnly,
+            schema_attestation_gap: None,
         }
     }
 

@@ -5,10 +5,11 @@ mod acp;
 
 use acp::{DshAcpMessage, DshAcpResponse, DshAcpUpdate};
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    ApprovalDecision, ApprovalDecisionEnvelope, ApprovalKind, ApprovalRequestLifecycleKind,
-    ApprovalRequestObservation, CancelExecutionEnvelope, DispatchEnvelope, HarnessErrorCode,
-    HarnessReadiness, LifecycleKind, LifecycleObservation, NativeProtocolFingerprint,
-    ObservationCriticality, ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
+    AckDisposition, ApprovalDecision, ApprovalDecisionEnvelope, ApprovalKind,
+    ApprovalRequestLifecycleKind, ApprovalRequestObservation, CancelExecutionEnvelope,
+    DispatchEnvelope, HarnessAckObservation, HarnessErrorCode, HarnessReadiness, LifecycleKind,
+    LifecycleObservation, NativeProtocolFingerprint, ObservationCriticality, ProbeHarnessRequest,
+    ProbeHarnessResult, harness_observation,
 };
 use egopulse_harness_adapter::{
     DriverDelivery, DriverError, DriverErrorCertainty, DriverEvent, NativeHarnessDriver,
@@ -60,6 +61,12 @@ pub struct DshAcpConfig {
     /// This is optional for Harnesses that do not expose model selection, but
     /// must be set when one ACP executable can route to multiple providers.
     pub required_model: Option<String>,
+    /// Establishes `required_model` through the ACP config option before the
+    /// first prompt. A Harness that offers a model option on `session/new`
+    /// reports its own default there, so a route pin that only reads that
+    /// response would either refuse every session or accept whichever model
+    /// the Harness happened to default to.
+    pub select_session_model: bool,
     pub request_timeout: Duration,
 }
 
@@ -72,6 +79,7 @@ impl DshAcpConfig {
             working_directory: working_directory.into(),
             environment_overrides: Vec::new(),
             required_model: None,
+            select_session_model: false,
             request_timeout: Duration::from_secs(10),
         }
     }
@@ -97,12 +105,21 @@ impl DshAcpConfig {
         self.required_model = Some(model.into());
         self
     }
+
+    #[must_use]
+    pub fn with_session_model_selection(mut self) -> Self {
+        self.select_session_model = true;
+        self
+    }
 }
 
 struct DshSession {
     process: SupervisedProcess,
     next_request_id: u64,
     native_session_ref: String,
+    /// The Harness response that established this session, kept verbatim as the
+    /// evidence behind every dispatch acknowledgement on the session.
+    established_evidence: Vec<u8>,
 }
 
 struct ActiveDispatch {
@@ -111,6 +128,8 @@ struct ActiveDispatch {
     prompt_request_id: u64,
     output_text: String,
     output_candidate_taken: bool,
+    /// Acknowledgement due to the control plane for this dispatch, taken once.
+    pending_session_ack: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -215,8 +234,10 @@ impl DshAcpDriver {
             driver_error("DSH_ACP_SESSION_NEW_INVALID_MESSAGE", detail.as_bytes())
         })? {
             DshAcpMessage::Response(DshAcpResponse::Result { result, .. }) => {
-                validate_required_session_model(&result, self.config.required_model.as_deref())
-                    .map_err(|code| driver_error(code, session_raw.as_bytes()))?;
+                if !self.config.select_session_model {
+                    validate_required_session_model(&result, self.config.required_model.as_deref())
+                        .map_err(|code| driver_error(code, session_raw.as_bytes()))?;
+                }
                 result
                     .get("sessionId")
                     .and_then(Value::as_str)
@@ -233,10 +254,52 @@ impl DshAcpDriver {
                 ));
             }
         };
+        let mut next_request_id = 3;
+        if self.config.select_session_model {
+            let required_model = self
+                .config
+                .required_model
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+                .ok_or_else(|| {
+                    driver_error("DSH_ACP_REQUIRED_MODEL_INVALID", session_raw.as_bytes())
+                })?;
+            let selection_request = acp::session_set_config_option_request(
+                next_request_id,
+                &session_id,
+                "model",
+                required_model,
+            );
+            write_json_value(
+                &mut process,
+                &selection_request,
+                "DSH_ACP_SESSION_MODEL_WRITE_FAILED",
+            )
+            .await?;
+            let selection_raw =
+                read_response_for_id(&mut process, self.config.request_timeout, next_request_id)
+                    .await?;
+            let selection_result =
+                match acp::parse_message(selection_raw.as_bytes()).map_err(|detail| {
+                    driver_error("DSH_ACP_SESSION_MODEL_INVALID_MESSAGE", detail.as_bytes())
+                })? {
+                    DshAcpMessage::Response(DshAcpResponse::Result { result, .. }) => result,
+                    _ => {
+                        return Err(driver_error(
+                            "DSH_ACP_SESSION_MODEL_REJECTED",
+                            selection_raw.as_bytes(),
+                        ));
+                    }
+                };
+            validate_required_session_model(&selection_result, Some(required_model))
+                .map_err(|code| driver_error(code, selection_raw.as_bytes()))?;
+            next_request_id = next_request_id.saturating_add(1);
+        }
         self.session = Some(DshSession {
             process,
-            next_request_id: 3,
+            next_request_id,
             native_session_ref: session_id,
+            established_evidence: session_raw.into_bytes(),
         });
         Ok(())
     }
@@ -289,12 +352,14 @@ impl NativeHarnessDriver for DshAcpDriver {
                 error
             })?;
             let native_session_ref = session.native_session_ref.clone();
+            let established_evidence = session.established_evidence.clone();
             self.active = Some(ActiveDispatch {
                 dispatch_id: envelope.dispatch_id.clone(),
                 native_session_ref: native_session_ref.clone(),
                 prompt_request_id: request_id,
                 output_text: String::new(),
                 output_candidate_taken: false,
+                pending_session_ack: Some(established_evidence),
             });
             self.terminal_dispatch_id = None;
             self.completed_dispatch_id = None;
@@ -333,6 +398,15 @@ impl NativeHarnessDriver for DshAcpDriver {
                     )
                 })
                 .ok_or_else(|| dependency_error("DSH_ACP_ACTIVE_DISPATCH_NOT_FOUND"))?;
+            if let Some(active) = self.active.as_mut()
+                && let Some(evidence) = active.pending_session_ack.take()
+            {
+                return Ok(Some(session_ack_event(
+                    &active.native_session_ref,
+                    active.prompt_request_id,
+                    evidence,
+                )));
+            }
             loop {
                 let line = {
                     let session = self
@@ -767,6 +841,50 @@ async fn read_json_line(
     Ok(line)
 }
 
+/// Awaits the ACP response carrying `request_id`, discarding whatever the
+/// Harness interleaves with it. A Harness may emit `session/update`
+/// notifications before answering a request, so a single-line read would
+/// mis-parse the first notification as the answer.
+async fn read_response_for_id(
+    process: &mut SupervisedProcess,
+    request_timeout: Duration,
+    request_id: u64,
+) -> Result<String, DriverError> {
+    const MAX_INTERLEAVED_LINES: usize = 16;
+    for _ in 0..MAX_INTERLEAVED_LINES {
+        let line = read_json_line(
+            process,
+            request_timeout,
+            "DSH_ACP_REQUEST_TIMEOUT",
+            "DSH_ACP_REQUEST_READ_FAILED",
+            b"dsh-acp-request",
+        )
+        .await?;
+        match acp::parse_message(line.as_bytes()) {
+            Ok(DshAcpMessage::Response(DshAcpResponse::Result { id, .. }))
+            | Ok(DshAcpMessage::Response(DshAcpResponse::Error { id: Some(id), .. }))
+                if id.as_u64() == Some(request_id) =>
+            {
+                return Ok(line);
+            }
+            Ok(DshAcpMessage::Response(DshAcpResponse::Error { id: None, .. })) => {
+                return Err(driver_error("DSH_ACP_REQUEST_REJECTED", line.as_bytes()));
+            }
+            Ok(_) => {}
+            Err(detail) => {
+                return Err(driver_error(
+                    "DSH_ACP_REQUEST_INVALID_MESSAGE",
+                    detail.as_bytes(),
+                ));
+            }
+        }
+    }
+    Err(driver_error(
+        "DSH_ACP_REQUEST_UNCONFIRMED",
+        b"dsh-acp-request",
+    ))
+}
+
 fn parse_initialize_response(raw: &[u8]) -> Result<ProbeHarnessResult, DriverError> {
     let value: Value = serde_json::from_slice(raw).map_err(|error| {
         driver_error(
@@ -894,6 +1012,33 @@ fn driver_error(detail: &str, raw: &[u8]) -> DriverError {
     }
 }
 
+/// ACP publishes no prompt-acceptance message: the first response a Harness
+/// sends for a dispatch is its end-of-turn result. The fact it does publish
+/// per dispatch is the session it opens to carry the work, so that response is
+/// what the control plane receives as the dispatch acknowledgement. Without it
+/// an ACP Attempt never reaches the acknowledged state, and its completion can
+/// never be settled.
+fn session_ack_event(
+    native_session_ref: &str,
+    prompt_request_id: u64,
+    evidence: Vec<u8>,
+) -> DriverEvent {
+    DriverEvent {
+        native_key: format!("session:{native_session_ref}:prompt:{prompt_request_id}:ack"),
+        native_event_id: None,
+        native_sequence: None,
+        native_observed_at: now(),
+        criticality: ObservationCriticality::Control,
+        payload: harness_observation::Payload::Ack(HarnessAckObservation {
+            disposition: AckDisposition::Accepted as i32,
+            ack_receipt_id: format!("acp-session-established:{native_session_ref}"),
+            native_session_ref: Some(native_session_ref.to_owned()),
+            native_execution_ref: None,
+        }),
+        raw_event: evidence,
+    }
+}
+
 fn lifecycle_event(
     native_method: &str,
     kind: LifecycleKind,
@@ -951,6 +1096,24 @@ mod tests {
             spec.environment_overrides,
             vec![("DEEPSEEK_API_KEY".to_owned(), "managed-secret".to_owned())]
         );
+    }
+
+    #[test]
+    fn dispatch_acknowledgement_carries_the_established_session_as_evidence() {
+        let evidence = br#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses-1"}}"#.to_vec();
+        let event = session_ack_event("ses-1", 3, evidence.clone());
+        assert_eq!(event.criticality, ObservationCriticality::Control);
+        assert_eq!(event.raw_event, evidence);
+        assert_eq!(event.native_key, "session:ses-1:prompt:3:ack");
+        match event.payload {
+            harness_observation::Payload::Ack(ack) => {
+                assert_eq!(ack.disposition, AckDisposition::Accepted as i32);
+                assert_eq!(ack.ack_receipt_id, "acp-session-established:ses-1");
+                assert_eq!(ack.native_session_ref.as_deref(), Some("ses-1"));
+                assert!(ack.native_execution_ref.is_none());
+            }
+            other => panic!("expected an acknowledgement observation, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1156,6 +1319,7 @@ mod tests {
             prompt_request_id: 41,
             output_text: "committed answer".to_owned(),
             output_candidate_taken: false,
+            pending_session_ack: None,
         });
         assert!(!driver.is_dispatch_ready());
         driver.record_terminal_dispatch(
@@ -1204,6 +1368,7 @@ mod tests {
                 prompt_request_id: 42,
                 output_text: "partial output must not become an Artifact".to_owned(),
                 output_candidate_taken: false,
+                pending_session_ack: None,
             });
             driver.record_terminal_dispatch(&dispatch_id, kind);
             assert!(driver.is_dispatch_ready());

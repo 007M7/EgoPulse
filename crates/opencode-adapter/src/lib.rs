@@ -11,8 +11,8 @@
 use std::{path::PathBuf, time::Duration};
 
 use egopulse_domain_contracts::v01::egopulse::harness::v1::{
-    ApprovalDecisionEnvelope, CancelExecutionEnvelope, DispatchEnvelope, ProbeHarnessRequest,
-    ProbeHarnessResult, harness_observation,
+    ApprovalDecisionEnvelope, CancelExecutionEnvelope, DispatchEnvelope, NativeProtocolFingerprint,
+    ProbeHarnessRequest, ProbeHarnessResult, harness_observation,
 };
 use egopulse_dsh_adapter::{DshAcpConfig, DshAcpDriver};
 use egopulse_harness_adapter::{
@@ -22,10 +22,38 @@ use egopulse_harness_adapter::{
 };
 
 pub const OPENCODE_ADAPTER_ID: &str = "opencode-adapter";
+/// Composition identity for routes served by one OpenCode executable. The
+/// admitted provider/model route travels separately in the sealed
+/// work-capability binding, so this names the Harness capability profile
+/// rather than any single model.
+pub const OPENCODE_CAPABILITY_PROFILE_ID: &str = "opencode-acp-v1";
 pub const OPENCODE_ACP_PROTOCOL: &str = "agent-client-protocol";
 pub const OPENCODE_ACP_PROTOCOL_VERSION: &str = "v1";
+/// OpenCode publishes no protocol schema, so a composition cannot pin a schema
+/// digest the way Codex pins its App Server schema. Naming the gap keeps that
+/// absence observable instead of filling the digest with a value nobody
+/// observed.
+pub const OPENCODE_ACP_SCHEMA_ATTESTATION_REQUIRED: &str =
+    "OPENCODE_ACP_SCHEMA_ATTESTATION_REQUIRED";
 pub const OPENCODE_NATIVE_RECOVERY_UNATTESTED_EVIDENCE_REF: &str =
     "opencode-reconcile:native-session-load-resume-not-attested";
+
+/// Protocol identity declared for an OpenCode ACP composition. The schema
+/// digest stays empty by design; `native_executable_version` is the version
+/// the admitting configuration observed for the executable it pinned.
+#[must_use]
+pub fn opencode_acp_protocol_fingerprint(
+    native_executable_version: String,
+) -> NativeProtocolFingerprint {
+    NativeProtocolFingerprint {
+        protocol_name: OPENCODE_ACP_PROTOCOL.to_owned(),
+        protocol_version: OPENCODE_ACP_PROTOCOL_VERSION.to_owned(),
+        schema_sha256: String::new(),
+        adapter_version: env!("CARGO_PKG_VERSION").to_owned(),
+        native_executable_version,
+        native_binary_sha256: None,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct OpenCodeAcpConfig {
@@ -72,7 +100,11 @@ impl OpenCodeAcpConfig {
 
     fn into_inner(self) -> DshAcpConfig {
         let mut config = DshAcpConfig::new(self.executable, self.working_directory)
-            .with_required_model(self.required_model);
+            .with_required_model(self.required_model)
+            // OpenCode offers a model option whose default is one of its own
+            // models, so the exact provider/model route is established by
+            // setting that option before the first prompt.
+            .with_session_model_selection();
         config.arguments = self.arguments;
         config.environment_overrides = self.environment_overrides;
         config.request_timeout = self.request_timeout;
@@ -236,6 +268,38 @@ mod tests {
         assert_eq!(
             provider_code("DSH_ACP_SESSION_MODEL_MISMATCH"),
             "OPENCODE_ACP_SESSION_MODEL_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn wrapper_establishes_the_model_option_before_prompting() {
+        let config = OpenCodeAcpConfig::new(
+            "opencode",
+            std::env::current_dir().expect("cwd"),
+            "zen/deepseek-v4-flash",
+        )
+        .into_inner();
+        assert_eq!(
+            config.required_model.as_deref(),
+            Some("zen/deepseek-v4-flash")
+        );
+        assert!(
+            config.select_session_model,
+            "an OpenCode session defaults to another model, so the exact route must be selected"
+        );
+    }
+
+    #[test]
+    fn protocol_fingerprint_names_the_transport_without_a_fabricated_schema_digest() {
+        let fingerprint = opencode_acp_protocol_fingerprint("1.18.31".to_owned());
+        assert_eq!(fingerprint.protocol_name, OPENCODE_ACP_PROTOCOL);
+        assert_eq!(fingerprint.protocol_version, OPENCODE_ACP_PROTOCOL_VERSION);
+        assert!(fingerprint.schema_sha256.is_empty());
+        assert_eq!(fingerprint.native_executable_version, "1.18.31");
+        assert_eq!(fingerprint.adapter_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            OPENCODE_ACP_SCHEMA_ATTESTATION_REQUIRED,
+            "OPENCODE_ACP_SCHEMA_ATTESTATION_REQUIRED"
         );
     }
 }

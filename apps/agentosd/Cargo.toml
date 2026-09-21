@@ -16,6 +16,7 @@ egopulse-local-api.workspace = true
 egopulse-local-ide-control.workspace = true
 egopulse-local-ipc-platform.workspace = true
 egopulse-local-read-model.workspace = true
+egopulse-opencode-adapter.workspace = true
 egopulse-founder-verdict-authority.workspace = true
 egopulse-policy-decision-authority.workspace = true
 egopulse-verification-authority.workspace = true

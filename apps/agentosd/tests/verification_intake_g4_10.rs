@@ -443,7 +443,11 @@ async fn exercise_verification_worker(unfinished_run: bool) {
             model_call_receipt_artifact_ids: Vec::new(),
             checker_timeout: std::time::Duration::from_secs(2),
             checker_output_limit: 64 * 1024,
+            // The repository path and deterministic fixtures seal their own
+            // evidence, so no configured deployment is needed here.
+            checker_profile_deployment: None,
         },
+        None,
     )
     .expect("compose configured verification worker");
     let first = worker

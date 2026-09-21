@@ -1074,6 +1074,7 @@ dependencies = [
  "egopulse-local-ide-control",
  "egopulse-local-ipc-platform",
  "egopulse-local-read-model",
+ "egopulse-opencode-adapter",
  "egopulse-policy-decision-authority",
  "egopulse-process-supervision",
  "egopulse-tui",

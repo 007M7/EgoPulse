@@ -700,6 +700,9 @@ pub struct VerificationWorkerConfig {
     pub model_call_receipt_artifact_ids: Vec<String>,
     pub checker_timeout: Duration,
     pub checker_output_limit: u64,
+    /// Present when no repository workflow deploys this profile, so the worker
+    /// seals the configured declaration itself before attesting it.
+    pub checker_profile_deployment: Option<crate::CheckerProfileDeploymentConfig>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -740,7 +743,152 @@ impl VerificationWorkerConfig {
                 "single-checker reviewed inputs",
             ));
         }
+        if let Some(deployment) = self.checker_profile_deployment.as_ref() {
+            deployment
+                .validate()
+                .map_err(|_| VerificationWorkerConfigurationError::Invalid("checker deployment"))?;
+            // The attestation cites artifacts, so the profile must cite the
+            // declaration this worker is about to seal: a profile that named a
+            // different (or no) evidence would either fail attestation or be
+            // attested on evidence nobody deployed.
+            if !self
+                .checker_profile
+                .attestation_evidence_artifact_ids
+                .contains(&crate::checker_profile_deployment::deployment_artifact_id(
+                    &self.checker_profile.checker_profile_id,
+                ))
+            {
+                return Err(VerificationWorkerConfigurationError::Invalid(
+                    "checker profile deployment evidence",
+                ));
+            }
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod deployment_tests {
+    use super::*;
+    use egopulse_domain_contracts::v01::egopulse::verification::v1::{
+        CriterionRequirement, DiscrepancySeverity,
+    };
+
+    fn reference(id: &str) -> ContractReference {
+        ContractReference {
+            contract_id: id.to_owned(),
+            version: "v1".to_owned(),
+            sha256: "ab".repeat(32),
+        }
+    }
+
+    fn profile() -> egopulse_domain_contracts::v01::egopulse::verification::v1::CheckerProfile {
+        egopulse_domain_contracts::v01::egopulse::verification::v1::CheckerProfile {
+            checker_profile_id: "profile-a".to_owned(),
+            revision: 1,
+            status: 1,
+            checker_id: "checker".to_owned(),
+            checker_version: "v1".to_owned(),
+            input_contract_ref: Some(reference("input")),
+            output_contract_ref: Some(reference("output")),
+            supported_criterion_types: vec!["criterion".to_owned()],
+            assurance_class: 1,
+            sandbox_profile_ref: Some(reference("sandbox")),
+            tool_policy_ref: Some(reference("tools")),
+            data_egress_policy_ref: Some(reference("egress")),
+            timeout_ms: 1000,
+            network_allowed: false,
+            profile_digest_sha256: String::new(),
+            attestation_evidence_artifact_ids: Vec::new(),
+            attested_at: None,
+        }
+    }
+
+    fn config(
+        checker_profile: egopulse_domain_contracts::v01::egopulse::verification::v1::CheckerProfile,
+        checker_profile_deployment: Option<crate::CheckerProfileDeploymentConfig>,
+    ) -> VerificationWorkerConfig {
+        VerificationWorkerConfig {
+            handoff_plan: VerificationHandoffPlan {
+                binding: VerificationBindingTemplate {
+                    claim_id: "claim".to_owned(),
+                    claim_semantic_profile_ref: reference("claim-semantic"),
+                },
+                criterion_ids: vec!["criterion".to_owned()],
+                checker_profile_refs: vec![reference("profile-a")],
+            },
+            checker_profile,
+            checker_profile_deployment,
+            checker_executable: "checker".into(),
+            checker_arguments: Vec::new(),
+            working_directory: ".".into(),
+            checker_request: b"{}".to_vec(),
+            mapper_policy: SegoMapperPolicy {
+                criterion_id: "criterion".to_owned(),
+                requirement: CriterionRequirement::MustPass,
+                checker_profile_ref: reference("profile-a"),
+                contract_id: "sego.review.artifact/v1".to_owned(),
+                contract_revision: 3,
+                expected_scope: "scope".to_owned(),
+                expected_diff_hash: "cd".repeat(32),
+                expected_reviewer: "checker".to_owned(),
+                expected_engine_version: "v1".to_owned(),
+                expected_review_mode: "mode".to_owned(),
+                positive_acceptance: false,
+                failure_threshold: DiscrepancySeverity::Major,
+                raw_output_artifact_id: "artifact".to_owned(),
+                raw_output_address:
+                    egopulse_domain_contracts::v01::egopulse::artifact::v1::ContentAddress {
+                        algorithm: 1,
+                        digest: "ef".repeat(32),
+                        byte_length: 1,
+                    },
+                finding_evidence: std::collections::BTreeMap::new(),
+            },
+            verification_run_id_prefix: "verification-run:".to_owned(),
+            verification_artifact_id_prefix: "verification-artifact:".to_owned(),
+            execution_id_prefix: "verification-execution:".to_owned(),
+            tool_receipt_artifact_ids: Vec::new(),
+            model_call_receipt_artifact_ids: Vec::new(),
+            checker_timeout: std::time::Duration::from_secs(1),
+            checker_output_limit: 1024,
+        }
+    }
+
+    fn deployment() -> crate::CheckerProfileDeploymentConfig {
+        crate::CheckerProfileDeploymentConfig {
+            workspace_ref: "default".to_owned(),
+            artifact_type_ref: reference("checker-profile-attestation"),
+            transformation_contract_ref: reference("checker-profile-deployment"),
+            retention_profile_ref: reference("verification-records"),
+            collector_principal_id: "collector:checker-profile-deployment".to_owned(),
+            artifact_authority_principal_id: "authority:artifact".to_owned(),
+            sensitivity_class: "local-user-data".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_deployment_screen_declares_the_artifact_its_worker_will_seal() {
+        assert_eq!(
+            crate::checker_profile_deployment::deployment_artifact_id("profile-a"),
+            "artifact:checker-profile-attestation:profile-a"
+        );
+    }
+
+    #[test]
+    fn a_deployment_requires_the_profile_to_cite_its_declaration() {
+        assert!(deployment().validate().is_ok());
+        // Without a cited declaration the profile would be attested on
+        // evidence this worker never seals.
+        assert!(config(profile(), Some(deployment())).validate().is_err());
+        let mut cited = profile();
+        cited.attestation_evidence_artifact_ids =
+            vec![crate::checker_profile_deployment::deployment_artifact_id(
+                "profile-a",
+            )];
+        assert!(config(cited.clone(), Some(deployment())).validate().is_ok());
+        // Without a deployment the configuration keeps its previous meaning.
+        assert!(config(cited, None).validate().is_ok());
     }
 }
 
@@ -766,6 +914,8 @@ pub enum VerificationWorkerCycleResult {
 pub enum VerificationWorkerCycleError {
     #[error("checker profile attestation failed: {0}")]
     Attestation(#[from] CheckerProfileAttestationError),
+    #[error("checker profile deployment failed: {0}")]
+    Deployment(#[from] crate::checker_profile_deployment::CheckerProfileDeploymentError),
     #[error("verification handoff intake failed: {0}")]
     Intake(#[from] VerificationHandoffIntakeError),
     #[error(
@@ -861,6 +1011,11 @@ pub struct ConfiguredVerificationWorker {
     intake: VerificationHandoffIntake,
     coordinator: GovernedVerificationExecutionCoordinator<SystemVerificationClock>,
     write_back: SystemTaskVerificationWriteBack,
+    checker_profile_deployment: Option<crate::ConfiguredCheckerProfileDeployment>,
+    /// Handoff blockages already reported, so a pending handoff this worker
+    /// does not serve is named once instead of on every cycle.
+    reported_handoff_blockages:
+        std::sync::Mutex<std::collections::BTreeSet<(String, String, String)>>,
 }
 
 /// The production repository path changes only preparation and execution;
@@ -920,6 +1075,7 @@ impl ConfiguredVerificationWorker {
         artifact: Box<dyn ArtifactReferenceSource>,
         verification: Arc<Mutex<VerificationAuthority>>,
         config: VerificationWorkerConfig,
+        checker_profile_deployment: Option<crate::ConfiguredCheckerProfileDeployment>,
     ) -> Result<Self, VerificationWorkerConfigurationError> {
         config.validate()?;
         let supervisor = GovernedCheckerSupervisor::new(
@@ -929,6 +1085,7 @@ impl ConfiguredVerificationWorker {
             config.checker_output_limit,
         )
         .map_err(|_| VerificationWorkerConfigurationError::CheckerSupervisor)?;
+        let checker_profile_deployment = checker_profile_deployment;
         let intake = VerificationHandoffIntake::new(
             Arc::clone(&task),
             artifact,
@@ -952,6 +1109,8 @@ impl ConfiguredVerificationWorker {
             intake,
             coordinator,
             write_back: SystemTaskVerificationWriteBack::new(task, verification),
+            checker_profile_deployment,
+            reported_handoff_blockages: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -991,18 +1150,115 @@ impl ConfiguredVerificationWorker {
                 &verification,
             )),
             write_back: SystemTaskVerificationWriteBack::new(task, verification),
+            checker_profile_deployment: None,
+            reported_handoff_blockages: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         })
+    }
+
+    /// Lineage of the work this worker is configured to verify, read from the
+    /// pending handoff it owns. The deployment is bound to that work, so it is
+    /// sealed only while such a handoff exists.
+    fn deployment_lineage(
+        &self,
+    ) -> Result<
+        Option<egopulse_domain_contracts::v01::egopulse::artifact::v1::LineageBinding>,
+        VerificationWorkerCycleError,
+    > {
+        let owned_claim = match &self.execution {
+            ConfiguredVerificationExecution::Legacy(config) => {
+                Some(config.handoff_plan.binding.claim_id.clone())
+            }
+            ConfiguredVerificationExecution::Prepared { .. } => None,
+        };
+        let pending = {
+            let task = self
+                .intake
+                .task
+                .lock()
+                .map_err(|_| VerificationWorkerCycleError::AuthorityLock)?;
+            task.pending_task_verifications()
+                .map_err(|_| VerificationWorkerCycleError::RequestLineage)?
+        };
+        for handoff in pending {
+            let Some(artifact_set_id) = handoff
+                .event
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.artifact_set_id.as_deref())
+            else {
+                continue;
+            };
+            let Some(artifact_set) = self
+                .intake
+                .artifact
+                .read_artifact_set(artifact_set_id)
+                .map_err(|_| VerificationWorkerCycleError::RequestLineage)?
+            else {
+                continue;
+            };
+            if let Some(claim) = owned_claim.as_deref()
+                && !artifact_set.claim_ids.iter().any(|id| id == claim)
+            {
+                continue;
+            }
+            if let Some(lineage) = artifact_set.lineage.clone() {
+                return Ok(Some(lineage));
+            }
+        }
+        Ok(None)
     }
 
     async fn run_cycle(
         &self,
     ) -> Result<VerificationWorkerCycleResult, VerificationWorkerCycleError> {
         let issued_at = VerificationClock::now(&SystemVerificationClock);
+        // A profile is attested only on evidence that exists. The declaration
+        // is sealed against the lineage of the work this worker serves, so it
+        // can only be deployed while that work is pending — and request
+        // creation then requires the profile to be attested already.
+        let mut profile_ready = self.checker_profile_deployment.is_none();
         if let ConfiguredVerificationExecution::Legacy(config) = &self.execution {
-            self.attestation
-                .attest_one(config.checker_profile.clone(), issued_at)?;
+            if let Some(deployment) = self.checker_profile_deployment.as_ref()
+                && let Some(lineage) = self.deployment_lineage()?
+            {
+                deployment.ensure_sealed(&config.checker_profile, &lineage, &issued_at)?;
+                profile_ready = true;
+            }
+            if profile_ready {
+                self.attestation
+                    .attest_one(config.checker_profile.clone(), issued_at)?;
+            }
         }
-        if let Some(handoff) = self.intake.consume_one(issued_at)?
+        let intake = self.intake.consume_one_with_report(issued_at)?;
+        let mut new_blockages = Vec::new();
+        {
+            let mut reported = self
+                .reported_handoff_blockages
+                .lock()
+                .map_err(|_| VerificationWorkerCycleError::AuthorityLock)?;
+            for blockage in &intake.blockages {
+                let key = (
+                    blockage.task_id.clone(),
+                    blockage.message_id.clone(),
+                    blockage.reason_code.to_owned(),
+                );
+                if reported.insert(key) {
+                    new_blockages.push(blockage.clone());
+                }
+            }
+        }
+        for blockage in &new_blockages {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "verification_handoff_not_served",
+                    "task_id": blockage.task_id,
+                    "message_id": blockage.message_id,
+                    "safe_detail_code": blockage.reason_code,
+                })
+            );
+        }
+        if let Some(handoff) = intake.consumed
             && !handoff.committed
             && !handoff.replayed
         {
@@ -1048,6 +1304,7 @@ impl ConfiguredVerificationWorker {
         {
             return Err(VerificationWorkerCycleError::RequestLineage);
         }
+
         let verification_run_id = self.execution.run_id(&request.verification_request_id);
         let verification_artifact_id = self.execution.artifact_id(&request.verification_request_id);
         let outcome = match &self.execution {
@@ -1225,17 +1482,24 @@ impl VerificationHandoffIntake {
             let resolved = self.prepare_handoff(&handoff, issued_at);
             let (command, expected_request_id) = match resolved {
                 Ok(prepared) => prepared,
-                Err(error) if matches!(self.plan, VerificationHandoffPlanSource::Prepared(_)) => {
+                // A handoff this worker's plan does not describe is simply not
+                // its work: it stays pending for a worker that can serve it.
+                // Only the material of a handoff this plan does own, and its
+                // commit, may fail the cycle.
+                Err(error)
+                    if matches!(
+                        &error,
+                        VerificationHandoffIntakeError::PreparationBlocked(_)
+                            | VerificationHandoffIntakeError::Plan(_)
+                    ) =>
+                {
                     let reason_code = match error {
                         VerificationHandoffIntakeError::PreparationBlocked(reason) => reason,
                         VerificationHandoffIntakeError::Plan(
                             VerificationHandoffPlanError::LineageMismatch,
                         ) => "VERIFICATION_HANDOFF_LINEAGE_MISMATCH",
                         VerificationHandoffIntakeError::Plan(_) => "VERIFICATION_MATERIAL_INVALID",
-                        VerificationHandoffIntakeError::Artifact(_) => {
-                            "VERIFICATION_MATERIAL_UNAVAILABLE"
-                        }
-                        fatal => return Err(fatal),
+                        _ => "VERIFICATION_MATERIAL_UNAVAILABLE",
                     };
                     blockages.push(VerificationHandoffBlockage {
                         task_id: handoff
