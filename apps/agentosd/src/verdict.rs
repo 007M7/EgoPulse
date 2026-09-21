@@ -724,15 +724,30 @@ fn criterion_is_closed(artifact: &VerificationArtifact, criterion_id: &str) -> b
     let Some(result) = matching_results.next() else {
         return false;
     };
+    // A closed criterion has to carry a durable proof of what the checker
+    // observed. Routine checkers record Evidence aggregates, and then the
+    // evidence ids are that proof. A deterministic acceptance checker that
+    // treats a zero-finding review as positive proof cannot do that: its raw
+    // output is an Artifact, and the Verification Authority rejects an
+    // artifact id in `evidence_ids` as a type confusion. Its durable proof is
+    // the detail artifact instead, which the Authority verified when the
+    // result was recorded. Requiring evidence ids of that shape would make
+    // such a criterion impossible to close, so protection and this checker
+    // shape would exclude each other.
+    let carries_evidence = !result.evidence_ids.is_empty()
+        && result
+            .evidence_ids
+            .iter()
+            .all(|evidence_id| !evidence_id.trim().is_empty());
+    let carries_detail_artifact = result
+        .safe_detail_artifact_id
+        .as_deref()
+        .is_some_and(|artifact_id| !artifact_id.trim().is_empty());
     if matching_results.next().is_some()
         || result.criterion_result_id.trim().is_empty()
         || result.outcome != CriterionOutcome::Passed as i32
         || result.evidence_coverage != EvidenceCoverage::Complete as i32
-        || result.evidence_ids.is_empty()
-        || result
-            .evidence_ids
-            .iter()
-            .any(|evidence_id| evidence_id.trim().is_empty())
+        || !(carries_evidence || carries_detail_artifact)
         || !result.discrepancy_ids.is_empty()
         || !result.unverified_item_ids.is_empty()
     {
@@ -1075,6 +1090,42 @@ mod tests {
             ("orphan discrepancy", orphan_discrepancy),
             ("orphan unverified item", orphan_unverified),
         ] {
+            assert_eq!(
+                resolved_blockers(artifact, BTreeSet::new()),
+                BTreeSet::from(["scope".to_owned()]),
+                "{name} must keep scope open"
+            );
+        }
+    }
+
+    #[test]
+    fn positive_acceptance_result_closes_its_criterion_without_evidence_aggregates() {
+        // A deterministic acceptance checker reports its raw output as an
+        // Artifact, so this result carries no evidence aggregate. The artifact
+        // reference is what the Authority verified at intake, and it closes
+        // the criterion.
+        let mut result = closed_scope_result();
+        result.evidence_ids.clear();
+        result.safe_detail_artifact_id = Some("artifact:harness-output:1".to_owned());
+        let mut artifact = artifact();
+        artifact.criterion_results = vec![result];
+        assert_eq!(
+            resolved_blockers(artifact, BTreeSet::new()),
+            BTreeSet::new()
+        );
+    }
+
+    #[test]
+    fn a_result_without_a_durable_proof_keeps_its_criterion_open() {
+        for (name, detail) in [
+            ("no proof at all", None),
+            ("blank detail artifact", Some("   ".to_owned())),
+        ] {
+            let mut result = closed_scope_result();
+            result.evidence_ids.clear();
+            result.safe_detail_artifact_id = detail;
+            let mut artifact = artifact();
+            artifact.criterion_results = vec![result];
             assert_eq!(
                 resolved_blockers(artifact, BTreeSet::new()),
                 BTreeSet::from(["scope".to_owned()]),
