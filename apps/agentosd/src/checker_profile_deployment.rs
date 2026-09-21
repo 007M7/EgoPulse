@@ -18,8 +18,8 @@ use egopulse_artifact_authority::{
 use egopulse_domain_contracts::v01::egopulse::{
     artifact::v1::{
         ArtifactCommand, ArtifactDescriptor, ArtifactSemanticClass, ArtifactStatus, ContentAddress,
-        IntegrityStatus, ProducerIdentity, Provenance, SealArtifactCommand, StageArtifactCommand,
-        artifact_command,
+        IntegrityStatus, LineageBinding, ProducerIdentity, Provenance, SealArtifactCommand,
+        StageArtifactCommand, artifact_command,
     },
     common::v1::{CommandMetadata, ContractReference},
     verification::v1::CheckerProfile,
@@ -159,13 +159,14 @@ impl ConfiguredCheckerProfileDeployment {
     pub fn ensure_sealed(
         &self,
         profile: &CheckerProfile,
+        lineage: &LineageBinding,
         issued_at: &Timestamp,
     ) -> Result<String, CheckerProfileDeploymentError> {
         let artifact_id = deployment_artifact_id(&profile.checker_profile_id);
         let bytes = serde_json::to_vec(&declaration(profile))
             .map_err(|_| CheckerProfileDeploymentError::Encoding)?;
         let address = content_address(&bytes);
-        let candidate = self.descriptor(&artifact_id, &address);
+        let candidate = self.descriptor(&artifact_id, &address, lineage);
         let mut authority = self
             .artifact
             .lock()
@@ -199,9 +200,9 @@ impl ConfiguredCheckerProfileDeployment {
             )
             .map_err(|_| CheckerProfileDeploymentError::Unavailable)?;
         if !staged.committed && !staged.replayed {
-            return Err(CheckerProfileDeploymentError::Rejected(
-                "STAGE_REJECTED".to_owned(),
-            ));
+            return Err(CheckerProfileDeploymentError::Rejected(command_refusal(
+                &staged,
+            )));
         }
         self.seal(&mut authority, &artifact_id, address, issued_at)?;
         let stored = authority
@@ -229,14 +230,19 @@ impl ConfiguredCheckerProfileDeployment {
             )
             .map_err(|_| CheckerProfileDeploymentError::Unavailable)?;
         if !sealed.committed && !sealed.replayed {
-            return Err(CheckerProfileDeploymentError::Rejected(
-                "SEAL_REJECTED".to_owned(),
-            ));
+            return Err(CheckerProfileDeploymentError::Rejected(command_refusal(
+                &sealed,
+            )));
         }
         Ok(())
     }
 
-    fn descriptor(&self, artifact_id: &str, address: &ContentAddress) -> ArtifactDescriptor {
+    fn descriptor(
+        &self,
+        artifact_id: &str,
+        address: &ContentAddress,
+        lineage: &LineageBinding,
+    ) -> ArtifactDescriptor {
         ArtifactDescriptor {
             artifact_id: artifact_id.to_owned(),
             revision: 1,
@@ -247,7 +253,7 @@ impl ConfiguredCheckerProfileDeployment {
             content: Some(address.clone()),
             integrity_status: IntegrityStatus::Unverified as i32,
             provenance: Some(Provenance {
-                lineage: None,
+                lineage: Some(lineage.clone()),
                 producer: Some(ProducerIdentity {
                     principal_kind: ArtifactPrincipalKind::GovernedCollector.as_str().to_owned(),
                     principal_id: self.config.collector_principal_id.clone(),
@@ -351,6 +357,7 @@ fn verify_declaration(
         || actual.type_contract_ref != expected.type_contract_ref
         || actual.retention_profile_ref != expected.retention_profile_ref
         || actual.media_type != expected.media_type
+        || actual_provenance.lineage != expected_provenance.lineage
         || actual_provenance.workspace_ref != expected_provenance.workspace_ref
         || actual_provenance.transformation_contract_ref
             != expected_provenance.transformation_contract_ref
@@ -387,6 +394,17 @@ fn seal_command(id: &str, address: ContentAddress, issued_at: &Timestamp) -> Art
             observed_content: Some(address),
         },
     ))
+}
+
+/// Names the Artifact Authority's own refusal instead of a generic code, so a
+/// rejected deployment can be diagnosed from the daemon's startup output.
+fn command_refusal(
+    result: &egopulse_domain_contracts::v01::egopulse::artifact::v1::ArtifactCommandResult,
+) -> String {
+    match result.safe_error_fingerprint.as_deref() {
+        Some(fingerprint) => format!("{}:{fingerprint}", result.error_code),
+        None => format!("{}:no-safe-fingerprint", result.error_code),
+    }
 }
 
 fn command_with_digest(command: artifact_command::Command) -> ArtifactCommand {
