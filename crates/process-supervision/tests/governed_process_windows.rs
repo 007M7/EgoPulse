@@ -71,8 +71,11 @@ fn pid_writer_script(pid_file: &std::path::Path) -> String {
     format!("Set-Content -NoNewline -LiteralPath '{escaped}' -Value $PID; Start-Sleep -Seconds 30")
 }
 
+/// Waits for the child to publish its PID. The assertion is that it does,
+/// never how fast: the budget only has to outlast the child's own startup,
+/// which is a PowerShell cold start (seconds under load, not milliseconds).
 async fn wait_for_pid(pid_file: &std::path::Path) -> u32 {
-    for _ in 0..100 {
+    for _ in 0..600 {
         if let Ok(value) = std::fs::read_to_string(pid_file)
             && let Ok(pid) = value.trim().parse()
         {
