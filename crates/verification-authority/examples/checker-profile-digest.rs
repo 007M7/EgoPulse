@@ -13,7 +13,10 @@
 //! Input is the checker-profile object exactly as the daemon configuration
 //! spells it (snake_case fields, references as `{contract_id, version,
 //! sha256}`). `revision`, `status`, `profile_digest_sha256` and `attested_at`
-//! are ignored by canonicalization and may be omitted.
+//! are ignored by canonicalization, so any value given for them is harmless;
+//! `revision`, `profile_digest_sha256` and `attested_at` may also be omitted,
+//! and an omitted `status` means `ACTIVE`. `assurance_class` **is** part of the
+//! canonical profile and must be given explicitly.
 
 use egopulse_domain_contracts::v01::egopulse::common::v1::ContractReference;
 use egopulse_domain_contracts::v01::egopulse::verification::v1::{
@@ -51,7 +54,9 @@ struct ProfileJson {
     network_allowed: bool,
     #[serde(default)]
     revision: u64,
-    #[serde(default)]
+    /// Outside the canonical profile, so an omitted value is the active
+    /// profile this tool is normally asked about.
+    #[serde(default = "active_status")]
     status: i32,
     #[serde(default)]
     input_contract_ref: Option<ReferenceJson>,
@@ -65,6 +70,10 @@ struct ProfileJson {
     data_egress_policy_ref: Option<ReferenceJson>,
     #[serde(default)]
     attestation_evidence_artifact_ids: Vec<String>,
+}
+
+const fn active_status() -> i32 {
+    CheckerProfileStatus::Active as i32
 }
 
 fn main() {
