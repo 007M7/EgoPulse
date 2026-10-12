@@ -4,13 +4,13 @@
 
 EgoPulse is not another model wrapper or an unconstrained tool-running Agent. It is a local control system for personal Agents: the user owns the configuration, durable state, Memory lifecycle, approvals, execution evidence and release decisions, while model providers and Harnesses remain replaceable execution resources.
 
-The first release slice is an unsigned Windows x64 engineering preview containing the CLI, TUI and `agentosd` daemon. GPT through the Codex app-server Harness is the only production-admitted model route. Desktop, additional Providers and semantic/vector RAG remain explicitly gated.
+The first release slice is an unsigned Windows x64 engineering preview containing the CLI, TUI and `agentosd` daemon. Production admission is per Provider/Harness route: GPT through the Codex app-server Harness, and DeepSeek through the DSH, OpenCode or Codex app-server Harness, with at most one production profile configured at a time. Kimi, GLM, Desktop, and semantic/vector RAG remain explicitly gated.
 
-This checkout includes the September 2026 phase-one work-loop repairs. Use the matching local candidate and its `BUILD-METADATA.json`; the previous published `v0.1.0-early-access.1` archive does not contain these repairs.
+This checkout carries the phase-one work-loop repairs plus the September and October 2026 verification work. **No Windows candidate has been built from this revision yet**: the current package entry is the local candidate whose exact commit and clean local CI evidence are recorded in its own `BUILD-METADATA.json`, and the newest built candidate predates this checkout. All release records so far are historical evidence — the published `v0.1.0-early-access.1` archive (`5c8a1e8`) and the September candidates do not contain the repairs described below.
 
 - [Windows early-access guide](WINDOWS-EARLY-ACCESS.md)
 - [Implementation architecture](ARCHITECTURE.md)
-- [Current release evidence](docs/release/windows-candidate-20260905.md)
+- [September 2026 release evidence (historical)](docs/release/windows-candidate-20260905.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 
@@ -45,9 +45,9 @@ EgoPulse addresses those questions at the system boundary. Models propose and ex
 | Windows TUI | Early-access package | Interactive natural-language Work Start, live Task/content views, approvals and governed state over the same kernel |
 | Desktop | Source candidate only | Tauri 2 + React + TypeScript is attached to the shared kernel, but native GUI acceptance and packaging are not closed |
 | GPT through Codex | Production-admitted route | Real Codex app-server adapter, exact profile binding, process supervision and governed return path |
-| DeepSeek/DSH | Held candidate | Adapter and composition work exists; authenticated end-to-end admission is deliberately deferred |
+| DeepSeek routes | Production-admitted routes | DSH, OpenCode and Codex app-server are admissible for DeepSeek; a recorded isolated run reached Task completion through DeepSeek/OpenCode |
 | Kimi | Held candidate | Candidate ACP lifecycle exists; it is not selectable for production work |
-| GLM/OpenCode | Held candidate | Representable in configuration; it is not authenticated or production-admitted |
+| GLM | Held candidate | Representable in configuration; it is not authenticated or production-admitted |
 | Memory governance | Implemented | SQLCipher Authority, candidate/accepted/revoked lifecycle, audit, idempotency and scoped snapshots |
 | Lexical Memory retrieval | Admitted baseline | Read-only supervised Python Worker returns references from accepted Memory snapshots |
 | Semantic/vector RAG | Evaluation candidate | Exact-vector and RRF experiment plumbing exists, but the accepted release path remains lexical |
@@ -81,7 +81,7 @@ User / Founder
         +--------------------+--------------------+
                              |
               replaceable Harness / Worker adapters
-         Codex | DSH candidate | Kimi candidate | OpenCode candidate
+         Codex | DSH | OpenCode | Kimi candidate
                              |
                        selected AI Provider
 ```
@@ -145,7 +145,7 @@ EgoPulse does not equate a Provider with a Harness:
 
 `work capabilities` shows admitted choices and held diagnostics separately. A user may change the default proposed for future work, but confirmation copies one exact route into immutable Context and Task facts. There is no silent fallback to another model.
 
-The repository contains Codex, DSH, Kimi and OpenCode adapter boundaries. Only GPT through Codex app-server is admitted in the current package. Cross-Harness composition tests prove that the architecture can represent the same model identity through different drivers; they do not claim that every Provider is authenticated or safe to release.
+The repository contains Codex, DSH, Kimi and OpenCode adapter boundaries. The current package admits GPT through Codex app-server and DeepSeek through DSH, OpenCode or Codex app-server; admission is checked per route against the composition allowlist and at most one production profile may be configured at a time. Cross-Harness composition tests prove that the architecture can represent the same model identity through different drivers; they do not claim that every Provider is authenticated or safe to release.
 
 ## Windows x64 quick start
 
@@ -173,7 +173,7 @@ EgoPulse does not place Provider credentials in the repository or ordinary JSON 
 
 ### 2. Download and verify
 
-Use the local Windows candidate supplied with this revision, including its ZIP and adjacent `.sha256` file. Its exact source commit is recorded in `BUILD-METADATA.json`. The earlier [`v0.1.0-early-access.1`](https://github.com/007M7/EgoPulse/releases/tag/v0.1.0-early-access.1) remains historical release evidence, not the package for the repaired workflow below.
+Use the local Windows candidate supplied with this revision, including its ZIP and adjacent `.sha256` file; its exact source commit is recorded in `BUILD-METADATA.json` and must match this checkout. Until such a candidate exists for the current source, treat every earlier package — including [`v0.1.0-early-access.1`](https://github.com/007M7/EgoPulse/releases/tag/v0.1.0-early-access.1) — as historical release evidence, not as the package for the workflow below.
 
 Verify the downloaded archive before extracting it:
 
@@ -450,7 +450,7 @@ Do not edit generated Rust, TypeScript or Python bindings as the source of truth
 
 ## Quality and release evidence
 
-The previous published Windows candidate was bound to commit `5c8a1e8` and tag `v0.1.0-early-access.1`. Its historical local gate included:
+The published Windows candidate was bound to commit `5c8a1e8` and tag `v0.1.0-early-access.1`; September 2026 candidates were built at later commits, and this checkout has no candidate yet. Their historical local gate included:
 
 - contract, repository-boundary and TypeScript checks;
 - the complete Rust workspace;
@@ -461,7 +461,7 @@ The previous published Windows candidate was bound to commit `5c8a1e8` and tag `
 - CLI, TUI and daemon startup probes;
 - archive and per-file SHA-256 verification for 55 packaged files.
 
-Current phase-one repair evidence includes two real repository tasks, CLI Accept/Rework, 24 TUI checkpoints including Reject, cancellation and same-database recovery. The new candidate's exact commit and clean local CI evidence are packaged under `BUILD-METADATA.json` and `manifests/local-ci-evidence.json`. Candidates are for local early-access testing, not signed production releases or admission of held Provider routes.
+Phase-one repair evidence includes two real repository tasks, CLI Accept/Rework, 24 TUI checkpoints including Reject, cancellation and same-database recovery. A candidate's exact commit and clean local CI evidence are packaged under its `BUILD-METADATA.json` and `manifests/local-ci-evidence.json`; the current source revision must be rebuilt locally to obtain them. Candidates are for local early-access testing, not signed production releases or admission of held Provider routes.
 
 The repository retains GitHub Actions CI/CD definitions, but the current operational gate is the recorded local Windows CI/CD path while Actions capacity is unavailable. See [local CI/CD policy](docs/engineering/local-ci-cd.md).
 

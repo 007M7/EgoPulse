@@ -47,9 +47,10 @@ or Harness-owned delegated login. These are local readiness hints, not
 authenticated lifecycle or production-admission evidence.
 
 The installer requires Windows x64, CPython 3.14.x, an installed `uv` command,
-and Codex 0.148.0-alpha.15 with an authenticated account for the exact selected
-model. The current production profile uses Codex app-server, so `codex` must resolve to a local
-application before installation can complete. If `uv` is absent, install it
+and the executable of the configured production Harness with an authenticated
+account for the exact selected model. A GPT/Codex profile needs Codex
+0.148.0-alpha.15 to resolve to a local application; a DeepSeek profile needs
+the executable of its own Harness instead, so installation can complete. If `uv` is absent, install it
 from `https://docs.astral.sh/uv/` first. A configured command is resolved to an
 absolute executable before daemon process supervision; an unavailable
 production Harness fails installation instead of surfacing on the first Task.
@@ -166,8 +167,8 @@ In another PowerShell window, use the CLI or TUI:
 The retrieval path is read-only, deterministic lexical retrieval in this
 early-access release. Agent writes remain candidates and require the frozen
 Memory governance path for promotion or revocation. Semantic/vector retrieval,
-reranking, a second production Harness, cloud telemetry and enterprise
-identity are outside this package. DeepSeek, Kimi and GLM profiles may be
-configured for evaluation, but their real authentication is deliberately not
-a blocker for this Codex-backed release and does not grant production
-admission.
+reranking, several production profiles at once, cloud telemetry and enterprise
+identity are outside this package. Only the routes the code admits for
+production are selectable; Kimi and GLM profiles may be represented as held
+candidates, and neither the example configuration nor a held entry grants
+production admission.
