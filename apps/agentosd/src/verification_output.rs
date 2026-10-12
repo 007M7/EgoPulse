@@ -42,6 +42,33 @@ pub(crate) struct VerificationOutputPolicy {
     pub(crate) max_output_bytes: usize,
 }
 
+impl VerificationOutputPolicy {
+    /// Policy for an environment that collects raw checker output only, such as
+    /// a non-repository verification worker whose checker writes no finding
+    /// detail, tool receipt or model call receipt. Those roles are never
+    /// requested by that composition; declaring the raw output contract for
+    /// them keeps every admitted contract one the installation reviewed.
+    pub(crate) fn raw_output_only(
+        raw_output_type_ref: ContractReference,
+        retention_profile_ref: ContractReference,
+        collector_principal_id: String,
+        artifact_authority_principal_id: String,
+        max_output_bytes: usize,
+    ) -> Self {
+        Self {
+            detail_type_ref: raw_output_type_ref.clone(),
+            tool_receipt_type_ref: raw_output_type_ref.clone(),
+            model_receipt_type_ref: raw_output_type_ref.clone(),
+            cost_receipt_type_ref: raw_output_type_ref.clone(),
+            raw_output_type_ref,
+            retention_profile_ref,
+            collector_principal_id,
+            artifact_authority_principal_id,
+            max_output_bytes,
+        }
+    }
+}
+
 pub(crate) struct VerificationOutputRequest<'a> {
     pub(crate) verification_request_id: &'a str,
     pub(crate) verification_run_id: &'a str,

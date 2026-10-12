@@ -641,31 +641,38 @@ impl ProductionBootstrapConfig {
             artifact_guard,
         )?));
 
-        let verification_resolver: Box<dyn VerificationReferenceResolver> =
-            match self.verification_references {
-                Some(config) => {
-                    let mut resolver = ArtifactBackedReferenceResolver::new(
-                        ArtifactAuthorityReferenceSource::new_shared(Arc::clone(&artifact)),
-                        config.criteria,
-                    )
-                    .map_err(|_| {
-                        ProductionBootstrapError::InvalidConfiguration("verification.criteria")
-                    })?;
-                    if let Some(repository) = &self.repository_verification {
-                        resolver = resolver
-                            .with_checker_output_collector(
-                                repository.collector_principal_id().to_owned(),
+        let verification_resolver: Box<dyn VerificationReferenceResolver> = match self
+            .verification_references
+        {
+            Some(config) => {
+                let mut resolver = ArtifactBackedReferenceResolver::new(
+                    ArtifactAuthorityReferenceSource::new_shared(Arc::clone(&artifact)),
+                    config.criteria,
+                )
+                .map_err(|_| {
+                    ProductionBootstrapError::InvalidConfiguration("verification.criteria")
+                })?;
+                let output_collector = match &self.repository_verification {
+                    Some(repository) => Some(repository.collector_principal_id().to_owned()),
+                    None => self
+                        .verification_worker
+                        .as_ref()
+                        .and_then(|worker| worker.checker_output_capture.as_ref())
+                        .map(|capture| capture.collector_principal_id.clone()),
+                };
+                if let Some(collector) = output_collector {
+                    resolver = resolver
+                        .with_checker_output_collector(collector)
+                        .map_err(|_| {
+                            ProductionBootstrapError::InvalidConfiguration(
+                                "Verification output collector",
                             )
-                            .map_err(|_| {
-                                ProductionBootstrapError::InvalidConfiguration(
-                                    "Verification output collector",
-                                )
-                            })?;
-                    }
-                    Box::new(resolver)
+                        })?;
                 }
-                None => Box::new(DenyVerificationReferences),
-            };
+                Box::new(resolver)
+            }
+            None => Box::new(DenyVerificationReferences),
+        };
 
         // Verification persists and projects only through its own Authority
         // boundary. The optional resolver above is still only an
@@ -862,7 +869,25 @@ impl ProductionBootstrapConfig {
                 "repository command Artifact policy without repository material",
             ));
         }
-        if let Some(worker_config) = self.verification_worker {
+        if let Some(mut worker_config) = self.verification_worker {
+            if let Some(capture) = worker_config.checker_output_capture.clone() {
+                let sink = crate::ConfiguredCheckerOutputSink::new(
+                    Arc::clone(&artifact),
+                    Arc::clone(&verification),
+                    derived_workspace_admission.clone(),
+                    capture,
+                )
+                .map_err(|_| {
+                    ProductionBootstrapError::InvalidConfiguration(
+                        "verification_worker.checker_output_capture",
+                    )
+                })?;
+                worker_config.checker_output_sink =
+                    Some(Arc::new(sink)
+                        as Arc<
+                            dyn egopulse_verification_authority::CheckerOutputSink,
+                        >);
+            }
             let deployment = worker_config
                 .checker_profile_deployment
                 .clone()
@@ -1276,6 +1301,47 @@ struct VerificationWorkerFile {
     model_call_receipt_artifact_ids: Vec<String>,
     checker_timeout_ms: u64,
     checker_output_limit: u64,
+    /// `stdout` (default) or `envelope_artifact_path` for a sidecar whose
+    /// stdout answers with an envelope naming the review artifact file.
+    #[serde(default)]
+    checker_output_source: Option<String>,
+    /// Present when this environment seals the checker's own output, so a
+    /// Verification result cites the bytes the checker produced.
+    #[serde(default)]
+    checker_output_capture: Option<CheckerOutputCaptureFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckerOutputCaptureFile {
+    raw_output_type_ref: ReferenceFile,
+    retention_profile_ref: ReferenceFile,
+    collector_principal_id: String,
+    artifact_authority_principal_id: String,
+    max_output_bytes: u64,
+}
+
+impl CheckerOutputCaptureFile {
+    fn into_typed(self) -> Result<crate::CheckerOutputCaptureConfig, ProductionBootstrapError> {
+        let max_output_bytes = usize::try_from(self.max_output_bytes).map_err(|_| {
+            ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.checker_output_capture.max_output_bytes",
+            )
+        })?;
+        Ok(crate::CheckerOutputCaptureConfig {
+            raw_output_type_ref: self.raw_output_type_ref.into_typed(),
+            retention_profile_ref: self.retention_profile_ref.into_typed(),
+            collector_principal_id: required(
+                self.collector_principal_id,
+                "verification_worker.checker_output_capture.collector_principal_id",
+            )?,
+            artifact_authority_principal_id: required(
+                self.artifact_authority_principal_id,
+                "verification_worker.checker_output_capture.artifact_authority_principal_id",
+            )?,
+            max_output_bytes,
+        })
+    }
 }
 
 /// Explicit user-owned execution and principal-to-scope policy for the
@@ -2901,6 +2967,24 @@ impl VerificationWorkerFile {
             model_call_receipt_artifact_ids: self.model_call_receipt_artifact_ids,
             checker_timeout: Duration::from_millis(self.checker_timeout_ms),
             checker_output_limit: self.checker_output_limit,
+            output_source: match self.checker_output_source.as_deref() {
+                None | Some("stdout") => {
+                    egopulse_verification_authority::CheckerOutputSource::Stdout
+                }
+                Some("envelope_artifact_path") => {
+                    egopulse_verification_authority::CheckerOutputSource::EnvelopeArtifactPath
+                }
+                Some(_) => {
+                    return Err(ProductionBootstrapError::InvalidConfiguration(
+                        "verification_worker.checker_output_source",
+                    ));
+                }
+            },
+            checker_output_capture: self
+                .checker_output_capture
+                .map(CheckerOutputCaptureFile::into_typed)
+                .transpose()?,
+            checker_output_sink: None,
         })
     }
 }
@@ -4185,9 +4269,27 @@ mod tests {
             "tool_receipt_artifact_ids": [],
             "model_call_receipt_artifact_ids": [],
             "checker_timeout_ms": 1000,
-            "checker_output_limit": 4096
+            "checker_output_limit": 4096,
+            "checker_output_source": "envelope_artifact_path",
+            "checker_output_capture": {
+                "raw_output_type_ref": {
+                    "contract_id": "verification-raw-output",
+                    "version": "v1",
+                    "sha256": "e".repeat(64)
+                },
+                "retention_profile_ref": {
+                    "contract_id": "verification-records",
+                    "version": "v1",
+                    "sha256": "f".repeat(64)
+                },
+                "collector_principal_id": "collector:checker-output",
+                "artifact_authority_principal_id": "authority:artifact",
+                "max_output_bytes": 1048576
+            }
         });
 
+        let mut unknown_output_source = value.clone();
+        unknown_output_source["checker_output_source"] = serde_json::json!("stdout_files");
         let file: VerificationWorkerFile = serde_json::from_value(value).expect("worker JSON");
         let config = file.into_typed().expect("typed worker config");
         assert_eq!(config.checker_request, b"{}".to_vec());
@@ -4201,6 +4303,29 @@ mod tests {
             HashAlgorithm::Sha256 as i32
         );
         assert_eq!(config.checker_timeout, Duration::from_millis(1000));
+        assert_eq!(
+            config.output_source,
+            egopulse_verification_authority::CheckerOutputSource::EnvelopeArtifactPath
+        );
+        let capture = config
+            .checker_output_capture
+            .as_ref()
+            .expect("declared output capture");
+        assert_eq!(capture.collector_principal_id, "collector:checker-output");
+        assert_eq!(capture.max_output_bytes, 1_048_576);
+        // The sink itself is composed at the application boundary, so a
+        // parsed declaration alone stays inert.
+        assert!(config.checker_output_sink.is_none());
+
+        let rejected = serde_json::from_value::<VerificationWorkerFile>(unknown_output_source)
+            .expect("worker JSON")
+            .into_typed();
+        assert!(matches!(
+            rejected,
+            Err(ProductionBootstrapError::InvalidConfiguration(
+                "verification_worker.checker_output_source"
+            ))
+        ));
     }
 
     #[test]

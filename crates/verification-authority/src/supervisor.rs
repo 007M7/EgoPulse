@@ -1,6 +1,6 @@
 use egopulse_process_supervision::{
     GovernedProcessBudget, GovernedProcessError, GovernedProcessReceipt, SupervisedProcessSpec,
-    run_governed_process,
+    run_governed_process_outcome,
 };
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -46,6 +46,10 @@ impl GovernedCheckerSupervisor {
         })
     }
 
+    /// Runs one checker exchange. A normally exited process is a receipt even
+    /// when its exit code is non-zero: the caller classifies the outcome and
+    /// can still account for what the checker wrote. Spawn, input-delivery,
+    /// timeout, output-limit and signal-termination failures remain errors.
     pub async fn run(
         &self,
         working_directory: &Path,
@@ -55,7 +59,7 @@ impl GovernedCheckerSupervisor {
         spec.arguments.clone_from(&self.arguments);
         spec.clear_environment = true;
         spec.inherited_environment = vec!["PATH".to_owned(), "SYSTEMROOT".to_owned()];
-        let receipt = run_governed_process(
+        let receipt = run_governed_process_outcome(
             &spec,
             request,
             GovernedProcessBudget {

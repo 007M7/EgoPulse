@@ -63,6 +63,80 @@ pub enum CheckerProcessFailure {
     OutputUntrusted,
 }
 
+impl CheckerProcessFailure {
+    /// Stable code for operator-facing records, so a failed checker is
+    /// attributed by code instead of by message text.
+    #[must_use]
+    pub const fn safe_code(self) -> &'static str {
+        match self {
+            Self::Unavailable => "CHECKER_UNAVAILABLE",
+            Self::Timeout => "CHECKER_TIMEOUT",
+            Self::Crashed => "CHECKER_CRASHED",
+            Self::OutputUntrusted => "CHECKER_OUTPUT_UNTRUSTED",
+        }
+    }
+}
+
+/// What a checker process left behind when it exited non-zero. The bytes are
+/// kept so a stop or error is attributed from the checker's own machine
+/// readable output instead of being discarded; a non-zero exit still never
+/// becomes a pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckerFailureOutput {
+    pub exit_code: i32,
+    pub bytes: Vec<u8>,
+    /// A stable code read out of the captured output, when it declares one.
+    pub safe_reason_code: Option<String>,
+}
+
+/// Largest captured failure output that is parsed for a stable code. Larger
+/// output is still preserved as bytes, only the code extraction gives up.
+pub const MAX_FAILURE_CODE_PARSE_BYTES: usize = 64 * 1024;
+
+/// Keys a governed checker may use to declare why it stopped. The extractor
+/// reads only these and accepts only values shaped like a stable code, so free
+/// text can never be promoted into an attribution.
+const FAILURE_CODE_KEYS: &[&str] = &[
+    "safe_reason_code",
+    "reason_code",
+    "safe_detail_code",
+    "error_code",
+    "status",
+];
+
+#[must_use]
+pub fn captured_failure_code(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() || bytes.len() > MAX_FAILURE_CODE_PARSE_BYTES {
+        return None;
+    }
+    // A failed checker may share stdout with a wrapper process, so the answer
+    // is found among the captured output instead of assumed to be all of it.
+    crate::checker_output::json_object_candidates(bytes)
+        .into_iter()
+        .find_map(failure_code_in_json)
+}
+
+fn failure_code_in_json(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let object = value.as_object()?;
+    for key in FAILURE_CODE_KEYS {
+        let Some(code) = object.get(*key).and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if stable_code(code) {
+            return Some(code.to_owned());
+        }
+    }
+    None
+}
+
+fn stable_code(code: &str) -> bool {
+    (3..=64).contains(&code.len())
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum SegoMapError {
     #[error("Sego output is not valid ReviewArtifact v1 JSON")]
@@ -130,6 +204,7 @@ pub fn map_sego_review(
                 EvidenceCoverage::Missing,
                 Vec::new(),
                 Vec::new(),
+                &policy.raw_output_artifact_id,
             ),
             discrepancies: Vec::new(),
             unverified_items: Vec::new(),
@@ -151,6 +226,7 @@ pub fn map_sego_review(
                     EvidenceCoverage::Missing,
                     Vec::new(),
                     vec![item.unverified_item_id.clone()],
+                    &policy.raw_output_artifact_id,
                 ),
                 discrepancies: Vec::new(),
                 unverified_items: vec![item],
@@ -168,6 +244,23 @@ pub fn checker_failure_result(
     execution_id: &str,
     failure: CheckerProcessFailure,
 ) -> SegoMappedResult {
+    checker_failure_result_with_detail(policy, execution_id, failure, None)
+}
+
+/// Fails one criterion for a checker process failure. `detail_artifact_id`
+/// names the sealed bytes the checker actually produced (a non-zero exit's
+/// captured output); when it is absent the configured raw output artifact is
+/// cited, which is what a checker that never wrote anything leaves behind.
+#[must_use]
+pub fn checker_failure_result_with_detail(
+    policy: &SegoMapperPolicy,
+    execution_id: &str,
+    failure: CheckerProcessFailure,
+    detail_artifact_id: Option<&str>,
+) -> SegoMappedResult {
+    let detail = detail_artifact_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&policy.raw_output_artifact_id);
     let result_id = stable_id(
         "criterion",
         &format!("{execution_id}:{}", policy.criterion_id),
@@ -187,7 +280,7 @@ pub fn checker_failure_result(
             &policy.criterion_id,
             reason,
             Vec::new(),
-            Some(policy.raw_output_artifact_id.clone()),
+            Some(detail.to_owned()),
         )
     });
     let item_ids = item
@@ -202,9 +295,49 @@ pub fn checker_failure_result(
             EvidenceCoverage::Missing,
             Vec::new(),
             item_ids,
+            detail,
         ),
         discrepancies: Vec::new(),
         unverified_items: item.into_iter().collect(),
+        review_id: execution_id.to_owned(),
+    }
+}
+
+/// The result of an execution whose declared output capture was refused. No
+/// outcome and no citation is claimed from bytes this environment could not
+/// seal, so the criterion is an explicit error instead of a positive result
+/// carried by an artifact of the Task's own input set. The refusal code is
+/// reported with the execution, not as a checker declaration.
+#[must_use]
+pub fn checker_capture_refused_result(
+    policy: &SegoMapperPolicy,
+    execution_id: &str,
+) -> SegoMappedResult {
+    let result_id = stable_id(
+        "criterion",
+        &format!("{execution_id}:{}", policy.criterion_id),
+    );
+    let item = unverified_item(
+        execution_id,
+        &policy.criterion_id,
+        UnverifiedReason::InsufficientEvidence,
+        Vec::new(),
+        None,
+    );
+    let mut criterion_result = base_result(
+        result_id,
+        policy,
+        CriterionOutcome::Error,
+        EvidenceCoverage::Missing,
+        Vec::new(),
+        vec![item.unverified_item_id.clone()],
+        &policy.raw_output_artifact_id,
+    );
+    criterion_result.safe_detail_artifact_id = None;
+    SegoMappedResult {
+        criterion_result,
+        discrepancies: Vec::new(),
+        unverified_items: vec![item],
         review_id: execution_id.to_owned(),
     }
 }
@@ -229,6 +362,7 @@ fn map_structured(
                     // as an evidence/artifact type confusion.
                     Vec::new(),
                     Vec::new(),
+                    &policy.raw_output_artifact_id,
                 ),
                 discrepancies: Vec::new(),
                 unverified_items: Vec::new(),
@@ -250,6 +384,7 @@ fn map_structured(
                 EvidenceCoverage::Missing,
                 Vec::new(),
                 vec![item.unverified_item_id.clone()],
+                &policy.raw_output_artifact_id,
             ),
             discrepancies: Vec::new(),
             unverified_items: vec![item],
@@ -334,6 +469,7 @@ fn map_structured(
             coverage,
             evidence_ids.into_iter().collect(),
             unverified_ids,
+            &policy.raw_output_artifact_id,
         )
         .with_discrepancies(discrepancy_ids),
         discrepancies,
@@ -360,6 +496,7 @@ fn base_result(
     coverage: EvidenceCoverage,
     evidence_ids: Vec<String>,
     unverified_item_ids: Vec<String>,
+    detail_artifact_id: &str,
 ) -> CriterionResult {
     CriterionResult {
         criterion_result_id: id,
@@ -373,7 +510,7 @@ fn base_result(
         discrepancy_ids: Vec::new(),
         unverified_item_ids,
         duration_ms: 0,
-        safe_detail_artifact_id: Some(policy.raw_output_artifact_id.clone()),
+        safe_detail_artifact_id: Some(detail_artifact_id.to_owned()),
     }
 }
 
@@ -506,4 +643,125 @@ const fn severity_rank_string(value: &str) -> u8 {
 fn stable_id(prefix: &str, seed: &str) -> String {
     let digest = hex::encode(Sha256::digest(seed.as_bytes()));
     format!("{prefix}_{}", &digest[..24])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egopulse_domain_contracts::v01::egopulse::artifact::v1::HashAlgorithm;
+
+    fn policy(positive_acceptance: bool) -> SegoMapperPolicy {
+        SegoMapperPolicy {
+            criterion_id: "criterion:local".to_owned(),
+            requirement: CriterionRequirement::MustPass,
+            checker_profile_ref: ContractReference {
+                contract_id: "profile:local".to_owned(),
+                version: "1".to_owned(),
+                sha256: "a".repeat(64),
+            },
+            contract_id: SEGO_REVIEW_ARTIFACT_CONTRACT_ID.to_owned(),
+            contract_revision: SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION,
+            expected_scope: "staged".to_owned(),
+            expected_diff_hash: "b".repeat(64),
+            expected_reviewer: "sego".to_owned(),
+            expected_engine_version: "0.1.9".to_owned(),
+            expected_review_mode: "model_code_review".to_owned(),
+            positive_acceptance,
+            failure_threshold: DiscrepancySeverity::Major,
+            raw_output_artifact_id: "artifact:configured-raw-output".to_owned(),
+            raw_output_address: ContentAddress {
+                algorithm: HashAlgorithm::Sha256 as i32,
+                digest: "c".repeat(64),
+                byte_length: 1,
+            },
+            finding_evidence: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_declared_stable_code_is_read_from_a_single_line_answer() {
+        assert_eq!(
+            captured_failure_code(br#"{"schema_version":1,"status":"budget_exceeded"}"#),
+            Some("budget_exceeded".to_owned())
+        );
+        assert_eq!(
+            captured_failure_code(br#"{"safe_reason_code":"model_unavailable"}"#),
+            Some("model_unavailable".to_owned())
+        );
+        assert_eq!(
+            captured_failure_code(b"warning: retrying\n{\"reason_code\":\"budget_exceeded\"}\n"),
+            Some("budget_exceeded".to_owned())
+        );
+    }
+
+    #[test]
+    fn free_text_and_unstable_values_are_not_promoted_to_codes() {
+        for bytes in [
+            b"".as_slice(),
+            b"review stopped: the declared budget of 4000 tokens was reached",
+            br#"{"message":"review stopped: budget reached"}"#,
+            br#"{"status":"FAILED"}"#,
+            br#"{"status":"no spaces allowed here"}"#,
+            br#"{"status":42}"#,
+        ] {
+            assert_eq!(
+                captured_failure_code(bytes),
+                None,
+                "{}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn a_cited_detail_artifact_replaces_the_configured_raw_output() {
+        let configured = checker_failure_result_with_detail(
+            &policy(false),
+            "execution-1",
+            CheckerProcessFailure::Crashed,
+            None,
+        );
+        assert_eq!(
+            configured
+                .criterion_result
+                .safe_detail_artifact_id
+                .as_deref(),
+            Some("artifact:configured-raw-output")
+        );
+        let captured = checker_failure_result_with_detail(
+            &policy(false),
+            "execution-1",
+            CheckerProcessFailure::Crashed,
+            Some("artifact:verification-output:sealed-failure"),
+        );
+        assert_eq!(
+            captured.criterion_result.safe_detail_artifact_id.as_deref(),
+            Some("artifact:verification-output:sealed-failure")
+        );
+        // A failed checker never becomes a pass, cited capture or not.
+        assert_eq!(
+            captured.criterion_result.outcome,
+            CriterionOutcome::Error as i32
+        );
+        assert_eq!(
+            configured.criterion_result.outcome,
+            CriterionOutcome::Error as i32
+        );
+    }
+
+    #[test]
+    fn an_answer_glued_to_wrapper_text_is_still_one_object() {
+        assert_eq!(
+            captured_failure_code(
+                b"running 1 test
+{\"schema_version\":1,\"status\":\"budget_exceeded\"}test ok"
+            ),
+            Some("budget_exceeded".to_owned())
+        );
+        assert_eq!(
+            captured_failure_code(br#"prefix {"status":"budget_exceeded"#),
+            None,
+            "a truncated object is never read as an answer"
+        );
+    }
 }
