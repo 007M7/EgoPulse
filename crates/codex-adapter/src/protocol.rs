@@ -1800,6 +1800,43 @@ impl CodexAppServerDriver {
     }
 }
 
+impl egopulse_harness_adapter::ReadOnlyTurnDriver for CodexAppServerDriver {
+    fn run_bounded_read_only_turn<'a>(
+        &'a mut self,
+        request: egopulse_harness_adapter::ReadOnlyTurnRequest,
+    ) -> NativeHarnessFuture<'a, Result<egopulse_harness_adapter::ReadOnlyTurnOutcome, DriverError>>
+    {
+        Box::pin(async move {
+            use egopulse_harness_adapter::{ReadOnlyTurnOutcome, ReadOnlyTurnStatus};
+            let outcome = self
+                .run_read_only_turn(CodexReadOnlyTurnRequest {
+                    execution_id: request.execution_id,
+                    working_directory: request.working_directory,
+                    model: request.model,
+                    prompt: request.prompt,
+                    output_schema: request.output_schema,
+                    timeout: request.timeout,
+                    output_limit_bytes: request.output_limit_bytes,
+                })
+                .await?;
+            let terminal_status = match outcome.terminal_status {
+                crate::CodexReadOnlyReviewTerminalStatus::Completed => {
+                    ReadOnlyTurnStatus::Completed
+                }
+                crate::CodexReadOnlyReviewTerminalStatus::Interrupted => {
+                    ReadOnlyTurnStatus::Interrupted
+                }
+                crate::CodexReadOnlyReviewTerminalStatus::Failed => ReadOnlyTurnStatus::Failed,
+            };
+            Ok(ReadOnlyTurnOutcome {
+                model: outcome.receipt.model,
+                terminal_status,
+                assistant_output: outcome.assistant_output,
+            })
+        })
+    }
+}
+
 impl NativeHarnessDriver for CodexAppServerDriver {
     fn is_dispatch_ready(&self) -> bool {
         self.dispatch_lifecycle_is_released()

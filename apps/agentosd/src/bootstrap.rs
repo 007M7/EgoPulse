@@ -1010,7 +1010,48 @@ impl ProductionBootstrapConfig {
         }
         if let Some((_work_type, target_scope_ref)) = intent_defaults {
             work_port = work_port
-                .with_codex_intent_interpreter(self.codex.app_server_config(), target_scope_ref)
+                .with_intent_interpreter(
+                    {
+                        use crate::intent_interpretation::IntentDriverConfig;
+                        let production = self
+                            .provider_profiles
+                            .iter()
+                            .find(|profile| profile.admission == ProviderAdmission::Production)
+                            .ok_or(ProductionBootstrapError::WorkPreparation)?;
+                        match production.harness {
+                            ProviderHarnessKind::CodexAppServer => {
+                                IntentDriverConfig::Codex(self.codex.app_server_config())
+                            }
+                            ProviderHarnessKind::OpenCodeAcp
+                                if production.catalog_snapshot.as_ref().is_some_and(
+                                    |snapshot| snapshot.harness_version == "1.18.31",
+                                ) =>
+                            {
+                                let mut config = egopulse_opencode_adapter::OpenCodeAcpConfig::new(
+                                    production.executable.clone(),
+                                    self.codex.native.workspace_root.clone(),
+                                    production.exact_model.clone(),
+                                );
+                                config.environment_overrides =
+                                    self.codex.environment_overrides.clone();
+                                IntentDriverConfig::OpenCode(config)
+                            }
+                            _ => IntentDriverConfig::Unsupported,
+                        }
+                    },
+                    self.provider_profiles
+                        .iter()
+                        .find(|profile| profile.admission == ProviderAdmission::Production)
+                        .ok_or(ProductionBootstrapError::WorkPreparation)?
+                        .profile_id
+                        .clone(),
+                    self.provider_profiles
+                        .iter()
+                        .find(|profile| profile.admission == ProviderAdmission::Production)
+                        .ok_or(ProductionBootstrapError::WorkPreparation)?
+                        .harness,
+                    target_scope_ref,
+                )
                 .map_err(|_| ProductionBootstrapError::WorkPreparation)?;
         }
         if let Some(repository_material) = repository_material {

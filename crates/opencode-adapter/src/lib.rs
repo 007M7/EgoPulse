@@ -114,14 +114,161 @@ impl OpenCodeAcpConfig {
 
 pub struct OpenCodeAcpDriver {
     inner: DshAcpDriver,
+    config: OpenCodeAcpConfig,
 }
 
 impl OpenCodeAcpDriver {
     #[must_use]
     pub fn new(config: OpenCodeAcpConfig) -> Self {
         Self {
-            inner: DshAcpDriver::new(config.into_inner()),
+            inner: DshAcpDriver::new(config.clone().into_inner()),
+            config,
         }
+    }
+}
+
+impl egopulse_harness_adapter::ReadOnlyTurnDriver for OpenCodeAcpDriver {
+    fn run_bounded_read_only_turn<'a>(
+        &'a mut self,
+        mut request: egopulse_harness_adapter::ReadOnlyTurnRequest,
+    ) -> NativeHarnessFuture<'a, Result<egopulse_harness_adapter::ReadOnlyTurnOutcome, DriverError>>
+    {
+        Box::pin(async move {
+            if request.model != self.config.required_model || request.model.is_empty() {
+                return Err(read_only_error("READ_ONLY_MODEL_MISMATCH"));
+            }
+            // No preexisting native configuration may widen this capability.
+            if self.config.environment_overrides.iter().any(|(name, _)| {
+                name.starts_with("OPENCODE_")
+                    || name.starts_with("XDG_")
+                    || matches!(name.as_str(), "HOME" | "USERPROFILE" | "ProgramData")
+            }) {
+                return Err(read_only_error("READ_ONLY_CONFIGURATION_OVERRIDE_REFUSED"));
+            }
+            let data_home = read_only_data_home()?;
+            refuse_remote_configuration(&data_home.join("opencode/auth.json"))?;
+            let managed = if cfg!(windows) {
+                PathBuf::from(
+                    std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into()),
+                )
+                .join("opencode")
+            } else {
+                PathBuf::from("/etc/opencode")
+            };
+            if managed.try_exists().unwrap_or(true) || cfg!(target_os = "macos") {
+                return Err(read_only_error(
+                    "READ_ONLY_MANAGED_CONFIGURATION_UNATTESTED",
+                ));
+            }
+            let root = tempfile::tempdir()
+                .map_err(|_| read_only_error("READ_ONLY_ISOLATION_UNAVAILABLE"))?;
+            let mut config = self.config.clone();
+            config.working_directory = root.path().to_owned();
+            // A fresh empty workspace/config directory prevents inheriting project
+            // instructions, MCP servers, plugins or user agents. Credentials still
+            // cross only the already-admitted process environment boundary.
+            config.environment_overrides.extend([
+                ("XDG_DATA_HOME".to_owned(), data_home.display().to_string()),
+                (
+                    "XDG_STATE_HOME".to_owned(),
+                    root.path().join("state").display().to_string(),
+                ),
+                (
+                    "XDG_CACHE_HOME".to_owned(),
+                    root.path().join("cache").display().to_string(),
+                ),
+                (
+                    "OPENCODE_DB".to_owned(),
+                    root.path().join("native.db").display().to_string(),
+                ),
+                (
+                    "OPENCODE_TEST_HOME".to_owned(),
+                    root.path().display().to_string(),
+                ),
+                ("OPENCODE_PURE".to_owned(), "true".to_owned()),
+                ("OPENCODE_DISABLE_AUTOUPDATE".to_owned(), "true".to_owned()),
+                (
+                    "XDG_CONFIG_HOME".to_owned(),
+                    root.path().display().to_string(),
+                ),
+                (
+                    "OPENCODE_CONFIG_DIR".to_owned(),
+                    root.path().display().to_string(),
+                ),
+                (
+                    "OPENCODE_DISABLE_PROJECT_CONFIG".to_owned(),
+                    "true".to_owned(),
+                ),
+                ("OPENCODE_DISABLE_CLAUDE_CODE".to_owned(), "true".to_owned()),
+                (
+                    "OPENCODE_CONFIG_CONTENT".to_owned(),
+                    serde_json::json!({
+                        "permission":{"*":"deny"}, "tools":{"*":false}, "plugin":[],
+                        "instructions":[], "autoupdate":false, "share":"disabled",
+                        "agent":{"build":{"permission":{"*":"deny"},"tools":{"*":false}}}
+                    })
+                    .to_string(),
+                ),
+            ]);
+            request.working_directory = root.path().to_owned();
+            let mut fresh = DshAcpDriver::new(config.into_inner());
+            fresh
+                .run_tools_disabled_turn(request)
+                .await
+                .map_err(map_error)
+        })
+    }
+}
+fn read_only_data_home() -> Result<PathBuf, DriverError> {
+    let path = if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(path)
+    } else {
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .ok_or_else(|| read_only_error("READ_ONLY_HOME_UNAVAILABLE"))?;
+        PathBuf::from(home).join(".local/share")
+    };
+    if !path.is_absolute() {
+        return Err(read_only_error("READ_ONLY_HOME_UNAVAILABLE"));
+    }
+    Ok(path)
+}
+fn refuse_remote_configuration(path: &std::path::Path) -> Result<(), DriverError> {
+    use std::{collections::BTreeMap, io::Read};
+    #[derive(serde::Deserialize)]
+    struct Metadata {
+        r#type: String,
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(read_only_error("READ_ONLY_AUTH_METADATA_UNAVAILABLE")),
+    };
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(65_537)
+        .read_to_end(&mut bytes)
+        .map_err(|_| read_only_error("READ_ONLY_AUTH_METADATA_UNAVAILABLE"))?;
+    if bytes.len() > 65_536 {
+        return Err(read_only_error("READ_ONLY_AUTH_METADATA_UNAVAILABLE"));
+    }
+    // Deserialize only types, ignoring credential fields; never log or persist the body.
+    let metadata: BTreeMap<String, Metadata> = serde_json::from_slice(&bytes)
+        .map_err(|_| read_only_error("READ_ONLY_AUTH_METADATA_UNAVAILABLE"))?;
+    if metadata
+        .values()
+        .any(|entry| !matches!(entry.r#type.as_str(), "api" | "oauth"))
+    {
+        return Err(read_only_error("READ_ONLY_REMOTE_CONFIGURATION_UNATTESTED"));
+    }
+    Ok(())
+}
+fn read_only_error(code: &str) -> DriverError {
+    DriverError {
+        certainty: egopulse_harness_adapter::DriverErrorCertainty::ProvenNotSent,
+        code:
+            egopulse_domain_contracts::v01::egopulse::harness::v1::HarnessErrorCode::InvalidArgument,
+        safe_detail_code: code.to_owned(),
+        error_fingerprint: None,
+        raw_evidence: Vec::new(),
     }
 }
 
@@ -301,5 +448,36 @@ mod tests {
             OPENCODE_ACP_SCHEMA_ATTESTATION_REQUIRED,
             "OPENCODE_ACP_SCHEMA_ATTESTATION_REQUIRED"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_only_metadata_tests {
+    use super::*;
+    #[test]
+    fn remote_account_configuration_is_refused_without_exposing_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("auth.json");
+        std::fs::write(&path, br#"{"provider":{"type":"wellknown","token":"fixture-secret-token","key":"fixture-key"}}"#).unwrap();
+        let error = refuse_remote_configuration(&path).unwrap_err();
+        assert_eq!(
+            error.safe_detail_code,
+            "READ_ONLY_REMOTE_CONFIGURATION_UNATTESTED"
+        );
+        assert!(error.raw_evidence.is_empty());
+        assert_eq!(
+            error.certainty,
+            egopulse_harness_adapter::DriverErrorCertainty::ProvenNotSent
+        );
+        std::fs::write(
+            &path,
+            br#"{"provider":{"type":"api","key":"fixture-secret-token"}}"#,
+        )
+        .unwrap();
+        assert!(refuse_remote_configuration(&path).is_ok());
+        std::fs::write(&path, br#"{"provider":{"type":"unknown-future-account"}}"#).unwrap();
+        assert!(refuse_remote_configuration(&path).is_err());
+        std::fs::write(&path, vec![b' '; 65_537]).unwrap();
+        assert!(refuse_remote_configuration(&path).is_err());
     }
 }

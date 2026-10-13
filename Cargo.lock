@@ -1293,6 +1293,7 @@ dependencies = [
  "prost-types",
  "rusqlite",
  "rusqlite_migration",
+ "serde_json",
  "sha2",
  "thiserror 2.0.20",
  "tokio",
@@ -1400,7 +1401,11 @@ dependencies = [
  "egopulse-domain-contracts",
  "egopulse-dsh-adapter",
  "egopulse-harness-adapter",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

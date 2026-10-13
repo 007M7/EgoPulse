@@ -406,9 +406,11 @@ impl ConfiguredWorkPreparationPort {
         self
     }
 
-    pub(crate) fn with_codex_intent_interpreter(
+    pub(crate) fn with_intent_interpreter(
         mut self,
-        codex: egopulse_codex_adapter::CodexAppServerConfig,
+        driver_config: crate::intent_interpretation::IntentDriverConfig,
+        profile_id: String,
+        harness_kind: crate::bootstrap::ProviderHarnessKind,
         target_scope_ref: String,
     ) -> Result<Self, CommandPortFailure> {
         let mut work_types = self.allowed_work_types.iter();
@@ -418,7 +420,9 @@ impl ConfiguredWorkPreparationPort {
             .cloned()
             .ok_or(CommandPortFailure::IntegrityFailure)?;
         self.intent_interpreter = Some(ConfiguredIntentInterpreter::new(
-            codex,
+            driver_config,
+            profile_id,
+            harness_kind,
             self.workspace_root.clone(),
             work_type,
             target_scope_ref,
@@ -964,9 +968,6 @@ impl WorkPreparationPort for ConfiguredWorkPreparationPort {
             registry.resolve_choice(request.work_capability_choice_id.trim())
         }
         .map_err(work_capability_failure)?;
-        if resolved.route().harness_id != "codex_app_server" {
-            return Err(CommandPortFailure::CapabilityNotAdmitted);
-        }
         let view = registry
             .projection_for_resolution(&resolved)
             .map_err(work_capability_failure)?;
