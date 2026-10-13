@@ -1249,6 +1249,10 @@ impl CliFailure {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if egopulse_local_ipc_platform::load_protected_process_keys().is_err() {
+        eprintln!("LOCAL_KEYS_INVALID: protected installation keys could not be loaded");
+        return ExitCode::from(78);
+    }
     let cli = Cli::parse();
     let json_output = command_json(&cli.command);
     let result = dispatch_command(cli.command).await;

@@ -122,7 +122,7 @@ foreach ($binary in $binaries) {
     Copy-EgoPulseFileExclusively -SourcePath $source -DestinationPath (Join-Path $binRoot $binary)
 }
 
-foreach ($source in @('README.md', 'SECURITY.md', 'WINDOWS-EARLY-ACCESS.md', 'setup-memory-worker.ps1', 'install-egopulse.ps1')) {
+foreach ($source in @('README.md', 'SECURITY.md', 'WINDOWS-EARLY-ACCESS.md', 'setup-memory-worker.ps1', 'install-egopulse.ps1', 'egopulse-keys.ps1')) {
     Copy-EgoPulseFileExclusively -SourcePath $source -DestinationPath (Join-Path $candidateRoot (Split-Path -Leaf $source))
 }
 $configRoot = Join-Path $candidateRoot 'config'

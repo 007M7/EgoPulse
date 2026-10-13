@@ -27,11 +27,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install-egopulse.ps1 `
 
 The installer creates a user-owned configuration under
 `%LOCALAPPDATA%\EgoPulse`, generates the ten local Authority/read-model
-encryption and session keys as user environment variables, installs the locked Memory Worker,
+encryption and session keys in `local-keys.dpapi` using Windows DPAPI CurrentUser, installs the locked Memory Worker,
 performs `agentosd --check-config`, and launches the daemon. It never writes
 Provider API keys to the package or configuration. A pre-existing
 configuration is preserved unless `-Force` is explicitly supplied; forced
-replacement creates a timestamped backup.
+replacement creates a timestamped backup. The installer persists only the key-file path; daemon, CLI and TUI decrypt and inject keys into their own process at startup. A legacy installation without this file is preserved and reports `LEGACY_KEYS_MIGRATION_REQUIRED`; reinstalling does not rotate its database keys or erase its User environment values. Back up the matching databases and protected key file together. DPAPI recovery requires the same Windows account and its DPAPI recovery material; the file alone is not a portable cross-account backup.
 
 Keep the reviewed acceptance contract outside the execution checkout and
 follow [repository setup](config/README.md#governed-repository-setup).

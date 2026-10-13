@@ -24,6 +24,7 @@ $requiredFiles = @(
     'SHA256SUMS',
     'setup-memory-worker.ps1',
     'install-egopulse.ps1',
+    'egopulse-keys.ps1',
     'config/agentos-config.example.json',
     'config/README.md',
     'docs/engineering/repository-work-loop.md',

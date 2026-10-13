@@ -1125,6 +1125,7 @@ dependencies = [
  "egopulse-director-facade",
  "egopulse-domain-contracts",
  "egopulse-local-api",
+ "egopulse-local-ipc-platform",
  "prost-types",
  "serde_json",
  "tokio",
@@ -1364,12 +1365,15 @@ name = "egopulse-local-ipc-platform"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "serde",
+ "serde_json",
  "sha2",
  "tokio",
  "tokio-stream",
  "tonic",
  "uuid",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1438,6 +1442,7 @@ dependencies = [
  "egopulse-director-facade",
  "egopulse-domain-contracts",
  "egopulse-local-api",
+ "egopulse-local-ipc-platform",
  "prost-types",
  "ratatui",
  "serde_json",
