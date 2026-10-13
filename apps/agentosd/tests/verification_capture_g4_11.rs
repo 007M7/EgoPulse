@@ -525,6 +525,19 @@ fn profile(case: &Case) -> CheckerProfile {
         )],
         attested_at: None,
     };
+    if case.profile.starts_with("sego.task.acceptance.s2") {
+        profile.checker_id = "sego".to_owned();
+        profile.checker_version = "0.1.9".to_owned();
+        profile.assurance_class = CheckerAssuranceClass::ModelAssisted as i32;
+        profile.timeout_ms = 120_000;
+        profile.network_allowed = true;
+        profile.output_contract_ref = Some(ContractReference {
+            contract_id: "sego.review.artifact/v1".to_owned(),
+            version: "3".to_owned(),
+            sha256: env::var("EGOPULSE_S2_CONTRACT_SHA").expect("pinned Sego contract source"),
+        });
+        profile.data_egress_policy_ref = Some(reference("provider_review_egress"));
+    }
     profile.profile_digest_sha256 = canonical_checker_profile_digest(&profile);
     profile
 }
@@ -1814,4 +1827,149 @@ fn checker_runs(root: &TempRoot) -> usize {
         .expect("checker run marker")
         .lines()
         .count()
+}
+
+/// Opt-in interoperability evidence. Real Sego/model output, real owners and
+/// persisted stores; Task activation is still the test guard used by this target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires EGOPULSE_S2_ROOT and a provenance-pinned real Sego wrapper; invokes the authorized provider"]
+async fn live_sego_sidecar_capture_reuses_profile_and_preserves_budget_stop() {
+    let root_path = PathBuf::from(env::var_os("EGOPULSE_S2_ROOT").expect("isolated S2 root"));
+    assert!(root_path.is_absolute());
+    let root = TempRoot(root_path);
+    // Preserve the whole live evidence site, including failures, rather than deleting it.
+    let root = Box::leak(Box::new(root));
+    let wrapper =
+        PathBuf::from(env::var_os("EGOPULSE_S2_WRAPPER").expect("provenance-pinned wrapper"));
+    let mut first = Case::first();
+    first.profile = "sego.task.acceptance.s2".into();
+    let mut second = Case::second();
+    second.profile = first.profile.clone();
+    second.criterion = first.criterion.clone();
+    let mut budget = Case::suffixed("-budget", "run:sego-s2-budget");
+    budget.profile = "sego.task.acceptance.s2.budget".into();
+    let cases = [&first, &second, &budget];
+    for case in cases {
+        let digest = env::var("EGOPULSE_S2_DIFF_HASH").expect("frozen real diff hash");
+        let config = user_config(
+            root,
+            &wrapper,
+            &ConfigSpec {
+                manifest_digest: &digest,
+                max_output_bytes: 1024 * 1024,
+                output_source: "envelope_artifact_path",
+                capture: true,
+                raw_output_artifact_id: &case.output,
+            },
+            case,
+        );
+        let mut value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        let review_root = root.path().join("workspace");
+        value["verification_worker"]["handoff"]["checker_profile_refs"][0]["version"] =
+            serde_json::json!("0.1.9");
+        value["verification_worker"]["mapper"]["checker_profile_ref"]["version"] =
+            serde_json::json!("0.1.9");
+        let worker = &mut value["verification_worker"];
+        worker["checker_timeout_ms"] = serde_json::json!(120_000);
+        worker["checker_output_limit"] = serde_json::json!(1024 * 1024);
+        worker["checker_profile"]["checker_id"] = serde_json::json!("sego");
+        worker["checker_profile"]["checker_version"] = serde_json::json!("0.1.9");
+        worker["checker_profile"]["assurance_class"] =
+            serde_json::json!(CheckerAssuranceClass::ModelAssisted as i32);
+        worker["checker_profile"]["timeout_ms"] = serde_json::json!(120_000);
+        worker["checker_profile"]["network_allowed"] = serde_json::json!(true);
+        worker["checker_profile"]["data_egress_policy_ref"] =
+            reference_value("provider_review_egress");
+        worker["checker_profile"]["output_contract_ref"] = serde_json::json!({
+            "contract_id":"sego.review.artifact/v1", "version":"3",
+            "sha256":env::var("EGOPULSE_S2_CONTRACT_SHA").expect("pinned Sego contract source")
+        });
+        worker["mapper"]["expected_reviewer"] = serde_json::json!("sego");
+        worker["mapper"]["expected_engine_version"] = serde_json::json!("0.1.9");
+        worker["mapper"]["expected_review_mode"] = serde_json::json!("model_code_review");
+        worker["mapper"]["positive_acceptance"] = serde_json::json!(false);
+        let request = serde_json::json!({
+            "schema_version":1, "action":"review", "cwd":review_root,
+            "scope":"staged", "options":{"provider":"deepseek","model":"deepseek-v4-flash"},
+            "context":{"diff_hash":digest,"invocation_id":format!("egopulse-s2{}",case.suffix)},
+        });
+        worker["checker_request_hex"] =
+            serde_json::json!(hex::encode(serde_json::to_vec(&request).unwrap()));
+        set_value(
+            &mut value,
+            "/verification/criteria/0/minimum_assurance",
+            serde_json::json!(CheckerAssuranceClass::ModelAssisted as i32),
+        );
+        fs::write(&config, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        if env::var_os("EGOPULSE_S2_PREFLIGHT_ONLY").is_some() {
+            ProductionBootstrapConfig::from_user_file(&config)
+                .expect("config validation must not open stores");
+            eprintln!(
+                "s2_preflight=passed profile={} stores_opened=false provider_called=false",
+                case.profile
+            );
+            continue;
+        }
+        if case.suffix == "-budget" {
+            fs::create_dir_all(review_root.join(".claude")).unwrap();
+            fs::write(
+                review_root.join(".claude/settings.json"),
+                br#"{"budget":{"maxInputTokens":1}}"#,
+            )
+            .unwrap();
+        }
+        seed(root.path(), case);
+        let run = run_cycle(root, &config, &[case]).await;
+        assert_ne!(
+            run.artifact.conclusion,
+            VerificationConclusion::Passed as i32,
+            "real model output never self-accepts the task"
+        );
+        let capture = run
+            .captured
+            .as_ref()
+            .expect("real output sealed by Artifact owner");
+        assert_eq!(capture.status, ArtifactStatus::Sealed as i32);
+        assert_eq!(
+            capture
+                .provenance
+                .as_ref()
+                .unwrap()
+                .producer
+                .as_ref()
+                .unwrap()
+                .component_version,
+            "0.1.9"
+        );
+        if case.suffix == "-budget" {
+            assert_eq!(
+                run.artifact.criterion_results[0].outcome,
+                egopulse_domain_contracts::v01::egopulse::verification::v1::CriterionOutcome::Error
+                    as i32
+            );
+        } else {
+            assert_ne!(
+                run.artifact.criterion_results[0].outcome,
+                egopulse_domain_contracts::v01::egopulse::verification::v1::CriterionOutcome::Error
+                    as i32,
+                "sidecar review must map successfully rather than merely produce a captured error"
+            );
+        }
+        let before = fs::read_to_string(root.path().join(".g4-11-runs")).unwrap();
+        let replay = run_worker_once(&config).await;
+        assert!(replay.contains("Idle"));
+        assert_eq!(
+            fs::read_to_string(root.path().join(".g4-11-runs")).unwrap(),
+            before
+        );
+        assert_eq!(read_run(root, &[case]).artifact, run.artifact);
+    }
+    if env::var_os("EGOPULSE_S2_PREFLIGHT_ONLY").is_some() {
+        eprintln!("s2_preflight_suite=passed real_model_calls=0 stores_opened=false");
+        return;
+    }
+    eprintln!(
+        "s2_live=passed real_sidecar=true real_review_tasks=2 independent_tasks=2 budget_stop=1 restart_replay=true founder_acceptance=pending root={}",
+        root.path().display()
+    );
 }
