@@ -119,6 +119,16 @@ pub fn captured_failure_code(bytes: &[u8]) -> Option<String> {
 fn failure_code_in_json(bytes: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let object = value.as_object()?;
+    // The real sidecar reports its cause inside error; status is only a category.
+    if let Some(error) = object.get("error").and_then(serde_json::Value::as_object) {
+        for key in ["safe_code", "code"] {
+            if let Some(code) = error.get(key).and_then(serde_json::Value::as_str)
+                && stable_code(code)
+            {
+                return Some(code.to_owned());
+            }
+        }
+    }
     for key in FAILURE_CODE_KEYS {
         let Some(code) = object.get(*key).and_then(|value| value.as_str()) else {
             continue;
@@ -688,6 +698,17 @@ mod tests {
         assert_eq!(
             captured_failure_code(b"warning: retrying\n{\"reason_code\":\"budget_exceeded\"}\n"),
             Some("budget_exceeded".to_owned())
+        );
+    }
+
+    #[test]
+    fn real_sidecar_error_preserves_the_nested_safe_cause() {
+        assert_eq!(captured_failure_code(br#"{"schema_version":1,"status":"error","error":{"code":"invalid_request","message":"private details"}}"#), Some("invalid_request".to_owned()));
+        assert_eq!(captured_failure_code(br#"{"status":"error","error":{"safe_code":"budget_exceeded","code":"internal_error"}}"#), Some("budget_exceeded".to_owned()));
+        assert_eq!(captured_failure_code(br#"{"status":"error","error":{"safe_code":"secret: unsafe","code":"invalid_request"}}"#), Some("invalid_request".to_owned()));
+        assert_eq!(
+            captured_failure_code(br#"{"error":{"code":"secret value"}}"#),
+            None
         );
     }
 

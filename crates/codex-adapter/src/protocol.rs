@@ -2299,7 +2299,10 @@ fn lifecycle_event(
         native_event_id: None,
         native_sequence: None,
         native_observed_at: now(),
-        criticality: if matches!(
+        criticality: if kind == LifecycleKind::ExecutionFailed && will_retry == Some(true) {
+            // Retried sampling failures keep the same native turn and dispatch alive.
+            ObservationCriticality::Control
+        } else if matches!(
             kind,
             LifecycleKind::ExecutionCompleted
                 | LifecycleKind::ExecutionInterrupted
@@ -3420,5 +3423,116 @@ mod tests {
             }
             _ => panic!("expected diagnostic payload"),
         }
+    }
+    #[tokio::test]
+    async fn retryable_codex_error_keeps_the_dispatch_observation_stream_open() {
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch-retryable-error".to_owned(),
+            ..Default::default()
+        };
+        driver.active = Some(ActiveDispatch {
+            dispatch_id: envelope.dispatch_id.clone(),
+            thread_id: "thread-retryable-error".to_owned(),
+            turn_id: Some("turn-retryable-error".to_owned()),
+            turn_request_id: 1,
+            workspace_root: std::env::current_dir().expect("test workspace"),
+        });
+
+        // Codex reports a transient sampling failure the same way it reports a
+        // fatal one: with an `error` notification. `willRetry` is the only
+        // signal that distinguishes a retried turn from an ended turn.
+        let notification = json!({
+            "method": "error",
+            "params": { "willRetry": true, "message": "stream disconnected" }
+        });
+        let raw = serde_json::to_vec(&notification).expect("error bytes");
+        let event = driver
+            .map_notification(&envelope, "error", notification, raw)
+            .expect("map retryable error")
+            .expect("retryable error event");
+
+        assert_eq!(event.criticality, ObservationCriticality::Control);
+        match event.payload {
+            harness_observation::Payload::Lifecycle(value) => {
+                assert_eq!(value.kind, LifecycleKind::ExecutionFailed as i32);
+                assert_eq!(value.native_will_retry, Some(true));
+            }
+            _ => panic!("expected lifecycle payload"),
+        }
+        // A retried failure does not end the native turn, so the dispatch must
+        // remain open; otherwise every later turn event is silently dropped by
+        // the completed-dispatch short circuit in next_event.
+        assert!(driver.active.is_some());
+        assert!(driver.completed_dispatch_id.is_none());
+
+        let delta = json!({
+            "method": "item/agentMessage/delta",
+            "params": { "itemId": "msg-after-retry", "delta": "continued" }
+        });
+        let raw = serde_json::to_vec(&delta).expect("delta bytes");
+        assert!(
+            driver
+                .map_notification(&envelope, "item/agentMessage/delta", delta, raw)
+                .expect("map post-retry delta")
+                .is_some(),
+            "post-retry turn content must still be observed"
+        );
+        // The retry is only transient: the same dispatch must still close normally
+        // when the turn really completes.
+        let completed = json!({
+            "method": "turn/completed",
+            "params": { "turn": { "status": "completed" } }
+        });
+        let raw = serde_json::to_vec(&completed).expect("completion bytes");
+        let terminal = driver
+            .map_notification(&envelope, "turn/completed", completed, raw)
+            .expect("map post-retry completion")
+            .expect("terminal event after retry");
+        assert_eq!(terminal.criticality, ObservationCriticality::Terminal);
+        assert!(driver.active.is_none());
+        assert_eq!(
+            driver.completed_dispatch_id.as_deref(),
+            Some(envelope.dispatch_id.as_str())
+        );
+        assert!(
+            driver
+                .next_event(&envelope)
+                .await
+                .expect("dispatch released after retry")
+                .is_none(),
+            "a retryable error must not make the dispatch unreleasable"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_codex_error_still_closes_the_dispatch_stream() {
+        let mut driver = CodexAppServerDriver::new(CodexAppServerConfig::new("codex"));
+        let envelope = DispatchEnvelope {
+            dispatch_id: "dispatch-fatal-error".to_owned(),
+            ..Default::default()
+        };
+        driver.active = Some(ActiveDispatch {
+            dispatch_id: envelope.dispatch_id.clone(),
+            thread_id: "thread-fatal-error".to_owned(),
+            turn_id: Some("turn-fatal-error".to_owned()),
+            turn_request_id: 1,
+            workspace_root: std::env::current_dir().expect("test workspace"),
+        });
+        let notification = json!({
+            "method": "error",
+            "params": { "willRetry": false, "message": "fatal" }
+        });
+        let raw = serde_json::to_vec(&notification).expect("error bytes");
+        let event = driver
+            .map_notification(&envelope, "error", notification, raw)
+            .expect("map fatal error")
+            .expect("fatal error event");
+        assert_eq!(event.criticality, ObservationCriticality::Terminal);
+        assert!(driver.active.is_none());
+        assert_eq!(
+            driver.completed_dispatch_id.as_deref(),
+            Some("dispatch-fatal-error")
+        );
     }
 }

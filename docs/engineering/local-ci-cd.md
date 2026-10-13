@@ -3,13 +3,14 @@
 ## Decision
 
 The repository keeps a complete GitHub Actions CI/CD workflow for pull requests,
-`main` pushes and release tags. During the current development period, the
-GitHub Actions usage quota is exhausted, so the local Windows x64 CI/CD path is
-the operationally authoritative gate and remote workflow failures are
-non-blocking. The workflow remains the intended reproducible remote path when
-capacity is available. Release operations produce an unsigned, commit-bound
-Windows early-access candidate; they do not imply code signing or a production
-release.
+`main` pushes and release tags. The local Windows x64 path provides a complete
+reproduction gate and commit-bound candidate evidence. Inspect actual current
+Actions results: a historical quota/billing exception does not make a present
+Rust, contract or packaging failure non-blocking. Required remote checks must
+pass on the current head before integration; an unavailable service must be
+reported separately from a failed check. Release operations produce an unsigned,
+commit-bound Windows early-access candidate; they do not imply code signing or
+a production release.
 
 The two repositories have different classifications:
 
@@ -51,7 +52,7 @@ pnpm run ci:local
 
 Bootstrap a new checkout once with `pnpm install --frozen-lockfile`. The recurring gate verifies Git diff integrity, Node manifest/lock consistency without reinstalling an already materialized dependency tree, repository boundaries, contracts, generated code, TypeScript, the Desktop frontend, the complete Rust workspace, and all three Python projects, including the Memory/RAG Worker. Missing or stale installed packages fail closed in the TypeScript or Desktop steps. Machine-readable evidence is written beneath `.local-ci/evidence/` and is intentionally ignored by Git.
 
-Why keep a tracked fast hook: it catches contract and boundary failures before a push without duplicating the long full Rust job. Git hooks can still be bypassed with `--no-verify`; the local full-CI evidence is the current development authority, while remote required checks become authoritative again when Actions capacity is restored.
+Why keep a tracked fast hook: it catches contract and boundary failures before a push without duplicating the long full Rust job. Git hooks can still be bypassed with `--no-verify`; local full-CI evidence supports candidate validation, while available remote required checks remain integration requirements.
 
 ## Local CD
 

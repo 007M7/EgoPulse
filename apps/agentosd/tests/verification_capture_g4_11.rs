@@ -245,7 +245,7 @@ fn g4_11_capture_scenarios_run_in_isolated_processes() {
         ),
         (
             "scenario_two_independent_tasks_are_served",
-            &["NO_FAILURE_EVENT"],
+            &["NO_FAILURE_EVENT", "VERIFICATION_HANDOFF_NOT_OUR_WORK"],
         ),
         (
             "scenario_fabricated_capture_references_are_rejected",
@@ -1493,6 +1493,15 @@ async fn scenario_two_independent_tasks_are_served() {
     capture_is_bound_to_its_execution(&root, &first_run, &first);
     assert_eq!(checker_runs(&root), 1, "only the first task's checker ran");
 
+    // Re-enter the first worker while the second task is pending. It must
+    // leave that handoff untouched and report ownership, not invalid material.
+    let first_idle = run_worker_once(&first_config).await;
+    assert!(first_idle.contains("Idle"));
+    assert_eq!(
+        checker_runs(&root),
+        1,
+        "a foreign task must not run this worker's checker"
+    );
     let second_run = run_cycle(&root, &second_config, &[&second]).await;
     assert_eq!(
         second_run.artifact.criterion_results[0].criterion_id,

@@ -1540,6 +1540,8 @@ mod tests {
             "-Command".to_owned(),
             format!("Add-Content -LiteralPath '{escaped_marker}' -Value 'run'; Write-Output 'ok'"),
         ];
+        // The replay test exercises durable receipts, not PowerShell startup latency.
+        fixture.command.timeout_seconds = 60;
         fixture.command.inherited_environment = vec!["SystemRoot".to_owned()];
         fixture.command.environment_overrides.clear();
         fixture.material.acceptance_contract.required_commands = vec![fixture.command.clone()];
@@ -1820,10 +1822,18 @@ mod tests {
         )
         .expect("runner");
         let first = runner.execute(fixture.request()).await.expect("first run");
-        assert!(matches!(
-            first,
-            RepositoryCommandExecutionOutcome::Completed(_)
-        ));
+        let RepositoryCommandExecutionOutcome::Completed(first) = first else {
+            panic!("fresh process must execute before replay");
+        };
+        assert_eq!(
+            first.supervision_failure, None,
+            "process supervision must succeed"
+        );
+        assert_eq!(
+            first.exit_code,
+            Some(0),
+            "marker process must exit successfully"
+        );
         assert_eq!(
             std::fs::read_to_string(&marker)
                 .expect("execution marker")

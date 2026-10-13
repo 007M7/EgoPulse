@@ -422,6 +422,8 @@ pub enum VerificationHandoffPlanError {
     AcceptanceContractMissing,
     #[error("Artifact set is missing, unsealed, or does not belong to the handoff")]
     ArtifactSetInvalid,
+    #[error("handoff belongs to another reviewed worker plan")]
+    NotOurWork,
     #[error("Artifact set primary Claim is missing, ambiguous, or invalid")]
     PrimaryClaimInvalid,
     #[error("Task handoff and configured lineage do not match")]
@@ -479,10 +481,6 @@ impl VerificationHandoffPlan {
             .ok_or(VerificationHandoffPlanError::ArtifactSetInvalid)?;
         if artifact_set.status != ArtifactSetStatus::Sealed as i32
             || artifact_set.artifact_set_id != artifact_set_id
-            || !artifact_set
-                .claim_ids
-                .iter()
-                .any(|id| id == &self.binding.claim_id)
         {
             return Err(VerificationHandoffPlanError::ArtifactSetInvalid);
         }
@@ -508,6 +506,13 @@ impl VerificationHandoffPlan {
             .ok_or(VerificationHandoffPlanError::ArtifactSetInvalid)?;
         if !content_address_valid(&artifact_set_manifest) {
             return Err(VerificationHandoffPlanError::ArtifactSetInvalid);
+        }
+        if !artifact_set
+            .claim_ids
+            .iter()
+            .any(|id| id == &self.binding.claim_id)
+        {
+            return Err(VerificationHandoffPlanError::NotOurWork);
         }
         let binding = VerificationBinding {
             lineage: Some(lineage),
@@ -1545,6 +1550,9 @@ impl VerificationHandoffIntake {
                         VerificationHandoffIntakeError::Plan(
                             VerificationHandoffPlanError::LineageMismatch,
                         ) => "VERIFICATION_HANDOFF_LINEAGE_MISMATCH",
+                        VerificationHandoffIntakeError::Plan(
+                            VerificationHandoffPlanError::NotOurWork,
+                        ) => "VERIFICATION_HANDOFF_NOT_OUR_WORK",
                         VerificationHandoffIntakeError::Plan(_) => "VERIFICATION_MATERIAL_INVALID",
                         _ => "VERIFICATION_MATERIAL_UNAVAILABLE",
                     };
@@ -1942,6 +1950,20 @@ mod tests {
         assert_eq!(request.request.checker_profile_refs.len(), 1);
     }
 
+    #[test]
+    fn non_owned_handoff_is_distinct_from_invalid_material() {
+        let mut other = artifact_set();
+        other.claim_ids = vec!["another-worker-claim".to_owned()];
+        assert_eq!(
+            plan().request_for(&handoff(), &other).unwrap_err(),
+            VerificationHandoffPlanError::NotOurWork
+        );
+        other.lineage = None;
+        assert_eq!(
+            plan().request_for(&handoff(), &other).unwrap_err(),
+            VerificationHandoffPlanError::ArtifactSetInvalid
+        );
+    }
     #[test]
     fn dynamic_plan_binds_the_current_artifact_set_primary_claim() {
         let (artifact_set, claim) = dynamic_artifact_set_and_claim();
