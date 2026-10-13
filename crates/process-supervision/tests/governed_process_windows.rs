@@ -74,8 +74,10 @@ fn pid_writer_script(pid_file: &std::path::Path) -> String {
 /// Waits for the child to publish its PID. The assertion is that it does,
 /// never how fast: the budget only has to outlast the child's own startup,
 /// which is a PowerShell cold start (seconds under load, not milliseconds).
+/// The CI runner needed more than the fifteen seconds this helper first
+/// allowed, and the assertion never depended on the shorter wait.
 async fn wait_for_pid(pid_file: &std::path::Path) -> u32 {
-    for _ in 0..600 {
+    for _ in 0..2400 {
         if let Ok(value) = std::fs::read_to_string(pid_file)
             && let Ok(pid) = value.trim().parse()
         {
