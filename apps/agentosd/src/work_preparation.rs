@@ -301,6 +301,19 @@ pub(crate) fn work_capability_view_from_compiled_context(
 /// deterministic: source refs are reviewed relative paths under the local
 /// workspace, and all authority fields are supplied by this daemon-owned
 /// compiler rather than by CLI/TUI input.
+/// The reviewed inputs one prepared work context is compiled from. The caller
+/// that already holds them composes one bundle, so the compiler no longer takes
+/// a growing positional list.
+struct ContextInputs<'a> {
+    owner_principal_id: &'a str,
+    legacy_replay: bool,
+    sources: &'a [ContextSourceFact],
+    project_source_prompt: &'a str,
+    memory: Option<&'a CompiledMemoryPack>,
+    work_capability: Option<&'a ResolvedWorkCapability>,
+    repository_material: Option<&'a FrozenRepositoryMaterialV1>,
+}
+
 pub struct ConfiguredWorkPreparationPort {
     context: Arc<Mutex<ContextAuthority>>,
     task_port: Arc<dyn TaskCommandPort>,
@@ -604,14 +617,17 @@ impl ConfiguredWorkPreparationPort {
     fn compile_context(
         &self,
         request: &PrepareWorkRequest,
-        owner_principal_id: &str,
-        legacy_replay: bool,
-        sources: &[ContextSourceFact],
-        project_source_prompt: &str,
-        memory: Option<&CompiledMemoryPack>,
-        work_capability: Option<&ResolvedWorkCapability>,
-        repository_material: Option<&FrozenRepositoryMaterialV1>,
+        inputs: &ContextInputs<'_>,
     ) -> Result<Vec<u8>, CommandPortFailure> {
+        let ContextInputs {
+            owner_principal_id,
+            legacy_replay,
+            sources,
+            project_source_prompt,
+            memory,
+            work_capability,
+            repository_material,
+        } = *inputs;
         let memory_prompt = memory
             .map(|pack| {
                 serde_json::to_string(pack)
@@ -752,13 +768,15 @@ impl ConfiguredWorkPreparationPort {
         }
         let compiled_context = self.compile_context(
             request,
-            owner_principal_id,
-            legacy_replay,
-            &sources,
-            &project_source_prompt,
-            memory.as_ref().map(|memory| &memory.compiled),
-            work_capability.as_ref(),
-            repository_material.as_ref(),
+            &ContextInputs {
+                owner_principal_id,
+                legacy_replay,
+                sources: &sources,
+                project_source_prompt: &project_source_prompt,
+                memory: memory.as_ref().map(|memory| &memory.compiled),
+                work_capability: work_capability.as_ref(),
+                repository_material: repository_material.as_ref(),
+            },
         )?;
         let recovery_entry = if excluded_sources.is_empty() {
             "hold-and-reconcile"
@@ -2911,13 +2929,15 @@ mod tests {
                 .port
                 .compile_context(
                     &request,
-                    &principal.principal_id,
-                    true,
-                    &sources,
-                    &project_source_prompt,
-                    None,
-                    None,
-                    None,
+                    &ContextInputs {
+                        owner_principal_id: &principal.principal_id,
+                        legacy_replay: true,
+                        sources: &sources,
+                        project_source_prompt: &project_source_prompt,
+                        memory: None,
+                        work_capability: None,
+                        repository_material: None,
+                    },
                 )
                 .expect("recompile legacy payload"),
             legacy_compiled_context,
@@ -3034,13 +3054,15 @@ mod tests {
             .port
             .compile_context(
                 &legacy_request,
-                &owner.principal_id,
-                true,
-                &legacy_sources,
-                &project_source_prompt,
-                None,
-                None,
-                None,
+                &ContextInputs {
+                    owner_principal_id: &owner.principal_id,
+                    legacy_replay: true,
+                    sources: &legacy_sources,
+                    project_source_prompt: &project_source_prompt,
+                    memory: None,
+                    work_capability: None,
+                    repository_material: None,
+                },
             )
             .expect("compile legacy collision payload");
         let expires_at_seconds = unix_seconds().expect("clock") + 60 * 60;

@@ -112,6 +112,16 @@ pub(crate) struct RepositoryCheckerDeploymentPreparer {
     config: RepositoryCheckerDeploymentConfig,
 }
 
+/// Where one staged declaration belongs: the lineage it evidences, the
+/// workspace that holds it, the binding it derives from, and the artifacts its
+/// provenance cites.
+struct DeclarationBinding<'a> {
+    lineage: &'a LineageBinding,
+    workspace_ref: &'a str,
+    source_binding_ref: &'a str,
+    binding_artifact_ids: &'a [String],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum RepositoryCheckerProfileError {
     #[error("repository checker deployment configuration is invalid")]
@@ -251,10 +261,12 @@ impl RepositoryCheckerDeploymentPreparer {
         self.stage_and_seal(
             &artifact_id,
             &bytes,
-            lineage,
-            &material.baseline.workspace_ref,
-            &source_binding_ref,
-            &binding_artifact_ids,
+            &DeclarationBinding {
+                lineage,
+                workspace_ref: &material.baseline.workspace_ref,
+                source_binding_ref: &source_binding_ref,
+                binding_artifact_ids: &binding_artifact_ids,
+            },
             &issued_at,
         )?;
         self.attestation
@@ -286,12 +298,15 @@ impl RepositoryCheckerDeploymentPreparer {
         &self,
         artifact_id: &str,
         bytes: &[u8],
-        lineage: &LineageBinding,
-        workspace_ref: &str,
-        source_binding_ref: &str,
-        binding_artifact_ids: &[String],
+        declaration: &DeclarationBinding<'_>,
         issued_at: &Timestamp,
     ) -> Result<(), RepositoryCheckerProfileError> {
+        let DeclarationBinding {
+            lineage,
+            workspace_ref,
+            source_binding_ref,
+            binding_artifact_ids,
+        } = *declaration;
         let address = content_address(bytes);
         let candidate = ArtifactDescriptor {
             artifact_id: artifact_id.to_owned(),

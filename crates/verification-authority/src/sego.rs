@@ -111,7 +111,7 @@ pub fn captured_failure_code(bytes: &[u8]) -> Option<String> {
     }
     // A failed checker may share stdout with a wrapper process, so the answer
     // is found among the captured output instead of assumed to be all of it.
-    crate::checker_output::json_object_candidates(bytes)
+    crate::checker_output::json_objects(bytes)
         .into_iter()
         .find_map(failure_code_in_json)
 }
@@ -303,27 +303,24 @@ pub fn checker_failure_result_with_detail(
     }
 }
 
-/// The result of an execution whose declared output capture was refused. No
-/// outcome and no citation is claimed from bytes this environment could not
-/// seal, so the criterion is an explicit error instead of a positive result
-/// carried by an artifact of the Task's own input set. The refusal code is
-/// reported with the execution, not as a checker declaration.
+/// The result of an execution that may cite nothing: its declared output
+/// capture was refused, or the failure left no output at all. No outcome and
+/// no citation is claimed from bytes this environment could not seal, so the
+/// criterion is an explicit error instead of a positive result carried by an
+/// artifact of the Task's own input set. `reason` states why the checker could
+/// not decide; the failure kind and the refusal code are reported with the
+/// execution, not as a checker declaration.
 #[must_use]
-pub fn checker_capture_refused_result(
+pub fn checker_uncited_failure_result(
     policy: &SegoMapperPolicy,
     execution_id: &str,
+    reason: UnverifiedReason,
 ) -> SegoMappedResult {
     let result_id = stable_id(
         "criterion",
         &format!("{execution_id}:{}", policy.criterion_id),
     );
-    let item = unverified_item(
-        execution_id,
-        &policy.criterion_id,
-        UnverifiedReason::InsufficientEvidence,
-        Vec::new(),
-        None,
-    );
+    let item = unverified_item(execution_id, &policy.criterion_id, reason, Vec::new(), None);
     let mut criterion_result = base_result(
         result_id,
         policy,

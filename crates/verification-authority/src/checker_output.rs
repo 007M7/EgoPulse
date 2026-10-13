@@ -141,7 +141,7 @@ pub fn read_envelope_artifact(
 /// could not attribute what it read.
 fn envelope_path(envelope: &[u8]) -> Result<String, EnvelopeReadError> {
     let mut declared: Option<String> = None;
-    for candidate in json_object_candidates(envelope) {
+    for candidate in json_objects(envelope) {
         let Some(path) = envelope_path_in_json(candidate) else {
             continue;
         };
@@ -161,31 +161,30 @@ fn envelope_path_in_json(bytes: &[u8]) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-/// Every slice of captured process output that could carry one JSON object, in
-/// a fixed order: the whole buffer, then each line, then the first balanced
-/// object of each line. A governed checker may share stdout with a wrapper
-/// process, so an answer glued to other text is still found; each candidate
-/// must still parse and validate before anything is read from it.
-pub(crate) fn json_object_candidates(bytes: &[u8]) -> Vec<&[u8]> {
-    let mut candidates = vec![bytes];
-    for line in bytes.split(|byte| *byte == b'\n') {
-        let line = trim_ascii(line);
-        if line.is_empty() {
-            continue;
-        }
-        candidates.push(line);
-        if let Some(object) = first_json_object(line) {
-            candidates.push(object);
-        }
+/// Every complete top-level JSON object in captured process output, in the
+/// order each one ends. A governed checker may share stdout with a wrapper
+/// process and may write several answers, so all of them are enumerated: a
+/// reader that used only the first would silently choose between conflicting
+/// answers. Braces inside strings do not count, and scanning stops at the
+/// first object that never closes, so a truncated answer is refused instead of
+/// being read as a shorter one.
+pub(crate) fn json_objects(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut objects = Vec::new();
+    let mut index = 0usize;
+    while let Some(offset) = bytes[index..].iter().position(|byte| *byte == b'{') {
+        let start = index + offset;
+        let Some(end) = json_object_end(bytes, start) else {
+            break;
+        };
+        objects.push(&bytes[start..=end]);
+        index = end + 1;
     }
-    candidates
+    objects
 }
 
-/// The first complete, balanced JSON object inside one line, if any. Braces
-/// inside strings do not count, so a truncated or nested fragment is never
-/// handed to a parser as an object.
-pub(crate) fn first_json_object(bytes: &[u8]) -> Option<&[u8]> {
-    let start = bytes.iter().position(|byte| *byte == b'{')?;
+/// Index of the brace closing the object that opens at `start`, or `None` when
+/// it never closes.
+fn json_object_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
@@ -206,25 +205,13 @@ pub(crate) fn first_json_object(bytes: &[u8]) -> Option<&[u8]> {
             b'}' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return bytes.get(start..=index);
+                    return Some(index);
                 }
             }
             _ => {}
         }
     }
     None
-}
-
-fn trim_ascii(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |index| index + 1);
-    &bytes[start..end]
 }
 
 #[cfg(test)]
@@ -385,6 +372,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_declared_path_that_is_a_symbolic_link_is_refused() {
         let directory = TempDirectory::new();
@@ -405,6 +393,72 @@ mod tests {
                 MAX_CHECKER_ARTIFACT_BYTES,
             ),
             Err(EnvelopeReadError::SymbolicLink)
+        );
+    }
+
+    #[test]
+    fn conflicting_declared_paths_on_one_line_are_refused() {
+        let directory = TempDirectory::new();
+        for name in ["one.json", "two.json"] {
+            fs::write(directory.path.join(name), b"{}").expect("write artifact");
+        }
+        // A wrapper may share the line with the answer, and the line itself
+        // may carry two answers: the second one must count.
+        let envelope =
+            "prefix {\"artifact_path\":\"one.json\"} {\"artifact_path\":\"two.json\"} suffix";
+        assert_eq!(
+            read_envelope_artifact(
+                &directory.path,
+                envelope.as_bytes(),
+                MAX_CHECKER_ARTIFACT_BYTES
+            ),
+            Err(EnvelopeReadError::AmbiguousArtifactPath)
+        );
+        // Nested braces and escaped quotes inside strings do not confuse the
+        // scan, and the conflict is still seen.
+        let nested = "{\"note\":\"a { \\\"quoted\\\" } brace\",\"artifact_path\":\"one.json\"} {\"artifact_path\":\"two.json\"}";
+        assert_eq!(
+            read_envelope_artifact(
+                &directory.path,
+                nested.as_bytes(),
+                MAX_CHECKER_ARTIFACT_BYTES
+            ),
+            Err(EnvelopeReadError::AmbiguousArtifactPath)
+        );
+    }
+
+    #[test]
+    fn a_pretty_printed_envelope_and_a_truncated_one_are_read_as_such() {
+        let directory = TempDirectory::new();
+        fs::write(directory.path.join("one.json"), b"{}").expect("write artifact");
+        let pretty = "{\n  \"action\": \"review\",\n  \"artifact_path\": \"one.json\"\n}";
+        assert_eq!(
+            read_envelope_artifact(
+                &directory.path,
+                pretty.as_bytes(),
+                MAX_CHECKER_ARTIFACT_BYTES
+            ),
+            Ok(b"{}".to_vec()),
+            "a legitimate multi-line envelope is read"
+        );
+        let truncated = "{\"artifact_path\":\"one.json\"";
+        assert_eq!(
+            read_envelope_artifact(
+                &directory.path,
+                truncated.as_bytes(),
+                MAX_CHECKER_ARTIFACT_BYTES
+            ),
+            Err(EnvelopeReadError::NotAnEnvelope),
+            "an object that never closes declares nothing"
+        );
+        let noise = "review started\nstill working\n";
+        assert_eq!(
+            read_envelope_artifact(
+                &directory.path,
+                noise.as_bytes(),
+                MAX_CHECKER_ARTIFACT_BYTES
+            ),
+            Err(EnvelopeReadError::NotAnEnvelope)
         );
     }
 

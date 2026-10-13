@@ -3,15 +3,15 @@ use crate::{
     CheckerProcessFailure, GovernedCheckerProcessOutcome, GovernedSegoRunError, GovernedSegoRunner,
     SealedCheckerOutput, SegoMapError, SegoMapperPolicy, VerificationAuthority,
     VerificationAuthorityFailure, VerificationClock, VerificationPrincipalKind,
-    canonical_request_digest, checker_capture_refused_result, checker_failure_result_with_detail,
+    canonical_request_digest, checker_failure_result_with_detail, checker_uncited_failure_result,
     map_sego_review,
 };
 use egopulse_domain_contracts::v01::egopulse::common::v1::CommandMetadata;
 use egopulse_domain_contracts::v01::egopulse::verification::v1::{
     CheckerProfile, CompleteVerificationCommand, HoldVerificationCommand,
-    RecordCriterionResultCommand, StartVerificationRunCommand, VerificationArtifact,
-    VerificationCommand, VerificationProvenance, VerificationRequest, VerificationStatus,
-    verification_command,
+    RecordCriterionResultCommand, StartVerificationRunCommand, UnverifiedReason,
+    VerificationArtifact, VerificationCommand, VerificationProvenance, VerificationRequest,
+    VerificationStatus, verification_command,
 };
 use prost_types::Timestamp;
 use sha2::{Digest, Sha256};
@@ -94,6 +94,15 @@ pub struct GovernedCheckerFailureReport {
     pub cited_configured_input_artifact_id: Option<String>,
     /// Why sealing this execution's output was refused, when it was.
     pub capture_failure_code: Option<String>,
+}
+
+/// What one completed execution contributes beyond its criterion results: how
+/// long it took, which reader produced it, and what failed while producing it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GovernedVerificationCompletion {
+    pub duration_ms: u64,
+    pub legacy: bool,
+    pub checker_failure: Option<GovernedCheckerFailureReport>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -253,15 +262,15 @@ where
                 plan.output_source,
             )
             .await?;
-        // One execution cites one raw output: the checker's own bytes when this
-        // environment can seal them, otherwise the artifact its configuration
-        // declared. A capture that is refused never fails the criterion by
-        // itself; it is reported with the execution instead.
-        let declared_capture = plan.checker_output_sink.is_some();
-        let (sealed_citation, capture_failure_code) =
-            capture_checker_output(&plan, &request, profile, &process);
-        let capture_refused =
-            declared_capture && sealed_citation.is_none() && capture_failure_code.is_some();
+        // One execution cites one raw output: the checker's own bytes when
+        // this environment can seal them, otherwise — and only when no capture
+        // is declared — the artifact its configuration named. A declared
+        // capture that cannot be sealed is a failure of this execution: it
+        // fails the criterion and cites nothing.
+        let capture = capture_checker_output(&plan, &request, profile, &process);
+        let capture_failure_code = capture.failure_code();
+        let capture_refused = capture.is_refused();
+        let sealed_citation = capture.sealed();
         let mut policy = plan.mapper_policy.clone();
         if let Some(sealed) = sealed_citation.as_ref() {
             policy.raw_output_artifact_id = sealed.artifact_id.clone();
@@ -291,13 +300,21 @@ where
                 ),
             },
         };
-        // A declared capture that could not be sealed is a failure of this
-        // execution: neither its outcome nor the configured input artifact may
-        // stand in for output that never became evidence.
+        // A declared capture this execution could not seal — refused, or with
+        // no output at all — is a failure of this execution: neither its
+        // outcome nor the configured input artifact may stand in for output
+        // that never became evidence. The process failure, when there was one,
+        // stays the reported kind; the refusal is reported beside it.
         let (mapped, effective_failure, raw_output_artifact_ids) = if capture_refused {
+            let reason = match process.failure {
+                Some(CheckerProcessFailure::Unavailable | CheckerProcessFailure::Timeout) => {
+                    UnverifiedReason::CheckerUnavailable
+                }
+                _ => UnverifiedReason::InsufficientEvidence,
+            };
             (
-                checker_capture_refused_result(&policy, &plan.execution_id),
-                Some(GovernedCheckerFailureKind::CaptureRefused),
+                checker_uncited_failure_result(&policy, &plan.execution_id, reason),
+                effective_failure.or(Some(GovernedCheckerFailureKind::CaptureRefused)),
                 Vec::new(),
             )
         } else {
@@ -344,9 +361,11 @@ where
                 model_call_receipt_artifact_ids: plan.model_call_receipt_artifact_ids,
                 raw_output_artifact_ids,
             },
-            elapsed_millis(started),
-            true,
-            checker_failure,
+            GovernedVerificationCompletion {
+                duration_ms: elapsed_millis(started),
+                legacy: true,
+                checker_failure,
+            },
         )
     }
 
@@ -391,9 +410,11 @@ where
             &request,
             run,
             output,
-            elapsed_millis(started),
-            false,
-            None,
+            GovernedVerificationCompletion {
+                duration_ms: elapsed_millis(started),
+                legacy: false,
+                checker_failure: None,
+            },
         ) {
             Ok(outcome) => Ok(outcome),
             Err(error) => self.recover_failed_completion(&plan, &request, error),
@@ -587,10 +608,13 @@ where
         request: &egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationRequest,
         mut run: egopulse_domain_contracts::v01::egopulse::verification::v1::VerificationRun,
         output: GovernedVerificationCheckOutput,
-        duration_ms: u64,
-        legacy: bool,
-        checker_failure: Option<GovernedCheckerFailureReport>,
+        completion: GovernedVerificationCompletion,
     ) -> Result<GovernedVerificationExecutionOutcome, GovernedVerificationExecutionError> {
+        let GovernedVerificationCompletion {
+            duration_ms,
+            legacy,
+            checker_failure,
+        } = completion;
         let ids = output
             .results
             .iter()
@@ -735,18 +759,52 @@ fn replayed(artifact: VerificationArtifact) -> GovernedVerificationExecutionOutc
     }
 }
 
+/// The outcome of the declared output capture for one execution.
+enum CheckerOutputCapture {
+    /// This environment declares no capture; the configured artifact stays the
+    /// citation, as it did before capture was configurable.
+    NotDeclared,
+    Sealed(SealedCheckerOutput),
+    /// Declared, but no output of this execution could be sealed.
+    Refused {
+        code: String,
+    },
+}
+
+impl CheckerOutputCapture {
+    fn sealed(self) -> Option<SealedCheckerOutput> {
+        match self {
+            Self::Sealed(sealed) => Some(sealed),
+            _ => None,
+        }
+    }
+
+    fn is_refused(&self) -> bool {
+        matches!(self, Self::Refused { .. })
+    }
+
+    fn failure_code(&self) -> Option<String> {
+        match self {
+            Self::Refused { code } => Some(code.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// Seals the bytes this execution cites as the checker's raw output. A
 /// successful exchange cites the mapped review artifact; a failed one cites
-/// what the failed process left behind. A refused capture returns its safe code
-/// and no artifact, so the caller keeps the configured citation instead.
+/// what the failed process left behind. When the capture is declared and there
+/// is nothing to seal — a zero-byte answer, an empty output file, a failure
+/// that produced no receipt — the outcome is a typed refusal with no artifact,
+/// so no citation of this execution can be invented from an earlier input.
 fn capture_checker_output(
     plan: &GovernedVerificationExecutionPlan,
     request: &VerificationRequest,
     profile: &CheckerProfile,
     process: &GovernedCheckerProcessOutcome,
-) -> (Option<SealedCheckerOutput>, Option<String>) {
+) -> CheckerOutputCapture {
     let Some(sink) = plan.checker_output_sink.as_deref() else {
-        return (None, None);
+        return CheckerOutputCapture::NotDeclared;
     };
     let (key, bytes) = match process.failure {
         None if !process.output.is_empty() => ("review", process.output.as_slice()),
@@ -754,12 +812,16 @@ fn capture_checker_output(
             Some(captured) if !captured.bytes.is_empty() => {
                 ("checker-failure-output", captured.bytes.as_slice())
             }
-            _ => return (None, None),
+            _ => {
+                return CheckerOutputCapture::Refused {
+                    code: "CHECKER_OUTPUT_CAPTURE_EMPTY".to_owned(),
+                };
+            }
         },
     };
     match sink.capture(request, &plan.verification_run_id, profile, key, bytes) {
-        Ok(sealed) => (Some(sealed), None),
-        Err(code) => (None, Some(code)),
+        Ok(sealed) => CheckerOutputCapture::Sealed(sealed),
+        Err(code) => CheckerOutputCapture::Refused { code },
     }
 }
 

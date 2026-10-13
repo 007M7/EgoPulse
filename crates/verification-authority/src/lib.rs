@@ -15,8 +15,9 @@ pub use checker_output::{
 pub use execution::{
     GovernedCheckerFailureKind, GovernedCheckerFailureReport, GovernedVerificationBatchPlan,
     GovernedVerificationCheckOutput, GovernedVerificationChecker, GovernedVerificationCheckerError,
-    GovernedVerificationExecutionCoordinator, GovernedVerificationExecutionError,
-    GovernedVerificationExecutionOutcome, GovernedVerificationExecutionPlan,
+    GovernedVerificationCompletion, GovernedVerificationExecutionCoordinator,
+    GovernedVerificationExecutionError, GovernedVerificationExecutionOutcome,
+    GovernedVerificationExecutionPlan,
 };
 pub use reference_resolver::{
     ArtifactBackedReferenceResolver, ArtifactContentSource, ArtifactReferenceSource,
@@ -28,8 +29,8 @@ pub use sego::{
     CheckerFailureOutput, CheckerProcessFailure, MAX_FAILURE_CODE_PARSE_BYTES,
     SEGO_REVIEW_ARTIFACT_CONTRACT_ID, SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION,
     SegoFindingEvidenceBinding, SegoMapError, SegoMappedResult, SegoMapperPolicy,
-    captured_failure_code, checker_capture_refused_result, checker_failure_result,
-    checker_failure_result_with_detail, map_sego_review,
+    captured_failure_code, checker_failure_result, checker_failure_result_with_detail,
+    checker_uncited_failure_result, map_sego_review,
 };
 pub use sego_runner::{GovernedCheckerProcessOutcome, GovernedSegoRunError, GovernedSegoRunner};
 pub use store::VerificationStoreInspection;

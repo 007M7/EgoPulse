@@ -970,6 +970,167 @@ async fn a_refused_capture_never_passes_on_an_input_artifact() {
     assert!(report.output_byte_length > 0);
 }
 
+/// A checker that answers with nothing at all. The crate tests use the test
+/// binary as the checker, so its own harness always writes; this probe asks
+/// PowerShell for truly empty stdout instead.
+#[cfg(windows)]
+fn empty_output_supervisor() -> GovernedCheckerSupervisor {
+    GovernedCheckerSupervisor::new(
+        PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+        vec![
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            String::new(),
+        ],
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .expect("supervisor")
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_declared_capture_of_empty_output_cites_nothing() {
+    let fixture = running_fixture(
+        "execution-empty-output",
+        CheckerAssuranceClass::Deterministic,
+    );
+    let mut authority = fixture.authority;
+    let mut request = fixture.request.clone();
+    request.verification_request_id = "verification-request-empty-output".to_owned();
+    create_request_for(&mut authority, &request, "empty-output-create").await;
+    let authority = Arc::new(Mutex::new(authority));
+    let coordinator = GovernedVerificationExecutionCoordinator::new(
+        Arc::clone(&authority),
+        GovernedSegoRunner::new(empty_output_supervisor()),
+    );
+    let mut policy = mapper_policy();
+    policy.positive_acceptance = true;
+    policy.checker_profile_ref = fixture.profile_ref.clone();
+    let completed = coordinator
+        .execute_one(GovernedVerificationExecutionPlan {
+            verification_request_id: request.verification_request_id.clone(),
+            verification_run_id: "verification-run-empty-output".to_owned(),
+            execution_id: "execution-empty-output-01".to_owned(),
+            working_directory: fixture._root.path().to_owned(),
+            checker_request: b"{}".to_vec(),
+            mapper_policy: policy,
+            verification_artifact_id: "verification-artifact-empty-output".to_owned(),
+            tool_receipt_artifact_ids: Vec::new(),
+            model_call_receipt_artifact_ids: Vec::new(),
+            issued_at: Timestamp {
+                seconds: 1_782_000_000,
+                nanos: 0,
+            },
+            output_source: CheckerOutputSource::Stdout,
+            checker_output_sink: Some(Arc::new(RefusingSink) as Arc<dyn CheckerOutputSink>),
+        })
+        .await
+        .expect("a zero-byte answer still records a criterion result");
+    let artifact = &completed.verification_artifact;
+    assert_ne!(
+        artifact.conclusion,
+        VerificationConclusion::Passed as i32,
+        "an execution that sealed nothing must not pass"
+    );
+    assert_eq!(artifact.criterion_results[0].safe_detail_artifact_id, None);
+    assert_eq!(
+        artifact
+            .provenance
+            .as_ref()
+            .expect("provenance")
+            .raw_output_artifact_ids,
+        Vec::<String>::new(),
+        "no citation may be invented from an earlier input"
+    );
+    let report = completed.checker_failure.expect("failure report");
+    // Two sources are reported side by side: the answer itself was unreadable,
+    // and the declared capture had nothing to seal.
+    assert_eq!(report.kind, GovernedCheckerFailureKind::OutputUntrusted);
+    assert_eq!(
+        report.capture_failure_code.as_deref(),
+        Some("CHECKER_OUTPUT_CAPTURE_EMPTY"),
+        "the refusal is typed, not inferred from the checker's silence"
+    );
+    assert_eq!(report.output_byte_length, 0);
+    assert_eq!(report.cited_configured_input_artifact_id, None);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_declared_capture_of_a_timed_out_checker_cites_nothing() {
+    let fixture = running_fixture(
+        "execution-timeout-capture",
+        CheckerAssuranceClass::Deterministic,
+    );
+    let root = fixture._root.path().to_owned();
+    fs::write(root.join("timeout.marker"), b"1").expect("arm timeout probe");
+    let mut authority = fixture.authority;
+    let mut request = fixture.request.clone();
+    request.verification_request_id = "verification-request-timeout-capture".to_owned();
+    create_request_for(&mut authority, &request, "timeout-capture-create").await;
+    let authority = Arc::new(Mutex::new(authority));
+    let coordinator = GovernedVerificationExecutionCoordinator::new(
+        Arc::clone(&authority),
+        GovernedSegoRunner::new(
+            GovernedCheckerSupervisor::new(
+                std::env::current_exe().expect("test executable"),
+                vec![
+                    "--exact".to_owned(),
+                    "checker_timeout_probe".to_owned(),
+                    "--nocapture".to_owned(),
+                ],
+                Duration::from_millis(200),
+                64 * 1024,
+            )
+            .expect("supervisor"),
+        ),
+    );
+    let mut policy = mapper_policy();
+    policy.checker_profile_ref = fixture.profile_ref.clone();
+    let completed = coordinator
+        .execute_one(GovernedVerificationExecutionPlan {
+            verification_request_id: request.verification_request_id.clone(),
+            verification_run_id: "verification-run-timeout-capture".to_owned(),
+            execution_id: "execution-timeout-capture-01".to_owned(),
+            working_directory: root,
+            checker_request: b"{}".to_vec(),
+            mapper_policy: policy,
+            verification_artifact_id: "verification-artifact-timeout-capture".to_owned(),
+            tool_receipt_artifact_ids: Vec::new(),
+            model_call_receipt_artifact_ids: Vec::new(),
+            issued_at: Timestamp {
+                seconds: 1_782_000_000,
+                nanos: 0,
+            },
+            output_source: CheckerOutputSource::Stdout,
+            checker_output_sink: Some(Arc::new(RefusingSink) as Arc<dyn CheckerOutputSink>),
+        })
+        .await
+        .expect("a timed-out checker still records a criterion result");
+    let artifact = &completed.verification_artifact;
+    assert_eq!(artifact.criterion_results[0].safe_detail_artifact_id, None);
+    assert_eq!(
+        artifact
+            .provenance
+            .as_ref()
+            .expect("provenance")
+            .raw_output_artifact_ids,
+        Vec::<String>::new()
+    );
+    let report = completed.checker_failure.expect("failure report");
+    assert_eq!(
+        report.kind,
+        GovernedCheckerFailureKind::Process(CheckerProcessFailure::Timeout),
+        "the process failure stays the reported kind"
+    );
+    assert_eq!(
+        report.capture_failure_code.as_deref(),
+        Some("CHECKER_OUTPUT_CAPTURE_EMPTY"),
+        "the capture side is reported beside it"
+    );
+}
+
 #[tokio::test]
 async fn a_refused_mapping_reports_output_untrusted() {
     let fixture = running_fixture(
