@@ -4295,16 +4295,31 @@ impl App {
             )
         };
         self.start_work_start().await?;
-        let draft = self
-            .work_start
-            .as_mut()
-            .ok_or_else(|| "Work Start controller is unavailable".to_owned())?
-            .model_mut()
-            .draft_mut();
-        populate_work_start_draft(draft, candidate, explicit_capability_choice_id);
+        let prepare_result = {
+            let controller = self
+                .work_start
+                .as_mut()
+                .ok_or_else(|| "Work Start controller is unavailable".to_owned())?;
+            populate_work_start_draft(
+                controller.model_mut().draft_mut(),
+                candidate,
+                explicit_capability_choice_id,
+            );
+            // X2：候选填入后由系统自动进入 PrepareWork；Confirm 仍由用户显式操作
+            execute_work_start_mutation(controller, WorkStartMutationAction::Prepare).await
+        };
         self.intent_conversation.take();
         self.intent_attachment.take();
-        self.message = "建议已填入工作草稿。请核对后按 Enter 准备；当前没有创建工作。".to_owned();
+        match prepare_result {
+            Ok(()) => {
+                self.message = "候选已自动准备完成；请核对预览后显式确认创建工作。".to_owned();
+            }
+            Err(error) => {
+                self.message = format!(
+                    "候选已填入工作草稿；自动准备被拒绝：{error}。可核对草稿后按 Enter 手动准备。"
+                );
+            }
+        }
         Ok(())
     }
 
