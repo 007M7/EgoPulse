@@ -142,6 +142,7 @@ foreach ($source in @('Cargo.lock', 'pnpm-lock.yaml')) {
 $operatorDocsRoot = Join-Path $candidateRoot 'docs/engineering'
 $null = New-Item -ItemType Directory -Path $operatorDocsRoot
 Copy-EgoPulseFileExclusively -SourcePath 'docs/engineering/repository-work-loop.md' -DestinationPath (Join-Path $operatorDocsRoot 'repository-work-loop.md')
+Copy-EgoPulseFileExclusively -SourcePath 'docs/engineering/local-key-recovery.md' -DestinationPath (Join-Path $operatorDocsRoot 'local-key-recovery.md')
 Copy-EgoPulseFileExclusively -SourcePath 'workers/foundation-probe/uv.lock' -DestinationPath (Join-Path $manifestRoot 'foundation-probe.uv.lock')
 Copy-EgoPulseFileExclusively -SourcePath 'workers/contract-bindings/uv.lock' -DestinationPath (Join-Path $manifestRoot 'contract-bindings.uv.lock')
 
