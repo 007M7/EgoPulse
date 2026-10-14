@@ -208,7 +208,8 @@ impl DshAcpDriver {
             return Err(dependency_error("READ_ONLY_TOOL_POLICY_REQUIRED"));
         }
         let model = request.model.clone();
-        let result = timeout(request.timeout, async {
+        let mut prompt_delivery_started = false;
+        let mut result = timeout(request.timeout, async {
             self.ensure_session(&request.working_directory).await?;
             let session = self.session.as_mut().expect("fresh session");
             let request_id = session.next_request_id;
@@ -216,6 +217,8 @@ impl DshAcpDriver {
                 "{}\nReturn one JSON object matching this schema, without tools:\n{}",
                 request.prompt, request.output_schema
             );
+            // A partial write or later timeout may already have reached the provider.
+            prompt_delivery_started = true;
             write_json_value(
                 &mut session.process,
                 &acp::session_prompt_request(request_id, &session.native_session_ref, &prompt),
@@ -287,6 +290,9 @@ impl DshAcpDriver {
         })
         .await
         .unwrap_or_else(|_| Err(driver_error("READ_ONLY_TURN_TIMEOUT", &[])));
+        if prompt_delivery_started && let Err(error) = &mut result {
+            error.certainty = DriverErrorCertainty::DeliveryUnknown;
+        }
         // The governed process drop kills descendants on every exit path.
         self.session.take();
         result
