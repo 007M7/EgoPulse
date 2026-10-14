@@ -28,6 +28,7 @@ $requiredFiles = @(
     'config/agentos-config.example.json',
     'config/README.md',
     'docs/engineering/repository-work-loop.md',
+    'docs/engineering/local-key-recovery.md',
     'workers/memory-rag/pyproject.toml',
     'workers/memory-rag/uv.lock',
     'workers/contract-bindings/pyproject.toml',
