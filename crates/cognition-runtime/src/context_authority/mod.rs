@@ -2971,14 +2971,16 @@ mod tests {
     #[test]
     fn issue_is_content_addressed_and_replays_by_idempotency() {
         let mut authority = authority();
-        let (first_receipt, first) = authority
-            .issue(&input("idem-1"), &compiler())
-            .expect("issue");
-        let (replay_receipt, replay) = authority
-            .issue(&input("idem-1"), &compiler())
-            .expect("replay");
+        // Expiry is part of the sealed request. Rebuilding the fixture on replay
+        // changes its semantics whenever the wall clock crosses a second.
+        let request = input("idem-1");
+        let (first_receipt, first) = authority.issue(&request, &compiler()).expect("issue");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let (replay_receipt, replay) = authority.issue(&request, &compiler()).expect("replay");
+        let mut dedupe_request = request.clone();
+        dedupe_request.idempotency_key = "idem-1b".to_owned();
         let (dedupe_receipt, dedupe) = authority
-            .issue(&input("idem-1b"), &compiler())
+            .issue(&dedupe_request, &compiler())
             .expect("dedupe");
         assert!(!first_receipt.replayed);
         assert!(replay_receipt.replayed);
@@ -3176,13 +3178,12 @@ mod tests {
             key: SqlCipherKey::new([41; 32]),
         };
 
+        let request = input("restart-1");
         let snapshot_id;
         let first_event_id;
         {
             let mut authority = ContextAuthority::open(config()).expect("open before restart");
-            let (receipt, snapshot) = authority
-                .issue(&input("restart-1"), &compiler())
-                .expect("issue");
+            let (receipt, snapshot) = authority.issue(&request, &compiler()).expect("issue");
             assert!(!receipt.replayed);
             snapshot_id = snapshot.snapshot_id.clone();
             first_event_id = receipt.event_id;
@@ -3191,6 +3192,7 @@ mod tests {
         // Simulate a daemon restart: the same database is reopened and every
         // durability property must hold — snapshot persistence, resolvable
         // material, idempotent replay and content dedupe.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         let mut reopened = ContextAuthority::open(config()).expect("reopen after restart");
         let persisted = reopened
             .get(&snapshot_id)
@@ -3208,14 +3210,16 @@ mod tests {
         assert_eq!(resolved.snapshot.snapshot_id, snapshot_id);
 
         let (replay_receipt, replayed) = reopened
-            .issue(&input("restart-1"), &compiler())
+            .issue(&request, &compiler())
             .expect("idempotent replay after restart");
         assert!(replay_receipt.replayed);
         assert_eq!(replay_receipt.event_id, first_event_id);
         assert_eq!(replayed.snapshot_id, snapshot_id);
 
+        let mut dedupe_request = request.clone();
+        dedupe_request.idempotency_key = "restart-1b".to_owned();
         let (dedupe_receipt, deduped) = reopened
-            .issue(&input("restart-1b"), &compiler())
+            .issue(&dedupe_request, &compiler())
             .expect("content dedupe after restart");
         assert!(dedupe_receipt.replayed);
         assert_eq!(deduped.snapshot_id, snapshot_id);
