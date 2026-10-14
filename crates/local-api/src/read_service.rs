@@ -11,7 +11,7 @@ use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
     local_read_model_service_server::LocalReadModelService,
 };
 use egopulse_local_ipc_platform::PeerConnectionInfo;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 use crate::read_gateway::{
@@ -21,12 +21,24 @@ use crate::read_gateway::{
 
 pub struct LocalReadModelEndpoint {
     application: std::sync::Arc<ReadGatewayApplication>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl LocalReadModelEndpoint {
     #[must_use]
     pub fn new(application: std::sync::Arc<ReadGatewayApplication>) -> Self {
-        Self { application }
+        Self {
+            application,
+            shutdown: None,
+        }
+    }
+
+    /// Stops read-only streams when the daemon requests shutdown. No Authority
+    /// state or client authorization is changed by closing an observation.
+    #[must_use]
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
     }
 
     fn peer<T>(request: &Request<T>) -> Option<PeerConnectionInfo> {
@@ -39,6 +51,22 @@ type ApprovalWatchStream =
     Pin<Box<dyn Stream<Item = Result<HarnessApprovalViewStreamFrame, Status>> + Send>>;
 type HarnessContentWatchStream =
     Pin<Box<dyn Stream<Item = Result<HarnessContentStreamFrame, Status>> + Send>>;
+
+fn shutdown_signal(
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let Some(mut shutdown) = shutdown else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        while !*shutdown.borrow_and_update() {
+            if shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+}
 
 #[tonic::async_trait]
 impl LocalReadModelService for LocalReadModelEndpoint {
@@ -139,17 +167,20 @@ impl LocalReadModelService for LocalReadModelEndpoint {
             .open_task_watch(peer, request.into_inner())
             .await
             .map_err(|error| local_error_status(*error))?;
-        Ok(Response::new(Box::pin(futures_util::stream::unfold(
-            Some(subscription),
-            |state: Option<TaskWatchSubscription>| async move {
-                let mut subscription = state?;
-                match subscription.next_frame().await {
-                    Ok(Some(frame)) => Some((Ok(frame), Some(subscription))),
-                    Ok(None) => None,
-                    Err(error) => Some((Err(local_error_status(*error)), None)),
-                }
-            },
-        ))))
+        Ok(Response::new(Box::pin(
+            futures_util::stream::unfold(
+                Some(subscription),
+                |state: Option<TaskWatchSubscription>| async move {
+                    let mut subscription = state?;
+                    match subscription.next_frame().await {
+                        Ok(Some(frame)) => Some((Ok(frame), Some(subscription))),
+                        Ok(None) => None,
+                        Err(error) => Some((Err(local_error_status(*error)), None)),
+                    }
+                },
+            )
+            .take_until(shutdown_signal(self.shutdown.clone())),
+        )))
     }
 
     type WatchHarnessApprovalViewsStream = ApprovalWatchStream;
@@ -165,17 +196,20 @@ impl LocalReadModelService for LocalReadModelEndpoint {
             .open_approval_watch(peer, request.into_inner())
             .await
             .map_err(|error| local_error_status(*error))?;
-        Ok(Response::new(Box::pin(futures_util::stream::unfold(
-            Some(subscription),
-            |state: Option<ApprovalWatchSubscription>| async move {
-                let mut subscription = state?;
-                match subscription.next_frame().await {
-                    Ok(Some(frame)) => Some((Ok(frame), Some(subscription))),
-                    Ok(None) => None,
-                    Err(error) => Some((Err(local_error_status(*error)), None)),
-                }
-            },
-        ))))
+        Ok(Response::new(Box::pin(
+            futures_util::stream::unfold(
+                Some(subscription),
+                |state: Option<ApprovalWatchSubscription>| async move {
+                    let mut subscription = state?;
+                    match subscription.next_frame().await {
+                        Ok(Some(frame)) => Some((Ok(frame), Some(subscription))),
+                        Ok(None) => None,
+                        Err(error) => Some((Err(local_error_status(*error)), None)),
+                    }
+                },
+            )
+            .take_until(shutdown_signal(self.shutdown.clone())),
+        )))
     }
 
     type WatchHarnessContentStream = HarnessContentWatchStream;
@@ -191,17 +225,20 @@ impl LocalReadModelService for LocalReadModelEndpoint {
             .open_content_watch(peer, request.into_inner())
             .await
             .map_err(|error| local_error_status(*error))?;
-        Ok(Response::new(Box::pin(futures_util::stream::unfold(
-            Some(subscription),
-            |state: Option<HarnessContentWatchSubscription>| async move {
-                let mut subscription = state?;
-                match subscription.next_frame().await {
-                    Ok(Some(frame)) => Some((Ok(frame), Some(subscription))),
-                    Ok(None) => None,
-                    Err(error) => Some((Err(local_error_status(*error)), None)),
-                }
-            },
-        ))))
+        Ok(Response::new(Box::pin(
+            futures_util::stream::unfold(
+                Some(subscription),
+                |state: Option<HarnessContentWatchSubscription>| async move {
+                    let mut subscription = state?;
+                    match subscription.next_frame().await {
+                        Ok(Some(frame)) => Some((Ok(frame), Some(subscription))),
+                        Ok(None) => None,
+                        Err(error) => Some((Err(local_error_status(*error)), None)),
+                    }
+                },
+            )
+            .take_until(shutdown_signal(self.shutdown.clone())),
+        )))
     }
 
     async fn await_projection(
@@ -257,4 +294,45 @@ fn local_error_status(
         status,
         format!("{} ({})", error.safe_fingerprint, error.correlation_id),
     )
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn shutdown_ends_idle_and_buffered_streams_without_another_frame() {
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        let mut idle = Box::pin(
+            futures_util::stream::pending::<u8>()
+                .take_until(shutdown_signal(Some(receiver.clone()))),
+        );
+        stop.send(true).expect("shutdown signal");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), idle.next())
+                .await
+                .expect("idle stream closes"),
+            None,
+        );
+        let mut buffered = Box::pin(
+            futures_util::stream::iter([1_u8, 2]).take_until(shutdown_signal(Some(receiver))),
+        );
+        assert_eq!(buffered.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn lost_shutdown_sender_ends_idle_stream() {
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        let mut idle = Box::pin(
+            futures_util::stream::pending::<u8>().take_until(shutdown_signal(Some(receiver))),
+        );
+        drop(stop);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), idle.next())
+                .await
+                .expect("orphaned stream closes"),
+            None,
+        );
+    }
 }
