@@ -389,13 +389,21 @@ fn execute_artifact(
 }
 
 fn guard_config() -> ConfiguredArtifactAdmissionGuardConfig {
+    let mut transformations: Vec<_> = ALLOWED_TRANSFORMATIONS
+        .iter()
+        .map(|id| reference(id))
+        .collect();
+    if let Ok(sha256) = env::var("EGOPULSE_S2_CONTRACT_SHA") {
+        transformations.push(ContractReference {
+            contract_id: "sego.review.artifact/v1".to_owned(),
+            version: "3".to_owned(),
+            sha256,
+        });
+    }
     ConfiguredArtifactAdmissionGuardConfig {
         allowed_workspace_refs: BTreeSet::from([WORKSPACE_REF.to_owned()]),
         allowed_artifact_type_refs: ALLOWED_TYPES.iter().map(|id| reference(id)).collect(),
-        allowed_transformation_contract_refs: ALLOWED_TRANSFORMATIONS
-            .iter()
-            .map(|id| reference(id))
-            .collect(),
+        allowed_transformation_contract_refs: transformations,
         allowed_retention_profile_refs: vec![reference(RETENTION_PROFILE)],
         allowed_claim_semantic_profile_refs: vec![reference(CLAIM_SEMANTIC)],
         allowed_claim_acceptance_contract_refs: vec![reference(ACCEPTANCE_CONTRACT)],
@@ -1900,6 +1908,15 @@ async fn live_sego_sidecar_capture_reuses_profile_and_preserves_budget_stop() {
             "/verification/criteria/0/minimum_assurance",
             serde_json::json!(CheckerAssuranceClass::ModelAssisted as i32),
         );
+        // Capture provenance uses the exact pinned checker output contract.
+        // This isolated installation must explicitly admit it before sealing;
+        // the production binding checks remain unchanged.
+        let output_contract =
+            value["verification_worker"]["checker_profile"]["output_contract_ref"].clone();
+        value["artifact"]["allowed_transformation_contract_refs"]
+            .as_array_mut()
+            .unwrap()
+            .push(output_contract);
         fs::write(&config, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         if env::var_os("EGOPULSE_S2_PREFLIGHT_ONLY").is_some() {
             ProductionBootstrapConfig::from_user_file(&config)
@@ -1911,10 +1928,10 @@ async fn live_sego_sidecar_capture_reuses_profile_and_preserves_budget_stop() {
             continue;
         }
         if case.suffix == "-budget" {
-            fs::create_dir_all(review_root.join(".claude")).unwrap();
+            fs::create_dir_all(review_root.join(".claw")).unwrap();
             fs::write(
-                review_root.join(".claude/settings.json"),
-                br#"{"budget":{"maxInputTokens":1}}"#,
+                review_root.join(".claw/settings.json"),
+                br#"{"budget":{"maxProviderCalls":0}}"#,
             )
             .unwrap();
         }
@@ -1969,7 +1986,7 @@ async fn live_sego_sidecar_capture_reuses_profile_and_preserves_budget_stop() {
         return;
     }
     eprintln!(
-        "s2_live=passed real_sidecar=true real_review_tasks=2 independent_tasks=2 budget_stop=1 restart_replay=true founder_acceptance=pending root={}",
+        "s2_sidecar_interoperability=passed real_sidecar=true real_review_tasks=2 independent_tasks=2 budget_stop=1 restart_replay=true founder_acceptance=pending root={}",
         root.path().display()
     );
 }
