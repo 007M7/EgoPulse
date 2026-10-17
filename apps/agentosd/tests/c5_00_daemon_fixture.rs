@@ -2624,6 +2624,19 @@ impl OwnerProjectionSource for R9bTaskDisconnectProjectionSource {
     }
 }
 
+// Parent and daemon write the same witness. Formatting must not emit fragments
+// between another process's writes. Windows locking needs read + append access.
+fn append_r9b_ordered_witness(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    file.lock()?;
+    file.write_all(format!("{line}\n").as_bytes())?;
+    file.sync_all()
+}
+
 struct R9bTaskFramesReader {
     inner: Arc<dyn ReadModelReader>,
     task_frame_calls: AtomicU64,
@@ -2655,13 +2668,7 @@ impl R9bTaskFramesReader {
         outcome: &str,
     ) -> Result<(), ReadModelAccessError> {
         let call = self.task_operation_calls.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.calls_path)
-            .map_err(|_| ReadModelAccessError::WorkerFailed)?;
-        writeln!(file, "{call} {operation} {outcome}")
-            .and_then(|()| file.sync_all())
+        append_r9b_ordered_witness(&self.calls_path, &format!("{call} {operation} {outcome}"))
             .map_err(|_| ReadModelAccessError::WorkerFailed)
     }
 
@@ -7584,13 +7591,7 @@ async fn r9b_task_stream_single_disconnect_keeps_approval_live_and_recovers_boun
     let baseline_approval = baseline.approval.clone();
     let calls_path = root.join(R9B_TASK_READER_CALLS_FILE);
     let append_parent_stage = |stage: &str| {
-        let mut witness = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&calls_path)
-            .expect("open R-9B C5-C ordered witness");
-        writeln!(witness, "parent {stage}")
-            .and_then(|()| witness.sync_all())
+        append_r9b_ordered_witness(&calls_path, &format!("parent {stage}"))
             .expect("persist R-9B C5-C ordered witness");
     };
     let approval_advance_path = root.join(R9B_APPROVAL_ADVANCE_FILE);
@@ -12409,6 +12410,30 @@ async fn u02c_real_daemon_seeded_projection_uses_production_approval_queue_contr
         .await
         .expect("attach production TUI controller to real daemon"),
     );
+    // IPC readiness does not mean the asynchronous seed projection has caught up.
+    // Wait for the exact facts this controller scenario requires, not a sleep.
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let projection = attachment
+                .read_projection_snapshot()
+                .await
+                .expect("read U-02c seed projection convergence");
+            let active_task = projection.tasks.iter().any(|view| {
+                view.task.as_ref().is_some_and(|task| {
+                    task.task_id == "task-c5-03" && task.status == TaskStatus::Active as i32
+                })
+            });
+            let approval = projection.approvals.iter().any(|view| {
+                view.approval_request_id == "approval-c5-03" && view.task_id == "task-c5-03"
+            });
+            if active_task && approval {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("U-02c exact seed projection must converge");
     let mut controller = ApprovalQueueController::new(Arc::clone(&attachment));
     controller
         .start()
@@ -15124,22 +15149,20 @@ async fn phase_one_restart_reads_existing_active_and_cancellation_pending_tasks_
     let mut daemon = spawn_fixture_with_mode(&root, &instance, "allow").await;
     wait_for_cli_status_with_child(&instance, &mut daemon).await;
 
-    let active_read = run_cli(&instance, &["task", "get", &active.task_id, "--json"]).await;
-    assert!(active_read.status.success());
-    let active_read: serde_json::Value =
-        serde_json::from_slice(&active_read.stdout).expect("decode restarted Active task");
+    let active_read =
+        wait_for_r8b2c_task_status(&instance, &active.task_id, TaskStatus::Active, &mut daemon)
+            .await;
     assert_eq!(
         active_read["data"]["status"],
         TaskStatus::Active.as_str_name()
     );
-    let cancellation_read = run_cli(
+    let cancellation_read = wait_for_r8b2c_task_status(
         &instance,
-        &["task", "get", &cancellation_pending.task_id, "--json"],
+        &cancellation_pending.task_id,
+        TaskStatus::CancellationPending,
+        &mut daemon,
     )
     .await;
-    assert!(cancellation_read.status.success());
-    let cancellation_read: serde_json::Value = serde_json::from_slice(&cancellation_read.stdout)
-        .expect("decode restarted CancellationPending task");
     assert_eq!(
         cancellation_read["data"]["status"],
         TaskStatus::CancellationPending.as_str_name()
