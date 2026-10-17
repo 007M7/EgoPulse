@@ -82,8 +82,8 @@ Collaboration/Sego stages after technical evidence intake.
 - Shared profile interpretation: G4-08C C2 moves digest verification, profile parsing and fail-closed RPC/oneof authorization lookup into the framework-neutral `domain-contracts::profiles` boundary. Client and server consume that one interpreter; framework types still cannot enter `domain-contracts`.
 - Local API gateway: G4-08C C2/C3 is exercised by the real CLI/TUI C5 fixtures over Windows Named Pipe; the default production provider bootstrap remains open.
 - Supervised Worker/Harness transport: the Codex App Server official native protocol adapter and durable Adapter Edge are implemented for V-01; additional Harness protocols remain separate adapter units.
-- Codex production adapter: `crates/codex-adapter` is the only active
-  production Harness (admitted for GPT and DeepSeek). It is selected
+- Codex production adapter: `crates/codex-adapter` is a production
+  Harness admitted for GPT and DeepSeek. It is selected
   through the reviewed capability profile and the governed
   Collaboration/Adapter/Artifact/Verification path.
 - Kimi candidate adapter: `crates/kimi-adapter` isolates the Kimi CLI ACP

@@ -365,9 +365,9 @@ crates/
   process-supervision/      Child-process lifecycle and framing
   harness-adapter/          Provider-neutral Harness boundary
   codex-adapter/            Production Codex app-server driver
-  dsh-adapter/              DeepSeek Harness candidate driver
+  dsh-adapter/              DeepSeek-admitted DSH driver
   kimi-adapter/             Kimi candidate driver
-  opencode-adapter/         OpenCode/GLM candidate driver
+  opencode-adapter/         DeepSeek-admitted OpenCode driver; GLM held
   artifact-authority/       Immutable Artifact metadata and blob receipts
   verification-authority/   Verification facts and artifacts
   founder-verdict-authority/ Founder verdict lifecycle
