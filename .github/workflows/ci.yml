@@ -24,6 +24,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
+      # The Rust gate runs the real Memory Worker integration test, which needs
+      # the worker's interpreter. Locally that is built by this script before
+      # the gate; the job builds the same prerequisite instead of failing on a
+      # bare checkout.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File setup-memory-worker.ps1
       - run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-rust.ps1
 
   typescript-and-contracts:

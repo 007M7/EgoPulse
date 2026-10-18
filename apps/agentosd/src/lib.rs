@@ -87,6 +87,7 @@ mod approval_recovery_tests;
 mod artifact;
 mod bootstrap;
 mod cancellation_delivery;
+mod checker_output_capture;
 mod checker_profile_deployment;
 mod context_material;
 mod context_mutation;
@@ -141,6 +142,7 @@ pub use bootstrap::{
     preview_work_capability_config_migration, preview_work_capability_config_rollback,
     rollback_work_capability_config_to_v2,
 };
+pub(crate) use checker_output_capture::{CheckerOutputCaptureConfig, ConfiguredCheckerOutputSink};
 pub(crate) use checker_profile_deployment::{
     CheckerProfileDeploymentConfig, ConfiguredCheckerProfileDeployment,
 };
@@ -2410,12 +2412,17 @@ impl DaemonComposition {
             ..
         } = self;
         let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
+        let (read_stop, read_shutdown) = tokio::sync::watch::channel(false);
+        let read_model = read_model.with_shutdown(read_shutdown);
         let mut server_stop = stop_receiver.clone();
         let server_shutdown = async move {
             tokio::select! {
                 _ = shutdown => {}
                 _ = server_stop.changed() => {}
             }
+            // Close observations before tonic drains connections. Durable
+            // workers keep their existing stop-after-server ordering.
+            let _ = read_stop.send(true);
         };
         let mut server = Box::pin(
             Server::builder()

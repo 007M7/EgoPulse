@@ -111,9 +111,11 @@ may pair any known Provider with any known Harness so compatibility can be
 evaluated without changing the schema or runtime architecture. Parsing that
 pair proves only representability: it does not prove that the Harness can
 authenticate to the Provider, preserve the exact model, or satisfy the
-governed lifecycle. The first release admits only GPT through Codex
-app-server; all other combinations remain non-selectable until separately
-promoted with evidence.
+governed lifecycle. Production admission is per Provider/Harness route and
+enforced from the composition allowlist: GPT through Codex app-server, and
+DeepSeek through DSH, OpenCode or Codex app-server, with at most one
+production profile configured at a time. Every other combination remains
+non-selectable until separately promoted with evidence.
 
 The example catalog is only an offline fallback snapshot. Vendor model lists
 change faster than EgoPulse releases, so the production flow will refresh from
@@ -199,3 +201,34 @@ unapproved verification profiles fail closed during startup.
 Memory governance requires the reviewed `memory_kind` binding, and
 `local.context.revoke` additionally requires `context_kind: "Founder"`.
 Missing or non-Founder Context binding fails startup before the daemon serves.
+
+## Verification worker checker output
+
+`verification_worker` runs one configured checker for one criterion. Two
+declarations decide how that checker's output is read and cited:
+
+- `checker_output_source` — `stdout` (the default) reads the review artifact
+  from the process' stdout. `envelope_artifact_path` treats stdout as a JSON
+  envelope and loads the review artifact from the `artifact_path` it names;
+  that path must resolve inside `working_directory`, and the artifact is read
+  with a 16 MiB cap. Anything else in the envelope is not interpreted.
+- `checker_output_capture` (optional) — when present, `agentosd` seals the
+  exact bytes the checker produced through the governed checker-output
+  collector and cites that artifact as the criterion's raw output. Without it,
+  the configured `mapper.raw_output_artifact_id` stays the citation, and that
+  artifact must then be a member of the Task's own artifact set.
+
+| Field | Meaning |
+| --- | --- |
+| `raw_output_type_ref` | Artifact type contract of the raw checker output; must be admitted in `artifact.allowed_artifact_type_refs` |
+| `retention_profile_ref` | Retention profile for the captured output; must be admitted in `artifact.allowed_retention_profile_refs` |
+| `collector_principal_id` | Governed collector that stages the captured output |
+| `artifact_authority_principal_id` | Authority principal that seals it; must differ from the collector |
+| `max_output_bytes` | Upper bound for one captured output, 1 to 67108864 |
+
+The checker profile's `output_contract_ref` is used as the captured artifact's
+transformation contract, so it must be admitted in
+`artifact.allowed_transformation_contract_refs`. A checker that exits non-zero
+is always a failed criterion; with capture configured, the bytes it wrote
+before exiting are sealed as well, so a declared stop reason such as
+`budget_exceeded` stays readable instead of being discarded.

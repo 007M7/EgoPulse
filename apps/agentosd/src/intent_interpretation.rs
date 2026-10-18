@@ -1,14 +1,35 @@
 use std::path::PathBuf;
 
-use egopulse_codex_adapter::{
-    CodexAppServerConfig, CodexAppServerDriver, CodexReadOnlyReviewTerminalStatus,
-    CodexReadOnlyTurnRequest,
-};
+use crate::bootstrap::ProviderHarnessKind;
+use egopulse_codex_adapter::{CodexAppServerConfig, CodexAppServerDriver};
 use egopulse_domain_contracts::v01::egopulse::localapi::v1::{
     IntentWorkCandidate, InterpretIntentRequest, InterpretedIntent, WorkCapabilityView,
     WorkSourceRequest,
 };
-use egopulse_harness_adapter::{DriverError, DriverErrorCertainty};
+use egopulse_harness_adapter::{
+    DriverError, DriverErrorCertainty, ReadOnlyTurnDriver, ReadOnlyTurnRequest, ReadOnlyTurnStatus,
+};
+use egopulse_opencode_adapter::{OpenCodeAcpConfig, OpenCodeAcpDriver};
+
+#[derive(Clone)]
+pub(crate) enum IntentDriverConfig {
+    Codex(CodexAppServerConfig),
+    OpenCode(OpenCodeAcpConfig),
+    Unsupported,
+}
+impl IntentDriverConfig {
+    fn driver(&self, model: &str) -> Result<Box<dyn ReadOnlyTurnDriver>, CommandPortFailure> {
+        match self {
+            Self::Codex(config) => Ok(Box::new(CodexAppServerDriver::new(config.clone()))),
+            Self::OpenCode(config) => {
+                let mut config = config.clone();
+                config.required_model = model.to_owned();
+                Ok(Box::new(OpenCodeAcpDriver::new(config)))
+            }
+            Self::Unsupported => Err(CommandPortFailure::CapabilityNotAdmitted),
+        }
+    }
+}
 use egopulse_local_api::command_gateway::CommandPortFailure;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -25,7 +46,9 @@ const MAX_SOURCE_FIELD_BYTES: usize = 4 * 1024;
 const MAX_MODEL_OUTPUT_BYTES: usize = 64 * 1024;
 
 pub(crate) struct ConfiguredIntentInterpreter {
-    codex: CodexAppServerConfig,
+    driver_config: IntentDriverConfig,
+    profile_id: String,
+    harness_kind: ProviderHarnessKind,
     workspace_root: PathBuf,
     work_type: String,
     target_scope_ref: String,
@@ -33,7 +56,9 @@ pub(crate) struct ConfiguredIntentInterpreter {
 
 impl ConfiguredIntentInterpreter {
     pub(crate) fn new(
-        codex: CodexAppServerConfig,
+        driver_config: IntentDriverConfig,
+        profile_id: String,
+        harness_kind: ProviderHarnessKind,
         workspace_root: PathBuf,
         work_type: String,
         target_scope_ref: String,
@@ -46,7 +71,9 @@ impl ConfiguredIntentInterpreter {
             return Err(CommandPortFailure::IntegrityFailure);
         }
         Ok(Self {
-            codex,
+            driver_config,
+            profile_id,
+            harness_kind,
             workspace_root,
             work_type,
             target_scope_ref,
@@ -59,24 +86,38 @@ impl ConfiguredIntentInterpreter {
         model: &str,
         work_capability: WorkCapabilityView,
     ) -> Result<InterpretedIntent, CommandPortFailure> {
+        if work_capability.harness_model_alias != model
+            || work_capability.provider_profile_id != self.profile_id
+            || work_capability.harness_alias
+                != match self.harness_kind {
+                    ProviderHarnessKind::CodexAppServer => "codex_app_server",
+                    ProviderHarnessKind::OpenCodeAcp => "opencode_acp",
+                    _ => return Err(CommandPortFailure::CapabilityNotAdmitted),
+                }
+        {
+            return Err(CommandPortFailure::CapabilityNotAdmitted);
+        }
         if model.trim().is_empty() {
             return Err(CommandPortFailure::IntegrityFailure);
         }
         let prompt = cognition_prompt(request, &self.work_type, &self.target_scope_ref)?;
-        let mut driver = CodexAppServerDriver::new(self.codex.clone());
+        let mut driver = self.driver_config.driver(model)?;
         let outcome = driver
-            .run_read_only_turn(CodexReadOnlyTurnRequest {
+            .run_bounded_read_only_turn(ReadOnlyTurnRequest {
                 execution_id: format!("intent:{}", Uuid::now_v7()),
                 working_directory: self.workspace_root.clone(),
                 model: model.to_owned(),
                 prompt,
                 output_schema: cognition_output_schema(),
-                timeout: self.codex.request_timeout,
+                timeout: std::time::Duration::from_secs(120),
                 output_limit_bytes: MAX_MODEL_OUTPUT_BYTES,
             })
             .await
             .map_err(model_failure)?;
-        if outcome.terminal_status != CodexReadOnlyReviewTerminalStatus::Completed {
+        if outcome.model != model {
+            return Err(CommandPortFailure::IntegrityFailure);
+        }
+        if outcome.terminal_status != ReadOnlyTurnStatus::Completed {
             return Err(CommandPortFailure::Unavailable);
         }
         let output: ModelIntentOutput = serde_json::from_slice(&outcome.assistant_output)

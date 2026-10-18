@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod checker_output;
 mod execution;
 mod reference_resolver;
 mod sego;
@@ -7,9 +8,14 @@ mod sego_runner;
 mod store;
 mod supervisor;
 
+pub use checker_output::{
+    CheckerOutputSink, CheckerOutputSource, EnvelopeReadError, MAX_CHECKER_ARTIFACT_BYTES,
+    SealedCheckerOutput, read_envelope_artifact,
+};
 pub use execution::{
-    GovernedVerificationBatchPlan, GovernedVerificationCheckOutput, GovernedVerificationChecker,
-    GovernedVerificationCheckerError, GovernedVerificationExecutionCoordinator,
+    GovernedCheckerFailureKind, GovernedCheckerFailureReport, GovernedVerificationBatchPlan,
+    GovernedVerificationCheckOutput, GovernedVerificationChecker, GovernedVerificationCheckerError,
+    GovernedVerificationCompletion, GovernedVerificationExecutionCoordinator,
     GovernedVerificationExecutionError, GovernedVerificationExecutionOutcome,
     GovernedVerificationExecutionPlan,
 };
@@ -20,11 +26,13 @@ pub use reference_resolver::{
     checker_output_execution_ref,
 };
 pub use sego::{
-    CheckerProcessFailure, SEGO_REVIEW_ARTIFACT_CONTRACT_ID,
-    SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION, SegoFindingEvidenceBinding, SegoMapError,
-    SegoMappedResult, SegoMapperPolicy, checker_failure_result, map_sego_review,
+    CheckerFailureOutput, CheckerProcessFailure, MAX_FAILURE_CODE_PARSE_BYTES,
+    SEGO_REVIEW_ARTIFACT_CONTRACT_ID, SEGO_REVIEW_ARTIFACT_CONTRACT_REVISION,
+    SegoFindingEvidenceBinding, SegoMapError, SegoMappedResult, SegoMapperPolicy,
+    captured_failure_code, checker_failure_result, checker_failure_result_with_detail,
+    checker_uncited_failure_result, map_sego_review,
 };
-pub use sego_runner::{GovernedSegoRunError, GovernedSegoRunResult, GovernedSegoRunner};
+pub use sego_runner::{GovernedCheckerProcessOutcome, GovernedSegoRunError, GovernedSegoRunner};
 pub use store::VerificationStoreInspection;
 pub use supervisor::{CheckerExecutionError, CheckerExecutionReceipt, GovernedCheckerSupervisor};
 

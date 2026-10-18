@@ -27,11 +27,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install-egopulse.ps1 `
 
 The installer creates a user-owned configuration under
 `%LOCALAPPDATA%\EgoPulse`, generates the ten local Authority/read-model
-encryption and session keys as user environment variables, installs the locked Memory Worker,
+encryption and session keys in `local-keys.dpapi` using Windows DPAPI CurrentUser, installs the locked Memory Worker,
 performs `agentosd --check-config`, and launches the daemon. It never writes
 Provider API keys to the package or configuration. A pre-existing
 configuration is preserved unless `-Force` is explicitly supplied; forced
-replacement creates a timestamped backup.
+replacement creates a timestamped backup. The installer persists only the key-file path; daemon, CLI and TUI decrypt and inject keys into their own process at startup. A legacy installation without this file is preserved and reports `LEGACY_KEYS_MIGRATION_REQUIRED`; reinstalling does not rotate its database keys or erase its User environment values. Back up the matching databases and protected key file together. DPAPI recovery requires the same Windows account and its DPAPI recovery material; the file alone is not a portable cross-account backup.
 
 Keep the reviewed acceptance contract outside the execution checkout and
 follow [repository setup](config/README.md#governed-repository-setup).
@@ -47,9 +47,10 @@ or Harness-owned delegated login. These are local readiness hints, not
 authenticated lifecycle or production-admission evidence.
 
 The installer requires Windows x64, CPython 3.14.x, an installed `uv` command,
-and Codex 0.148.0-alpha.15 with an authenticated account for the exact selected
-model. The current production profile uses Codex app-server, so `codex` must resolve to a local
-application before installation can complete. If `uv` is absent, install it
+and the executable of the configured production Harness with an authenticated
+account for the exact selected model. A GPT/Codex profile needs Codex
+0.148.0-alpha.15 to resolve to a local application; a DeepSeek profile needs
+the executable of its own Harness instead, so installation can complete. If `uv` is absent, install it
 from `https://docs.astral.sh/uv/` first. A configured command is resolved to an
 absolute executable before daemon process supervision; an unavailable
 production Harness fails installation instead of surfacing on the first Task.
@@ -166,8 +167,8 @@ In another PowerShell window, use the CLI or TUI:
 The retrieval path is read-only, deterministic lexical retrieval in this
 early-access release. Agent writes remain candidates and require the frozen
 Memory governance path for promotion or revocation. Semantic/vector retrieval,
-reranking, a second production Harness, cloud telemetry and enterprise
-identity are outside this package. DeepSeek, Kimi and GLM profiles may be
-configured for evaluation, but their real authentication is deliberately not
-a blocker for this Codex-backed release and does not grant production
-admission.
+reranking, several production profiles at once, cloud telemetry and enterprise
+identity are outside this package. Only the routes the code admits for
+production are selectable; Kimi and GLM profiles may be represented as held
+candidates, and neither the example configuration nor a held entry grants
+production admission.

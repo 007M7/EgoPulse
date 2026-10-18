@@ -49,20 +49,36 @@ function Invoke-HermeticInstaller {
         [Parameter(Mandatory = $true)][string]$InstallerPath,
         [Parameter(Mandatory = $true)][string]$PackageRoot,
         [Parameter(Mandatory = $true)][string]$DataRoot,
-        [Parameter(Mandatory = $true)][string]$IpcInstance
+        [Parameter(Mandatory = $true)][string]$IpcInstance,
+        [switch]$UseProtectedKeyFile
     )
 
     $keyLiterals = ($authorityKeys | ForEach-Object { ConvertTo-SingleQuotedPowerShellLiteral $_ }) -join ','
+    $protectedArgument = if ($UseProtectedKeyFile) { '-UseProtectedKeyFile' } else { '' }
+    $protectedLiteral = if ($UseProtectedKeyFile) { '$true' } else { '$false' }
     $command = @"
 if (Get-Command uv -ErrorAction SilentlyContinue) { throw 'uv unexpectedly visible in hermetic installer child' }
 Write-Output 'uv=unavailable'
-& $(ConvertTo-SingleQuotedPowerShellLiteral $InstallerPath) -PackageRoot $(ConvertTo-SingleQuotedPowerShellLiteral $PackageRoot) -DataRoot $(ConvertTo-SingleQuotedPowerShellLiteral $DataRoot) -IpcInstance $(ConvertTo-SingleQuotedPowerShellLiteral $IpcInstance) -SkipMemoryWorker -NoPersistEnvironment
-foreach (`$keyName in @($keyLiterals)) {
-    if ([Environment]::GetEnvironmentVariable(`$keyName, 'Process') -cne `$env:EGOPULSE_INSTALLER_TEST_KEY_SENTINEL) {
-        throw "process-only Authority key changed: `$keyName"
+& $(ConvertTo-SingleQuotedPowerShellLiteral $InstallerPath) -PackageRoot $(ConvertTo-SingleQuotedPowerShellLiteral $PackageRoot) -DataRoot $(ConvertTo-SingleQuotedPowerShellLiteral $DataRoot) -IpcInstance $(ConvertTo-SingleQuotedPowerShellLiteral $IpcInstance) -SkipMemoryWorker -NoPersistEnvironment $protectedArgument
+if ($protectedLiteral) {
+    if (-not (Test-Path -LiteralPath `$env:EGOPULSE_KEY_FILE)) { throw 'protected key file missing' }
+    `$protectedBefore=[Convert]::ToBase64String([IO.File]::ReadAllBytes(`$env:EGOPULSE_KEY_FILE))
+    foreach (`$keyName in @($keyLiterals)) { [Environment]::SetEnvironmentVariable(`$keyName, `$null, 'Process') }
+    # A new native process must reopen the file with no plaintext inherited keys.
+    & $(ConvertTo-SingleQuotedPowerShellLiteral (Join-Path $PackageRoot 'bin/agentosd.exe')) --check-config
+    if (`$LASTEXITCODE -ne 0) { throw 'native DPAPI startup failed' }
+    & $(ConvertTo-SingleQuotedPowerShellLiteral $InstallerPath) -PackageRoot $(ConvertTo-SingleQuotedPowerShellLiteral $PackageRoot) -DataRoot $(ConvertTo-SingleQuotedPowerShellLiteral $DataRoot) -IpcInstance $(ConvertTo-SingleQuotedPowerShellLiteral $IpcInstance) -SkipMemoryWorker -NoPersistEnvironment -UseProtectedKeyFile
+    if (`$LASTEXITCODE -ne 0) { throw 'protected reinstallation failed' }
+    if ([Convert]::ToBase64String([IO.File]::ReadAllBytes(`$env:EGOPULSE_KEY_FILE)) -cne `$protectedBefore) { throw 'reinstallation replaced protected keys' }
+    Write-Output 'protected_installation=passed native_restart=true reinstall_keys_unchanged=true'
+} else {
+    foreach (`$keyName in @($keyLiterals)) {
+        if ([Environment]::GetEnvironmentVariable(`$keyName, 'Process') -cne `$env:EGOPULSE_INSTALLER_TEST_KEY_SENTINEL) {
+            throw "process-only Authority key changed: `$keyName"
+        }
     }
+    Write-Output 'process_authority_keys=preserved'
 }
-Write-Output 'process_authority_keys=preserved'
 foreach (`$commandName in @('egopulse', 'egopulse-tui')) {
     `$resolvedCommand = Get-Command `$commandName -CommandType Application -ErrorAction Stop
     `$expectedCommand = Join-Path $(ConvertTo-SingleQuotedPowerShellLiteral $PackageRoot) "bin/`$commandName.exe"
@@ -150,6 +166,7 @@ try {
     }
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'config/agentos-config.example.json') -Destination (Join-Path $packageRoot 'config/agentos-config.example.json')
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'install-egopulse.ps1') -Destination (Join-Path $packageRoot 'install-egopulse.ps1')
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'egopulse-keys.ps1') -Destination (Join-Path $packageRoot 'egopulse-keys.ps1')
     $installerPath = Join-Path $packageRoot 'install-egopulse.ps1'
 
     $invalid = Invoke-HermeticInstaller -InstallerPath $installerPath -PackageRoot $packageRoot -DataRoot $invalidDataRoot -IpcInstance 'bad/instance'
@@ -190,9 +207,16 @@ try {
     Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $packageRoot '.cache'))) 'SkipMemoryWorker created a package worker cache'
     Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $packageRoot 'workers/memory-rag/.venv'))) 'SkipMemoryWorker created a Memory Worker virtual environment'
 
+    $protectedDataRoot = Join-Path $sandbox 'protected-data'
+    $protected = Invoke-HermeticInstaller -InstallerPath $installerPath -PackageRoot $packageRoot -DataRoot $protectedDataRoot -IpcInstance "$ipcInstance-protected" -UseProtectedKeyFile
+    Assert-Condition ($protected.ExitCode -eq 0) "protected installer failed: stdout=$($protected.Stdout) stderr=$($protected.Stderr)"
+    Assert-Condition ($protected.Stdout.Contains('protected_installation=passed native_restart=true reinstall_keys_unchanged=true')) 'DPAPI install/restart/reinstall evidence missing'
+    Assert-Condition (-not $protected.Stdout.Contains($keySentinel)) 'protected installer leaked key sentinel'
+
     $userEnvironmentAfter = Get-EgoPulseEnvironmentSnapshot -Target User
     Assert-Condition ($userEnvironmentAfter -ceq $userEnvironmentBefore) 'NoPersistEnvironment changed User-scope EGOPULSE environment variables'
     Assert-Condition ([Environment]::GetEnvironmentVariable('Path', 'User') -ceq $userPathBefore) 'NoPersistEnvironment changed User-scope PATH'
+    Write-Output 'installer_protected_keys_test=passed native_restart=true reinstall_keys_unchanged=true user_environment_unchanged=true'
     Write-Output "installer_hermetic_test=passed ipc_instance=$ipcInstance"
 }
 finally {

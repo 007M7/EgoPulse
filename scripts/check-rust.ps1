@@ -44,6 +44,9 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $cargo build -p egopulse-agentosd --bin agentosd --locked
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+& (Join-Path $PSScriptRoot 'test-protected-keys.ps1')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 & (Join-Path $PSScriptRoot 'test-install-egopulse.ps1')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

@@ -13,6 +13,7 @@ egopulse-client-operations.workspace = true
 egopulse-domain-contracts.workspace = true
 egopulse-director-facade.workspace = true
 egopulse-local-api.workspace = true
+egopulse-local-ipc-platform.workspace = true
 prost-types.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true

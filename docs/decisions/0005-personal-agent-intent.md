@@ -56,3 +56,36 @@ Generated Rust, TypeScript and Python bindings and repository-level digest pins 
 ## Review triggers
 
 Re-open this decision if interpretation is allowed to create or mutate governed facts, selects an unadmitted route, needs a new permission/Authority, persists a new conversation store, or introduces a second model execution loop outside the existing Harness boundary.
+
+## Bounded cognition implementation (2026-10-14)
+
+The implementation now uses the provider-neutral `ReadOnlyTurnDriver` capability
+in `harness-adapter`. Each interpretation uses one fresh native session, the
+already admitted profile and exact selected model, a 120-second time budget and
+a 64 KiB assistant-output budget. Profile or native-model mismatch fails closed.
+Codex uses its checked read-only policy. OpenCode uses a disposable empty
+workspace/config root, disables project and Claude configuration inheritance,
+denies all tools, and rejects any ACP tool or permission request. ACP frames are
+bounded to 1 MiB and the turn has a total event/output bound. Unsupported harnesses
+report capability unavailable; there is no model or harness fallback.
+
+Conversation remains only a proposal. CLI `ask --cancel` exits before attachment
+or RPC. An interactive `ask` candidate can enter the governed preview, while
+non-interactive use requires explicit `--confirm` to create work. Selecting a TUI
+candidate automatically prepares its preview; confirmation remains an explicit
+Founder action. Neither surface supplies low-level snapshot or authorization
+bindings. Existing confirmed routes and persisted Task facts are unchanged.
+
+OpenCode support is restricted to the source-checked 1.18.31 configuration
+contract. Pure mode suppresses external plugins; an isolated home/config/cache,
+state and native database prevent inheriting user agents or active organization
+settings. Existing credential-file metadata is bounded and checked without
+retaining credential fields: remote `wellknown` configuration and unknown types
+are refused. Managed native configuration and caller configuration overrides
+are also refused before any native process starts. Such configurations need
+separate read-only capability evidence; production dispatch admission is retained.
+
+The versioned upstream sources establish the configuration precedence and
+isolation controls: [config](https://github.com/anomalyco/opencode/blob/v1.18.31/packages/opencode/src/config/config.ts),
+[global paths](https://github.com/anomalyco/opencode/blob/v1.18.31/packages/core/src/global.ts),
+[plugin pure mode](https://github.com/anomalyco/opencode/blob/v1.18.31/packages/opencode/src/plugin/index.ts).

@@ -1,6 +1,6 @@
 # EgoPulse implementation architecture
 
-- Status: Gate 4 vertical implementation in progress; Phase 2-03 candidate admission held
+- Status: governed work loop implemented; production admission is held per Provider/Harness route
 - Date: 2026-08-27
 - Decision owner: Founder
 
@@ -82,21 +82,23 @@ Collaboration/Sego stages after technical evidence intake.
 - Shared profile interpretation: G4-08C C2 moves digest verification, profile parsing and fail-closed RPC/oneof authorization lookup into the framework-neutral `domain-contracts::profiles` boundary. Client and server consume that one interpreter; framework types still cannot enter `domain-contracts`.
 - Local API gateway: G4-08C C2/C3 is exercised by the real CLI/TUI C5 fixtures over Windows Named Pipe; the default production provider bootstrap remains open.
 - Supervised Worker/Harness transport: the Codex App Server official native protocol adapter and durable Adapter Edge are implemented for V-01; additional Harness protocols remain separate adapter units.
-- Codex production adapter: `crates/codex-adapter` is the only active
-  production Harness. It is selected through the reviewed capability profile
-  and the governed Collaboration/Adapter/Artifact/Verification path.
+- Codex production adapter: `crates/codex-adapter` is a production
+  Harness admitted for GPT and DeepSeek. It is selected
+  through the reviewed capability profile and the governed
+  Collaboration/Adapter/Artifact/Verification path.
 - Kimi candidate adapter: `crates/kimi-adapter` isolates the Kimi CLI ACP
   session and candidate execution lifecycle behind the same provider-neutral
   driver and process-supervision boundary. It supports candidate prompt,
   update, permission, cancellation and one-shot output extraction, but the
   authenticated lifecycle has not been attested; it is not wired into daemon
   provider selection.
-- DSH candidate adapter: `crates/dsh-adapter` isolates the DeepSeek Harness
+- DSH adapter (admitted for DeepSeek): `crates/dsh-adapter` isolates the DeepSeek Harness
   ACP lifecycle behind the same provider-neutral driver and process
   supervision boundary. Fresh-session prompt, cancellation and a governed
   permission replay are locally verified. Native `session/load`/
   `session/resume` are unsupported and native Artifact semantics are not
-  independently attested, so DSH remains degraded and fail-closed.
+  independently attested, so those paths stay degraded and fail-closed even
+  though the route is admitted for production work.
 - Memory/RAG boundary: `workers/memory-rag` is a dependency-free, read-only
   lexical retrieval implementation behind the frozen `egopulse.memory.v1`
   contract. Rust supplies verified, scoped, already-accepted records; the
@@ -121,8 +123,8 @@ Collaboration/Sego stages after technical evidence intake.
   rejected. The exact `ContractReference` route matches profile ID, version
   and SHA-256; an ID-only route is not a supported production API. The
   composite sequences runners and does not choose models or merge
-  provider-owned facts. This is a multi-model composition capability, not
-  evidence that a second Harness has been admitted.
+  provider-owned facts. A second and third Harness are admitted only for
+  DeepSeek; composition itself admits nothing.
 - Task activation routing: the production native composition binds the same
   exact profile reference at activation consumption, Collaboration dispatch
   registration and dispatch selection. Workflow resolution distinguishes an
@@ -137,8 +139,10 @@ Collaboration/Sego stages after technical evidence intake.
   point is a compatibility wrapper that adds the Codex executable while the
   user-owned JSON shape remains stable. Supplying a profile or native config to
   this boundary does not grant admission; profile attestation and the
-  provider-specific lifecycle evidence remain prerequisites before a Kimi,
-  DSH or other Harness can be wired into production selection.
+  provider-specific lifecycle evidence remain prerequisites, and each
+  Provider/Harness route is admitted separately in the composition
+  allowlist, so Kimi, GLM and any unlisted pairing cannot be wired into
+  production selection.
 
 ## Repository rules
 

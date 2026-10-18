@@ -19,11 +19,12 @@ use egopulse_domain_contracts::v01::egopulse::{
 };
 use egopulse_verification_authority::{
     ArtifactReferenceSource, ArtifactReferenceSourceError, AuthenticatedVerificationPrincipal,
-    GovernedCheckerSupervisor, GovernedSegoRunner, GovernedVerificationBatchPlan,
-    GovernedVerificationChecker, GovernedVerificationExecutionCoordinator,
-    GovernedVerificationExecutionError, GovernedVerificationExecutionPlan, SegoMapperPolicy,
-    SystemVerificationClock, VerificationAuthority, VerificationAuthorityFailure,
-    VerificationClock, VerificationPrincipalKind, canonical_request_digest,
+    CheckerOutputSink, CheckerOutputSource, GovernedCheckerSupervisor, GovernedSegoRunner,
+    GovernedVerificationBatchPlan, GovernedVerificationChecker,
+    GovernedVerificationExecutionCoordinator, GovernedVerificationExecutionError,
+    GovernedVerificationExecutionPlan, SegoMapperPolicy, SystemVerificationClock,
+    VerificationAuthority, VerificationAuthorityFailure, VerificationClock,
+    VerificationPrincipalKind, canonical_request_digest,
 };
 use prost_types::Timestamp;
 use sha2::{Digest, Sha256};
@@ -421,6 +422,8 @@ pub enum VerificationHandoffPlanError {
     AcceptanceContractMissing,
     #[error("Artifact set is missing, unsealed, or does not belong to the handoff")]
     ArtifactSetInvalid,
+    #[error("handoff belongs to another reviewed worker plan")]
+    NotOurWork,
     #[error("Artifact set primary Claim is missing, ambiguous, or invalid")]
     PrimaryClaimInvalid,
     #[error("Task handoff and configured lineage do not match")]
@@ -478,10 +481,6 @@ impl VerificationHandoffPlan {
             .ok_or(VerificationHandoffPlanError::ArtifactSetInvalid)?;
         if artifact_set.status != ArtifactSetStatus::Sealed as i32
             || artifact_set.artifact_set_id != artifact_set_id
-            || !artifact_set
-                .claim_ids
-                .iter()
-                .any(|id| id == &self.binding.claim_id)
         {
             return Err(VerificationHandoffPlanError::ArtifactSetInvalid);
         }
@@ -507,6 +506,13 @@ impl VerificationHandoffPlan {
             .ok_or(VerificationHandoffPlanError::ArtifactSetInvalid)?;
         if !content_address_valid(&artifact_set_manifest) {
             return Err(VerificationHandoffPlanError::ArtifactSetInvalid);
+        }
+        if !artifact_set
+            .claim_ids
+            .iter()
+            .any(|id| id == &self.binding.claim_id)
+        {
+            return Err(VerificationHandoffPlanError::NotOurWork);
         }
         let binding = VerificationBinding {
             lineage: Some(lineage),
@@ -684,7 +690,7 @@ pub(crate) struct VerificationHandoffIntakeReport {
 /// Explicit reviewed composition for the first single-checker Verification
 /// worker. The worker never derives a checker, workspace, request bytes, or
 /// mapper policy from a Task payload.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VerificationWorkerConfig {
     pub handoff_plan: VerificationHandoffPlan,
     pub checker_profile: CheckerProfile,
@@ -700,6 +706,14 @@ pub struct VerificationWorkerConfig {
     pub model_call_receipt_artifact_ids: Vec<String>,
     pub checker_timeout: Duration,
     pub checker_output_limit: u64,
+    /// Where this environment reads the checker's review artifact from.
+    pub output_source: CheckerOutputSource,
+    /// Declared capture of the checker's own output; the sink is composed from
+    /// it at the application boundary.
+    pub checker_output_capture: Option<crate::CheckerOutputCaptureConfig>,
+    /// Seals the exact checker bytes so results cite the checker's own output.
+    /// Absent keeps the configured raw output artifact as the citation.
+    pub checker_output_sink: Option<Arc<dyn CheckerOutputSink>>,
     /// Present when no repository workflow deploys this profile, so the worker
     /// seals the configured declaration itself before attesting it.
     pub checker_profile_deployment: Option<crate::CheckerProfileDeploymentConfig>,
@@ -742,6 +756,16 @@ impl VerificationWorkerConfig {
             return Err(VerificationWorkerConfigurationError::Invalid(
                 "single-checker reviewed inputs",
             ));
+        }
+        if let Some(capture) = self.checker_output_capture.as_ref() {
+            capture.validate().map_err(|_| {
+                VerificationWorkerConfigurationError::Invalid("checker output capture")
+            })?;
+            if self.checker_output_sink.is_none() {
+                return Err(VerificationWorkerConfigurationError::Invalid(
+                    "checker output capture sink",
+                ));
+            }
         }
         if let Some(deployment) = self.checker_profile_deployment.as_ref() {
             deployment
@@ -823,6 +847,9 @@ mod deployment_tests {
             checker_arguments: Vec::new(),
             working_directory: ".".into(),
             checker_request: b"{}".to_vec(),
+            output_source: CheckerOutputSource::Stdout,
+            checker_output_capture: None,
+            checker_output_sink: None,
             mapper_policy: SegoMapperPolicy {
                 criterion_id: "criterion".to_owned(),
                 requirement: CriterionRequirement::MustPass,
@@ -1326,6 +1353,8 @@ impl ConfiguredVerificationWorker {
                             .model_call_receipt_artifact_ids
                             .clone(),
                         issued_at,
+                        output_source: config.output_source,
+                        checker_output_sink: config.checker_output_sink.clone(),
                     })
                     .await
             }
@@ -1359,6 +1388,29 @@ impl ConfiguredVerificationWorker {
             }
             Err(error) => return Err(error.into()),
         };
+        // A failed checker is a failed criterion either way. Emitting the
+        // report here keeps the attribution (exit code, declared stop reason,
+        // captured artifact) observable even when nothing was sealed.
+        if let Some(failure) = outcome.checker_failure.as_ref() {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "verification_checker_failed",
+                    "verification_request_id":
+                        outcome.verification_artifact.verification_request_id.clone(),
+                    "verification_run_id": outcome.verification_artifact.verification_run_id.clone(),
+                    "safe_failure_code": failure.kind.safe_code(),
+                    "exit_code": failure.exit_code,
+                    "checker_declared_code": failure.checker_declared_code,
+                    "output_sha256": failure.output_sha256,
+                    "output_byte_length": failure.output_byte_length,
+                    "captured_artifact_id": failure.captured_artifact_id,
+                    "cited_configured_input_artifact_id":
+                        failure.cited_configured_input_artifact_id,
+                    "capture_failure_code": failure.capture_failure_code,
+                })
+            );
+        }
         let write_back = self.write_back.record_one(
             &lineage.task_id,
             lineage
@@ -1498,6 +1550,9 @@ impl VerificationHandoffIntake {
                         VerificationHandoffIntakeError::Plan(
                             VerificationHandoffPlanError::LineageMismatch,
                         ) => "VERIFICATION_HANDOFF_LINEAGE_MISMATCH",
+                        VerificationHandoffIntakeError::Plan(
+                            VerificationHandoffPlanError::NotOurWork,
+                        ) => "VERIFICATION_HANDOFF_NOT_OUR_WORK",
                         VerificationHandoffIntakeError::Plan(_) => "VERIFICATION_MATERIAL_INVALID",
                         _ => "VERIFICATION_MATERIAL_UNAVAILABLE",
                     };
@@ -1895,6 +1950,20 @@ mod tests {
         assert_eq!(request.request.checker_profile_refs.len(), 1);
     }
 
+    #[test]
+    fn non_owned_handoff_is_distinct_from_invalid_material() {
+        let mut other = artifact_set();
+        other.claim_ids = vec!["another-worker-claim".to_owned()];
+        assert_eq!(
+            plan().request_for(&handoff(), &other).unwrap_err(),
+            VerificationHandoffPlanError::NotOurWork
+        );
+        other.lineage = None;
+        assert_eq!(
+            plan().request_for(&handoff(), &other).unwrap_err(),
+            VerificationHandoffPlanError::ArtifactSetInvalid
+        );
+    }
     #[test]
     fn dynamic_plan_binds_the_current_artifact_set_primary_claim() {
         let (artifact_set, claim) = dynamic_artifact_set_and_claim();

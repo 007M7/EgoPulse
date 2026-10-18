@@ -97,6 +97,8 @@ fn copy_and_free_output(
     if !output.pbData.is_null() {
         // SAFETY: DPAPI requires LocalFree for this output allocation.
         unsafe {
+            // DPAPI can return plaintext key material; wipe its OS allocation before freeing.
+            ptr::write_bytes(output.pbData, 0, output.cbData as usize);
             LocalFree(output.pbData as HLOCAL);
         }
     }

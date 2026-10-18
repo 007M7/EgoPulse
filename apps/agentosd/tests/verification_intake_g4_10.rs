@@ -413,6 +413,9 @@ async fn exercise_verification_worker(unfinished_run: bool) {
             ],
             working_directory: root.path().to_owned(),
             checker_request: b"{}".to_vec(),
+            output_source: egopulse_verification_authority::CheckerOutputSource::Stdout,
+            checker_output_capture: None,
+            checker_output_sink: None,
             mapper_policy: egopulse_verification_authority::SegoMapperPolicy {
                 criterion_id: "criterion-g4-10".to_owned(),
                 requirement: CriterionRequirement::MustPass,

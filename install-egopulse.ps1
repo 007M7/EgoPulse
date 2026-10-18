@@ -9,6 +9,7 @@ param(
     [switch]$Force,
     [switch]$SkipMemoryWorker,
     [switch]$Launch,
+    [switch]$UseProtectedKeyFile,
     [switch]$NoPersistEnvironment
 )
 
@@ -94,6 +95,11 @@ foreach ($binary in @('agentosd.exe', 'egopulse.exe', 'egopulse-tui.exe')) {
 
 $data = (New-Item -ItemType Directory -Force -Path $DataRoot).FullName
 $configPath = Join-Path $data 'agentos-config.json'
+$keyFile = Join-Path $data 'local-keys.dpapi'
+. (Join-Path $root 'egopulse-keys.ps1')
+if ((-not $NoPersistEnvironment -or $UseProtectedKeyFile) -and (Test-Path -LiteralPath $configPath) -and -not (Test-Path -LiteralPath $keyFile)) {
+    throw 'LEGACY_KEYS_MIGRATION_REQUIRED: existing installation is preserved. Prepare a matching database/key backup and explicitly authorize migration before reinstalling.'
+}
 $templatePath = Join-Path $root 'config/agentos-config.example.json'
 $requiresFreshV3Migration = $false
 $configureRepository = -not [string]::IsNullOrWhiteSpace($RepositoryRoot) -or
@@ -194,22 +200,23 @@ $authorityKeys = @(
     'EGOPULSE_READ_MODEL_KEY_HEX',
     'EGOPULSE_TOKEN_MAC_KEY_HEX'
 )
-foreach ($keyName in $authorityKeys) {
-    if ($NoPersistEnvironment) {
+if ($NoPersistEnvironment -and -not $UseProtectedKeyFile) {
+    # Hermetic caller-owned process keys remain compatible; never persist them.
+    foreach ($keyName in $authorityKeys) {
         $existing = [Environment]::GetEnvironmentVariable($keyName, 'Process')
         if ([string]::IsNullOrWhiteSpace($existing)) {
             Set-Item -Path "Env:$keyName" -Value (New-RandomHex)
         }
     }
-    else {
-        $existing = [Environment]::GetEnvironmentVariable($keyName, 'User')
-        if ([string]::IsNullOrWhiteSpace($existing)) {
-            Set-UserEnvironment -Name $keyName -Value (New-RandomHex)
-        }
-        else {
-            Set-Item -Path "Env:$keyName" -Value $existing
-        }
+    [Environment]::SetEnvironmentVariable('EGOPULSE_KEY_FILE', $null, 'Process')
+} else {
+    if (Test-Path -LiteralPath $keyFile) {
+        Import-EgoPulseProtectedKeys -Path $keyFile -Names $authorityKeys
+    } else {
+        New-EgoPulseProtectedKeys -Path $keyFile -Names $authorityKeys
     }
+    Set-UserEnvironment -Name 'EGOPULSE_KEY_FILE' -Value $keyFile
+    Write-Output 'authority_keys=dpapi-current-user process-injection-only'
 }
 Set-UserEnvironment -Name 'EGOPULSE_USER_CONFIG' -Value $configPath
 Set-UserEnvironment -Name 'EGOPULSE_IPC_INSTANCE' -Value $IpcInstance
@@ -342,7 +349,7 @@ if (-not $NoPersistEnvironment) {
     }
 }
 
-$environmentMode = if ($NoPersistEnvironment) { 'process-only' } else { 'persisted' }
+$environmentMode = if ($NoPersistEnvironment) { 'process-only' } else { 'dpapi-keys-config-paths-persisted' }
 Write-Output 'egopulse_installation=passed'
 Write-Output "package_root=$root"
 Write-Output "data_root=$data"

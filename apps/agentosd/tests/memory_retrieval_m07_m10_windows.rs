@@ -70,18 +70,11 @@ fn real_worker_config() -> MemoryRetrievalCompositionConfig {
     }
 }
 
-fn powershell_config(command: &str, timeout: Duration) -> MemoryRetrievalCompositionConfig {
-    let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
-    let executable =
-        PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+// Use the already provisioned Worker interpreter. PowerShell cold startup can
+// consume the crash fixture's deadline before its explicit exit is executed.
+fn python_config(command: &str, timeout: Duration) -> MemoryRetrievalCompositionConfig {
     let mut config = real_worker_config();
-    config.worker_executable = executable;
-    config.worker_arguments = vec![
-        "-NoProfile".to_owned(),
-        "-NonInteractive".to_owned(),
-        "-Command".to_owned(),
-        command.to_owned(),
-    ];
+    config.worker_arguments = vec!["-c".to_owned(), command.to_owned()];
     config.timeout = timeout;
     config
 }
@@ -169,7 +162,7 @@ async fn timeout_crash_and_concurrency_preserve_frozen_error_semantics() {
     let (_store, authority) = authority();
     let timeout = ConfiguredMemoryRetrievalPort::new(
         Arc::clone(&authority),
-        powershell_config("Start-Sleep -Seconds 30", Duration::from_millis(100)),
+        python_config("import time; time.sleep(30)", Duration::from_millis(100)),
     )
     .expect("timeout port");
     assert_eq!(
@@ -179,7 +172,7 @@ async fn timeout_crash_and_concurrency_preserve_frozen_error_semantics() {
 
     let crash = ConfiguredMemoryRetrievalPort::new(
         Arc::clone(&authority),
-        powershell_config("exit 7", Duration::from_secs(5)),
+        python_config("import sys; sys.exit(7)", Duration::from_secs(5)),
     )
     .expect("crash port");
     assert_eq!(
@@ -190,7 +183,10 @@ async fn timeout_crash_and_concurrency_preserve_frozen_error_semantics() {
     let busy = Arc::new(
         ConfiguredMemoryRetrievalPort::new(
             authority,
-            powershell_config("Start-Sleep -Seconds 2; exit 7", Duration::from_secs(5)),
+            python_config(
+                "import sys, time; time.sleep(2); sys.exit(7)",
+                Duration::from_secs(5),
+            ),
         )
         .expect("busy port"),
     );

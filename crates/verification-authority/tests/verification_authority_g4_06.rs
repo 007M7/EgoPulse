@@ -11,19 +11,21 @@ use egopulse_domain_contracts::v01::egopulse::verification::v1::{
     VerificationProvenance, VerificationRequest, VerificationStatus, verification_command,
 };
 use egopulse_verification_authority::{
-    AuthenticatedVerificationPrincipal, CheckerExecutionError, CheckerProcessFailure,
-    CriterionPolicySnapshot, GovernedCheckerSupervisor, GovernedSegoRunner,
+    AuthenticatedVerificationPrincipal, CheckerExecutionError, CheckerOutputSink,
+    CheckerOutputSource, CheckerProcessFailure, CriterionPolicySnapshot,
+    GovernedCheckerFailureKind, GovernedCheckerSupervisor, GovernedSegoRunner,
     GovernedVerificationBatchPlan, GovernedVerificationCheckOutput, GovernedVerificationChecker,
     GovernedVerificationCheckerError, GovernedVerificationExecutionCoordinator,
     GovernedVerificationExecutionError, GovernedVerificationExecutionPlan, ReferenceRejection,
-    ResolvedVerificationInput, SegoFindingEvidenceBinding, SegoMapError, SegoMappedResult,
-    SegoMapperPolicy, VerificationAuthority, VerificationAuthorityConfig, VerificationClock,
-    VerificationPrincipalKind, VerificationReferenceResolver, VerificationSqlCipherKey,
-    canonical_checker_profile_digest, canonical_request_digest, checker_failure_result,
-    map_sego_review,
+    ResolvedVerificationInput, SealedCheckerOutput, SegoFindingEvidenceBinding, SegoMapError,
+    SegoMappedResult, SegoMapperPolicy, VerificationAuthority, VerificationAuthorityConfig,
+    VerificationClock, VerificationPrincipalKind, VerificationReferenceResolver,
+    VerificationSqlCipherKey, canonical_checker_profile_digest, canonical_request_digest,
+    checker_failure_result, map_sego_review,
 };
 use prost_types::Timestamp;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -583,9 +585,19 @@ async fn governed_checker_supervisor_distinguishes_timeout_crash_and_output_limi
         64 * 1024,
     )
     .expect("supervisor");
-    assert_eq!(
-        crash.run(crash_root.path(), b"{}").await,
-        Err(CheckerExecutionError::Crashed)
+    // A failed run is a receipt, not a lost payload: the panic exit code and
+    // everything the process wrote are preserved for the caller's
+    // classification. Only timeout, output-limit and spawn failures stay
+    // errors at this layer.
+    let crash_receipt = crash
+        .run(crash_root.path(), b"{}")
+        .await
+        .expect("a non-zero exit is still a receipt");
+    assert_ne!(crash_receipt.exit_code, 0);
+    assert!(
+        String::from_utf8_lossy(&crash_receipt.stdout).contains("checker_crash_probe"),
+        "captured stdout: {}",
+        String::from_utf8_lossy(&crash_receipt.stdout)
     );
 
     let output_root = TempRoot::new("checker-output-limit");
@@ -625,20 +637,604 @@ async fn governed_sego_runner_maps_untrusted_output_without_dropping_receipt() {
     );
 
     let result = runner
-        .run(
+        .run_checker(
             root.path(),
             b"{}",
             "execution-untrusted-01",
-            &mapper_policy(),
+            CheckerOutputSource::Stdout,
         )
         .await
         .expect("runner result");
-    assert_eq!(result.failure, Some(CheckerProcessFailure::OutputUntrusted));
-    assert!(result.receipt.is_some());
+    // The process exited zero: the runner hands the bytes to the mapper and
+    // does not decide the criterion itself.
+    assert_eq!(result.failure, None);
+    assert!(
+        String::from_utf8_lossy(&result.output).contains("not-a-review-artifact"),
+        "runner output: {}",
+        String::from_utf8_lossy(&result.output)
+    );
     assert_eq!(
-        result.mapped.criterion_result.outcome,
+        result.receipt.as_ref().map(|receipt| receipt.exit_code),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn governed_sego_runner_keeps_a_nonzero_exit_and_its_declared_code() {
+    let root = TempRoot::new("sego-runner-budget-stop");
+    fs::write(root.path().join("budget-stop.marker"), b"stop").expect("write marker");
+    let runner = GovernedSegoRunner::new(
+        GovernedCheckerSupervisor::new(
+            std::env::current_exe().expect("test executable"),
+            vec![
+                "--exact".to_owned(),
+                "checker_budget_stop_probe".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            Duration::from_secs(5),
+            64 * 1024,
+        )
+        .expect("supervisor"),
+    );
+
+    let result = runner
+        .run_checker(
+            root.path(),
+            b"{}",
+            "execution-budget-stop-01",
+            CheckerOutputSource::Stdout,
+        )
+        .await
+        .expect("runner result");
+    assert_eq!(result.failure, Some(CheckerProcessFailure::Crashed));
+    assert!(result.output.is_empty());
+    assert_eq!(
+        result.receipt.as_ref().map(|receipt| receipt.exit_code),
+        Some(1)
+    );
+    let captured = result.captured.expect("captured output");
+    assert_eq!(captured.exit_code, 1);
+    assert_eq!(
+        captured.safe_reason_code.as_deref(),
+        Some("budget_exceeded")
+    );
+    assert!(
+        String::from_utf8_lossy(&captured.bytes).contains("budget_exceeded"),
+        "captured bytes: {}",
+        String::from_utf8_lossy(&captured.bytes)
+    );
+}
+
+#[derive(Default)]
+struct RecordingSink {
+    sealed: String,
+    calls: Mutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl RecordingSink {
+    fn new(sealed: &str) -> Self {
+        Self {
+            sealed: sealed.to_owned(),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn captured(&self, output_key: &str) -> Option<Vec<u8>> {
+        let calls = self.calls.lock().expect("sink lock");
+        calls
+            .iter()
+            .find(|(key, _)| key == output_key)
+            .map(|(_, bytes)| bytes.clone())
+    }
+}
+
+impl CheckerOutputSink for RecordingSink {
+    fn capture(
+        &self,
+        _request: &VerificationRequest,
+        _run_id: &str,
+        _profile: &CheckerProfile,
+        output_key: &str,
+        bytes: &[u8],
+    ) -> Result<SealedCheckerOutput, String> {
+        self.calls
+            .lock()
+            .map_err(|_| "TEST_SINK_POISONED".to_owned())?
+            .push((output_key.to_owned(), bytes.to_vec()));
+        Ok(SealedCheckerOutput {
+            artifact_id: self.sealed.clone(),
+            address: ContentAddress {
+                algorithm: HashAlgorithm::Sha256 as i32,
+                digest: hex::encode(Sha256::digest(bytes)),
+                byte_length: bytes.len() as u64,
+            },
+        })
+    }
+}
+
+async fn create_request_for<C: VerificationClock>(
+    authority: &mut VerificationAuthority<C>,
+    request: &VerificationRequest,
+    key: &str,
+) {
+    let create = seal_command(
+        VerificationCommand {
+            command: Some(verification_command::Command::CreateVerificationRequest(
+                CreateVerificationRequestCommand {
+                    metadata: Some(metadata(key)),
+                    request: Some(request.clone()),
+                },
+            )),
+        },
+        key,
+    );
+    assert!(
+        authority
+            .execute(
+                &create,
+                &principal(
+                    VerificationPrincipalKind::TaskAuthority,
+                    "agentosd:task-authority",
+                    None,
+                ),
+            )
+            .expect("create request")
+            .committed
+    );
+}
+
+fn probe_supervisor(test: &str) -> GovernedCheckerSupervisor {
+    GovernedCheckerSupervisor::new(
+        std::env::current_exe().expect("test executable"),
+        vec![
+            "--exact".to_owned(),
+            test.to_owned(),
+            "--nocapture".to_owned(),
+        ],
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .expect("supervisor")
+}
+
+#[tokio::test]
+async fn coordinator_cites_the_sealed_bytes_of_a_stopped_checker() {
+    let fixture = running_fixture(
+        "execution-failure-capture",
+        CheckerAssuranceClass::ModelAssisted,
+    );
+    let mut authority = fixture.authority;
+    let mut request = fixture.request.clone();
+    request.verification_request_id = "verification-request-failure-capture".to_owned();
+    create_request_for(&mut authority, &request, "failure-capture-create").await;
+    let authority = Arc::new(Mutex::new(authority));
+    fs::write(fixture._root.path().join("budget-stop.marker"), b"stop").expect("write marker");
+    let coordinator = GovernedVerificationExecutionCoordinator::new(
+        Arc::clone(&authority),
+        GovernedSegoRunner::new(probe_supervisor("checker_budget_stop_probe")),
+    );
+    let sink = Arc::new(RecordingSink::new("sealed-checker-output"));
+    let plan = GovernedVerificationExecutionPlan {
+        verification_request_id: request.verification_request_id.clone(),
+        verification_run_id: "verification-run-failure-capture".to_owned(),
+        execution_id: "execution-failure-capture-01".to_owned(),
+        working_directory: fixture._root.path().to_owned(),
+        checker_request: b"{}".to_vec(),
+        mapper_policy: mapper_policy(),
+        verification_artifact_id: "verification-artifact-failure-capture".to_owned(),
+        tool_receipt_artifact_ids: Vec::new(),
+        model_call_receipt_artifact_ids: Vec::new(),
+        issued_at: Timestamp {
+            seconds: 1_782_000_000,
+            nanos: 0,
+        },
+        output_source: CheckerOutputSource::Stdout,
+        checker_output_sink: Some(Arc::clone(&sink) as Arc<dyn CheckerOutputSink>),
+    };
+    let completed = coordinator
+        .execute_one(plan)
+        .await
+        .expect("a stopped checker still records a criterion result");
+    let report = completed.checker_failure.expect("failure report");
+    assert_eq!(
+        report.kind,
+        GovernedCheckerFailureKind::Process(CheckerProcessFailure::Crashed)
+    );
+    assert_eq!(report.exit_code, Some(1));
+    assert_eq!(
+        report.checker_declared_code.as_deref(),
+        Some("budget_exceeded")
+    );
+    assert_eq!(
+        report.captured_artifact_id.as_deref(),
+        Some("sealed-checker-output")
+    );
+    assert_eq!(report.capture_failure_code, None);
+    assert_eq!(report.cited_configured_input_artifact_id, None);
+    assert_eq!(
+        report.output_sha256,
+        Some(hex::encode(Sha256::digest(
+            sink.captured("checker-failure-output")
+                .expect("captured bytes")
+        )))
+    );
+    // The criterion failed and cites the bytes the checker itself wrote.
+    let artifact = &completed.verification_artifact;
+    assert_eq!(
+        artifact.conclusion,
+        VerificationConclusion::Indeterminate as i32
+    );
+    assert_eq!(
+        artifact.criterion_results[0].outcome,
         CriterionOutcome::Error as i32
     );
+    assert_eq!(
+        artifact.criterion_results[0]
+            .safe_detail_artifact_id
+            .as_deref(),
+        Some("sealed-checker-output")
+    );
+    assert_eq!(
+        artifact
+            .provenance
+            .as_ref()
+            .expect("provenance")
+            .raw_output_artifact_ids,
+        vec!["sealed-checker-output".to_owned()]
+    );
+}
+
+struct RefusingSink;
+
+impl CheckerOutputSink for RefusingSink {
+    fn capture(
+        &self,
+        _request: &VerificationRequest,
+        _run_id: &str,
+        _profile: &CheckerProfile,
+        _output_key: &str,
+        _bytes: &[u8],
+    ) -> Result<SealedCheckerOutput, String> {
+        Err("CHECKER_OUTPUT_CAPTURE_UNAVAILABLE".to_owned())
+    }
+}
+
+#[tokio::test]
+async fn a_refused_capture_never_passes_on_an_input_artifact() {
+    let fixture = running_fixture(
+        "execution-refused-capture",
+        CheckerAssuranceClass::Deterministic,
+    );
+    let mut authority = fixture.authority;
+    let mut request = fixture.request.clone();
+    request.verification_request_id = "verification-request-refused-capture".to_owned();
+    create_request_for(&mut authority, &request, "refused-capture-create").await;
+    let authority = Arc::new(Mutex::new(authority));
+    fs::write(fixture._root.path().join("envelope.marker"), b"envelope").expect("write marker");
+    let coordinator = GovernedVerificationExecutionCoordinator::new(
+        Arc::clone(&authority),
+        GovernedSegoRunner::new(probe_supervisor("checker_envelope_probe")),
+    );
+    // A deterministic acceptance checker that would pass on its own output,
+    // deployed with a declared capture that refuses to seal it.
+    let mut policy = mapper_policy();
+    policy.positive_acceptance = true;
+    policy.checker_profile_ref = fixture.profile_ref.clone();
+    let completed = coordinator
+        .execute_one(GovernedVerificationExecutionPlan {
+            verification_request_id: request.verification_request_id.clone(),
+            verification_run_id: "verification-run-refused-capture".to_owned(),
+            execution_id: "execution-refused-capture-01".to_owned(),
+            working_directory: fixture._root.path().to_owned(),
+            checker_request: b"{}".to_vec(),
+            mapper_policy: policy,
+            verification_artifact_id: "verification-artifact-refused-capture".to_owned(),
+            tool_receipt_artifact_ids: Vec::new(),
+            model_call_receipt_artifact_ids: Vec::new(),
+            issued_at: Timestamp {
+                seconds: 1_782_000_000,
+                nanos: 0,
+            },
+            output_source: CheckerOutputSource::EnvelopeArtifactPath,
+            checker_output_sink: Some(Arc::new(RefusingSink) as Arc<dyn CheckerOutputSink>),
+        })
+        .await
+        .expect("a refused capture still records a criterion result");
+    let artifact = &completed.verification_artifact;
+    assert_ne!(
+        artifact.conclusion,
+        VerificationConclusion::Passed as i32,
+        "an unsealed execution must not pass on an artifact of its own input set"
+    );
+    assert_eq!(
+        artifact.criterion_results[0].outcome,
+        CriterionOutcome::Error as i32
+    );
+    assert_eq!(artifact.criterion_results[0].safe_detail_artifact_id, None);
+    assert_eq!(
+        artifact
+            .provenance
+            .as_ref()
+            .expect("provenance")
+            .raw_output_artifact_ids,
+        Vec::<String>::new()
+    );
+    let report = completed.checker_failure.expect("failure report");
+    assert_eq!(report.kind, GovernedCheckerFailureKind::CaptureRefused);
+    assert_eq!(
+        report.capture_failure_code.as_deref(),
+        Some("CHECKER_OUTPUT_CAPTURE_UNAVAILABLE")
+    );
+    assert_eq!(report.captured_artifact_id, None);
+    assert_eq!(report.cited_configured_input_artifact_id, None);
+    assert!(report.output_byte_length > 0);
+}
+
+/// A checker that answers with nothing at all. The crate tests use the test
+/// binary as the checker, so its own harness always writes; this probe asks
+/// PowerShell for truly empty stdout instead.
+#[cfg(windows)]
+fn empty_output_supervisor() -> GovernedCheckerSupervisor {
+    GovernedCheckerSupervisor::new(
+        PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+        vec![
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            String::new(),
+        ],
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .expect("supervisor")
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_declared_capture_of_empty_output_cites_nothing() {
+    let fixture = running_fixture(
+        "execution-empty-output",
+        CheckerAssuranceClass::Deterministic,
+    );
+    let mut authority = fixture.authority;
+    let mut request = fixture.request.clone();
+    request.verification_request_id = "verification-request-empty-output".to_owned();
+    create_request_for(&mut authority, &request, "empty-output-create").await;
+    let authority = Arc::new(Mutex::new(authority));
+    let coordinator = GovernedVerificationExecutionCoordinator::new(
+        Arc::clone(&authority),
+        GovernedSegoRunner::new(empty_output_supervisor()),
+    );
+    let mut policy = mapper_policy();
+    policy.positive_acceptance = true;
+    policy.checker_profile_ref = fixture.profile_ref.clone();
+    let completed = coordinator
+        .execute_one(GovernedVerificationExecutionPlan {
+            verification_request_id: request.verification_request_id.clone(),
+            verification_run_id: "verification-run-empty-output".to_owned(),
+            execution_id: "execution-empty-output-01".to_owned(),
+            working_directory: fixture._root.path().to_owned(),
+            checker_request: b"{}".to_vec(),
+            mapper_policy: policy,
+            verification_artifact_id: "verification-artifact-empty-output".to_owned(),
+            tool_receipt_artifact_ids: Vec::new(),
+            model_call_receipt_artifact_ids: Vec::new(),
+            issued_at: Timestamp {
+                seconds: 1_782_000_000,
+                nanos: 0,
+            },
+            output_source: CheckerOutputSource::Stdout,
+            checker_output_sink: Some(Arc::new(RefusingSink) as Arc<dyn CheckerOutputSink>),
+        })
+        .await
+        .expect("a zero-byte answer still records a criterion result");
+    let artifact = &completed.verification_artifact;
+    assert_ne!(
+        artifact.conclusion,
+        VerificationConclusion::Passed as i32,
+        "an execution that sealed nothing must not pass"
+    );
+    assert_eq!(artifact.criterion_results[0].safe_detail_artifact_id, None);
+    assert_eq!(
+        artifact
+            .provenance
+            .as_ref()
+            .expect("provenance")
+            .raw_output_artifact_ids,
+        Vec::<String>::new(),
+        "no citation may be invented from an earlier input"
+    );
+    let report = completed.checker_failure.expect("failure report");
+    // Two sources are reported side by side: the answer itself was unreadable,
+    // and the declared capture had nothing to seal.
+    assert_eq!(report.kind, GovernedCheckerFailureKind::OutputUntrusted);
+    assert_eq!(
+        report.capture_failure_code.as_deref(),
+        Some("CHECKER_OUTPUT_CAPTURE_EMPTY"),
+        "the refusal is typed, not inferred from the checker's silence"
+    );
+    assert_eq!(report.output_byte_length, 0);
+    assert_eq!(report.cited_configured_input_artifact_id, None);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_declared_capture_of_a_timed_out_checker_cites_nothing() {
+    let fixture = running_fixture(
+        "execution-timeout-capture",
+        CheckerAssuranceClass::Deterministic,
+    );
+    let root = fixture._root.path().to_owned();
+    fs::write(root.join("timeout.marker"), b"1").expect("arm timeout probe");
+    let mut authority = fixture.authority;
+    let mut request = fixture.request.clone();
+    request.verification_request_id = "verification-request-timeout-capture".to_owned();
+    create_request_for(&mut authority, &request, "timeout-capture-create").await;
+    let authority = Arc::new(Mutex::new(authority));
+    let coordinator = GovernedVerificationExecutionCoordinator::new(
+        Arc::clone(&authority),
+        GovernedSegoRunner::new(
+            GovernedCheckerSupervisor::new(
+                std::env::current_exe().expect("test executable"),
+                vec![
+                    "--exact".to_owned(),
+                    "checker_timeout_probe".to_owned(),
+                    "--nocapture".to_owned(),
+                ],
+                Duration::from_millis(200),
+                64 * 1024,
+            )
+            .expect("supervisor"),
+        ),
+    );
+    let mut policy = mapper_policy();
+    policy.checker_profile_ref = fixture.profile_ref.clone();
+    let completed = coordinator
+        .execute_one(GovernedVerificationExecutionPlan {
+            verification_request_id: request.verification_request_id.clone(),
+            verification_run_id: "verification-run-timeout-capture".to_owned(),
+            execution_id: "execution-timeout-capture-01".to_owned(),
+            working_directory: root,
+            checker_request: b"{}".to_vec(),
+            mapper_policy: policy,
+            verification_artifact_id: "verification-artifact-timeout-capture".to_owned(),
+            tool_receipt_artifact_ids: Vec::new(),
+            model_call_receipt_artifact_ids: Vec::new(),
+            issued_at: Timestamp {
+                seconds: 1_782_000_000,
+                nanos: 0,
+            },
+            output_source: CheckerOutputSource::Stdout,
+            checker_output_sink: Some(Arc::new(RefusingSink) as Arc<dyn CheckerOutputSink>),
+        })
+        .await
+        .expect("a timed-out checker still records a criterion result");
+    let artifact = &completed.verification_artifact;
+    assert_eq!(artifact.criterion_results[0].safe_detail_artifact_id, None);
+    assert_eq!(
+        artifact
+            .provenance
+            .as_ref()
+            .expect("provenance")
+            .raw_output_artifact_ids,
+        Vec::<String>::new()
+    );
+    let report = completed.checker_failure.expect("failure report");
+    assert_eq!(
+        report.kind,
+        GovernedCheckerFailureKind::Process(CheckerProcessFailure::Timeout),
+        "the process failure stays the reported kind"
+    );
+    assert_eq!(
+        report.capture_failure_code.as_deref(),
+        Some("CHECKER_OUTPUT_CAPTURE_EMPTY"),
+        "the capture side is reported beside it"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_mapping_reports_output_untrusted() {
+    let fixture = running_fixture(
+        "execution-untrusted-report",
+        CheckerAssuranceClass::ModelAssisted,
+    );
+    let mut authority = fixture.authority;
+    let mut request = fixture.request.clone();
+    request.verification_request_id = "verification-request-untrusted-report".to_owned();
+    create_request_for(&mut authority, &request, "untrusted-report-create").await;
+    let authority = Arc::new(Mutex::new(authority));
+    let coordinator = GovernedVerificationExecutionCoordinator::new(
+        Arc::clone(&authority),
+        GovernedSegoRunner::new(probe_supervisor("checker_invalid_output_probe")),
+    );
+    let completed = coordinator
+        .execute_one(GovernedVerificationExecutionPlan {
+            verification_request_id: request.verification_request_id.clone(),
+            verification_run_id: "verification-run-untrusted-report".to_owned(),
+            execution_id: "execution-untrusted-report-01".to_owned(),
+            working_directory: fixture._root.path().to_owned(),
+            checker_request: b"{}".to_vec(),
+            mapper_policy: mapper_policy(),
+            verification_artifact_id: "verification-artifact-untrusted-report".to_owned(),
+            tool_receipt_artifact_ids: Vec::new(),
+            model_call_receipt_artifact_ids: Vec::new(),
+            issued_at: Timestamp {
+                seconds: 1_782_000_000,
+                nanos: 0,
+            },
+            output_source: CheckerOutputSource::Stdout,
+            checker_output_sink: None,
+        })
+        .await
+        .expect("an unmappable exit-zero output still records a result");
+    assert_eq!(
+        completed.verification_artifact.criterion_results[0].outcome,
+        CriterionOutcome::Error as i32
+    );
+    let report = completed
+        .checker_failure
+        .expect("a mapper rejection is reported like any other execution failure");
+    assert_eq!(report.kind, GovernedCheckerFailureKind::OutputUntrusted);
+    assert_eq!(report.exit_code, Some(0));
+    assert!(report.output_byte_length > 0);
+    assert_eq!(
+        report.cited_configured_input_artifact_id.as_deref(),
+        Some("raw-sego-output")
+    );
+}
+
+#[tokio::test]
+async fn envelope_output_source_maps_the_artifact_named_by_stdout() {
+    let fixture = running_fixture("execution-envelope", CheckerAssuranceClass::ModelAssisted);
+    let mut authority = fixture.authority;
+    let mut request = fixture.request.clone();
+    request.verification_request_id = "verification-request-envelope".to_owned();
+    create_request_for(&mut authority, &request, "envelope-create").await;
+    let authority = Arc::new(Mutex::new(authority));
+    fs::write(fixture._root.path().join("envelope.marker"), b"envelope").expect("write marker");
+    let coordinator = GovernedVerificationExecutionCoordinator::new(
+        Arc::clone(&authority),
+        GovernedSegoRunner::new(probe_supervisor("checker_envelope_probe")),
+    );
+    let sink = Arc::new(RecordingSink::new("sealed-checker-output"));
+    let plan = GovernedVerificationExecutionPlan {
+        verification_request_id: request.verification_request_id.clone(),
+        verification_run_id: "verification-run-envelope".to_owned(),
+        execution_id: "execution-envelope-01".to_owned(),
+        working_directory: fixture._root.path().to_owned(),
+        checker_request: b"{}".to_vec(),
+        mapper_policy: mapper_policy(),
+        verification_artifact_id: "verification-artifact-envelope".to_owned(),
+        tool_receipt_artifact_ids: Vec::new(),
+        model_call_receipt_artifact_ids: Vec::new(),
+        issued_at: Timestamp {
+            seconds: 1_782_000_000,
+            nanos: 0,
+        },
+        output_source: CheckerOutputSource::EnvelopeArtifactPath,
+        checker_output_sink: Some(Arc::clone(&sink) as Arc<dyn CheckerOutputSink>),
+    };
+    let completed = coordinator
+        .execute_one(plan)
+        .await
+        .expect("envelope artifact is mapped");
+    assert!(completed.checker_failure.is_none());
+    // Zero findings under model review stay explicitly unverified, and the
+    // sealed bytes are the artifact file, not the envelope that named it.
+    let artifact = &completed.verification_artifact;
+    assert_eq!(
+        artifact.criterion_results[0].outcome,
+        CriterionOutcome::Unverified as i32
+    );
+    assert_eq!(
+        artifact.criterion_results[0]
+            .safe_detail_artifact_id
+            .as_deref(),
+        Some("sealed-checker-output")
+    );
+    let sealed_bytes = sink.captured("review").expect("sealed review artifact");
+    let review: serde_json::Value = serde_json::from_slice(&sealed_bytes).expect("sealed JSON");
+    assert_eq!(review["scope"], "staged");
+    assert!(review.get("artifact_path").is_none());
 }
 
 #[tokio::test]
@@ -703,6 +1299,8 @@ async fn governed_execution_coordinator_records_completes_and_replays() {
             seconds: 1_782_000_000,
             nanos: 0,
         },
+        output_source: CheckerOutputSource::Stdout,
+        checker_output_sink: None,
     };
     let completed = coordinator
         .execute_one(plan.clone())
@@ -1123,6 +1721,8 @@ async fn coordinator_holds_unfinished_durable_runs_without_invoking_checker() {
             tool_receipt_artifact_ids: vec![],
             model_call_receipt_artifact_ids: vec![],
             issued_at: FixedClock.now(),
+            output_source: CheckerOutputSource::Stdout,
+            checker_output_sink: None,
         };
         let mut held_inspection = None;
         for _ in 0..2 {
@@ -1242,6 +1842,56 @@ fn checker_invalid_output_probe() {
     print!("not-a-review-artifact");
 }
 
+#[test]
+fn checker_budget_stop_probe() {
+    if Path::new("budget-stop.marker").exists() {
+        println!(r#"{{"schema_version":1,"status":"budget_exceeded","artifact_path":null}}"#);
+        std::io::Write::flush(&mut std::io::stdout()).expect("flush stop answer");
+        std::process::exit(1);
+    }
+}
+
+#[test]
+fn checker_envelope_probe() {
+    if !Path::new("envelope.marker").exists() {
+        return;
+    }
+    let reviews = Path::new(".sego").join("reviews");
+    fs::create_dir_all(&reviews).expect("create reviews directory");
+    let artifact = serde_json::json!({
+        "schema_version": 1,
+        "id": "review:envelope-01",
+        "scope": "staged",
+        "diff_hash": SHA_C,
+        "finding_count": 0,
+        "highest_severity": serde_json::Value::Null,
+        "parse_status": "structured",
+        "findings": [],
+        "reviewer": "sego",
+        "engine_version": "0.1.9",
+        "review_mode": "model_code_review",
+        "data_egress_class": "none",
+        "compute_boundary": "local",
+    });
+    let artifact_path = reviews.join("r-envelope-01.json");
+    fs::write(
+        &artifact_path,
+        serde_json::to_vec(&artifact).expect("serialize review artifact"),
+    )
+    .expect("write review artifact");
+    let envelope = serde_json::json!({
+        "schema_version": 1,
+        "action": "review",
+        "status": "ok",
+        "artifact_path": artifact_path.display().to_string(),
+    });
+    print!(
+        "{}",
+        serde_json::to_string(&envelope).expect("serialize envelope")
+    );
+    std::io::Write::flush(&mut std::io::stdout()).expect("flush envelope");
+}
+
 fn running_fixture(name: &str, assurance: CheckerAssuranceClass) -> RunningFixture {
     let root = TempRoot::new(name);
     let binding = binding();
@@ -1263,6 +1913,7 @@ fn running_fixture(name: &str, assurance: CheckerAssuranceClass) -> RunningFixtu
             .collect(),
         artifact_ids: [
             "raw-sego-output",
+            "sealed-checker-output",
             "finding-description",
             "finding-fix",
             "model-call-receipt",

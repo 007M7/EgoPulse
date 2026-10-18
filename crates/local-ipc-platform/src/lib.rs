@@ -1,6 +1,21 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod identity;
+#[cfg(windows)]
+mod secret_keys;
+#[cfg(windows)]
+pub use secret_keys::load_protected_process_keys;
+#[cfg(not(windows))]
+pub fn load_protected_process_keys() -> std::io::Result<()> {
+    if std::env::var_os("EGOPULSE_KEY_FILE").is_some() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "LOCAL_KEYS_WINDOWS_REQUIRED",
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 #[cfg(windows)]
 mod client_record;

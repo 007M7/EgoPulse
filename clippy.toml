@@ -1,0 +1,8 @@
+# Repository-owned Clippy configuration.
+#
+# Clippy discovers clippy.toml by walking up from the working directory, so a
+# checkout inside an unrelated tree would otherwise inherit that tree's
+# thresholds. The CI Rust job runs clippy with `-D warnings` from this
+# repository root; this file makes the local standalone checkout apply exactly
+# the same rule.
+too-many-arguments-threshold = 7

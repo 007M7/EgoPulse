@@ -104,11 +104,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Ask the Personal Agent; work proposals still require preview and confirmation.
+    /// Ask the Personal Agent; a work candidate still passes through the
+    /// governed preview and needs an explicit confirmation before any Task
+    /// is created.
     Ask {
         text: String,
         #[arg(long, default_value = "")]
         capability: String,
+        /// Confirm the governed preview and create the Task. Required when no
+        /// interactive terminal is attached.
+        #[arg(long, conflicts_with = "cancel")]
+        confirm: bool,
+        /// Cancel before attachment or preparation; no RPC is sent.
+        #[arg(long, conflicts_with = "confirm")]
+        cancel: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1249,6 +1258,10 @@ impl CliFailure {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if egopulse_local_ipc_platform::load_protected_process_keys().is_err() {
+        eprintln!("LOCAL_KEYS_INVALID: protected installation keys could not be loaded");
+        return ExitCode::from(78);
+    }
     let cli = Cli::parse();
     let json_output = command_json(&cli.command);
     let result = dispatch_command(cli.command).await;
@@ -1276,8 +1289,10 @@ fn dispatch_command(command: Command) -> CliCommandFuture {
         Command::Ask {
             text,
             capability,
+            confirm,
+            cancel,
             json,
-        } => Box::pin(ask(text, capability, json)),
+        } => Box::pin(ask(text, capability, confirm, cancel, json)),
         Command::Status { json } => Box::pin(status(json)),
         Command::Await {
             token_json,
@@ -3070,20 +3085,109 @@ async fn memory_mutation(
     Ok(())
 }
 
-async fn ask(text: String, capability: String, json_output: bool) -> Result<(), CliFailure> {
-    let attached = attach("ask").await?;
-    let result = attached
-        .0
-        .interpret_intent_typed(text, Vec::new(), capability)
-        .await
-        .map_err(|error| match error {
-            ClientWorkError::Transport(detail) => {
-                let mut failure = CliFailure::daemon_unavailable(detail).for_operation("ask");
-                failure.required_action_code = Some("RECONNECT_AND_RETRY_INTENT".to_owned());
-                failure
-            }
-            error => client_work_failure(error, "ask"),
-        })?;
+async fn ask(
+    text: String,
+    capability: String,
+    explicit_confirm: bool,
+    explicit_cancel: bool,
+    json_output: bool,
+) -> Result<(), CliFailure> {
+    if explicit_confirm && explicit_cancel {
+        return Err(CliFailure::protocol("--confirm and --cancel conflict").for_operation("ask"));
+    }
+    // Cancellation is local and precedes every attachment or model call.
+    if explicit_cancel {
+        if json_output {
+            println!(
+                "{}",
+                json!({"data": {"cancelled": true, "taskCreated": false}})
+            );
+        } else {
+            println!("已取消；没有创建工作。");
+        }
+        return Ok(());
+    }
+    let capability_choice = guided_work_capability_choice(
+        (!capability.trim().is_empty()).then(|| capability.clone()),
+        "ask",
+    )?;
+    let result = {
+        let attached = attach("ask").await?;
+        attached
+            .0
+            .interpret_intent_typed(text, Vec::new(), capability)
+            .await
+            .map_err(|error| match error {
+                ClientWorkError::Transport(detail) => {
+                    let mut failure = CliFailure::daemon_unavailable(detail).for_operation("ask");
+                    failure.required_action_code = Some("RECONNECT_AND_RETRY_INTENT".to_owned());
+                    failure
+                }
+                error => client_work_failure(error, "ask"),
+            })?
+    };
+
+    let candidate = result
+        .work_candidate
+        .as_ref()
+        .filter(|_| !result.needs_clarification);
+    let bridge = ask_bridges_to_governed_work(
+        candidate.is_some(),
+        explicit_confirm,
+        explicit_cancel,
+        json_output,
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+    );
+
+    let Some(candidate) = candidate.filter(|_| bridge) else {
+        render_ask_interpretation(&result, json_output);
+        return Ok(());
+    };
+
+    if !json_output {
+        println!("{}", result.reply);
+    }
+    // Only Founder-facing text crosses into the governed request. Snapshot,
+    // idempotency and acceptance bindings are derived inside the shared client
+    // and are never taken from the operator.
+    let input = GuidedWorkInput {
+        intent: candidate.intent.clone(),
+        work_type: candidate.work_type.clone(),
+        target_scope_ref: candidate.target_scope_ref.clone(),
+        sources: candidate
+            .sources
+            .iter()
+            .map(|source| GuidedWorkSource {
+                source_ref: source.source_ref.clone(),
+                label: source.label.clone(),
+            })
+            .collect(),
+        memory_mode: GuidedWorkMemoryMode::GovernedRetrieval,
+        capability: capability_choice,
+    };
+    guided_work_start(input, explicit_confirm, explicit_cancel, json_output).await
+}
+
+/// A daemon interpretation is only a proposal. It reaches the governed work
+/// path when the Founder chooses explicitly, or when an interactive terminal
+/// can display the sealed preview and demand the PREVIEW/CONFIRM words.
+/// Without one of those, `ask` never calls PrepareWork.
+fn ask_bridges_to_governed_work(
+    has_candidate: bool,
+    explicit_confirm: bool,
+    explicit_cancel: bool,
+    json_output: bool,
+    interactive_terminal: bool,
+) -> bool {
+    has_candidate
+        && !explicit_cancel
+        && (explicit_confirm || (interactive_terminal && !json_output))
+}
+
+fn render_ask_interpretation(
+    result: &egopulse_domain_contracts::v01::egopulse::localapi::v1::InterpretedIntent,
+    json_output: bool,
+) {
     if json_output {
         let candidate = result.work_candidate.as_ref().map(|candidate| {
             json!({
@@ -3104,12 +3208,13 @@ async fn ask(text: String, capability: String, json_output: bool) -> Result<(), 
         );
     } else {
         println!("{}", result.reply);
-        if let Some(candidate) = result.work_candidate {
+        if let Some(candidate) = result.work_candidate.as_ref() {
             println!("\n工作建议：{}", candidate.intent);
-            println!("尚未执行。打开 egopulse-tui 继续对话、预览并确认工作。");
+            println!(
+                "尚未执行。加 --confirm 预览并确认，或打开 egopulse-tui 继续对话、预览并确认工作。"
+            );
         }
     }
-    Ok(())
 }
 
 async fn status(json: bool) -> Result<(), CliFailure> {
@@ -9036,6 +9141,82 @@ mod tests {
             guided_work_start_mode(&guided_cli_input(), false, false, false, true).unwrap(),
             GuidedWorkStartMode::Interactive
         );
+    }
+
+    #[test]
+    fn ask_cli_accepts_only_high_level_inputs_and_never_auto_executes_a_candidate() {
+        // `ask` carries Founder-facing text plus the explicit confirm/cancel
+        // choice. Snapshot, idempotency and acceptance bindings are derived
+        // inside the shared client and must never be operator inputs.
+        assert!(matches!(
+            Cli::try_parse_from([
+                "egopulse",
+                "ask",
+                "prepare the release notes",
+                "--confirm",
+                "--json",
+            ]),
+            Ok(Cli {
+                command: Command::Ask {
+                    confirm: true,
+                    cancel: false,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+
+        // Omitting both flags still parses as a proposal-only surface.
+        assert!(matches!(
+            Cli::try_parse_from(["egopulse", "ask", "summarize the branch"]),
+            Ok(Cli {
+                command: Command::Ask {
+                    confirm: false,
+                    cancel: false,
+                    json: false,
+                    ..
+                }
+            })
+        ));
+
+        for forbidden in [
+            "--snapshot-id",
+            "--confirmation-binding-sha256",
+            "--context-state-revision",
+            "--idempotency-key",
+            "--principal-id",
+        ] {
+            assert!(
+                Cli::try_parse_from(["egopulse", "ask", "work", "--confirm", forbidden, "forged"])
+                    .is_err()
+            );
+        }
+
+        assert!(Cli::try_parse_from(["egopulse", "ask", "work", "--confirm", "--cancel"]).is_err());
+
+        // A candidate alone never bridges: without an explicit Founder choice
+        // and without an interactive terminal nothing reaches PrepareWork.
+        assert!(!ask_bridges_to_governed_work(
+            false, true, false, true, true
+        ));
+        assert!(!ask_bridges_to_governed_work(
+            true, false, false, false, false
+        ));
+        assert!(!ask_bridges_to_governed_work(
+            true, false, false, true, true
+        ));
+        // Explicit confirmation bridges without a TTY; cancellation never bridges.
+        assert!(ask_bridges_to_governed_work(
+            true, true, false, false, false
+        ));
+        assert!(ask_bridges_to_governed_work(true, true, false, true, false));
+        assert!(!ask_bridges_to_governed_work(
+            true, false, true, false, false
+        ));
+        // An interactive terminal bridges only in the human-readable surface.
+        assert!(ask_bridges_to_governed_work(
+            true, false, false, false, true
+        ));
     }
 
     #[test]

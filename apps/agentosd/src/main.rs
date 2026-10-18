@@ -48,6 +48,10 @@ first-run configuration template."#
 
 #[tokio::main]
 async fn main() {
+    if egopulse_local_ipc_platform::load_protected_process_keys().is_err() {
+        eprintln!("LOCAL_KEYS_INVALID: protected installation keys could not be loaded");
+        std::process::exit(78);
+    }
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let json_output = args
         .last()

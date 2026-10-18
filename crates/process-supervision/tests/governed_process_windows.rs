@@ -68,18 +68,29 @@ fn unique_command_root(test_name: &str) -> PathBuf {
 
 fn pid_writer_script(pid_file: &std::path::Path) -> String {
     let escaped = pid_file.to_string_lossy().replace('\'', "''");
-    format!("Set-Content -NoNewline -LiteralPath '{escaped}' -Value $PID; Start-Sleep -Seconds 30")
+    format!("[IO.File]::WriteAllText('{escaped}', [string]$PID); [Threading.Thread]::Sleep(30000)")
 }
 
 /// Waits for the child to publish its PID. The assertion is that it does,
 /// never how fast: the budget only has to outlast the child's own startup,
 /// which is a PowerShell cold start (seconds under load, not milliseconds).
-async fn wait_for_pid(pid_file: &std::path::Path) -> u32 {
-    for _ in 0..600 {
+/// The CI runner needed more than the fifteen seconds this helper first
+/// allowed, and the assertion never depended on the shorter wait.
+async fn wait_for_pid(
+    pid_file: &std::path::Path,
+    exchange: &mut tokio::task::JoinHandle<
+        Result<egopulse_process_supervision::GovernedProcessReceipt, GovernedProcessError>,
+    >,
+) -> u32 {
+    for _ in 0..2400 {
         if let Ok(value) = std::fs::read_to_string(pid_file)
             && let Ok(pid) = value.trim().parse()
         {
             return pid;
+        }
+        if exchange.is_finished() {
+            let outcome = exchange.await;
+            panic!("child ended before publishing its PID: {pid_file:?}; outcome={outcome:?}");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -276,10 +287,10 @@ async fn governed_process_maps_real_child_timeout() {
     // killing it: with a budget shorter than a cold start under load, the child
     // was killed before it ever wrote the file.
     let spec = powershell_spec(&pid_writer_script(&pid_file));
-    let run = tokio::spawn(async move {
+    let mut run = tokio::spawn(async move {
         run_governed_process(&spec, b"request", budget(Duration::from_secs(15), 64)).await
     });
-    let pid = wait_for_pid(&pid_file).await;
+    let pid = wait_for_pid(&pid_file, &mut run).await;
     let error = run
         .await
         .expect("timeout case task")
@@ -296,10 +307,10 @@ async fn governed_process_maps_real_child_timeout() {
 async fn dropping_a_governed_exchange_kills_the_real_child() {
     let pid_file = unique_pid_file("cancel");
     let spec = powershell_spec(&pid_writer_script(&pid_file));
-    let exchange = tokio::spawn(async move {
+    let mut exchange = tokio::spawn(async move {
         run_governed_process(&spec, b"request", budget(Duration::from_secs(60), 64)).await
     });
-    let pid = wait_for_pid(&pid_file).await;
+    let pid = wait_for_pid(&pid_file, &mut exchange).await;
     assert!(
         process_is_running(pid).await,
         "child never became observable"
@@ -333,10 +344,10 @@ async fn dropping_a_governed_cmd_exchange_kills_its_descendant_tree() {
         std::env::current_dir().expect("test working directory"),
     )
     .with_minimal_user_environment();
-    let exchange = tokio::spawn(async move {
+    let mut exchange = tokio::spawn(async move {
         run_governed_process(&spec, b"", budget(Duration::from_secs(60), 64)).await
     });
-    let descendant_pid = wait_for_pid(&pid_file).await;
+    let descendant_pid = wait_for_pid(&pid_file, &mut exchange).await;
     assert!(
         process_is_running(descendant_pid).await,
         "command descendant never became observable"

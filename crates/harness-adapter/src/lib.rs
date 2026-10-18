@@ -32,6 +32,11 @@ pub use edge::{
     SafeContentBudgetSnapshot, SafeContentBudgetUsage, SafeContentCommit, SafeContentOwnerRecord,
     SafeContentOwnerSnapshot, SafeContentProjectionMessage,
 };
+mod read_only;
+pub use read_only::{
+    ReadOnlyTurnDriver, ReadOnlyTurnOutcome, ReadOnlyTurnRequest, ReadOnlyTurnStatus,
+};
+
 pub use runtime::{
     AdapterClock, AdapterReconciliationEvidence, AdapterRuntimeResidencyReader,
     AuthorizedDispatchContext, DispatchContextAuthorization, DispatchContextAuthorizationGate,

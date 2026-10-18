@@ -172,6 +172,132 @@ impl DshAcpDriver {
         }
     }
 
+    /// A fresh ACP turn for OpenCode's isolated deny-all configuration. DSH
+    /// production dispatch is not promoted to this separate capability.
+    pub async fn run_tools_disabled_turn(
+        &mut self,
+        request: egopulse_harness_adapter::ReadOnlyTurnRequest,
+    ) -> Result<egopulse_harness_adapter::ReadOnlyTurnOutcome, DriverError> {
+        use egopulse_harness_adapter::{ReadOnlyTurnOutcome, ReadOnlyTurnStatus};
+        if self.session.is_some()
+            || self.active.is_some()
+            || request.execution_id.is_empty()
+            || request.model.is_empty()
+            || request.prompt.is_empty()
+            || request.timeout.is_zero()
+            || request.output_limit_bytes == 0
+            || request.output_limit_bytes > 1024 * 1024
+            || !request.working_directory.is_absolute()
+            || !request.working_directory.is_dir()
+            || self.config.required_model.as_deref() != Some(request.model.as_str())
+        {
+            return Err(dependency_error("READ_ONLY_TURN_INVALID"));
+        }
+        // Caller must provide the isolated OpenCode config; no implicit capability
+        // is granted to a generic ACP driver.
+        let deny_all = self
+            .config
+            .environment_overrides
+            .iter()
+            .find(|(name, _)| name == "OPENCODE_CONFIG_CONTENT")
+            .and_then(|(_, value)| serde_json::from_str::<Value>(value).ok())
+            .is_some_and(|value| {
+                value["permission"] == json!({"*":"deny"}) && value["tools"] == json!({"*":false})
+            });
+        if !deny_all {
+            return Err(dependency_error("READ_ONLY_TOOL_POLICY_REQUIRED"));
+        }
+        let model = request.model.clone();
+        let mut prompt_delivery_started = false;
+        let mut result = timeout(request.timeout, async {
+            self.ensure_session(&request.working_directory).await?;
+            let session = self.session.as_mut().expect("fresh session");
+            let request_id = session.next_request_id;
+            let prompt = format!(
+                "{}\nReturn one JSON object matching this schema, without tools:\n{}",
+                request.prompt, request.output_schema
+            );
+            // A partial write or later timeout may already have reached the provider.
+            prompt_delivery_started = true;
+            write_json_value(
+                &mut session.process,
+                &acp::session_prompt_request(request_id, &session.native_session_ref, &prompt),
+                "READ_ONLY_PROMPT_WRITE_FAILED",
+            )
+            .await?;
+            let mut output = Vec::new();
+            let mut observed_bytes = 0usize;
+            for _ in 0..4096 {
+                let line = read_json_line(
+                    &mut session.process,
+                    request.timeout,
+                    "READ_ONLY_EVENT_TIMEOUT",
+                    "READ_ONLY_EVENT_READ_FAILED",
+                    b"read-only-event",
+                )
+                .await?;
+                observed_bytes = observed_bytes.saturating_add(line.len());
+                if observed_bytes > request.output_limit_bytes.saturating_add(1024 * 1024) {
+                    return Err(driver_error("READ_ONLY_OUTPUT_LIMIT", &[]));
+                }
+                match acp::parse_message(line.as_bytes())
+                    .map_err(|_| driver_error("READ_ONLY_PROTOCOL_INVALID", &[]))?
+                {
+                    DshAcpMessage::SessionUpdate { session_id, update } => {
+                        if session_id != session.native_session_ref {
+                            return Err(driver_error("READ_ONLY_SESSION_MISMATCH", &[]));
+                        }
+                        match update {
+                            DshAcpUpdate::AgentMessageChunk { text } => {
+                                if output.len().saturating_add(text.len())
+                                    > request.output_limit_bytes
+                                {
+                                    return Err(driver_error("READ_ONLY_OUTPUT_LIMIT", &[]));
+                                }
+                                output.extend_from_slice(text.as_bytes());
+                            }
+                            DshAcpUpdate::ToolCall { .. } => {
+                                return Err(driver_error("READ_ONLY_TOOL_CALL_REFUSED", &[]));
+                            }
+                            DshAcpUpdate::AgentThoughtChunk { .. }
+                            | DshAcpUpdate::Unknown { .. } => {}
+                        }
+                    }
+                    DshAcpMessage::ServerRequest { .. } => {
+                        return Err(driver_error("READ_ONLY_SERVER_REQUEST_REFUSED", &[]));
+                    }
+                    DshAcpMessage::Response(DshAcpResponse::Result { id, result })
+                        if id.as_u64() == Some(request_id) =>
+                    {
+                        let terminal_status = match result["stopReason"].as_str() {
+                            Some("end_turn") => ReadOnlyTurnStatus::Completed,
+                            Some("cancelled" | "canceled") => ReadOnlyTurnStatus::Interrupted,
+                            _ => ReadOnlyTurnStatus::Failed,
+                        };
+                        return Ok(ReadOnlyTurnOutcome {
+                            model,
+                            terminal_status,
+                            assistant_output: output,
+                        });
+                    }
+                    DshAcpMessage::Response(DshAcpResponse::Error { .. }) => {
+                        return Err(driver_error("READ_ONLY_NATIVE_ERROR", &[]));
+                    }
+                    _ => {}
+                }
+            }
+            Err(driver_error("READ_ONLY_EVENT_LIMIT", &[]))
+        })
+        .await
+        .unwrap_or_else(|_| Err(driver_error("READ_ONLY_TURN_TIMEOUT", &[])));
+        if prompt_delivery_started && let Err(error) = &mut result {
+            error.certainty = DriverErrorCertainty::DeliveryUnknown;
+        }
+        // The governed process drop kills descendants on every exit path.
+        self.session.take();
+        result
+    }
+
     fn record_terminal_dispatch(&mut self, dispatch_id: &str, kind: LifecycleKind) {
         self.terminal_dispatch_id = Some(dispatch_id.to_owned());
         self.completed_dispatch_id =
@@ -834,10 +960,39 @@ async fn read_json_line(
     request: &[u8],
 ) -> Result<String, DriverError> {
     let mut line = String::new();
-    timeout(request_timeout, process.stdout.read_line(&mut line))
-        .await
-        .map_err(|_| driver_error(timeout_code, request))?
-        .map_err(|error| driver_error(read_code, error.to_string().as_bytes()))?;
+    timeout(request_timeout, async {
+        const MAX_LINE_BYTES: usize = 1024 * 1024;
+        let mut bytes = Vec::new();
+        loop {
+            let available = process.stdout.fill_buf().await?;
+            if available.is_empty() {
+                break;
+            }
+            let end = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|index| index + 1);
+            let count = end.unwrap_or(available.len());
+            if bytes.len().saturating_add(count) > MAX_LINE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ACP_LINE_LIMIT",
+                ));
+            }
+            bytes.extend_from_slice(&available[..count]);
+            process.stdout.consume(count);
+            if end.is_some() {
+                break;
+            }
+        }
+        line = String::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "ACP_UTF8_INVALID")
+        })?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|_| driver_error(timeout_code, request))?
+    .map_err(|error| driver_error(read_code, error.to_string().as_bytes()))?;
     Ok(line)
 }
 
