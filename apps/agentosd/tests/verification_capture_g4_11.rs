@@ -1311,7 +1311,7 @@ async fn scenario_capture_seals_the_checker_output_and_reads_back() {
         root.path(),
         "checker.ps1",
         &format!(
-            "Add-Content -Path '.g4-11-runs' -Value 'run'\n{}",
+            "[System.IO.File]::AppendAllText('.g4-11-runs', 'run' + [Environment]::NewLine)\n{}",
             powershell_printing(&review_json(&subject))
         ),
     );
@@ -1460,7 +1460,7 @@ async fn scenario_two_independent_tasks_are_served() {
     let second_digest = subject_digest(&second);
     let marked = |digest: &str| {
         format!(
-            "Add-Content -Path '.g4-11-runs' -Value 'run'\n{}",
+            "[System.IO.File]::AppendAllText('.g4-11-runs', 'run' + [Environment]::NewLine)\n{}",
             powershell_printing(&review_json(digest))
         )
     };
