@@ -6642,6 +6642,52 @@ async fn u03c_selected_task_or_reap(
     }
 }
 
+// A projected result can be visible before its source has durably ACKed delivery.
+// Freeze the read-only oracle only after all active workers have drained their queues.
+async fn wait_for_u03c_delivery_quiescence(
+    root: &Path,
+    task_id: &str,
+    child: &mut Child,
+    require_verification_projection: bool,
+) {
+    let quiescence_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect U-03c daemon while awaiting worker quiescence")
+                .is_none(),
+            "U-03c daemon exited before its durable workers became quiescent"
+        );
+        let durable = read_governed_result_durability(&u03c_oracle_request(root, task_id))
+            .expect("read U-03c durable worker delivery state");
+        let mut pending = vec![
+            durable.task.pending_local_read_model_outbox_count,
+            durable.task.pending_founder_verdict_cross_outbox_count,
+            durable.collaboration.pending_local_read_model_outbox_count,
+            durable.artifact.pending_local_read_model_outbox_count,
+            durable.verdict.pending_projection_outbox_count,
+        ];
+        if require_verification_projection {
+            pending.push(durable.verification.pending_local_read_model_outbox_count);
+        } else {
+            // The stale-review fixture deliberately omits this source. Its backlog must
+            // remain pending while every active source finishes its own delivery ACKs.
+            assert!(durable.verification.pending_local_read_model_outbox_count > 0);
+        }
+        if durable.verdict.consumption_receipt_count == 1 && pending.iter().all(|count| *count == 0)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < quiescence_deadline,
+            "U-03c durable workers did not quiesce: consumption_receipts={} pending={pending:?}",
+            durable.verdict.consumption_receipt_count
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn wait_for_u03c_projection(
     attachment: &egopulse_client_operations::ClientAttachment,
     task_id: &str,
@@ -6903,6 +6949,7 @@ async fn u03c_real_daemon_cli_and_tui_review_complete_governed_result_without_au
     discovery_watch.stop().await;
     drop(discovery_watch);
     drop(discovery_attachment);
+    wait_for_u03c_delivery_quiescence(&root, &task_id, &mut child, true).await;
     let baseline = u03c_durability_oracle(&root, &task_id);
     let mut wrong_profile = u03c_oracle_request(&root, &task_id);
     wrong_profile.task_profile.schema_profile_sha256 =
@@ -8232,36 +8279,7 @@ async fn u05d_real_daemon_tui_baseline_is_read_only() {
     wait_for_u03c_ready(&instance, &mut child).await;
 
     let task_id = u03c_discover_single_task_id(&root);
-    let quiescence_deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        assert!(
-            child
-                .try_wait()
-                .expect("inspect U-05d daemon while awaiting worker quiescence")
-                .is_none(),
-            "U-05d daemon exited before its durable workers became quiescent"
-        );
-        let durable = read_governed_result_durability(&u03c_oracle_request(&root, &task_id))
-            .expect("read U-05d durable worker delivery state");
-        let pending = [
-            durable.task.pending_local_read_model_outbox_count,
-            durable.task.pending_founder_verdict_cross_outbox_count,
-            durable.collaboration.pending_local_read_model_outbox_count,
-            durable.artifact.pending_local_read_model_outbox_count,
-            durable.verification.pending_local_read_model_outbox_count,
-            durable.verdict.pending_projection_outbox_count,
-        ];
-        if durable.verdict.consumption_receipt_count == 1 && pending.iter().all(|count| *count == 0)
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < quiescence_deadline,
-            "U-05d durable workers did not quiesce: consumption_receipts={} pending={pending:?}",
-            durable.verdict.consumption_receipt_count
-        );
-        sleep(Duration::from_millis(10)).await;
-    }
+    wait_for_u03c_delivery_quiescence(&root, &task_id, &mut child, true).await;
     let before = u03c_durability_oracle(&root, &task_id);
 
     let (attachment, mut controller, selected_task_id) =
@@ -8545,6 +8563,7 @@ async fn u03c_same_root_restart_preserves_result_review_and_authority_snapshots(
     first_discovery_watch.stop().await;
     drop(first_discovery_watch);
     drop(first_discovery_attachment);
+    wait_for_u03c_delivery_quiescence(&root, &task_id, &mut first, true).await;
     let baseline = u03c_durability_oracle(&root, &task_id);
     let first_cli = normalized_u03c_cli_review(u03c_cli_review_json(&instance, &task_id).await);
     assert_eq!(u03c_durability_oracle(&root, &task_id), baseline);
@@ -8580,6 +8599,7 @@ async fn u03c_same_root_restart_preserves_result_review_and_authority_snapshots(
     second_discovery_watch.stop().await;
     drop(second_discovery_watch);
     drop(second_discovery_attachment);
+    wait_for_u03c_delivery_quiescence(&root, &task_id, &mut second, true).await;
     assert_eq!(u03c_durability_oracle(&root, &task_id), baseline);
     let second_cli = normalized_u03c_cli_review(u03c_cli_review_json(&instance, &task_id).await);
     assert_eq!(second_cli, first_cli);
@@ -8619,6 +8639,13 @@ async fn u03c_real_clients_fail_closed_for_missing_permission_and_stale_review()
             u03c_selected_task_or_reap(&instance, &mut child).await;
         wait_for_u03c_projection(&attachment, &task_id, mode != U03C_RESULT_REVIEW_STALE_MODE)
             .await;
+        wait_for_u03c_delivery_quiescence(
+            &root,
+            &task_id,
+            &mut child,
+            mode != U03C_RESULT_REVIEW_STALE_MODE,
+        )
+        .await;
         let baseline = u03c_durability_oracle(&root, &task_id);
         let requested_task_id = if label == "missing" {
             "task:u03c-missing"
