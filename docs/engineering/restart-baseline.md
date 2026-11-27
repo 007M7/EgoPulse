@@ -80,6 +80,48 @@ between the TypeScript gate and the Rust gate. It is recorded rather than repair
 because repairing it is not part of a baseline PR, and because a gate that hangs
 silently is worse than one that fails.
 
+### The Rust gate itself cannot complete on this host
+
+`scripts/check-rust.ps1` was attempted twice after the individual gates above, and
+both attempts failed for **environment** reasons. Neither failure is a defect in
+the repository, and neither lets this document claim the Rust gate passed.
+
+**Attempt 1 — `CARGO_TARGET_DIR` is not honoured.** With the build directed to a
+shared target directory, the run stopped at:
+
+```
+Required debug binary is missing: <repo>/target/debug/agentosd.exe
+```
+
+`scripts/test-install-egopulse.ps1:117` resolves the binaries it installs at
+`<repo>/target/debug` unconditionally, so a centralized `CARGO_TARGET_DIR` and a
+passing `check-rust.ps1` are mutually exclusive today. The build had succeeded;
+only the lookup was wrong.
+
+**Attempt 2 — the disk is too small.** Run with the default in-repo target so the
+installer test can find its binaries, the link step ran out of space:
+
+```
+LINK : fatal error LNK1106: invalid file or disk full: cannot seek to 0x1F10002
+rustc-LLVM ERROR: IO failure on output stream: no space on device
+LINK : fatal error LNK1318: Unexpected PDB error; LIMIT (12)
+```
+
+The debug `target/` for this workspace reached **21 GB** before the link step for
+`apps/agentosd` failed — roughly 14 GB of library artifacts plus the integration
+test binaries (`c5_00_daemon_fixture`, `production_runner_g4_04`, …), which are
+large enough that the link for each one is itself a multi-hundred-megabyte write.
+
+Available space on the working drive was 19.5 GB. The artifacts were removed
+afterwards to restore the machine; the numbers are recorded here because
+"the gate failed" without the reason is the kind of baseline entry that gets
+misread six months later.
+
+**Conclusion for the baseline:** the Rust workspace gate needs roughly 30 GB of
+free space on the build drive, or a CI runner. It is not a statement about the
+code — every gate that could run passed, including the whole TypeScript and
+contract suite and all three Python workers.
+
 ## 5. Environment traps worth recording
 
 - **`cargo` must be on `PATH`.** `scripts/contract-codegen.ps1` falls back to
@@ -99,6 +141,22 @@ silently is worse than one that fails.
   today. Any move to PowerShell 7 — including the planned `xtask` migration —
   has to fix the restore semantics first, otherwise the gate turns red for a
   reason unrelated to the change being made.
+
+- **`scripts/test-install-egopulse.ps1` ignores `CARGO_TARGET_DIR`.** It resolves
+  the binaries it installs at `<repo>/target/debug` unconditionally
+  (`test-install-egopulse.ps1:117`). When `CARGO_TARGET_DIR` points somewhere
+  shared — which is the whole point of keeping the build off the near-full system
+  drives — every `check-rust.ps1` run stops with:
+
+  ```
+  Required debug binary is missing: <repo>/target/debug/agentosd.exe
+  ```
+
+  The build itself succeeds; only the lookup is wrong. Until the script honours
+  `CARGO_TARGET_DIR`, the Rust gate forces an in-repo `target/`, so a centralized
+  target directory and a passing `check-rust` are mutually exclusive today. Both
+  ways out are one-line changes, but choosing between them is a policy decision:
+  teach the script to resolve the variable, or stop centralizing for Rust.
 
 ## 6. Codex CLI drifted from the pinned protocol version
 
