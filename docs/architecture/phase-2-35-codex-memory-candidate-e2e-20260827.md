@@ -1,4 +1,5 @@
 # Phase 2.35 — Codex to Memory candidate E2E evidence
+> Note: local user-profile paths in this document are redacted to ``%USERPROFILE%``.
 
 Status: locally verified on Windows x64; candidate-only Memory write
 
@@ -56,7 +57,7 @@ existing `EGOPULSE_CODEX_EXECUTABLE` test configuration. It verified:
 Focused command:
 
 ```powershell
-$env:EGOPULSE_CODEX_EXECUTABLE = 'C:\Users\Administrator\AppData\Local\OpenAI\Codex\bin\f71e347eb70b3d24\codex.exe'
+$env:EGOPULSE_CODEX_EXECUTABLE = '%USERPROFILE%\AppData\Local\OpenAI\Codex\bin\f71e347eb70b3d24\codex.exe'
 cargo test -p egopulse-agentosd --test codex_memory_candidate_e2e -- --nocapture
 ```
 

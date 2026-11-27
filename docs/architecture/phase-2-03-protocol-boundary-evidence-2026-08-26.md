@@ -1,4 +1,5 @@
 # Phase 2-03 protocol boundary evidence
+> Note: local user-profile paths in this document are redacted to ``%USERPROFILE%``.
 
 This note records local, non-inference observations after executable
 discovery. No model prompt, API key or paid inference was used.
@@ -86,7 +87,7 @@ run.
 
 Additionally, attempting a profile-level local help probe failed before the
 profile started because the launcher could not create its user-profile module
-symlink under `C:\Users\Administrator\.dsh\profiles` (`EPERM`). This is a
+symlink under `%USERPROFILE%\.dsh\profiles` (`EPERM`). This is a
 real Windows packaging/permission finding, but it is not evidence that DSH's
 native workflow semantics are unsupported. It must be fixed or isolated in a
 dedicated probe workspace before a fair semantic comparison.
@@ -181,8 +182,8 @@ share directory. The probe intentionally performs only ACP `initialize` and
 empty `session/new`; it does not send a prompt or invoke model inference:
 
 ```powershell
-$probeDir = 'C:\Users\Administrator\AppData\Local\Temp\egopulse-kimi-probe-20260826'
-$env:EGOPULSE_KIMI_NATIVE_EXE = 'C:\Users\Administrator\AppData\Roaming\npm\kimi.cmd'
+$probeDir = '%USERPROFILE%\AppData\Local\Temp\egopulse-kimi-probe-20260826'
+$env:EGOPULSE_KIMI_NATIVE_EXE = '%USERPROFILE%\AppData\Roaming\npm\kimi.cmd'
 $env:EGOPULSE_KIMI_PROBE_DIR = $probeDir
 cargo test -p egopulse-kimi-adapter `
   live_kimi_initialize_probe_is_reachable_without_promoting_capability `

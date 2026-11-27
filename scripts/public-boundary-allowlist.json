@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "note": [
+    "Grandfather list for the E-104 public-boundary content rules.",
+    "",
+    "'governanceRefCounts' records how many private-governance references (B2)",
+    "each file was allowed to carry when the rule was introduced. Rewriting those",
+    "references changes frozen contract content (contracts/manifest.json and the",
+    "IMPLEMENTATION-SSOT baselines carry digests over the very text), so it is a",
+    "separate contract change. Until that lands, the rule blocks any increase:",
+    "raise a count here only together with a reviewable reason, never to make a",
+    "new leak pass.",
+    "",
+    "Deleting a line reduces the real count below the allowance, which is fine;",
+    "the allowance is an upper bound, not an exact expectation."
+  ],
+  "governanceRefCounts": [
+    { "path": "contracts/baselines/v01-gate3-draft11.json", "count": 1 },
+    { "path": "contracts/baselines/v01-gate3-draft13.json", "count": 1 },
+    { "path": "contracts/context-revoke-semantic-profile.schema.json", "count": 1 },
+    { "path": "contracts/IMPLEMENTATION-SSOT.json", "count": 14 },
+    { "path": "contracts/IMPLEMENTATION-SSOT.md", "count": 13 },
+    { "path": "contracts/manifest.json", "count": 27 },
+    { "path": "contracts/profiles/authorization/v1/v01-default.json", "count": 1 },
+    { "path": "contracts/profiles/client-kernel/v1/v01-default.json", "count": 1 },
+    { "path": "contracts/profiles/context-revoke/v1/v01-default.json", "count": 1 },
+    { "path": "contracts/profiles/harness-content-disclosure/v1/v01-default.json", "count": 1 },
+    { "path": "contracts/profiles/quality-budget/v1/v01-default.json", "count": 1 },
+    { "path": "contracts/scripts/validate-candidate.js", "count": 6 },
+    { "path": "crates/domain-contracts/src/profiles.rs", "count": 2 },
+    { "path": "crates/domain-contracts/tests/harness_content_r9c.rs", "count": 1 },
+    { "path": "docs/architecture/phase-2-10-memory-rag-contract-approval-package.md", "count": 1 },
+    { "path": "docs/architecture/phase-2-11-memory-retrieval-daemon-contract-decision.md", "count": 1 },
+    { "path": "docs/architecture/phase-2-75-r9b-governed-state-dual-stream-contract-20260904.md", "count": 1 },
+    { "path": "docs/architecture/phase-2-81-r9c-harness-content-disclosure-decision-candidate-20260904.md", "count": 1 },
+    { "path": "docs/architecture/phase-2-82-r9c-implementation-readiness-plan-20260904.md", "count": 1 },
+    { "path": "docs/architecture/phase-2-83-r9c-core-closure-evidence-20260905.md", "count": 1 },
+    { "path": "docs/architecture/phase-2-84-m13-governed-memory-context-consumption-decision-20260905.md", "count": 1 },
+    { "path": "docs/decisions/0005-personal-agent-intent.md", "count": 1 },
+    { "path": "scripts/verify-v01-contract-import.mjs", "count": 8 }
+  ],
+  "governanceRefAllowance": {
+    "total": 87,
+    "recordedAt": "2026-11-28",
+    "recordedAtCommit": "f5d74ed"
+  }
+}
