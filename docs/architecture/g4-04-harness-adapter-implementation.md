@@ -1,4 +1,5 @@
 # G4-04 Harness Adapter implementation profile
+> Note: local user-profile paths in this document are redacted to ``%USERPROFILE%``.
 
 - Status: G4-04 accepted; production composition, authenticated provider-boundary and
   Verification-gated Return settlement evidence complete
@@ -135,7 +136,7 @@ classification defect:
 
 ```powershell
 $env:EGOPULSE_CODEX_NATIVE_EXE =
-  'C:\Users\Administrator\AppData\Roaming\npm\codex.cmd'
+  '%USERPROFILE%\AppData\Roaming\npm\codex.cmd'
 cargo test -p egopulse-codex-adapter --test provider_neutral_contract live_codex_app_server_emits_contract_valid_ack_running_and_terminal_observations -- --ignored --nocapture
 ```
 
@@ -170,7 +171,7 @@ non-terminal production return slice:
 
 ```powershell
 $env:EGOPULSE_CODEX_NATIVE_EXE =
-  'C:\Users\Administrator\AppData\Local\OpenAI\Codex\bin\<installed>\codex.exe'
+  '%USERPROFILE%\AppData\Local\OpenAI\Codex\bin\<installed>\codex.exe'
 cargo test -p egopulse-agentosd --test production_runner_g4_04 `
   user_configured_production_runner_completes_real_codex_dispatch `
   -- --ignored --nocapture

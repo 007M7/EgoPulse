@@ -1,4 +1,5 @@
 # Phase 2-03 Windows x64 executable discovery
+> Note: local user-profile paths in this document are redacted to ``%USERPROFILE%``.
 
 This is the first, zero-API-call slice of the candidate Harness probe. It only
 checks that the locally configured command entry point exists and can report a
@@ -11,8 +12,8 @@ Probe date: 2026-08-26 (Asia/Shanghai)
 
 | Candidate | Local entry point | Version output | Result |
 | --- | --- | --- | --- |
-| Codex | `C:\Users\Administrator\AppData\Roaming\npm\codex.cmd` | `codex-cli 0.148.0-alpha.15` | Executable discovery passed; existing native app-server probe remains the reference |
-| Kimi CLI | `C:\Users\Administrator\AppData\Roaming\npm\kimi.cmd` → `C:\Users\Administrator\.local\bin\kimi.exe` | `kimi, version 1.49.0` | Executable, ACP initialize/empty-session boundary and candidate driver seam present; authenticated dispatch/lifecycle attestation pending |
+| Codex | `%USERPROFILE%\AppData\Roaming\npm\codex.cmd` | `codex-cli 0.148.0-alpha.15` | Executable discovery passed; existing native app-server probe remains the reference |
+| Kimi CLI | `%USERPROFILE%\AppData\Roaming\npm\kimi.cmd` → `%USERPROFILE%\.local\bin\kimi.exe` | `kimi, version 1.49.0` | Executable, ACP initialize/empty-session boundary and candidate driver seam present; authenticated dispatch/lifecycle attestation pending |
 | DeepSeek Harness | `D:\deepseek harness\dsh.cmd` | `0.1.0-rc.5` | ACP initialize/session, multi-turn and cancel replay passed; native load/resume unsupported, candidate held |
 
 The Codex version command emitted a non-fatal warning about cleaning stale

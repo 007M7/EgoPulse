@@ -1,4 +1,5 @@
 # Phase 2-49 authenticated Provider admission and Memory/RAG candidate gate
+> Note: local user-profile paths in this document are redacted to ``%USERPROFILE%``.
 
 - Date: 2026-08-27
 - Scope: DeepSeek Harness, Kimi CLI, GLM/OpenCode, and read-only Memory/RAG
@@ -24,7 +25,7 @@ The common Windows entry point is:
 $env:EGOPULSE_PROVIDER_AUTH_READY = '1'
 ./scripts/probe-provider-authenticated-windows.ps1 `
   -Provider kimi `
-  -ExecutablePath 'C:\Users\Administrator\AppData\Roaming\npm\kimi.cmd' `
+  -ExecutablePath '%USERPROFILE%\AppData\Roaming\npm\kimi.cmd' `
   -ExactModel 'kimi-k2.5' `
   -AllowInference
 ```

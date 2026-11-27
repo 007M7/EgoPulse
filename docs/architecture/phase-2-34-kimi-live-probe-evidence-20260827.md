@@ -1,4 +1,5 @@
 # Phase 2.34 — Kimi live ACP probe evidence
+> Note: local user-profile paths in this document are redacted to ``%USERPROFILE%``.
 
 Status: candidate-only; authentication required
 
@@ -28,7 +29,7 @@ stores.
 ```powershell
 $taskProbeDir = Join-Path $env:TEMP 'egopulse-kimi-probe-20260827'
 New-Item -ItemType Directory -Force -Path $taskProbeDir
-$env:EGOPULSE_KIMI_NATIVE_EXE = 'C:\Users\Administrator\AppData\Roaming\npm\kimi.cmd'
+$env:EGOPULSE_KIMI_NATIVE_EXE = '%USERPROFILE%\AppData\Roaming\npm\kimi.cmd'
 $env:EGOPULSE_KIMI_PROBE_DIR = $taskProbeDir
 cargo test -p egopulse-kimi-adapter --lib `
   live_kimi_initialize_probe_is_reachable_without_promoting_capability `

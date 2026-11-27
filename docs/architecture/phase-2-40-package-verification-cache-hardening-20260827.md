@@ -1,4 +1,5 @@
 # Phase 2-40: Windows package verification cache hardening
+> Note: local user-profile paths in this document are redacted to ``%USERPROFILE%``.
 
 - Status: locally verified; candidate regenerated
 - Evidence date: 2026-08-27
@@ -8,7 +9,7 @@
 
 The first verification attempt for the `4dddcdf` candidate failed while
 installing the packaged Memory Worker because `uv` used the default user cache
-at `C:\Users\Administrator\AppData\Local\uv\cache`, which was not writable
+at `%USERPROFILE%\AppData\Local\uv\cache`, which was not writable
 in the verification environment. The executable probes and archive SHA-256
 had already passed. An explicit writable cache made the same candidate pass,
 showing that this was an environment-permission failure rather than a package
